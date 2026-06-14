@@ -1,0 +1,71 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.13
+          cache: pnpm
+
+      - run: npm install -g node-gyp@12.3.0
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm build
+
+      - run: pnpm test:coverage
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo "## Test Coverage"
+            echo ""
+            echo "| Package | Lines | Statements | Branches | Functions |"
+            echo "|---|---|---|---|---|"
+            for pkg in server web; do
+              file="packages/$pkg/coverage/coverage-summary.json"
+              if [ -f "$file" ]; then
+                jq -r --arg pkg "$pkg" '
+                  .total |
+                  "| \($pkg) | \(.lines.pct)% (\(.lines.covered)/\(.lines.total)) | \(.statements.pct)% (\(.statements.covered)/\(.statements.total)) | \(.branches.pct)% (\(.branches.covered)/\(.branches.total)) | \(.functions.pct)% (\(.functions.covered)/\(.functions.total)) |"
+                ' "$file"
+              else
+                echo "| $pkg | _missing_ | _missing_ | _missing_ | _missing_ |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-reports
+          path: |
+            packages/server/coverage
+            packages/web/coverage
+          retention-days: 14

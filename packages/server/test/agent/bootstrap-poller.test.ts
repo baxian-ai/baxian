@@ -1,0 +1,342 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import type { AgentConfig, BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import { AgentStore } from '../../src/state/agent-store.js';
+import { EventBus } from '../../src/event/bus.js';
+import { EventLog } from '../../src/event/log.js';
+import { BootstrapPoller } from '../../src/agent/bootstrap-poller.js';
+import { createRepoStoreCache } from '../../src/agent/repo-store.js';
+import { initStateDir } from '../../src/state/init.js';
+import { ErrorRecordStore } from '../../src/state/error-record-store.js';
+
+const NOW = '2026-04-28T10:00:00Z';
+const devAgent: AgentConfig = {
+  id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', // no workdir → auto mode
+};
+const config: BaxianConfig = {
+  github: {} as never, review: { rounds: 10 }, server: { port: 3000 },
+  project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent]] }],
+};
+const noopRunner = {
+  exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+  writeFile: async () => {},
+};
+
+let tempDir: string;
+let agentStore: AgentStore;
+let eventBus: EventBus;
+const events: BaxianEvent[] = [];
+
+beforeEach(async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'baxian-br-'));
+  await initStateDir(tempDir);
+  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
+  eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
+  events.length = 0;
+  eventBus.on('*', (e) => { events.push(e); });
+});
+afterEach(async () => { await rm(tempDir, { recursive: true }); });
+
+describe('BootstrapPoller', () => {
+  it('start/stop schedules and halts periodic ticks', async () => {
+    vi.useFakeTimers();
+    // Strip fs latency from agentStore.update so PeriodicTaskRunner's running
+    // flag has cleared before the next setInterval tick fires; otherwise the
+    // 60_000ms advance can race with a still-in-flight first tick.
+    vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
+    const ensure = vi.fn().mockResolvedValue('/repo/path');
+    const poller = new BootstrapPoller({
+      config, agentStore, eventBus,
+      repoCache: createRepoStoreCache(),
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => ({ ensure })) as never,
+      intervalMs: 60_000,
+    });
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ensure).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ensure).toHaveBeenCalledTimes(2);
+    poller.stop();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(ensure).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it('does NOT emit agent.bootstrap_succeeded when no existing binding is updated', async () => {
+    const poller = new BootstrapPoller({
+      config, agentStore, eventBus,
+      repoCache: createRepoStoreCache(),
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => ({ ensure: async () => '/p' })) as never,
+      intervalMs: 60_000,
+    });
+    await poller.pollOnce();
+    expect(events.filter(e => e.type === 'agent.bootstrap_succeeded')).toHaveLength(0);
+  });
+
+  it('updates repoPath and emits succeeded when an existing binding is updated', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    const poller = new BootstrapPoller({
+      config, agentStore, eventBus,
+      repoCache: createRepoStoreCache(),
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => ({ ensure: async () => '/p' })) as never,
+      intervalMs: 60_000,
+    });
+    await poller.pollOnce();
+    expect((await agentStore.get('dev-1'))?.repoPath).toBe('/p');
+    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
+  });
+
+  it('multi-target allSettled: later targets run after one throws', async () => {
+    const cfg2: BaxianConfig = {
+      ...config,
+      project: [
+        { id: 'p1', repo: 'user/r1', merge: null, agent: [[{ ...devAgent, id: 'dev-1' }]] },
+        { id: 'p2', repo: 'user/r2', merge: null, agent: [[{ ...devAgent, id: 'dev-2' }]] },
+      ],
+    };
+    let ensureCalls = 0;
+    const poller = new BootstrapPoller({
+      config: cfg2, agentStore, eventBus,
+      repoCache: createRepoStoreCache(),
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => {
+        ensureCalls++;
+        const id = ensureCalls;
+        return { ensure: async () => { if (id === 1) throw new Error('first down'); return '/p'; } };
+      }) as never,
+      intervalMs: 60_000,
+    });
+    await poller.pollOnce();
+    expect(ensureCalls).toBe(2);
+  });
+
+  it('deduplicates repeated bootstrap_failed events for the same target and error', async () => {
+    const poller = new BootstrapPoller({
+      config,
+      agentStore,
+      eventBus,
+      repoCache: createRepoStoreCache(),
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => ({ ensure: async () => { throw new Error('clone refused'); } })) as never,
+      intervalMs: 60_000,
+    });
+
+    await poller.pollOnce();
+    await poller.pollOnce();
+
+    expect(events.filter(e => e.type === 'agent.bootstrap_failed')).toHaveLength(1);
+  });
+
+  it('records bootstrap failures once per emitted failure event', async () => {
+    const errorRecordStore = new ErrorRecordStore(join(tempDir, 'state', 'errors'));
+    const poller = new BootstrapPoller({
+      config,
+      agentStore,
+      eventBus,
+      repoCache: createRepoStoreCache(),
+      errorRecordStore,
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => ({ ensure: async () => { throw new Error('clone refused'); } })) as never,
+      intervalMs: 60_000,
+    });
+
+    await poller.pollOnce();
+    await poller.pollOnce();
+
+    expect(await errorRecordStore.latestForAgent('dev-1')).toMatchObject({
+      reason: 'BOOTSTRAP_REPO_ENSURE_FAILED',
+      message: 'clone refused',
+    });
+  });
+
+  it('reentrant pollOnce while previous in flight skips', async () => {
+    let releaseEnsure!: () => void;
+    const gate = new Promise<string>(r => { releaseEnsure = () => r('/p'); });
+    const ensure = vi.fn().mockReturnValue(gate);
+    const poller = new BootstrapPoller({
+      config, agentStore, eventBus,
+      repoCache: createRepoStoreCache(),
+      runnerFactory: () => noopRunner as never,
+      repoStoreFactory: (() => ({ ensure })) as never,
+      intervalMs: 60_000,
+    });
+    const p1 = poller.pollOnce();
+    const p2 = poller.pollOnce();
+    releaseEnsure();
+    await Promise.all([p1, p2]);
+    expect(ensure).toHaveBeenCalledTimes(1);
+  });
+
+  describe('pollProject (user-triggered retry)', () => {
+    const cfgTwoProjects: BaxianConfig = {
+      github: {} as never, review: { rounds: 10 }, server: { port: 3000 },
+      project: [
+        { id: 'p-yes', repo: 'u/r1', merge: null, agent: [[{ ...devAgent, id: 'dev-yes' }]] },
+        { id: 'p-no', repo: 'u/r2', merge: null, agent: [[{ ...devAgent, id: 'dev-no' }]] },
+      ],
+    };
+
+    it('runs only the matching project (not the whole config)', async () => {
+      const ensure = vi.fn().mockResolvedValue('/p');
+      const poller = new BootstrapPoller({
+        config: cfgTwoProjects, agentStore, eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+        intervalMs: 60_000,
+      });
+      await poller.pollProject('p-yes');
+      expect(ensure).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns knownProject=false for unknown projectId so endpoint can distinguish 404 vs ran=0', async () => {
+      const ensure = vi.fn().mockResolvedValue('/p');
+      const poller = new BootstrapPoller({
+        config: cfgTwoProjects, agentStore, eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+        intervalMs: 60_000,
+      });
+      expect(await poller.pollProject('nope')).toEqual({ ok: false, ran: 0, knownProject: false });
+      expect(ensure).not.toHaveBeenCalled();
+    });
+
+    it('returns knownProject=true + ran=0 + ok=true for project with no auto-mode agents (success no-op)', async () => {
+      // All agents have explicit workdir → collectTargets returns 0 targets for this project.
+      // This is a legitimate success, not a failure — operator shouldn't see a warn toast.
+      const cfgOnlyManual: BaxianConfig = {
+        ...cfgTwoProjects,
+        project: [{
+          id: 'manual-only', repo: 'u/r3', merge: null,
+          agent: [[{ ...devAgent, id: 'dev-m', workdir: '/manual' }]],
+        }],
+      };
+      const ensure = vi.fn().mockResolvedValue('/p');
+      const poller = new BootstrapPoller({
+        config: cfgOnlyManual, agentStore, eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+        intervalMs: 60_000,
+      });
+      expect(await poller.pollProject('manual-only')).toEqual({ ok: true, ran: 0, knownProject: true });
+      expect(ensure).not.toHaveBeenCalled();
+    });
+
+    it('returns ok=false when the bootstrap actually fails', async () => {
+      const ensure = vi.fn().mockRejectedValue(new Error('access denied'));
+      const poller = new BootstrapPoller({
+        config: cfgTwoProjects, agentStore, eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+        intervalMs: 60_000,
+      });
+      expect(await poller.pollProject('p-yes')).toEqual({ ok: false, ran: 1, knownProject: true });
+    });
+
+    it('bypasses suppressFailureMessage dedup so the same error re-emits on retry', async () => {
+      // Operator clicked Retry expecting a fresh signal. The automatic poll path dedupes by
+      // last-seen message; manual retry should NOT inherit that suppression.
+      const ensure = vi.fn().mockRejectedValue(new Error('access denied'));
+      const poller = new BootstrapPoller({
+        config: cfgTwoProjects, agentStore, eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+        intervalMs: 60_000,
+      });
+      await poller.pollOnce();
+      events.length = 0;
+      await poller.pollProject('p-yes');
+      expect(events.filter(e => e.type === 'agent.bootstrap_failed')).toHaveLength(1);
+    });
+  });
+
+  describe('replaceConfig reschedule', () => {
+    it('clearing bootstrapRetryIntervalMs reverts to DEFAULT_INTERVAL_MS (60s), not the stale runtime value', async () => {
+      vi.useFakeTimers();
+      vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
+      const ensure = vi.fn().mockResolvedValue('/repo/path');
+      const customConfig: BaxianConfig = {
+        ...config,
+        server: { ...config.server, bootstrapRetryIntervalMs: 5000 },
+      };
+      const poller = new BootstrapPoller({
+        config: customConfig,
+        agentStore,
+        eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+      });
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      const callsAtBoot = ensure.mock.calls.length;
+      expect(callsAtBoot).toBeGreaterThan(0);
+
+      poller.replaceConfig({
+        ...customConfig,
+        server: { port: 3000 },
+      });
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(ensure.mock.calls.length).toBe(callsAtBoot);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ensure.mock.calls.length).toBeGreaterThan(callsAtBoot);
+
+      poller.stop();
+      vi.useRealTimers();
+    });
+
+    it('reschedules timer when bootstrapRetryIntervalMs changes', async () => {
+      vi.useFakeTimers();
+      vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
+      const ensure = vi.fn().mockResolvedValue('/repo/path');
+      const baseConfig: BaxianConfig = {
+        ...config,
+        server: { ...config.server, bootstrapRetryIntervalMs: 2000 },
+      };
+      const poller = new BootstrapPoller({
+        config: baseConfig,
+        agentStore,
+        eventBus,
+        repoCache: createRepoStoreCache(),
+        runnerFactory: () => noopRunner as never,
+        repoStoreFactory: (() => ({ ensure })) as never,
+      });
+      poller.start();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ensure).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ensure).toHaveBeenCalledTimes(2);
+
+      poller.replaceConfig({
+        ...baseConfig,
+        server: { ...baseConfig.server, bootstrapRetryIntervalMs: 7000 },
+      });
+
+      await vi.advanceTimersByTimeAsync(6999);
+      expect(ensure).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ensure).toHaveBeenCalledTimes(3);
+
+      poller.stop();
+      vi.useRealTimers();
+    });
+  });
+});

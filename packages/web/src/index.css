@@ -1,0 +1,139 @@
+@font-face {
+  font-family: 'iA Writer Quattro S';
+  src: url('/fonts/ia-writer-quattro-s-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'iA Writer Quattro S';
+  src: url('/fonts/ia-writer-quattro-s-italic.woff2') format('woff2');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'iA Writer Quattro S';
+  src: url('/fonts/ia-writer-quattro-s-bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'iA Writer Quattro S';
+  src: url('/fonts/ia-writer-quattro-s-bolditalic.woff2') format('woff2');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Lilex';
+  src: url('/fonts/lilex-variable.woff2') format('woff2-variations');
+  font-weight: 200 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-page text-og-800 font-sans;
+    font-size: 14px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: geometricprecision;
+    /* Stop iOS from auto-inflating body text when rotated to landscape. */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+}
+
+/* iOS Safari zooms the viewport when focusing a control whose font-size < 16px.
+   Pin form controls to 16px on touch devices so tapping a field never zooms. */
+@media (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="file"]),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md border border-og-100 bg-surface px-3 py-1.5 text-[13px] font-medium text-og-800 transition-colors hover:border-accent hover:bg-accent-soft hover:text-accent disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md bg-transparent px-3 py-1.5 text-[13px] font-medium text-og-500 transition-colors hover:bg-og-50 hover:text-og-800 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full bg-og-50 px-2 py-0.5 font-mono text-[11px] leading-[1.4] text-og-700;
+  }
+  .pill::before {
+    content: '';
+    @apply inline-block h-1.5 w-1.5 rounded-full bg-og-300;
+  }
+  .pill-live {
+    @apply bg-[#e6f4ec] text-success;
+  }
+  .pill-live::before {
+    @apply bg-success;
+  }
+  .pill-warn {
+    @apply bg-[#fef3c7] text-warn;
+  }
+  .pill-warn::before {
+    @apply bg-warn;
+  }
+  .pill-review {
+    @apply bg-accent-soft text-accent;
+  }
+  .pill-review::before {
+    @apply bg-accent;
+  }
+
+  .card {
+    @apply rounded-lg border border-hairline bg-surface transition-colors hover:border-og-100;
+  }
+
+  .status-dot {
+    @apply inline-block h-[0.725rem] w-[0.725rem] shrink-0 rounded-full bg-og-50;
+  }
+  .status-dot--healthy {
+    @apply bg-[#e6f4ec];
+  }
+  .status-dot--warn {
+    @apply bg-[#fef3c7];
+    animation: breathe 1.8s ease-in-out infinite;
+  }
+  .status-dot--danger {
+    @apply bg-[#fef2f2];
+    animation: breathe 1.8s ease-in-out infinite;
+  }
+  .status-dot--info {
+    @apply bg-accent-soft;
+    animation: breathe 1.8s ease-in-out infinite;
+  }
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@layer utilities {
+  /* Single-line rows that must not wrap degrade to horizontal scroll; hide the bar so it stays clean. */
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}

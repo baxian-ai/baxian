@@ -1,0 +1,1459 @@
+import { createSignalToken, type PhaseSignalKind } from '../agent/phase-signal.js';
+import { TASK_TERMINAL_STATUS_SET, type BaxianEvent, type TaskState } from '../shared/index.js';
+import type { EventBus } from './bus.js';
+import { type AgentManager, DispatchTerminalError, EnsureSessionError } from '../agent/manager.js';
+
+type InterventionData = Record<string, unknown> & { phase: string };
+const HEAD_SHA_RE = /^[0-9a-f]{40}$/i;
+
+function validHeadSha(value: unknown): string | undefined {
+  return typeof value === 'string' && HEAD_SHA_RE.test(value) ? value : undefined;
+}
+
+// Re-establish the develop-phase watcher after a handler-side rejection so the same
+// task can consume a corrected emit (same token) without a server restart.
+async function reArmDevelopWatcher(
+  manager: AgentManager,
+  task: TaskState,
+  agentId: string,
+): Promise<void> {
+  const kinds: readonly PhaseSignalKind[] =
+    task.phase === 'code' ? ['pr-created'] : ['spec-done', 'pr-created'];
+  await manager.setupPhaseSignal(task.id, agentId, kinds);
+}
+
+async function emitIntervention(
+  bus: EventBus,
+  projectId: string,
+  agentId: string,
+  taskId: string,
+  data: InterventionData,
+): Promise<void> {
+  try {
+    const evt: BaxianEvent = {
+      id: '',
+      type: 'human.intervention',
+      timestamp: new Date().toISOString(),
+      projectId,
+      agentId,
+      taskId,
+      data,
+    };
+    await bus.emit(evt);
+  } catch (emitErr) {
+    console.warn(`[EventHandler] human.intervention emit failed (phase=${data.phase}):`, emitErr);
+  }
+}
+
+// Live `gh pr view` is the only authoritative source; fallbacks are tagged so
+// audit logs reveal that staleness inference is best-effort.
+type HeadAnchorSource = 'fetch' | 'task-store' | 'payload-self' | 'completion-approved' | 'unknown';
+interface HeadAnchor {
+  headSha: string | undefined;
+  source: HeadAnchorSource;
+  fetchError?: string;
+}
+
+async function resolveAuthoritativeHead(
+  manager: AgentManager,
+  task: TaskState,
+  opts: {
+    payloadCurrentHeadSha?: string;
+    legacyFallback?: string;
+  } = {},
+): Promise<HeadAnchor> {
+  try {
+    const headSha = await manager.fetchPrHeadSha(task.id);
+    return { headSha, source: 'fetch' };
+  } catch (err) {
+    const fetchError = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[handlers] fetchPrHeadSha(task=${task.id}) failed; falling back to stored / payload:`,
+      err,
+    );
+    const stored = validHeadSha(task.latestHeadSha);
+    if (stored) return { headSha: stored, source: 'task-store', fetchError };
+    if (opts.payloadCurrentHeadSha) {
+      return { headSha: opts.payloadCurrentHeadSha, source: 'payload-self', fetchError };
+    }
+    if (opts.legacyFallback) {
+      return { headSha: opts.legacyFallback, source: 'completion-approved', fetchError };
+    }
+    return { headSha: undefined, source: 'unknown', fetchError };
+  }
+}
+
+// pr-fixed verification needs a LIVE head (no stale fallback). GitHub has brief
+// read-after-write lag + transient failures, so retry a few times, then throw so
+// the handler fails closed instead of mis-reading a no-op.
+async function fetchVerifiedHeadSha(manager: AgentManager, taskId: string): Promise<string> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await manager.fetchPrHeadSha(taskId);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 300));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+}
+
+// Budget = initial APPROVE dispatch + N redispatches; sized to converge a ~10-finding PR.
+export const POST_APPROVE_REDISPATCH_CAP = 10;
+
+// Clock-skew tolerance for the verdict freshness gate. GitHub `submitted_at` is
+// second-granularity and its clock drifts from baxian's ms-precision
+// `reviewDispatchedAt`; a false-reject is costly (poller cursor marks the review
+// processed and won't retry → task strands), while real superseded passes are
+// seconds-to-minutes stale, so a few seconds of slack is safe.
+export const VERDICT_FRESHNESS_SKEW_MS = 5000;
+
+async function dispatchDevPostApproveCheck(
+  bus: EventBus,
+  manager: AgentManager,
+  task: TaskState,
+  approvedHeadSha: string,
+  opts: { redispatchCount?: number } = {},
+): Promise<void> {
+  if (!approvedHeadSha) {
+    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      phase: 'post-approve-approved-head-unavailable',
+    });
+    return;
+  }
+
+  const acquired = await manager.acquireAgentForTask(task.agentId, task.id, 'post-approve');
+  if (!acquired) {
+    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      phase: 'post-approve-dev-acquire-failed',
+      devAgentId: task.agentId,
+    });
+    return;
+  }
+
+  const signalToken = createSignalToken();
+  await manager.setPostApproveCompletion(task.id, {
+    token: signalToken,
+    approvedHeadSha,
+    ...(typeof opts.redispatchCount === 'number' ? { redispatchCount: opts.redispatchCount } : {}),
+  });
+
+  let resumed = false;
+  let dispatchErr: unknown = null;
+  try {
+    resumed = await manager.continueSession(task.id, task.agentId, 'post-approve', {
+      signalToken,
+      ...(typeof opts.redispatchCount === 'number'
+        ? { postApproveRedispatchCount: opts.redispatchCount }
+        : {}),
+    });
+  } catch (err) {
+    dispatchErr = err;
+    console.error(
+      `[EventHandler] APPROVE continueSession(dev=${task.agentId}, post-approve) failed:`,
+      err,
+    );
+  }
+  if (resumed) return;
+
+  await manager.clearPostApproveCompletionIfMatches(task.id, signalToken);
+
+  if (dispatchErr instanceof DispatchTerminalError) {
+    await manager.failTaskForDispatchError(task.id, 'post-approve', task.agentId, dispatchErr);
+    return;
+  }
+
+  await manager.markAgentWaiting(task.agentId, task.id)
+    .catch(err => {
+      console.error(
+        `[EventHandler] APPROVE markAgentWaiting(dev=${task.agentId}) rollback failed:`,
+        err,
+      );
+      return false;
+    });
+  await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+    phase: 'post-approve-dispatch-failed',
+    reviewRound: task.reviewRound,
+    ...(dispatchErr instanceof DispatchTerminalError ? { terminalReason: dispatchErr.reason } : {}),
+    ...(dispatchErr ? { error: dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr) } : {}),
+  });
+}
+
+async function isServerModeTask(manager: AgentManager, taskId: string): Promise<boolean> {
+  const task = await manager.getTask(taskId);
+  return task?.reviewMode === 'server';
+}
+
+async function gateDevForPostApproveRedispatch(
+  bus: EventBus,
+  manager: AgentManager,
+  task: TaskState,
+): Promise<boolean> {
+  const ready = await manager
+    .releaseAgentForTask(task.agentId, task.id, 'waiting')
+    .catch(err => {
+      console.error(
+        `[EventHandler] post-approve redispatch releaseAgentForTask(dev=${task.agentId}) failed:`,
+        err,
+      );
+      return false;
+    });
+  if (ready) return true;
+  await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+    phase: 'post-approve-dev-wait-gate-failed-before-redispatch',
+    devAgentId: task.agentId,
+  });
+  return false;
+}
+
+export function registerEventHandlers(
+  bus: EventBus,
+  manager: AgentManager,
+): void {
+  bus.on('pr.created', async (event) => {
+    if (!event.taskId || !event.agentId) return;
+    if (await isServerModeTask(manager, event.taskId)) return;
+
+    // pane-signal pr.created carries data.prNumber (extracted from the agent's
+    // [bx:pr-created:<num>:<token>] signal) but no prUrl / headSha. The
+    // transition only needs prNumber to wire task→PR; prUrl is derivable from
+    // repo+number; headSha lands via the next pr.updated push event.
+    //
+    // spec phase 由 server 评审链（server.spec.* handlers）驱动；poller 不应越过它派 QA review，
+    // 否则 QA 在 spec-review 槽位上跑 pr-review 流程，gh pr review --approve 会误触 post-approve。
+    {
+      const taskNow = await manager.getTask(event.taskId);
+      if (taskNow?.phase === 'spec') {
+        console.warn(
+          `[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`,
+        );
+        return;
+      }
+    }
+
+    // Pane-signal prNumber is agent-emitted; verify the PR's headRefName equals
+    // task.branch before persisting. Without this, a typo / hallucinated /
+    // cross-task PR number would route QA review and later auto-merge to the
+    // wrong PR. Poller-sourced events skip this because the poller already
+    // routes by `bx/<taskId>`.
+    let paneVerifiedHeadSha: string | undefined;
+    if (event.data.source === 'pane-signal' && event.data.prNumber !== undefined) {
+      try {
+        const verified = await manager.verifyPaneSignalPrNumber(
+          event.taskId,
+          event.data.prNumber as number,
+        );
+        if (!verified) {
+          const taskNow = await manager.getTask(event.taskId);
+          console.warn(
+            `[EventHandler] pr.created REJECT pane prNumber=${event.data.prNumber} for task ${event.taskId} ` +
+            `(branch mismatch: task.branch=${taskNow?.branch})`,
+          );
+          if (taskNow) {
+            // The watcher fired+removed its entry on this signal; without re-establish
+            // a corrected emit (same token) would strand the task until restart.
+            await reArmDevelopWatcher(manager, taskNow, event.agentId);
+            await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
+              phase: 'pane-pr-created-branch-mismatch',
+              claimedPrNumber: event.data.prNumber as number,
+              taskBranch: taskNow.branch ?? '',
+            });
+          }
+          return;
+        }
+        paneVerifiedHeadSha = verified.headSha;
+      } catch (err) {
+        console.warn(
+          `[EventHandler] pr.created: verifyPaneSignalPrNumber failed for task ${event.taskId}:`,
+          err,
+        );
+        // Re-establish so a retry once the underlying issue clears (gh transient
+        // failure, network) can still be consumed without a server restart.
+        const taskNow = await manager.getTask(event.taskId);
+        if (taskNow) await reArmDevelopWatcher(manager, taskNow, event.agentId);
+        return;
+      }
+    }
+
+    const createdHeadSha = validHeadSha(event.data.headSha) ?? paneVerifiedHeadSha;
+    // Snapshot pre-transition fields so an arm failure can be rolled back atomically (restore
+    // status/token/anchor instead of stranding the task in review with no QA — see armed gate below).
+    const taskBeforeTransition = await manager.getTask(event.taskId);
+    const result = await manager.transitionTaskStatus(
+      event.taskId,
+      'review',
+      { fromStatus: ['in_progress', 'fixing'] },
+      {
+        ...(event.data.prNumber !== undefined ? { prNumber: event.data.prNumber as number } : {}),
+        ...(event.data.prUrl !== undefined ? { prUrl: event.data.prUrl as string } : {}),
+        ...(createdHeadSha ? { latestHeadSha: createdHeadSha, reviewHeadAnchorSha: createdHeadSha } : {}),
+        reviewDispatchedAt: new Date().toISOString(),
+        // Rotate the per-pass token ATOMICALLY with the anchor (same as pr.updated and
+        // dispatchReviewToQa). On a fixing→review re-review there is a prior QA pass; if
+        // the QA acquire below fails the token would otherwise lag until
+        // rotateAndSetupPhaseSignal never runs, letting that old pass's late stamped
+        // verdict (token still == task.signalToken) slip past the gate.
+        signalToken: createSignalToken(),
+      },
+    );
+    if (!result) {
+      console.warn(
+        `[EventHandler] pr.created: cannot transition task ${event.taskId} (terminal or invalid from-state)`,
+      );
+      return;
+    }
+    const { task: transitioned, previousStatus } = result;
+    // Round captured before any verdict can land (watcher armed only after this) — the
+    // count-once token for bumpReviewRoundIfStillAt on the dispatch success path.
+    const expectedRound = transitioned.reviewRound;
+
+    const qa = manager.findQaPartner(event.agentId);
+    if (!qa) {
+      const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
+      if (!ok) {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'dev-wait-gate-failed-no-qa',
+        });
+      }
+      return;
+    }
+
+    // Acquire before startSession so the lock window covers the task binding write.
+    const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, 'review');
+    if (!acquired) {
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-acquire-failed',
+        qaAgentId: qa.id,
+      });
+      return;
+    }
+
+    // Persist qaAgentId BEFORE setting up so a pane-fallback verdict's review.submitted
+    // handler can read task.qaAgentId for the release path.
+    await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
+
+    // Poller is authoritative for the verdict (native `gh pr review` state, with
+    // commit_id + submitted_at). Set up the verdict watcher as a FALLBACK: when dev
+    // and qa share a GitHub identity, `gh pr review` is rejected (422 — can't
+    // review your own PR) and leaves no GitHub state to poll, so QA echoes the
+    // verdict as a pane signal instead. A distinct-identity task never fires this
+    // watcher; the review.submitted handler tears it down when the poller verdict lands.
+    const { armed } = await manager.rotateAndSetupPhaseSignal(
+      transitioned.id,
+      qa.id,
+      ['pr-approved', 'pr-changes-requested'] as const,
+    );
+    if (!armed) {
+      // Verdict watcher didn't arm. For a same-identity task the poller can't supply a verdict
+      // (422), so dispatching now would deadlock with no consumer. Atomically restore the
+      // pre-transition state (status/token/anchor) + re-arm the develop watcher so the dev's
+      // already-emitted pr-created is re-consumed (self-heal), then release QA + intervention.
+      console.warn(
+        `[EventHandler] pr.created verdict watcher failed to arm for task=${transitioned.id}; rolling back review dispatch`,
+      );
+      await manager.rollbackVerdictArmFailure(transitioned.id, {
+        status: previousStatus,
+        signalToken: taskBeforeTransition?.signalToken,
+        reviewHeadAnchorSha: taskBeforeTransition?.reviewHeadAnchorSha,
+        reviewDispatchedAt: taskBeforeTransition?.reviewDispatchedAt,
+      });
+      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
+        console.error(`[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
+        return false;
+      });
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-review-arm-failed',
+        qaAgentId: qa.id,
+      });
+      return;
+    }
+    let started = false;
+    let dispatchErr: unknown = null;
+    try {
+      started = await manager.startSession(transitioned.id, qa.id, 'review');
+    } catch (err) {
+      dispatchErr = err;
+      console.error(`[EventHandler] pr.created startSession(QA=${qa.id}) hard error:`, err);
+    }
+    if (!started) {
+      console.warn(
+        `[EventHandler] pr.created QA session not started for task=${transitioned.id}; ` +
+        `task stays in 'review' but no active QA — emitting human.intervention`,
+      );
+      if (dispatchErr instanceof DispatchTerminalError) {
+        await manager.failTaskForDispatchError(transitioned.id, 'review', qa.id, dispatchErr);
+      } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
+        // handleDialogPendingFromRuntime 已标 QA Held + fail task + release partners；这里
+        // 再调 release 会因 boundTask terminal 让 shouldReleaseHeldBinding 放行 → 解锁仍卡 dialog 的 pane。
+      } else {
+        // Rollback the pre-set up qaAgentId so the task doesn't keep a binding to a QA we never started.
+        await manager.updateTask(transitioned.id, { qaAgentId: undefined });
+        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+          .catch(err => {
+            console.error(
+              `[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
+              err,
+            );
+            return false;
+          });
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'qa-review-start-failed',
+          qaAgentId: qa.id,
+        });
+      }
+      return;
+    }
+
+    // QA review pass started → count it (1-based Round). Bump on the success path only,
+    // so a no-QA / acquire / startSession failure above never inflates the round. The
+    // count-once token no-ops if a same-identity verdict already counted this pass.
+    if (previousStatus === 'in_progress') {
+      await manager.bumpReviewRoundIfStillAt(transitioned.id, expectedRound);
+    }
+
+    const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
+    if (!ok) {
+      // QA review prompt 已粘进 pane 在跑；裸 release 让下一 review 派来同一 pane 会污染 outcome。
+      // 标 awaiting_human 让 operator 决定如何收尾（取消该 task 走 cancelTask，或等 QA 跑完再 Resume）。
+      // expectedTaskId: 防止迟到的 mark 撞 outcome 已被接受 + QA release+reassign 后的新 binding。
+      await manager.markAwaitingHuman(
+        qa.id,
+        'dev-wait-gate-failed-after-qa-started',
+        `QA review for task ${transitioned.id} started but dev wait-gate failed; QA prompt may still be running, needs operator decision.`,
+        { expectedTaskId: transitioned.id },
+      ).catch(err => {
+        console.error(
+          `[EventHandler] pr.created markAwaitingHuman(QA=${qa.id}) after dev-wait-gate-fail:`,
+          err,
+        );
+      });
+    }
+  });
+
+  bus.on('pr.updated', async (event) => {
+    if (!event.taskId || !event.agentId) return;
+    // Server tasks review via the exchange protocol — a poller-observed sync on
+    // the published PR must not drag them into legacy QA review.
+    // pr.merged stays open: external merges of a ready PR finish through it.
+    if (await isServerModeTask(manager, event.taskId)) return;
+
+    const eventPrNumber = event.data.prNumber as number | undefined;
+    const eventPrUrl = event.data.prUrl as string | undefined;
+    const eventKind = event.data.kind as
+      | 'push' | 'comment' | 'review-comment' | 'pr-edit' | 'pr-merge-ready' | undefined;
+
+    // spec phase 由 server 评审链驱动；spec doc 的 push/comment 不应进入 code-review 流程
+    // （避免 QA recheck → gh pr review --approve → 误派 post-approve）。
+    // pr-merge-ready 是 dev 内部状态推进，不受 phase gate 限制。
+    if (eventKind !== 'pr-merge-ready') {
+      const taskNow = await manager.getTask(event.taskId);
+      if (taskNow?.phase === 'spec') {
+        console.warn(
+          `[EventHandler] pr.updated (kind=${eventKind ?? 'push'}) ignored for task ${event.taskId}: task in spec phase`,
+        );
+        return;
+      }
+    }
+    // Only `push` freshens `latestHeadSha` — other event payloads can regress it under reorder.
+    const eventHeadSha = validHeadSha(event.data.headSha);
+    const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'latestHeadSha'>> = {
+      ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+      ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+      ...(eventKind === 'push' && eventHeadSha ? { latestHeadSha: eventHeadSha } : {}),
+    };
+
+    if (eventKind === 'pr-merge-ready') {
+      const taskNow = await manager.getTask(event.taskId);
+      if (!taskNow) return;
+      const needsPatch =
+        (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
+        || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
+      if (needsPatch) {
+        await manager.updateTask(event.taskId, prPatch);
+      }
+      const verdictAgentId = event.data.verdictAgentId as string | undefined;
+      // PhaseSignalWatcher emits the per-signal token under `data.token` for all
+      // kinds (unified field). Old PostApproveSignalWatcher used `data.signalToken`
+      // — that name is gone; reading the wrong field made every pr-merge-ready
+      // event fail the freshness gate below and silently strand approved tasks.
+      const signalToken = event.data.token as string | undefined;
+      const completion = await manager.getPostApproveCompletion(taskNow.id);
+      if (
+        taskNow.status !== 'approved'
+        || verdictAgentId !== taskNow.agentId
+        || !signalToken
+        || completion?.token !== signalToken
+      ) return;
+
+      const ok = await manager.markAgentWaiting(taskNow.agentId, taskNow.id);
+      if (!ok) {
+        await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+          phase: 'post-approve-dev-wait-gate-failed',
+        });
+        return;
+      }
+
+      const freshTask = await manager.getTask(taskNow.id);
+      const freshCompletion = await manager.getPostApproveCompletion(taskNow.id);
+      if (
+        !freshTask
+        || freshTask.status !== 'approved'
+        || freshTask.agentId !== taskNow.agentId
+        || freshCompletion?.token !== signalToken
+      ) {
+        await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+          phase: 'post-approve-merge-skipped-stale-task',
+        });
+        return;
+      }
+
+      // pendingRedispatch means new feedback arrived mid-pass — redispatch instead of merging.
+      if (freshCompletion.pendingRedispatch) {
+        const nextCount = (freshCompletion.redispatchCount ?? 0) + 1;
+        if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+          await manager.clearPostApproveCompletion(freshTask.id);
+          await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
+            phase: 'post-approve-redispatch-cap-exceeded',
+            redispatchCount: freshCompletion.redispatchCount ?? 0,
+            cap: POST_APPROVE_REDISPATCH_CAP,
+          });
+          return;
+        }
+        await dispatchDevPostApproveCheck(
+          bus,
+          manager,
+          freshTask,
+          freshCompletion.approvedHeadSha,
+          { redispatchCount: nextCount },
+        );
+        return;
+      }
+
+      // Human gate (spec §10): checks passed — surface merge-ready and wait for the
+      // operator. merge:'auto' no longer merges here; it decides what the confirm
+      // endpoint executes (server merges on confirm vs human merges by hand).
+      // Persist the post-approve head: confirm's merge guards on it so a push
+      // landing inside the gate window can never be merged blind.
+      const readied = await manager.transitionTaskStatus(
+        freshTask.id,
+        'merge-ready',
+        { fromStatus: ['approved'] },
+        { latestHeadSha: freshCompletion.approvedHeadSha },
+      );
+      if (readied) {
+        await manager.clearPostApproveCompletionIfMatches(freshTask.id, signalToken);
+      }
+      return;
+    }
+
+    const isCodeUpdate = eventKind === 'push' || eventKind === undefined;
+
+    if (!isCodeUpdate) {
+      const taskNow = await manager.getTask(event.taskId);
+      if (!taskNow) return;
+      const needsPatch =
+        (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
+        || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
+      if (needsPatch) {
+        await manager.updateTask(event.taskId, prPatch);
+      }
+      const completion = taskNow.status === 'approved'
+        ? await manager.getPostApproveCompletion(taskNow.id)
+        : null;
+      const isNewFeedback = eventKind === 'comment' || eventKind === 'review-comment';
+      if (taskNow.status === 'approved' && isNewFeedback) {
+        if (!completion) {
+          await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+            phase: 'post-approve-approved-head-unavailable',
+          });
+          return;
+        }
+        // Don't Ctrl-C Dev mid-pass on its own webhook echo — coalesce via pendingRedispatch instead.
+        const devState = await manager.getAgentState(taskNow.agentId);
+        if (devState?.taskId === taskNow.id) {
+          if (!completion.pendingRedispatch) {
+            await manager.setPostApproveCompletion(taskNow.id, {
+              token: completion.token,
+              approvedHeadSha: completion.approvedHeadSha,
+              ...(typeof completion.redispatchCount === 'number'
+                ? { redispatchCount: completion.redispatchCount } : {}),
+              pendingRedispatch: true,
+            });
+          }
+          return;
+        }
+        const nextCount = (completion.redispatchCount ?? 0) + 1;
+        if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+          // Clear completion so an in-flight signal can't auto-merge past the cap.
+          await manager.clearPostApproveCompletion(taskNow.id);
+          await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+            phase: 'post-approve-redispatch-cap-exceeded',
+            redispatchCount: completion.redispatchCount ?? 0,
+            cap: POST_APPROVE_REDISPATCH_CAP,
+          });
+          return;
+        }
+        const ready = await gateDevForPostApproveRedispatch(bus, manager, taskNow);
+        if (!ready) return;
+        await dispatchDevPostApproveCheck(
+          bus,
+          manager,
+          { ...taskNow, ...prPatch },
+          completion.approvedHeadSha,
+          { redispatchCount: nextCount },
+        );
+      }
+      return;
+    }
+
+    const taskBeforeTransition = await manager.getTask(event.taskId);
+    if (!taskBeforeTransition) return;
+    const willHavePrNumber =
+      taskBeforeTransition.prNumber !== undefined || eventPrNumber !== undefined;
+    if (taskBeforeTransition.status === 'in_progress' && !willHavePrNumber) {
+      console.warn(
+        `[EventHandler] pr.updated: task ${event.taskId} in_progress but neither task nor event has prNumber; ` +
+        `deferring catch-up`,
+      );
+      return;
+    }
+
+    // Pin the review anchor SHA at dispatch time: if this push provided a head,
+    // use it; otherwise fall back to the existing latestHeadSha (last known
+    // head from poller). The anchor must NOT shift if a subsequent push lands
+    // mid-review.
+    const anchorAtDispatch = eventHeadSha ?? validHeadSha(taskBeforeTransition.latestHeadSha);
+    const result = await manager.transitionTaskStatus(
+      event.taskId,
+      'review',
+      { fromStatus: ['in_progress', 'fixing', 'review', 'approved', 'merge-ready'] },
+      {
+        ...prPatch,
+        ...(anchorAtDispatch ? { reviewHeadAnchorSha: anchorAtDispatch } : {}),
+        reviewDispatchedAt: new Date().toISOString(),
+        // Rotate the per-pass token ATOMICALLY with the anchors. If the redispatch's
+        // later acquire/startSession fails and returns, the token still changed here,
+        // so an old QA's late verdict (carrying the prior token) is rejected by the
+        // token gate. rotateAndSetupPhaseSignal below rotates once more for the set up —
+        // harmless, since the gate only needs the value to differ from the old pass.
+        signalToken: createSignalToken(),
+      },
+    );
+    if (!result) return;
+    const { task: transitioned, previousStatus } = result;
+    // Round captured before any verdict can land — the count-once token (see pr.created).
+    const expectedRound = transitioned.reviewRound;
+    await manager.clearPostApproveCompletion(transitioned.id);
+
+    let devAlreadyWaiting = false;
+    if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
+      devAlreadyWaiting = await manager
+        .releaseAgentForTask(transitioned.agentId, transitioned.id, 'waiting')
+        .catch(err => {
+          console.error(
+            `[EventHandler] pr.updated releaseAgentForTask(dev=${transitioned.agentId}) before approved→recheck failed:`,
+            err,
+          );
+          return false;
+        });
+      if (!devAlreadyWaiting) {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'post-approve-dev-wait-gate-failed-before-recheck',
+          devAgentId: transitioned.agentId,
+        });
+        return;
+      }
+    }
+
+    // Release stale QA before recheck — a half-released REPL must not receive new prompt.
+    if (previousStatus === 'review' && transitioned.qaAgentId) {
+      const released = await manager
+        .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle')
+        .catch(err => {
+          console.error(
+            `[EventHandler] pr.updated releaseAgentForTask(QA=${transitioned.qaAgentId}) for review→review push failed:`,
+            err,
+          );
+          return false;
+        });
+      if (!released) {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'qa-release-failed-cannot-recheck',
+          qaAgentId: transitioned.qaAgentId,
+        });
+        return;
+      }
+    }
+
+    // Any push once the task is already past initial dispatch (review/fixing/approved)
+    // is a re-look → 'recheck'. The recheck prompt is phrased neutrally ("re-check the
+    // new commits and any prior feedback"), so it never falsely claims "dev addressed
+    // your prior changes-requested"; keeping 'recheck' for previousStatus='review'
+    // preserves the recheck framing for a push DURING a recheck (don't downgrade it).
+    const qaPhase: 'review' | 'recheck' =
+      previousStatus === 'fixing' || previousStatus === 'review'
+      || previousStatus === 'approved' || previousStatus === 'merge-ready'
+        ? 'recheck'
+        : 'review';
+
+    const qa = manager.findQaPartner(event.agentId);
+    if (!qa) {
+      if (!devAlreadyWaiting && !(await manager.markAgentWaiting(event.agentId, transitioned.id))) {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'dev-wait-gate-failed-no-qa',
+        });
+      }
+      return;
+    }
+
+    const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, qaPhase);
+    if (!acquired) {
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-acquire-failed',
+        qaAgentId: qa.id,
+        qaPhase,
+      });
+      return;
+    }
+
+    // Persist qaAgentId BEFORE setting up so a pane-fallback verdict's review.submitted
+    // handler can read it for the release path (same as pr.created).
+    await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
+
+    // Poller-authoritative verdict; set up the verdict watcher as the same-identity
+    // (422) fallback — see pr.created. Torn down on poller verdict in review.submitted.
+    const { armed } = await manager.rotateAndSetupPhaseSignal(
+      transitioned.id,
+      qa.id,
+      ['pr-approved', 'pr-changes-requested'] as const,
+    );
+    if (!armed) {
+      // No armed watcher → a same-identity verdict would have no consumer.
+      console.warn(
+        `[EventHandler] pr.updated verdict watcher failed to arm for task=${transitioned.id} (${qaPhase}); rolling back recheck dispatch`,
+      );
+      if (previousStatus === 'in_progress' || previousStatus === 'fixing') {
+        // Full rollback: the dev's prior-phase prompt (spec-done/pr-created or pr-fixed) used the
+        // pre-rotation token; restore status+token+anchor and re-arm so its already-emitted signal
+        // isn't stranded by the token rotation.
+        await manager.rollbackVerdictArmFailure(transitioned.id, {
+          status: previousStatus,
+          signalToken: taskBeforeTransition.signalToken,
+          reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
+          reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
+        });
+      } else {
+        // approved/review: do NOT restore status. 'approved' is unsafe to restore (its post-approve
+        // completion was already cleared and the new push is unreviewed); 'review' was already
+        // current. Leave the task in review for operator/poller follow-up (matches the start-failure
+        // branch below) and just drop the QA we acquired.
+        await manager.updateTask(transitioned.id, { qaAgentId: undefined });
+      }
+      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
+        console.error(`[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
+        return false;
+      });
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: previousStatus === 'approved' || previousStatus === 'merge-ready' ? 'qa-recheck-arm-failed-after-approved-push' : 'qa-recheck-arm-failed',
+        qaAgentId: qa.id,
+        qaPhase,
+      });
+      return;
+    }
+    let started = false;
+    let dispatchErr: unknown = null;
+    try {
+      started = await manager.startSession(transitioned.id, qa.id, qaPhase);
+    } catch (err) {
+      dispatchErr = err;
+      console.error(
+        `[EventHandler] pr.updated startSession(QA=${qa.id}, ${qaPhase}) hard error:`,
+        err,
+      );
+    }
+    if (!started) {
+      console.warn(
+        `[EventHandler] pr.updated QA ${qaPhase} not started; previousStatus=${previousStatus}`,
+      );
+      if (dispatchErr instanceof DispatchTerminalError) {
+        await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
+      } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
+        // handleDialogPendingFromRuntime 已标 QA Held + fail task + release partners；不能再 release
+        // 否则 boundTask terminal 会让 shouldReleaseHeldBinding 放行 → 解锁仍卡 dialog 的 pane。
+      } else {
+        // Rollback pre-set up qaAgentId so the task doesn't keep a binding to a QA we never started.
+        await manager.updateTask(transitioned.id, { qaAgentId: undefined });
+        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+          .catch(err => {
+            console.error(
+              `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
+              err,
+            );
+            return false;
+          });
+        if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
+          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+            phase: 'qa-recheck-failed-after-approved-push',
+            qaAgentId: qa.id,
+          });
+        } else if (previousStatus !== 'review') {
+          await manager.transitionTaskStatus(transitioned.id, previousStatus, { fromStatus: ['review'] });
+        } else {
+          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+            phase: 'qa-recheck-failed-after-stop',
+            qaAgentId: qa.id,
+          });
+        }
+      }
+      return;
+    }
+
+    // New QA pass started → count it (1-based Round). Bump on the success path only.
+    // First review (in_progress→review) and re-review after approval (approved→review,
+    // dev pushed before merge) each start a new pass; fixing/review→review is a recheck
+    // of the in-flight pass and must NOT bump. The count-once token no-ops if a
+    // same-identity verdict already counted this pass mid-dispatch — symmetric for the
+    // first review (expected 0) and an approved re-review (expected ≥1).
+    if (previousStatus === 'in_progress' || previousStatus === 'approved' || previousStatus === 'merge-ready') {
+      await manager.bumpReviewRoundIfStillAt(transitioned.id, expectedRound);
+    }
+
+    const ok = devAlreadyWaiting || (await manager.markAgentWaiting(event.agentId, transitioned.id));
+    if (!ok) {
+      // 同 pr.created 路径：QA review prompt 已粘进 pane 在跑，裸 release 让下一 review
+      // 派同一 QA 时新 prompt 灌进仍在跑旧 review 的 pane。标 awaiting_human 让 operator 处理。
+      await manager.markAwaitingHuman(
+        qa.id,
+        'dev-wait-gate-failed-after-qa-started',
+        `QA review for task ${transitioned.id} started but dev wait-gate failed; QA prompt may still be running, needs operator decision.`,
+        { expectedTaskId: transitioned.id },
+      ).catch(err => {
+        console.error(
+          `[EventHandler] pr.updated markAwaitingHuman(QA=${qa.id}) after dev-wait-gate-fail:`,
+          err,
+        );
+      });
+    }
+  });
+
+  bus.on('pr.merged', async (event) => {
+    if (!event.taskId) return;
+
+    const eventPrNumber = event.data.prNumber as number | undefined;
+    const eventPrUrl = event.data.prUrl as string | undefined;
+    const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
+      ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+      ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+    };
+
+    const result = await manager.transitionTaskStatus(
+      event.taskId,
+      'merged',
+      // max_rounds included so manual mark-complete (and an externally-merged
+      // max_rounds PR the poller detects) transitions to merged + runs cleanup.
+      // ready included for server-mode afterDone:'pr' tasks whose managed PR is
+      // merged directly on GitHub instead of via baxian's Confirm.
+      { fromStatus: ['in_progress', 'fixing', 'review', 'approved', 'merge-ready', 'ready', 'max_rounds'] },
+      prPatch,
+    );
+    if (!result) return;
+    const { task: transitioned } = result;
+
+    if (transitioned.qaAgentId) {
+      // Keep QA bound (non-dispatchable) until its branch cleanup + /clear finish, then release.
+      // dispatchPostMergeCleanup owns the worktree removal → branch delete → /clear → release.
+      if (transitioned.prNumber && transitioned.branch) {
+        await manager.dispatchPostMergeCleanup(transitioned.qaAgentId, {
+          prNumber: transitioned.prNumber,
+          taskId: transitioned.id,
+          branch: transitioned.branch,
+        }).catch(err => console.warn(
+          `[EventHandler] pr.merged dispatchPostMergeCleanup(QA=${transitioned.qaAgentId}) failed:`,
+          err,
+        ));
+      } else {
+        // Nothing to clean up or compact — release QA immediately so it frees up.
+        try {
+          await manager.releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle');
+        } catch (err) {
+          console.error(
+            `[EventHandler] pr.merged releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+            err,
+          );
+        }
+      }
+    }
+
+    try {
+      await manager.cleanupAfterMerge(transitioned.id);
+    } catch (err) {
+      console.error(`[EventHandler] cleanupAfterMerge(${transitioned.id}) failed:`, err);
+    }
+  });
+
+  bus.on('review.submitted', async (event) => {
+    if (!event.taskId) return;
+    if (await isServerModeTask(manager, event.taskId)) return;
+
+    const action = event.data.action as 'APPROVE' | 'REQUEST_CHANGES' | string;
+    let task = await manager.getTask(event.taskId);
+    if (!task) return;
+
+    // Terminal-task escape: release QA on manual reviews of merged/cancelled/failed/max_rounds
+    // tasks; transitions below return null on terminal so QA would otherwise stay glued.
+    // 注：spec phase 任务也可能终态（spec-review max_rounds 只改 status 不清 phase）。terminal
+    // escape 必须在 spec gate 之前，否则 spec terminal 状态的残留 QA 绑定无法靠这条 manual
+    // review 兜底释放。
+    {
+      const terminalQaId = task.qaAgentId;
+      if (terminalQaId && TASK_TERMINAL_STATUS_SET.has(task.status)) {
+        const qaState = await manager.getAgentState(terminalQaId);
+        if (qaState?.taskId === task.id) {
+          const terminalTask = task;
+          await manager
+            .releaseAgentForTask(terminalQaId, terminalTask.id, 'idle')
+            .catch(err =>
+              console.error(
+                `[EventHandler] terminal-task manual review releaseAgentForTask(QA=${terminalQaId}) failed:`,
+                err,
+              ),
+            );
+          await emitIntervention(bus, terminalTask.projectId, terminalTask.agentId, terminalTask.id, {
+            phase: 'manual-review-on-terminal-task-completed',
+            qaAgentId: terminalQaId,
+            taskStatus: terminalTask.status,
+            reviewAction: action,
+            note: 'Manual QA review on a terminal task finished. Task state untouched; QA released. Operator owns any follow-up.',
+          });
+          return;
+        }
+      }
+    }
+
+    // spec phase（非 terminal）由 server 评审链（server.spec.review.submitted）驱动 verdict；
+    // GitHub PR review 不应改 task.status，早退避免误推 approved + 派 dev post-approve。
+    // terminal 状态已在前面兜底释放，此处只屏蔽 active spec 路径。
+    if (task.phase === 'spec') {
+      console.warn(
+        `[EventHandler] review.submitted (action=${action}) ignored for task ${task.id}: task in spec phase`,
+      );
+      return;
+    }
+
+    // Freshness gate: reject a verdict whose GitHub submit time precedes the
+    // current review pass's dispatch. Such a verdict belongs to a SUPERSEDED
+    // pass — dev force-pushed mid-review, the server re-dispatched a fresh pass,
+    // and the prior pass's late verdict is now landing. GitHub attributes a
+    // review to its submit-time head, so commit_id can't catch this; only baxian
+    // knows when it dispatched the active pass. Skipped when either timestamp is
+    // absent (can't prove staleness → allow).
+    const verdictSubmittedAt =
+      typeof event.data.submittedAt === 'string' ? event.data.submittedAt : undefined;
+    if (verdictSubmittedAt && task.reviewDispatchedAt) {
+      const submittedMs = Date.parse(verdictSubmittedAt);
+      const dispatchedMs = Date.parse(task.reviewDispatchedAt);
+      // Reject only when clearly older than dispatch (beyond the skew budget) — a
+      // same-second fresh verdict must not be killed by clock granularity/drift.
+      if (
+        Number.isFinite(submittedMs) && Number.isFinite(dispatchedMs)
+        && submittedMs < dispatchedMs - VERDICT_FRESHNESS_SKEW_MS
+      ) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'stale-verdict-superseded-pass',
+          action,
+          submittedAt: verdictSubmittedAt,
+          reviewDispatchedAt: task.reviewDispatchedAt,
+        });
+        return;
+      }
+    }
+
+    // Per-pass identity gate. signalToken rotates on every (re)dispatch, so a verdict
+    // whose pass token != the task's current token belongs to a SUPERSEDED pass. The
+    // token arrives two ways and BOTH must be checked:
+    //   - poller verdict: `reviewPassToken` (QA stamps it into the gh review body,
+    //     <!-- baxian:pr-approved:TOKEN -->; mapper/poller extract it).
+    //   - pane fallback verdict: `data.token` (the signal the watcher matched).
+    // Checking only the poller stamp leaves a hole: an old QA's late
+    // `[bx:pr-approved:<old-token>]`, fired by a not-yet-replaced watcher after a
+    // redispatch whose new-QA dispatch failed, would bypass the rotation. That pane
+    // case is worse — it has no headSha, so the handler would otherwise bind it to the
+    // new anchor head the old QA never reviewed. Verify-if-present: a human review (no
+    // stamp / no token) is not rejected.
+    const verdictPassToken =
+      (typeof event.data.reviewPassToken === 'string' ? event.data.reviewPassToken : undefined)
+      ?? (typeof event.data.token === 'string' ? event.data.token : undefined);
+    if (verdictPassToken && task.signalToken && verdictPassToken !== task.signalToken) {
+      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+        phase: 'stale-verdict-wrong-pass',
+        action,
+        verdictPassToken,
+        currentToken: task.signalToken,
+        source: event.data.source === 'pane-signal' ? 'pane-signal' : 'poller',
+      });
+      return;
+    }
+
+    const eventPrNumber = event.data.prNumber as number | undefined;
+    const eventPrUrl = event.data.prUrl as string | undefined;
+    const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
+      ...(eventPrNumber !== undefined && eventPrNumber !== task.prNumber ? { prNumber: eventPrNumber } : {}),
+      ...(eventPrUrl !== undefined && eventPrUrl !== task.prUrl ? { prUrl: eventPrUrl } : {}),
+    };
+    // Poller verdicts carry `headSha` (the review's GitHub commit_id) and
+    // `currentHeadSha` (the PR's live head). A pane-fallback verdict (same-identity
+    // 422 case) carries neither — the agent doesn't observe SHAs — so it applies to
+    // the head pinned at dispatch into `task.reviewHeadAnchorSha`. Using
+    // `latestHeadSha` would let a mid-review push silently re-anchor the approval to
+    // a commit QA never saw; the anchor is immutable per review round.
+    const isPaneSignal = event.data.source === 'pane-signal';
+    const reviewedHeadSha = validHeadSha(event.data.headSha)
+      ?? (isPaneSignal ? validHeadSha(task.reviewHeadAnchorSha) : undefined);
+    const currentHeadSha = validHeadSha(event.data.currentHeadSha)
+      ?? (isPaneSignal ? validHeadSha(task.reviewHeadAnchorSha) : undefined);
+
+    // A late verdict can arrive while the task is still in_progress/fixing (the
+    // pr.created/pr.updated that should have moved it to review was missed). Catch up
+    // to review WITHOUT bumping here: the first-review count is derived from persisted
+    // state below (reviewRound === 0 ⇒ first pass) and applied only when the verdict is
+    // accepted. So a stale verdict that returns early leaves reviewRound 0, and the
+    // NEXT valid verdict — which no longer re-enters this catch-up — still counts it.
+    if ((task.status === 'in_progress' || task.status === 'fixing') && eventPrNumber !== undefined) {
+      const catchup = await manager.transitionTaskStatus(
+        event.taskId,
+        'review',
+        { fromStatus: ['in_progress', 'fixing'] },
+        prPatch,
+      );
+      if (catchup) {
+        task = catchup.task;
+        if (task.agentId) {
+          const ok = await manager.markAgentWaiting(task.agentId, task.id);
+          if (!ok) {
+            await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+              phase: 'dev-wait-gate-failed-late-catchup',
+            });
+          }
+        }
+      } else {
+        return;
+      }
+    }
+
+    if (action === 'APPROVE') {
+      if (!reviewedHeadSha) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'approval-reviewed-head-unavailable',
+        });
+        return;
+      }
+
+      const anchor = await resolveAuthoritativeHead(manager, task, {
+        payloadCurrentHeadSha: currentHeadSha,
+      });
+      // Refresh cache BEFORE the reject decision so a fetch outage can't fall back to a stale store.
+      if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
+        await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
+      }
+      // No anchor (fetch + fallbacks all missing) ⇒ proceed; can't prove staleness either way.
+      if (anchor.headSha && reviewedHeadSha !== anchor.headSha) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'stale-approval-head-mismatch',
+          reviewedHeadSha,
+          currentHeadSha: anchor.headSha,
+          source: anchor.source,
+          ...(anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
+        });
+        return;
+      }
+
+      const result = await manager.transitionTaskStatus(
+        event.taskId,
+        'approved',
+        { fromStatus: ['review'] },
+        // reviewRound 0 here ⇒ first pass entered via catch-up (deferred bump). Count it
+        // now that the verdict is accepted. A stale verdict returns above and never
+        // reaches this point, so the round is consumed only on a real acceptance.
+        task.reviewRound === 0 ? { ...prPatch, reviewRound: 1 } : prPatch,
+      );
+      if (!result) return;
+      const { task: transitioned } = result;
+
+      // Verdict consumed → tear down the fallback verdict watcher. A distinct-identity
+      // task got its verdict via the poller, leaving the pane watcher set up-but-unfired;
+      // a same-identity pane verdict already removed its own entry, so this is a no-op.
+      // Placed AFTER the transition so a head-stale rejection above never tears it down
+      // (and never touches an approved task's pr-merge-ready watcher).
+      manager.stopPhaseSignalWatcher(transitioned.id);
+
+      if (transitioned.qaAgentId) {
+        // outcome 到达 = QA turn 完成，即使 QA 之前 Held（dev_wait_gate_failed / ack_unknown）也可放行。
+        await manager.releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+          .catch(err =>
+            console.error(
+              `[EventHandler] APPROVE releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+              err,
+            ),
+          );
+      }
+
+      await dispatchDevPostApproveCheck(
+        bus,
+        manager,
+        transitioned,
+        reviewedHeadSha,
+      );
+      return;
+    }
+
+    if (action === 'REQUEST_CHANGES') {
+      const approvedCompletion = task.status === 'approved'
+        ? await manager.getPostApproveCompletion(task.id)
+        : null;
+      const anchor = await resolveAuthoritativeHead(manager, task, {
+        payloadCurrentHeadSha: currentHeadSha,
+        legacyFallback: approvedCompletion?.approvedHeadSha,
+      });
+      if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
+        await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
+      }
+      if (reviewedHeadSha && anchor.headSha && reviewedHeadSha !== anchor.headSha) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'stale-request-changes-head-mismatch',
+          reviewedHeadSha,
+          currentHeadSha: anchor.headSha,
+          source: anchor.source,
+          ...(anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
+        });
+        return;
+      }
+
+      // reviewRound 0 here ⇒ first pass entered via catch-up (deferred bump); the pass
+      // being judged is round 1. Otherwise the round was already counted on dispatch.
+      const reviewedRound = task.reviewRound === 0 ? 1 : task.reviewRound;
+      const nextRound = reviewedRound + 1;
+      if (task.status === 'approved' && nextRound <= manager.getConfig().review.rounds) {
+        // post-approve check 可能仍在 dev pane 中跑——release(waiting) 只 bump updatedAt 不 wait ready，
+        // 后续 continueSession(fix) 会把 fix prompt 灌进 busy pane (pr.updated approved+new feedback 已通过
+        // pendingRedispatch 走 coalesce；review.submitted 这里需要同等 gate)。检测 dev 仍绑 task + post-approve
+        // completion 仍存在 → emit intervention + skip 派发；signal 完成后 (pr-merge-ready handler)
+        // task 会回到 approved，operator 可以重新触发 REQUEST_CHANGES manual review 或 cancel task。
+        const devState = await manager.getAgentState(task.agentId);
+        const postApproveActive = await manager.getPostApproveCompletion(task.id);
+        if (devState?.taskId === task.id && postApproveActive) {
+          // 必须先清 PostApproveCompletion 阻止 signal 完成后 auto-merge：
+          // pr-merge-ready handler 看 completion.token 仍匹配 + freshTask.status='approved'
+          // + pendingRedispatch=false 会调 mergePr——但我们刚收到 REQUEST_CHANGES，绝不能 merge。
+          await manager.clearPostApproveCompletion(task.id);
+          await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+            phase: 'request-changes-during-post-approve',
+            devAgentId: task.agentId,
+            note: 'Dev is still running post-approve check; fix dispatch deferred to avoid prompt collision. PostApproveCompletion cleared to block auto-merge. Operator: wait for post-approve signal to complete, then re-trigger REQUEST_CHANGES manually or cancel the task.',
+          });
+          return;
+        }
+        const ready = await manager
+          .releaseAgentForTask(task.agentId, task.id, 'waiting')
+          .catch(err => {
+            console.error(
+              `[EventHandler] REQUEST_CHANGES releaseAgentForTask(dev=${task.agentId}) before fix failed:`,
+              err,
+            );
+            return false;
+          });
+        if (!ready) {
+          await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+            phase: 'post-approve-dev-wait-gate-failed-before-fix',
+            devAgentId: task.agentId,
+          });
+          return;
+        }
+      }
+
+      if (nextRound > manager.getConfig().review.rounds) {
+        const result = await manager.transitionTaskStatus(
+          event.taskId,
+          'max_rounds',
+          { fromStatus: ['review', 'approved', 'merge-ready'] },
+          // Persist the reviewed round (no-op for the normal path; records the
+          // deferred first-review count for a catch-up that hit the cap).
+          { ...prPatch, reviewRound: reviewedRound },
+        );
+        if (!result) return;
+        const { task: transitioned } = result;
+        await manager.clearPostApproveCompletion(transitioned.id);
+        manager.stopPhaseSignalWatcher(transitioned.id);
+
+        // Reconcile the QA reference regardless of how we reached the cap (REQUEST_CHANGES can
+        // hit it from review OR approved/merge-ready). max_rounds is active and failTasksForAgent
+        // matches by task.qaAgentId, so a stale id pointing at a released QA would let that QA's
+        // later failure false-fail this paused task. The next review re-sets qaAgentId.
+        if (transitioned.qaAgentId) {
+          const qaState = await manager.getAgentState(transitioned.qaAgentId);
+          if (qaState?.taskId === transitioned.id) {
+            // QA still bound (review path): release it via the outcome path. allowAwaitingHuman —
+            // the verdict arriving IS the QA turn completing, so a Held QA must still be releasable.
+            // Clear only on a successful release; if refused (still bound/held), keep the reference
+            // so a later Cancel/Complete can reclaim it.
+            const qaReleased = await manager
+              .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+              .catch(err => {
+                console.error(
+                  `[EventHandler] max_rounds releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+                  err,
+                );
+                return false;
+              });
+            if (qaReleased) {
+              await manager.updateTask(transitioned.id, { qaAgentId: undefined })
+                .catch(err =>
+                  console.error(`[EventHandler] max_rounds clear qaAgentId(${transitioned.id}) failed:`, err),
+                );
+            }
+          } else {
+            // QA already unbound (approved/merge-ready path released it earlier without clearing the
+            // id) — drop the stale reference so it can't false-fail this active task.
+            await manager.updateTask(transitioned.id, { qaAgentId: undefined })
+              .catch(err =>
+                console.error(`[EventHandler] max_rounds clear stale qaAgentId(${transitioned.id}) failed:`, err),
+              );
+          }
+        }
+        // Dev is intentionally NOT released: this is the code-phase review loop
+        // (review.submitted early-returns for spec phase). The dev stays parked
+        // 'waiting' + bound with its worktree intact, so "continue one round"
+        // reuses the checkout (no -B branch reset / lost commits). It is freed by
+        // mark-complete (post-merge cleanup) or cancel.
+
+        try {
+          await bus.emit({
+            id: '',
+            type: 'review.max_rounds',
+            timestamp: new Date().toISOString(),
+            projectId: transitioned.projectId,
+            agentId: transitioned.agentId,
+            taskId: transitioned.id,
+            data: { reviewRound: transitioned.reviewRound },
+          });
+        } catch (emitErr) {
+          console.warn(`[EventHandler] max_rounds emit failed:`, emitErr);
+        }
+        return;
+      }
+
+      const result = await manager.transitionTaskStatus(
+        event.taskId,
+        'fixing',
+        { fromStatus: ['review', 'approved', 'merge-ready'] },
+        // fixDispatchedAt marks the round start so the pr-fixed verifier doesn't
+        // count QA/human comments left during the prior review as dev activity.
+        { ...prPatch, reviewRound: nextRound, fixDispatchedAt: new Date().toISOString() },
+      );
+      if (!result) return;
+      const { task: transitioned, previousStatus } = result;
+      await manager.clearPostApproveCompletion(transitioned.id);
+      manager.stopPhaseSignalWatcher(transitioned.id);
+
+      let qaReleased = true;
+      if (previousStatus === 'review' && transitioned.qaAgentId) {
+        // outcome 到达 = QA turn 完成，allowAwaitingHuman 让 Held QA (ack_unknown / dev_wait_gate_failed) 也可放行。
+        qaReleased = await manager
+          .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+          .catch(err => {
+            console.error(
+              `[EventHandler] REQUEST_CHANGES releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+              err,
+            );
+            return false;
+          });
+        if (!qaReleased) {
+          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+            phase: 'qa-release-failed-but-dev-dispatched',
+            qaAgentId: transitioned.qaAgentId,
+          });
+        }
+      }
+
+      // Explicit acquire short-circuits if a concurrent DELETE/restart-repl released the lock.
+      const acquired = await manager.acquireAgentForTask(transitioned.agentId, transitioned.id, 'fix');
+      if (!acquired) {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'dev-acquire-failed-fix',
+          devAgentId: transitioned.agentId,
+        });
+        return;
+      }
+
+      // Set up the pr-fixed completion watcher BEFORE the prompt. rotateAndSetupPhaseSignal
+      // rotates the per-pass token atomically; continueSession then reads that token and
+      // embeds it in the fix prompt, so the dev's pr-fixed signal advances fixing→review
+      // even when the round produced no push.
+      const { armed } = await manager.rotateAndSetupPhaseSignal(transitioned.id, transitioned.agentId, 'pr-fixed');
+
+      if (!armed) {
+        // pr-fixed watcher didn't arm → the fix completion signal (esp. the no-push case) would have
+        // no consumer. Don't dispatch; hold the dev explicitly so the stuck state is operator-handleable
+        // (resumeAgent refuses signal-arm-failed → cancel/delete), instead of leaving task=fixing with
+        // the dev merely 'waiting' and no fix prompt running (snapshot would mislabel it as working).
+        console.warn(
+          `[EventHandler] REQUEST_CHANGES pr-fixed watcher failed to arm for task=${transitioned.id}; holding dev (not dispatching fix)`,
+        );
+        await manager.markAwaitingHuman(
+          transitioned.agentId,
+          'signal-arm-failed:pr-fixed',
+          'pr-fixed watcher failed to arm; the fix was not dispatched (its completion signal would have no consumer). Cancel the task or delete the agent to retry.',
+          { expectedTaskId: transitioned.id },
+        );
+        return;
+      }
+
+      let resumed = false;
+      let dispatchErr: unknown = null;
+      try {
+        resumed = await manager.continueSession(transitioned.id, transitioned.agentId, 'fix');
+      } catch (err) {
+        dispatchErr = err;
+        console.error(
+          `[EventHandler] REQUEST_CHANGES continueSession(dev=${transitioned.agentId}, fix) failed:`,
+          err,
+        );
+      }
+      if (!resumed) {
+        console.warn(
+          `[EventHandler] REQUEST_CHANGES dev=${transitioned.agentId} not resumable for task=${transitioned.id}; ` +
+          `task remains in 'fixing' but no dev session is attached`,
+        );
+        if (dispatchErr instanceof DispatchTerminalError) {
+          await manager.failTaskForDispatchError(
+            transitioned.id, 'fix', transitioned.agentId, dispatchErr,
+          );
+        } else {
+          await manager.markAgentWaiting(transitioned.agentId, transitioned.id)
+            .catch(err => {
+              console.error(
+                `[EventHandler] REQUEST_CHANGES markAgentWaiting(dev=${transitioned.agentId}) rollback failed:`,
+                err,
+              );
+              return false;
+            });
+          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+            phase: 'fix-resume-failed',
+            reviewRound: transitioned.reviewRound,
+          });
+        }
+      }
+    }
+  });
+
+  // Dev emitted pr-fixed: it claims the fixing round is done. Verify on GitHub
+  // before advancing (option C) — a new commit OR a reply to the findings means
+  // real work; neither means a no-op claim. Every GitHub read
+  // fails closed: a verification we can't complete must NOT be read as "no-op".
+  bus.on('pr.fix.submitted', async (event) => {
+    if (!event.taskId || !event.agentId) return;
+    const task = await manager.getTask(event.taskId);
+    if (!task || task.reviewMode === 'server' || task.status !== 'fixing' || task.phase === 'spec') return;
+    const { projectId, agentId } = task;
+
+    // The watcher is one-shot and already consumed this pr-fixed. For paths that
+    // leave the task in `fixing`, re-establish (skipSnapshot so we don't re-fire on the
+    // same scrollback signal) so the dev can retry pr-fixed after addressing the
+    // note — otherwise a corrected retry has no watcher and the task strands.
+    const stayFixing = async (data: { phase: string; [key: string]: unknown }): Promise<void> => {
+      await emitIntervention(bus, projectId, agentId, task.id, data);
+      await manager.setupPhaseSignal(task.id, agentId, 'pr-fixed', { skipSnapshot: true });
+    };
+
+    // Anti-stale, fail-closed: a pr-fixed with a missing OR mismatched token
+    // (superseded pass) must not advance. No re-establish — a superseded pass means a
+    // fresh dispatch already set up its own watcher.
+    const token = typeof event.data.token === 'string' ? event.data.token : undefined;
+    if (!token || !task.signalToken || token !== task.signalToken) {
+      await emitIntervention(bus, projectId, agentId, task.id, {
+        phase: 'stale-pr-fixed-wrong-pass',
+        signalToken: token,
+        currentToken: task.signalToken,
+      });
+      return;
+    }
+
+    // pr-fixed's premise is "read the real GitHub state", so the head MUST come
+    // from a live fetch (resolveAuthoritativeHead's stale fallback could read the
+    // pre-push anchor). Fail closed on fetch failure rather than guessing no-op.
+    let headSha: string;
+    try {
+      headSha = await fetchVerifiedHeadSha(manager, task.id);
+    } catch (err) {
+      await stayFixing({
+        phase: 'fix-verify-head-fetch-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    // Without a review anchor we can't tell a pushed fix from a no-op — fail closed
+    // rather than mis-read the missing anchor as "no new commit".
+    if (!task.reviewHeadAnchorSha) {
+      await stayFixing({ phase: 'fix-verify-no-anchor', headSha });
+      return;
+    }
+
+    // New commit → the poller's pr.updated(push) is the authoritative advance;
+    // re-dispatching here too would double-trigger the QA recheck. Defer to it.
+    if (headSha !== task.reviewHeadAnchorSha) return;
+
+    // No new commit: did the dev do anything since THIS fix round started? Use
+    // fixDispatchedAt (not reviewDispatchedAt) so QA/human comments left during the
+    // prior review don't count as dev activity. Fail closed on a fetch error.
+    const since = task.fixDispatchedAt ?? task.reviewDispatchedAt;
+    let hasReplies: boolean;
+    try {
+      hasReplies = since ? await manager.prHasDevReplySince(task.id, since) : false;
+    } catch (err) {
+      await stayFixing({
+        phase: 'fix-verify-replies-fetch-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    if (!hasReplies) {
+      await stayFixing({
+        phase: 'fix-no-op-no-commit-no-reply',
+        note: 'Dev emitted pr-fixed but pushed no commit and left no reply on the PR — the fixing round changed nothing. Inspect the pane.',
+      });
+      return;
+    }
+
+    // Replies but no new commit (all "Won't fix"): recheck the same head + the
+    // replies. Reuse the push path for identical round/anchor/token semantics.
+    await bus.emit({
+      id: '',
+      type: 'pr.updated',
+      timestamp: new Date().toISOString(),
+      projectId,
+      agentId,
+      taskId: task.id,
+      data: {
+        kind: 'push',
+        headSha,
+        ...(task.prNumber !== undefined ? { prNumber: task.prNumber } : {}),
+        ...(task.prUrl !== undefined ? { prUrl: task.prUrl } : {}),
+        source: 'pr-fixed',
+      },
+    });
+
+    // If that synthetic advance failed downstream — the push handler rolls a failed
+    // QA dispatch back from review to fixing — the one-shot pr-fixed watcher is
+    // already consumed and (unlike a real push) there is no poller event to retry
+    // it. Surface it rather than leaving the task silently stuck in fixing.
+    const afterAdvance = await manager.getTask(task.id);
+    if (afterAdvance?.status === 'fixing') {
+      await emitIntervention(bus, projectId, agentId, task.id, {
+        phase: 'fix-advance-rolled-back',
+        note: 'pr-fixed advanced the PR to QA recheck but the QA dispatch failed and rolled the task back to fixing; the completion watcher is consumed. Inspect the QA agent and re-dispatch.',
+      });
+    }
+  });
+}

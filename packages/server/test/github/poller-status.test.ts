@@ -1,0 +1,473 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import {
+  GitHubPoller,
+  computePollerHealth,
+  type PollerOptions,
+} from '../../src/github/poller.js';
+import type { CommandRunner } from '../../src/agent/runner.js';
+
+const REPO = 'user/repo';
+const PROJECT_ID = 'test-proj';
+
+function okRunner(): CommandRunner {
+  return {
+    exec: vi.fn(async (cmd: string) => {
+      const slurped = cmd.includes('--slurp');
+      return {
+        stdout: slurped ? '[[]]' : '[]',
+        stderr: '',
+        exitCode: 0,
+      };
+    }),
+  };
+}
+
+function throwingRunner(message: string): CommandRunner {
+  return {
+    exec: vi.fn(async () => {
+      throw new Error(message);
+    }),
+  };
+}
+
+function nonZeroExitRunner(stderr: string): CommandRunner {
+  return {
+    exec: vi.fn(async () => ({ stdout: '', stderr, exitCode: 1 })),
+  };
+}
+
+function badJsonRunner(stdout: string): CommandRunner {
+  return {
+    exec: vi.fn(async () => ({ stdout, stderr: '', exitCode: 0 })),
+  };
+}
+
+function makePoller(runner: CommandRunner): GitHubPoller {
+  const opts: PollerOptions = { runner, onEvent: () => undefined };
+  return new GitHubPoller(opts);
+}
+
+describe('computePollerHealth', () => {
+  it('returns unknown when never polled and no failure', () => {
+    expect(computePollerHealth(0, undefined)).toBe('unknown');
+  });
+  it('returns healthy when successful at least once and no consecutive failure', () => {
+    expect(computePollerHealth(0, '2026-05-12T00:00:00Z')).toBe('healthy');
+  });
+  it('returns degraded at first failure', () => {
+    expect(computePollerHealth(1, '2026-05-12T00:00:00Z')).toBe('degraded');
+    expect(computePollerHealth(2, '2026-05-12T00:00:00Z')).toBe('degraded');
+  });
+  it('returns failed when 3+ consecutive failures', () => {
+    expect(computePollerHealth(3, '2026-05-12T00:00:00Z')).toBe('failed');
+    expect(computePollerHealth(99, undefined)).toBe('failed');
+  });
+});
+
+describe('GitHubPoller.snapshots()', () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('returns one snapshot per added entry with initial unknown health', () => {
+    const p = makePoller(okRunner());
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    p.add({ projectId: 'p2', repo: 'a/b' });
+    const snaps = p.snapshots();
+    expect(snaps).toHaveLength(2);
+    expect(snaps[0].repo).toBe(REPO);
+    expect(snaps[0].projectId).toBe(PROJECT_ID);
+    expect(snaps[0].intervalMs).toBe(0);
+    expect(snaps[0].isPolling).toBe(false);
+    expect(snaps[0].consecutiveFailures).toBe(0);
+    expect(snaps[0].health).toBe('unknown');
+    expect(snaps[0].lastPollStartedAt).toBeUndefined();
+    expect(snaps[0].lastPollEndedAt).toBeUndefined();
+    expect(snaps[0].lastErrorAt).toBeUndefined();
+    expect(snaps[1].repo).toBe('a/b');
+  });
+
+  it('after successful poll(): entry is healthy, lastPollEndedAt set, no error', async () => {
+    const p = makePoller(okRunner());
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('healthy');
+    expect(snap.consecutiveFailures).toBe(0);
+    expect(snap.lastPollStartedAt).toBeDefined();
+    expect(snap.lastPollEndedAt).toBeDefined();
+    expect(snap.lastPollDurationMs).toBeGreaterThanOrEqual(0);
+    expect(snap.lastErrorMessage).toBeUndefined();
+  });
+
+  it('after failed poll(): entry is degraded, lastErrorMessage captured', async () => {
+    const p = makePoller(throwingRunner('network down'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toBe('network down');
+    expect(snap.lastErrorAt).toBeDefined();
+    expect(snap.lastPollEndedAt).toBeDefined();
+  });
+
+  it('escalates to failed after 3 consecutive failures', async () => {
+    const p = makePoller(throwingRunner('boom'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    expect(p.snapshots()[0].health).toBe('degraded');
+    await p.poll();
+    expect(p.snapshots()[0].health).toBe('degraded');
+    await p.poll();
+    expect(p.snapshots()[0].health).toBe('failed');
+    expect(p.snapshots()[0].consecutiveFailures).toBe(3);
+  });
+
+  it('gh exit code != 0 → cycle counted as failure (degraded, error message captured)', async () => {
+    const p = makePoller(nonZeroExitRunner('gh: not authenticated'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toMatch(/pollPullRequests failed.*gh: not authenticated/);
+  });
+
+  it('3 consecutive gh exit != 0 cycles escalate to failed health', async () => {
+    const p = makePoller(nonZeroExitRunner('rate limited'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    await p.poll();
+    await p.poll();
+    expect(p.snapshots()[0].health).toBe('failed');
+    expect(p.snapshots()[0].consecutiveFailures).toBe(3);
+  });
+
+  it('stdout JSON parse failure → cycle counted as failure', async () => {
+    const p = makePoller(badJsonRunner('not valid json {'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toMatch(/JSON parse failed/);
+  });
+
+  it('response not an array → cycle counted as failure', async () => {
+    const p = makePoller(badJsonRunner('{"message":"unauthorized"}'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toMatch(/expected array, got object/);
+  });
+
+  it('list-PR succeeds but all sub-polls fail → cycle counted as degraded', async () => {
+    const prData = JSON.stringify([{
+      number: 42,
+      html_url: 'https://github.com/u/r/pull/42',
+      body: '<!-- baxian:managed -->',
+      head: { ref: 'bx/task-something', sha: 'a'.repeat(40) },
+      state: 'open',
+      merged_at: null,
+      updated_at: '2026-05-12T00:00:00Z',
+    }]);
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('/pulls?')) {
+          return { stdout: prData, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: 'rate limited', exitCode: 1 };
+      }),
+    };
+    const p = new GitHubPoller({ runner, onEvent: () => undefined });
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toMatch(/pollPullRequests: \d+ failure/);
+    expect(snap.lastErrorMessage).toMatch(/rate limited/);
+  });
+
+  it('onEvent throw on pr.created → cycle counted as degraded; cursor not stamped', async () => {
+    const prData = JSON.stringify([{
+      number: 700,
+      html_url: 'https://github.com/u/r/pull/700',
+      body: '<!-- baxian:managed -->',
+      head: { ref: 'bx/task-emit', sha: 'a'.repeat(40) },
+      state: 'open',
+      merged_at: null,
+      updated_at: '2026-05-12T00:00:00Z',
+    }]);
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('/pulls?')) return { stdout: prData, stderr: '', exitCode: 0 };
+        return { stdout: cmd.includes('--slurp') ? '[[]]' : '[]', stderr: '', exitCode: 0 };
+      }),
+    };
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let emitCalls = 0;
+    const p = new GitHubPoller({
+      runner,
+      onEvent: async () => {
+        emitCalls += 1;
+        throw new Error('event sink down');
+      },
+    });
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toMatch(/event sink down/);
+    expect(emitCalls).toBe(1);
+    errSpy.mockRestore();
+  });
+
+  it('onEvent throw inside sub-poll (review.submitted) → cycle counted as degraded', async () => {
+    const prData = JSON.stringify([{
+      number: 701,
+      html_url: 'https://github.com/u/r/pull/701',
+      body: '<!-- baxian:managed -->',
+      head: { ref: 'bx/task-review-emit', sha: 'a'.repeat(40) },
+      state: 'open',
+      merged_at: null,
+      updated_at: '2026-05-12T00:00:00Z',
+    }]);
+    const reviewData = JSON.stringify([{ id: 9000, state: 'APPROVED' }]);
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('/pulls?')) return { stdout: prData, stderr: '', exitCode: 0 };
+        if (cmd.includes('/pulls/701/reviews')) return { stdout: `[${reviewData}]`, stderr: '', exitCode: 0 };
+        return { stdout: cmd.includes('--slurp') ? '[[]]' : '[]', stderr: '', exitCode: 0 };
+      }),
+    };
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const p = new GitHubPoller({
+      runner,
+      onEvent: async (_pid, e) => {
+        if (e.type === 'review.submitted') throw new Error('handler wedged');
+      },
+    });
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('degraded');
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toMatch(/review event emit/);
+    errSpy.mockRestore();
+  });
+
+  it('legacy adoption confirm + sub-poll exit≠0 → cycle counted as degraded', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'baxian-poller-legacy-status-'));
+    const statePath = join(dir, 'cursor.json');
+    try {
+      const sha = 'a'.repeat(40);
+      // Seed cursor to hit the confirm branch: pullsByHead = legacy non-SHA,
+      // legacyAdoptionPending = current sha.
+      await writeFile(statePath, JSON.stringify({
+        pullsByHead: { 'bx/task-legacy': '2026-04-30T00:00:00Z' },
+        legacyAdoptionPending: { 'bx/task-legacy': sha },
+        reviews: [],
+        reviewComments: [],
+        issueComments: [],
+        mergedPrs: [],
+      }));
+      const prData = JSON.stringify([{
+        number: 300,
+        head: { ref: 'bx/task-legacy', sha },
+        html_url: 'https://github.com/u/r/pull/300',
+        state: 'open',
+        merged_at: null,
+        updated_at: '2026-05-04T00:00:00Z',
+      }]);
+      const runner: CommandRunner = {
+        exec: vi.fn(async (cmd: string) => {
+          if (cmd.includes('/pulls?')) {
+            return { stdout: prData, stderr: '', exitCode: 0 };
+          }
+          return { stdout: '', stderr: 'rate limited', exitCode: 1 };
+        }),
+      };
+      const p = new GitHubPoller({ runner, onEvent: () => undefined });
+      p.add({ projectId: PROJECT_ID, repo: REPO, statePath });
+      await p.poll();
+      const snap = p.snapshots()[0];
+      expect(snap.health).toBe('degraded');
+      expect(snap.consecutiveFailures).toBe(1);
+      expect(snap.lastErrorMessage).toMatch(/pollPullRequests: \d+ failure/);
+      expect(snap.lastErrorMessage).toMatch(/rate limited/);
+    } finally {
+      await rm(dir, { recursive: true });
+    }
+  });
+
+  it('sub-poll failure does not block sibling sub-polls for the same PR or other PRs', async () => {
+    // Two managed PRs; pollReviewsForPr fails for the first PR, comments succeed.
+    // The second PR's sub-polls all succeed. We verify both PRs reached emit by
+    // counting onEvent invocations.
+    const prData = JSON.stringify([
+      { number: 1, html_url: 'u1', body: '<!-- baxian:managed -->', head: { ref: 'bx/a', sha: 'a'.repeat(40) }, state: 'open', merged_at: null, updated_at: '2026-05-12T00:00:00Z' },
+      { number: 2, html_url: 'u2', body: '<!-- baxian:managed -->', head: { ref: 'bx/b', sha: 'b'.repeat(40) }, state: 'open', merged_at: null, updated_at: '2026-05-12T00:00:00Z' },
+    ]);
+    let reviewsForPr1Call = 0;
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('/pulls?')) return { stdout: prData, stderr: '', exitCode: 0 };
+        if (cmd.includes('/pulls/1/reviews')) {
+          reviewsForPr1Call++;
+          return { stdout: '', stderr: 'rate limited', exitCode: 1 };
+        }
+        const slurped = cmd.includes('--slurp');
+        return { stdout: slurped ? '[[]]' : '[]', stderr: '', exitCode: 0 };
+      }),
+    };
+    const events: Array<{ type: string }> = [];
+    const p = new GitHubPoller({
+      runner,
+      onEvent: (_pid, e) => { events.push(e); },
+    });
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    // The first PR's /reviews failed but its other sub-polls AND the second PR still ran.
+    expect(reviewsForPr1Call).toBe(1);
+    const created = events.filter(e => e.type === 'pr.created');
+    expect(created).toHaveLength(2); // both managed PRs created
+    // Cycle as a whole is still degraded due to the first PR's review fetch.
+    expect(p.snapshots()[0].health).toBe('degraded');
+  });
+
+  it('preserves lastErrorMessage across recovery (historical reference)', async () => {
+    const p = makePoller(throwingRunner('rate limited'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    await p.poll();
+    expect(p.snapshots()[0].lastErrorMessage).toBe('rate limited');
+    expect(p.snapshots()[0].consecutiveFailures).toBe(1);
+
+    // Swap to a working runner — poller exposes no setter so mutate the
+    // private field via a typed assertion.
+    (p as unknown as { runner: CommandRunner }).runner = okRunner();
+    await p.poll();
+    const snap = p.snapshots()[0];
+    expect(snap.health).toBe('healthy');
+    expect(snap.consecutiveFailures).toBe(0);
+    // Historical error preserved — UI can show "last failed N min ago".
+    expect(snap.lastErrorMessage).toBe('rate limited');
+    expect(snap.lastErrorAt).toBeDefined();
+  });
+
+  it('one failing repo does not contaminate another entry status', async () => {
+    // Custom runner: succeeds for repo-good, throws for repo-bad.
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('repo-bad')) {
+          throw new Error('rate limited');
+        }
+        const slurped = cmd.includes('--slurp');
+        return { stdout: slurped ? '[[]]' : '[]', stderr: '', exitCode: 0 };
+      }),
+    };
+    const p = makePoller(runner);
+    p.add({ projectId: 'p1', repo: 'user/repo-good' });
+    p.add({ projectId: 'p2', repo: 'user/repo-bad' });
+    await p.poll();
+    const snaps = p.snapshots();
+    const good = snaps.find(s => s.repo === 'user/repo-good')!;
+    const bad = snaps.find(s => s.repo === 'user/repo-bad')!;
+    expect(good.health).toBe('healthy');
+    expect(good.consecutiveFailures).toBe(0);
+    expect(good.lastErrorMessage).toBeUndefined();
+    expect(bad.health).toBe('degraded');
+    expect(bad.consecutiveFailures).toBe(1);
+    expect(bad.lastErrorMessage).toBe('rate limited');
+  });
+});
+
+describe('GitHubPoller lifecycle hook', () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('fires twice per entry per cycle (start + end)', async () => {
+    const p = makePoller(okRunner());
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    p.add({ projectId: 'p2', repo: 'a/b' });
+    const fn = vi.fn();
+    p.setLifecycleHook(fn);
+    await p.poll();
+    // 2 entries × 2 fires = 4
+    expect(fn).toHaveBeenCalledTimes(4);
+  });
+
+  it('hook still fires twice for an entry whose pollOne throws', async () => {
+    const p = makePoller(throwingRunner('boom'));
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    const fn = vi.fn();
+    p.setLifecycleHook(fn);
+    await p.poll();
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('thrown hook does not crash the cycle', async () => {
+    const p = makePoller(okRunner());
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    p.setLifecycleHook(() => {
+      throw new Error('hook is buggy');
+    });
+    await expect(p.poll()).resolves.toBeUndefined();
+    expect(p.snapshots()[0].consecutiveFailures).toBe(0);
+  });
+
+  it('snapshots() inside hook reflect current entry status (isPolling=true mid-cycle)', async () => {
+    const p = makePoller(okRunner());
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    const isPollingAt: boolean[] = [];
+    p.setLifecycleHook(() => {
+      isPollingAt.push(p.snapshots()[0].isPolling);
+    });
+    await p.poll();
+    expect(isPollingAt).toEqual([true, false]);
+  });
+});
+
+describe('GitHubPoller.start()', () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('captures intervalMs in snapshots after start()', () => {
+    const p = makePoller(okRunner());
+    p.add({ projectId: PROJECT_ID, repo: REPO });
+    p.start(45_000);
+    expect(p.snapshots()[0].intervalMs).toBe(45_000);
+    p.stop();
+  });
+});

@@ -1,0 +1,249 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api } from '../api.ts';
+import { TaskStatusDot, shortTaskId, useTaskDetail } from './task-detail-modal.tsx';
+import { TASK_ACTIVE_STATUS_SET, TASK_LIST_PAGE_SIZE, type TaskState } from '../shared/index.js';
+
+interface TaskPanelProps {
+  projectId: string;
+  // Live open working set (active + pending) from the project-tasks WS frame; the
+  // panel reuses it so 状态 / Round N update without a manual refresh.
+  openTasks: TaskState[];
+  onClose: () => void;
+  className?: string;
+}
+
+function taskIdNum(id: string): number {
+  const match = id.match(/^task-(\d+)$/);
+  return match ? parseInt(match[1], 10) : Number.NaN;
+}
+
+function byIdAsc(a: TaskState, b: TaskState): number {
+  const na = taskIdNum(a.id);
+  const nb = taskIdNum(b.id);
+  if (Number.isNaN(na) || Number.isNaN(nb)) return a.id.localeCompare(b.id);
+  return na - nb;
+}
+
+function byUpdatedDesc(a: TaskState, b: TaskState): number {
+  const cmp = (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '');
+  if (cmp !== 0) return cmp;
+  const na = taskIdNum(a.id);
+  const nb = taskIdNum(b.id);
+  if (Number.isNaN(na) || Number.isNaN(nb)) return b.id.localeCompare(a.id);
+  return nb - na;
+}
+
+// Client-paginated live section: status / round track the WS frame in real time,
+// while only TASK_LIST_PAGE_SIZE rows render until the user asks for more.
+function useLiveSection(all: TaskState[], projectId: string) {
+  const [visible, setVisible] = useState(TASK_LIST_PAGE_SIZE);
+  useEffect(() => setVisible(TASK_LIST_PAGE_SIZE), [projectId]);
+  const items = all.slice(0, visible);
+  const hasMore = all.length > items.length;
+  const loadMore = () => setVisible((v) => v + TASK_LIST_PAGE_SIZE);
+  return { items, hasMore, loadMore, total: all.length };
+}
+
+interface DoneState {
+  items: TaskState[];
+  hasMore: boolean;
+  loading: boolean;
+  loaded: boolean;
+  error: string | null;
+  load: (mode: 'first' | 'more') => void;
+}
+
+// 已处理 are terminal (status no longer changes) and accumulate without bound, so
+// they stay on the server-paged REST path, fetched only when the user expands them.
+function useDoneSection(projectId: string): DoneState {
+  const [items, setItems] = useState<TaskState[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requestRef = useRef(0);
+  const offsetRef = useRef(0);
+
+  const load = useCallback(
+    (mode: 'first' | 'more') => {
+      const requestId = ++requestRef.current;
+      const offset = mode === 'first' ? 0 : offsetRef.current;
+      setLoading(true);
+      setError(null);
+      void api.tasks.page(projectId, { category: 'done', offset }).then(
+        (page) => {
+          if (requestRef.current !== requestId) return;
+          setItems((prev) => (mode === 'first' ? page.tasks : [...prev, ...page.tasks]));
+          setHasMore(page.hasMore);
+          offsetRef.current = page.nextOffset;
+          setLoaded(true);
+          setLoading(false);
+        },
+        (err) => {
+          if (requestRef.current !== requestId) return;
+          setError(err instanceof Error ? err.message : String(err));
+          setLoading(false);
+        },
+      );
+    },
+    [projectId],
+  );
+
+  useEffect(() => {
+    requestRef.current += 1;
+    offsetRef.current = 0;
+    setItems([]);
+    setHasMore(false);
+    setLoaded(false);
+    setError(null);
+    setLoading(false);
+  }, [projectId]);
+
+  return { items, hasMore, loading, loaded, error, load };
+}
+
+export function TaskPanel({ projectId, openTasks, onClose, className = '' }: TaskPanelProps) {
+  const activeAll = useMemo(
+    () => openTasks.filter((t) => TASK_ACTIVE_STATUS_SET.has(t.status)).sort(byUpdatedDesc),
+    [openTasks],
+  );
+  const pendingAll = useMemo(
+    () => openTasks.filter((t) => t.status === 'pending').sort(byIdAsc),
+    [openTasks],
+  );
+  const active = useLiveSection(activeAll, projectId);
+  const pending = useLiveSection(pendingAll, projectId);
+  const done = useDoneSection(projectId);
+  const [doneExpanded, setDoneExpanded] = useState(false);
+
+  useEffect(() => {
+    setDoneExpanded(false);
+  }, [projectId]);
+
+  const toggleDone = () => {
+    if (doneExpanded) {
+      setDoneExpanded(false);
+      return;
+    }
+    setDoneExpanded(true);
+    done.load('first');
+  };
+
+  return (
+    <aside
+      aria-label="Task 面板"
+      className={`flex flex-col rounded-lg border border-hairline bg-surface ${className}`}
+    >
+      <div className="flex items-center justify-between border-b border-hairline px-3 py-2">
+        <h2 className="font-display text-[12px] font-semibold uppercase tracking-[0.06em] text-og-500">
+          Tasks
+        </h2>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="关闭 Task 面板"
+          className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      </div>
+
+      <div>
+        <LiveSection title="IN PROGRESS" section={active} emptyHint="暂无正在处理的任务" />
+        <LiveSection title="PENDING" section={pending} emptyHint="暂无待处理的任务" />
+
+        <div>
+          <button
+            type="button"
+            onClick={toggleDone}
+            aria-expanded={doneExpanded}
+            className="flex w-full items-center justify-between px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
+          >
+            <span>DONE</span>
+            <span className="font-normal normal-case text-accent">{doneExpanded ? '收起' : '查看'}</span>
+          </button>
+          {doneExpanded && <DoneBody state={done} />}
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function LiveSection({
+  title,
+  section,
+  emptyHint,
+}: {
+  title: string;
+  section: { items: TaskState[]; hasMore: boolean; loadMore: () => void; total: number };
+  emptyHint: string;
+}) {
+  return (
+    <section aria-label={title} className="border-b border-hairline">
+      <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.05em] text-og-500">
+        {title} <span className="text-og-400">({section.total})</span>
+      </div>
+      {section.items.length === 0 ? (
+        <div className="px-3 pb-3 text-[12px] text-og-400">{emptyHint}</div>
+      ) : (
+        <div className="divide-y divide-hairline">
+          {section.items.map((task) => <TaskRow key={task.id} task={task} />)}
+          {section.hasMore && (
+            <button
+              type="button"
+              onClick={section.loadMore}
+              className="w-full px-3 py-2 text-center text-[12px] text-accent transition-colors hover:bg-og-50/40"
+            >
+              加载更多
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DoneBody({ state }: { state: DoneState }) {
+  const showEmpty = state.loaded && !state.error && state.items.length === 0;
+  return (
+    <div className="divide-y divide-hairline">
+      {state.items.map((task) => <TaskRow key={task.id} task={task} />)}
+      {state.error && <div className="px-3 py-2 text-[12px] text-danger">加载失败：{state.error}</div>}
+      {showEmpty && <div className="px-3 pb-3 pt-1 text-[12px] text-og-400">暂无已处理的任务</div>}
+      {state.loading && state.items.length === 0 && (
+        <div className="px-3 py-3 text-center text-[12px] text-og-400">加载中…</div>
+      )}
+      {state.hasMore && (
+        <button
+          type="button"
+          onClick={() => state.load('more')}
+          disabled={state.loading}
+          className="w-full px-3 py-2 text-center text-[12px] text-accent transition-colors hover:bg-og-50/40 disabled:opacity-50"
+        >
+          {state.loading ? '加载中…' : '加载更多'}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TaskRow({ task }: { task: TaskState }) {
+  const { openTask } = useTaskDetail();
+  const round = task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+  return (
+    <button
+      type="button"
+      onClick={() => openTask(task.id)}
+      className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] transition-colors hover:bg-og-50/60"
+    >
+      <span className="shrink-0 font-mono text-[11px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
+      <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
+      {task.phase === 'spec' && <span className="pill pill-review shrink-0">spec</span>}
+      <span aria-label={`Round ${round}`} className="shrink-0 text-[11px] text-og-400">R{round}</span>
+      <TaskStatusDot status={task.status} />
+    </button>
+  );
+}

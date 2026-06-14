@@ -1,0 +1,159 @@
+name: npm publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Validate package only, do not publish to npm"
+        type: boolean
+        default: true
+  repository_dispatch:
+    types:
+      - npm-publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-repository:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      dry-run: ${{ steps.publish-mode.outputs.dry-run }}
+
+    steps:
+      - name: Ensure public release repository
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$GH_REPOSITORY" != "baxian-ai/baxian" ]; then
+            echo "npm publish workflow is only allowed in baxian-ai/baxian."
+            exit 1
+          fi
+
+      - name: Resolve publish mode
+        id: publish-mode
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_DRY_RUN: ${{ inputs['dry-run'] }}
+          DISPATCH_DRY_RUN: ${{ github.event.client_payload.dry_run }}
+        run: |
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              dry_run="${WORKFLOW_DRY_RUN:-true}"
+              ;;
+            repository_dispatch)
+              if [ "$EVENT_ACTION" != "npm-publish" ]; then
+                echo "Unsupported repository_dispatch action: $EVENT_ACTION"
+                exit 1
+              fi
+              dry_run="$DISPATCH_DRY_RUN"
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
+          if [ "$dry_run" != "true" ] && [ "$dry_run" != "false" ]; then
+            echo "dry-run must be true or false, got: $dry_run"
+            exit 1
+          fi
+
+          echo "dry-run=$dry_run" >> "$GITHUB_OUTPUT"
+
+  validate:
+    needs: validate-repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.13
+          cache: pnpm
+
+      - run: npm install -g node-gyp@12.3.0
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm test
+
+      - run: pnpm -r build
+
+      - run: npm pack
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: baxian-tarball
+          path: baxian-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: ${{ needs.validate-repository.outputs.dry-run == 'false' && github.ref == 'refs/heads/main' && github.repository == 'baxian-ai/baxian' }}
+    needs:
+      - validate-repository
+      - validate
+    runs-on: ubuntu-latest
+    environment: npm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - run: npm install -g npm@latest
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: baxian-tarball
+          path: .
+
+      - name: Check version is unpublished
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(baxian-*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "Expected exactly one baxian tarball, found ${#tarballs[@]}."
+            exit 1
+          fi
+          version="$(tar -xOf "${tarballs[0]}" package/package.json | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => console.log(JSON.parse(input).version));')"
+          if npm view "baxian@$version" version >/dev/null 2>&1; then
+            echo "baxian@$version already exists on npm."
+            exit 1
+          fi
+
+      - name: Publish tarball to npm
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(baxian-*.tgz)
+          if [ "${#tarballs[@]}" -ne 1 ]; then
+            echo "Expected exactly one baxian tarball, found ${#tarballs[@]}."
+            exit 1
+          fi
+          npm publish "${tarballs[0]}"

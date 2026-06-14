@@ -1,0 +1,455 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, cleanup, screen, within, fireEvent, act, waitFor } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
+import type { ProjectConfig, AgentSnapshot, TaskState } from '../../src/shared/index.js';
+
+vi.mock('../../src/components/pane-terminal.tsx', () => ({
+  TERMINAL_BG: '#fdfdfd',
+  PaneTerminal: () => <div data-testid="pane-terminal" />,
+}));
+
+vi.mock('../../src/components/toast.tsx', () => ({
+  useToast: () => ({ show: vi.fn() }),
+}));
+
+vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
+  usePendingRestart: () => ({ flagDirty: vi.fn() }),
+}));
+
+vi.mock('../../src/api.ts', () => ({
+  api: {
+    projects: {
+      list: vi.fn(async () => []),
+      create: vi.fn(async () => ({ project: { id: 'newproj' }, restartRequired: false })),
+    },
+    config: { get: vi.fn(async () => ({ project: [] })) },
+  },
+}));
+
+vi.mock('../../src/components/create-agent-modal.tsx', () => ({
+  CreateAgentModal: ({ open, projectId }: { open: boolean; projectId: string }) =>
+    open ? <div data-testid="agent-modal">agent:{projectId}</div> : null,
+}));
+
+const projectsHookState = {
+  projects: null as ProjectConfig[] | null,
+  error: null as string | null,
+};
+vi.mock('../../src/hooks/use-projects.ts', () => ({
+  useProjects: () => ({
+    projects: projectsHookState.projects,
+    error: projectsHookState.error,
+    refresh: vi.fn(),
+  }),
+}));
+
+const agentsHookState = {
+  data: null as AgentSnapshot[] | null,
+  loaded: false,
+  error: null as { message: string } | null,
+};
+const projectTasksHookState = {
+  data: [] as TaskState[] | null,
+  loaded: true,
+  error: null as { code: string; message: string } | null,
+};
+vi.mock('../../src/hooks/use-events.ts', () => ({
+  useAgents: () => agentsHookState,
+  useProjectTasks: () => projectTasksHookState,
+  // 真实 task-detail-modal（经 importOriginal 透传）顶层导入 useTask，mock 需保持完整。
+  useTask: () => ({ data: null, loaded: true, error: null }),
+}));
+
+vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/components/task-detail-modal.tsx')>();
+  return { ...actual, useTaskDetail: () => ({ openTask: vi.fn() }) };
+});
+
+import { Dashboard } from '../../src/pages/dashboard.tsx';
+
+beforeEach(() => {
+  cleanup();
+  projectsHookState.projects = null;
+  projectsHookState.error = null;
+  agentsHookState.data = null;
+  agentsHookState.loaded = false;
+  agentsHookState.error = null;
+  projectTasksHookState.data = [];
+  projectTasksHookState.loaded = true;
+  projectTasksHookState.error = null;
+});
+
+describe('Dashboard layout', () => {
+  it('keeps an sr-only h1 "Dashboard" so screen readers see the page heading even though the visible title is removed', () => {
+    projectsHookState.projects = [];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const h1 = screen.getByRole('heading', { level: 1, name: 'Dashboard' });
+    expect(h1.className).toContain('sr-only');
+  });
+
+  it('renders each project\'s agent groups in a full-width vertical stack (no xl:grid-cols-2 split)', () => {
+    projectsHookState.projects = [
+      {
+        id: 'demo',
+        repo: '/tmp/demo',
+        agent: [
+          [
+            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
+            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+          ],
+        ],
+      } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    const { container } = render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const groupWrapper = container.querySelector('[role="group"]')?.parentElement;
+    expect(groupWrapper).toBeTruthy();
+    expect(groupWrapper!.className).toContain('space-y-3');
+    expect(groupWrapper!.className).not.toContain('xl:grid-cols-2');
+    expect(groupWrapper!.className).not.toContain('grid-cols-1');
+  });
+
+  it('project header row exposes two narrow click targets (project id + Details) and the surrounding row is not clickable, to avoid mis-taps', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const heading = screen.getByRole('heading', { level: 2, name: 'demo' });
+    const idLink = within(heading).getByRole('link', { name: 'demo' });
+    expect(idLink.getAttribute('href')).toBe('/project/demo');
+
+    const detailsLink = screen.getByRole('link', { name: /Details/ });
+    expect(detailsLink.getAttribute('href')).toBe('/project/demo');
+    expect(detailsLink.getAttribute('aria-label')).toMatch(/demo/);
+
+    const row = heading.parentElement!;
+    expect(row.tagName).toBe('DIV');
+    expect(row.className).not.toContain('hover:bg-og-25');
+    expect(within(row).getByText('/tmp/demo').closest('a')).toBeNull();
+  });
+
+  it('multi-project Dashboard gives each Details link a unique accessible name so SR/voice-control users can distinguish destinations', () => {
+    projectsHookState.projects = [
+      { id: 'alpha', repo: '/tmp/alpha', agent: [] } as ProjectConfig,
+      { id: 'beta', repo: '/tmp/beta', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const alphaDetails = screen.getByRole('link', { name: /Details.*alpha/ });
+    const betaDetails = screen.getByRole('link', { name: /Details.*beta/ });
+    expect(alphaDetails.getAttribute('href')).toBe('/project/alpha');
+    expect(betaDetails.getAttribute('href')).toBe('/project/beta');
+    expect(alphaDetails).not.toBe(betaDetails);
+  });
+
+  it('hides the repo path on narrow viewports (mobile) — uses hidden sm:inline-block so 640px+ shows it', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo-repo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const repoSpan = screen.getByText('/tmp/demo-repo');
+    expect(repoSpan.className).toContain('hidden');
+    expect(repoSpan.className).toContain('sm:inline-block');
+  });
+
+  it('row keeps a single-line layout via truncate + title so a long repo path can not blow up row height', () => {
+    projectsHookState.projects = [
+      { id: 'very-long-project-id', repo: '/some/very/long/repo/path/that/should/not/wrap', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const heading = screen.getByRole('heading', { level: 2, name: 'very-long-project-id' });
+    expect(heading.className).toContain('truncate');
+    expect(heading.className).not.toContain('break-words');
+    expect(heading.getAttribute('title')).toBe('very-long-project-id');
+
+    const repoSpan = screen.getByText('/some/very/long/repo/path/that/should/not/wrap');
+    expect(repoSpan.className).toContain('truncate');
+    expect(repoSpan.className).not.toContain('break-words');
+    expect(repoSpan.getAttribute('title')).toBe('/some/very/long/repo/path/that/should/not/wrap');
+  });
+
+  it('multi-group project lays groups out in a 2-column grid at xl so one row holds up to 2 task areas', () => {
+    projectsHookState.projects = [
+      {
+        id: 'demo',
+        repo: '/tmp/demo',
+        agent: [
+          [
+            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
+            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+          ],
+          [
+            { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local' },
+            { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local' },
+          ],
+        ],
+      } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    const { container } = render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const groups = container.querySelectorAll('[role="group"]');
+    expect(groups.length).toBe(2);
+    const groupWrapper = groups[0].parentElement!;
+    expect(groupWrapper.className).toContain('grid');
+    expect(groupWrapper.className).toContain('grid-cols-1');
+    expect(groupWrapper.className).toContain('xl:grid-cols-2');
+    expect(groupWrapper.className).toContain('gap-3');
+    expect(groupWrapper.className).not.toContain('space-y-3');
+  });
+
+  it('promotes "新建 Task" to the primary CTA and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const taskBtn = screen.getByRole('button', { name: '+ 新建 Task' });
+    expect(taskBtn.className).toContain('btn-primary');
+    expect(taskBtn.className).not.toContain('btn-secondary');
+
+    expect(screen.queryByRole('button', { name: '新建项目' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+
+    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    expect(moreTrigger.getAttribute('aria-haspopup')).toBe('menu');
+    expect(moreTrigger.getAttribute('aria-expanded')).toBe('false');
+
+    const toolbar = taskBtn.parentElement!;
+    const triggerWrapper = moreTrigger.parentElement!;
+    expect(
+      toolbar.compareDocumentPosition(triggerWrapper) & Node.DOCUMENT_POSITION_CONTAINED_BY,
+    ).toBeTruthy();
+    expect(toolbar.lastElementChild).toBe(triggerWrapper);
+  });
+
+  it('opens the kebab menu on click and exposes a "新建项目" menuitem that opens the CreateProject modal', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    fireEvent.click(moreTrigger);
+
+    expect(moreTrigger.getAttribute('aria-expanded')).toBe('true');
+    const createProjectItem = screen.getByRole('menuitem', { name: '新建项目' });
+    fireEvent.click(createProjectItem);
+
+    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: /新建项目|Create/ })).toBeTruthy();
+  });
+
+  it('kebab menuitem opens neutral (no default bg, no auto-focus) and only changes text color on hover', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    fireEvent.click(moreTrigger);
+
+    const item = screen.getByRole('menuitem', { name: '新建项目' });
+    expect(item.textContent).toBe('新建项目');
+    expect(item.className).not.toMatch(/(^|\s)bg-/);
+    expect(item.className).not.toMatch(/focus:bg-/);
+    expect(item.className).not.toMatch(/hover:bg-/);
+    expect(item.className).toMatch(/hover:text-/);
+    expect(document.activeElement).not.toBe(item);
+  });
+
+  it('closes the kebab menu when Escape is pressed or an outside click happens', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    fireEvent.click(moreTrigger);
+    expect(screen.getByRole('menuitem', { name: '新建项目' })).toBeTruthy();
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+    expect(document.activeElement).toBe(moreTrigger);
+
+    fireEvent.click(moreTrigger);
+    expect(screen.getByRole('menuitem', { name: '新建项目' })).toBeTruthy();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+  });
+
+  it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', () => {
+    projectsHookState.projects = [
+      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
+    ];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+    projectTasksHookState.data = null;
+    projectTasksHookState.error = { code: 'connection_failed', message: 'realtime down' };
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/任务列表加载失败：realtime down/)).toBeTruthy();
+  });
+
+  it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', () => {
+    projectsHookState.projects = [
+      {
+        id: 'demo',
+        repo: '/tmp/demo',
+        agent: [
+          [
+            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
+            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+          ],
+        ],
+      } as ProjectConfig,
+    ];
+    agentsHookState.data = [
+      { id: 'dev-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+      { id: 'qa-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+    ];
+    agentsHookState.loaded = true;
+
+    const { getAllByTestId } = render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    const terminals = getAllByTestId('pane-terminal');
+    expect(terminals.length).toBe(2);
+  });
+});
+
+describe('Dashboard 项目已创建 follow-up modal', () => {
+  async function reachContinueDialog(): Promise<HTMLElement> {
+    projectsHookState.projects = [{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig];
+    agentsHookState.data = [];
+    agentsHookState.loaded = true;
+
+    render(
+      <MemoryRouter>
+        <Dashboard />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '更多操作' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: '新建项目' }));
+
+    const createDialog = screen.getByRole('dialog', { name: /新建项目/ });
+    fireEvent.change(within(createDialog).getByLabelText('项目 ID'), { target: { value: 'newproj' } });
+    fireEvent.change(within(createDialog).getByLabelText('Git 仓库地址'), { target: { value: 'https://github.com/o/r.git' } });
+    await act(async () => {
+      fireEvent.click(within(createDialog).getByRole('button', { name: '创建' }));
+    });
+
+    return screen.findByRole('dialog', { name: '项目已创建' });
+  }
+
+  it('pins both follow-up buttons in the footer region and "继续添加 Agent" enters the add-agent flow', async () => {
+    const dialog = await reachContinueDialog();
+
+    const continueBtn = within(dialog).getByRole('button', { name: '继续添加 Agent' });
+    const laterBtn = within(dialog).getByRole('button', { name: '稍后再加' });
+    const footer = continueBtn.parentElement!;
+    expect(footer.className).toContain('border-t');
+    expect(footer.className).toContain('shrink-0');
+    expect(laterBtn.parentElement).toBe(footer);
+
+    fireEvent.click(continueBtn);
+    expect(screen.getByTestId('agent-modal').textContent).toContain('newproj');
+  });
+
+  it('"稍后再加" closes the follow-up modal without entering the add-agent flow', async () => {
+    const dialog = await reachContinueDialog();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '稍后再加' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '项目已创建' })).toBeNull());
+    expect(screen.queryByTestId('agent-modal')).toBeNull();
+  });
+});

@@ -1,0 +1,364 @@
+export type AgentRuntime = 'claude-code' | 'codex';
+export type AgentRole = 'dev' | 'qa';
+export type AgentMode = 'local' | 'remote';
+export type MergeStrategy = 'auto' | null;
+
+export interface HostConfig {
+  id?: string;
+  hostname: string;
+  port?: number;
+  alias?: string;
+  user?: string;
+  password?: string;
+}
+
+export interface AgentConfig {
+  id: string;
+  runtime: AgentRuntime;
+  role: AgentRole;
+  mode: AgentMode;
+  // string = registry host id; object = legacy inline host.
+  host?: string | HostConfig;
+  workdir?: string;
+  yolo?: boolean;
+  model?: string;
+  addDirs?: string[];
+}
+
+export interface ProjectConfig {
+  id: string;
+  repo: string;
+  merge: MergeStrategy;
+  agent: AgentConfig[][];
+}
+
+export interface ReviewConfig {
+  /**
+   * Maximum review iterations for this task. Applies to BOTH the code-review
+   * loop (dev↔qa code rounds) AND the spec-review loop (dev↔qa spec rounds);
+   * same numeric cap. If the two ever need to diverge, split this field then.
+   */
+  rounds: number;
+}
+
+export interface HttpsConfig {
+  /** Absolute path to PEM-encoded private key, readable by the server user. */
+  keyFile: string;
+  /** Absolute path to PEM-encoded full-chain certificate. */
+  certFile: string;
+}
+
+export interface ServerConfig {
+  port: number;
+  token?: string;
+  host?: string;
+  /** When set, server listens with TLS instead of plain HTTP. */
+  https?: HttpsConfig;
+  /**
+   * Allowed Host header values. Empty/undefined = accept any (dev default).
+   * Set in production to mitigate Host-header attacks.
+   */
+  allowedHosts?: string[];
+  /** Per-repo poller cadence in ms. Default 30_000. */
+  githubPollIntervalMs?: number;
+  tmuxProbePollIntervalMs?: number;
+  tmuxProbeTimeoutMs?: number;
+  tmuxProbeConcurrency?: number;
+  bootstrapRetryIntervalMs?: number;
+}
+
+export interface BaxianConfig {
+  review: ReviewConfig;
+  server: ServerConfig;
+  host: HostConfig[];
+  project: ProjectConfig[];
+}
+
+export type AgentRuntimeStatus =
+  | 'unknown'
+  | 'idle'
+  | 'pending'
+  | 'working'
+  | 'waiting'
+  | 'error';
+
+export type TmuxSessionStatus =
+  | 'unknown'
+  | 'present'
+  | 'absent'
+  | 'unreachable';
+
+export type TaskStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'review'
+  | 'fixing'
+  | 'approved'
+  | 'merge-ready'
+  | 'ready'
+  | 'merged'
+  | 'done'
+  | 'max_rounds'
+  | 'failed'
+  | 'cancelled';
+
+export type TaskPhase = 'spec' | 'code';
+
+// baxian 自己设的 lifecycle 状态（权威），区别于 AgentRuntimeStatus（探针派生量）。
+// awaiting_human: 自动调度路径无法继续，必须 operator 显式 resumeAgent 才放出。
+export type AgentLifecycleStatus = 'ok' | 'awaiting_human';
+
+export interface AgentBindingFacts {
+  id: string;
+  projectId: string;
+  taskId?: string;
+  worktreePath?: string;
+  repoPath?: string;
+  startedAt?: string;
+  updatedAt: string;
+  paneId?: string;
+  creationToken?: string;
+  status?: AgentLifecycleStatus;
+  awaitingPhase?: string;
+  awaitingReason?: string;
+  awaitingSince?: string;
+  // Skills already inlined into the REPL session's context, scoped to
+  // (taskId, paneId). When either changes we treat the agent's context as
+  // fresh and re-inject — this is the "across task cycles re-inject, within
+  // a cycle dedup" boundary.
+  injectedSkills?: InjectedSkillsRecord;
+}
+
+export interface InjectedSkillsRecord {
+  taskId: string;
+  paneId: string;
+  skills: string[];
+}
+
+export interface AgentErrorSummary {
+  id: string;
+  reason: string;
+  message: string;
+  occurredAt: string;
+  recommendation?: string;
+}
+
+export interface AgentSnapshot {
+  id: string;
+  projectId: string;
+  runtimeStatus: AgentRuntimeStatus;
+  tmuxSessionStatus: TmuxSessionStatus;
+  stale: boolean;
+  observedAt?: string;
+  binding?: AgentBindingFacts;
+  latestError?: AgentErrorSummary;
+  latestBootstrapError?: AgentErrorSummary;
+  reason?: string;
+  message?: string;
+}
+
+export interface TaskState {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  preferredAgentId: string;
+  agentId: string;
+  qaAgentId?: string;
+  prNumber?: number;
+  prUrl?: string;
+  branch?: string;
+  /** Server-trusted PR head SHA — anchor for review.submitted staleness checks. */
+  latestHeadSha?: string;
+  reviewHeadAnchorSha?: string;
+  reviewRound: number;
+  /** Spec review round, isolated from PR review round. */
+  specReviewRound?: number;
+  /** undefined ≡ 'code' for backward compatibility. */
+  phase?: TaskPhase;
+  /** Signal token for the current pending pane signal; rotated each dispatch/phase transition. */
+  signalToken?: string;
+  /** Review mode snapshotted at task creation. */
+  reviewMode?: 'github' | 'server';
+  batchIndex?: number;
+  batchTotal?: number;
+  maxRoundsContinues?: number;
+  afterDone?: 'pr' | 'branch' | null;
+  publishDispatchedAt?: string;
+  status: TaskStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type FindingSeverity = 'critical' | 'major' | 'minor';
+
+export interface Finding {
+  id: string;
+  severity: FindingSeverity;
+  message: string;
+  file?: string;
+  line?: number;
+  location?: string;
+}
+
+export interface ReviewFindings {
+  round: number;
+  verdict: 'approve' | 'request-changes';
+  findings: Finding[];
+}
+
+export interface FindingResponse {
+  findingId: string;
+  action: 'fix' | 'reject' | 'out-of-scope';
+  rationale: string;
+  commitSha?: string;
+}
+
+export interface ReviewResponse {
+  round: number;
+  responses: FindingResponse[];
+}
+
+export interface ReviewRound {
+  round: number;
+  phase: TaskPhase;
+  content: string;
+  contentTruncated?: boolean;
+  diffstat?: string;
+  baseSha?: string;
+  findings?: ReviewFindings;
+  response?: ReviewResponse;
+  batchFindings?: ReviewFindings[];
+  startedAt: string;
+  completedAt?: string;
+}
+
+export type StreamSubMode = 'preview' | 'full';
+
+export interface StreamSubscribeMsg {
+  op: 'subscribe';
+  subscriberId: string;
+  agentId: string;
+  mode: StreamSubMode;
+}
+
+export interface StreamUnsubscribeMsg {
+  op: 'unsubscribe';
+  subscriberId: string;
+}
+
+export interface StreamInputMsg {
+  op: 'input';
+  subscriberId: string;
+  data: string;
+}
+
+export interface StreamResizeMsg {
+  op: 'resize';
+  subscriberId: string;
+  cols: number;
+  rows: number;
+}
+
+export interface StreamPingMsg {
+  op: 'ping';
+}
+
+export type StreamClientMsg =
+  | StreamSubscribeMsg
+  | StreamUnsubscribeMsg
+  | StreamInputMsg
+  | StreamResizeMsg
+  | StreamPingMsg;
+
+export interface StreamSnapshotMsg {
+  type: 'snapshot';
+  subscriberId: string;
+  cols: number;
+  rows: number;
+  data: string;
+  snapshotSeq: number;
+}
+
+export interface StreamDataMsg {
+  type: 'data';
+  agentId: string;
+  data: string;
+  seq: number;
+}
+
+export interface StreamSubscribedMsg {
+  type: 'subscribed';
+  subscriberId: string;
+  agentId: string;
+  cols: number;
+  rows: number;
+  snapshotSeq: number;
+}
+
+export interface StreamErrorMsg {
+  type: 'error';
+  subscriberId?: string;
+  agentId?: string;
+  code: string;
+  message: string;
+}
+
+export interface StreamSessionGoneMsg {
+  type: 'session_gone';
+  agentId: string;
+}
+
+export interface StreamPongMsg {
+  type: 'pong';
+}
+
+export type StreamServerMsg =
+  | StreamSnapshotMsg
+  | StreamDataMsg
+  | StreamSubscribedMsg
+  | StreamErrorMsg
+  | StreamSessionGoneMsg
+  | StreamPongMsg;
+
+export type PollerHealth = 'healthy' | 'degraded' | 'failed' | 'unknown';
+
+export interface PollerSnapshot {
+  repo: string;
+  projectId: string;
+  intervalMs: number;
+  isPolling: boolean;
+  lastPollStartedAt?: string;
+  lastPollEndedAt?: string;
+  lastPollDurationMs?: number;
+  lastErrorAt?: string;
+  lastErrorMessage?: string;
+  consecutiveFailures: number;
+  health: PollerHealth;
+}
+
+export type EventsTopicAgents = 'agents';
+export type EventsTopicAgent = `agent:${string}`;
+export type EventsTopicTask = `task:${string}`;
+export type EventsTopicProjectTasks = `project-tasks:${string}`;
+export type EventsTopicPollers = 'pollers';
+export type EventsTopic =
+  | EventsTopicAgents
+  | EventsTopicAgent
+  | EventsTopicTask
+  | EventsTopicProjectTasks
+  | EventsTopicPollers;
+
+export type EventsClientMsg =
+  | { op: 'subscribe'; topic: EventsTopic }
+  | { op: 'unsubscribe'; topic: EventsTopic }
+  | { op: 'ping' };
+
+export type EventsServerMsg =
+  | { type: 'data'; topic: EventsTopicAgents; data: AgentSnapshot[] }
+  | { type: 'data'; topic: EventsTopicAgent; data: AgentSnapshot | null }
+  | { type: 'data'; topic: EventsTopicTask; data: TaskState | null }
+  | { type: 'data'; topic: EventsTopicProjectTasks; data: TaskState[] }
+  | { type: 'data'; topic: EventsTopicPollers; data: PollerSnapshot[] }
+  | { type: 'error'; topic?: EventsTopic; code: string; message: string }
+  | { type: 'pong' };

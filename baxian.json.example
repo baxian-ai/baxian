@@ -1,0 +1,61 @@
+{
+  "review": {
+    "rounds": 10
+  },
+  "server": {
+    "port": 3000,
+    "host": "127.0.0.1"
+  },
+  "host": [
+    {
+      "id": "worker-01",
+      "hostname": "remote.example.com",
+      "port": 22,
+      "alias": "Prod worker",
+      "user": "agent"
+    }
+  ],
+  "project": [
+    {
+      "id": "my-project",
+      "repo": "https://github.com/your-username/your-repo.git",
+      "merge": null,
+      "agent": [
+        [
+          {
+            "id": "dev-1",
+            "runtime": "claude-code",
+            "role": "dev",
+            "mode": "local",
+            "workdir": "/path/to/your/repo"
+          },
+          {
+            "id": "qa-1",
+            "runtime": "codex",
+            "role": "qa",
+            "mode": "local",
+            "workdir": "/path/to/your/repo"
+          }
+        ],
+        [
+          {
+            "id": "dev-2",
+            "runtime": "claude-code",
+            "role": "dev",
+            "mode": "remote",
+            "workdir": "/home/agent/repo",
+            "host": "worker-01"
+          },
+          {
+            "id": "qa-2",
+            "runtime": "codex",
+            "role": "qa",
+            "mode": "remote",
+            "workdir": "/home/agent/repo",
+            "host": "worker-01"
+          }
+        ]
+      ]
+    }
+  ]
+}

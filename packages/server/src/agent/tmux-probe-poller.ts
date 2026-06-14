@@ -1,0 +1,538 @@
+import { createHash } from 'node:crypto';
+import type {
+  AgentConfig,
+  AgentErrorSummary,
+  AgentRuntimeStatus,
+  BaxianConfig,
+  TmuxSessionStatus,
+} from '../shared/index.js';
+import type { AgentManager } from './manager.js';
+import type { CommandRunner } from './runner.js';
+import { createRunner, resolveAgentHost } from './runner.js';
+import { TmuxManager, detectActiveRegionBusy, hasActiveSpinnerInTail, detectRuntimeMenu, type AdoptPaneState } from './tmux.js';
+import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
+import type { AgentStore } from '../state/agent-store.js';
+import type { ErrorRecordStore } from '../state/error-record-store.js';
+
+export interface TmuxSessionObservation {
+  tmuxSessionStatus: TmuxSessionStatus;
+  observedAt?: string;
+  lastPresentAt?: string;
+  error?: string;
+  latestError?: AgentErrorSummary;
+  runtimeStatusHint?: AgentRuntimeStatus;
+  reason?: string;
+  message?: string;
+  paneState?: AdoptPaneState['kind'];
+}
+
+export type TmuxSessionStatusStoreChangeKind = 'set' | 'delete';
+export type TmuxSessionStatusStoreListener = (
+  kind: TmuxSessionStatusStoreChangeKind,
+  agentId: string,
+) => void;
+
+export class TmuxSessionStatusStore {
+  private entries = new Map<string, TmuxSessionObservation>();
+  private listeners = new Set<TmuxSessionStatusStoreListener>();
+
+  onChange(fn: TmuxSessionStatusStoreListener): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  get(agentId: string): TmuxSessionObservation {
+    return this.entries.get(agentId) ?? { tmuxSessionStatus: 'unknown' };
+  }
+
+  set(agentId: string, entry: TmuxSessionObservation): void {
+    const prev = this.entries.get(agentId);
+    this.entries.set(agentId, entry);
+    if (
+      prev
+      && prev.tmuxSessionStatus === entry.tmuxSessionStatus
+      && prev.error === entry.error
+      && prev.runtimeStatusHint === entry.runtimeStatusHint
+      && prev.reason === entry.reason
+      && prev.message === entry.message
+      && prev.paneState === entry.paneState
+      && prev.latestError?.id === entry.latestError?.id
+    ) {
+      return;
+    }
+    this.fire('set', agentId);
+  }
+
+  keys(): IterableIterator<string> {
+    return this.entries.keys();
+  }
+
+  delete(agentId: string): void {
+    if (!this.entries.has(agentId)) return;
+    this.entries.delete(agentId);
+    this.fire('delete', agentId);
+  }
+
+  private fire(kind: TmuxSessionStatusStoreChangeKind, agentId: string): void {
+    for (const fn of [...this.listeners]) {
+      try {
+        fn(kind, agentId);
+      } catch (err) {
+        console.error(`[TmuxSessionStatusStore] listener threw on ${kind} ${agentId}:`, err);
+      }
+    }
+  }
+}
+
+export interface TmuxProbePollerOptions {
+  config: BaxianConfig;
+  store: TmuxSessionStatusStore;
+  agentManager: AgentManager;
+  agentStore?: AgentStore;
+  errorRecordStore?: ErrorRecordStore;
+  runnerFactory?: (agent: AgentConfig) => CommandRunner;
+  intervalMs?: number;
+  probeTimeoutMs?: number;
+  concurrency?: number;
+  failureThreshold?: number;
+  now?: () => number;
+}
+
+const DEFAULT_INTERVAL_MS = 10_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 3_000;
+const DEFAULT_CONCURRENCY = 4;
+const DEFAULT_FAILURE_THRESHOLD = 2;
+const PENDING_IDLE_AFTER_MS = 5 * 60 * 1000;
+
+export class TmuxProbePoller {
+  private readonly periodicRunner: PeriodicTaskRunner;
+  private failureCounts = new Map<string, number>();
+  private config: BaxianConfig;
+  private store: TmuxSessionStatusStore;
+  private agentManager: AgentManager;
+  private agentStore?: AgentStore;
+  private errorRecordStore?: ErrorRecordStore;
+  private runnerFactory?: (agent: AgentConfig) => CommandRunner;
+  private pollIntervalMs: number;
+  private probeTimeoutMs: number;
+  private concurrency: number;
+  private failureThreshold: number;
+  private lastRecordedIssue = new Map<string, string>();
+  private lastScreen = new Map<string, { hash: string; changedAt: number; taskId: string | null }>();
+  // id → current AgentConfig reference. Reference identity is the generation token:
+  // every prepareConfig produces fresh instances, so DELETE→CREATE same-id is detectable.
+  private validInstances = new Map<string, AgentConfig>();
+  private now: () => number;
+
+  constructor(options: TmuxProbePollerOptions) {
+    this.config = options.config;
+    this.store = options.store;
+    this.agentManager = options.agentManager;
+    this.agentStore = options.agentStore;
+    this.errorRecordStore = options.errorRecordStore;
+    this.runnerFactory = options.runnerFactory;
+    this.now = options.now ?? Date.now;
+    this.pollIntervalMs = options.intervalMs ?? options.config.server.tmuxProbePollIntervalMs ?? DEFAULT_INTERVAL_MS;
+    this.probeTimeoutMs = options.probeTimeoutMs ?? options.config.server.tmuxProbeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+    this.concurrency = options.concurrency ?? options.config.server.tmuxProbeConcurrency ?? DEFAULT_CONCURRENCY;
+    this.failureThreshold = options.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
+    this.validInstances = buildInstanceIndex(options.config);
+    this.periodicRunner = new PeriodicTaskRunner({
+      name: 'tmux-probe-poller',
+      intervalMs: this.pollIntervalMs,
+      run: () => this.probeConfiguredAgents(),
+      onError: err => console.error('[tmux-probe] poll failed:', err),
+    });
+  }
+
+  replaceConfig(validated: BaxianConfig): void {
+    this.config = validated;
+    this.validInstances = buildInstanceIndex(validated);
+    const allKnownIds = new Set([
+      ...this.failureCounts.keys(),
+      ...this.lastRecordedIssue.keys(),
+      ...this.lastScreen.keys(),
+      ...this.store.keys(),
+    ]);
+    for (const id of allKnownIds) {
+      if (!this.validInstances.has(id)) this.purgeAgent(id);
+    }
+    // Cleared field must revert to default, not freeze the prior runtime value —
+    // PATCH /config dropping the key signals "use default", not "keep current".
+    this.probeTimeoutMs = validated.server.tmuxProbeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+    this.concurrency = validated.server.tmuxProbeConcurrency ?? DEFAULT_CONCURRENCY;
+    const nextIntervalMs = validated.server.tmuxProbePollIntervalMs ?? DEFAULT_INTERVAL_MS;
+    if (nextIntervalMs !== this.pollIntervalMs) {
+      this.pollIntervalMs = nextIntervalMs;
+      this.periodicRunner.reschedule(nextIntervalMs);
+    }
+  }
+
+  purgeAgent(id: string): void {
+    this.failureCounts.delete(id);
+    this.lastRecordedIssue.delete(id);
+    this.lastScreen.delete(id);
+    this.store.delete(id);
+  }
+
+  // Instance equality, not just id: DELETE→CREATE same id swaps the AgentConfig reference,
+  // so an in-flight probe whose captured agent is now stale won't pass this gate.
+  private isCurrentInstance(agent: AgentConfig): boolean {
+    return this.validInstances.get(agent.id) === agent;
+  }
+
+  // Race guard #2: observePresentSession / recordProbeError can still await past the entry-time check.
+  private commitObservation(agent: AgentConfig, entry: TmuxSessionObservation): void {
+    if (!this.isCurrentInstance(agent)) {
+      this.purgeAgent(agent.id);
+      return;
+    }
+    this.store.set(agent.id, entry);
+  }
+
+  start(): void {
+    this.periodicRunner.start({ runImmediately: true });
+  }
+
+  stop(): void {
+    this.periodicRunner.stop();
+  }
+
+  async pollOnce(): Promise<void> {
+    await this.periodicRunner.runOnce();
+  }
+
+  private async probeConfiguredAgents(): Promise<void> {
+    const agents = uniqueAgents(this.config);
+    await runWithConcurrency(agents, Math.max(1, this.concurrency), agent => this.probe(agent));
+  }
+
+  private async probe(agent: AgentConfig): Promise<void> {
+    let tmux: TmuxManager | undefined;
+    let result: { tmuxSessionStatus: TmuxSessionStatus; error?: string };
+    try {
+      const runner = this.runnerFactory
+        ? this.runnerFactory(agent)
+        : createRunner(agent.mode, resolveAgentHost(this.config.host, agent.host));
+      tmux = new TmuxManager(runner);
+      result = await this.runProbe(agent, tmux);
+    } catch (err) {
+      result = {
+        tmuxSessionStatus: 'unreachable',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    // Issue #120: an in-flight probe must not resurrect stale observations after the agent
+    // was DELETEd (gone from config) OR DELETE→CREATE-d same id (new AgentConfig instance).
+    if (!this.isCurrentInstance(agent)) {
+      this.purgeAgent(agent.id);
+      return;
+    }
+    const now = new Date().toISOString();
+    const previousEntry = this.store.get(agent.id);
+    const previous = previousEntry.tmuxSessionStatus;
+
+    if (result.tmuxSessionStatus === 'unreachable') {
+      const failures = (this.failureCounts.get(agent.id) ?? 0) + 1;
+      this.failureCounts.set(agent.id, failures);
+      if (failures >= this.failureThreshold) {
+        // Only reset the idle baseline when the store is actually flipping to non-present;
+        // single transient probe failures below the threshold must not zero the timer or a
+        // truly idle session on a flaky link would never accumulate 5 minutes.
+        this.lastScreen.delete(agent.id);
+        const latestError = await this.recordProbeError(agent, now, result.error);
+        this.commitObservation(agent, {
+          tmuxSessionStatus: 'unreachable',
+          observedAt: now,
+          ...(previousEntry.lastPresentAt ? { lastPresentAt: previousEntry.lastPresentAt } : {}),
+          error: result.error,
+          ...(latestError ? { latestError } : {}),
+        });
+        this.logTransition(agent.id, previous, 'unreachable', result.error);
+      }
+      return;
+    }
+
+    this.failureCounts.delete(agent.id);
+    if (result.tmuxSessionStatus !== 'present') {
+      this.lastRecordedIssue.delete(agent.id);
+      this.lastScreen.delete(agent.id);
+    }
+    const presentDetails = result.tmuxSessionStatus === 'present' && tmux
+      ? await this.observePresentSession(agent, tmux, now)
+      : {};
+    this.commitObservation(agent, {
+      tmuxSessionStatus: result.tmuxSessionStatus,
+      observedAt: now,
+      ...(result.tmuxSessionStatus === 'present' ? { lastPresentAt: now } : {}),
+      ...presentDetails,
+    });
+    this.logTransition(agent.id, previous, result.tmuxSessionStatus);
+
+    if (result.tmuxSessionStatus === 'absent') {
+      try {
+        await this.agentManager.reconcileFailedAgent(agent.id);
+      } catch (err) {
+        console.error(`[tmux-probe] reconcileFailedAgent ${agent.id} threw:`, err);
+      }
+    }
+  }
+
+  private async observePresentSession(
+    agent: AgentConfig,
+    tmux: TmuxManager,
+    occurredAt: string,
+  ): Promise<Partial<TmuxSessionObservation>> {
+    try {
+      const paneId = await tmux.getSinglePaneId(agent.id, { timeout: this.probeTimeoutMs });
+      const paneState = await tmux.classifyPaneForAdopt(paneId, agent.runtime, { timeout: this.probeTimeoutMs });
+      const runtimeScreen = paneState.kind === 'live-runtime'
+        ? await tmux.capturePaneById(paneId, {
+            ansi: false,
+            scrollback: 0,
+            timeoutMs: this.probeTimeoutMs,
+          })
+        : '';
+      const liveRuntime = paneState.kind === 'live-runtime';
+      // taskId is part of the baseline key: a new (or different, or just-released) task must
+      // restart the 5-min grace. Without this, an agent idling on `❯` for 10 min before being
+      // bound to a fresh task would mis-fire PENDING_IDLE on the very first post-bind probe
+      // because the hash hadn't changed.
+      const currentTaskId = liveRuntime && this.agentStore
+        ? (await this.agentStore.get(agent.id))?.taskId ?? null
+        : null;
+      if (liveRuntime) {
+        const hash = createHash('sha1').update(runtimeScreen).digest('hex');
+        const prev = this.lastScreen.get(agent.id);
+        if (!prev || prev.hash !== hash || prev.taskId !== currentTaskId) {
+          this.lastScreen.set(agent.id, { hash, changedAt: this.now(), taskId: currentTaskId });
+        }
+      } else {
+        this.lastScreen.delete(agent.id);
+      }
+      // Busy uses detectReplActiveBusy (tail-scoped esc-to-interrupt + live spinner), same as dispatch
+      // ack: a stale 'esc to interrupt' high in the viewport above a ready prompt must NOT count as busy
+      // (else an idle pane is mislabeled instead of PENDING_IDLE).
+      // Live status uses detectActiveRegionBusy (spinner in the activity region + tail esc-to-interrupt),
+      // NOT whole-screen: a quoted/stale spinner high in scrollback above an idle prompt must fall through
+      // to PENDING_IDLE, not read as 'working'; a stale esc-to-interrupt high above a ready
+      // prompt likewise. STUCK_BUSY then fires only on a FROZEN active spinner — its seconds
+      // advance every second, so a spinner static across the grace window means the runtime is stuck; a
+      // static esc-to-interrupt without a spinner (long-running Codex task) never escalates.
+      // Menu UI still wins as a hard human-pending signal.
+      const pending = liveRuntime && detectRuntimeMenu(runtimeScreen);
+      const busy = liveRuntime && !pending && detectActiveRegionBusy(runtimeScreen, agent.runtime);
+      const screenStatic = !pending && this.screenStaticForGrace(agent.id, paneState);
+      const stuckBusy = busy && screenStatic && hasActiveSpinnerInTail(runtimeScreen);
+      const pendingIdle = !busy && screenStatic;
+      const issue = this.issueForPaneState(paneState, pending, pendingIdle, stuckBusy);
+      if (!issue) {
+        this.lastRecordedIssue.delete(agent.id);
+        return {
+          paneState: paneState.kind,
+          ...(busy ? { runtimeStatusHint: 'working' as const } : {}),
+        };
+      }
+      const latestError = await this.recordRuntimeIssue(agent, occurredAt, issue);
+      return {
+        paneState: paneState.kind,
+        runtimeStatusHint: issue.runtimeStatusHint,
+        reason: issue.reason,
+        message: issue.message,
+        ...(latestError ? { latestError } : {}),
+      };
+    } catch (err) {
+      // Probe failed mid-session: PANE_PROBE_FAILED is a discontinuity in observation. The
+      // "5 minutes static" claim requires unbroken sampling, so drop the baseline; next
+      // successful probe will rebuild it and start the grace period fresh.
+      this.lastScreen.delete(agent.id);
+      const message = err instanceof Error ? err.message : String(err);
+      const issue = {
+        runtimeStatusHint: 'error' as const,
+        reason: 'PANE_PROBE_FAILED',
+        message,
+      };
+      const latestError = await this.recordRuntimeIssue(agent, occurredAt, issue);
+      return {
+        runtimeStatusHint: 'error',
+        reason: issue.reason,
+        message,
+        ...(latestError ? { latestError } : {}),
+      };
+    }
+  }
+
+  // True when the captured screen has not changed for the grace window while bound to a task —
+  // shared by PENDING_IDLE (idle screen) and STUCK_BUSY (busy anchor frozen) inference.
+  private screenStaticForGrace(agentId: string, paneState: AdoptPaneState): boolean {
+    if (paneState.kind !== 'live-runtime') return false;
+    const entry = this.lastScreen.get(agentId);
+    if (!entry || !entry.taskId) return false;
+    return this.now() - entry.changedAt > PENDING_IDLE_AFTER_MS;
+  }
+
+  private issueForPaneState(
+    paneState: AdoptPaneState,
+    pendingRuntimeMenu: boolean,
+    pendingIdle: boolean,
+    stuckBusy: boolean,
+  ): { runtimeStatusHint: AgentRuntimeStatus; reason: string; message: string } | undefined {
+    if (pendingRuntimeMenu) {
+      return {
+        runtimeStatusHint: 'pending',
+        reason: 'PENDING_HUMAN',
+        message: 'Agent runtime is waiting on an interactive menu.',
+      };
+    }
+    if (stuckBusy) {
+      return {
+        runtimeStatusHint: 'error',
+        reason: 'STUCK_BUSY',
+        message: 'Agent runtime shows a busy indicator but the pane has not changed for over 5 minutes — the runtime is likely stuck. Inspect or interrupt via the web terminal.',
+      };
+    }
+    if (pendingIdle) {
+      return {
+        runtimeStatusHint: 'pending',
+        reason: 'PENDING_IDLE',
+        message: 'Agent runtime has been idle while a task is active — likely waiting on user input.',
+      };
+    }
+    if (paneState.kind === 'startup-dialog' || paneState.kind === 'trust-dialog') {
+      return {
+        runtimeStatusHint: 'pending',
+        reason: 'PENDING_HUMAN',
+        message: 'Agent runtime is waiting on a startup dialog.',
+      };
+    }
+    if (paneState.kind === 'other') {
+      return {
+        runtimeStatusHint: 'error',
+        reason: 'UNSUPPORTED_FOREGROUND_PROCESS',
+        message: `Pane foreground "${paneState.paneCurrentCommand}" is not a supported runtime or shell.`,
+      };
+    }
+    return undefined;
+  }
+
+  private async recordRuntimeIssue(
+    agent: AgentConfig,
+    occurredAt: string,
+    issue: { reason: string; message: string; runtimeStatusHint: AgentRuntimeStatus },
+  ): Promise<AgentErrorSummary | undefined> {
+    if (!this.errorRecordStore) return undefined;
+    const key = `${issue.reason}:${issue.message}`;
+    if (this.lastRecordedIssue.get(agent.id) === key) {
+      return this.store.get(agent.id).latestError;
+    }
+    this.lastRecordedIssue.set(agent.id, key);
+    const projectId = projectIdForAgent(this.config, agent.id) ?? '';
+    try {
+      const record = await this.errorRecordStore.append({
+        agentId: agent.id,
+        projectId,
+        operation: 'tmux-probe',
+        reason: issue.reason,
+        message: issue.message,
+        occurredAt,
+        observation: {
+          tmuxSessionStatus: 'present',
+          runtimeStatusHint: issue.runtimeStatusHint,
+        },
+        recommendation: issue.runtimeStatusHint === 'pending'
+          ? 'Open the web terminal and complete the pending prompt.'
+          : 'Inspect the pane before assigning more work to this agent.',
+      });
+      return this.errorRecordStore.toSummary(record);
+    } catch (err) {
+      console.warn(`[tmux-probe] record runtime issue for ${agent.id} failed:`, err);
+      return undefined;
+    }
+  }
+
+  private async recordProbeError(
+    agent: AgentConfig,
+    occurredAt: string,
+    message: string | undefined,
+  ): Promise<AgentErrorSummary | undefined> {
+    if (!this.errorRecordStore) return undefined;
+    const projectId = projectIdForAgent(this.config, agent.id) ?? '';
+    const record = await this.errorRecordStore.append({
+      agentId: agent.id,
+      projectId,
+      operation: 'tmux-probe',
+      reason: 'TMUX_UNREACHABLE',
+      message: message ?? 'tmux probe failed',
+      occurredAt,
+      observation: { tmuxSessionStatus: 'unreachable' },
+      recommendation: 'Check host connectivity and tmux availability, then retry the agent.',
+    });
+    return this.errorRecordStore.toSummary(record);
+  }
+
+  private logTransition(
+    agentId: string,
+    from: TmuxSessionStatus,
+    to: TmuxSessionStatus,
+    error?: string,
+  ): void {
+    if (from === to) return;
+    const suffix = error ? `: ${error}` : '';
+    console.log(`[tmux-session] ${agentId} ${from} -> ${to}${suffix}`);
+  }
+
+  private async runProbe(
+    agent: AgentConfig,
+    tmux: TmuxManager,
+  ): Promise<{ tmuxSessionStatus: TmuxSessionStatus; error?: string }> {
+    try {
+      const isPresent = await tmux.hasSession(agent.id, { timeout: this.probeTimeoutMs });
+      return { tmuxSessionStatus: isPresent ? 'present' : 'absent' };
+    } catch (err) {
+      return {
+        tmuxSessionStatus: 'unreachable',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+}
+
+function uniqueAgents(config: BaxianConfig): AgentConfig[] {
+  return [...buildInstanceIndex(config).values()];
+}
+
+function buildInstanceIndex(config: BaxianConfig): Map<string, AgentConfig> {
+  const byId = new Map<string, AgentConfig>();
+  for (const project of config.project) {
+    for (const pair of project.agent) {
+      for (const agent of pair) {
+        byId.set(agent.id, agent);
+      }
+    }
+  }
+  return byId;
+}
+
+function projectIdForAgent(config: BaxianConfig, agentId: string): string | undefined {
+  for (const project of config.project) {
+    for (const pair of project.agent) {
+      if (pair.some(agent => agent.id === agentId)) return project.id;
+    }
+  }
+  return undefined;
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const item = items[index++];
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
+}
