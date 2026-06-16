@@ -26,6 +26,11 @@ export async function resolveEventRouting(
     }
   }
 
+  if (branch) {
+    const task = await manager.findTaskByBranch(branch, projectId);
+    if (task) return { taskId: task.id, agentId: task.agentId };
+  }
+
   if (typeof prNumber === 'number') {
     const tasks = await manager.listTasksByPrNumber(prNumber, projectId);
     if (tasks.length > 0) {

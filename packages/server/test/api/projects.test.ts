@@ -121,6 +121,29 @@ describe('POST /api/projects', () => {
     expect(body.project.merge).toBeNull();
   });
 
+  it('persists project review mode when provided', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { id: 'serverproj', repo: 'a/server', review: { mode: 'server' } },
+    });
+    expect(response.statusCode).toBe(201);
+    const body = JSON.parse(response.body);
+    expect(body.project.review).toEqual({ mode: 'server' });
+    expect(app.ctx.config.project.find(p => p.id === 'serverproj')?.review?.mode).toBe('server');
+  });
+
+  it('defaults non-github projects to server review mode', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git' },
+    });
+    expect(response.statusCode).toBe(201);
+    const body = JSON.parse(response.body);
+    expect(body.project.review).toEqual({ mode: 'server' });
+  });
+
   it('returns 409 on duplicate project id', async () => {
     const response = await app.inject({
       method: 'POST',

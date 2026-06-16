@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mapGitHubEvent } from '../../src/github/mapper.js';
+import { isManagedPr, mapGitHubEvent } from '../../src/github/mapper.js';
 
 const REPO = 'user/repo';
 
@@ -466,5 +466,46 @@ describe('mapGitHubEvent', () => {
       repository: { full_name: REPO },
     };
     expect(mapGitHubEvent('deployment', payload)).toBeNull();
+  });
+});
+
+const MARKER = '<!-- baxian:managed -->';
+
+describe('isManagedPr with knownBranches', () => {
+  it('bx/ prefix + body marker → true (no Set needed)', () => {
+    expect(isManagedPr('bx/task-001', MARKER)).toBe(true);
+  });
+
+  it('bx/ prefix + no Set → true (backward compat)', () => {
+    expect(isManagedPr('bx/task-001', MARKER, undefined)).toBe(true);
+  });
+
+  it('custom branch in knownBranches + body marker → true', () => {
+    const set = new Set(['feat/my-feature']);
+    expect(isManagedPr('feat/my-feature', MARKER, set)).toBe(true);
+  });
+
+  it('custom branch in knownBranches + no body marker → false', () => {
+    const set = new Set(['feat/my-feature']);
+    expect(isManagedPr('feat/my-feature', 'no marker here', set)).toBe(false);
+  });
+
+  it('custom branch NOT in knownBranches + body marker → false', () => {
+    const set = new Set(['other/branch']);
+    expect(isManagedPr('feat/my-feature', MARKER, set)).toBe(false);
+  });
+
+  it('non-bx/ branch + no Set + body marker → false', () => {
+    expect(isManagedPr('feat/my-feature', MARKER)).toBe(false);
+  });
+
+  it('null body → false regardless of branch or Set', () => {
+    const set = new Set(['feat/my-feature']);
+    expect(isManagedPr('feat/my-feature', null, set)).toBe(false);
+    expect(isManagedPr('bx/task-001', null)).toBe(false);
+  });
+
+  it('empty Set behaves like no Set', () => {
+    expect(isManagedPr('feat/my-feature', MARKER, new Set())).toBe(false);
   });
 });

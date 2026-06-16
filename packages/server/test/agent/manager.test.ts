@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager, DispatchTerminalError, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
 import { prepareConfig } from '../../src/config/loader.js';
 import { ApiError } from '../../src/errors.js';
@@ -21,7 +22,7 @@ const NOW = '2026-05-14T05:00:00.000Z';
 
 const CONFIG: BaxianConfig = {
   review: { rounds: 2 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'proj',
     repo: 'user/repo',
@@ -263,6 +264,91 @@ describe('AgentManager task binding flow', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
+  it('createTask stores custom branch in TaskState', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    const created = await manager.createTask('proj', {
+      title: 'custom branch',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: 'feat/my-feature',
+    });
+    expect(created.branch).toBe('feat/my-feature');
+  });
+
+  it('createTask rejects branch names starting with a dash', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await expect(manager.createTask('proj', {
+      title: 'bad branch',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: '-flag-like',
+    })).rejects.toThrow(/Invalid branch name/);
+  });
+
+  it('createTask rejects branch names containing ".."', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await expect(manager.createTask('proj', {
+      title: 'bad branch',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: 'feat/../escape',
+    })).rejects.toThrow(/Invalid branch name/);
+  });
+
+  it('createTask rejects custom branch starting with reserved bx/ prefix', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await expect(manager.createTask('proj', {
+      title: 'reserved prefix',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: 'bx/task-other',
+    })).rejects.toThrow(/reserved prefix/);
+  });
+
+  it('createTask rejects branch names containing "@{"', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await expect(manager.createTask('proj', {
+      title: 'bad branch',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: 'feat@{0}',
+    })).rejects.toThrow(/Invalid branch name/);
+  });
+
+  it.each([
+    'feat/.hidden',
+    'feat/foo.lock',
+    'feat/',
+    'feat//x',
+    'feat/x.',
+  ])('createTask rejects git-invalid branch name: %s', async (branch) => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await expect(manager.createTask('proj', {
+      title: 'bad branch',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch,
+    })).rejects.toThrow(/Invalid branch name/);
+  });
+
+  it('createTask rejects duplicate custom branch within the same project', async () => {
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await manager.createTask('proj', {
+      title: 'first',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: 'feat/unique',
+    });
+
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await expect(manager.createTask('proj', {
+      title: 'second',
+      description: 'details',
+      preferredAgentId: 'dev-1',
+      branch: 'feat/unique',
+    })).rejects.toThrow(/already bound to task/);
+  });
+
   it('cancelTask delegates releaseAgentForTask for dev and qa after cancelling the task', async () => {
     const t = task({ qaAgentId: 'qa-1' });
     await taskStore.set(t);
@@ -454,7 +540,7 @@ describe('AgentManager task binding flow', () => {
 
     expect(created.status).toBe('in_progress');
     await holdDone;
-    expect(holdSpy).toHaveBeenCalledWith(created.id, 'dev-1', ['spec-done', 'pr-created']);
+    expect(holdSpy).toHaveBeenCalledWith(created.id, 'dev-1', ['spec-done', 'code-done']);
   });
 
   it('createAndStartTask: a cancel before delivery releases the agent from the now-terminal task', async () => {
@@ -4605,24 +4691,39 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     });
   }
 
-  function cfg(opts: { mode?: 'github' | 'server'; afterDone?: 'pr' | 'branch' | null; glHasQa?: boolean }): BaxianConfig {
+  function cfg(opts: {
+    mode?: 'github' | 'server';
+    afterDone?: 'pr' | 'branch' | null;
+    ghReviewMode?: 'github' | 'server';
+    glReviewMode?: 'github' | 'server';
+    glHasQa?: boolean;
+  }): BaxianConfig {
     const dev = { id: 'gldev', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: '/tmp/repo' };
     const qa = { id: 'glqa', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: '/tmp/repo' };
+    const mode = opts.mode ?? 'server';
     return {
       review: {
         rounds: 2,
-        ...(opts.mode ? { mode: opts.mode } : {}),
+        mode,
         ...(opts.afterDone !== undefined ? { afterDone: opts.afterDone } : {}),
       },
-      server: { port: 3000 },
+      server: DEFAULT_SERVER_CONFIG,
       project: [
-        { id: 'gh', repo: 'user/repo', merge: null, agent: [] },
-        { id: 'gl', repo: GL, merge: null, agent: [opts.glHasQa === false ? [dev] : [dev, qa]] },
+        {
+          id: 'gh', repo: 'user/repo', merge: null,
+          review: { mode: opts.ghReviewMode ?? mode },
+          agent: [],
+        },
+        {
+          id: 'gl', repo: GL, merge: null,
+          review: { mode: opts.glReviewMode ?? 'server' },
+          agent: [opts.glHasQa === false ? [dev] : [dev, qa]],
+        },
       ],
     };
   }
 
-  it('effectiveReviewMode: non-github forced to server; github honors global mode', () => {
+  it('effectiveReviewMode: project override wins for github repos; non-github stays server', () => {
     const mGh = makeMgr(cfg({ mode: 'github' }));
     expect(mGh.effectiveReviewMode('gh')).toBe('github');
     expect(mGh.effectiveReviewMode('gl')).toBe('server');
@@ -4632,8 +4733,33 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     expect(mSrv.effectiveReviewMode('gl')).toBe('server');
 
     const mDef = makeMgr(cfg({}));
-    expect(mDef.effectiveReviewMode('gh')).toBe('github');   // default normalizes to github
+    expect(mDef.effectiveReviewMode('gh')).toBe('server');
     expect(mDef.effectiveReviewMode('gl')).toBe('server');
+
+    const mMixed = makeMgr(cfg({ mode: 'server', ghReviewMode: 'github', glReviewMode: 'server' }));
+    expect(mMixed.effectiveReviewMode('gh')).toBe('github');
+    expect(mMixed.effectiveReviewMode('gl')).toBe('server');
+
+    const mProjectServer = makeMgr(cfg({ mode: 'github', ghReviewMode: 'server' }));
+    expect(mProjectServer.effectiveReviewMode('gh')).toBe('server');
+  });
+
+  it('createTask snapshots the project review mode override', async () => {
+    const githubOverride = makeMgr(cfg({ mode: 'server', ghReviewMode: 'github' }));
+    const githubTask = await githubOverride.createTask('gh', {
+      title: 'T',
+      description: 'D',
+      preferredAgentId: '',
+    });
+    expect(githubTask.reviewMode).toBe('github');
+
+    const serverOverride = makeMgr(cfg({ mode: 'github', ghReviewMode: 'server' }));
+    const serverTask = await serverOverride.createTask('gh', {
+      title: 'T',
+      description: 'D',
+      preferredAgentId: '',
+    });
+    expect(serverTask.reviewMode).toBe('server');
   });
 
   it('resolveAfterDone: non-github coerces pr/unset → branch; explicit null honored; github unchanged', () => {
@@ -4660,12 +4786,12 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     expect(m.resolveAfterDone(task({ projectId: 'gl', afterDone: null }))).toBe(null);
   });
 
-  it('createTask refuses a server-mode (non-github) dev that has no QA partner', async () => {
+  it('createTask allows a server-mode (non-github) dev without QA partner', async () => {
     await agentStore.set({ id: 'gldev', projectId: 'gl', updatedAt: NOW });
     const m = makeMgr(cfg({ glHasQa: false }));
-    await expect(
-      m.createTask('gl', { title: 'T', description: 'D', preferredAgentId: 'gldev' }),
-    ).rejects.toThrow(/needs a QA partner/i);
+    const created = await m.createTask('gl', { title: 'T', description: 'D', preferredAgentId: 'gldev' });
+    expect(created.reviewMode).toBe('server');
+    expect(created.qaAgentId).toBeUndefined();
   });
 
   it('createTask allows a non-github dev that DOES have a QA partner (snapshots server mode)', async () => {
@@ -4674,22 +4800,6 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     const created = await m.createTask('gl', { title: 'T', description: 'D', preferredAgentId: 'gldev' });
     expect(created.reviewMode).toBe('server');
     expect(created.qaAgentId).toBe('glqa');
-  });
-
-  it('createTask with a no-QA server dev rejects BEFORE staging images (no orphaned task-images)', async () => {
-    await agentStore.set({ id: 'gldev', projectId: 'gl', updatedAt: NOW });
-    const m = makeMgr(cfg({ glHasQa: false }));
-    const persistSpy = vi.spyOn(
-      m as unknown as { persistTaskImages: (...a: unknown[]) => unknown },
-      'persistTaskImages',
-    );
-    await expect(
-      m.createTask('gl', {
-        title: 'T', description: 'D', preferredAgentId: 'gldev',
-        images: [{ bytes: Buffer.from('x'), ext: 'png' }],
-      }),
-    ).rejects.toThrow(/needs a QA partner/i);
-    expect(persistSpy).not.toHaveBeenCalled();
   });
 
   it('resolveAfterDone through prepareConfig: non-github with omitted afterDone delivers (branch)', () => {

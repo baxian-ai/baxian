@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { redactConfig, redactHosts, redactProjects } from '../../src/api/config.js';
 import type { BaxianConfig } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
 describe('password redaction (f-3 recursive contract)', () => {
   it('redactHosts replaces top-level registry passwords with ***', () => {
@@ -28,7 +29,7 @@ describe('password redaction (f-3 recursive contract)', () => {
   it('redactConfig covers both the registry and inline agent hosts in one pass', () => {
     const config: BaxianConfig = {
       review: { rounds: 10 },
-      server: { port: 3000, token: 'tok' },
+      server: { ...DEFAULT_SERVER_CONFIG, token: 'tok' },
       host: [{ id: 'box', hostname: 'h', password: 'regpw' }],
       project: [{
         id: 'p', repo: 'u/r', merge: null,

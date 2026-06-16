@@ -11,6 +11,7 @@ import { EventLog } from '../../src/event/log.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { BaxianConfig, TaskState } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
@@ -18,7 +19,7 @@ const GIF = Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0]);
 
 const CONFIG: BaxianConfig = {
   review: { rounds: 10 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'proj',
     repo: 'user/repo',

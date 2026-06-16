@@ -11,11 +11,12 @@ import { EventLog } from '../../src/event/log.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 const CONFIG: BaxianConfig = {
   review: { rounds: 10 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [
     {
       id: 'proj',

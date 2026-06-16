@@ -32,7 +32,12 @@ export interface ProjectConfig {
   id: string;
   repo: string;
   merge: MergeStrategy;
+  review?: ProjectReviewConfig;
   agent: AgentConfig[][];
+}
+
+export interface ProjectReviewConfig {
+  mode?: ReviewMode;
 }
 
 export interface ReviewConfig {
@@ -42,7 +47,7 @@ export interface ReviewConfig {
    * same numeric cap. If the two ever need to diverge, split this field then.
    */
   rounds: number;
-  /** 'github' (default) keeps PR-based review; 'server' uses the server-mediated protocol. */
+  /** 'github' keeps PR-based review; 'server' uses the server-mediated protocol. */
   mode?: ReviewMode;
   /** Server mode only: what dev publishes after QA approves. Ignored when mode==='github'. */
   afterDone?: AfterDone;
@@ -57,8 +62,8 @@ export interface HttpsConfig {
 
 export interface ServerConfig {
   port: number;
+  host: string;
   token?: string;
-  host?: string;
   /** When set, server listens with TLS instead of plain HTTP. */
   https?: HttpsConfig;
   /**
@@ -66,12 +71,11 @@ export interface ServerConfig {
    * Set in production to mitigate Host-header attacks.
    */
   allowedHosts?: string[];
-  /** Per-repo poller cadence in ms. Default 30_000. */
-  githubPollIntervalMs?: number;
-  tmuxProbePollIntervalMs?: number;
-  tmuxProbeTimeoutMs?: number;
-  tmuxProbeConcurrency?: number;
-  bootstrapRetryIntervalMs?: number;
+  githubPollIntervalMs: number;
+  tmuxProbePollIntervalMs: number;
+  tmuxProbeTimeoutMs: number;
+  tmuxProbeConcurrency: number;
+  bootstrapRetryIntervalMs: number;
 }
 
 export interface BaxianConfig {

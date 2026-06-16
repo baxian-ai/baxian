@@ -3,6 +3,7 @@ import { mkdtemp, rm, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  formatServerRunningMessage,
   migrateLegacyPollerStateFile,
   pickExistingPath,
 } from '../src/index.js';
@@ -32,6 +33,27 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true });
 });
 
+
+describe('formatServerRunningMessage', () => {
+  it('prints the default server URL in the startup line', () => {
+    expect(formatServerRunningMessage('127.0.0.1', 3000, false)).toBe(
+      'baxian server running on http://127.0.0.1:3000',
+    );
+  });
+
+  it('uses the actual bound host instead of replacing wildcard bind addresses', () => {
+    const message = formatServerRunningMessage('0.0.0.0', 8080, false);
+
+    expect(message).toBe('baxian server running on http://0.0.0.0:8080');
+    expect(message).not.toMatch(/Open .*browser/i);
+  });
+
+  it('formats HTTPS IPv6 hosts as a valid URL authority', () => {
+    expect(formatServerRunningMessage('::', 3443, true)).toBe(
+      'baxian server running on https://[::]:3443',
+    );
+  });
+});
 
 describe('migrateLegacyPollerStateFile', () => {
   let stateRoot: string;

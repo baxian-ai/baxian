@@ -6,6 +6,7 @@ import { GitHubPoller, pollerStatePathFor, type PollerOptions } from '../../src/
 import type { MappedEvent } from '../../src/github/mapper.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
 import type { BaxianConfig, ProjectConfig } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
 function makeRunner(responses: Record<string, string>) {
   return {
@@ -398,6 +399,54 @@ describe('GitHubPoller', () => {
     expect(emitted).toHaveLength(0);
     const reviewCalls = runner.exec.mock.calls.filter((c) => c[0].includes('/pulls/15'));
     expect(reviewCalls).toHaveLength(0);
+  });
+
+  it('emits pr.created for custom branch PR when knownBranchesFor includes it', async () => {
+    const prData = JSON.stringify([
+      {
+        number: 20,
+        head: { ref: 'feat/my-feature', sha: 'cafe0000cafe0000cafe0000cafe0000cafe0000' },
+        html_url: 'https://github.com/user/repo/pull/20',
+        body: '<!-- baxian:managed -->',
+        state: 'open',
+        merged_at: null,
+        updated_at: '2026-04-30T00:00:00Z',
+      },
+    ]);
+    const runner = makeRunner({ '/pulls?': prData });
+    const emitted: MappedEvent[] = [];
+    const opts: PollerOptions = {
+      runner,
+      onEvent: (_projectId, e) => emitted.push(e),
+      knownBranchesFor: async () => new Set(['feat/my-feature']),
+    };
+    const poller = new GitHubPoller(opts);
+    const entry = poller.add({ projectId: 'test-proj', repo: REPO });
+
+    await poller.pollPullRequests(entry);
+
+    expect(emitted.some(e => e.type === 'pr.created' && e.data.branch === 'feat/my-feature')).toBe(true);
+  });
+
+  it('filters out custom branch PR when knownBranchesFor is not injected', async () => {
+    const prData = JSON.stringify([
+      {
+        number: 21,
+        head: { ref: 'feat/other', sha: 'dead0000dead0000dead0000dead0000dead0000' },
+        html_url: 'https://github.com/user/repo/pull/21',
+        body: '<!-- baxian:managed -->',
+        state: 'open',
+        merged_at: null,
+        updated_at: '2026-04-30T00:00:00Z',
+      },
+    ]);
+    const runner = makeRunner({ '/pulls?': prData });
+    const emitted: MappedEvent[] = [];
+    const { poller, entry } = makePoller(runner, (e) => emitted.push(e));
+
+    await poller.pollPullRequests(entry);
+
+    expect(emitted).toHaveLength(0);
   });
 
   it('emits pr.updated for review-line comments with prUrl', async () => {
@@ -1329,7 +1378,7 @@ describe('GitHubPoller', () => {
     function makeConfig(projects: ProjectConfig[], githubPollIntervalMs?: number): BaxianConfig {
       return {
         review: { rounds: 1 },
-        server: { port: 3000, ...(githubPollIntervalMs ? { githubPollIntervalMs } : {}) },
+        server: { ...DEFAULT_SERVER_CONFIG, ...(githubPollIntervalMs !== undefined ? { githubPollIntervalMs } : {}) },
         project: projects,
       };
     }

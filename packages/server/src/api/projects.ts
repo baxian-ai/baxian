@@ -143,7 +143,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy } }>(
+  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; review?: ProjectConfig['review'] } }>(
     '/projects',
     async (request, reply) => {
       if (!app.ctx.configPath) {
@@ -151,7 +151,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       return withConfigLock(async () => {
-        const { id, repo, merge } = request.body ?? {};
+        const { id, repo, merge, review } = request.body ?? {};
         if (!id || typeof id !== 'string') {
           return reply.status(400).send({ error: 'id must be a non-empty string' });
         }
@@ -166,6 +166,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           id,
           repo,
           merge: merge ?? null,
+          ...(review !== undefined ? { review } : {}),
           agent: [],
         };
 

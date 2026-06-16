@@ -98,9 +98,6 @@ export interface TmuxProbePollerOptions {
   now?: () => number;
 }
 
-const DEFAULT_INTERVAL_MS = 10_000;
-const DEFAULT_PROBE_TIMEOUT_MS = 3_000;
-const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_FAILURE_THRESHOLD = 2;
 const PENDING_IDLE_AFTER_MS = 5 * 60 * 1000;
 
@@ -132,9 +129,9 @@ export class TmuxProbePoller {
     this.errorRecordStore = options.errorRecordStore;
     this.runnerFactory = options.runnerFactory;
     this.now = options.now ?? Date.now;
-    this.pollIntervalMs = options.intervalMs ?? options.config.server.tmuxProbePollIntervalMs ?? DEFAULT_INTERVAL_MS;
-    this.probeTimeoutMs = options.probeTimeoutMs ?? options.config.server.tmuxProbeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-    this.concurrency = options.concurrency ?? options.config.server.tmuxProbeConcurrency ?? DEFAULT_CONCURRENCY;
+    this.pollIntervalMs = options.intervalMs ?? options.config.server.tmuxProbePollIntervalMs;
+    this.probeTimeoutMs = options.probeTimeoutMs ?? options.config.server.tmuxProbeTimeoutMs;
+    this.concurrency = options.concurrency ?? options.config.server.tmuxProbeConcurrency;
     this.failureThreshold = options.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
     this.validInstances = buildInstanceIndex(options.config);
     this.periodicRunner = new PeriodicTaskRunner({
@@ -157,11 +154,9 @@ export class TmuxProbePoller {
     for (const id of allKnownIds) {
       if (!this.validInstances.has(id)) this.purgeAgent(id);
     }
-    // Cleared field must revert to default, not freeze the prior runtime value —
-    // PATCH /config dropping the key signals "use default", not "keep current".
-    this.probeTimeoutMs = validated.server.tmuxProbeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-    this.concurrency = validated.server.tmuxProbeConcurrency ?? DEFAULT_CONCURRENCY;
-    const nextIntervalMs = validated.server.tmuxProbePollIntervalMs ?? DEFAULT_INTERVAL_MS;
+    this.probeTimeoutMs = validated.server.tmuxProbeTimeoutMs;
+    this.concurrency = validated.server.tmuxProbeConcurrency;
+    const nextIntervalMs = validated.server.tmuxProbePollIntervalMs;
     if (nextIntervalMs !== this.pollIntervalMs) {
       this.pollIntervalMs = nextIntervalMs;
       this.periodicRunner.reschedule(nextIntervalMs);

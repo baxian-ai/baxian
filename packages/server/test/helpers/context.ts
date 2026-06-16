@@ -2,6 +2,7 @@ import { vi } from 'vitest';
 import { join } from 'node:path';
 import { mkdir, writeFile } from 'node:fs/promises';
 import type { BaxianConfig } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { initStateDir } from '../../src/state/init.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -35,7 +36,7 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
 
   const config: BaxianConfig = {
     review: { rounds: 10 },
-    server: { port: 3000 },
+    server: DEFAULT_SERVER_CONFIG,
     host: [],
     project: [{
       id: 'proj',

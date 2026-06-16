@@ -10,6 +10,7 @@ import type {
   ReviewResponse,
   TaskState,
 } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
 const DEV = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', projectId: 'proj' };
 const QA = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', projectId: 'proj' };
@@ -81,9 +82,10 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     readFileRange: vi.fn(async () => ''),
     readHeadSha: vi.fn(async () => 'head123'),
   };
-  const transitionTaskStatus = vi.fn(async (id: string, to: TaskState['status']) => {
+  const transitionTaskStatus = vi.fn(async (id: string, to: TaskState['status'], _guard?: unknown, patch?: unknown) => {
     calls.transitionTaskStatus.push([id, to]);
     task.status = to;
+    if (patch && typeof patch === 'object') Object.assign(task, patch);
     return { task, previousStatus: task.status };
   });
   const releaseAgentForTask = vi.fn(async (agentId: string, taskId: string, mode: string, opts?: unknown) => {
@@ -98,9 +100,10 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     getReviewTransport: () => transport,
     getTask: async () => task,
     getAgentConfig: (id: string) => (id === DEV.id ? DEV : id === QA.id ? QA : undefined),
+    findQaPartner: (devId: string) => (devId === DEV.id && task.qaAgentId ? QA : undefined),
     getConfig: () => ({
       review: { rounds: config.rounds ?? 10, mode: 'server', afterDone: config.afterDone ?? null },
-      server: { port: 3000 },
+      server: DEFAULT_SERVER_CONFIG,
       host: [],
       project: [{ id: 'proj', repo: 'u/r', merge: null, agent: [] }],
     }),
@@ -207,6 +210,61 @@ describe('server.code.ready', () => {
     expect(opts.batch).toEqual({ index: 0, total: 2 });
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.batchFindings).toEqual([]);
+  });
+});
+
+describe('no-QA auto-approve', () => {
+  it('code-done without QA partner → auto-approve to ready (afterDone null)', async () => {
+    const fx = makeFixture({ qaAgentId: undefined });
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
+  });
+
+  it('code-done without QA partner → auto-approve to approved + afterDone with reviewHeadAnchorSha', async () => {
+    const fx = makeFixture({ qaAgentId: undefined }, { afterDone: 'branch' });
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.transport.readHeadSha).toHaveBeenCalled();
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'approved']);
+    const approvedCall = fx.transitionTaskStatus.mock.calls.find(
+      (c: unknown[]) => c[1] === 'approved',
+    )!;
+    expect(approvedCall[3]).toEqual({ reviewHeadAnchorSha: 'head123' });
+    expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'branch']);
+  });
+
+  it('code-done without QA partner → head capture failure re-arms code-done', async () => {
+    const fx = makeFixture({ qaAgentId: undefined }, { afterDone: 'branch' });
+    fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git failed'));
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.calls.transitionTaskStatus).toHaveLength(0);
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-done']);
+    expect(fx.emitted.some(e => e.type === 'human.intervention'
+      && (e.data as Record<string, unknown>)?.phase === 'server-code-auto-approve-head-capture-failed')).toBe(true);
+  });
+
+  it('spec-done without QA partner → auto-approve spec, transition to code phase', async () => {
+    const fx = makeFixture({ qaAgentId: undefined, phase: undefined });
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
+  });
+
+  it('no-QA afterDone publish lifecycle: code-done → approved → published → ready', async () => {
+    const fx = makeFixture({ qaAgentId: undefined }, { afterDone: 'branch' });
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.task.reviewHeadAnchorSha).toBe('head123');
+    expect(fx.task.status).toBe('approved');
+    fx.task.signalToken = 'pub-tok';
+    await fx.emit('server.code.published', { token: 'pub-tok', kind: 'code-ready', prNumber: 42 });
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
+  });
+
+  it('code-done WITH QA partner still dispatches review', async () => {
+    const fx = makeFixture();
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
   });
 });
 

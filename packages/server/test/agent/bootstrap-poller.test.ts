@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentConfig, BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
@@ -16,7 +17,7 @@ const devAgent: AgentConfig = {
   id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', // no workdir → auto mode
 };
 const config: BaxianConfig = {
-  github: {} as never, review: { rounds: 10 }, server: { port: 3000 },
+  github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
   project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent]] }],
 };
 const noopRunner = {
@@ -176,7 +177,7 @@ describe('BootstrapPoller', () => {
 
   describe('pollProject (user-triggered retry)', () => {
     const cfgTwoProjects: BaxianConfig = {
-      github: {} as never, review: { rounds: 10 }, server: { port: 3000 },
+      github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [
         { id: 'p-yes', repo: 'u/r1', merge: null, agent: [[{ ...devAgent, id: 'dev-yes' }]] },
         { id: 'p-no', repo: 'u/r2', merge: null, agent: [[{ ...devAgent, id: 'dev-no' }]] },
@@ -262,7 +263,7 @@ describe('BootstrapPoller', () => {
   });
 
   describe('replaceConfig reschedule', () => {
-    it('clearing bootstrapRetryIntervalMs reverts to DEFAULT_INTERVAL_MS (60s), not the stale runtime value', async () => {
+    it('clearing bootstrapRetryIntervalMs reverts to DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS (60s), not the stale runtime value', async () => {
       vi.useFakeTimers();
       vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
       const ensure = vi.fn().mockResolvedValue('/repo/path');
@@ -286,7 +287,7 @@ describe('BootstrapPoller', () => {
 
       poller.replaceConfig({
         ...customConfig,
-        server: { port: 3000 },
+        server: DEFAULT_SERVER_CONFIG,
       });
 
       await vi.advanceTimersByTimeAsync(59_999);

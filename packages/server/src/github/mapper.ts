@@ -60,11 +60,16 @@ export function extractReviewPassToken(body: string | null | undefined): string 
 }
 
 // Missing body passes; explicit null means no marker.
-export function isManagedPr(branch: string, body: string | null | undefined): boolean {
-  if (!branch.startsWith(BRANCH_PREFIX)) return false;
+export function isManagedPr(
+  branch: string,
+  body: string | null | undefined,
+  knownBranches?: ReadonlySet<string>,
+): boolean {
   if (body === null) return false;
   if (typeof body === 'string' && !body.includes(BAXIAN_PR_CLAIM)) return false;
-  return true;
+  if (branch.startsWith(BRANCH_PREFIX)) return true;
+  if (knownBranches?.has(branch) === true) return true;
+  return false;
 }
 
 export function mapGitHubEvent(

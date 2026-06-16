@@ -82,6 +82,40 @@ describe('resolveEventRouting', () => {
     expect(result).toEqual({});
   });
 
+  it('routes via custom branch (non-bx/ prefix) when task.branch matches', async () => {
+    const ctx = await createTestContext(tempDir);
+    await seedTask(ctx.taskStore, { id: 'task-010', branch: 'feat/my-feature' });
+    const result = await resolveEventRouting(ctx.agentManager, {
+      type: 'pr.created',
+      repo: 'user/repo',
+      data: { branch: 'feat/my-feature' },
+    });
+    expect(result.taskId).toBe('task-010');
+    expect(result.agentId).toBe('dev-1');
+  });
+
+  it('does not route custom branch from a different project', async () => {
+    const ctx = await createTestContext(tempDir);
+    await seedTask(ctx.taskStore, { id: 'task-011', branch: 'feat/other', projectId: 'other-project' });
+    const result = await resolveEventRouting(ctx.agentManager, {
+      type: 'pr.created',
+      repo: 'user/repo',
+      data: { branch: 'feat/other' },
+    });
+    expect(result).toEqual({});
+  });
+
+  it('prefers bx/ prefix route over custom branch fallback', async () => {
+    const ctx = await createTestContext(tempDir);
+    await seedTask(ctx.taskStore, { id: 'task-012', branch: 'bx/task-012' });
+    const result = await resolveEventRouting(ctx.agentManager, {
+      type: 'pr.created',
+      repo: 'user/repo',
+      data: { branch: 'bx/task-012' },
+    });
+    expect(result.taskId).toBe('task-012');
+  });
+
   it('routes when project.repo is configured as a git URL (poller events carry the slug)', async () => {
     const ctx = await createTestContext(tempDir);
     await seedTask(ctx.taskStore, { id: 'task-009', branch: 'bx/task-009' });

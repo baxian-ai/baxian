@@ -31,7 +31,7 @@ import { GitHubPoller, pollerStatePathFor } from './github/poller.js';
 import { resolveEventRouting } from './github/resolver.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
 import type { AgentConfig, HostConfig } from './shared/index.js';
-import { isGitHubRepo, repoSlug } from './shared/index.js';
+import { BRANCH_PREFIX, isGitHubRepo, repoSlug } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
 import { buildApp } from './app.js';
@@ -74,6 +74,15 @@ export async function migrateLegacyPollerStateFile(
       return;
     }
   }
+}
+
+function formatUrlHost(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+export function formatServerRunningMessage(host: string, port: number, https: boolean): string {
+  const scheme = https ? 'https' : 'http';
+  return `baxian server running on ${scheme}://${formatUrlHost(host)}:${port}`;
 }
 
 export async function startServer(configPath?: string): Promise<void> {
@@ -254,6 +263,14 @@ export async function startServer(configPath?: string): Promise<void> {
 
     const poller = new GitHubPoller({
       runner: createRunner('local'),
+      knownBranchesFor: async (projectId) => {
+        const tasks = await agentManager.listTasksByProject(projectId);
+        return new Set(
+          tasks
+            .filter(t => t.branch && !t.branch.startsWith(BRANCH_PREFIX) && t.agentId)
+            .map(t => t.branch!),
+        );
+      },
       onEvent: async (projectId, mapped) => {
         const routing = await resolveEventRouting(agentManager, mapped);
         await eventBus.emit({
@@ -285,7 +302,7 @@ export async function startServer(configPath?: string): Promise<void> {
     poller.setLifecycleHook(() => {
       eventPublisher.publishPollersChange(() => poller.snapshots());
     });
-    poller.start(config.server.githubPollIntervalMs ?? 30_000);
+    poller.start(config.server.githubPollIntervalMs);
 
     const httpsOpts = config.server.https
       ? {
@@ -334,7 +351,7 @@ export async function startServer(configPath?: string): Promise<void> {
     });
     app.ctx.restartCoordinator = restartCoordinator;
 
-    const host = config.server.host ?? '127.0.0.1';
+    const host = config.server.host;
     if (host !== '127.0.0.1' && !config.server.token) {
       console.warn(
         `[baxian] server.host=${host} but no server.token configured — API is unauthenticated. Set a token before exposing the server.`,
@@ -343,12 +360,7 @@ export async function startServer(configPath?: string): Promise<void> {
     await app.listen({ port: config.server.port, host });
     tmuxProbePoller.start();
     bootstrapPoller.start();
-    // Print user-clickable URL. 0.0.0.0/:: bind addresses aren't connectable in browsers,
-    // so swap to 127.0.0.1 for the printed link; the underlying listen address is unchanged.
-    const browsable = host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host;
-    const scheme = config.server.https ? 'https' : 'http';
-    console.log(`baxian server running on ${host}:${config.server.port}`);
-    console.log(`Open ${scheme}://${browsable}:${config.server.port} in your browser to manage projects.`);
+    console.log(formatServerRunningMessage(host, config.server.port, Boolean(config.server.https)));
   } catch (err) {
     await releaseLockBestEffort();
     throw err;

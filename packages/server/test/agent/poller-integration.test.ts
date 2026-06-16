@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentConfig, BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -22,7 +23,7 @@ const devAgent: AgentConfig = {
 };
 const config: BaxianConfig = {
   review: { rounds: 10 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent]] }],
 };
 const noopRunner: CommandRunner = {

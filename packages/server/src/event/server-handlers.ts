@@ -187,6 +187,58 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     if (!armed) await manager.holdAgentForUnarmedSignal(task.id, agentId, kind);
   }
 
+  async function autoApproveCode(task: TaskState): Promise<void> {
+    const afterDone = manager.resolveAfterDone(task);
+    if (task.afterDone === undefined) {
+      await manager.updateTask(task.id, { afterDone });
+    }
+    if (afterDone === null) {
+      const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['in_progress'] });
+      if (!ready) await emitIntervention(bus, task, { phase: 'server-code-auto-approve-transition-failed' });
+      return;
+    }
+    const dev = manager.getAgentConfig(task.agentId);
+    if (!dev) {
+      await emitIntervention(bus, task, { phase: 'server-code-auto-approve-no-dev-agent' });
+      return;
+    }
+    await manager.refreshWorktreeCacheFor(task.agentId);
+    let reviewHeadAnchorSha: string;
+    try {
+      reviewHeadAnchorSha = await transport().readHeadSha(dev);
+    } catch (err) {
+      await emitIntervention(bus, task, {
+        phase: 'server-code-auto-approve-head-capture-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await manager.setupPhaseSignal(task.id, task.agentId, 'code-done', { skipSnapshot: true });
+      return;
+    }
+    const approved = await manager.transitionTaskStatus(
+      task.id, 'approved', { fromStatus: ['in_progress'] },
+      { reviewHeadAnchorSha },
+    );
+    if (!approved) {
+      await emitIntervention(bus, task, { phase: 'server-code-auto-approve-transition-failed' });
+      return;
+    }
+    await manager.dispatchServerAfterDone(task.id, afterDone);
+  }
+
+  async function autoApproveSpec(task: TaskState): Promise<void> {
+    try {
+      const result = await manager.transitionToCodePhase(task.id);
+      if (!result) {
+        await emitIntervention(bus, task, { phase: 'server-spec-auto-approve-transition-failed' });
+      }
+    } catch (err) {
+      await emitIntervention(bus, task, {
+        phase: 'server-spec-auto-approve-transition-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // Shared by code-done (first review) and code-fixed (recheck): read the dev
   // diff, persist the round, size/batch, dispatch QA.
   async function prepareAndDispatchCodeReview(
@@ -331,7 +383,13 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   bus.on('server.code.ready', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'code', requireServerMode: true });
     if (!gated) return;
-    await prepareAndDispatchCodeReview(gated.task, { recheck: false });
+    const { task } = gated;
+    const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
+    if (!hasQa) {
+      await autoApproveCode(task);
+      return;
+    }
+    await prepareAndDispatchCodeReview(task, { recheck: false });
   });
 
   bus.on('server.code.review.submitted', async (event) => {
@@ -650,7 +708,13 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   bus.on('server.spec.ready', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'any', requireServerMode: false });
     if (!gated) return;
-    await dispatchSpecReview(gated.task);
+    const { task } = gated;
+    const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
+    if (!hasQa) {
+      await autoApproveSpec(task);
+      return;
+    }
+    await dispatchSpecReview(task);
   });
 
   async function dispatchSpecReview(task: TaskState, prior?: { findingsJson: string; responseJson: string }): Promise<void> {

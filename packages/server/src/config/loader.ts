@@ -4,11 +4,18 @@ import { homedir } from 'node:os';
 import type { AfterDone, BaxianConfig, HostConfig, ProjectConfig, ReviewMode, ServerConfig } from '../shared/index.js';
 import {
   CONFIG_FILE,
+  DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
+  DEFAULT_GITHUB_POLL_INTERVAL_MS,
   DEFAULT_REVIEW_ROUNDS,
+  DEFAULT_SERVER_HOST,
   DEFAULT_SERVER_PORT,
+  DEFAULT_TMUX_PROBE_CONCURRENCY,
+  DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
+  DEFAULT_TMUX_PROBE_TIMEOUT_MS,
   STATE_DIR,
   USER_CONFIG_REL,
   USER_STATE_REL,
+  isGitHubRepo,
 } from '../shared/index.js';
 import { normalizeConfig } from './normalizer.js';
 import { validateConfig, type ValidationError } from './validator.js';
@@ -149,7 +156,7 @@ export function resolveStateDir(configPath: string): string {
 
 const DEFAULT_CONFIG_TEMPLATE = {
   review: { rounds: DEFAULT_REVIEW_ROUNDS },
-  server: { port: DEFAULT_SERVER_PORT, host: '127.0.0.1' },
+  server: { port: DEFAULT_SERVER_PORT, host: DEFAULT_SERVER_HOST },
   host: [] as HostConfig[],
   project: [] as ProjectConfig[],
 };
@@ -224,11 +231,12 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const hasHttps = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'https');
   const hasAllowedHosts = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'allowedHosts');
 
+  const reviewMode = (rv.mode === undefined ? 'server' : rv.mode) as ReviewMode;
+
   return {
     review: {
       rounds: isFiniteNumber(rv.rounds) ? rv.rounds : DEFAULT_REVIEW_ROUNDS,
-      // Raw values survive to the validator so misconfig surfaces as a clear error.
-      mode: (rv.mode === undefined ? 'github' : rv.mode) as ReviewMode,
+      mode: reviewMode,
       // Deliberately NOT defaulted to null: an OMITTED afterDone must stay distinguishable from
       // an explicit null so non-GitHub repos can deliver-by-default (unset → 'branch') while an
       // explicit null still means review-only (see AgentManager.coerceAfterDone). For GitHub both
@@ -237,38 +245,38 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
     },
     server: {
       port: isFiniteNumber(sv.port) ? sv.port : DEFAULT_SERVER_PORT,
-      ...(typeof sv.host === 'string' ? { host: sv.host } : {}),
+      host: typeof sv.host === 'string' ? sv.host : DEFAULT_SERVER_HOST,
       ...(typeof sv.token === 'string' && sv.token.trim().length > 0 ? { token: sv.token } : {}),
       ...(hasHttps ? { https: sv.https as unknown as ServerConfig['https'] } : {}),
       ...(hasAllowedHosts ? { allowedHosts: sv.allowedHosts as unknown as string[] } : {}),
-      // Type-narrow only; range checks live in the validator.
-      ...(isFiniteNumber(sv.githubPollIntervalMs)
-        ? { githubPollIntervalMs: sv.githubPollIntervalMs }
-        : {}),
-      ...(isFiniteNumber(sv.tmuxProbePollIntervalMs)
-        ? { tmuxProbePollIntervalMs: sv.tmuxProbePollIntervalMs }
-        : {}),
-      ...(isFiniteNumber(sv.tmuxProbeTimeoutMs)
-        ? { tmuxProbeTimeoutMs: sv.tmuxProbeTimeoutMs }
-        : {}),
-      ...(isFiniteNumber(sv.tmuxProbeConcurrency)
-        ? { tmuxProbeConcurrency: sv.tmuxProbeConcurrency }
-        : {}),
-      ...(isFiniteNumber(sv.bootstrapRetryIntervalMs)
-        ? { bootstrapRetryIntervalMs: sv.bootstrapRetryIntervalMs }
-        : {}),
+      githubPollIntervalMs: isFiniteNumber(sv.githubPollIntervalMs) ? sv.githubPollIntervalMs : DEFAULT_GITHUB_POLL_INTERVAL_MS,
+      tmuxProbePollIntervalMs: isFiniteNumber(sv.tmuxProbePollIntervalMs) ? sv.tmuxProbePollIntervalMs : DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
+      tmuxProbeTimeoutMs: isFiniteNumber(sv.tmuxProbeTimeoutMs) ? sv.tmuxProbeTimeoutMs : DEFAULT_TMUX_PROBE_TIMEOUT_MS,
+      tmuxProbeConcurrency: isFiniteNumber(sv.tmuxProbeConcurrency) ? sv.tmuxProbeConcurrency : DEFAULT_TMUX_PROBE_CONCURRENCY,
+      bootstrapRetryIntervalMs: isFiniteNumber(sv.bootstrapRetryIntervalMs) ? sv.bootstrapRetryIntervalMs : DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
     },
     host: hosts,
-    project: projects.map(p => ({
-      ...(p as unknown as ProjectConfig),
-      merge: (p.merge as ProjectConfig['merge'] | undefined) ?? null,
-      // yolo defaults true so legacy configs load; validator rejects explicit false.
-      agent: Array.isArray(p.agent)
-        ? (p.agent as unknown as Record<string, unknown>[][]).map(pair => pair.map(a => ({
-          ...a,
-          yolo: a.yolo === undefined ? true : a.yolo,
-        }))) as unknown as ProjectConfig['agent']
-        : [],
-    })),
+    project: projects.map(p => applyProjectDefaults(p, reviewMode)),
   };
+}
+
+function applyProjectDefaults(p: Record<string, unknown>, globalReviewMode: ReviewMode): ProjectConfig {
+  const project: ProjectConfig = {
+    ...(p as unknown as ProjectConfig),
+    merge: (p.merge as ProjectConfig['merge'] | undefined) ?? null,
+    // yolo defaults true so legacy configs load; validator rejects explicit false.
+    agent: Array.isArray(p.agent)
+      ? (p.agent as unknown as Record<string, unknown>[][]).map(pair => pair.map(a => ({
+        ...a,
+        yolo: a.yolo === undefined ? true : a.yolo,
+      }))) as unknown as ProjectConfig['agent']
+      : [],
+  };
+  const review = project.review as unknown;
+  if (review !== undefined && !isRecord(review)) return project;
+  if (isRecord(review) && review.mode !== undefined) return project;
+  const mode = typeof project.repo === 'string' && !isGitHubRepo(project.repo)
+    ? 'server'
+    : globalReviewMode;
+  return { ...project, review: { ...(isRecord(review) ? project.review : {}), mode } };
 }

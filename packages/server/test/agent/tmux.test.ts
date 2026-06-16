@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectBusy, detectReplActiveBusy, detectActiveRegionBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView } from '../../src/agent/tmux.js';
+import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectBusy, detectReplActiveBusy, detectActiveRegionBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, runtimeBusyCheck } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
@@ -528,7 +528,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('idle composer\n', 0);
       primeSnapshot('idle composer\n', 0);
       primeSnapshot('working\n  esc to interrupt\n', 0);
-      await expect(tmux.waitSubmitAck('%0', baseline, { timeoutMs: 1500, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
@@ -536,7 +536,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('composer still open\n', 5);
       let h = 5;
       runner.exec.mockImplementation(async () => ({ stdout: composeStdout('composer still open\n', ++h), stderr: '', exitCode: 0 }));
-      await expect(tmux.waitSubmitAck('%0', baseline, { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/runtime ack timeout/);
     });
 
@@ -545,14 +545,36 @@ describe('TmuxManager', () => {
       // even if the visible pane later changes, a busy baseline can never produce a trustworthy ack.
       let n = 0;
       runner.exec.mockImplementation(async () => ({ stdout: composeStdout(`do X\n  esc to interrupt\n[Image #1] frame ${n++}\n`, 3), stderr: '', exitCode: 0 }));
-      await expect(tmux.waitSubmitAck('%0', baseline, { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/runtime ack timeout/);
+    });
+
+    it('codex: stale esc-to-interrupt above → prompt is NOT busy baseline (position-aware)', async () => {
+      const baseline = buildBaseline('Working on it…\n  esc to interrupt\n→ baxian git:(main)\n', 0);
+      primeSnapshot('· Thinking… (2s)\n→ baxian git:(main)\n', 0);
+      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+        .resolves.toBeUndefined();
+    });
+
+    it('codex: pasted prompt containing "Working (8s)" is NOT busy baseline', async () => {
+      const baseline = buildBaseline('→ baxian git:(main)\nPlease explain this log:\nWorking (8s)\n', 0);
+      primeSnapshot('· Thinking… (2s)\n  esc to interrupt\n', 0);
+      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+        .resolves.toBeUndefined();
+    });
+
+    it('codex: full-screen spinner high on viewport acks after Enter', async () => {
+      const baseline = buildBaseline('→ baxian git:(main)\nidle prompt text\n', 0);
+      const lines = ['· Thinking… (2s)', ...Array(12).fill(''), '→ baxian git:(main)'].join('\n') + '\n';
+      primeSnapshot(lines, 0);
+      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+        .resolves.toBeUndefined();
     });
 
     it('throws "runtime ack timeout" when the pane stays idle (swallowed Enter)', async () => {
       const baseline = buildBaseline('idle composer\n', 0);
       runner.exec.mockResolvedValue({ stdout: composeStdout('idle composer\n', 0), stderr: '', exitCode: 0 });
-      await expect(tmux.waitSubmitAck('%0', baseline, { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/runtime ack timeout/);
     });
 
@@ -566,7 +588,7 @@ describe('TmuxManager', () => {
       }));
       const resend = vi.fn(async () => { submitted = true; });
       await expect(
-        tmux.waitSubmitAck('%0', baseline, { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
     });
@@ -582,7 +604,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -653,12 +675,41 @@ describe('TmuxManager', () => {
     });
 
     it('returns false (already past dialog) when ready anchor is already visible', async () => {
-      runner.exec.mockResolvedValueOnce({
-        stdout: '⏵⏵ bypass permissions on\n',
-        stderr: '', exitCode: 0,
-      });
+      runner.exec
+        .mockResolvedValueOnce({ stdout: '⏵⏵ bypass permissions on\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: '2.1.129\n', stderr: '', exitCode: 0 });
       const answered = await tmux.handleTrustDialog('%0', 'claude-code', { timeoutMs: 200, intervalMs: 50 });
       expect(answered).toBe(false);
+    });
+
+    it('returns false early for codex → prompt when runtime is running', async () => {
+      runner.exec
+        .mockResolvedValueOnce({ stdout: '→ baxian git:(main)\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: 'codex\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: '→ baxian git:(main)\n', stderr: '', exitCode: 0 });
+      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 200, intervalMs: 50 });
+      expect(answered).toBe(false);
+    });
+
+    it('stale shell → on first capture does not early-exit when fresh capture shows dialog', async () => {
+      runner.exec
+        .mockResolvedValueOnce({ stdout: '→ baxian git:(main)\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: 'codex\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: 'Do you trust the contents of this folder?\n› 1. Yes, continue\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: 'Do you trust the contents of this folder?\n› 1. Yes, continue\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });
+      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 2000, intervalMs: 50 });
+      expect(answered).toBe(true);
+    });
+
+    it('does not early-exit on shell → prompt before runtime starts, then handles trust dialog', async () => {
+      runner.exec
+        .mockResolvedValueOnce({ stdout: '→ baxian git:(main)\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: 'zsh\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: 'Do you trust the contents of this folder?\n› 1. Yes, continue\n', stderr: '', exitCode: 0 })
+        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });
+      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 2000, intervalMs: 50 });
+      expect(answered).toBe(true);
     });
 
     it('detects codex dialog text (different from claude phrasing)', async () => {
@@ -1195,8 +1246,123 @@ describe('hasRuntimeReadyView', () => {
     }
   });
 
+  it('rejects claude-code when spinner is high on tall pane (full-screen check)', () => {
+    const lines = [
+      '✽ Grooving… (5m 21s · thinking)',
+      ...Array(18).fill(''),
+      '❯ ',
+      '',
+    ];
+    expect(hasRuntimeReadyView(lines.join('\n'), 'claude-code')).toBe(false);
+  });
+
   it('does not apply the claude small-pane fallback to codex', () => {
     expect(hasRuntimeReadyView('❯ \n', 'codex')).toBe(false);
+  });
+
+  it('accepts codex idle prompt with → arrow', () => {
+    expect(hasRuntimeReadyView('→ baxian git:(main)\n', 'codex')).toBe(true);
+  });
+
+  it('does not accept bare › as codex idle via composer fallback (handled by READY_ANCHORS)', () => {
+    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(false);
+  });
+
+  it('rejects codex → prompt when busy spinner is active', () => {
+    const screen = '· Thinking… (5s)\n→ baxian git:(main)\n';
+    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
+  });
+
+  it('accepts codex → prompt when stale esc-to-interrupt is ABOVE the prompt', () => {
+    const screen = 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n';
+    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
+  });
+
+  it('rejects codex → prompt when esc-to-interrupt is BELOW the prompt (active busy)', () => {
+    const screen = '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n';
+    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
+  });
+
+  it('rejects codex → prompt when Working(...) is active in tail', () => {
+    const screen = '→ baxian git:(main)\n• Working (8s)\n';
+    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
+  });
+
+  it('does not accept → output line (e.g. → run tests) as codex idle prompt', () => {
+    expect(hasRuntimeReadyView('→ run tests\n', 'codex')).toBe(false);
+  });
+
+  it('does not accept indented → line as codex idle prompt', () => {
+    expect(hasRuntimeReadyView('  → baxian git:(main)\n', 'codex')).toBe(false);
+  });
+
+  it('rejects codex → prompt when output follows it', () => {
+    expect(hasRuntimeReadyView('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
+  });
+});
+
+describe('runtimeBusyCheck', () => {
+  it('codex: stale esc-to-interrupt above → prompt is NOT busy (position-aware)', () => {
+    const screen = 'Working on it…\n  esc to interrupt\n→ baxian git:(main)\n';
+    expect(runtimeBusyCheck(screen, 'codex')).toBe(false);
+  });
+
+  it('codex: active esc-to-interrupt below → prompt IS busy', () => {
+    const screen = '→ baxian git:(main)\nWorking on it…\n  esc to interrupt\n';
+    expect(runtimeBusyCheck(screen, 'codex')).toBe(true);
+  });
+
+  it('claude-code: spinner high on tall pane IS busy (full-screen check)', () => {
+    const lines = [
+      '✽ Grooving… (5m 21s · thinking)',
+      ...Array(18).fill(''),
+      '❯ ',
+      '',
+    ];
+    expect(runtimeBusyCheck(lines.join('\n'), 'claude-code')).toBe(true);
+  });
+
+  it('codex: same tall-pane spinner is NOT busy (position-aware only checks tail)', () => {
+    const lines = [
+      '✽ Grooving… (5m 21s · thinking)',
+      ...Array(18).fill(''),
+      '→ baxian git:(main)',
+      '',
+    ];
+    expect(runtimeBusyCheck(lines.join('\n'), 'codex')).toBe(false);
+  });
+});
+
+describe('hasRuntimeIdleComposerPrompt', () => {
+  it('detects codex → prompt in tail', () => {
+    const screen = 'some output\n→ baxian git:(main)\n';
+    expect(hasRuntimeIdleComposerPrompt(screen, 'codex')).toBe(true);
+  });
+
+  it('detects codex → prompt without git info', () => {
+    expect(hasRuntimeIdleComposerPrompt('→ myproject\n', 'codex')).toBe(true);
+  });
+
+  it('does not match bare › as codex composer prompt (handled by READY_ANCHORS)', () => {
+    expect(hasRuntimeIdleComposerPrompt('› \n', 'codex')).toBe(false);
+  });
+
+  it('does not match → followed by multi-word content (output, not prompt)', () => {
+    expect(hasRuntimeIdleComposerPrompt('→ run tests now\n', 'codex')).toBe(false);
+  });
+
+  it('does not match → prompt when output follows it', () => {
+    expect(hasRuntimeIdleComposerPrompt('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
+  });
+
+  it('rejects codex when prompt is not in tail', () => {
+    const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`);
+    lines[0] = '→ baxian git:(main)';
+    expect(hasRuntimeIdleComposerPrompt(lines.join('\n'), 'codex')).toBe(false);
+  });
+
+  it('still works for claude-code', () => {
+    expect(hasRuntimeIdleComposerPrompt('❯ \n', 'claude-code')).toBe(true);
   });
 });
 

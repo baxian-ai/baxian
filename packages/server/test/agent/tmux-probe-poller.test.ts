@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, it, expect, vi } from 'vitest';
 import type { AgentConfig, BaxianConfig } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
 import { ErrorRecordStore } from '../../src/state/error-record-store.js';
@@ -25,7 +26,7 @@ function makeAgent(id: string): AgentConfig {
 function makeConfig(agents: AgentConfig[]): BaxianConfig {
   return {
     review: { rounds: 10 },
-    server: { port: 3000 },
+    server: DEFAULT_SERVER_CONFIG,
     project: [{
       id: 'proj',
       repo: 'user/repo',
@@ -1077,7 +1078,7 @@ describe('TmuxProbePoller', () => {
     const ag1 = makeAgent('dev-1');
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
-      server: { port: 3000, tmuxProbePollIntervalMs: 2000 },
+      server: { ...DEFAULT_SERVER_CONFIG, tmuxProbePollIntervalMs: 2000 },
       project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[ag1]] }],
     };
     const exec = vi.fn(async () => present);
@@ -1114,7 +1115,7 @@ describe('TmuxProbePoller', () => {
     const store = new TmuxSessionStatusStore();
     const baseConfig: BaxianConfig = {
       review: { rounds: 10 },
-      server: { port: 3000, tmuxProbeConcurrency: 2, tmuxProbeTimeoutMs: 1500 },
+      server: { ...DEFAULT_SERVER_CONFIG, tmuxProbeConcurrency: 2, tmuxProbeTimeoutMs: 1500 },
       project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[makeAgent('dev-1')]] }],
     };
     const poller = new TmuxProbePoller({
@@ -1140,7 +1141,7 @@ describe('TmuxProbePoller', () => {
     const customConfig: BaxianConfig = {
       review: { rounds: 10 },
       server: {
-        port: 3000,
+        ...DEFAULT_SERVER_CONFIG,
         tmuxProbePollIntervalMs: 5000,
         tmuxProbeTimeoutMs: 4000,
         tmuxProbeConcurrency: 8,
@@ -1166,7 +1167,7 @@ describe('TmuxProbePoller', () => {
 
     poller.replaceConfig({
       review: { rounds: 10 },
-      server: { port: 3000 },
+      server: DEFAULT_SERVER_CONFIG,
       project: customConfig.project,
     });
 

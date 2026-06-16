@@ -36,6 +36,7 @@ const VALID_CONFIG = {
       agent: [
         [
           { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
         ],
       ],
     },
@@ -58,7 +59,10 @@ describe('loadConfig', () => {
         {
           id: 'pp',
           repo: 'u/r',
-          agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
+          agent: [[
+            { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
+            { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+          ]],
         },
       ],
     };
@@ -69,7 +73,8 @@ describe('loadConfig', () => {
     expect(config.review.rounds).toBe(10);
     expect(config.server.port).toBe(3000);
     expect(config.project[0].merge).toBeNull();
-    expect(config.review.mode).toBe('github');
+    expect(config.review.mode).toBe('server');
+    expect(config.project[0].review?.mode).toBe('server');
     // afterDone is intentionally NOT defaulted to null — an omitted value stays undefined so a
     // non-GitHub repo can tell "unset → deliver-by-default ('branch')" from explicit "null → review-only".
     expect(config.review.afterDone).toBeUndefined();
@@ -81,7 +86,10 @@ describe('loadConfig', () => {
         {
           id: 'pp',
           repo: 'u/r',
-          agents: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
+          agents: [[
+            { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
+            { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+          ]],
         },
       ],
     };
@@ -123,7 +131,10 @@ describe('loadConfig', () => {
 describe('prepareConfig type guards', () => {
   const PROJECT = {
     id: 'pp', repo: 'u/r',
-    agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
+    agent: [[
+      { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
+      { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+    ]],
   };
 
   it('throws on non-array project (was silently coerced to [] before this fix; would hide malformed shape)', () => {
@@ -214,13 +225,13 @@ describe('prepareConfig type guards', () => {
     expect(cfg.server.port).toBe(3000);
   });
 
-  it('drops server.token / host when not strings', () => {
+  it('drops server.token when not string, falls back host to default when not string', () => {
     const cfg = prepareConfig({
       server: { token: { x: 1 }, host: 7 },
       project: [PROJECT],
     });
     expect(cfg.server.token).toBeUndefined();
-    expect(cfg.server.host).toBeUndefined();
+    expect(cfg.server.host).toBe('127.0.0.1');
   });
 
   it('keeps a valid positive integer server.githubPollIntervalMs within [1000ms, 2^31-1]', () => {
@@ -238,25 +249,19 @@ describe('prepareConfig type guards', () => {
     ).toBe(2147483647);
   });
 
-  it('drops non-number / non-finite server.githubPollIntervalMs at the loader (type narrowing only — out-of-range goes to the validator pass)', () => {
-    // loader is type-narrow only; finite numbers (incl. out-of-range)
-    // are preserved here and surfaced as ConfigValidationError by the
-    // validator. See validator.test.ts for the range-reject cases.
+  it('falls back non-number / non-finite server.githubPollIntervalMs to default (out-of-range finite numbers go to the validator pass)', () => {
     expect(
       prepareConfig({ server: { githubPollIntervalMs: undefined }, project: [PROJECT] })
         .server.githubPollIntervalMs,
-    ).toBeUndefined();
-    expect(() =>
-      prepareConfig({ server: { githubPollIntervalMs: '30000' }, project: [PROJECT] }),
-    ).not.toThrow();
+    ).toBe(30_000);
     expect(
       prepareConfig({ server: { githubPollIntervalMs: '30000' }, project: [PROJECT] })
         .server.githubPollIntervalMs,
-    ).toBeUndefined();
+    ).toBe(30_000);
     expect(
       prepareConfig({ server: { githubPollIntervalMs: NaN }, project: [PROJECT] })
         .server.githubPollIntervalMs,
-    ).toBeUndefined();
+    ).toBe(30_000);
   });
 
   it('rejects out-of-range / non-integer server.githubPollIntervalMs via ConfigValidationError (so PATCH returns 400 instead of silently falling back)', () => {
@@ -295,7 +300,7 @@ describe('prepareConfig type guards', () => {
     expect(cfg.server.tmuxProbeConcurrency).toBe(4);
   });
 
-  it('drops non-number server tmux probe settings', () => {
+  it('falls back non-number server tmux probe settings to defaults', () => {
     const cfg = prepareConfig({
       server: {
         tmuxProbePollIntervalMs: '10000',
@@ -304,9 +309,9 @@ describe('prepareConfig type guards', () => {
       },
       project: [PROJECT],
     });
-    expect(cfg.server.tmuxProbePollIntervalMs).toBeUndefined();
-    expect(cfg.server.tmuxProbeTimeoutMs).toBeUndefined();
-    expect(cfg.server.tmuxProbeConcurrency).toBeUndefined();
+    expect(cfg.server.tmuxProbePollIntervalMs).toBe(10_000);
+    expect(cfg.server.tmuxProbeTimeoutMs).toBe(3_000);
+    expect(cfg.server.tmuxProbeConcurrency).toBe(4);
   });
 
   it('passes through server.bootstrapRetryIntervalMs', () => {
@@ -317,12 +322,12 @@ describe('prepareConfig type guards', () => {
     expect(config.server.bootstrapRetryIntervalMs).toBe(30_000);
   });
 
-  it('drops non-finite server.bootstrapRetryIntervalMs', () => {
+  it('falls back non-finite server.bootstrapRetryIntervalMs to default', () => {
     const config = prepareConfig({
       server: { port: 3000, bootstrapRetryIntervalMs: 'oops' as unknown as number },
       project: [PROJECT],
     });
-    expect(config.server.bootstrapRetryIntervalMs).toBeUndefined();
+    expect(config.server.bootstrapRetryIntervalMs).toBe(60_000);
   });
 
   it('falls back to default rounds when review.rounds is non-finite', () => {
@@ -333,15 +338,54 @@ describe('prepareConfig type guards', () => {
     expect(cfg.review.rounds).toBe(10);
   });
 
-  it('defaults review.mode to github but leaves an omitted afterDone undefined (preserves "unset")', () => {
+  it('defaults review.mode to server but leaves an omitted afterDone undefined (preserves "unset")', () => {
     const cfg = prepareConfig({
       review: { rounds: 10 },
       project: [PROJECT],
     });
-    expect(cfg.review.mode).toBe('github');
+    expect(cfg.review.mode).toBe('server');
+    expect(cfg.project[0].review?.mode).toBe('server');
     // NOT defaulted to null — non-GitHub repos distinguish unset (deliver-by-default) from
     // explicit null (review-only); GitHub collapses both via `?? null`, so this is behavior-neutral.
     expect(cfg.review.afterDone).toBeUndefined();
+  });
+
+  it('passes through project.review.mode overrides', () => {
+    const cfg = prepareConfig({
+      review: { rounds: 10, mode: 'server' },
+      project: [{
+        ...PROJECT,
+        review: { mode: 'github' },
+      }],
+    });
+    expect(cfg.project[0].review?.mode).toBe('github');
+  });
+
+  it('defaults non-github projects to project.review.mode=server when global mode is github', () => {
+    const cfg = prepareConfig({
+      review: { rounds: 10, mode: 'github' },
+      project: [{
+        id: 'gl',
+        repo: 'https://gitlab.example.com/group/proj.git',
+        merge: null,
+        agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
+      }],
+    });
+    expect(cfg.project[0].review?.mode).toBe('server');
+  });
+
+  it('defaults non-github project.review={} to mode=server when global mode is github', () => {
+    const cfg = prepareConfig({
+      review: { rounds: 10, mode: 'github' },
+      project: [{
+        id: 'gl',
+        repo: 'https://gitlab.example.com/group/proj.git',
+        merge: null,
+        review: {},
+        agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
+      }],
+    });
+    expect(cfg.project[0].review?.mode).toBe('server');
   });
 
   it('passes through review.mode=server and afterDone=pr', () => {
@@ -360,11 +404,16 @@ describe('prepareConfig type guards', () => {
     expect(cfg.review.afterDone).toBe('pr');
   });
 
-  it('rejects server mode with a dev-only pair', () => {
-    expect(() => prepareConfig({
+  it('allows server mode config with a dev-only pair for incremental agent setup', () => {
+    const cfg = prepareConfig({
       review: { rounds: 10, mode: 'server' },
-      project: [PROJECT],
-    })).toThrow(/qa partner/);
+      project: [{
+        id: 'pp',
+        repo: 'u/r',
+        agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
+      }],
+    });
+    expect(cfg.project[0].review?.mode).toBe('server');
   });
 
   it('passes through invalid review.mode for the validator to reject', () => {
@@ -372,6 +421,13 @@ describe('prepareConfig type guards', () => {
       review: { rounds: 10, mode: 'gitlab' },
       project: [PROJECT],
     })).toThrow(/review\.mode/);
+  });
+
+  it('passes through invalid project.review.mode for the validator to reject', () => {
+    expect(() => prepareConfig({
+      review: { rounds: 10 },
+      project: [{ ...PROJECT, review: { mode: 'gitlab' } }],
+    })).toThrow(/project\[0\]\.review\.mode/);
   });
 
   it('rejects legacy top-level "codereview" with a clear rename message (no silent fallback to default rounds)', () => {

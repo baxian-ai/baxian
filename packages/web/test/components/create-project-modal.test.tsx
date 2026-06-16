@@ -55,6 +55,23 @@ it('trims surrounding whitespace before submitting', async () => {
   });
 });
 
+it('submits an explicit server review mode override', async () => {
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  await waitFor(() => expect(configGetMock).toHaveBeenCalled());
+  fireEvent.change(screen.getByLabelText('项目 ID'), { target: { value: 'serverproj' } });
+  fireEvent.change(screen.getByLabelText('Git 仓库地址'), { target: { value: 'example-owner/example-repo' } });
+  fireEvent.click(screen.getByLabelText('Server'));
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+  });
+  expect(createMock).toHaveBeenCalledWith({
+    id: 'serverproj',
+    repo: 'example-owner/example-repo',
+    merge: null,
+    review: { mode: 'server' },
+  });
+});
+
 it.each([
   ['single token, no slash', 'justaname'],
   ['contains a space', 'https://gitlab.example.com/group/ proj'],

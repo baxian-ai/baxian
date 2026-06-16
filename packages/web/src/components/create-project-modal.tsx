@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { MergeStrategy } from '../shared/index.js';
+import type { MergeStrategy, ReviewMode } from '../shared/index.js';
 import { Modal } from './modal.tsx';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
@@ -30,6 +30,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [id, setId] = useState('');
   const [repo, setRepo] = useState('');
   const [merge, setMerge] = useState<MergeStrategy>(null);
+  const [reviewMode, setReviewMode] = useState<ReviewMode | ''>('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{ id?: string; repo?: string }>({});
@@ -45,6 +46,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setId('');
     setRepo('');
     setMerge(null);
+    setReviewMode('');
     setError(null);
     setFieldErrors({});
     setExistingIds(new Set());
@@ -84,7 +86,12 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setSubmitting(true);
     setError(null);
     try {
-      const result = await api.projects.create({ id, repo: repo.trim(), merge });
+      const result = await api.projects.create({
+        id,
+        repo: repo.trim(),
+        merge,
+        ...(reviewMode ? { review: { mode: reviewMode } } : {}),
+      });
       if (result.restartRequired) flagDirty();
       show({
         kind: 'success',
@@ -173,6 +180,43 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               className="h-3.5 w-3.5 accent-[#1348dc]"
             />
             <span className="text-[13px] text-og-800">QA Approve 后自动合并</span>
+          </label>
+        </div>
+
+        <div>
+          <span className={labelCls}>Review 模式</span>
+          <label className="mb-1 flex items-center gap-2">
+            <input
+              type="radio"
+              name="review-mode"
+              checked={reviewMode === ''}
+              onChange={() => setReviewMode('')}
+              disabled={submitting}
+              className="h-3.5 w-3.5 accent-[#1348dc]"
+            />
+            <span className="text-[13px] text-og-800">跟随全局</span>
+          </label>
+          <label className="mb-1 flex items-center gap-2">
+            <input
+              type="radio"
+              name="review-mode"
+              checked={reviewMode === 'github'}
+              onChange={() => setReviewMode('github')}
+              disabled={submitting}
+              className="h-3.5 w-3.5 accent-[#1348dc]"
+            />
+            <span className="text-[13px] text-og-800">GitHub PR</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="review-mode"
+              checked={reviewMode === 'server'}
+              onChange={() => setReviewMode('server')}
+              disabled={submitting}
+              className="h-3.5 w-3.5 accent-[#1348dc]"
+            />
+            <span className="text-[13px] text-og-800">Server</span>
           </label>
         </div>
       </form>

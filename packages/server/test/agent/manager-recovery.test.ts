@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
 import { WorktreeManager } from '../../src/agent/worktree.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
@@ -19,7 +20,7 @@ const NOW = '2026-05-14T05:00:00.000Z';
 
 const CONFIG: BaxianConfig = {
   review: { rounds: 10 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'proj',
     repo: 'user/repo',

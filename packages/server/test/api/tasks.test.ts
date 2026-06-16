@@ -349,6 +349,29 @@ describe('POST /api/tasks', () => {
     }, { background: true });
   });
 
+  it('passes branch to createAndStartTask when provided', async () => {
+    const spy = vi
+      .spyOn(app.ctx.agentManager, 'createAndStartTask')
+      .mockResolvedValue(makeTask({ id: 'task-branch', branch: 'feat/custom' }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      payload: {
+        projectId: 'proj',
+        title: 'custom branch task',
+        description: 'details',
+        preferredAgentId: 'dev-1',
+        branch: 'feat/custom',
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(spy).toHaveBeenCalledWith('proj', expect.objectContaining({
+      branch: 'feat/custom',
+    }), { background: true });
+  });
+
   it('opts into background bootstrap so the response does not block on agent startup', async () => {
     const spy = vi
       .spyOn(app.ctx.agentManager, 'createAndStartTask')

@@ -98,7 +98,10 @@ const CODEX_WORKING_TAIL_LINES = 8;
 const CLAUDE_IDLE_COMPOSER_TAIL_LINES = 6;
 const ESC_TO_INTERRUPT_RE = /esc to interru(?:pt|p(?:…|\.{3})?)/i;
 const CODEX_WORKING_LINE_RE = /^[ \t]*(?:[•·][ \t]+)?Working[ \t]*\(/im;
-const CODEX_IDLE_PROMPT_LINE_RE = /^[ \t]*›(?:[ \t].*)?$/im;
+const CODEX_IDLE_PROMPT_LINE_RE = /^[ \t]*[›→](?:[ \t].*)?$/im;
+// no m flag: $ anchors to end-of-string so prompt must be the last non-whitespace content
+const CODEX_IDLE_COMPOSER_LINE_RE = /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:\s+git:\([^\s)]+\))?\s*$/i;
+const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
 const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t]*[❯>][ \t]*$/m;
 
 // A live, incomplete spinner ("· Verb… (Ns"): its elapsed-seconds advance every second, so the
@@ -179,18 +182,41 @@ export function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeK
 }
 
 export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRuntimeKind): boolean {
-  if (runtime !== 'claude-code') return false;
-  return CLAUDE_IDLE_COMPOSER_LINE_RE.test(tail(stripped, CLAUDE_IDLE_COMPOSER_TAIL_LINES));
+  if (runtime === 'claude-code') {
+    return CLAUDE_IDLE_COMPOSER_LINE_RE.test(tail(stripped, CLAUDE_IDLE_COMPOSER_TAIL_LINES));
+  }
+  if (runtime === 'codex') {
+    return CODEX_IDLE_COMPOSER_LINE_RE.test(tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES));
+  }
+  return false;
 }
 
 export function hasRuntimeReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (hasReplReadyAnchor(stripped, runtime)) return true;
   if (!hasRuntimeIdleComposerPrompt(stripped, runtime)) return false;
-  if (detectReplActiveBusy(stripped)) return false;
+  if (runtimeBusyCheck(stripped, runtime)) return false;
   if (detectRuntimeMenu(stripped)) return false;
   if (detectStartupDialog(stripped, runtime)) return false;
   if (TRUST_DIALOGS[runtime].test(stripped)) return false;
   return true;
+}
+
+// codex: position-aware — stale busy above → prompt is not active
+// claude-code: full-screen spinner — can sit above ❯ composer in tall panes
+export function runtimeBusyCheck(stripped: string, runtime: AgentRuntimeKind): boolean {
+  return runtime === 'codex'
+    ? detectActiveRegionBusy(stripped, runtime)
+    : detectReplActiveBusy(stripped);
+}
+
+// submit-ack busy: full-screen spinner + position-aware esc-to-interrupt.
+// Excludes codexWorkingInTail — pasted prompt text can contain "Working (...)"
+// which must not trip the baseline check before Enter.
+function submitAckBusy(stripped: string, runtime: AgentRuntimeKind): boolean {
+  if (runtime === 'codex') {
+    return hasActiveSpinner(stripped) || escToInterruptActiveInTail(stripped, runtime);
+  }
+  return detectReplActiveBusy(stripped);
 }
 
 const SPINNER_LINE_RE = /^[·✢✳✶✻✽][ \t]+[^\n…]{1,200}…[ \t]*\([ \t]*(?:\d+[ \t]*m[ \t]+)?\d+[ \t]*s/gm;
@@ -552,19 +578,20 @@ export class TmuxManager {
   async waitSubmitAck(
     paneId: string,
     baseline: string,
+    runtime: AgentRuntimeKind,
     opts: WaitSubmitAckOpts = {},
   ): Promise<void> {
     const deadline = Date.now() + (opts.timeoutMs ?? 30_000);
     const interval = Math.max(opts.intervalMs ?? 100, MIN_POLL_INTERVAL_MS);
     const composerBaseline = stripHistorySuffix(baseline);
-    if (detectReplActiveBusy(composerBaseline)) {
+    if (submitAckBusy(composerBaseline, runtime)) {
       throw new Error(`runtime ack timeout (paneId=${paneId}): pane already busy at baseline`);
     }
     const resendIntervalMs = Math.max(opts.resendIntervalMs ?? 3_000, interval);
     let lastResend = Date.now();
     while (Date.now() < deadline) {
       const visible = stripHistorySuffix(await this.capturePaneSnapshot(paneId));
-      if (detectReplActiveBusy(visible)) return;
+      if (submitAckBusy(visible, runtime)) return;
       // Any deviation from the pre-Enter composer (submit cleared it, or the runtime parked on a
       // menu/dialog/other UI) means a swallowed Enter is NOT the cause — and pressing Enter there
       // would answer whatever is on screen, exactly what the detect-only dialog policy forbids
@@ -598,8 +625,11 @@ export class TmuxManager {
         await sleep(800);
         return true;
       }
-      const ready = READY_ANCHORS[runtime];
-      if (ready.test(stripped)) return false;
+      const current = await this.displayMessage(paneId, '#{pane_current_command}');
+      if (hasReplProcTitle(current, runtime)) {
+        const freshStripped = stripAnsi(await this.capturePaneById(paneId, { ansi: false, scrollback: 0 }));
+        if (hasRuntimeReadyView(freshStripped, runtime)) return false;
+      }
       await sleep(interval);
     }
     return false;

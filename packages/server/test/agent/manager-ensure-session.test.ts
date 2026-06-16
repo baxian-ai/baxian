@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import {
   AgentManager,
   EnsureSessionError,
@@ -18,7 +19,7 @@ import { initStateDir } from '../../src/state/init.js';
 
 const CONFIG: BaxianConfig = {
   review: { rounds: 10 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'proj',
     repo: 'owner/repo',

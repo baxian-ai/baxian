@@ -9,11 +9,12 @@ import { EventLog } from '../../src/event/log.js';
 import { initStateDir } from '../../src/state/init.js';
 import { createRepoStoreCache, type RepoStore } from '../../src/agent/repo-store.js';
 import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
 
 const baseConfig: BaxianConfig = {
   review: { rounds: 10 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [{
     id: 'p1', repo: 'u/r1', merge: null,
     agent: [
@@ -513,7 +514,7 @@ describe('classifyBootstrapError — non-GitHub (generic git) repos', () => {
 describe('autoBootstrapAgentIds', () => {
   it('includes auto-mode agents (no workdir) and excludes explicit-workdir agents', () => {
     const config: BaxianConfig = {
-      github: {} as never, review: { rounds: 10 }, server: { port: 3000 },
+      github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [{
         id: 'p', repo: 'u/r', merge: null,
         agent: [
@@ -535,7 +536,7 @@ describe('collectTargets host resolution (string id refs, f-2)', () => {
   it('groups a remote agent by its resolved endpoint, not remote:@', () => {
     const config: BaxianConfig = {
       review: { rounds: 10 },
-      server: { port: 3000 },
+      server: DEFAULT_SERVER_CONFIG,
       host: [{ id: 'box', hostname: 'box.example.com', port: 2222, user: 'agent' }],
       project: [{
         id: 'p1', repo: 'u/r', merge: null,
@@ -550,7 +551,7 @@ describe('collectTargets host resolution (string id refs, f-2)', () => {
   it('collapses two agents referencing the same machine (different ids, same endpoint) into one bootstrap group', () => {
     const config: BaxianConfig = {
       review: { rounds: 10 },
-      server: { port: 3000 },
+      server: DEFAULT_SERVER_CONFIG,
       host: [
         { id: 'box', hostname: 'h', port: 22, user: 'u' },
         { id: 'box2', hostname: 'h', port: 22, user: 'u' },

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { validateConfig } from '../../src/config/validator.js';
 import type { BaxianConfig, AgentConfig, MergeStrategy } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -16,7 +17,7 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 function makeConfig(overrides: Partial<BaxianConfig> = {}): BaxianConfig {
   return {
     review: { rounds: 10 },
-    server: { port: 3000 },
+    server: DEFAULT_SERVER_CONFIG,
     host: [],
     project: [
       {
@@ -265,15 +266,25 @@ describe('validateConfig', () => {
   });
 
   it('accepts a non-github project with a lone dev (no qa) — incremental agent creation not blocked at config time', () => {
-    // Non-github is server-forced at runtime (effectiveReviewMode), but the "server needs qa"
-    // invariant is enforced at dispatch, not config — so the Web/API add-dev-then-add-qa flow works.
     const cfg = makeConfig({
       project: [{
         id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', merge: null,
+        review: { mode: 'server' },
         agent: [[makeAgent({ id: 'gldev', role: 'dev' })]],
       }],
     });
     expect(validateConfig(cfg)).toEqual([]);
+  });
+
+  it('rejects a non-github project whose effective review.mode is github', () => {
+    const errors = validateConfig(makeConfig({
+      review: { rounds: 10, mode: 'github' },
+      project: [{
+        id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', merge: null,
+        agent: [],
+      }],
+    }));
+    expect(errors.map(e => e.path)).toContain('project[0].review.mode');
   });
 
   it('rejects unknown agent.runtime / role / mode', () => {
@@ -306,7 +317,7 @@ describe('validateConfig', () => {
 
   it('rejects invalid server.port and review.rounds', () => {
     const cfg = makeConfig({
-      server: { port: 70000 },
+      server: { ...DEFAULT_SERVER_CONFIG, port: 70000 },
       review: { rounds: 0 },
     });
     const paths = validateConfig(cfg).map(e => e.path);
@@ -319,6 +330,29 @@ describe('validateConfig', () => {
       review: { rounds: 10, mode: 'gitlab' as never },
     }));
     expect(errors.map(e => e.path)).toContain('review.mode');
+  });
+
+  it('rejects invalid project.review.mode', () => {
+    const errors = validateConfig(makeConfig({
+      project: [{
+        id: 'pp', repo: 'u/r', merge: null,
+        review: { mode: 'gitlab' as never },
+        agent: [],
+      }],
+    }));
+    expect(errors.map(e => e.path)).toContain('project[0].review.mode');
+  });
+
+  it('allows a github project to override global server mode back to github', () => {
+    const errors = validateConfig(makeConfig({
+      review: { rounds: 10, mode: 'server' },
+      project: [{
+        id: 'pp', repo: 'u/r', merge: null,
+        review: { mode: 'github' },
+        agent: [[makeAgent({ id: 'd1', role: 'dev' })]],
+      }],
+    }));
+    expect(errors).toEqual([]);
   });
 
   it('rejects invalid review.afterDone', () => {
@@ -338,14 +372,14 @@ describe('validateConfig', () => {
   describe('server.https', () => {
     it('accepts well-formed https config', () => {
       const cfg = makeConfig({
-        server: { port: 443, https: { keyFile: '/etc/baxian/ssl/key.pem', certFile: '/etc/baxian/ssl/cert.pem' } },
+        server: { ...DEFAULT_SERVER_CONFIG, port: 443, https: { keyFile: '/etc/baxian/ssl/key.pem', certFile: '/etc/baxian/ssl/cert.pem' } },
       });
       expect(validateConfig(cfg)).toEqual([]);
     });
 
     it('rejects https with empty keyFile or certFile', () => {
       const cfg = makeConfig({
-        server: { port: 443, https: { keyFile: '', certFile: '   ' } as never },
+        server: { ...DEFAULT_SERVER_CONFIG, port: 443, https: { keyFile: '', certFile: '   ' } as never },
       });
       const paths = validateConfig(cfg).map(e => e.path);
       expect(paths).toContain('server.https.keyFile');
@@ -354,7 +388,7 @@ describe('validateConfig', () => {
 
     it('rejects relative cert paths (they resolve against process.cwd, which varies between systemd/manual launch)', () => {
       const cfg = makeConfig({
-        server: { port: 443, https: { keyFile: 'ssl/key.pem', certFile: 'ssl/cert.pem' } },
+        server: { ...DEFAULT_SERVER_CONFIG, port: 443, https: { keyFile: 'ssl/key.pem', certFile: 'ssl/cert.pem' } },
       });
       const errors = validateConfig(cfg);
       const keyErr = errors.find(e => e.path === 'server.https.keyFile');
@@ -367,14 +401,14 @@ describe('validateConfig', () => {
   describe('server.allowedHosts', () => {
     it('accepts an array of non-empty strings', () => {
       const cfg = makeConfig({
-        server: { port: 3000, allowedHosts: ['baxian.dev', 'www.baxian.dev'] },
+        server: { ...DEFAULT_SERVER_CONFIG, allowedHosts: ['baxian.dev', 'www.baxian.dev'] },
       });
       expect(validateConfig(cfg)).toEqual([]);
     });
 
     it('rejects non-array allowedHosts', () => {
       const cfg = makeConfig({
-        server: { port: 3000, allowedHosts: 'baxian.dev' as never },
+        server: { ...DEFAULT_SERVER_CONFIG, allowedHosts: 'baxian.dev' as never },
       });
       const paths = validateConfig(cfg).map(e => e.path);
       expect(paths).toContain('server.allowedHosts');
@@ -382,7 +416,7 @@ describe('validateConfig', () => {
 
     it('rejects empty string entries inside allowedHosts', () => {
       const cfg = makeConfig({
-        server: { port: 3000, allowedHosts: ['baxian.dev', ''] },
+        server: { ...DEFAULT_SERVER_CONFIG, allowedHosts: ['baxian.dev', ''] },
       });
       const paths = validateConfig(cfg).map(e => e.path);
       expect(paths).toContain('server.allowedHosts[1]');
@@ -392,7 +426,7 @@ describe('validateConfig', () => {
   it('accepts valid server tmux probe settings', () => {
     const cfg = makeConfig({
       server: {
-        port: 3000,
+        ...DEFAULT_SERVER_CONFIG,
         tmuxProbePollIntervalMs: 10000,
         tmuxProbeTimeoutMs: 3000,
         tmuxProbeConcurrency: 4,
@@ -405,10 +439,8 @@ describe('validateConfig', () => {
     for (const ms of [1000, 10_000, 2_147_483_647]) {
       const cfg = makeConfig({
         server: {
-          port: 3000,
+          ...DEFAULT_SERVER_CONFIG,
           tmuxProbePollIntervalMs: ms,
-          tmuxProbeTimeoutMs: 3000,
-          tmuxProbeConcurrency: 4,
         },
       });
       expect(validateConfig(cfg).some(e => e.path === 'server.tmuxProbePollIntervalMs')).toBe(false);
@@ -419,7 +451,7 @@ describe('validateConfig', () => {
     for (const ms of [999, 0, -1000, 1500.5, 2_147_483_648]) {
       const cfg = makeConfig({
         server: {
-          port: 3000,
+          ...DEFAULT_SERVER_CONFIG,
           tmuxProbePollIntervalMs: ms,
           tmuxProbeTimeoutMs: -1,
           tmuxProbeConcurrency: 1.5,
@@ -434,28 +466,26 @@ describe('validateConfig', () => {
 
   it('rejects non-positive server.bootstrapRetryIntervalMs', () => {
     const errors = validateConfig(makeConfig({
-      server: { port: 3000, bootstrapRetryIntervalMs: 0 },
+      server: { ...DEFAULT_SERVER_CONFIG, bootstrapRetryIntervalMs: 0 },
     }));
     expect(errors.some(e => e.path === 'server.bootstrapRetryIntervalMs')).toBe(true);
   });
 
   it('rejects non-integer server.bootstrapRetryIntervalMs', () => {
     const errors = validateConfig(makeConfig({
-      server: { port: 3000, bootstrapRetryIntervalMs: 1.5 },
+      server: { ...DEFAULT_SERVER_CONFIG, bootstrapRetryIntervalMs: 1.5 },
     }));
     expect(errors.some(e => e.path === 'server.bootstrapRetryIntervalMs')).toBe(true);
   });
 
-  it('accepts undefined server.bootstrapRetryIntervalMs', () => {
-    const errors = validateConfig(makeConfig({
-      server: { port: 3000 },
-    }));
+  it('accepts default server.bootstrapRetryIntervalMs', () => {
+    const errors = validateConfig(makeConfig());
     expect(errors.some(e => e.path === 'server.bootstrapRetryIntervalMs')).toBe(false);
   });
 
   it('accepts positive integer server.bootstrapRetryIntervalMs', () => {
     const errors = validateConfig(makeConfig({
-      server: { port: 3000, bootstrapRetryIntervalMs: 60_000 },
+      server: { ...DEFAULT_SERVER_CONFIG, bootstrapRetryIntervalMs: 60_000 },
     }));
     expect(errors.some(e => e.path === 'server.bootstrapRetryIntervalMs')).toBe(false);
   });
@@ -463,7 +493,7 @@ describe('validateConfig', () => {
   it('accepts server.bootstrapRetryIntervalMs at bounds [1000, 2^31-1]', () => {
     for (const ms of [1000, 60_000, 2_147_483_647]) {
       const errors = validateConfig(makeConfig({
-        server: { port: 3000, bootstrapRetryIntervalMs: ms },
+        server: { ...DEFAULT_SERVER_CONFIG, bootstrapRetryIntervalMs: ms },
       }));
       expect(errors.some(e => e.path === 'server.bootstrapRetryIntervalMs')).toBe(false);
     }
@@ -472,7 +502,7 @@ describe('validateConfig', () => {
   it('rejects server.bootstrapRetryIntervalMs below floor or above setInterval ceiling', () => {
     for (const ms of [999, 2_147_483_648]) {
       const errors = validateConfig(makeConfig({
-        server: { port: 3000, bootstrapRetryIntervalMs: ms },
+        server: { ...DEFAULT_SERVER_CONFIG, bootstrapRetryIntervalMs: ms },
       }));
       expect(errors.some(e => e.path === 'server.bootstrapRetryIntervalMs')).toBe(true);
     }
@@ -480,7 +510,7 @@ describe('validateConfig', () => {
 
   it('accepts server.githubPollIntervalMs within [1000, 2^31-1]', () => {
     for (const ms of [1000, 60000, 2147483647]) {
-      const cfg = makeConfig({ server: { port: 3000, githubPollIntervalMs: ms } });
+      const cfg = makeConfig({ server: { ...DEFAULT_SERVER_CONFIG, githubPollIntervalMs: ms } });
       expect(validateConfig(cfg).some(e => e.path === 'server.githubPollIntervalMs')).toBe(false);
     }
   });
@@ -488,7 +518,7 @@ describe('validateConfig', () => {
   it('rejects server.githubPollIntervalMs out of [1000, 2^31-1] or non-integer', () => {
     // sub-second floor, non-integer, zero, negative, 32-bit overflow
     for (const ms of [500, 0, -1000, 1500.5, 2147483648]) {
-      const cfg = makeConfig({ server: { port: 3000, githubPollIntervalMs: ms } });
+      const cfg = makeConfig({ server: { ...DEFAULT_SERVER_CONFIG, githubPollIntervalMs: ms } });
       const paths = validateConfig(cfg).map(e => e.path);
       expect(paths).toContain('server.githubPollIntervalMs');
     }

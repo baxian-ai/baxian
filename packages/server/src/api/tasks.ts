@@ -83,6 +83,7 @@ interface CreateTaskBody {
   title?: string;
   description?: string;
   preferredAgentId?: string;
+  branch?: string;
   issueNumber?: number;
   images?: unknown;
 }
@@ -181,6 +182,11 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Project not found' });
     }
 
+    const branchTrimmed = typeof body.branch === 'string' ? body.branch.trim() : undefined;
+    if (branchTrimmed !== undefined && branchTrimmed.length === 0) {
+      return reply.status(400).send({ error: 'branch must be non-empty when provided' });
+    }
+
     await app.ctx.agentManager.validateTaskDispatch(projectIdTrimmed, {
       title: titleTrimmed,
       description: descriptionTrimmed,
@@ -217,6 +223,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       title: titleTrimmed,
       description: descriptionTrimmed,
       preferredAgentId: preferredAgentIdTrimmed,
+      ...(branchTrimmed ? { branch: branchTrimmed } : {}),
       ...(decodedImages && decodedImages.length ? { images: decodedImages } : {}),
     }, { background: true });
     return reply.status(201).send(task);

@@ -2,8 +2,33 @@ import type { AgentRole, TaskStatus } from './types.js';
 
 export const DEFAULT_REVIEW_ROUNDS = 10;
 export const DEFAULT_SERVER_PORT = 3000;
+export const DEFAULT_SERVER_HOST = '127.0.0.1';
+export const DEFAULT_GITHUB_POLL_INTERVAL_MS = 30_000;
+export const DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS = 10_000;
+export const DEFAULT_TMUX_PROBE_TIMEOUT_MS = 3_000;
+export const DEFAULT_TMUX_PROBE_CONCURRENCY = 4;
+export const DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS = 60_000;
+
+export const DEFAULT_SERVER_CONFIG = {
+  port: DEFAULT_SERVER_PORT,
+  host: DEFAULT_SERVER_HOST,
+  githubPollIntervalMs: DEFAULT_GITHUB_POLL_INTERVAL_MS,
+  tmuxProbePollIntervalMs: DEFAULT_TMUX_PROBE_POLL_INTERVAL_MS,
+  tmuxProbeTimeoutMs: DEFAULT_TMUX_PROBE_TIMEOUT_MS,
+  tmuxProbeConcurrency: DEFAULT_TMUX_PROBE_CONCURRENCY,
+  bootstrapRetryIntervalMs: DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
+} as const;
 
 export const BRANCH_PREFIX = 'bx/';
+export const BRANCH_NAME_RE = /^(?!-)[A-Za-z0-9._\/-]+$/;
+
+export function isValidBranchName(name: string): boolean {
+  if (!BRANCH_NAME_RE.test(name)) return false;
+  if (name.includes('..') || name.includes('@{') || name === '@') return false;
+  if (name.endsWith('/') || name.startsWith('/') || name.includes('//')) return false;
+  if (name.endsWith('.')) return false;
+  return name.split('/').every(p => !p.startsWith('.') && !p.endsWith('.lock'));
+}
 export const WORKTREE_DIR = '.baxian-worktrees';
 export const STATE_DIR = '.baxian';
 export const CONFIG_FILE = 'baxian.json';

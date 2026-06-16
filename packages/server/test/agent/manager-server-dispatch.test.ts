@@ -10,6 +10,7 @@ import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { BaxianConfig, BaxianEvent, ReviewMode, TaskState } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
 
 let tempDir: string;
@@ -26,7 +27,7 @@ function makeConfig(mode: ReviewMode, opts: { omitQa?: boolean } = {}): BaxianCo
   ];
   return {
     review: { rounds: 10, mode },
-    server: { port: 3000 },
+    server: DEFAULT_SERVER_CONFIG,
     host: [],
     project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [agents] }],
   } as BaxianConfig;

@@ -26,8 +26,6 @@ export interface BootstrapPollerOptions {
   intervalMs?: number;
 }
 
-const DEFAULT_INTERVAL_MS = 60_000;
-
 export class BootstrapPoller {
   private readonly periodicRunner: PeriodicTaskRunner;
   private opts: BootstrapPollerOptions;
@@ -37,8 +35,7 @@ export class BootstrapPoller {
   constructor(options: BootstrapPollerOptions) {
     this.opts = options;
     this.pollIntervalMs = options.intervalMs
-      ?? options.config.server.bootstrapRetryIntervalMs
-      ?? DEFAULT_INTERVAL_MS;
+      ?? options.config.server.bootstrapRetryIntervalMs;
     this.periodicRunner = new PeriodicTaskRunner({
       name: 'bootstrap-poller',
       intervalMs: this.pollIntervalMs,
@@ -55,9 +52,7 @@ export class BootstrapPoller {
     for (const key of [...this.lastFailureByTarget.keys()]) {
       if (!validKeys.has(key)) this.lastFailureByTarget.delete(key);
     }
-    // Cleared field must revert to default, not freeze the prior runtime value —
-    // PATCH /config dropping the key signals "use default", not "keep current".
-    const nextIntervalMs = validated.server.bootstrapRetryIntervalMs ?? DEFAULT_INTERVAL_MS;
+    const nextIntervalMs = validated.server.bootstrapRetryIntervalMs;
     if (nextIntervalMs !== this.pollIntervalMs) {
       this.pollIntervalMs = nextIntervalMs;
       this.periodicRunner.reschedule(nextIntervalMs);

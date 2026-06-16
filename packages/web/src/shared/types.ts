@@ -2,6 +2,8 @@ export type AgentRuntime = 'claude-code' | 'codex';
 export type AgentRole = 'dev' | 'qa';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
+export type ReviewMode = 'github' | 'server';
+export type AfterDone = 'pr' | 'branch' | null;
 
 export interface HostConfig {
   id?: string;
@@ -29,7 +31,12 @@ export interface ProjectConfig {
   id: string;
   repo: string;
   merge: MergeStrategy;
+  review?: ProjectReviewConfig;
   agent: AgentConfig[][];
+}
+
+export interface ProjectReviewConfig {
+  mode?: ReviewMode;
 }
 
 export interface ReviewConfig {
@@ -39,6 +46,8 @@ export interface ReviewConfig {
    * same numeric cap. If the two ever need to diverge, split this field then.
    */
   rounds: number;
+  mode?: ReviewMode;
+  afterDone?: AfterDone;
 }
 
 export interface HttpsConfig {
@@ -179,11 +188,11 @@ export interface TaskState {
   /** Signal token for the current pending pane signal; rotated each dispatch/phase transition. */
   signalToken?: string;
   /** Review mode snapshotted at task creation. */
-  reviewMode?: 'github' | 'server';
+  reviewMode?: ReviewMode;
   batchIndex?: number;
   batchTotal?: number;
   maxRoundsContinues?: number;
-  afterDone?: 'pr' | 'branch' | null;
+  afterDone?: AfterDone;
   publishDispatchedAt?: string;
   status: TaskStatus;
   createdAt: string;

@@ -11,6 +11,7 @@ import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { AfterDone, BaxianConfig, MergeStrategy, TaskState } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
 
 let tempDir: string;
@@ -27,7 +28,7 @@ afterEach(async () => {
 function makeConfig(merge: MergeStrategy, afterDone: AfterDone): BaxianConfig {
   return {
     review: { rounds: 10, mode: 'server', afterDone },
-    server: { port: 3000 },
+    server: DEFAULT_SERVER_CONFIG,
     host: [],
     project: [{
       id: 'proj',

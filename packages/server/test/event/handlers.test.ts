@@ -12,11 +12,12 @@ import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
 import type { BaxianConfig, BaxianEvent, TaskState, TaskStatus } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 const BASE_CONFIG: BaxianConfig = {
   review: { rounds: 3 },
-  server: { port: 3000 },
+  server: DEFAULT_SERVER_CONFIG,
   project: [
     {
       id: 'proj',
@@ -644,7 +645,7 @@ describe('pr.created handler', () => {
       ...BASE_CONFIG,
       project: [{
         ...BASE_CONFIG.project[0],
-        agent: [[{ id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '' }]],
+        agent: [[{ id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' }]],
       }],
     };
     const lonelyManager = new AgentManager({

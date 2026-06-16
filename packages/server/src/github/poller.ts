@@ -15,12 +15,13 @@ export interface PollerEntry {
 
 export type StatePathProvider = (project: ProjectConfig) => string | undefined;
 
+export type KnownBranchesProvider = (projectId: string) => Promise<ReadonlySet<string>>;
+
 export interface PollerOptions {
   runner: CommandRunner;
   onEvent: (projectId: string, event: MappedEvent) => void | Promise<void>;
+  knownBranchesFor?: KnownBranchesProvider;
 }
-
-const DEFAULT_POLL_INTERVAL_MS = 30_000;
 
 // Slug-normalized so a config rewrite between URL and "owner/repo" spellings
 // keeps the same state file — losing the cursor would replay every PR as pr.created.
@@ -111,6 +112,7 @@ function trimStderr(stderr: string, maxLen = 500): string {
 export class GitHubPoller {
   private runner: CommandRunner;
   private onEvent: (projectId: string, event: MappedEvent) => void | Promise<void>;
+  private knownBranchesFor?: KnownBranchesProvider;
   private entries: InternalEntry[] = [];
   private periodicRunner?: PeriodicTaskRunner;
   private intervalMs?: number;
@@ -120,6 +122,7 @@ export class GitHubPoller {
   constructor(options: PollerOptions) {
     this.runner = options.runner;
     this.onEvent = options.onEvent;
+    this.knownBranchesFor = options.knownBranchesFor;
   }
 
   add(entry: PollerEntry): InternalEntry {
@@ -182,7 +185,7 @@ export class GitHubPoller {
       }
     }
 
-    const nextIntervalMs = config.server.githubPollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const nextIntervalMs = config.server.githubPollIntervalMs;
     this.intervalMs = nextIntervalMs;
     this.periodicRunner?.reschedule(nextIntervalMs);
   }
@@ -393,11 +396,14 @@ export class GitHubPoller {
       throw new Error(`pollPullRequests: expected array, got ${typeof prs}`);
     }
 
+    const knownBranches = await this.knownBranchesFor?.(entry.projectId)
+      ?? new Set<string>();
+
     const seenMerged = new Set(entry.cursor.mergedPrs);
     const cycleErrors: string[] = [];
 
     for (const pr of prs) {
-      if (!isManagedPr(pr.head.ref, pr.body)) continue;
+      if (!isManagedPr(pr.head.ref, pr.body, knownBranches)) continue;
 
       if (pr.state === 'closed' && pr.merged_at && !seenMerged.has(pr.number)) {
         try {

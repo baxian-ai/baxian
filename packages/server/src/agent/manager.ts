@@ -17,6 +17,7 @@ import type {
 } from '../shared/index.js';
 import {
   BRANCH_PREFIX,
+  isValidBranchName,
   PHASE_EXPECTED_STATUS,
   PHASE_REQUIRES_AGENT_BOUND_TO_TASK,
   TASK_TERMINAL_STATUSES as TERMINAL_STATUSES,
@@ -40,7 +41,7 @@ import {
   ReplNotReadyError,
   detectStartupDialog,
   detectRuntimeMenu,
-  detectReplActiveBusy,
+  runtimeBusyCheck,
   hasRuntimeReadyView,
   hasReplProcTitle,
   type AdoptPaneState,
@@ -63,6 +64,7 @@ import {
   type PostMergeBranchCleanupResult,
 } from './prompt.js';
 import { ApiError } from '../errors.js';
+import { prepareConfig } from '../config/loader.js';
 
 export interface EnsureSessionResult {
   ok: true;
@@ -102,7 +104,6 @@ export type DispatchTerminalReason =
   | 'gate_failed'
   | 'prompt_too_large'
   | 'required_skills_missing'
-  | 'server_review_needs_qa'
   | 'task_image_missing';
 
 export class CleanupFailedError extends Error {
@@ -316,7 +317,8 @@ export class AgentManager {
   private compactInFlight = new Set<string>();
 
   constructor(deps: AgentManagerDeps) {
-    this.config = deps.config;
+    const config = prepareConfig(deps.config);
+    this.config = config;
     this.agentStore = deps.agentStore;
     this.taskStore = deps.taskStore;
     this.lockManager = deps.lockManager;
@@ -338,7 +340,7 @@ export class AgentManager {
     this.reviewStore = deps.reviewStore;
     this.dispatchAckTimeoutMs = deps.dispatchAckTimeoutMs ?? DEFAULT_DISPATCH_ACK_TIMEOUT_MS;
     this.dispatchSettleTimeoutMs = deps.dispatchSettleTimeoutMs ?? DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS;
-    this.agentIndex = buildAgentIndex(deps.config);
+    this.agentIndex = buildAgentIndex(config);
     this.platformRunner = deps.platformRunner ?? new LocalRunner();
     this.imageStagingRoot = deps.imageStagingRoot ?? join(tmpdir(), 'baxian-task-images');
     this.repoCache = createRepoStoreCache();
@@ -358,12 +360,12 @@ export class AgentManager {
     return this.reviewStore;
   }
 
-  // Non-GitHub repos are forced to server review mode — there is no platform PR/review
-  // to map onto. GitHub honors the global config. Snapshotted per-task at creation.
+  // Non-GitHub repos are pinned to server mode because there is no PR review fallback to map onto.
   effectiveReviewMode(projectId: string): ReviewMode {
     const project = this.getProjectConfig(projectId);
-    if (project && !isGitHubRepo(project.repo)) return 'server';
-    return this.config.review.mode ?? 'github';
+    const mode = project ? project.review!.mode! : this.config.review.mode!;
+    if (project && !isGitHubRepo(project.repo) && mode !== 'server') return 'server';
+    return mode;
   }
 
   // Snapshot-aware afterDone read: an EXPLICIT null snapshot must win over hot
@@ -429,8 +431,9 @@ export class AgentManager {
   }
 
   replaceConfig(validated: BaxianConfig): void {
-    this.config = validated;
-    this.agentIndex = buildAgentIndex(validated);
+    const config = prepareConfig(validated);
+    this.config = config;
+    this.agentIndex = buildAgentIndex(config);
   }
 
   // Live view — handlers that read review.rounds etc. must go through this so PATCH /config
@@ -2332,6 +2335,15 @@ export class AgentManager {
     return { headRefName, headSha };
   }
 
+  async listTasksByProject(projectId: string): Promise<TaskState[]> {
+    return this.taskStore.list({ projectId });
+  }
+
+  async findTaskByBranch(branch: string, projectId: string): Promise<TaskState | undefined> {
+    const all = await this.taskStore.list({ projectId });
+    return all.find(t => t.branch === branch);
+  }
+
   async listTasksByPrNumber(prNumber: number, projectId?: string): Promise<TaskState[]> {
     const all = await this.taskStore.list({ projectId });
     return all.filter(t => t.prNumber === prNumber);
@@ -2517,25 +2529,28 @@ export class AgentManager {
       title: string;
       description: string;
       preferredAgentId: string;
+      branch?: string;
       images?: { bytes: Buffer; ext: string }[];
     },
   ): Promise<TaskState> {
     return this.withTaskLock(async () => {
       const taskId = await this.taskStore.nextId();
       const now = new Date().toISOString();
+      if (input.branch) {
+        if (input.branch.startsWith(BRANCH_PREFIX)) {
+          throw new ApiError(400, `Custom branch must not start with reserved prefix "${BRANCH_PREFIX}"`);
+        }
+        if (!isValidBranchName(input.branch)) {
+          throw new ApiError(400, `Invalid branch name: "${input.branch}"`);
+        }
+      }
+      const taskBranch = input.branch ?? BRANCH_PREFIX + taskId;
 
-      // Server review has no platform fallback: a dev with no QA partner would strand (server mode
-      // is forced for non-GitHub repos). Fail fast BEFORE staging images — a rejected create must not
-      // orphan state/task-images/<taskId> with no TaskState to reclaim it. The dispatch path also
-      // guards (unassigned-claim entry). Unassigned skips this: empty preferredAgentId → no dev config.
-      if (this.getAgentConfig(input.preferredAgentId)?.role === 'dev'
-        && this.effectiveReviewMode(projectId) === 'server'
-        && !this.findQaPartner(input.preferredAgentId)) {
-        throw new ApiError(
-          400,
-          `Project "${projectId}" uses server review mode (forced for non-GitHub repos); ` +
-          `dev "${input.preferredAgentId}" needs a QA partner — add a QA agent paired with this dev before creating tasks.`,
-        );
+      if (input.branch) {
+        const existing = await this.findTaskByBranch(input.branch, projectId);
+        if (existing) {
+          throw new ApiError(400, `Branch "${input.branch}" is already bound to task ${existing.id}`);
+        }
       }
 
       // Stage images first so the task is written + emitted (task.created) WITH its images already
@@ -2556,7 +2571,7 @@ export class AgentManager {
           agentId: '',
           reviewRound: 0,
           status: 'pending',
-          branch: BRANCH_PREFIX + taskId,
+          branch: taskBranch,
           reviewMode: this.effectiveReviewMode(projectId),
           createdAt: now,
           updatedAt: now,
@@ -2587,7 +2602,7 @@ export class AgentManager {
           agentId: '',
           reviewRound: 0,
           status: 'pending',
-          branch: BRANCH_PREFIX + taskId,
+          branch: taskBranch,
           reviewMode: this.effectiveReviewMode(projectId),
           createdAt: now,
           updatedAt: now,
@@ -2621,7 +2636,7 @@ export class AgentManager {
           agentId: '',
           reviewRound: 0,
           status: 'pending',
-          branch: BRANCH_PREFIX + taskId,
+          branch: taskBranch,
           reviewMode: this.effectiveReviewMode(projectId),
           createdAt: now,
           updatedAt: now,
@@ -2654,7 +2669,7 @@ export class AgentManager {
         ...(qa ? { qaAgentId: qa.id } : {}),
         reviewRound: 0,
         status: 'in_progress',
-        branch: BRANCH_PREFIX + taskId,
+        branch: taskBranch,
         reviewMode: this.effectiveReviewMode(projectId),
         createdAt: now,
         updatedAt: now,
@@ -2692,6 +2707,7 @@ export class AgentManager {
       title: string;
       description: string;
       preferredAgentId: string;
+      branch?: string;
       images?: { bytes: Buffer; ext: string }[];
     },
     opts: { background?: boolean } = {},
@@ -3191,11 +3207,12 @@ export class AgentManager {
       : await this.resolveAutoBaseRef(runner, workdir);
 
     const isServerQaPhase = phase === 'server-review' || phase === 'server-recheck' || phase === 'server-spec-review';
+    const customBranch = task.branch && !task.branch.startsWith(BRANCH_PREFIX) ? task.branch : undefined;
     const worktreePath = isServerQaPhase
       ? await worktree.createDetachedAtBase(workdir, taskId)
       : phase === 'review' || phase === 'recheck'
         ? await worktree.createDetached(workdir, taskId, task.branch!)
-        : await worktree.create(workdir, taskId, baseRef);
+        : await worktree.create(workdir, taskId, baseRef, customBranch);
 
     // Persist worktreePath now so a crash before set-running leaves a recoverable trail.
     await this.agentStore.update(agentId, (stateNow) => {
@@ -3224,17 +3241,6 @@ export class AgentManager {
     const hasQaPartner = !!(task.qaAgentId ?? this.findQaPartner(agentId)?.id);
     let prompt: string;
     try {
-      // Server review has no platform fallback: a dev with no QA partner would emit a
-      // completion signal nobody consumes and the task strands (server mode is forced
-      // for non-GitHub repos via effectiveReviewMode). Enforce at this single dispatch
-      // chokepoint — the catch below removes the worktree, then the task fails cleanly.
-      if (task.reviewMode === 'server' && !hasQaPartner) {
-        throw new DispatchTerminalError(
-          'server_review_needs_qa',
-          `Task ${task.id} runs in server review mode but dev "${agentId}" has no QA partner; ` +
-          `pair a QA agent with this dev (server review has no platform fallback to absorb the verdict).`,
-        );
-      }
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       prompt = buildPromptInline({
         task,
@@ -3255,7 +3261,7 @@ export class AgentManager {
         ...(opts.contentTruncated ? { contentTruncated: true } : {}),
       });
     } catch (err) {
-      try { await worktree.remove(workdir, worktreePath); } catch {}
+      try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       // Terminal — rolling back to pending would loop on the same misconfiguration.
       if (err instanceof PromptSizeError) {
         throw new DispatchTerminalError('prompt_too_large', err.message);
@@ -3272,7 +3278,7 @@ export class AgentManager {
       console.warn(
         `[AgentManager] startSession: task ${taskId} disappeared mid-dispatch; cleaning up worktree before paste`,
       );
-      try { await worktree.remove(workdir, worktreePath); } catch {}
+      try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       return false;
     }
     if (TERMINAL_STATUSES.includes(taskFresh.status)) {
@@ -3280,7 +3286,7 @@ export class AgentManager {
         `[AgentManager] startSession: task ${taskId} status=${taskFresh.status} is terminal ` +
         `for phase=${phase}; cleaning up worktree before paste`,
       );
-      try { await worktree.remove(workdir, worktreePath); } catch {}
+      try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       return false;
     }
     if (!opts.bypassTaskStatusGate && !expectedStatuses.includes(taskFresh.status)) {
@@ -3288,7 +3294,7 @@ export class AgentManager {
         `[AgentManager] startSession: task ${taskId} status=${taskFresh.status} not in ` +
         `expected ${expectedStatuses.join('/')} for phase=${phase}; cleaning up worktree before paste`,
       );
-      try { await worktree.remove(workdir, worktreePath); } catch {}
+      try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       return false;
     }
 
@@ -3299,7 +3305,7 @@ export class AgentManager {
           `[AgentManager] startSession[${phase}]: agent ${agentId} not bound to ${taskId} ` +
           `(got taskId=${agentFresh?.taskId}); cleaning up worktree before paste`,
         );
-        try { await worktree.remove(workdir, worktreePath); } catch {}
+        try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
         return false;
       }
     } else if (agentFresh && agentFresh.taskId && agentFresh.taskId !== taskId) {
@@ -3307,7 +3313,7 @@ export class AgentManager {
         `[AgentManager] startSession[${phase}]: agent ${agentId} reassigned to ${agentFresh.taskId} ` +
         `(was ${taskId}); cleaning up worktree before paste`,
       );
-      try { await worktree.remove(workdir, worktreePath); } catch {}
+      try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       return false;
     }
 
@@ -3379,7 +3385,7 @@ export class AgentManager {
       // 由上游 failTaskForDispatchError → markAwaitingHuman 接手等人。
       const isAckUnknown = err instanceof DispatchTerminalError && err.reason === 'ack_unknown';
       if (!isAckUnknown) {
-        try { await worktree.remove(workdir, worktreePath); } catch {}
+        try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
         if (agentMarkedRunning) {
           try {
             let released = false;
@@ -3447,7 +3453,7 @@ export class AgentManager {
     paneId: string,
     prompt: string,
     agentId: string,
-    _runtime: AgentConfig['runtime'],
+    runtime: AgentConfig['runtime'],
   ): Promise<{ acked: boolean; composerDelivered: boolean }> {
     await tmux.injectPrompt(paneId, prompt, agentId);
     let baseline: string;
@@ -3465,7 +3471,7 @@ export class AgentManager {
       );
     }
     try {
-      await tmux.waitSubmitAck(paneId, baseline, {
+      await tmux.waitSubmitAck(paneId, baseline, runtime, {
         timeoutMs: this.dispatchAckTimeoutMs,
         resend: () => tmux.sendEnter(paneId),
         resendIntervalMs: this.dispatchAckResendIntervalMs,
@@ -4776,7 +4782,7 @@ export class AgentManager {
   // Dev's first prompt offers the spec-first or straight-to-code path; the arm
   // must accept both completion signals for the task's protocol family.
   private devInitialSignalKinds(reviewMode?: TaskState['reviewMode']): readonly PhaseSignalKind[] {
-    const mode = reviewMode ?? this.config.review.mode ?? 'github';
+    const mode = reviewMode ?? this.config.review.mode!;
     return mode === 'server'
       ? (['spec-done', 'code-done'] as const)
       : (['spec-done', 'pr-created'] as const);
@@ -5392,7 +5398,7 @@ export class AgentManager {
       if (detectRuntimeMenu(cap) || (!ready && detectStartupDialog(cap, runtime))) {
         throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
       }
-      if (!detectReplActiveBusy(cap)) {
+      if (!runtimeBusyCheck(cap, runtime)) {
         if (!ready) {
           throw new Error(`waitForReplPromptReady: pane ${paneId} observed idle but no ready anchor (stale frame?)`);
         }
@@ -5536,7 +5542,7 @@ export class AgentManager {
     const transition = await this.transitionTaskStatus(
       taskId,
       'in_progress',
-      { fromStatus: ['review', 'fixing'] },
+      { fromStatus: ['review', 'fixing', 'in_progress'] },
       { phase: 'code', signalToken: newToken },
     );
     if (!transition) return null;

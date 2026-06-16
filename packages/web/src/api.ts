@@ -7,6 +7,7 @@ import type {
   AgentMode,
   HostConfig,
   MergeStrategy,
+  ProjectReviewConfig,
   ReviewRound,
 } from './shared/index.js';
 
@@ -253,7 +254,7 @@ export const api = {
   projects: {
     list: () => get<ProjectConfig[]>('/projects'),
     get: (id: string) => get<ProjectConfig>(`/projects/${enc(id)}`),
-    create: (body: { id: string; repo: string; merge?: MergeStrategy }) =>
+    create: (body: { id: string; repo: string; merge?: MergeStrategy; review?: ProjectReviewConfig }) =>
       post<{ project: ProjectConfig; restartRequired: boolean }>('/projects', body),
     delete: (id: string) =>
       del<{ removed: string; restartRequired: boolean }>(`/projects/${enc(id)}`),

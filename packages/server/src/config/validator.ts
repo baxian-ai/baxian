@@ -1,5 +1,5 @@
 import { isAbsolute } from 'node:path';
-import type { BaxianConfig, AgentRole, AgentRuntime, AgentMode, MergeStrategy } from '../shared/index.js';
+import type { BaxianConfig, AgentRole, AgentRuntime, AgentMode, MergeStrategy, ProjectConfig, ReviewMode } from '../shared/index.js';
 import { hasEmbeddedCredentials, isGitHubRepo, isSafeGitHost, parseGitRemote, repoSlug } from '../shared/index.js';
 
 export interface ValidationError {
@@ -42,6 +42,7 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateGlobals(config, errors);
   validateHosts(config, errors);
   validateProjectFields(config, errors);
+  validateProjectReviewModes(config, errors);
   validateProjectIds(config, errors);
   validateAgentFields(config, errors);
   validateAgentIds(config, errors);
@@ -53,6 +54,15 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
 
 function nonEmptyString(v: unknown): boolean {
   return typeof v === 'string' && v.trim().length > 0;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
+  const review = (project as { review?: unknown }).review;
+  return (isRecord(review) && review.mode !== undefined ? review.mode : config.review.mode) as ReviewMode;
 }
 
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {
@@ -96,22 +106,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
   }
   if (config.review.mode !== undefined && config.review.mode !== 'github' && config.review.mode !== 'server') {
     errors.push({ path: 'review.mode', message: "review.mode must be 'github' or 'server'" });
-  }
-  if (config.review.mode === 'server') {
-    // Server review has no GitHub fallback: a dev without a QA partner consumes
-    // its completion signal into a void and the task strands.
-    config.project.forEach((project, pi) => {
-      project.agent.forEach((pair, ai) => {
-        const hasDev = pair.some(a => a?.role === 'dev');
-        const hasQa = pair.some(a => a?.role === 'qa');
-        if (hasDev && !hasQa) {
-          errors.push({
-            path: `project[${pi}].agent[${ai}]`,
-            message: "review.mode 'server' requires every dev to have a qa partner in its pair",
-          });
-        }
-      });
-    });
   }
   const afterDone = config.review.afterDone;
   if (afterDone !== undefined && afterDone !== null && afterDone !== 'pr' && afterDone !== 'branch') {
@@ -159,6 +153,35 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
       }
     }
   }
+}
+
+function validateProjectReviewModes(config: BaxianConfig, errors: ValidationError[]): void {
+  config.project.forEach((project, i) => {
+    const path = `project[${i}]`;
+    const review = (project as { review?: unknown }).review;
+    if (review !== undefined) {
+      if (!isRecord(review)) {
+        errors.push({ path: `${path}.review`, message: 'project.review must be an object' });
+        return;
+      }
+      if (review.mode !== undefined && review.mode !== 'github' && review.mode !== 'server') {
+        errors.push({ path: `${path}.review.mode`, message: "project.review.mode must be 'github' or 'server'" });
+      }
+    }
+
+    if (
+      nonEmptyString(project.repo)
+      && !hasEmbeddedCredentials(project.repo)
+      && isValidRepo(project.repo)
+      && !isGitHubRepo(project.repo)
+      && projectReviewMode(config, project) !== 'server'
+    ) {
+      errors.push({
+        path: `${path}.review.mode`,
+        message: "non-GitHub projects require effective review.mode 'server'",
+      });
+    }
+  });
 }
 
 function validateOptionalPositiveInteger(
