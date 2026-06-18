@@ -1,6 +1,8 @@
 import { isAbsolute } from 'node:path';
-import type { BaxianConfig, AgentRole, AgentRuntime, AgentMode, MergeStrategy, ProjectConfig, ReviewMode } from '../shared/index.js';
-import { hasEmbeddedCredentials, isGitHubRepo, isSafeGitHost, parseGitRemote, repoSlug } from '../shared/index.js';
+import {
+  hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoSlug,
+  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode,
+} from '../shared/index.js';
 
 export interface ValidationError {
   path: string;
@@ -56,9 +58,6 @@ function nonEmptyString(v: unknown): boolean {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
   const review = (project as { review?: unknown }).review;

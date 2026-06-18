@@ -43,12 +43,15 @@ const oneClaudePane: ExecResult = { stdout: '%1 claude\n', stderr: '', exitCode:
 const liveRuntimePane: ExecResult = { stdout: 'claude\n___bx-classify-sep___\n> ', stderr: '', exitCode: 0 };
 const readyCapture: ExecResult = { stdout: '> ', stderr: '', exitCode: 0 };
 
+const emptyPaneTitle: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
+
 function execForSession(result: ExecResult): CommandRunner['exec'] {
   return vi.fn(async (cmd: string) => {
     if (cmd.includes('has-session')) return result;
     if (cmd.includes('list-panes')) return oneClaudePane;
     if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
     if (cmd.includes('capture-pane')) return readyCapture;
+    if (cmd.includes('pane_title')) return emptyPaneTitle;
     return present;
   });
 }
@@ -88,6 +91,7 @@ describe('TmuxProbePoller', () => {
       if (cmd.includes('list-panes')) return oneClaudePane;
       if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
       if (cmd.includes('capture-pane')) return readyCapture;
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return present;
     });
     const runner: CommandRunner = { exec };
@@ -129,6 +133,7 @@ describe('TmuxProbePoller', () => {
       if (cmd.includes('capture-pane')) {
         return { stdout: 'Enter to select · ↑/↓ to navigate · Esc to cancel', stderr: '', exitCode: 0 };
       }
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return present;
     });
     const poller = new TmuxProbePoller({
@@ -160,6 +165,7 @@ describe('TmuxProbePoller', () => {
       if (cmd.includes('capture-pane')) {
         return { stdout: 'Hatching...\nEsc to interrupt', stderr: '', exitCode: 0 };
       }
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return present;
     });
     const poller = new TmuxProbePoller({
@@ -194,6 +200,7 @@ describe('TmuxProbePoller', () => {
       if (cmd.includes('capture-pane')) {
         return { stdout: '• Working (2m 30s • esc to interrup…', stderr: '', exitCode: 0 };
       }
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return present;
     });
     const poller = new TmuxProbePoller({
@@ -220,6 +227,7 @@ describe('TmuxProbePoller', () => {
       if (cmd.includes('___bx-classify-sep___')) {
         return { stdout: 'vim\n___bx-classify-sep___\nediting', stderr: '', exitCode: 0 };
       }
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return present;
     });
     const poller = new TmuxProbePoller({
@@ -257,6 +265,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return captures[Math.min(i++, captures.length - 1)];
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
     }
@@ -352,6 +361,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return scenario === 'live' ? liveRuntimePane : shellPane;
         if (cmd.includes('capture-pane')) return idleCapture;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -384,6 +394,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return idleCapture;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -421,6 +432,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return listPanesResult;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return idleCapture;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -447,6 +459,46 @@ describe('TmuxProbePoller', () => {
       expect(store.get('dev-1').reason).toBeUndefined();
     });
 
+    it('resets debouncer on unreachable so recovery does not inherit stale working state', async () => {
+      const store = new TmuxSessionStatusStore();
+      let nowMs = 1_000_000;
+      let sessionResult: ExecResult = present;
+      const workingScreen: ExecResult = { stdout: '· Wrangling… (5s · esc to interrupt)', stderr: '', exitCode: 0 };
+      let captureResult: ExecResult = workingScreen;
+      const exec = vi.fn(async (cmd: string) => {
+        if (cmd.includes('has-session')) return sessionResult;
+        if (cmd.includes('list-panes')) return oneClaudePane;
+        if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+        if (cmd.includes('capture-pane')) return captureResult;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
+        return present;
+      });
+      const poller = new TmuxProbePoller({
+        config: makeConfig([makeAgent('dev-1')]),
+        store,
+        agentManager: noopAgentManager,
+        agentStore: fakeAgentStore({ 'dev-1': { taskId: 'task-001' } }),
+        runnerFactory: () => ({ exec }),
+        now: () => nowMs,
+        failureThreshold: 1,
+      });
+
+      await poller.pollOnce();
+      expect(store.get('dev-1').runtimeStatusHint).toBe('working');
+
+      sessionResult = unreachable;
+      nowMs += 1000;
+      await poller.pollOnce();
+      expect(store.get('dev-1').tmuxSessionStatus).toBe('unreachable');
+
+      sessionResult = present;
+      captureResult = idleCapture;
+      nowMs += 1000;
+      await poller.pollOnce();
+
+      expect(store.get('dev-1').runtimeStatusHint).toBeUndefined();
+    });
+
     it('transient unreachable below failure threshold does not reset the idle timer', async () => {
       const store = new TmuxSessionStatusStore();
       let nowMs = 1_000_000;
@@ -456,6 +508,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return idleCapture;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -496,6 +549,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return frozenSpinner;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -519,16 +573,16 @@ describe('TmuxProbePoller', () => {
       });
     });
 
-    it('does NOT flag STUCK_BUSY for a static busy screen WITHOUT a live spinner', async () => {
+    it('does NOT flag STUCK_BUSY for static esc-to-interrupt without visibleWorking', async () => {
       const store = new TmuxSessionStatusStore();
       let nowMs = 1_000_000;
-      // Codex busy screen: static "Working on it… / esc to interrupt", no ticking spinner. Healthy long task.
       const codexBusyStatic: ExecResult = { stdout: 'Working on it…\n  esc to interrupt', stderr: '', exitCode: 0 };
       const exec = vi.fn(async (cmd: string) => {
         if (cmd.includes('has-session')) return present;
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return codexBusyStatic;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -544,9 +598,42 @@ describe('TmuxProbePoller', () => {
       nowMs += 6 * 60 * 1000;
       await poller.pollOnce();
 
-      // esc-to-interrupt in tail → 'working'; no live spinner → never STUCK_BUSY even when static.
       expect(store.get('dev-1').runtimeStatusHint).toBe('working');
       expect(store.get('dev-1').reason).toBeUndefined();
+    });
+
+    it('flags STUCK_BUSY when working is determined only by frozen OSC braille title', async () => {
+      const store = new TmuxSessionStatusStore();
+      let nowMs = 1_000_000;
+      const oscTitle: ExecResult = { stdout: '⠁ Reading file', stderr: '', exitCode: 0 };
+      const plainScreen: ExecResult = { stdout: 'some output\n', stderr: '', exitCode: 0 };
+      const exec = vi.fn(async (cmd: string) => {
+        if (cmd.includes('has-session')) return present;
+        if (cmd.includes('list-panes')) return oneClaudePane;
+        if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+        if (cmd.includes('capture-pane')) return plainScreen;
+        if (cmd.includes('pane_title')) return oscTitle;
+        return present;
+      });
+      const poller = new TmuxProbePoller({
+        config: makeConfig([makeAgent('dev-1')]),
+        store,
+        agentManager: noopAgentManager,
+        agentStore: fakeAgentStore({ 'dev-1': { taskId: 'task-001' } }),
+        runnerFactory: () => ({ exec }),
+        now: () => nowMs,
+      });
+
+      await poller.pollOnce();
+      expect(store.get('dev-1').runtimeStatusHint).toBe('working');
+
+      nowMs += 6 * 60 * 1000;
+      await poller.pollOnce();
+
+      expect(store.get('dev-1')).toMatchObject({
+        runtimeStatusHint: 'error',
+        reason: 'STUCK_BUSY',
+      });
     });
 
     it('a quoted/leftover spinner above an idle prompt is classified as PENDING_IDLE', async () => {
@@ -563,6 +650,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return quotedSpinnerIdle;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -597,6 +685,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('capture-pane')) {
           return { stdout: `· Working… (${secs} s · esc to interrupt)`, stderr: '', exitCode: 0 };
         }
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -633,6 +722,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return staleAnchor;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -672,6 +762,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return { stdout: '%1 node\n', stderr: '', exitCode: 0 };
         if (cmd.includes('___bx-classify-sep___')) return { stdout: 'node\n___bx-classify-sep___\n› ', stderr: '', exitCode: 0 };
         if (cmd.includes('capture-pane')) return staleWorkingIdle;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
       const poller = new TmuxProbePoller({
@@ -757,12 +848,114 @@ describe('TmuxProbePoller', () => {
     });
   });
 
+  it('skipStateUpdate rule preserves previous observation (e.g. transcript viewer)', async () => {
+    const store = new TmuxSessionStatusStore();
+    const workingCapture: ExecResult = {
+      stdout: 'Hatching...\nEsc to interrupt',
+      stderr: '', exitCode: 0,
+    };
+    const transcriptCapture: ExecResult = {
+      stdout: 'Showing detailed transcript\nctrl+o to toggle\n↑↓ scroll\n? for shortcuts',
+      stderr: '', exitCode: 0,
+    };
+    let currentCapture = workingCapture;
+    const exec = vi.fn(async (cmd: string) => {
+      if (cmd.includes('has-session')) return present;
+      if (cmd.includes('list-panes')) return oneClaudePane;
+      if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+      if (cmd.includes('capture-pane')) return currentCapture;
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
+      return present;
+    });
+    const poller = new TmuxProbePoller({
+      config: makeConfig([makeAgent('dev-1')]),
+      store,
+      agentManager: noopAgentManager,
+      runnerFactory: () => ({ exec }),
+    });
+
+    await poller.pollOnce();
+    expect(store.get('dev-1').runtimeStatusHint).toBe('working');
+
+    currentCapture = transcriptCapture;
+    await poller.pollOnce();
+    expect(store.get('dev-1').runtimeStatusHint).toBe('working');
+  });
+
+  it('skipStateUpdate preserves latestError from previous observation', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'baxian-errors-'));
+    await mkdir(join(dir, 'errors'), { recursive: true });
+    const errorRecordStore = new ErrorRecordStore(join(dir, 'errors'));
+    const store = new TmuxSessionStatusStore();
+    const blockerCapture: ExecResult = {
+      stdout: 'Enter to select · ↑/↓ to navigate · Esc to cancel',
+      stderr: '', exitCode: 0,
+    };
+    const transcriptCapture: ExecResult = {
+      stdout: 'Showing detailed transcript\nctrl+o to toggle\n↑↓ scroll\n? for shortcuts',
+      stderr: '', exitCode: 0,
+    };
+    let currentCapture: ExecResult = blockerCapture;
+    const exec = vi.fn(async (cmd: string) => {
+      if (cmd.includes('has-session')) return present;
+      if (cmd.includes('list-panes')) return oneClaudePane;
+      if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+      if (cmd.includes('capture-pane')) return currentCapture;
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
+      return present;
+    });
+    const poller = new TmuxProbePoller({
+      config: makeConfig([makeAgent('dev-1')]),
+      store,
+      agentManager: noopAgentManager,
+      errorRecordStore,
+      runnerFactory: () => ({ exec }),
+    });
+
+    await poller.pollOnce();
+    expect(store.get('dev-1').latestError).toBeDefined();
+    expect(store.get('dev-1').latestError?.reason).toBe('PENDING_HUMAN');
+
+    currentCapture = transcriptCapture;
+    await poller.pollOnce();
+    expect(store.get('dev-1').latestError).toBeDefined();
+    expect(store.get('dev-1').latestError?.reason).toBe('PENDING_HUMAN');
+  });
+
+  it('skipStateUpdate on first observation still commits presence to store', async () => {
+    const store = new TmuxSessionStatusStore();
+    const transcriptCapture: ExecResult = {
+      stdout: 'Showing detailed transcript\nctrl+o to toggle\n↑↓ scroll\n? for shortcuts',
+      stderr: '', exitCode: 0,
+    };
+    const exec = vi.fn(async (cmd: string) => {
+      if (cmd.includes('has-session')) return present;
+      if (cmd.includes('list-panes')) return oneClaudePane;
+      if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+      if (cmd.includes('capture-pane')) return transcriptCapture;
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
+      return present;
+    });
+    const poller = new TmuxProbePoller({
+      config: makeConfig([makeAgent('dev-1')]),
+      store,
+      agentManager: noopAgentManager,
+      runnerFactory: () => ({ exec }),
+    });
+
+    expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+    await poller.pollOnce();
+    expect(store.get('dev-1').tmuxSessionStatus).toBe('present');
+    expect(store.get('dev-1').lastPresentAt).toBeTruthy();
+  });
+
   it('reuses one runner for session presence and present-session observation', async () => {
     const exec = vi.fn(async (cmd: string) => {
       if (cmd.includes('has-session')) return present;
       if (cmd.includes('list-panes')) return oneClaudePane;
       if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
       if (cmd.includes('capture-pane')) return readyCapture;
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return present;
     });
     const runnerFactory = vi.fn(() => ({ exec }));
@@ -815,6 +1008,7 @@ describe('TmuxProbePoller', () => {
         return { stdout: '%1 claude\n%2 zsh\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+      if (cmd.includes('pane_title')) return emptyPaneTitle;
       return readyCapture;
     });
     const poller = new TmuxProbePoller({
@@ -910,6 +1104,7 @@ describe('TmuxProbePoller', () => {
       agentManager: noopAgentManager,
       runnerFactory: () => ({
         exec: async (cmd: string) => {
+          if (cmd.includes('pane_title')) return emptyPaneTitle;
           if (!cmd.includes('has-session')) return oneClaudePane;
           probeStarted += 1;
           inProbe += 1;
@@ -942,6 +1137,7 @@ describe('TmuxProbePoller', () => {
         if (cmd.includes('list-panes')) return oneClaudePane;
         if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
         if (cmd.includes('capture-pane')) return readyCapture;
+        if (cmd.includes('pane_title')) return emptyPaneTitle;
         return present;
       });
     const poller = new TmuxProbePoller({
@@ -1007,6 +1203,7 @@ describe('TmuxProbePoller', () => {
           if (cmd.includes('list-panes')) return oneClaudePane;
           if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
           if (cmd.includes('capture-pane')) return readyCapture;
+          if (cmd.includes('pane_title')) return emptyPaneTitle;
           return present;
         }),
       }) as unknown as CommandRunner,
@@ -1051,6 +1248,7 @@ describe('TmuxProbePoller', () => {
             if (cmd.includes('list-panes')) return oneClaudePane;
             if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
             if (cmd.includes('capture-pane')) return readyCapture;
+            if (cmd.includes('pane_title')) return emptyPaneTitle;
             return present;
           }),
         } as unknown as CommandRunner;
@@ -1194,6 +1392,69 @@ describe('TmuxProbePoller', () => {
 
     poller.purgeAgent('dev-1');
     expect(store.get('dev-1').tmuxSessionStatus).toBe('unknown');
+  });
+
+  it('detects blocked state via manifest permission prompt', async () => {
+    const store = new TmuxSessionStatusStore();
+    const agent = makeAgent('dev-1');
+    const config = makeConfig([agent]);
+    const permissionScreen = [
+      'Run this bash command?',
+      'Do you want to proceed?',
+      'Tab to amend',
+      '❯ Yes',
+      '2. No',
+    ].join('\n');
+    const poller = new TmuxProbePoller({
+      config,
+      store,
+      agentManager: noopAgentManager,
+      runnerFactory: () => ({
+        exec: vi.fn(async (cmd: string) => {
+          if (cmd.includes('has-session')) return present;
+          if (cmd.includes('list-panes')) return oneClaudePane;
+          if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+          if (cmd.includes('capture-pane')) return { stdout: permissionScreen, stderr: '', exitCode: 0 };
+          if (cmd.includes('pane_title')) return emptyPaneTitle;
+          return present;
+        }),
+      }),
+    });
+
+    await poller.pollOnce();
+
+    const obs = store.get('dev-1');
+    expect(obs.runtimeStatusHint).toBe('pending');
+    expect(obs.reason).toBe('PENDING_HUMAN');
+  });
+
+  it('detects working state via OSC title braille spinner', async () => {
+    const store = new TmuxSessionStatusStore();
+    const agent = makeAgent('dev-1');
+    const config = makeConfig([agent]);
+    const poller = new TmuxProbePoller({
+      config,
+      store,
+      agentManager: noopAgentManager,
+      runnerFactory: () => ({
+        exec: vi.fn(async (cmd: string) => {
+          if (cmd.includes('has-session')) return present;
+          if (cmd.includes('list-panes')) return oneClaudePane;
+          if (cmd.includes('___bx-classify-sep___')) return liveRuntimePane;
+          if (cmd.includes('capture-pane')) return { stdout: 'some output', stderr: '', exitCode: 0 };
+          if (cmd.includes('pane_title')) return { stdout: '⠁ Reading file\n', stderr: '', exitCode: 0 };
+          return present;
+        }),
+      }),
+    });
+
+    await poller.pollOnce();
+
+    expect(store.get('dev-1')).toMatchObject({
+      tmuxSessionStatus: 'present',
+      paneState: 'live-runtime',
+      runtimeStatusHint: 'working',
+    });
   });
 });
 

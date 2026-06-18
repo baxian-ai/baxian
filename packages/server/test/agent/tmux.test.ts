@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectBusy, detectReplActiveBusy, detectActiveRegionBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, runtimeBusyCheck } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
@@ -870,6 +870,25 @@ describe('TmuxManager', () => {
     });
   });
 
+  describe('readPaneTitle', () => {
+    it('reads pane title via display-message #{pane_title}', async () => {
+      runner.exec.mockResolvedValueOnce({
+        stdout: '⠋ Reading file\n', stderr: '', exitCode: 0,
+      });
+      const title = await tmux.readPaneTitle('%1');
+      expect(lastCmd(runner)).toBe("tmux display-message -p -t '%1' '#{pane_title}'");
+      expect(title).toBe('⠋ Reading file');
+    });
+
+    it('returns empty string on failure', async () => {
+      runner.exec.mockResolvedValueOnce({
+        stdout: '', stderr: 'pane not found', exitCode: 1,
+      });
+      const title = await tmux.readPaneTitle('%1');
+      expect(title).toBe('');
+    });
+  });
+
   describe('classifyPaneForAdopt', () => {
     const SEP = '___bx-classify-sep___';
     const composeProbeOut = (procTitle: string, capture: string): string =>
@@ -1366,79 +1385,6 @@ describe('hasRuntimeIdleComposerPrompt', () => {
   });
 });
 
-describe('detectBusy', () => {
-  const LONG_LABEL =
-    '重构 packages/server/src/agent/tmux.ts 中所有与 spinner 检测、completion-marker 处理相关的逻辑分支';
-
-  const POSITIVE: Array<[string, string]> = [
-    ['claude-code "Esc to interrupt" screen', '⏵ Thinking…\n\n  Esc to interrupt'],
-    ['codex busy screen (lowercase)', 'Working on it…\n  esc to interrupt'],
-    ['codex busy screen (uppercase)', 'Processing\n  ESC TO INTERRUPT'],
-    ['claude-code thinking spinner: · Wrangling…', '· Wrangling… (1m 55s · almost done thinking with xhigh effort)'],
-    ['claude-code thinking spinner: · Stewing…', '· Stewing… (24s)'],
-    ['claude-code thinking spinner: ✻ Pondering…', '✻ Pondering… (5m 33s · ↓ 13.5k tokens · almost done thinking with xhigh effort)'],
-    ['claude-code thinking spinner: ✳ Pondering…', '✳ Pondering… (5m 31s · ↓ 13.2k tokens)'],
-    ['claude-code thinking spinner: ✶ Pondering…', '✶ Pondering… (5m 35s)'],
-    ['claude-code thinking spinner: ✽ Pondering…', '✽ Pondering… (5m 32s)'],
-    ['spinner verb with apostrophe', "· Beboppin'… (3s)"],
-    ['spinner verb with hyphen', '· Razzle-dazzling… (5s)'],
-    ['spinner verb with non-ASCII char', '✻ Flambéing… (10s)'],
-    ['spinner verb (sock-hopping)', '✢ Sock-hopping… (24s)'],
-    ['spinner verb (dilly-dallying)', '· Dilly-dallying… (1m 30s)'],
-    ['dynamic task-description: 改 prompt.ts', '· 改 prompt.ts… (23m 7s · ↑ 30.2k tokens · thought for 1s)'],
-    ['dynamic task-description: 分析依赖关系', '✻ 分析依赖关系… (45s)'],
-    ['1-char label boundary', '· 改… (3s)'],
-    ['long-label boundary', `· ${LONG_LABEL}… (5m 12s)`],
-    [
-      'claude-code /compact progress spinner',
-      '✢ Compacting conversation… (1m 58s)\n  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱ 73%\n',
-    ],
-    [
-      'real worker-01 baxian-dev capture mid-thinking (regression)',
-      "❯ 当 qa agent 认为一个 pr 已经可以合并了，我们要求 qa agent 同时做评论 :+1: 和发\n  approve 这两件事。\n\n· Wrangling… (2m 42s · almost done thinking with xhigh effort)\n  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's\n     current work\n\n────────────────────────────────────────────────────────────────────────────────\n❯ \n────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [#################   ] 87%\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #101\n",
-    ],
-    [
-      'live spinner below an older "Worked for" marker (new round of thinking)',
-      '⏺ 上一轮 reply 在这里。\n\n✻ Worked for 24s\n\n❯ 用户又问了一句\n\n· Stewing… (5s)\n  ⎿  Tip: ...\n\n────────────────────────────────────────────────────────────────────────────────\n❯ \n────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [#################   ] 50%\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-  ];
-
-  const NEGATIVE: Array<[string, string]> = [
-    ['idle REPL prompt', '⏵⏵ bypass permissions on ~/code\n\n>'],
-    [
-      'idle REPL prompt with status bar and history',
-      '✻ Worked for 33m 3s\n\n────────────────────────────────────────────────────────────────────────────────\n❯ \n────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [#################   ] 85%\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #101\n',
-    ],
-    ['runtime menu (no busy signal)', 'Enter to select · ↑/↓ to navigate · Esc to cancel'],
-    ['prose with "-ing" verbs but no duration tail', 'See pull request: refactoring legacy module to remove unused exports.\n'],
-    [
-      'user prefilled input with spinner-shaped prose (line starts with ❯)',
-      '✻ Worked for 5m 38s\n\n────────────────────────────────────────────────────────────────────────────────\n❯ 请解释日志里的 Wrangling… (24s) 是什么意思\n────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [#################   ] 87%\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    ['markdown bullet describing a spinner verb (ASCII *)', '* Pondering… (3s) 表示模型正在思考\n'],
-    ['markdown bullet describing a spinner verb (ASCII -)', '- Wrangling… (24s) 是 thinking 阶段\n'],
-    ['cross-line text: "…" and "(duration)" split across newlines', '· Wrangling…\n(24s) — split across newlines, not a spinner'],
-    ['cross-line text: duration paren split across newlines', '· Wrangling… (\n24s) — duration split too'],
-    [
-      'spinner-shaped line followed by "Worked for" completion marker (history / reply quoting)',
-      '⏺ Claude Code 的 spinner 显示为：\n\n· Wrangling… (24s)\n\n表示模型在思考中。\n\n✻ Worked for 24s\n────────────────────────────────────────────────────────────────────────────────\n❯ \n────────────────────────────────────────────────────────────────────────────────\n  Opus 4.7 [#################   ] 50%\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n',
-    ],
-    ['empty string', ''],
-  ];
-
-  it('matches every known busy signal', () => {
-    for (const [name, screen] of POSITIVE) {
-      expect.soft(detectBusy(screen), name).toBe(true);
-    }
-  });
-
-  it('does NOT match idle / quoted / boundary-edge content', () => {
-    for (const [name, screen] of NEGATIVE) {
-      expect.soft(detectBusy(screen), name).toBe(false);
-    }
-  });
-});
-
 describe('detectReplActiveBusy', () => {
   const STATUS_TAIL = [
     '────────────────────────────────────────────────────────────────────────────────',
@@ -1537,35 +1483,5 @@ describe('hasActiveSpinnerInTail (active-region-scoped, used for stuck-busy)', (
     // spinner is present anywhere (hasActiveSpinner true) but NOT in the active tail region.
     expect(hasActiveSpinner(screen)).toBe(true);
     expect(hasActiveSpinnerInTail(screen)).toBe(false);
-  });
-});
-
-describe('detectActiveRegionBusy (live-status busy for the poller, scoped to the activity region)', () => {
-  it('is busy for an active-region spinner or a tail esc-to-interrupt', () => {
-    for (const [name, screen] of [
-      ['active-region spinner', '· Stewing… (24s)'],
-      ['codex tail esc-to-interrupt', 'Working on it…\n  esc to interrupt'],
-      ['codex tail truncated esc-to-interrupt', '• Working (2m 30s • esc to interrup…'],
-    ] as Array<[string, string]>) {
-      expect.soft(detectActiveRegionBusy(screen), name).toBe(true);
-    }
-  });
-
-  it('uses codex runtime context to recognize the current Working line', () => {
-    expect(detectActiveRegionBusy('• Working (2m 30s • esc to interrup…', 'codex')).toBe(true);
-    expect(detectActiveRegionBusy('Working (8s)', 'codex')).toBe(true);
-    expect(detectActiveRegionBusy('Working (8s)', 'claude-code')).toBe(false);
-  });
-
-  it('is NOT busy when only a quoted/stale signal sits high in scrollback above an idle prompt', () => {
-    for (const [name, screen] of [
-      ['quoted spinner high, idle prompt below', ['· Wrangling… (24s)', ...Array(12).fill(''), '❯ '].join('\n')],
-      ['stale esc-to-interrupt high, idle prompt below', ['esc to interrupt', ...Array(9).fill(''), '❯ '].join('\n')],
-      ['stale codex Working line high, idle prompt below', ['• Working (2m 30s • esc to interrup…', ...Array(9).fill(''), '› '].join('\n')],
-      ['stale codex Working line in tail, idle prompt below', ['• Working (2m 30s • esc to interrup…', '', '› '].join('\n')],
-      ['idle ready prompt', '❯ '],
-    ] as Array<[string, string]>) {
-      expect.soft(detectActiveRegionBusy(screen, 'codex'), name).toBe(false);
-    }
   });
 });

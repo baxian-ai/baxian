@@ -90,18 +90,14 @@ export function hasReplProcTitle(current: string, runtime: AgentRuntimeKind): bo
   return REPL_PROC_TITLES[runtime].test(current);
 }
 
-// 全局统一的 active-busy 判定：spinner 在 viewport 任意位置 OK（SPINNER_LINE_RE 格式严格，
-// 普通对话文本极难误命中），但 "esc to interrupt" 仅看 viewport 底部状态区，避免历史/引用
-// 文本误报。dispatch ack 与 tmux-probe-poller 都用它，保证 busy 语义一致。
 const ESC_TO_INTERRUPT_TAIL_LINES = 8;
-const CODEX_WORKING_TAIL_LINES = 8;
 const CLAUDE_IDLE_COMPOSER_TAIL_LINES = 6;
 const ESC_TO_INTERRUPT_RE = /esc to interru(?:pt|p(?:…|\.{3})?)/i;
 const CODEX_WORKING_LINE_RE = /^[ \t]*(?:[•·][ \t]+)?Working[ \t]*\(/im;
 const CODEX_IDLE_PROMPT_LINE_RE = /^[ \t]*[›→](?:[ \t].*)?$/im;
-// no m flag: $ anchors to end-of-string so prompt must be the last non-whitespace content
 const CODEX_IDLE_COMPOSER_LINE_RE = /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:\s+git:\([^\s)]+\))?\s*$/i;
 const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
+const CODEX_WORKING_TAIL_LINES = 8;
 const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t]*[❯>][ \t]*$/m;
 
 // A live, incomplete spinner ("· Verb… (Ns"): its elapsed-seconds advance every second, so the
@@ -136,6 +132,10 @@ function escToInterruptInTail(stripped: string): boolean {
   return ESC_TO_INTERRUPT_RE.test(tail(stripped, ESC_TO_INTERRUPT_TAIL_LINES));
 }
 
+export function detectReplActiveBusy(stripped: string): boolean {
+  return hasActiveSpinner(stripped) || escToInterruptInTail(stripped);
+}
+
 function lastMatchIndex(stripped: string, pattern: RegExp): number {
   let last = -1;
   const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
@@ -166,15 +166,6 @@ function codexWorkingInTail(stripped: string, runtime?: AgentRuntimeKind): boole
   return lastWorking > lastIdlePromptIndex(activeTail, runtime);
 }
 
-// Whole-screen spinner (anywhere) + tail esc-to-interrupt. Used by dispatch ack, where the subject is
-// the post-paste composer / post-Enter pane and a spinner anywhere is a fine submit confirmation.
-export function detectReplActiveBusy(stripped: string): boolean {
-  return hasActiveSpinner(stripped) || escToInterruptInTail(stripped);
-}
-
-// Active-region busy: spinner in the activity region + tail esc-to-interrupt. Used by the live-status
-// poller so a quoted/stale spinner high in scrollback above an idle prompt does NOT read as 'working'
-// — it must fall through to PENDING_IDLE.
 export function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeKind): boolean {
   return hasActiveSpinnerInTail(stripped)
     || escToInterruptActiveInTail(stripped, runtime)
@@ -221,13 +212,6 @@ function submitAckBusy(stripped: string, runtime: AgentRuntimeKind): boolean {
 
 const SPINNER_LINE_RE = /^[·✢✳✶✻✽][ \t]+[^\n…]{1,200}…[ \t]*\([ \t]*(?:\d+[ \t]*m[ \t]+)?\d+[ \t]*s/gm;
 const COMPLETION_MARKER_RE = /^✻[ \t]+Worked for/m;
-
-// Whole-screen busy matcher: matches "esc to interrupt" ANYWHERE, so it false-positives on history /
-// quoted text. NOT for live status (use detectReplActiveBusy). Kept as the SPINNER_LINE_RE coverage util.
-export function detectBusy(stripped: string): boolean {
-  if (/esc to interrupt/i.test(stripped)) return true;
-  return hasActiveSpinner(stripped);
-}
 
 export type AdoptPaneState =
   | { kind: 'live-runtime' }
@@ -403,6 +387,14 @@ export class TmuxManager {
       throw new Error(`tmux displayMessage ${paneId} failed: ${result.stderr}`);
     }
     return result.stdout.replace(/\n$/, '');
+  }
+
+  async readPaneTitle(paneId: string, opts?: ExecOptions): Promise<string> {
+    try {
+      return await this.displayMessage(paneId, '#{pane_title}', opts);
+    } catch {
+      return '';
+    }
   }
 
   async setOption(name: string, key: string, value: string): Promise<void> {

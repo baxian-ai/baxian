@@ -449,3 +449,7 @@ export type EventsServerMsg =
   | { type: 'data'; topic: EventsTopicPollers; data: PollerSnapshot[] }
   | { type: 'error'; topic?: EventsTopic; code: string; message: string }
   | { type: 'pong' };
+
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}

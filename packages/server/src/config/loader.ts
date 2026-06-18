@@ -1,7 +1,7 @@
 import { readFile, writeFile, access, mkdir } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import type { AfterDone, BaxianConfig, HostConfig, ProjectConfig, ReviewMode, ServerConfig } from '../shared/index.js';
+import { isRecord, type AfterDone, type BaxianConfig, type HostConfig, type ProjectConfig, type ReviewMode, type ServerConfig } from '../shared/index.js';
 import {
   CONFIG_FILE,
   DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
@@ -177,9 +177,6 @@ export async function saveConfig(configPath: string, config: BaxianConfig): Prom
   await writeFile(configPath, JSON.stringify(config, null, 2) + '\n');
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 // Element-level shape guard run before applyDefaults coerces. Without it, applyDefaults silently
 // drops non-record projects (filter(isRecord)) and throws a raw TypeError on a non-array agent pair.

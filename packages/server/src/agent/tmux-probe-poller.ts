@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type {
   AgentConfig,
   AgentErrorSummary,
@@ -9,7 +12,9 @@ import type {
 import type { AgentManager } from './manager.js';
 import type { CommandRunner } from './runner.js';
 import { createRunner, resolveAgentHost } from './runner.js';
-import { TmuxManager, detectActiveRegionBusy, hasActiveSpinnerInTail, detectRuntimeMenu, type AdoptPaneState } from './tmux.js';
+import { TmuxManager, type AdoptPaneState, type AgentRuntimeKind } from './tmux.js';
+import { evaluateManifest, WorkingToIdleDebounce, type AgentManifest, type DetectedState } from './detect/index.js';
+import type { DetectionInput } from './detect/region.js';
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { ErrorRecordStore } from '../state/error-record-store.js';
@@ -98,6 +103,16 @@ export interface TmuxProbePollerOptions {
   now?: () => number;
 }
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function loadManifests(): Map<AgentRuntimeKind, AgentManifest> {
+  const dir = join(__dirname, 'detect', 'manifests');
+  return new Map<AgentRuntimeKind, AgentManifest>([
+    ['claude-code', JSON.parse(readFileSync(join(dir, 'claude-code.json'), 'utf-8')) as AgentManifest],
+    ['codex', JSON.parse(readFileSync(join(dir, 'codex.json'), 'utf-8')) as AgentManifest],
+  ]);
+}
+
 const DEFAULT_FAILURE_THRESHOLD = 2;
 const PENDING_IDLE_AFTER_MS = 5 * 60 * 1000;
 
@@ -119,6 +134,9 @@ export class TmuxProbePoller {
   // id → current AgentConfig reference. Reference identity is the generation token:
   // every prepareConfig produces fresh instances, so DELETE→CREATE same-id is detectable.
   private validInstances = new Map<string, AgentConfig>();
+  private manifests = loadManifests();
+  private debouncers = new Map<string, WorkingToIdleDebounce>();
+  private lastPublishedState = new Map<string, DetectedState>();
   private now: () => number;
 
   constructor(options: TmuxProbePollerOptions) {
@@ -166,8 +184,14 @@ export class TmuxProbePoller {
   purgeAgent(id: string): void {
     this.failureCounts.delete(id);
     this.lastRecordedIssue.delete(id);
-    this.lastScreen.delete(id);
+    this.resetDetectionBaseline(id);
     this.store.delete(id);
+  }
+
+  private resetDetectionBaseline(id: string): void {
+    this.lastScreen.delete(id);
+    this.debouncers.delete(id);
+    this.lastPublishedState.delete(id);
   }
 
   // Instance equality, not just id: DELETE→CREATE same id swaps the AgentConfig reference,
@@ -183,6 +207,38 @@ export class TmuxProbePoller {
       return;
     }
     this.store.set(agent.id, entry);
+  }
+
+  private detectViaManifest(
+    agentId: string,
+    runtime: AgentRuntimeKind,
+    runtimeScreen: string,
+    oscTitle: string,
+  ): { runtimeStatusHint?: AgentRuntimeStatus; visibleBlocker: boolean; visibleWorking: boolean } | 'skip' {
+    const manifest = this.manifests.get(runtime);
+    if (!manifest) {
+      return { runtimeStatusHint: undefined, visibleBlocker: false, visibleWorking: false };
+    }
+
+    const input: DetectionInput = { screen: runtimeScreen, oscTitle };
+    const detection = evaluateManifest(manifest, input);
+
+    if (detection.skipStateUpdate) return 'skip';
+
+    let debouncer = this.debouncers.get(agentId);
+    if (!debouncer) {
+      debouncer = new WorkingToIdleDebounce();
+      this.debouncers.set(agentId, debouncer);
+    }
+    const previousPublished = this.lastPublishedState.get(agentId) ?? 'unknown';
+    const published = debouncer.apply(detection.state, previousPublished, detection.visibleIdle);
+    this.lastPublishedState.set(agentId, published);
+
+    return {
+      runtimeStatusHint: published === 'working' || published === 'pending' ? published : undefined,
+      visibleBlocker: detection.visibleBlocker,
+      visibleWorking: detection.visibleWorking,
+    };
   }
 
   start(): void {
@@ -234,7 +290,7 @@ export class TmuxProbePoller {
         // Only reset the idle baseline when the store is actually flipping to non-present;
         // single transient probe failures below the threshold must not zero the timer or a
         // truly idle session on a flaky link would never accumulate 5 minutes.
-        this.lastScreen.delete(agent.id);
+        this.resetDetectionBaseline(agent.id);
         const latestError = await this.recordProbeError(agent, now, result.error);
         this.commitObservation(agent, {
           tmuxSessionStatus: 'unreachable',
@@ -251,17 +307,19 @@ export class TmuxProbePoller {
     this.failureCounts.delete(agent.id);
     if (result.tmuxSessionStatus !== 'present') {
       this.lastRecordedIssue.delete(agent.id);
-      this.lastScreen.delete(agent.id);
+      this.resetDetectionBaseline(agent.id);
     }
     const presentDetails = result.tmuxSessionStatus === 'present' && tmux
       ? await this.observePresentSession(agent, tmux, now)
       : {};
-    this.commitObservation(agent, {
-      tmuxSessionStatus: result.tmuxSessionStatus,
-      observedAt: now,
-      ...(result.tmuxSessionStatus === 'present' ? { lastPresentAt: now } : {}),
-      ...presentDetails,
-    });
+    if (presentDetails !== undefined) {
+      this.commitObservation(agent, {
+        tmuxSessionStatus: result.tmuxSessionStatus,
+        observedAt: now,
+        ...(result.tmuxSessionStatus === 'present' ? { lastPresentAt: now } : {}),
+        ...presentDetails,
+      });
+    }
     this.logTransition(agent.id, previous, result.tmuxSessionStatus);
 
     if (result.tmuxSessionStatus === 'absent') {
@@ -277,7 +335,7 @@ export class TmuxProbePoller {
     agent: AgentConfig,
     tmux: TmuxManager,
     occurredAt: string,
-  ): Promise<Partial<TmuxSessionObservation>> {
+  ): Promise<Partial<TmuxSessionObservation> | undefined> {
     try {
       const paneId = await tmux.getSinglePaneId(agent.id, { timeout: this.probeTimeoutMs });
       const paneState = await tmux.classifyPaneForAdopt(paneId, agent.runtime, { timeout: this.probeTimeoutMs });
@@ -296,29 +354,42 @@ export class TmuxProbePoller {
       const currentTaskId = liveRuntime && this.agentStore
         ? (await this.agentStore.get(agent.id))?.taskId ?? null
         : null;
+      let oscTitle = '';
       if (liveRuntime) {
-        const hash = createHash('sha1').update(runtimeScreen).digest('hex');
+        try {
+          oscTitle = await tmux.readPaneTitle(paneId, { timeout: this.probeTimeoutMs });
+        } catch { /* best-effort */ }
+      }
+      if (liveRuntime) {
+        const hash = createHash('sha1').update(runtimeScreen).update(oscTitle).digest('hex');
         const prev = this.lastScreen.get(agent.id);
         if (!prev || prev.hash !== hash || prev.taskId !== currentTaskId) {
           this.lastScreen.set(agent.id, { hash, changedAt: this.now(), taskId: currentTaskId });
         }
       } else {
-        this.lastScreen.delete(agent.id);
+        this.resetDetectionBaseline(agent.id);
       }
-      // Busy uses detectReplActiveBusy (tail-scoped esc-to-interrupt + live spinner), same as dispatch
-      // ack: a stale 'esc to interrupt' high in the viewport above a ready prompt must NOT count as busy
-      // (else an idle pane is mislabeled instead of PENDING_IDLE).
-      // Live status uses detectActiveRegionBusy (spinner in the activity region + tail esc-to-interrupt),
-      // NOT whole-screen: a quoted/stale spinner high in scrollback above an idle prompt must fall through
-      // to PENDING_IDLE, not read as 'working'; a stale esc-to-interrupt high above a ready
-      // prompt likewise. STUCK_BUSY then fires only on a FROZEN active spinner — its seconds
-      // advance every second, so a spinner static across the grace window means the runtime is stuck; a
-      // static esc-to-interrupt without a spinner (long-running Codex task) never escalates.
-      // Menu UI still wins as a hard human-pending signal.
-      const pending = liveRuntime && detectRuntimeMenu(runtimeScreen);
-      const busy = liveRuntime && !pending && detectActiveRegionBusy(runtimeScreen, agent.runtime);
+
+      const manifestResult = liveRuntime
+        ? this.detectViaManifest(agent.id, agent.runtime, runtimeScreen, oscTitle)
+        : undefined;
+
+      if (manifestResult === 'skip') {
+        const prev = this.store.get(agent.id);
+        return {
+          paneState: paneState.kind,
+          ...(prev.runtimeStatusHint ? { runtimeStatusHint: prev.runtimeStatusHint } : {}),
+          ...(prev.reason ? { reason: prev.reason } : {}),
+          ...(prev.message ? { message: prev.message } : {}),
+          ...(prev.latestError ? { latestError: prev.latestError } : {}),
+        };
+      }
+
+      const pending = manifestResult ? manifestResult.visibleBlocker : false;
+      const busy = manifestResult ? manifestResult.runtimeStatusHint === 'working' : false;
       const screenStatic = !pending && this.screenStaticForGrace(agent.id, paneState);
-      const stuckBusy = busy && screenStatic && hasActiveSpinnerInTail(runtimeScreen);
+      const visibleWorking = manifestResult ? manifestResult.visibleWorking : false;
+      const stuckBusy = busy && screenStatic && visibleWorking;
       const pendingIdle = !busy && screenStatic;
       const issue = this.issueForPaneState(paneState, pending, pendingIdle, stuckBusy);
       if (!issue) {
@@ -340,7 +411,7 @@ export class TmuxProbePoller {
       // Probe failed mid-session: PANE_PROBE_FAILED is a discontinuity in observation. The
       // "5 minutes static" claim requires unbroken sampling, so drop the baseline; next
       // successful probe will rebuild it and start the grace period fresh.
-      this.lastScreen.delete(agent.id);
+      this.resetDetectionBaseline(agent.id);
       const message = err instanceof Error ? err.message : String(err);
       const issue = {
         runtimeStatusHint: 'error' as const,

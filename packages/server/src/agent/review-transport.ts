@@ -1,15 +1,14 @@
 import {
+  isRecord,
   MAX_READ_FILE_BYTES,
   REVIEW_EXCHANGE_DIR,
   SPEC_DOC_RELPATH,
-} from '../shared/index.js';
-import type {
-  AgentConfig,
-  Finding,
-  ReviewFindings,
-  ReviewResponse,
-  TaskPhase,
-  TaskState,
+  type AgentConfig,
+  type Finding,
+  type ReviewFindings,
+  type ReviewResponse,
+  type TaskPhase,
+  type TaskState,
 } from '../shared/index.js';
 import type { CommandRunner } from './runner.js';
 
@@ -45,9 +44,6 @@ export interface ReviewTransportDeps {
   resolveWorktree(agentId: string): string | undefined;
 }
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 const SEVERITIES = new Set(['critical', 'major', 'minor']);
 const VERDICTS = new Set(['approve', 'request-changes']);

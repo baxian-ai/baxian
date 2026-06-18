@@ -1,0 +1,115 @@
+{
+  "id": "codex",
+  "rules": [
+    {
+      "id": "osc_title_blocked",
+      "state": "pending",
+      "priority": 1100,
+      "region": "oscTitle",
+      "visibleBlocker": true,
+      "contains": ["Action Required"]
+    },
+    {
+      "id": "osc_title_working",
+      "state": "working",
+      "priority": 1050,
+      "region": "oscTitle",
+      "visibleWorking": true,
+      "regex": ["^[\\u2800-\\u28FF] "]
+    },
+    {
+      "id": "transcript_viewer",
+      "state": "unknown",
+      "priority": 1200,
+      "region": "tailNonEmpty(1)",
+      "skipStateUpdate": true,
+      "any": [
+        { "contains": ["↑/↓ to scroll", "q to quit"] },
+        { "contains": ["esc to edit prev"] },
+        { "contains": ["esc/← to edit prev"] }
+      ]
+    },
+    {
+      "id": "live_strong_blocker",
+      "state": "pending",
+      "priority": 900,
+      "region": "afterLastPromptMarker",
+      "visibleBlocker": true,
+      "any": [
+        { "contains": ["press enter to confirm or esc to cancel"] },
+        { "contains": ["enter to submit answer"] },
+        { "contains": ["enter to submit all"] },
+        { "contains": ["allow command?"] }
+      ],
+      "notAfter": [
+        { "lineRegex": ["^[ \\t]*(?:[•·][ \\t]+)?Working[ \\t]*\\("] },
+        { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
+        { "lineRegex": ["^[ \\t]*›[ \\t]*$"] },
+        { "lineRegex": ["^→ [A-Za-z0-9][\\w.-]*(?:\\s+git:\\([^\\s)]+\\))?\\s*$"] },
+        { "regex": ["(?:^|\\n)› [^\\n]+\\n\\n\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\\s+·[^\\n]*(?:\\n\\s*)?$"] },
+        { "lineRegex": ["^\\s*permissions:\\s*YOLO mode\\s*$"] }
+      ]
+    },
+    {
+      "id": "weak_blocker",
+      "state": "pending",
+      "priority": 600,
+      "region": "whole",
+      "visibleBlocker": true,
+      "any": [
+        { "contains": ["[y/n]"] },
+        { "contains": ["yes (y)"] },
+        { "contains": ["do you want to"], "any": [{ "contains": ["yes"] }, { "lineRegex": ["^\\s*❯\\s+\\S"] }] },
+        { "contains": ["would you like to"], "any": [{ "contains": ["yes"] }, { "lineRegex": ["^\\s*❯\\s+\\S"] }] }
+      ],
+      "notAfter": [
+        { "lineRegex": ["^[ \\t]*(?:[•·][ \\t]+)?Working[ \\t]*\\("] },
+        { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
+        { "lineRegex": ["^[ \\t]*›[ \\t]*$"] },
+        { "lineRegex": ["^→ [A-Za-z0-9][\\w.-]*(?:\\s+git:\\([^\\s)]+\\))?\\s*$"] },
+        { "regex": ["(?:^|\\n)› [^\\n]+\\n\\n\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\\s+·[^\\n]*(?:\\n\\s*)?$"] },
+        { "lineRegex": ["^\\s*permissions:\\s*YOLO mode\\s*$"] }
+      ]
+    },
+    {
+      "id": "working_line",
+      "state": "working",
+      "priority": 300,
+      "region": "afterLastPromptMarker",
+      "visibleWorking": true,
+      "lineRegex": ["^[ \\t]*(?:[•·][ \\t]+)?Working[ \\t]*\\("]
+    },
+    {
+      "id": "esc_to_interrupt_working",
+      "state": "working",
+      "priority": 240,
+      "region": "afterLastPromptMarker",
+      "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"]
+    },
+    {
+      "id": "codex_idle_prompt",
+      "state": "idle",
+      "priority": 150,
+      "region": "tail(6)",
+      "visibleIdle": true,
+      "any": [
+        { "regex": ["(?:^|\\n)[ \\t]*›[ \\t]*(?:\\n[ \\t]*)*$"] },
+        { "regex": ["(?:^|\\n)→ [A-Za-z0-9][\\w.-]*(?:[ \\t]+git:\\([^\\s)]+\\))?[ \\t]*(?:\\n[ \\t]*)*$"] },
+        { "regex": ["(?:^|\\n)› [^\\n]+\\n\\n\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\\s+·[^\\n]*(?:\\n\\s*)?$"] },
+        { "regex": ["(?:^|\\n)[ \\t]*permissions:[ \\t]*YOLO mode[ \\t]*(?:\\n[ \\t]*)*$"] }
+      ]
+    },
+    {
+      "id": "osc_title_idle",
+      "state": "idle",
+      "priority": 100,
+      "region": "oscTitle",
+      "visibleIdle": true,
+      "regex": ["\\S"],
+      "not": [
+        { "regex": ["^[\\u2800-\\u28FF]"] },
+        { "contains": ["Action Required"] }
+      ]
+    }
+  ]
+}
