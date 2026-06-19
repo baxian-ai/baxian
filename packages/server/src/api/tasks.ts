@@ -9,6 +9,7 @@ import {
   TASK_STATUS_SET,
 } from '../shared/index.js';
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
+import { enrichTaskSnapshot } from '../state/snapshot.js';
 
 const TITLE_MAX_LEN = 200;
 const DESCRIPTION_MAX_LEN = 16_000;
@@ -49,7 +50,7 @@ function compareByUpdatedDesc(a: TaskState, b: TaskState): number {
 function paginate(pool: TaskState[], rawOffset: string | undefined): TaskPage {
   const parsed = Number.parseInt(rawOffset ?? '0', 10);
   const offset = Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-  const page = pool.slice(offset, offset + TASK_LIST_PAGE_SIZE);
+  const page = pool.slice(offset, offset + TASK_LIST_PAGE_SIZE).map(enrichTaskSnapshot);
   return {
     tasks: page,
     hasMore: offset + page.length < pool.length,
@@ -125,7 +126,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     if (!task) {
       return reply.status(404).send({ error: 'Task not found' });
     }
-    return task;
+    return enrichTaskSnapshot(task);
   });
 
   app.post<{ Body: CreateTaskBody }>(

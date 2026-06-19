@@ -8,12 +8,31 @@ import { useProjects } from '../hooks/use-projects.ts';
 import {
   agentRuntimeLabel,
   agentRuntimeTitle,
+  REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
   type AgentRuntime,
   type ReviewRound,
   type TaskState,
   type TaskStatus,
 } from '../shared/index.js';
+
+function useVerdictOverdue(task: TaskState | null): boolean {
+  const [overdue, setOverdue] = useState(false);
+  useEffect(() => {
+    function check() {
+      if (!task || task.status !== 'review' || !task.reviewDispatchedAt || !task.qaAgentId) {
+        setOverdue(false);
+        return;
+      }
+      const elapsed = Date.now() - Date.parse(task.reviewDispatchedAt);
+      setOverdue(elapsed >= REVIEW_VERDICT_TIMEOUT_MS);
+    }
+    check();
+    const id = setInterval(check, 30_000);
+    return () => clearInterval(id);
+  }, [task?.status, task?.reviewDispatchedAt, task?.qaAgentId]);
+  return overdue;
+}
 
 interface TaskDetailContextValue {
   openTask: (taskId: string) => void;
@@ -135,6 +154,7 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
   const task = override ?? streamed;
+  const verdictOverdue = useVerdictOverdue(task);
   const error = errorPayload?.message ?? null;
   const agentRuntimeById = useMemo(() => {
     const next = new Map<string, AgentRuntime>();
@@ -317,6 +337,19 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
         <div className="mb-4 text-[12px] text-og-500">
           Created at {formatTaskTimestamp(task.createdAt)}, Updated at {formatTaskTimestamp(task.updatedAt)}
         </div>
+
+        {verdictOverdue && (
+          <div className="mb-4 rounded-lg border border-[#fecaca] bg-[#fef2f2] p-4 text-[13px] text-danger">
+            <div className="font-semibold">Review verdict missing</div>
+            <div className="mt-1 text-og-700">
+              QA dispatched at {formatTaskTimestamp(task.reviewDispatchedAt)} 超过 10 分钟未提交 verdict。
+              可能原因：QA agent 上下文压缩后误报已完成、agent 卡住、或 GitHub API 异常。
+            </div>
+            <div className="mt-2 text-og-700">
+              建议：打开 QA terminal 检查实际状态，或手动 Call review 重新派发。
+            </div>
+          </div>
+        )}
 
         {showApprovedAction && (
           <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-[13px] text-success">

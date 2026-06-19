@@ -194,6 +194,7 @@ function buildReviewOrRecheckInstructions(
   isRecheck: boolean,
 ): string {
   const prRef = task.prNumber !== undefined ? String(task.prNumber) : '<pr-number>';
+  const anchorSha = task.reviewHeadAnchorSha;
   return [
     `Code ${isRecheck ? 'recheck' : 'review'} phase:`,
     isRecheck
@@ -201,6 +202,9 @@ function buildReviewOrRecheckInstructions(
       : '- Check out PR branch, review changes against task spec.',
     `- Execute verdict per ${isRecheck ? 'pr-recheck' : 'pr-review'} skill §Verdict. PR number: ${prRef}`,
     `  Build the \`gh pr review ${prRef}\` commands per the verdict table, substituting N=${prRef} and TOKEN=${signalToken}.`,
+    anchorSha
+      ? `  Review head SHA for §Verdict Verification: ${anchorSha}`
+      : '  Review head SHA is unavailable — skip the commit_id check in §Verdict Verification.',
     `- 422 fallback signals:`,
     `    ${buildPhaseSignalTemplate('pr-approved')}`,
     `    ${buildPhaseSignalTemplate('pr-changes-requested')}`,

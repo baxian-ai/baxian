@@ -180,6 +180,7 @@ export interface TaskState {
   /** Server-trusted PR head SHA — anchor for review.submitted staleness checks. */
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
+  reviewDispatchedAt?: string;
   reviewRound: number;
   /** Spec review round, isolated from PR review round. */
   specReviewRound?: number;
@@ -197,6 +198,7 @@ export interface TaskState {
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
+  verdictOverdue?: boolean;
 }
 
 export type FindingSeverity = 'critical' | 'major' | 'minor';

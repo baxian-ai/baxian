@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { AgentBindingFacts, TaskState } from '../../src/shared/index.js';
+import { REVIEW_VERDICT_TIMEOUT_MS } from '../../src/shared/index.js';
 import type { TmuxSessionObservation } from '../../src/agent/tmux-probe-poller.js';
 import type { ErrorRecord } from '../../src/state/error-record-store.js';
-import { agentSnapshot, buildAllAgentSnapshots, deriveRuntimeStatus } from '../../src/state/snapshot.js';
+import { agentSnapshot, buildAllAgentSnapshots, deriveRuntimeStatus, enrichTaskSnapshot } from '../../src/state/snapshot.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 
@@ -362,6 +363,55 @@ describe('agentSnapshot', () => {
       undefined,
     );
     expect(snapshot.latestBootstrapError).toBeUndefined();
+  });
+});
+
+describe('enrichTaskSnapshot', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  function reviewTask(overrides: Partial<TaskState> = {}): TaskState {
+    return {
+      ...task('review'),
+      qaAgentId: 'qa-1',
+      signalToken: 'tok-abc',
+      reviewDispatchedAt: new Date(Date.now() - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString(),
+      ...overrides,
+    };
+  }
+
+  it('sets verdictOverdue when review exceeds timeout', () => {
+    const result = enrichTaskSnapshot(reviewTask());
+    expect(result.verdictOverdue).toBe(true);
+  });
+
+  it('does not set verdictOverdue within timeout window', () => {
+    const result = enrichTaskSnapshot(reviewTask({
+      reviewDispatchedAt: new Date(Date.now() - 60_000).toISOString(),
+    }));
+    expect(result.verdictOverdue).toBeUndefined();
+  });
+
+  it('does not set verdictOverdue for non-review status', () => {
+    const result = enrichTaskSnapshot(reviewTask({ status: 'in_progress' }));
+    expect(result.verdictOverdue).toBeUndefined();
+  });
+
+  it('does not set verdictOverdue when qaAgentId is missing', () => {
+    const result = enrichTaskSnapshot(reviewTask({ qaAgentId: undefined }));
+    expect(result.verdictOverdue).toBeUndefined();
+  });
+
+  it('does not set verdictOverdue when signalToken is missing', () => {
+    const result = enrichTaskSnapshot(reviewTask({ signalToken: undefined }));
+    expect(result.verdictOverdue).toBeUndefined();
+  });
+
+  it('does not mutate the original task object', () => {
+    const original = reviewTask();
+    const result = enrichTaskSnapshot(original);
+    expect(result).not.toBe(original);
+    expect(original.verdictOverdue).toBeUndefined();
   });
 });
 

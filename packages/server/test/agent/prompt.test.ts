@@ -628,7 +628,7 @@ describe('buildSkillsXml + buildPromptInline', () => {
       id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/repo',
     };
     const prompt = buildPromptInline({
-      task: { ...TASK, status: 'review', prNumber: 42 },
+      task: { ...TASK, status: 'review', prNumber: 42, reviewHeadAnchorSha: 'abc123def456' },
       phase: 'review',
       agent: QA_AGENT,
       worktreePath: '/tmp/repo',
@@ -639,6 +639,67 @@ describe('buildSkillsXml + buildPromptInline', () => {
     expect(prompt).not.toContain('Output exactly one filled signal');
     expect(prompt).toContain('gh pr review N --approve');
     expect(prompt).toContain('422 fallback');
+    expect(prompt).toContain('Verdict Verification');
+    expect(prompt).toContain('verdict 未落到 GitHub');
+    expect(prompt).toContain('Review head SHA for §Verdict Verification: abc123def456');
+    expect(prompt).not.toContain('skip the commit_id check');
+  });
+
+  it('review prompt tells QA to skip commit_id check when anchor SHA is unavailable', async () => {
+    const realBaxianRules = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-rules/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    const realPrReview = await readFile(
+      fileURLToPath(new URL('../../../../skills/pr-review/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    await seedAllPhaseSkills();
+    await makeSkill('baxian-rules', realBaxianRules);
+    await makeSkill('pr-review', realPrReview);
+    await registry.scan();
+    const QA_AGENT: AgentConfig = {
+      id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/repo',
+    };
+    const prompt = buildPromptInline({
+      task: { ...TASK, status: 'review', prNumber: 42 },
+      phase: 'review',
+      agent: QA_AGENT,
+      worktreePath: '/tmp/repo',
+      skillRegistry: registry,
+      signalToken: 'review-token-N',
+    });
+    expect(prompt).toContain('skip the commit_id check');
+    expect(prompt).not.toContain('Review head SHA for §Verdict Verification');
+  });
+
+  it('recheck skill carries verdict verification section', async () => {
+    const realBaxianRules = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-rules/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    const realPrRecheck = await readFile(
+      fileURLToPath(new URL('../../../../skills/pr-recheck/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    await seedAllPhaseSkills();
+    await makeSkill('baxian-rules', realBaxianRules);
+    await makeSkill('pr-recheck', realPrRecheck);
+    await registry.scan();
+    const QA_AGENT: AgentConfig = {
+      id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/repo',
+    };
+    const prompt = buildPromptInline({
+      task: { ...TASK, status: 'review', prNumber: 42, reviewRound: 2, reviewHeadAnchorSha: 'sha-recheck-789' },
+      phase: 'recheck',
+      agent: QA_AGENT,
+      worktreePath: '/tmp/repo',
+      skillRegistry: registry,
+      signalToken: 'recheck-token-N',
+    });
+    expect(prompt).toContain('Verdict Verification');
+    expect(prompt).toContain('verdict 未落到 GitHub');
+    expect(prompt).toContain('Review head SHA for §Verdict Verification: sha-recheck-789');
   });
 
   it('code prompt asks dev to open the PR and emit pr-created signal', async () => {

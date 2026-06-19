@@ -237,6 +237,8 @@ export interface TaskState {
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
+  /** Computed at snapshot time; true when review has been pending past REVIEW_VERDICT_TIMEOUT_MS. */
+  verdictOverdue?: boolean;
 }
 
 export type FindingSeverity = 'critical' | 'major' | 'minor';

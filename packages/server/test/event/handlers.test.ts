@@ -230,13 +230,9 @@ describe('pr.created handler', () => {
     expect(task!.reviewHeadAnchorSha).toBe(HEAD_SHA);
   });
 
-  it('pane-signal pr.created REJECTS when prNumber branch does not match task.branch (no transition, intervention emitted)', async () => {
-    // Codex P1 #3323644756: agent-emitted prNumber pointing at a different
-    // PR/branch must NOT be persisted — would route QA review + auto-merge to
-    // the wrong PR.
+  it('pane-signal pr.created REJECTS when verify returns undefined (no transition, intervention emitted)', async () => {
     await seedTask({ id: 'task-pane-bad', status: 'in_progress', reviewRound: 0 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    // verifyPaneSignalPrNumber returns undefined on branch mismatch.
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
     vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
 
@@ -250,14 +246,110 @@ describe('pr.created handler', () => {
     });
 
     const task = await taskStore.get('task-pane-bad');
-    expect(task!.status).toBe('in_progress'); // no transition
-    expect(task!.prNumber).toBe(58);          // unchanged from seed; NOT overwritten with rejected 9999
+    expect(task!.status).toBe('in_progress');
+    expect(task!.prNumber).toBe(58);
     expect(startSpy).not.toHaveBeenCalled();
     const intervention = emittedEvents.find(
       e => e.type === 'human.intervention' && e.taskId === 'task-pane-bad',
     );
     expect(intervention!.data.phase).toBe('pane-pr-created-branch-mismatch');
     expect(intervention!.data.claimedPrNumber).toBe(9999);
+  });
+
+  it('pane-signal pr.created reconciles task.branch atomically via transition patch', async () => {
+    await seedTask({ id: 'task-pane-recon', status: 'in_progress', reviewRound: 0 });
+    await seedDevAgent('task-pane-recon');
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'fix/custom-branch', headSha: HEAD_SHA, body: '<!-- baxian:managed -->\nsome description' });
+    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
+
+    await emitAndWait({
+      type: 'pr.created',
+      timestamp: new Date().toISOString(),
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-pane-recon',
+      data: { prNumber: 200, source: 'pane-signal' },
+    });
+
+    const task = await taskStore.get('task-pane-recon');
+    expect(task!.status).toBe('review');
+    expect(task!.branch).toBe('fix/custom-branch');
+    expect(task!.latestHeadSha).toBe(HEAD_SHA);
+  });
+
+  it('pane-signal pr.created REJECTS when PR branch is bound to another task', async () => {
+    await seedTask({ id: 'task-pane-bound', status: 'in_progress', reviewRound: 0 });
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
+    vi.spyOn(manager, 'findTaskByBranch')
+      .mockResolvedValue({ id: 'task-other', branch: 'bx/task-other' } as TaskState);
+    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await emitAndWait({
+      type: 'pr.created',
+      timestamp: new Date().toISOString(),
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-pane-bound',
+      data: { prNumber: 9999, source: 'pane-signal' },
+    });
+
+    const task = await taskStore.get('task-pane-bound');
+    expect(task!.status).toBe('in_progress');
+    const intervention = emittedEvents.find(
+      e => e.type === 'human.intervention' && e.taskId === 'task-pane-bound',
+    );
+    expect(intervention!.data.phase).toBe('pane-pr-created-branch-mismatch');
+  });
+
+  it('pane-signal pr.created REJECTS when PR branch has foreign bx/ prefix', async () => {
+    await seedTask({ id: 'task-pane-bx', status: 'in_progress', reviewRound: 0 });
+    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
+    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await emitAndWait({
+      type: 'pr.created',
+      timestamp: new Date().toISOString(),
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-pane-bx',
+      data: { prNumber: 9999, source: 'pane-signal' },
+    });
+
+    const task = await taskStore.get('task-pane-bx');
+    expect(task!.status).toBe('in_progress');
+    expect(task!.branch).toBe('bx/task-pane-bx');
+  });
+
+  it('pane-signal pr.created REJECTS when PR body lacks managed marker', async () => {
+    await seedTask({ id: 'task-pane-nomark', status: 'in_progress', reviewRound: 0 });
+    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'fix/unmanaged', headSha: HEAD_SHA, body: 'just a plain PR' });
+    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await emitAndWait({
+      type: 'pr.created',
+      timestamp: new Date().toISOString(),
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-pane-nomark',
+      data: { prNumber: 9999, source: 'pane-signal' },
+    });
+
+    const task = await taskStore.get('task-pane-nomark');
+    expect(task!.status).toBe('in_progress');
+    expect(task!.branch).toBe('bx/task-pane-nomark');
   });
 
   it('pane-signal pr.created reject re-sets up develop watcher so a corrected emit can be consumed', async () => {
@@ -278,7 +370,7 @@ describe('pr.created handler', () => {
     });
 
     expect(armSpy).toHaveBeenCalledWith(
-      'task-pane-rearm', 'dev-1', ['spec-done', 'pr-created'],
+      'task-pane-rearm', 'dev-1', ['spec-done', 'pr-created'], { skipSnapshot: true },
     );
   });
 
@@ -296,10 +388,10 @@ describe('pr.created handler', () => {
       data: { prNumber: 9999, source: 'pane-signal' },
     });
 
-    expect(armSpy).toHaveBeenCalledWith('task-pane-rearm-code', 'dev-1', ['pr-created']);
+    expect(armSpy).toHaveBeenCalledWith('task-pane-rearm-code', 'dev-1', ['pr-created'], { skipSnapshot: true });
   });
 
-  it('pane-signal pr.created re-sets up on verify error (e.g. gh transient failure) so a retry can land', async () => {
+  it('pane-signal pr.created re-sets up WITHOUT skipSnapshot on verify error so snapshot retry can land', async () => {
     await seedTask({ id: 'task-pane-rearm-err', status: 'in_progress', reviewRound: 0 });
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockRejectedValue(new Error('gh transient'));
     const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
@@ -314,8 +406,43 @@ describe('pr.created handler', () => {
     });
 
     expect(armSpy).toHaveBeenCalledWith(
-      'task-pane-rearm-err', 'dev-1', ['spec-done', 'pr-created'],
+      'task-pane-rearm-err', 'dev-1', ['spec-done', 'pr-created'], { skipSnapshot: false },
     );
+    const intervention = emittedEvents.find(
+      e => e.type === 'human.intervention' && e.taskId === 'task-pane-rearm-err',
+    );
+    expect(intervention).toBeDefined();
+    expect(intervention!.data.phase).toBe('pane-pr-created-verify-error');
+  });
+
+  it('pane-signal pr.created reArms watcher when transition fails with task still active', async () => {
+    await seedTask({ id: 'task-pane-txfail', status: 'in_progress', reviewRound: 0 });
+    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'fix/conflict-branch', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
+    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'transitionTaskStatus').mockResolvedValue(null);
+    const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await emitAndWait({
+      type: 'pr.created',
+      timestamp: new Date().toISOString(),
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-pane-txfail',
+      data: { prNumber: 200, source: 'pane-signal' },
+    });
+
+    expect(armSpy).toHaveBeenCalledWith(
+      'task-pane-txfail', 'dev-1', ['spec-done', 'pr-created'], { skipSnapshot: true },
+    );
+    const task = await taskStore.get('task-pane-txfail');
+    expect(task!.status).toBe('in_progress');
+    const intervention = emittedEvents.find(
+      e => e.type === 'human.intervention' && e.taskId === 'task-pane-txfail',
+    );
+    expect(intervention).toBeDefined();
+    expect(intervention!.data.phase).toBe('pane-pr-created-transition-failed');
   });
 
   it('writes task.latestHeadSha from pr.created event headSha', async () => {

@@ -44,3 +44,5 @@ export const TASK_LIST_PAGE_SIZE = 20;
 // Mirrors the server constants of the same name.
 export const IMAGE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
 export const TASK_IMAGE_MAX_COUNT = 4;
+
+export const REVIEW_VERDICT_TIMEOUT_MS = 10 * 60 * 1000;

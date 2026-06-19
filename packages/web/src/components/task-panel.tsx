@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api.ts';
 import { TaskStatusDot, shortTaskId, useTaskDetail } from './task-detail-modal.tsx';
-import { TASK_ACTIVE_STATUS_SET, TASK_LIST_PAGE_SIZE, type TaskState } from '../shared/index.js';
+import { TASK_ACTIVE_STATUS_SET, REVIEW_VERDICT_TIMEOUT_MS, TASK_LIST_PAGE_SIZE, type TaskState } from '../shared/index.js';
 
 interface TaskPanelProps {
   projectId: string;
@@ -230,9 +230,27 @@ function DoneBody({ state }: { state: DoneState }) {
   );
 }
 
+function useVerdictOverdue(task: TaskState): boolean {
+  const [overdue, setOverdue] = useState(false);
+  useEffect(() => {
+    function check() {
+      if (task.status !== 'review' || !task.reviewDispatchedAt || !task.qaAgentId) {
+        setOverdue(false);
+        return;
+      }
+      setOverdue(Date.now() - Date.parse(task.reviewDispatchedAt) >= REVIEW_VERDICT_TIMEOUT_MS);
+    }
+    check();
+    const id = setInterval(check, 30_000);
+    return () => clearInterval(id);
+  }, [task.status, task.reviewDispatchedAt, task.qaAgentId]);
+  return overdue;
+}
+
 function TaskRow({ task }: { task: TaskState }) {
   const { openTask } = useTaskDetail();
   const round = task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+  const overdue = useVerdictOverdue(task);
   return (
     <button
       type="button"
@@ -242,6 +260,7 @@ function TaskRow({ task }: { task: TaskState }) {
       <span className="shrink-0 font-mono text-[11px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
       <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
       {task.phase === 'spec' && <span className="pill pill-review shrink-0">spec</span>}
+      {overdue && <span className="pill pill-warn shrink-0" title="Review verdict missing">!</span>}
       <span aria-label={`Round ${round}`} className="shrink-0 text-[11px] text-og-400">R{round}</span>
       <TaskStatusDot status={task.status} />
     </button>

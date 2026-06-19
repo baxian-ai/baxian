@@ -2335,6 +2335,29 @@ export class AgentManager {
     return { headRefName, headSha };
   }
 
+  async fetchPrHeadRef(
+    prNumber: number,
+    projectId: string,
+  ): Promise<{ headRefName: string; headSha: string; body: string } | undefined> {
+    const project = this.getProjectConfig(projectId);
+    if (!project) return undefined;
+    const result = await this.platformRunner.exec(
+      `gh pr view ${prNumber} --repo ${shellQuote(repoSlug(project.repo))} --json headRefName,headRefOid,body,state,isCrossRepository --jq '.headRefName + "\\t" + .headRefOid + "\\t" + .state + "\\t" + (.isCrossRepository | tostring) + "\\t" + .body'`,
+    );
+    if (result.exitCode !== 0) {
+      const stderr = result.stderr ?? '';
+      if (stderr.includes('Could not resolve to a PullRequest')) return undefined;
+      throw new Error(`gh pr view exited ${result.exitCode} for PR #${prNumber}: ${stderr.slice(0, 200)}`);
+    }
+    const parts = result.stdout.trim().split('\t');
+    const [headRefName, headSha, state, isCross] = parts;
+    const body = parts.slice(4).join('\t');
+    if (!headRefName || !/^[0-9a-f]{40}$/i.test(headSha)) return undefined;
+    if (state !== 'OPEN') return undefined;
+    if (isCross === 'true') return undefined;
+    return { headRefName, headSha, body };
+  }
+
   async listTasksByProject(projectId: string): Promise<TaskState[]> {
     return this.taskStore.list({ projectId });
   }
@@ -2385,6 +2408,7 @@ export class AgentManager {
       | 'phase'
       | 'batchIndex'
       | 'batchTotal'
+      | 'branch'
     >>,
   ): Promise<TransitionResult | null> {
     return this.withTaskLock(async () => {
@@ -2393,6 +2417,10 @@ export class AgentManager {
       const previousStatus = task.status;
       if (TERMINAL_STATUSES.includes(previousStatus)) return null;
       if (!guard.fromStatus.includes(previousStatus)) return null;
+      if (patch?.branch && patch.branch !== task.branch) {
+        const existing = await this.findTaskByBranch(patch.branch, task.projectId);
+        if (existing && existing.id !== taskId) return null;
+      }
       Object.assign(task, patch ?? {}, {
         status: toStatus,
         updatedAt: new Date().toISOString(),

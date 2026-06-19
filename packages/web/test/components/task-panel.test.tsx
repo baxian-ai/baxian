@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, cleanup, fireEvent, waitFor, within, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { TaskState } from '../../src/shared/index.js';
+import { REVIEW_VERDICT_TIMEOUT_MS } from '../../src/shared/index.js';
 
 const { pageMock, openTaskMock } = vi.hoisted(() => ({
   pageMock: vi.fn(),
@@ -321,5 +322,68 @@ describe('TaskPanel', () => {
     const idCell = within(active).getByText('042');
     expect(idCell.getAttribute('title')).toBe('task-042');
     expect(within(active).queryByText('task-042')).toBeNull();
+  });
+
+  describe('verdict overdue indicator', () => {
+    beforeEach(() => { vi.useFakeTimers(); });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('shows ! after the timeout threshold elapses via interval tick', () => {
+      const now = new Date('2026-06-19T12:00:00Z').getTime();
+      vi.setSystemTime(now);
+      const dispatchedAt = new Date(now - REVIEW_VERDICT_TIMEOUT_MS + 60_000).toISOString();
+      renderPanel([task({
+        id: 'task-100', status: 'review', title: 'stuck',
+        qaAgentId: 'qa-1', reviewDispatchedAt: dispatchedAt,
+      })]);
+
+      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
+
+      act(() => { vi.advanceTimersByTime(90_000); });
+
+      expect(screen.getByTitle('Review verdict missing')).toBeTruthy();
+    });
+
+    it('stays hidden when within the timeout window', () => {
+      const now = new Date('2026-06-19T12:00:00Z').getTime();
+      vi.setSystemTime(now);
+      const dispatchedAt = new Date(now - 60_000).toISOString();
+      renderPanel([task({
+        id: 'task-101', status: 'review', title: 'fresh',
+        qaAgentId: 'qa-1', reviewDispatchedAt: dispatchedAt,
+      })]);
+
+      act(() => { vi.advanceTimersByTime(30_000); });
+
+      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
+    });
+
+    it('stays hidden for non-review status even if dispatched long ago', () => {
+      const now = new Date('2026-06-19T12:00:00Z').getTime();
+      vi.setSystemTime(now);
+      const dispatchedAt = new Date(now - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString();
+      renderPanel([task({
+        id: 'task-102', status: 'in_progress', title: 'not reviewing',
+        qaAgentId: 'qa-1', reviewDispatchedAt: dispatchedAt,
+      })]);
+
+      act(() => { vi.advanceTimersByTime(30_000); });
+
+      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
+    });
+
+    it('stays hidden when qaAgentId is missing', () => {
+      const now = new Date('2026-06-19T12:00:00Z').getTime();
+      vi.setSystemTime(now);
+      const dispatchedAt = new Date(now - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString();
+      renderPanel([task({
+        id: 'task-103', status: 'review', title: 'no qa',
+        reviewDispatchedAt: dispatchedAt,
+      })]);
+
+      act(() => { vi.advanceTimersByTime(30_000); });
+
+      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
+    });
   });
 });

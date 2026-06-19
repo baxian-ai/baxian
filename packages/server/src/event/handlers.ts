@@ -1,5 +1,6 @@
 import { createSignalToken, type PhaseSignalKind } from '../agent/phase-signal.js';
-import { TASK_TERMINAL_STATUS_SET, type BaxianEvent, type TaskState } from '../shared/index.js';
+import { BAXIAN_PR_CLAIM } from '../agent/prompt.js';
+import { BRANCH_PREFIX, TASK_TERMINAL_STATUS_SET, isValidBranchName, type BaxianEvent, type TaskState } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import { type AgentManager, DispatchTerminalError, EnsureSessionError } from '../agent/manager.js';
 
@@ -16,10 +17,11 @@ async function reArmDevelopWatcher(
   manager: AgentManager,
   task: TaskState,
   agentId: string,
+  opts: { skipSnapshot?: boolean } = {},
 ): Promise<void> {
   const kinds: readonly PhaseSignalKind[] =
     task.phase === 'code' ? ['pr-created'] : ['spec-done', 'pr-created'];
-  await manager.setupPhaseSignal(task.id, agentId, kinds);
+  await manager.setupPhaseSignal(task.id, agentId, kinds, { skipSnapshot: opts.skipSnapshot ?? true });
 }
 
 async function emitIntervention(
@@ -882,18 +884,30 @@ export function registerEventHandlers(
       }
     }
 
-    // Pane-signal prNumber is agent-emitted; verify the PR's headRefName equals
-    // task.branch before persisting. Without this, a typo / hallucinated /
-    // cross-task PR number would route QA review and later auto-merge to the
-    // wrong PR. Poller-sourced events skip this because the poller already
-    // routes by `bx/<taskId>`.
     let paneVerifiedHeadSha: string | undefined;
+    let reconciledBranch: string | undefined;
     if (event.data.source === 'pane-signal' && event.data.prNumber !== undefined) {
       try {
-        const verified = await manager.verifyPaneSignalPrNumber(
-          event.taskId,
-          event.data.prNumber as number,
-        );
+        const prNumber = event.data.prNumber as number;
+        let verified = await manager.verifyPaneSignalPrNumber(event.taskId, prNumber);
+        if (!verified) {
+          const taskNow = await manager.getTask(event.taskId);
+          if (taskNow) {
+            const prInfo = await manager.fetchPrHeadRef(prNumber, taskNow.projectId);
+            if (prInfo) {
+              const ownPrefix = BRANCH_PREFIX + event.taskId;
+              const isForeignBxBranch = prInfo.headRefName.startsWith(BRANCH_PREFIX)
+                && prInfo.headRefName !== ownPrefix;
+              const bound = await manager.findTaskByBranch(prInfo.headRefName, taskNow.projectId);
+              const hasClaimMarker = prInfo.body.includes(BAXIAN_PR_CLAIM);
+              if (!isForeignBxBranch && hasClaimMarker && isValidBranchName(prInfo.headRefName)
+                && (!bound || bound.id === taskNow.id)) {
+                reconciledBranch = prInfo.headRefName;
+                verified = prInfo;
+              }
+            }
+          }
+        }
         if (!verified) {
           const taskNow = await manager.getTask(event.taskId);
           console.warn(
@@ -901,8 +915,6 @@ export function registerEventHandlers(
             `(branch mismatch: task.branch=${taskNow?.branch})`,
           );
           if (taskNow) {
-            // The watcher fired+removed its entry on this signal; without re-establish
-            // a corrected emit (same token) would strand the task until restart.
             await reArmDevelopWatcher(manager, taskNow, event.agentId);
             await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
               phase: 'pane-pr-created-branch-mismatch',
@@ -918,10 +930,15 @@ export function registerEventHandlers(
           `[EventHandler] pr.created: verifyPaneSignalPrNumber failed for task ${event.taskId}:`,
           err,
         );
-        // Re-establish so a retry once the underlying issue clears (gh transient
-        // failure, network) can still be consumed without a server restart.
         const taskNow = await manager.getTask(event.taskId);
-        if (taskNow) await reArmDevelopWatcher(manager, taskNow, event.agentId);
+        if (taskNow) {
+          await reArmDevelopWatcher(manager, taskNow, event.agentId, { skipSnapshot: false });
+          await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
+            phase: 'pane-pr-created-verify-error',
+            claimedPrNumber: event.data.prNumber as number,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
         return;
       }
     }
@@ -938,12 +955,8 @@ export function registerEventHandlers(
         ...(event.data.prNumber !== undefined ? { prNumber: event.data.prNumber as number } : {}),
         ...(event.data.prUrl !== undefined ? { prUrl: event.data.prUrl as string } : {}),
         ...(createdHeadSha ? { latestHeadSha: createdHeadSha, reviewHeadAnchorSha: createdHeadSha } : {}),
+        ...(reconciledBranch ? { branch: reconciledBranch } : {}),
         reviewDispatchedAt: new Date().toISOString(),
-        // Rotate the per-pass token ATOMICALLY with the anchor (same as pr.updated and
-        // dispatchReviewToQa). On a fixing→review re-review there is a prior QA pass; if
-        // the QA acquire below fails the token would otherwise lag until
-        // rotateAndSetupPhaseSignal never runs, letting that old pass's late stamped
-        // verdict (token still == task.signalToken) slip past the gate.
         signalToken: createSignalToken(),
       },
     );
@@ -951,9 +964,26 @@ export function registerEventHandlers(
       console.warn(
         `[EventHandler] pr.created: cannot transition task ${event.taskId} (terminal or invalid from-state)`,
       );
+      if (event.data.source === 'pane-signal') {
+        const taskNow = await manager.getTask(event.taskId);
+        if (taskNow && ['in_progress', 'fixing'].includes(taskNow.status)) {
+          await reArmDevelopWatcher(manager, taskNow, event.agentId);
+          await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
+            phase: 'pane-pr-created-transition-failed',
+            claimedPrNumber: event.data.prNumber as number,
+            taskBranch: taskNow.branch ?? '',
+          });
+        }
+      }
       return;
     }
     const { task: transitioned, previousStatus } = result;
+    if (reconciledBranch) {
+      console.log(
+        `[EventHandler] pr.created reconciled branch for task ${event.taskId}: ` +
+        `${taskBeforeTransition?.branch} → ${reconciledBranch}`,
+      );
+    }
     // Round captured before any verdict can land (watcher armed only after this) — the
     // count-once token for bumpReviewRoundIfStillAt on the dispatch success path.
     const expectedRound = transitioned.reviewRound;
