@@ -73,8 +73,8 @@ describe('loadConfig', () => {
     expect(config.review.rounds).toBe(10);
     expect(config.server.port).toBe(3000);
     expect(config.project[0].merge).toBeNull();
-    expect(config.review.mode).toBe('server');
-    expect(config.project[0].review?.mode).toBe('server');
+    expect(config.review.mode).toBe('github');
+    expect(config.project[0].review?.mode).toBeUndefined();
     // afterDone is intentionally NOT defaulted to null — an omitted value stays undefined so a
     // non-GitHub repo can tell "unset → deliver-by-default ('branch')" from explicit "null → review-only".
     expect(config.review.afterDone).toBeUndefined();
@@ -338,13 +338,13 @@ describe('prepareConfig type guards', () => {
     expect(cfg.review.rounds).toBe(10);
   });
 
-  it('defaults review.mode to server but leaves an omitted afterDone undefined (preserves "unset")', () => {
+  it('defaults review.mode to github but leaves an omitted project override and afterDone undefined', () => {
     const cfg = prepareConfig({
       review: { rounds: 10 },
       project: [PROJECT],
     });
-    expect(cfg.review.mode).toBe('server');
-    expect(cfg.project[0].review?.mode).toBe('server');
+    expect(cfg.review.mode).toBe('github');
+    expect(cfg.project[0].review?.mode).toBeUndefined();
     // NOT defaulted to null — non-GitHub repos distinguish unset (deliver-by-default) from
     // explicit null (review-only); GitHub collapses both via `?? null`, so this is behavior-neutral.
     expect(cfg.review.afterDone).toBeUndefined();
@@ -361,8 +361,8 @@ describe('prepareConfig type guards', () => {
     expect(cfg.project[0].review?.mode).toBe('github');
   });
 
-  it('defaults non-github projects to project.review.mode=server when global mode is github', () => {
-    const cfg = prepareConfig({
+  it('rejects non-github projects whose global fallback review.mode is github', () => {
+    expect(() => prepareConfig({
       review: { rounds: 10, mode: 'github' },
       project: [{
         id: 'gl',
@@ -370,13 +370,12 @@ describe('prepareConfig type guards', () => {
         merge: null,
         agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
       }],
-    });
-    expect(cfg.project[0].review?.mode).toBe('server');
+    })).toThrow(ConfigValidationError);
   });
 
-  it('defaults non-github project.review={} to mode=server when global mode is github', () => {
+  it('defaults non-github project.review={} to mode=server when global mode is server', () => {
     const cfg = prepareConfig({
-      review: { rounds: 10, mode: 'github' },
+      review: { rounds: 10, mode: 'server' },
       project: [{
         id: 'gl',
         repo: 'https://gitlab.example.com/group/proj.git',
@@ -391,7 +390,6 @@ describe('prepareConfig type guards', () => {
   it('passes through review.mode=server and afterDone=pr', () => {
     const cfg = prepareConfig({
       review: { rounds: 10, mode: 'server', afterDone: 'pr' },
-      // Server mode demands a qa partner per pair — extend the shared fixture.
       project: [{
         ...PROJECT,
         agent: [[
@@ -413,7 +411,8 @@ describe('prepareConfig type guards', () => {
         agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
       }],
     });
-    expect(cfg.project[0].review?.mode).toBe('server');
+    expect(cfg.review.mode).toBe('server');
+    expect(cfg.project[0].review?.mode).toBeUndefined();
   });
 
   it('passes through invalid review.mode for the validator to reject', () => {

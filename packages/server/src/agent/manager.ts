@@ -360,12 +360,10 @@ export class AgentManager {
     return this.reviewStore;
   }
 
-  // Non-GitHub repos are pinned to server mode because there is no PR review fallback to map onto.
+  // Config validation guarantees non-GitHub projects resolve to server mode.
   effectiveReviewMode(projectId: string): ReviewMode {
     const project = this.getProjectConfig(projectId);
-    const mode = project ? project.review!.mode! : this.config.review.mode!;
-    if (project && !isGitHubRepo(project.repo) && mode !== 'server') return 'server';
-    return mode;
+    return project?.review?.mode ?? this.config.review.mode ?? 'github';
   }
 
   // Snapshot-aware afterDone read: an EXPLICIT null snapshot must win over hot
@@ -4810,7 +4808,7 @@ export class AgentManager {
   // Dev's first prompt offers the spec-first or straight-to-code path; the arm
   // must accept both completion signals for the task's protocol family.
   private devInitialSignalKinds(reviewMode?: TaskState['reviewMode']): readonly PhaseSignalKind[] {
-    const mode = reviewMode ?? this.config.review.mode!;
+    const mode = reviewMode ?? this.config.review.mode ?? 'github';
     return mode === 'server'
       ? (['spec-done', 'code-done'] as const)
       : (['spec-done', 'pr-created'] as const);

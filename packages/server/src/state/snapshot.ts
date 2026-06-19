@@ -43,7 +43,7 @@ export function agentSnapshot(
   // When PENDING_IDLE is gated by task status, also hide the matching error card / reason /
   // message — otherwise the UI keeps a red "waiting on user input" banner that points operators
   // at a terminal they shouldn't touch (the task is on GitHub now, not in the dev's pane).
-  const suppressPendingIdle = shouldGatePendingIdle(tmuxObservation, task);
+  const suppressPendingIdle = shouldGatePendingIdle(tmuxObservation, task, binding?.id);
   // Bootstrap error visibility is gated by errorRecordStore presence, not by binding.repoPath:
   // (a) never-dispatched agents never get a binding (runSingleTarget skips AgentStore.update on
   //     existing=undefined), so repoPath-based suppression keeps showing stale errors forever;
@@ -73,21 +73,21 @@ export function deriveRuntimeStatus(
   task: TaskState | undefined,
 ): AgentRuntimeStatus {
   if (binding?.creationToken) return 'pending';
-  if (tmuxObservation.runtimeStatusHint && !shouldGatePendingIdle(tmuxObservation, task)) {
+  if (tmuxObservation.runtimeStatusHint && !shouldGatePendingIdle(tmuxObservation, task, binding?.id)) {
     return tmuxObservation.runtimeStatusHint;
   }
   if (tmuxObservation.tmuxSessionStatus === 'unknown') return 'unknown';
   if (binding?.taskId && tmuxObservation.paneState === 'shell') return 'error';
   if (binding?.taskId && tmuxObservation.tmuxSessionStatus === 'unreachable') {
     return isRecentPresentObservation(tmuxObservation)
-      ? deriveTaskBoundStatus(task)
+      ? deriveTaskBoundStatus(task, binding.id)
       : 'unknown';
   }
   if (binding?.taskId && tmuxObservation.tmuxSessionStatus !== 'present') return 'error';
   if (!binding?.taskId) {
     return tmuxObservation.tmuxSessionStatus === 'present' ? 'idle' : 'unknown';
   }
-  return deriveTaskBoundStatus(task);
+  return deriveTaskBoundStatus(task, binding.id);
 }
 
 // PENDING_IDLE is a soft inference (screen idle ≥ N min); only trust it while dev is actively
@@ -96,14 +96,17 @@ export function deriveRuntimeStatus(
 function shouldGatePendingIdle(
   tmuxObservation: TmuxSessionObservation,
   task: TaskState | undefined,
+  agentId?: string,
 ): boolean {
   if (tmuxObservation.runtimeStatusHint !== 'pending') return false;
   if (tmuxObservation.reason !== 'PENDING_IDLE') return false;
+  if (agentId && task?.qaAgentId === agentId && task.status === 'review') return false;
   return !(task && WORKING_TASK_STATUSES.has(task.status));
 }
 
-function deriveTaskBoundStatus(task: TaskState | undefined): AgentRuntimeStatus {
+function deriveTaskBoundStatus(task: TaskState | undefined, agentId?: string): AgentRuntimeStatus {
   if (!task) return 'working';
+  if (agentId && task.qaAgentId === agentId && task.status === 'review') return 'working';
   if (WORKING_TASK_STATUSES.has(task.status)) return 'working';
   if (WAITING_TASK_STATUSES.has(task.status)) return 'waiting';
   if (ERROR_TASK_STATUSES.has(task.status)) return 'error';

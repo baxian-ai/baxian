@@ -228,7 +228,7 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const hasHttps = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'https');
   const hasAllowedHosts = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'allowedHosts');
 
-  const reviewMode = (rv.mode === undefined ? 'server' : rv.mode) as ReviewMode;
+  const reviewMode = (rv.mode === undefined ? 'github' : rv.mode) as ReviewMode;
 
   return {
     review: {
@@ -272,8 +272,7 @@ function applyProjectDefaults(p: Record<string, unknown>, globalReviewMode: Revi
   const review = project.review as unknown;
   if (review !== undefined && !isRecord(review)) return project;
   if (isRecord(review) && review.mode !== undefined) return project;
-  const mode = typeof project.repo === 'string' && !isGitHubRepo(project.repo)
-    ? 'server'
-    : globalReviewMode;
+  if (typeof project.repo === 'string' && isGitHubRepo(project.repo)) return project;
+  const mode = globalReviewMode;
   return { ...project, review: { ...(isRecord(review) ? project.review : {}), mode } };
 }

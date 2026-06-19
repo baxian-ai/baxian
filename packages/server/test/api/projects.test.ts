@@ -64,6 +64,7 @@ describe('POST /api/projects', () => {
     const body = JSON.parse(response.body);
     expect(body.project.id).toBe('newproj');
     expect(body.project.agent).toEqual([]);
+    expect(body.project.review?.mode).toBeUndefined();
     expect(body.restartRequired).toBe(false);
     expect(app.ctx.config.project.some(p => p.id === 'newproj')).toBe(true);
   });
@@ -133,11 +134,20 @@ describe('POST /api/projects', () => {
     expect(app.ctx.config.project.find(p => p.id === 'serverproj')?.review?.mode).toBe('server');
   });
 
-  it('defaults non-github projects to server review mode', async () => {
+  it('rejects non-github projects that would fall back to github review mode', async () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/projects',
       payload: { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git' },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('creates a non-github project with an explicit server review mode override', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      payload: { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git', review: { mode: 'server' } },
     });
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
@@ -186,7 +196,7 @@ describe('POST /api/projects', () => {
       const response = await app.inject({
         method: 'POST',
         url: '/api/projects',
-        payload: { id, repo, merge: null },
+        payload: { id, repo, merge: null, review: { mode: 'server' } },
       });
       expect.soft(response.statusCode, repo).toBe(201);
       expect.soft(JSON.parse(response.body).project.repo, repo).toBe(repo);
@@ -209,7 +219,9 @@ describe('POST /api/projects', () => {
       payload: { id: 'persisted', repo: 'a/b' },
     });
     const written = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
-    expect(written.project.some(p => p.id === 'persisted')).toBe(true);
+    const project = written.project.find(p => p.id === 'persisted');
+    expect(project).toBeDefined();
+    expect(project?.review?.mode).toBeUndefined();
     const files = await readdir(tempDir);
     expect(files.some(f => /^baxian\.json\.\d{8}-\d{6}$/.test(f))).toBe(true);
   });

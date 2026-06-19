@@ -276,11 +276,34 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg)).toEqual([]);
   });
 
+  it('accepts a non-github project that falls back to global server review mode', () => {
+    const cfg = makeConfig({
+      review: { rounds: 10, mode: 'server' },
+      project: [{
+        id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', merge: null,
+        agent: [[makeAgent({ id: 'gldev', role: 'dev' })]],
+      }],
+    });
+    expect(validateConfig(cfg)).toEqual([]);
+  });
+
   it('rejects a non-github project whose effective review.mode is github', () => {
     const errors = validateConfig(makeConfig({
       review: { rounds: 10, mode: 'github' },
       project: [{
         id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', merge: null,
+        agent: [],
+      }],
+    }));
+    expect(errors.map(e => e.path)).toContain('project[0].review.mode');
+  });
+
+  it('rejects a non-github project overriding global server mode back to github', () => {
+    const errors = validateConfig(makeConfig({
+      review: { rounds: 10, mode: 'server' },
+      project: [{
+        id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', merge: null,
+        review: { mode: 'github' },
         agent: [],
       }],
     }));

@@ -540,7 +540,7 @@ describe('AgentManager task binding flow', () => {
 
     expect(created.status).toBe('in_progress');
     await holdDone;
-    expect(holdSpy).toHaveBeenCalledWith(created.id, 'dev-1', ['spec-done', 'code-done']);
+    expect(holdSpy).toHaveBeenCalledWith(created.id, 'dev-1', ['spec-done', 'pr-created']);
   });
 
   it('createAndStartTask: a cancel before delivery releases the agent from the now-terminal task', async () => {
@@ -4700,18 +4700,17 @@ describe('AgentManager — non-GitHub platform derivation', () => {
   }): BaxianConfig {
     const dev = { id: 'gldev', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: '/tmp/repo' };
     const qa = { id: 'glqa', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: '/tmp/repo' };
-    const mode = opts.mode ?? 'server';
     return {
       review: {
         rounds: 2,
-        mode,
+        ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
         ...(opts.afterDone !== undefined ? { afterDone: opts.afterDone } : {}),
       },
       server: DEFAULT_SERVER_CONFIG,
       project: [
         {
           id: 'gh', repo: 'user/repo', merge: null,
-          review: { mode: opts.ghReviewMode ?? mode },
+          ...(opts.ghReviewMode !== undefined ? { review: { mode: opts.ghReviewMode } } : {}),
           agent: [],
         },
         {
@@ -4733,7 +4732,7 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     expect(mSrv.effectiveReviewMode('gl')).toBe('server');
 
     const mDef = makeMgr(cfg({}));
-    expect(mDef.effectiveReviewMode('gh')).toBe('server');
+    expect(mDef.effectiveReviewMode('gh')).toBe('github');
     expect(mDef.effectiveReviewMode('gl')).toBe('server');
 
     const mMixed = makeMgr(cfg({ mode: 'server', ghReviewMode: 'github', glReviewMode: 'server' }));
@@ -4742,6 +4741,14 @@ describe('AgentManager — non-GitHub platform derivation', () => {
 
     const mProjectServer = makeMgr(cfg({ mode: 'github', ghReviewMode: 'server' }));
     expect(mProjectServer.effectiveReviewMode('gh')).toBe('server');
+  });
+
+  it('effectiveReviewMode: github projects without overrides follow global mode changes', () => {
+    const m = makeMgr(cfg({ mode: 'server' }));
+    expect(m.effectiveReviewMode('gh')).toBe('server');
+
+    m.replaceConfig(cfg({ mode: 'github' }));
+    expect(m.effectiveReviewMode('gh')).toBe('github');
   });
 
   it('createTask snapshots the project review mode override', async () => {
@@ -4806,7 +4813,7 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     // Production path: prepareConfig must NOT collapse an omitted afterDone to null, or the
     // non-github deliver-by-default would silently degrade to review-only.
     const prepared = prepareConfig({
-      review: { rounds: 2 },
+      review: { rounds: 2, mode: 'server' },
       project: [{ id: 'gl', repo: GL, merge: null, agent: [[
         { id: 'gldev', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
         { id: 'glqa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo' },

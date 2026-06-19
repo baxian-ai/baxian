@@ -50,6 +50,20 @@ describe('deriveRuntimeStatus', () => {
     expect(deriveRuntimeStatus(b, obs, task('failed'))).toBe('error');
   });
 
+  it('reports a QA agent bound to a review task as working (it IS doing the review)', () => {
+    const b = binding({ id: 'qa-1', taskId: 'task-1' });
+    const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
+    const t = { ...task('review'), qaAgentId: 'qa-1' };
+    expect(deriveRuntimeStatus(b, obs, t)).toBe('working');
+  });
+
+  it('reports a dev agent bound to a review task as waiting (QA is reviewing, dev waits)', () => {
+    const b = binding({ id: 'dev-1', taskId: 'task-1' });
+    const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
+    const t = { ...task('review'), qaAgentId: 'qa-1' };
+    expect(deriveRuntimeStatus(b, obs, t)).toBe('waiting');
+  });
+
   it('reports a reserved max_rounds dev as waiting (awaiting human decision), not error (task-097)', () => {
     const b = binding({ taskId: 'task-1' });
     const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
@@ -77,6 +91,21 @@ describe('deriveRuntimeStatus', () => {
           lastPresentAt: '2026-05-14T05:00:00.000Z',
         },
         task('in_progress'),
+      ),
+    ).toBe('working');
+  });
+
+  it('reports QA agent as working during unreachable grace when task is in review', () => {
+    const b = binding({ id: 'qa-1', taskId: 'task-1' });
+    expect(
+      deriveRuntimeStatus(
+        b,
+        {
+          tmuxSessionStatus: 'unreachable',
+          observedAt: '2026-05-14T05:00:20.000Z',
+          lastPresentAt: '2026-05-14T05:00:00.000Z',
+        },
+        { ...task('review'), qaAgentId: 'qa-1' },
       ),
     ).toBe('working');
   });
@@ -153,7 +182,7 @@ describe('deriveRuntimeStatus', () => {
     expect(deriveRuntimeStatus(b, obs, task('fixing'))).toBe('pending');
   });
 
-  it('PENDING_IDLE hint is suppressed when task is in a non-working status (e.g. review)', () => {
+  it('PENDING_IDLE hint is suppressed for dev agent when task is in review (dev is not expected at terminal)', () => {
     expect(
       deriveRuntimeStatus(
         binding({ taskId: 'task-1' }),
@@ -163,9 +192,24 @@ describe('deriveRuntimeStatus', () => {
           runtimeStatusHint: 'pending',
           reason: 'PENDING_IDLE',
         },
-        task('review'),
+        { ...task('review'), qaAgentId: 'qa-1' },
       ),
     ).toBe('waiting');
+  });
+
+  it('PENDING_IDLE hint is honored for QA agent reviewing (QA IS expected at terminal)', () => {
+    expect(
+      deriveRuntimeStatus(
+        binding({ id: 'qa-1', taskId: 'task-1' }),
+        {
+          tmuxSessionStatus: 'present',
+          observedAt: NOW,
+          runtimeStatusHint: 'pending',
+          reason: 'PENDING_IDLE',
+        },
+        { ...task('review'), qaAgentId: 'qa-1' },
+      ),
+    ).toBe('pending');
   });
 
   it('PENDING_IDLE hint is suppressed when no task is attached', () => {
@@ -228,6 +272,32 @@ describe('agentSnapshot', () => {
     expect(snapshot.reason).toBeUndefined();
     expect(snapshot.message).toBeUndefined();
     expect(snapshot.latestError).toBeUndefined();
+  });
+
+  it('keeps PENDING_IDLE reason/message/latestError for QA agent reviewing (QA is expected at terminal)', () => {
+    const snapshot = agentSnapshot(
+      { id: 'qa-1', projectId: 'proj' },
+      binding({ id: 'qa-1', taskId: 'task-1' }),
+      {
+        tmuxSessionStatus: 'present',
+        observedAt: NOW,
+        runtimeStatusHint: 'pending',
+        reason: 'PENDING_IDLE',
+        message: 'Agent runtime has been idle while a task is active — likely waiting on user input.',
+        latestError: {
+          id: 'err-1',
+          agentId: 'qa-1',
+          reason: 'PENDING_IDLE',
+          message: 'idle',
+          occurredAt: NOW,
+        },
+      },
+      { ...task('review'), qaAgentId: 'qa-1' },
+    );
+    expect(snapshot.runtimeStatus).toBe('pending');
+    expect(snapshot.reason).toBe('PENDING_IDLE');
+    expect(snapshot.message).toBeDefined();
+    expect(snapshot.latestError?.reason).toBe('PENDING_IDLE');
   });
 
   it('keeps PENDING_IDLE reason/message/latestError when task is in working status', () => {

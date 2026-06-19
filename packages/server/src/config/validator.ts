@@ -61,7 +61,7 @@ function nonEmptyString(v: unknown): boolean {
 
 function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
   const review = (project as { review?: unknown }).review;
-  return (isRecord(review) && review.mode !== undefined ? review.mode : config.review.mode) as ReviewMode;
+  return (isRecord(review) && review.mode !== undefined ? review.mode : (config.review.mode ?? 'github')) as ReviewMode;
 }
 
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {

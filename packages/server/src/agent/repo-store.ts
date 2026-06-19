@@ -37,7 +37,8 @@ export class RepoStore {
     const absRepoPath = await this.resolveAbsPath();
     const cacheKey = `${this.hostKey()}:${absRepoPath}`;
     return this.runUnderMutex(cacheKey, async () => {
-      await this.cloneIfNeeded(absRepoPath);
+      const originChanged = await this.cloneIfNeeded(absRepoPath);
+      if (originChanged) this.cache.lastFetchAt.delete(cacheKey);
       await this.fetchIfStale(cacheKey, absRepoPath);
       return absRepoPath;
     });
@@ -87,7 +88,7 @@ export class RepoStore {
     return home;
   }
 
-  private async cloneIfNeeded(absRepoPath: string): Promise<void> {
+  private async cloneIfNeeded(absRepoPath: string): Promise<boolean> {
     const dirExists = (await this.runner.exec(`test -d ${shellQuote(absRepoPath)}`)).exitCode === 0;
     const gitExists = (await this.runner.exec(`test -d ${shellQuote(`${absRepoPath}/.git`)}`)).exitCode === 0;
 
@@ -116,7 +117,7 @@ export class RepoStore {
         // echoes the URL — without this the token lands in error records / events / logs.
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
-      return;
+      return false;
     }
 
     const originResult = await this.runner.exec(
@@ -125,11 +126,32 @@ export class RepoStore {
     if (originResult.exitCode !== 0) {
       throw new Error(`Failed to read origin URL at ${absRepoPath}: ${originResult.stderr}`);
     }
-    if (!this.originMatches(originResult.stdout.trim())) {
+    const originUrl = originResult.stdout.trim();
+    if (!this.originMatches(originUrl)) {
       throw new Error(redactGitCredentials(
-        `Existing repo at ${absRepoPath} has origin "${originResult.stdout.trim()}" which does not match project.repo "${this.repo}". Remove the directory or change project.repo.`,
+        `Existing repo at ${absRepoPath} has origin "${originUrl}" which does not match project.repo "${this.repo}". Remove the directory or change project.repo.`,
       ));
     }
+    return this.syncOriginUrl(absRepoPath, originUrl);
+  }
+
+  private async syncOriginUrl(absRepoPath: string, originUrl: string): Promise<boolean> {
+    if (parseGitRemote(this.repo) === null) return false;
+    if (!accessMethodDiffers(this.repo, originUrl)) return false;
+    // config --replace-all bypasses set-url's regex matching, which breaks with
+    // multi-URL origins and url.<base>.insteadOf shorthands.
+    const result = await this.runner.exec(
+      `git -C ${shellQuote(absRepoPath)} config --replace-all remote.origin.url ${shellQuote(this.repo)}`,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(redactGitCredentials(
+        `Failed to update origin URL at ${absRepoPath}: ${result.stderr}`,
+      ));
+    }
+    await this.runner.exec(
+      `git -C ${shellQuote(absRepoPath)} config --unset-all remote.origin.pushurl`,
+    );
+    return true;
   }
 
   private originMatches(originUrl: string): boolean {
@@ -180,4 +202,24 @@ export function nonGitHubSubpath(repo: string): string {
     throw new Error(`refusing unsafe path segment in repo "${repo}"`);
   }
   return `repos-ext/${parsed.host.replace(/:/g, '_')}/${segments.join('/')}`;
+}
+
+function urlScheme(url: string): string {
+  if (/^https:\/\//i.test(url)) return 'https';
+  if (/^http:\/\//i.test(url)) return 'http';
+  if (/^ssh:\/\//i.test(url)) return 'ssh';
+  if (/^[^@/\s]+@[^:/\s]+:/.test(url)) return 'ssh';
+  return '';
+}
+
+function urlUser(url: string): string {
+  const proto = url.match(/^(?:ssh|https?):\/\/([^@/]+)@/);
+  if (proto) return proto[1];
+  const scp = url.match(/^([^@/\s]+)@[^:/\s]+:/);
+  if (scp) return scp[1];
+  return '';
+}
+
+export function accessMethodDiffers(a: string, b: string): boolean {
+  return urlScheme(a) !== urlScheme(b) || urlUser(a) !== urlUser(b);
 }
