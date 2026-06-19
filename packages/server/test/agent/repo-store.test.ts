@@ -31,6 +31,46 @@ describe('RepoStore.ensure (clone path)', () => {
     const cmds = runner.exec.mock.calls.map(c => c[0]);
     expect(cmds.some(c => c.includes('gh repo clone') && c.includes('user/repo') && c.includes('--no-upstream'))).toBe(true);
     expect(cmds.some(c => /gh repo clone .+ -- /.test(c))).toBe(false);
+    expect(cmds.some(c => c.includes('remote get-url origin'))).toBe(false);
+  });
+
+  it('syncs origin immediately when a full GitHub URL is cloned through gh', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      if (cmd.includes('gh repo clone')) return OK;
+      if (cmd.includes('remote get-url origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('config --replace-all')) return OK;
+      if (cmd.includes('config --unset-all')) return OK;
+      if (cmd.includes('git fetch')) return OK;
+      return FAIL;
+    });
+    const store = new RepoStore(runner, 'git@github.com:user/repo.git', 'local', undefined, cache);
+    await store.ensure();
+    const cmds = runner.exec.mock.calls.map(c => c[0]);
+    expect(cmds.some(c => c.includes('gh repo clone') && c.includes('user/repo'))).toBe(true);
+    const replaceCmd = cmds.find(c => c.includes('config --replace-all remote.origin.url'));
+    expect(replaceCmd).toContain('git@github.com:user/repo.git');
+    expect(cmds.some(c => c.includes('config --unset-all remote.origin.pushurl'))).toBe(true);
+    expect(cmds.some(c => c.includes('git fetch'))).toBe(true);
+  });
+
+  it('rejects a mismatched origin immediately after a full GitHub URL clone', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      if (cmd.includes('gh repo clone')) return OK;
+      if (cmd.includes('remote get-url origin')) {
+        return { stdout: 'https://github.com/other/repo.git\n', stderr: '', exitCode: 0 };
+      }
+      return FAIL;
+    });
+    const store = new RepoStore(runner, 'git@github.com:user/repo.git', 'local', undefined, cache);
+    await expect(store.ensure()).rejects.toThrow(/does not match/i);
+    const cmds = runner.exec.mock.calls.map(c => c[0]);
+    expect(cmds.some(c => c.includes('git fetch'))).toBe(false);
   });
 
   it('skips clone when dir + .git both exist and origin matches', async () => {

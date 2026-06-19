@@ -117,9 +117,16 @@ export class RepoStore {
         // echoes the URL — without this the token lands in error records / events / logs.
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
+      if (this.isGitHub && parseGitRemote(this.repo) !== null) {
+        return this.syncMatchingOriginUrl(absRepoPath);
+      }
       return false;
     }
 
+    return this.syncMatchingOriginUrl(absRepoPath);
+  }
+
+  private async syncMatchingOriginUrl(absRepoPath: string): Promise<boolean> {
     const originResult = await this.runner.exec(
       `git -C ${shellQuote(absRepoPath)} remote get-url origin`,
     );
