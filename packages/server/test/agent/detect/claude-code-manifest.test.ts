@@ -657,4 +657,148 @@ describe('claude-code manifest', () => {
     const result = evaluateManifest(manifest, input(screen));
     expect(result.matchedRuleId).not.toBe('model_picker_menu');
   });
+
+  it.each([
+    { rule: 'bash_permission_prompt',    header: ['Do you want to proceed?', 'Bash command', '❯ Yes'],      state: 'pending', blocker: true },
+    { rule: 'generic_permission_prompt', header: ['Do you want to proceed?', 'Esc to cancel', '❯ 1. Yes'], state: 'pending', blocker: true },
+    { rule: 'runtime_menu',             header: ['Enter to confirm · Esc to cancel'],                       state: 'pending', blocker: true },
+    { rule: 'esc_to_interrupt_working',  header: ['Esc to interrupt'],                                       state: 'working', blocker: false },
+  ])('mid-screen bypass does NOT suppress $rule', ({ rule, header, state, blocker }) => {
+    const screen = [...header, '  ⏵⏵ bypass permissions on (shift+tab to cycle)', 'more output'].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.state).toBe(state);
+    if (blocker) expect(result.visibleBlocker).toBe(true);
+    expect(result.matchedRuleId).toBe(rule);
+  });
+
+  it('stale live_blocked_form loses to current model picker (footer with Esc)', () => {
+    const screen = [
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).not.toBe('live_blocked_form');
+    expect(result.matchedRuleId).toBe('model_picker_menu');
+    expect(result.skipStateUpdate).toBe(true);
+  });
+
+  it('stale live_blocked_form loses to current model picker (footer without Esc)', () => {
+    const screen = [
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).not.toBe('live_blocked_form');
+    expect(result.matchedRuleId).toBe('model_picker_menu');
+    expect(result.skipStateUpdate).toBe(true);
+  });
+
+  it('stale dynamic_workflow_prompt loses to current model picker (footer with Esc)', () => {
+    const screen = [
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).not.toBe('dynamic_workflow_prompt');
+    expect(result.matchedRuleId).toBe('model_picker_menu');
+    expect(result.skipStateUpdate).toBe(true);
+  });
+
+  it('stale dynamic_workflow_prompt loses to current model picker (footer without Esc)', () => {
+    const screen = [
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).not.toBe('dynamic_workflow_prompt');
+    expect(result.matchedRuleId).toBe('model_picker_menu');
+    expect(result.skipStateUpdate).toBe(true);
+  });
+
+  it('detects live_blocked_form with split footer (Enter/Esc on separate lines)', () => {
+    const screen = [
+      'Enter to select',
+      '↑/↓ to navigate',
+      'Esc to cancel',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).toBe('live_blocked_form');
+    expect(result.state).toBe('pending');
+  });
+
+  it('current live_blocked_form wins over stale model picker above', () => {
+    const screen = [
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).toBe('live_blocked_form');
+    expect(result.state).toBe('pending');
+  });
+
+  it('current dynamic_workflow_prompt wins over stale model picker above', () => {
+    const screen = [
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).toBe('dynamic_workflow_prompt');
+    expect(result.state).toBe('pending');
+  });
+
+  it('stale live_blocked_form loses to current model picker (split footer)', () => {
+    const screen = [
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+      'Esc to cancel',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).toBe('model_picker_menu');
+    expect(result.skipStateUpdate).toBe(true);
+  });
+
+  it('stale dynamic_workflow_prompt loses to current model picker (split footer)', () => {
+    const screen = [
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+      'Esc to cancel',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).toBe('model_picker_menu');
+    expect(result.skipStateUpdate).toBe(true);
+  });
+
+  it('stale model picker suppressed by mid-screen bypass with working output', () => {
+    const screen = [
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'some working output',
+      'more output',
+    ].join('\n');
+    const result = evaluateManifest(manifest, input(screen));
+    expect(result.matchedRuleId).not.toBe('model_picker_menu');
+  });
 });

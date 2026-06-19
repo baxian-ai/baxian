@@ -5017,19 +5017,11 @@ export class AgentManager {
         throw new ApiError(400, `Task ${taskId} has no PR/branch; cannot mark complete`);
       }
       if (serverApprovedRetry) {
-        // A live code-ready watcher armed by a real dispatch means the publish
-        // prompt IS running — a retry would inject a second prompt and rotate
-        // the token under it. A RECOVERED watcher is weaker evidence, but
-        // publishDispatchedAt persists delivery across restarts: set = the
-        // prompt reached the pane before the restart (still in flight, 409);
-        // cleared = the dispatch failed and this approved state is retryable —
-        // stop the recovered watch and let the retry own the dispatch.
-        if (this.phaseSignalWatcher?.expectedKindsFor(taskId).has('code-ready')) {
-          if (!this.phaseSignalWatcher.isRecovered(taskId) || task.publishDispatchedAt) {
-            throw new ApiError(409, `Task ${taskId} publish is in flight; retry only after it fails`);
-          }
-          this.phaseSignalWatcher.stop(taskId);
-        } else if (task.publishDispatchedAt) {
+        const publishState = this.checkPublishInFlight(taskId, task.publishDispatchedAt);
+        if (publishState === 'live') {
+          throw new ApiError(409, `Task ${taskId} publish is in flight; retry only after it fails`);
+        }
+        if (publishState === 'delivered') {
           throw new ApiError(
             409,
             `Task ${taskId} publish was delivered and is awaiting code-ready; ` +
@@ -5413,6 +5405,18 @@ export class AgentManager {
 
   stopPhaseSignalWatcher(taskId: string): void {
     this.phaseSignalWatcher?.stop(taskId);
+  }
+
+  // Returns 'live' when a code-ready watcher is armed and a publish prompt is in flight,
+  // 'delivered' when no watcher is running but publishDispatchedAt indicates delivery,
+  // or false when the approved state is retryable (stops any stale recovered watcher).
+  private checkPublishInFlight(taskId: string, publishDispatchedAt: string | undefined): 'live' | 'delivered' | false {
+    if (this.phaseSignalWatcher?.expectedKindsFor(taskId).has('code-ready')) {
+      if (!this.phaseSignalWatcher.isRecovered(taskId) || publishDispatchedAt) return 'live';
+      this.phaseSignalWatcher.stop(taskId);
+      return false;
+    }
+    return publishDispatchedAt ? 'delivered' : false;
   }
 
   // Prompt build (via task.signalToken) and watcher must share the same token.

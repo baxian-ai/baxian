@@ -207,6 +207,656 @@ async function gateDevForPostApproveRedispatch(
   return false;
 }
 
+async function handlePrMergeReady(
+  bus: EventBus,
+  manager: AgentManager,
+  event: BaxianEvent,
+): Promise<void> {
+  const taskId = event.taskId!;
+  const taskNow = await manager.getTask(taskId);
+  if (!taskNow) return;
+  const eventPrNumber = event.data.prNumber as number | undefined;
+  const eventPrUrl = event.data.prUrl as string | undefined;
+  const needsPatch =
+    (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
+    || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
+  if (needsPatch) {
+    await manager.updateTask(taskId, {
+      ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+      ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+    });
+  }
+  const verdictAgentId = event.data.verdictAgentId as string | undefined;
+  // PhaseSignalWatcher unified `data.token`; old PostApproveSignalWatcher used
+  // `data.signalToken` — reading the wrong field strands approved tasks.
+  const signalToken = event.data.token as string | undefined;
+  const completion = await manager.getPostApproveCompletion(taskNow.id);
+  if (
+    taskNow.status !== 'approved'
+    || verdictAgentId !== taskNow.agentId
+    || !signalToken
+    || completion?.token !== signalToken
+  ) return;
+
+  const ok = await manager.markAgentWaiting(taskNow.agentId, taskNow.id);
+  if (!ok) {
+    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+      phase: 'post-approve-dev-wait-gate-failed',
+    });
+    return;
+  }
+
+  const freshTask = await manager.getTask(taskNow.id);
+  const freshCompletion = await manager.getPostApproveCompletion(taskNow.id);
+  if (
+    !freshTask
+    || freshTask.status !== 'approved'
+    || freshTask.agentId !== taskNow.agentId
+    || freshCompletion?.token !== signalToken
+  ) {
+    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
+    return;
+  }
+
+  if (freshCompletion.pendingRedispatch) {
+    const nextCount = (freshCompletion.redispatchCount ?? 0) + 1;
+    if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+      await manager.clearPostApproveCompletion(freshTask.id);
+      await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
+        phase: 'post-approve-redispatch-cap-exceeded',
+        redispatchCount: freshCompletion.redispatchCount ?? 0,
+        cap: POST_APPROVE_REDISPATCH_CAP,
+      });
+      return;
+    }
+    await dispatchDevPostApproveCheck(
+      bus,
+      manager,
+      freshTask,
+      freshCompletion.approvedHeadSha,
+      { redispatchCount: nextCount },
+    );
+    return;
+  }
+
+  // merge:'auto' decides what confirm executes; persist the approved head so
+  // confirm's merge guard catches a push inside the gate window.
+  const readied = await manager.transitionTaskStatus(
+    freshTask.id,
+    'merge-ready',
+    { fromStatus: ['approved'] },
+    { latestHeadSha: freshCompletion.approvedHeadSha },
+  );
+  if (readied) {
+    await manager.clearPostApproveCompletionIfMatches(freshTask.id, signalToken);
+  }
+}
+
+async function handlePrFeedback(
+  bus: EventBus,
+  manager: AgentManager,
+  event: BaxianEvent,
+): Promise<void> {
+  const taskId = event.taskId!;
+  const taskNow = await manager.getTask(taskId);
+  if (!taskNow) return;
+  const eventPrNumber = event.data.prNumber as number | undefined;
+  const eventPrUrl = event.data.prUrl as string | undefined;
+  const eventKind = event.data.kind as string | undefined;
+  const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
+    ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+    ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+  };
+  const needsPatch =
+    (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
+    || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
+  if (needsPatch) {
+    await manager.updateTask(taskId, prPatch);
+  }
+  if (taskNow.status !== 'approved') return;
+  const isNewFeedback = eventKind === 'comment' || eventKind === 'review-comment';
+  if (!isNewFeedback) return;
+
+  const completion = await manager.getPostApproveCompletion(taskNow.id);
+  if (!completion) {
+    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+      phase: 'post-approve-approved-head-unavailable',
+    });
+    return;
+  }
+  // Don't Ctrl-C dev mid-pass on its own webhook echo — coalesce via pendingRedispatch.
+  const devState = await manager.getAgentState(taskNow.agentId);
+  if (devState?.taskId === taskNow.id) {
+    if (!completion.pendingRedispatch) {
+      await manager.setPostApproveCompletion(taskNow.id, {
+        token: completion.token,
+        approvedHeadSha: completion.approvedHeadSha,
+        ...(typeof completion.redispatchCount === 'number'
+          ? { redispatchCount: completion.redispatchCount } : {}),
+        pendingRedispatch: true,
+      });
+    }
+    return;
+  }
+  const nextCount = (completion.redispatchCount ?? 0) + 1;
+  if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+    await manager.clearPostApproveCompletion(taskNow.id);
+    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+      phase: 'post-approve-redispatch-cap-exceeded',
+      redispatchCount: completion.redispatchCount ?? 0,
+      cap: POST_APPROVE_REDISPATCH_CAP,
+    });
+    return;
+  }
+  const ready = await gateDevForPostApproveRedispatch(bus, manager, taskNow);
+  if (!ready) return;
+  await dispatchDevPostApproveCheck(
+    bus,
+    manager,
+    { ...taskNow, ...prPatch },
+    completion.approvedHeadSha,
+    { redispatchCount: nextCount },
+  );
+}
+
+async function handlePrCodePush(
+  bus: EventBus,
+  manager: AgentManager,
+  event: BaxianEvent,
+): Promise<void> {
+  const taskId = event.taskId!;
+  const agentId = event.agentId!;
+  const eventPrNumber = event.data.prNumber as number | undefined;
+  const eventPrUrl = event.data.prUrl as string | undefined;
+  const eventKind = event.data.kind as string | undefined;
+  const eventHeadSha = validHeadSha(event.data.headSha);
+  // Only `push` freshens `latestHeadSha` — legacy events (kind=undefined) use headSha
+  // for the review anchor only, not for the staleness fallback cache.
+  const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'latestHeadSha'>> = {
+    ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+    ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+    ...(eventKind === 'push' && eventHeadSha ? { latestHeadSha: eventHeadSha } : {}),
+  };
+
+  const taskBeforeTransition = await manager.getTask(taskId);
+  if (!taskBeforeTransition) return;
+  const willHavePrNumber =
+    taskBeforeTransition.prNumber !== undefined || eventPrNumber !== undefined;
+  if (taskBeforeTransition.status === 'in_progress' && !willHavePrNumber) {
+    console.warn(
+      `[EventHandler] pr.updated: task ${taskId} in_progress but neither task nor event has prNumber; ` +
+      `deferring catch-up`,
+    );
+    return;
+  }
+
+  // Anchor at dispatch time — must NOT shift if a subsequent push lands mid-review.
+  const anchorAtDispatch = eventHeadSha ?? validHeadSha(taskBeforeTransition.latestHeadSha);
+  const result = await manager.transitionTaskStatus(
+    taskId,
+    'review',
+    { fromStatus: ['in_progress', 'fixing', 'review', 'approved', 'merge-ready'] },
+    {
+      ...prPatch,
+      ...(anchorAtDispatch ? { reviewHeadAnchorSha: anchorAtDispatch } : {}),
+      reviewDispatchedAt: new Date().toISOString(),
+      // Rotate token atomically so an old QA's late verdict is rejected by the gate.
+      signalToken: createSignalToken(),
+    },
+  );
+  if (!result) return;
+  const { task: transitioned, previousStatus } = result;
+  const expectedRound = transitioned.reviewRound;
+  await manager.clearPostApproveCompletion(transitioned.id);
+
+  let devAlreadyWaiting = false;
+  if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
+    devAlreadyWaiting = await manager
+      .releaseAgentForTask(transitioned.agentId, transitioned.id, 'waiting')
+      .catch(err => {
+        console.error(
+          `[EventHandler] pr.updated releaseAgentForTask(dev=${transitioned.agentId}) before approved→recheck failed:`,
+          err,
+        );
+        return false;
+      });
+    if (!devAlreadyWaiting) {
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'post-approve-dev-wait-gate-failed-before-recheck',
+        devAgentId: transitioned.agentId,
+      });
+      return;
+    }
+  }
+
+  if (previousStatus === 'review' && transitioned.qaAgentId) {
+    const released = await manager
+      .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle')
+      .catch(err => {
+        console.error(
+          `[EventHandler] pr.updated releaseAgentForTask(QA=${transitioned.qaAgentId}) for review→review push failed:`,
+          err,
+        );
+        return false;
+      });
+    if (!released) {
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-release-failed-cannot-recheck',
+        qaAgentId: transitioned.qaAgentId,
+      });
+      return;
+    }
+  }
+
+  const qaPhase: 'review' | 'recheck' =
+    previousStatus === 'fixing' || previousStatus === 'review'
+    || previousStatus === 'approved' || previousStatus === 'merge-ready'
+      ? 'recheck'
+      : 'review';
+
+  const qa = manager.findQaPartner(agentId);
+  if (!qa) {
+    if (!devAlreadyWaiting && !(await manager.markAgentWaiting(agentId, transitioned.id))) {
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'dev-wait-gate-failed-no-qa',
+      });
+    }
+    return;
+  }
+
+  const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, qaPhase);
+  if (!acquired) {
+    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+      phase: 'qa-acquire-failed',
+      qaAgentId: qa.id,
+      qaPhase,
+    });
+    return;
+  }
+
+  // Persist qaAgentId BEFORE setting up so a pane-fallback verdict's review.submitted
+  // handler can read it for the release path.
+  await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
+
+  const { armed } = await manager.rotateAndSetupPhaseSignal(
+    transitioned.id,
+    qa.id,
+    ['pr-approved', 'pr-changes-requested'] as const,
+  );
+  if (!armed) {
+    console.warn(
+      `[EventHandler] pr.updated verdict watcher failed to arm for task=${transitioned.id} (${qaPhase}); rolling back recheck dispatch`,
+    );
+    if (previousStatus === 'in_progress' || previousStatus === 'fixing') {
+      // Full rollback: restore status+token+anchor and re-arm so the dev's already-emitted
+      // signal isn't stranded by the token rotation.
+      await manager.rollbackVerdictArmFailure(transitioned.id, {
+        status: previousStatus,
+        signalToken: taskBeforeTransition.signalToken,
+        reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
+        reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
+      });
+    } else {
+      // approved/review: don't restore status (approved with cleared completion is unsafe;
+      // review was already current). Leave in review for operator follow-up.
+      await manager.updateTask(transitioned.id, { qaAgentId: undefined });
+    }
+    await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
+      console.error(`[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
+      return false;
+    });
+    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+      phase: previousStatus === 'approved' || previousStatus === 'merge-ready' ? 'qa-recheck-arm-failed-after-approved-push' : 'qa-recheck-arm-failed',
+      qaAgentId: qa.id,
+      qaPhase,
+    });
+    return;
+  }
+  let started = false;
+  let dispatchErr: unknown = null;
+  try {
+    started = await manager.startSession(transitioned.id, qa.id, qaPhase);
+  } catch (err) {
+    dispatchErr = err;
+    console.error(
+      `[EventHandler] pr.updated startSession(QA=${qa.id}, ${qaPhase}) hard error:`,
+      err,
+    );
+  }
+  if (!started) {
+    console.warn(
+      `[EventHandler] pr.updated QA ${qaPhase} not started; previousStatus=${previousStatus}`,
+    );
+    if (dispatchErr instanceof DispatchTerminalError) {
+      await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
+    } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
+      // handleDialogPendingFromRuntime already marked QA Held + fail task + release partners
+    } else {
+      await manager.updateTask(transitioned.id, { qaAgentId: undefined });
+      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+        .catch(err => {
+          console.error(
+            `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
+            err,
+          );
+          return false;
+        });
+      if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'qa-recheck-failed-after-approved-push',
+          qaAgentId: qa.id,
+        });
+      } else if (previousStatus !== 'review') {
+        await manager.transitionTaskStatus(transitioned.id, previousStatus, { fromStatus: ['review'] });
+      } else {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'qa-recheck-failed-after-stop',
+          qaAgentId: qa.id,
+        });
+      }
+    }
+    return;
+  }
+
+  // Bump round for first review / approved re-review only; fixing/review→review recheck
+  // of the in-flight pass must NOT bump.
+  if (previousStatus === 'in_progress' || previousStatus === 'approved' || previousStatus === 'merge-ready') {
+    await manager.bumpReviewRoundIfStillAt(transitioned.id, expectedRound);
+  }
+
+  const ok = devAlreadyWaiting || (await manager.markAgentWaiting(agentId, transitioned.id));
+  if (!ok) {
+    await manager.markAwaitingHuman(
+      qa.id,
+      'dev-wait-gate-failed-after-qa-started',
+      `QA review for task ${transitioned.id} started but dev wait-gate failed; QA prompt may still be running, needs operator decision.`,
+      { expectedTaskId: transitioned.id },
+    ).catch(err => {
+      console.error(
+        `[EventHandler] pr.updated markAwaitingHuman(QA=${qa.id}) after dev-wait-gate-fail:`,
+        err,
+      );
+    });
+  }
+}
+
+async function handleReviewApproval(
+  bus: EventBus,
+  manager: AgentManager,
+  task: TaskState,
+  reviewedHeadSha: string | undefined,
+  currentHeadSha: string | undefined,
+  prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>>,
+): Promise<void> {
+  if (!reviewedHeadSha) {
+    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      phase: 'approval-reviewed-head-unavailable',
+    });
+    return;
+  }
+
+  const anchor = await resolveAuthoritativeHead(manager, task, {
+    payloadCurrentHeadSha: currentHeadSha,
+  });
+  if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
+    await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
+  }
+  if (anchor.headSha && reviewedHeadSha !== anchor.headSha) {
+    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      phase: 'stale-approval-head-mismatch',
+      reviewedHeadSha,
+      currentHeadSha: anchor.headSha,
+      source: anchor.source,
+      ...(anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
+    });
+    return;
+  }
+
+  const result = await manager.transitionTaskStatus(
+    task.id,
+    'approved',
+    { fromStatus: ['review'] },
+    // reviewRound 0 = first pass entered via catch-up (deferred bump). Count it now.
+    task.reviewRound === 0 ? { ...prPatch, reviewRound: 1 } : prPatch,
+  );
+  if (!result) return;
+  const { task: transitioned } = result;
+
+  // Verdict consumed → tear down the fallback verdict watcher (poller path leaves
+  // it set-up-but-unfired; pane path already removed its entry — this is a no-op).
+  manager.stopPhaseSignalWatcher(transitioned.id);
+
+  if (transitioned.qaAgentId) {
+    await manager.releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+      .catch(err =>
+        console.error(
+          `[EventHandler] APPROVE releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+          err,
+        ),
+      );
+  }
+
+  await dispatchDevPostApproveCheck(bus, manager, transitioned, reviewedHeadSha);
+}
+
+async function handleReviewRequestChanges(
+  bus: EventBus,
+  manager: AgentManager,
+  task: TaskState,
+  reviewedHeadSha: string | undefined,
+  currentHeadSha: string | undefined,
+  prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>>,
+): Promise<void> {
+  const approvedCompletion = task.status === 'approved'
+    ? await manager.getPostApproveCompletion(task.id)
+    : null;
+  const anchor = await resolveAuthoritativeHead(manager, task, {
+    payloadCurrentHeadSha: currentHeadSha,
+    legacyFallback: approvedCompletion?.approvedHeadSha,
+  });
+  if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
+    await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
+  }
+  if (reviewedHeadSha && anchor.headSha && reviewedHeadSha !== anchor.headSha) {
+    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      phase: 'stale-request-changes-head-mismatch',
+      reviewedHeadSha,
+      currentHeadSha: anchor.headSha,
+      source: anchor.source,
+      ...(anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
+    });
+    return;
+  }
+
+  const reviewedRound = task.reviewRound === 0 ? 1 : task.reviewRound;
+  const nextRound = reviewedRound + 1;
+  if (task.status === 'approved' && nextRound <= manager.getConfig().review.rounds) {
+    // Post-approve check may still be running — clearing completion blocks auto-merge;
+    // fix dispatch deferred to avoid prompt collision with the in-flight check.
+    const devState = await manager.getAgentState(task.agentId);
+    const postApproveActive = await manager.getPostApproveCompletion(task.id);
+    if (devState?.taskId === task.id && postApproveActive) {
+      await manager.clearPostApproveCompletion(task.id);
+      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+        phase: 'request-changes-during-post-approve',
+        devAgentId: task.agentId,
+        note: 'Dev is still running post-approve check; fix dispatch deferred to avoid prompt collision. PostApproveCompletion cleared to block auto-merge. Operator: wait for post-approve signal to complete, then re-trigger REQUEST_CHANGES manually or cancel the task.',
+      });
+      return;
+    }
+    const ready = await manager
+      .releaseAgentForTask(task.agentId, task.id, 'waiting')
+      .catch(err => {
+        console.error(
+          `[EventHandler] REQUEST_CHANGES releaseAgentForTask(dev=${task.agentId}) before fix failed:`,
+          err,
+        );
+        return false;
+      });
+    if (!ready) {
+      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+        phase: 'post-approve-dev-wait-gate-failed-before-fix',
+        devAgentId: task.agentId,
+      });
+      return;
+    }
+  }
+
+  if (nextRound > manager.getConfig().review.rounds) {
+    return handleMaxRounds(bus, manager, task, prPatch, reviewedRound);
+  }
+
+  const result = await manager.transitionTaskStatus(
+    task.id,
+    'fixing',
+    { fromStatus: ['review', 'approved', 'merge-ready'] },
+    { ...prPatch, reviewRound: nextRound, fixDispatchedAt: new Date().toISOString() },
+  );
+  if (!result) return;
+  const { task: transitioned, previousStatus } = result;
+  await manager.clearPostApproveCompletion(transitioned.id);
+  manager.stopPhaseSignalWatcher(transitioned.id);
+
+  if (previousStatus === 'review' && transitioned.qaAgentId) {
+    const qaReleased = await manager
+      .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+      .catch(err => {
+        console.error(
+          `[EventHandler] REQUEST_CHANGES releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+          err,
+        );
+        return false;
+      });
+    if (!qaReleased) {
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-release-failed-but-dev-dispatched',
+        qaAgentId: transitioned.qaAgentId,
+      });
+    }
+  }
+
+  const acquired = await manager.acquireAgentForTask(transitioned.agentId, transitioned.id, 'fix');
+  if (!acquired) {
+    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+      phase: 'dev-acquire-failed-fix',
+      devAgentId: transitioned.agentId,
+    });
+    return;
+  }
+
+  const { armed } = await manager.rotateAndSetupPhaseSignal(transitioned.id, transitioned.agentId, 'pr-fixed');
+
+  if (!armed) {
+    console.warn(
+      `[EventHandler] REQUEST_CHANGES pr-fixed watcher failed to arm for task=${transitioned.id}; holding dev (not dispatching fix)`,
+    );
+    await manager.markAwaitingHuman(
+      transitioned.agentId,
+      'signal-arm-failed:pr-fixed',
+      'pr-fixed watcher failed to arm; the fix was not dispatched (its completion signal would have no consumer). Cancel the task or delete the agent to retry.',
+      { expectedTaskId: transitioned.id },
+    );
+    return;
+  }
+
+  let resumed = false;
+  let dispatchErr: unknown = null;
+  try {
+    resumed = await manager.continueSession(transitioned.id, transitioned.agentId, 'fix');
+  } catch (err) {
+    dispatchErr = err;
+    console.error(
+      `[EventHandler] REQUEST_CHANGES continueSession(dev=${transitioned.agentId}, fix) failed:`,
+      err,
+    );
+  }
+  if (!resumed) {
+    console.warn(
+      `[EventHandler] REQUEST_CHANGES dev=${transitioned.agentId} not resumable for task=${transitioned.id}; ` +
+      `task remains in 'fixing' but no dev session is attached`,
+    );
+    if (dispatchErr instanceof DispatchTerminalError) {
+      await manager.failTaskForDispatchError(
+        transitioned.id, 'fix', transitioned.agentId, dispatchErr,
+      );
+    } else {
+      await manager.markAgentWaiting(transitioned.agentId, transitioned.id)
+        .catch(err => {
+          console.error(
+            `[EventHandler] REQUEST_CHANGES markAgentWaiting(dev=${transitioned.agentId}) rollback failed:`,
+            err,
+          );
+          return false;
+        });
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'fix-resume-failed',
+        reviewRound: transitioned.reviewRound,
+      });
+    }
+  }
+}
+
+async function handleMaxRounds(
+  bus: EventBus,
+  manager: AgentManager,
+  task: TaskState,
+  prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>>,
+  reviewedRound: number,
+): Promise<void> {
+  const result = await manager.transitionTaskStatus(
+    task.id,
+    'max_rounds',
+    { fromStatus: ['review', 'approved', 'merge-ready'] },
+    { ...prPatch, reviewRound: reviewedRound },
+  );
+  if (!result) return;
+  const { task: transitioned } = result;
+  await manager.clearPostApproveCompletion(transitioned.id);
+  manager.stopPhaseSignalWatcher(transitioned.id);
+
+  if (transitioned.qaAgentId) {
+    const qaState = await manager.getAgentState(transitioned.qaAgentId);
+    if (qaState?.taskId === transitioned.id) {
+      const qaReleased = await manager
+        .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+        .catch(err => {
+          console.error(
+            `[EventHandler] max_rounds releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
+            err,
+          );
+          return false;
+        });
+      if (qaReleased) {
+        await manager.updateTask(transitioned.id, { qaAgentId: undefined })
+          .catch(err =>
+            console.error(`[EventHandler] max_rounds clear qaAgentId(${transitioned.id}) failed:`, err),
+          );
+      }
+    } else {
+      await manager.updateTask(transitioned.id, { qaAgentId: undefined })
+        .catch(err =>
+          console.error(`[EventHandler] max_rounds clear stale qaAgentId(${transitioned.id}) failed:`, err),
+        );
+    }
+  }
+
+  try {
+    await bus.emit({
+      id: '',
+      type: 'review.max_rounds',
+      timestamp: new Date().toISOString(),
+      projectId: transitioned.projectId,
+      agentId: transitioned.agentId,
+      taskId: transitioned.id,
+      data: { reviewRound: transitioned.reviewRound },
+    });
+  } catch (emitErr) {
+    console.warn(`[EventHandler] max_rounds emit failed:`, emitErr);
+  }
+}
+
 export function registerEventHandlers(
   bus: EventBus,
   manager: AgentManager,
@@ -438,14 +1088,10 @@ export function registerEventHandlers(
     // pr.merged stays open: external merges of a ready PR finish through it.
     if (await isServerModeTask(manager, event.taskId)) return;
 
-    const eventPrNumber = event.data.prNumber as number | undefined;
-    const eventPrUrl = event.data.prUrl as string | undefined;
     const eventKind = event.data.kind as
       | 'push' | 'comment' | 'review-comment' | 'pr-edit' | 'pr-merge-ready' | undefined;
 
-    // spec phase 由 server 评审链驱动；spec doc 的 push/comment 不应进入 code-review 流程
-    // （避免 QA recheck → gh pr review --approve → 误派 post-approve）。
-    // pr-merge-ready 是 dev 内部状态推进，不受 phase gate 限制。
+    // spec phase 由 server 评审链驱动；pr-merge-ready 是 dev 内部状态推进，不受限。
     if (eventKind !== 'pr-merge-ready') {
       const taskNow = await manager.getTask(event.taskId);
       if (taskNow?.phase === 'spec') {
@@ -455,386 +1101,10 @@ export function registerEventHandlers(
         return;
       }
     }
-    // Only `push` freshens `latestHeadSha` — other event payloads can regress it under reorder.
-    const eventHeadSha = validHeadSha(event.data.headSha);
-    const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'latestHeadSha'>> = {
-      ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
-      ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
-      ...(eventKind === 'push' && eventHeadSha ? { latestHeadSha: eventHeadSha } : {}),
-    };
 
-    if (eventKind === 'pr-merge-ready') {
-      const taskNow = await manager.getTask(event.taskId);
-      if (!taskNow) return;
-      const needsPatch =
-        (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
-        || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
-      if (needsPatch) {
-        await manager.updateTask(event.taskId, prPatch);
-      }
-      const verdictAgentId = event.data.verdictAgentId as string | undefined;
-      // PhaseSignalWatcher emits the per-signal token under `data.token` for all
-      // kinds (unified field). Old PostApproveSignalWatcher used `data.signalToken`
-      // — that name is gone; reading the wrong field made every pr-merge-ready
-      // event fail the freshness gate below and silently strand approved tasks.
-      const signalToken = event.data.token as string | undefined;
-      const completion = await manager.getPostApproveCompletion(taskNow.id);
-      if (
-        taskNow.status !== 'approved'
-        || verdictAgentId !== taskNow.agentId
-        || !signalToken
-        || completion?.token !== signalToken
-      ) return;
-
-      const ok = await manager.markAgentWaiting(taskNow.agentId, taskNow.id);
-      if (!ok) {
-        await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-          phase: 'post-approve-dev-wait-gate-failed',
-        });
-        return;
-      }
-
-      const freshTask = await manager.getTask(taskNow.id);
-      const freshCompletion = await manager.getPostApproveCompletion(taskNow.id);
-      if (
-        !freshTask
-        || freshTask.status !== 'approved'
-        || freshTask.agentId !== taskNow.agentId
-        || freshCompletion?.token !== signalToken
-      ) {
-        await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-          phase: 'post-approve-merge-skipped-stale-task',
-        });
-        return;
-      }
-
-      // pendingRedispatch means new feedback arrived mid-pass — redispatch instead of merging.
-      if (freshCompletion.pendingRedispatch) {
-        const nextCount = (freshCompletion.redispatchCount ?? 0) + 1;
-        if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-          await manager.clearPostApproveCompletion(freshTask.id);
-          await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
-            phase: 'post-approve-redispatch-cap-exceeded',
-            redispatchCount: freshCompletion.redispatchCount ?? 0,
-            cap: POST_APPROVE_REDISPATCH_CAP,
-          });
-          return;
-        }
-        await dispatchDevPostApproveCheck(
-          bus,
-          manager,
-          freshTask,
-          freshCompletion.approvedHeadSha,
-          { redispatchCount: nextCount },
-        );
-        return;
-      }
-
-      // Human gate (spec §10): checks passed — surface merge-ready and wait for the
-      // operator. merge:'auto' no longer merges here; it decides what the confirm
-      // endpoint executes (server merges on confirm vs human merges by hand).
-      // Persist the post-approve head: confirm's merge guards on it so a push
-      // landing inside the gate window can never be merged blind.
-      const readied = await manager.transitionTaskStatus(
-        freshTask.id,
-        'merge-ready',
-        { fromStatus: ['approved'] },
-        { latestHeadSha: freshCompletion.approvedHeadSha },
-      );
-      if (readied) {
-        await manager.clearPostApproveCompletionIfMatches(freshTask.id, signalToken);
-      }
-      return;
-    }
-
-    const isCodeUpdate = eventKind === 'push' || eventKind === undefined;
-
-    if (!isCodeUpdate) {
-      const taskNow = await manager.getTask(event.taskId);
-      if (!taskNow) return;
-      const needsPatch =
-        (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
-        || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
-      if (needsPatch) {
-        await manager.updateTask(event.taskId, prPatch);
-      }
-      const completion = taskNow.status === 'approved'
-        ? await manager.getPostApproveCompletion(taskNow.id)
-        : null;
-      const isNewFeedback = eventKind === 'comment' || eventKind === 'review-comment';
-      if (taskNow.status === 'approved' && isNewFeedback) {
-        if (!completion) {
-          await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-            phase: 'post-approve-approved-head-unavailable',
-          });
-          return;
-        }
-        // Don't Ctrl-C Dev mid-pass on its own webhook echo — coalesce via pendingRedispatch instead.
-        const devState = await manager.getAgentState(taskNow.agentId);
-        if (devState?.taskId === taskNow.id) {
-          if (!completion.pendingRedispatch) {
-            await manager.setPostApproveCompletion(taskNow.id, {
-              token: completion.token,
-              approvedHeadSha: completion.approvedHeadSha,
-              ...(typeof completion.redispatchCount === 'number'
-                ? { redispatchCount: completion.redispatchCount } : {}),
-              pendingRedispatch: true,
-            });
-          }
-          return;
-        }
-        const nextCount = (completion.redispatchCount ?? 0) + 1;
-        if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-          // Clear completion so an in-flight signal can't auto-merge past the cap.
-          await manager.clearPostApproveCompletion(taskNow.id);
-          await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-            phase: 'post-approve-redispatch-cap-exceeded',
-            redispatchCount: completion.redispatchCount ?? 0,
-            cap: POST_APPROVE_REDISPATCH_CAP,
-          });
-          return;
-        }
-        const ready = await gateDevForPostApproveRedispatch(bus, manager, taskNow);
-        if (!ready) return;
-        await dispatchDevPostApproveCheck(
-          bus,
-          manager,
-          { ...taskNow, ...prPatch },
-          completion.approvedHeadSha,
-          { redispatchCount: nextCount },
-        );
-      }
-      return;
-    }
-
-    const taskBeforeTransition = await manager.getTask(event.taskId);
-    if (!taskBeforeTransition) return;
-    const willHavePrNumber =
-      taskBeforeTransition.prNumber !== undefined || eventPrNumber !== undefined;
-    if (taskBeforeTransition.status === 'in_progress' && !willHavePrNumber) {
-      console.warn(
-        `[EventHandler] pr.updated: task ${event.taskId} in_progress but neither task nor event has prNumber; ` +
-        `deferring catch-up`,
-      );
-      return;
-    }
-
-    // Pin the review anchor SHA at dispatch time: if this push provided a head,
-    // use it; otherwise fall back to the existing latestHeadSha (last known
-    // head from poller). The anchor must NOT shift if a subsequent push lands
-    // mid-review.
-    const anchorAtDispatch = eventHeadSha ?? validHeadSha(taskBeforeTransition.latestHeadSha);
-    const result = await manager.transitionTaskStatus(
-      event.taskId,
-      'review',
-      { fromStatus: ['in_progress', 'fixing', 'review', 'approved', 'merge-ready'] },
-      {
-        ...prPatch,
-        ...(anchorAtDispatch ? { reviewHeadAnchorSha: anchorAtDispatch } : {}),
-        reviewDispatchedAt: new Date().toISOString(),
-        // Rotate the per-pass token ATOMICALLY with the anchors. If the redispatch's
-        // later acquire/startSession fails and returns, the token still changed here,
-        // so an old QA's late verdict (carrying the prior token) is rejected by the
-        // token gate. rotateAndSetupPhaseSignal below rotates once more for the set up —
-        // harmless, since the gate only needs the value to differ from the old pass.
-        signalToken: createSignalToken(),
-      },
-    );
-    if (!result) return;
-    const { task: transitioned, previousStatus } = result;
-    // Round captured before any verdict can land — the count-once token (see pr.created).
-    const expectedRound = transitioned.reviewRound;
-    await manager.clearPostApproveCompletion(transitioned.id);
-
-    let devAlreadyWaiting = false;
-    if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
-      devAlreadyWaiting = await manager
-        .releaseAgentForTask(transitioned.agentId, transitioned.id, 'waiting')
-        .catch(err => {
-          console.error(
-            `[EventHandler] pr.updated releaseAgentForTask(dev=${transitioned.agentId}) before approved→recheck failed:`,
-            err,
-          );
-          return false;
-        });
-      if (!devAlreadyWaiting) {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'post-approve-dev-wait-gate-failed-before-recheck',
-          devAgentId: transitioned.agentId,
-        });
-        return;
-      }
-    }
-
-    // Release stale QA before recheck — a half-released REPL must not receive new prompt.
-    if (previousStatus === 'review' && transitioned.qaAgentId) {
-      const released = await manager
-        .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle')
-        .catch(err => {
-          console.error(
-            `[EventHandler] pr.updated releaseAgentForTask(QA=${transitioned.qaAgentId}) for review→review push failed:`,
-            err,
-          );
-          return false;
-        });
-      if (!released) {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'qa-release-failed-cannot-recheck',
-          qaAgentId: transitioned.qaAgentId,
-        });
-        return;
-      }
-    }
-
-    // Any push once the task is already past initial dispatch (review/fixing/approved)
-    // is a re-look → 'recheck'. The recheck prompt is phrased neutrally ("re-check the
-    // new commits and any prior feedback"), so it never falsely claims "dev addressed
-    // your prior changes-requested"; keeping 'recheck' for previousStatus='review'
-    // preserves the recheck framing for a push DURING a recheck (don't downgrade it).
-    const qaPhase: 'review' | 'recheck' =
-      previousStatus === 'fixing' || previousStatus === 'review'
-      || previousStatus === 'approved' || previousStatus === 'merge-ready'
-        ? 'recheck'
-        : 'review';
-
-    const qa = manager.findQaPartner(event.agentId);
-    if (!qa) {
-      if (!devAlreadyWaiting && !(await manager.markAgentWaiting(event.agentId, transitioned.id))) {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'dev-wait-gate-failed-no-qa',
-        });
-      }
-      return;
-    }
-
-    const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, qaPhase);
-    if (!acquired) {
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-acquire-failed',
-        qaAgentId: qa.id,
-        qaPhase,
-      });
-      return;
-    }
-
-    // Persist qaAgentId BEFORE setting up so a pane-fallback verdict's review.submitted
-    // handler can read it for the release path (same as pr.created).
-    await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
-
-    // Poller-authoritative verdict; set up the verdict watcher as the same-identity
-    // (422) fallback — see pr.created. Torn down on poller verdict in review.submitted.
-    const { armed } = await manager.rotateAndSetupPhaseSignal(
-      transitioned.id,
-      qa.id,
-      ['pr-approved', 'pr-changes-requested'] as const,
-    );
-    if (!armed) {
-      // No armed watcher → a same-identity verdict would have no consumer.
-      console.warn(
-        `[EventHandler] pr.updated verdict watcher failed to arm for task=${transitioned.id} (${qaPhase}); rolling back recheck dispatch`,
-      );
-      if (previousStatus === 'in_progress' || previousStatus === 'fixing') {
-        // Full rollback: the dev's prior-phase prompt (spec-done/pr-created or pr-fixed) used the
-        // pre-rotation token; restore status+token+anchor and re-arm so its already-emitted signal
-        // isn't stranded by the token rotation.
-        await manager.rollbackVerdictArmFailure(transitioned.id, {
-          status: previousStatus,
-          signalToken: taskBeforeTransition.signalToken,
-          reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
-          reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
-        });
-      } else {
-        // approved/review: do NOT restore status. 'approved' is unsafe to restore (its post-approve
-        // completion was already cleared and the new push is unreviewed); 'review' was already
-        // current. Leave the task in review for operator/poller follow-up (matches the start-failure
-        // branch below) and just drop the QA we acquired.
-        await manager.updateTask(transitioned.id, { qaAgentId: undefined });
-      }
-      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
-        console.error(`[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
-        return false;
-      });
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: previousStatus === 'approved' || previousStatus === 'merge-ready' ? 'qa-recheck-arm-failed-after-approved-push' : 'qa-recheck-arm-failed',
-        qaAgentId: qa.id,
-        qaPhase,
-      });
-      return;
-    }
-    let started = false;
-    let dispatchErr: unknown = null;
-    try {
-      started = await manager.startSession(transitioned.id, qa.id, qaPhase);
-    } catch (err) {
-      dispatchErr = err;
-      console.error(
-        `[EventHandler] pr.updated startSession(QA=${qa.id}, ${qaPhase}) hard error:`,
-        err,
-      );
-    }
-    if (!started) {
-      console.warn(
-        `[EventHandler] pr.updated QA ${qaPhase} not started; previousStatus=${previousStatus}`,
-      );
-      if (dispatchErr instanceof DispatchTerminalError) {
-        await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
-      } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
-        // handleDialogPendingFromRuntime 已标 QA Held + fail task + release partners；不能再 release
-        // 否则 boundTask terminal 会让 shouldReleaseHeldBinding 放行 → 解锁仍卡 dialog 的 pane。
-      } else {
-        // Rollback pre-set up qaAgentId so the task doesn't keep a binding to a QA we never started.
-        await manager.updateTask(transitioned.id, { qaAgentId: undefined });
-        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
-          .catch(err => {
-            console.error(
-              `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
-              err,
-            );
-            return false;
-          });
-        if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
-          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-            phase: 'qa-recheck-failed-after-approved-push',
-            qaAgentId: qa.id,
-          });
-        } else if (previousStatus !== 'review') {
-          await manager.transitionTaskStatus(transitioned.id, previousStatus, { fromStatus: ['review'] });
-        } else {
-          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-            phase: 'qa-recheck-failed-after-stop',
-            qaAgentId: qa.id,
-          });
-        }
-      }
-      return;
-    }
-
-    // New QA pass started → count it (1-based Round). Bump on the success path only.
-    // First review (in_progress→review) and re-review after approval (approved→review,
-    // dev pushed before merge) each start a new pass; fixing/review→review is a recheck
-    // of the in-flight pass and must NOT bump. The count-once token no-ops if a
-    // same-identity verdict already counted this pass mid-dispatch — symmetric for the
-    // first review (expected 0) and an approved re-review (expected ≥1).
-    if (previousStatus === 'in_progress' || previousStatus === 'approved' || previousStatus === 'merge-ready') {
-      await manager.bumpReviewRoundIfStillAt(transitioned.id, expectedRound);
-    }
-
-    const ok = devAlreadyWaiting || (await manager.markAgentWaiting(event.agentId, transitioned.id));
-    if (!ok) {
-      // 同 pr.created 路径：QA review prompt 已粘进 pane 在跑，裸 release 让下一 review
-      // 派同一 QA 时新 prompt 灌进仍在跑旧 review 的 pane。标 awaiting_human 让 operator 处理。
-      await manager.markAwaitingHuman(
-        qa.id,
-        'dev-wait-gate-failed-after-qa-started',
-        `QA review for task ${transitioned.id} started but dev wait-gate failed; QA prompt may still be running, needs operator decision.`,
-        { expectedTaskId: transitioned.id },
-      ).catch(err => {
-        console.error(
-          `[EventHandler] pr.updated markAwaitingHuman(QA=${qa.id}) after dev-wait-gate-fail:`,
-          err,
-        );
-      });
-    }
+    if (eventKind === 'pr-merge-ready') return handlePrMergeReady(bus, manager, event);
+    if (eventKind !== 'push' && eventKind !== undefined) return handlePrFeedback(bus, manager, event);
+    return handlePrCodePush(bus, manager, event);
   });
 
   bus.on('pr.merged', async (event) => {
@@ -1042,307 +1312,10 @@ export function registerEventHandlers(
     }
 
     if (action === 'APPROVE') {
-      if (!reviewedHeadSha) {
-        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-          phase: 'approval-reviewed-head-unavailable',
-        });
-        return;
-      }
-
-      const anchor = await resolveAuthoritativeHead(manager, task, {
-        payloadCurrentHeadSha: currentHeadSha,
-      });
-      // Refresh cache BEFORE the reject decision so a fetch outage can't fall back to a stale store.
-      if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
-        await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
-      }
-      // No anchor (fetch + fallbacks all missing) ⇒ proceed; can't prove staleness either way.
-      if (anchor.headSha && reviewedHeadSha !== anchor.headSha) {
-        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-          phase: 'stale-approval-head-mismatch',
-          reviewedHeadSha,
-          currentHeadSha: anchor.headSha,
-          source: anchor.source,
-          ...(anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
-        });
-        return;
-      }
-
-      const result = await manager.transitionTaskStatus(
-        event.taskId,
-        'approved',
-        { fromStatus: ['review'] },
-        // reviewRound 0 here ⇒ first pass entered via catch-up (deferred bump). Count it
-        // now that the verdict is accepted. A stale verdict returns above and never
-        // reaches this point, so the round is consumed only on a real acceptance.
-        task.reviewRound === 0 ? { ...prPatch, reviewRound: 1 } : prPatch,
-      );
-      if (!result) return;
-      const { task: transitioned } = result;
-
-      // Verdict consumed → tear down the fallback verdict watcher. A distinct-identity
-      // task got its verdict via the poller, leaving the pane watcher set up-but-unfired;
-      // a same-identity pane verdict already removed its own entry, so this is a no-op.
-      // Placed AFTER the transition so a head-stale rejection above never tears it down
-      // (and never touches an approved task's pr-merge-ready watcher).
-      manager.stopPhaseSignalWatcher(transitioned.id);
-
-      if (transitioned.qaAgentId) {
-        // outcome 到达 = QA turn 完成，即使 QA 之前 Held（dev_wait_gate_failed / ack_unknown）也可放行。
-        await manager.releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
-          .catch(err =>
-            console.error(
-              `[EventHandler] APPROVE releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-              err,
-            ),
-          );
-      }
-
-      await dispatchDevPostApproveCheck(
-        bus,
-        manager,
-        transitioned,
-        reviewedHeadSha,
-      );
-      return;
+      return handleReviewApproval(bus, manager, task, reviewedHeadSha, currentHeadSha, prPatch);
     }
-
     if (action === 'REQUEST_CHANGES') {
-      const approvedCompletion = task.status === 'approved'
-        ? await manager.getPostApproveCompletion(task.id)
-        : null;
-      const anchor = await resolveAuthoritativeHead(manager, task, {
-        payloadCurrentHeadSha: currentHeadSha,
-        legacyFallback: approvedCompletion?.approvedHeadSha,
-      });
-      if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
-        await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
-      }
-      if (reviewedHeadSha && anchor.headSha && reviewedHeadSha !== anchor.headSha) {
-        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-          phase: 'stale-request-changes-head-mismatch',
-          reviewedHeadSha,
-          currentHeadSha: anchor.headSha,
-          source: anchor.source,
-          ...(anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
-        });
-        return;
-      }
-
-      // reviewRound 0 here ⇒ first pass entered via catch-up (deferred bump); the pass
-      // being judged is round 1. Otherwise the round was already counted on dispatch.
-      const reviewedRound = task.reviewRound === 0 ? 1 : task.reviewRound;
-      const nextRound = reviewedRound + 1;
-      if (task.status === 'approved' && nextRound <= manager.getConfig().review.rounds) {
-        // post-approve check 可能仍在 dev pane 中跑——release(waiting) 只 bump updatedAt 不 wait ready，
-        // 后续 continueSession(fix) 会把 fix prompt 灌进 busy pane (pr.updated approved+new feedback 已通过
-        // pendingRedispatch 走 coalesce；review.submitted 这里需要同等 gate)。检测 dev 仍绑 task + post-approve
-        // completion 仍存在 → emit intervention + skip 派发；signal 完成后 (pr-merge-ready handler)
-        // task 会回到 approved，operator 可以重新触发 REQUEST_CHANGES manual review 或 cancel task。
-        const devState = await manager.getAgentState(task.agentId);
-        const postApproveActive = await manager.getPostApproveCompletion(task.id);
-        if (devState?.taskId === task.id && postApproveActive) {
-          // 必须先清 PostApproveCompletion 阻止 signal 完成后 auto-merge：
-          // pr-merge-ready handler 看 completion.token 仍匹配 + freshTask.status='approved'
-          // + pendingRedispatch=false 会调 mergePr——但我们刚收到 REQUEST_CHANGES，绝不能 merge。
-          await manager.clearPostApproveCompletion(task.id);
-          await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-            phase: 'request-changes-during-post-approve',
-            devAgentId: task.agentId,
-            note: 'Dev is still running post-approve check; fix dispatch deferred to avoid prompt collision. PostApproveCompletion cleared to block auto-merge. Operator: wait for post-approve signal to complete, then re-trigger REQUEST_CHANGES manually or cancel the task.',
-          });
-          return;
-        }
-        const ready = await manager
-          .releaseAgentForTask(task.agentId, task.id, 'waiting')
-          .catch(err => {
-            console.error(
-              `[EventHandler] REQUEST_CHANGES releaseAgentForTask(dev=${task.agentId}) before fix failed:`,
-              err,
-            );
-            return false;
-          });
-        if (!ready) {
-          await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-            phase: 'post-approve-dev-wait-gate-failed-before-fix',
-            devAgentId: task.agentId,
-          });
-          return;
-        }
-      }
-
-      if (nextRound > manager.getConfig().review.rounds) {
-        const result = await manager.transitionTaskStatus(
-          event.taskId,
-          'max_rounds',
-          { fromStatus: ['review', 'approved', 'merge-ready'] },
-          // Persist the reviewed round (no-op for the normal path; records the
-          // deferred first-review count for a catch-up that hit the cap).
-          { ...prPatch, reviewRound: reviewedRound },
-        );
-        if (!result) return;
-        const { task: transitioned } = result;
-        await manager.clearPostApproveCompletion(transitioned.id);
-        manager.stopPhaseSignalWatcher(transitioned.id);
-
-        // Reconcile the QA reference regardless of how we reached the cap (REQUEST_CHANGES can
-        // hit it from review OR approved/merge-ready). max_rounds is active and failTasksForAgent
-        // matches by task.qaAgentId, so a stale id pointing at a released QA would let that QA's
-        // later failure false-fail this paused task. The next review re-sets qaAgentId.
-        if (transitioned.qaAgentId) {
-          const qaState = await manager.getAgentState(transitioned.qaAgentId);
-          if (qaState?.taskId === transitioned.id) {
-            // QA still bound (review path): release it via the outcome path. allowAwaitingHuman —
-            // the verdict arriving IS the QA turn completing, so a Held QA must still be releasable.
-            // Clear only on a successful release; if refused (still bound/held), keep the reference
-            // so a later Cancel/Complete can reclaim it.
-            const qaReleased = await manager
-              .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
-              .catch(err => {
-                console.error(
-                  `[EventHandler] max_rounds releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-                  err,
-                );
-                return false;
-              });
-            if (qaReleased) {
-              await manager.updateTask(transitioned.id, { qaAgentId: undefined })
-                .catch(err =>
-                  console.error(`[EventHandler] max_rounds clear qaAgentId(${transitioned.id}) failed:`, err),
-                );
-            }
-          } else {
-            // QA already unbound (approved/merge-ready path released it earlier without clearing the
-            // id) — drop the stale reference so it can't false-fail this active task.
-            await manager.updateTask(transitioned.id, { qaAgentId: undefined })
-              .catch(err =>
-                console.error(`[EventHandler] max_rounds clear stale qaAgentId(${transitioned.id}) failed:`, err),
-              );
-          }
-        }
-        // Dev is intentionally NOT released: this is the code-phase review loop
-        // (review.submitted early-returns for spec phase). The dev stays parked
-        // 'waiting' + bound with its worktree intact, so "continue one round"
-        // reuses the checkout (no -B branch reset / lost commits). It is freed by
-        // mark-complete (post-merge cleanup) or cancel.
-
-        try {
-          await bus.emit({
-            id: '',
-            type: 'review.max_rounds',
-            timestamp: new Date().toISOString(),
-            projectId: transitioned.projectId,
-            agentId: transitioned.agentId,
-            taskId: transitioned.id,
-            data: { reviewRound: transitioned.reviewRound },
-          });
-        } catch (emitErr) {
-          console.warn(`[EventHandler] max_rounds emit failed:`, emitErr);
-        }
-        return;
-      }
-
-      const result = await manager.transitionTaskStatus(
-        event.taskId,
-        'fixing',
-        { fromStatus: ['review', 'approved', 'merge-ready'] },
-        // fixDispatchedAt marks the round start so the pr-fixed verifier doesn't
-        // count QA/human comments left during the prior review as dev activity.
-        { ...prPatch, reviewRound: nextRound, fixDispatchedAt: new Date().toISOString() },
-      );
-      if (!result) return;
-      const { task: transitioned, previousStatus } = result;
-      await manager.clearPostApproveCompletion(transitioned.id);
-      manager.stopPhaseSignalWatcher(transitioned.id);
-
-      let qaReleased = true;
-      if (previousStatus === 'review' && transitioned.qaAgentId) {
-        // outcome 到达 = QA turn 完成，allowAwaitingHuman 让 Held QA (ack_unknown / dev_wait_gate_failed) 也可放行。
-        qaReleased = await manager
-          .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
-          .catch(err => {
-            console.error(
-              `[EventHandler] REQUEST_CHANGES releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-              err,
-            );
-            return false;
-          });
-        if (!qaReleased) {
-          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-            phase: 'qa-release-failed-but-dev-dispatched',
-            qaAgentId: transitioned.qaAgentId,
-          });
-        }
-      }
-
-      // Explicit acquire short-circuits if a concurrent DELETE/restart-repl released the lock.
-      const acquired = await manager.acquireAgentForTask(transitioned.agentId, transitioned.id, 'fix');
-      if (!acquired) {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'dev-acquire-failed-fix',
-          devAgentId: transitioned.agentId,
-        });
-        return;
-      }
-
-      // Set up the pr-fixed completion watcher BEFORE the prompt. rotateAndSetupPhaseSignal
-      // rotates the per-pass token atomically; continueSession then reads that token and
-      // embeds it in the fix prompt, so the dev's pr-fixed signal advances fixing→review
-      // even when the round produced no push.
-      const { armed } = await manager.rotateAndSetupPhaseSignal(transitioned.id, transitioned.agentId, 'pr-fixed');
-
-      if (!armed) {
-        // pr-fixed watcher didn't arm → the fix completion signal (esp. the no-push case) would have
-        // no consumer. Don't dispatch; hold the dev explicitly so the stuck state is operator-handleable
-        // (resumeAgent refuses signal-arm-failed → cancel/delete), instead of leaving task=fixing with
-        // the dev merely 'waiting' and no fix prompt running (snapshot would mislabel it as working).
-        console.warn(
-          `[EventHandler] REQUEST_CHANGES pr-fixed watcher failed to arm for task=${transitioned.id}; holding dev (not dispatching fix)`,
-        );
-        await manager.markAwaitingHuman(
-          transitioned.agentId,
-          'signal-arm-failed:pr-fixed',
-          'pr-fixed watcher failed to arm; the fix was not dispatched (its completion signal would have no consumer). Cancel the task or delete the agent to retry.',
-          { expectedTaskId: transitioned.id },
-        );
-        return;
-      }
-
-      let resumed = false;
-      let dispatchErr: unknown = null;
-      try {
-        resumed = await manager.continueSession(transitioned.id, transitioned.agentId, 'fix');
-      } catch (err) {
-        dispatchErr = err;
-        console.error(
-          `[EventHandler] REQUEST_CHANGES continueSession(dev=${transitioned.agentId}, fix) failed:`,
-          err,
-        );
-      }
-      if (!resumed) {
-        console.warn(
-          `[EventHandler] REQUEST_CHANGES dev=${transitioned.agentId} not resumable for task=${transitioned.id}; ` +
-          `task remains in 'fixing' but no dev session is attached`,
-        );
-        if (dispatchErr instanceof DispatchTerminalError) {
-          await manager.failTaskForDispatchError(
-            transitioned.id, 'fix', transitioned.agentId, dispatchErr,
-          );
-        } else {
-          await manager.markAgentWaiting(transitioned.agentId, transitioned.id)
-            .catch(err => {
-              console.error(
-                `[EventHandler] REQUEST_CHANGES markAgentWaiting(dev=${transitioned.agentId}) rollback failed:`,
-                err,
-              );
-              return false;
-            });
-          await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-            phase: 'fix-resume-failed',
-            reviewRound: transitioned.reviewRound,
-          });
-        }
-      }
+      return handleReviewRequestChanges(bus, manager, task, reviewedHeadSha, currentHeadSha, prPatch);
     }
   });
 

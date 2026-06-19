@@ -42,7 +42,8 @@
         { "lineRegex": ["^\\s*[❯>]\\s*$"] },
         { "lineRegex": ["^[·✢✳✶✻✽][ \\t]+[^\\n…]{1,200}…[ \\t]*\\([ \\t]*(?:\\d+[ \\t]*m[ \\t]+)?\\d+[ \\t]*s"] },
         { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] },
+        { "contains": ["select model", "enter to set as default"] }
       ]
     },
     {
@@ -56,7 +57,8 @@
         { "lineRegex": ["^\\s*[❯>]\\s*$"] },
         { "lineRegex": ["^[·✢✳✶✻✽][ \\t]+[^\\n…]{1,200}…[ \\t]*\\([ \\t]*(?:\\d+[ \\t]*m[ \\t]+)?\\d+[ \\t]*s"] },
         { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] },
+        { "contains": ["select model", "enter to set as default"] }
       ]
     },
     {
@@ -71,7 +73,7 @@
         { "lineRegex": ["^[·✢✳✶✻✽][ \\t]+[^\\n…]{1,200}…[ \\t]*\\([ \\t]*(?:\\d+[ \\t]*m[ \\t]+)?\\d+[ \\t]*s"] },
         { "lineRegex": ["^\\s*[❯>]\\s*$"] },
         { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     },
     {
@@ -92,7 +94,7 @@
     {
       "id": "model_picker_menu",
       "state": "unknown",
-      "priority": 960,
+      "priority": 985,
       "region": "whole",
       "skipStateUpdate": true,
       "contains": ["select model", "enter to set as default"],
@@ -109,6 +111,7 @@
         { "contains": ["ctrl+e to explain"] },
         { "contains": ["review your answers"] },
         { "contains": ["skip interview and plan immediately"] },
+        { "contains": ["run a dynamic workflow?"] },
         { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
       ]
     },
@@ -137,7 +140,7 @@
         { "lineRegex": ["^\\s*[❯>]\\s*$"] },
         { "lineRegex": ["^[·✢✳✶✻✽][ \\t]+[^\\n…]{1,200}…[ \\t]*\\([ \\t]*(?:\\d+[ \\t]*m[ \\t]+)?\\d+[ \\t]*s"] },
         { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     },
     {
@@ -159,7 +162,7 @@
         { "lineRegex": ["^\\s*[❯>]\\s*$"] },
         { "lineRegex": ["^[·✢✳✶✻✽][ \\t]+[^\\n…]{1,200}…[ \\t]*\\([ \\t]*(?:\\d+[ \\t]*m[ \\t]+)?\\d+[ \\t]*s"] },
         { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     },
     {
@@ -182,7 +185,7 @@
       "notAfter": [
         { "lineRegex": ["^\\s*[❯>]\\s*$"] },
         { "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     },
     {
@@ -204,7 +207,7 @@
       "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"],
       "notAfter": [
         { "lineRegex": ["^[ \\t]*[❯>][ \\t]*$"] },
-        { "lineRegex": ["^[ \\t]*⏵⏵ bypass permissions on"] }
+        { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     },
     {

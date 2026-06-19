@@ -1698,6 +1698,28 @@ describe('pr.updated handler', () => {
     expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
   });
 
+  it('default kind (no kind field) with headSha does NOT overwrite latestHeadSha — regression guard', async () => {
+    await seedTask({
+      id: 'task-up-legacy',
+      status: 'in_progress',
+      reviewRound: 0,
+      prNumber: 90,
+      latestHeadSha: HEAD_SHA,
+    });
+
+    await emitAndWait({
+      type: 'pr.updated',
+      timestamp: new Date().toISOString(),
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-up-legacy',
+      data: { prNumber: 90, headSha: NEXT_HEAD_SHA },
+    });
+
+    const task = await taskStore.get('task-up-legacy');
+    expect(task!.latestHeadSha).toBe(HEAD_SHA);
+  });
+
   it('push kind in review (dev pushed during QA review): stop old QA + start recheck (neutral prompt, no false premise)', async () => {
     // A mid-review push re-dispatches as 'recheck'. The recheck prompt is phrased
     // neutrally ("re-check the new commits and any prior feedback"), so it does NOT
