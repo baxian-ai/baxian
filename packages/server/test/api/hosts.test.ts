@@ -67,7 +67,7 @@ describe('POST /api/hosts', () => {
     await app.close();
   });
 
-  it('forces a fresh authenticated connection (noMux) for the connectivity check (f-1)', async () => {
+  it('forces a fresh authenticated connection (noMux) for the connectivity check', async () => {
     const { app, calls } = await makeApp(true);
     await app.inject({ method: 'POST', url: '/api/hosts', payload: { hostname: 'h', alias: 'box' } });
     expect(calls).toHaveLength(1);
@@ -128,7 +128,7 @@ describe('PATCH /api/hosts/:id', () => {
     await app.close();
   });
 
-  it('keeps the existing password when the field is omitted (f-3 preserve-current)', async () => {
+  it('keeps the existing password when the field is omitted', async () => {
     const { app } = await makeApp(true);
     const res = await app.inject({
       method: 'PATCH', url: '/api/hosts/box',
@@ -173,7 +173,7 @@ describe('PATCH /api/hosts/:id', () => {
     await app.close();
   });
 
-  it('blocks a structural change while a referencing agent is live (f-1/f-2)', async () => {
+  it('blocks a structural change while a referencing agent is live', async () => {
     // Key host (no password) so the structural change reaches the live-agent guard rather than the
     // "endpoint change needs an explicit password" gate.
     ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
@@ -274,7 +274,7 @@ describe('DELETE /api/hosts/:id', () => {
 });
 
 describe('POST /api/hosts/check', () => {
-  it('resolves an omitted password to the stored one for an existing host (f-3)', async () => {
+  it('resolves an omitted password to the stored one for an existing host', async () => {
     ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u', password: 'stored-pw' }];
     const { app, calls } = await makeApp(true);
     const res = await app.inject({
@@ -377,7 +377,7 @@ describe('host routes reject malformed (non-string) fields with 400, never 500',
   });
 });
 
-describe('PATCH /api/hosts/:id streamer invalidation + concurrency (round-7)', () => {
+describe('PATCH /api/hosts/:id streamer invalidation + concurrency', () => {
   it('tears down referencing streamers when the password changes', async () => {
     ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u', password: 'orig' }];
     ctx.config.project = [{
@@ -446,7 +446,7 @@ describe('PATCH /api/hosts/:id streamer invalidation + concurrency (round-7)', (
   });
 });
 
-describe('PATCH /api/hosts/:id connectivity re-check on concurrent connection edits (round-8)', () => {
+describe('PATCH /api/hosts/:id connectivity re-check on concurrent connection edits', () => {
   it('never persists a host combination that was never connectivity-checked', async () => {
     ctx.config.host = [{ id: 'box', hostname: 'old.example', port: 22, user: 'u', password: 'orig' }];
     const runner: CommandRunner = {

@@ -79,7 +79,7 @@ describe('writeImageToHost', () => {
     expect(runner.writeFile).toHaveBeenCalledWith('/tmp/baxian/upload/a/x.png', PNG);
   });
 
-  it('SshRunner → pipes raw bytes via stdin (cat > path), never embeds bytes in argv (f-1/ARG_MAX)', async () => {
+  it('SshRunner → pipes raw bytes via stdin (cat > path), never embeds bytes in argv (ARG_MAX)', async () => {
     const local = {
       exec: vi.fn(),
       writeFile: vi.fn(),

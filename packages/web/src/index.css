@@ -105,9 +105,6 @@
   .status-dot {
     @apply inline-block h-[0.725rem] w-[0.725rem] shrink-0 rounded-full bg-og-50;
   }
-  .status-dot--healthy {
-    @apply bg-[#e6f4ec];
-  }
   .status-dot--warn {
     @apply bg-[#fef3c7];
     animation: breathe 1.8s ease-in-out infinite;

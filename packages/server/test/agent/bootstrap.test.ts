@@ -532,7 +532,7 @@ describe('autoBootstrapAgentIds', () => {
   });
 });
 
-describe('collectTargets host resolution (string id refs, f-2)', () => {
+describe('collectTargets host resolution (string id refs)', () => {
   it('groups a remote agent by its resolved endpoint, not remote:@', () => {
     const config: BaxianConfig = {
       review: { rounds: 10 },

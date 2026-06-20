@@ -82,14 +82,14 @@ describe('GET /api/config', () => {
     expect(body.server.token).toBe('***');
   });
 
-  it('redacts registry host passwords (f-3)', async () => {
+  it('redacts registry host passwords', async () => {
     app.ctx.config = { ...app.ctx.config, host: [{ id: 'box', hostname: 'h', password: 'reg-secret' }] };
     const response = await app.inject({ method: 'GET', url: '/api/config' });
     const body = JSON.parse(response.body) as BaxianConfig;
     expect(body.host[0].password).toBe('***');
   });
 
-  it('redacts a legacy inline agent.host password on GET /config and GET /projects (f-3)', async () => {
+  it('redacts a legacy inline agent.host password on GET /config and GET /projects', async () => {
     app.ctx.config = {
       ...app.ctx.config,
       project: [{

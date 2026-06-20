@@ -5,7 +5,7 @@ import {
   isTaskOpen,
 } from '../../src/shared/index.js';
 
-describe('task status sets (task-097: max_rounds is non-terminal)', () => {
+describe('task status sets: max_rounds is non-terminal', () => {
   it('classifies max_rounds as active, not terminal', () => {
     expect(TASK_ACTIVE_STATUS_SET.has('max_rounds')).toBe(true);
     expect(TASK_TERMINAL_STATUS_SET.has('max_rounds')).toBe(false);

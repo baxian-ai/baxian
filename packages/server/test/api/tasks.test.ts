@@ -109,7 +109,7 @@ describe('POST /api/tasks with images', () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it('route bodyLimits cover the max legal base64 payload (f-3 self-consistency)', () => {
+  it('route bodyLimits cover the max legal base64 payload', () => {
     expect(TASK_CREATE_ROUTE_BODY_LIMIT).toBeGreaterThanOrEqual(
       Math.ceil((TASK_IMAGE_MAX_COUNT * IMAGE_UPLOAD_MAX_BYTES * 4) / 3),
     );

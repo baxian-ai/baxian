@@ -4365,7 +4365,7 @@ describe('injectAndAwaitAck busy-baseline is non-ackable', () => {
   });
 });
 
-describe('AgentManager max_rounds manual actions (task-097)', () => {
+describe('AgentManager max_rounds manual actions', () => {
   function maxRoundsTask(overrides: Partial<TaskState> = {}): TaskState {
     return task({
       id: 'task-mr',

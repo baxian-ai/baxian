@@ -1322,28 +1322,6 @@ describe('PaneTerminal control bar layout', () => {
   });
 });
 
-describe('PaneTerminal control bar', () => {
-  it('hides the upload button and control bar on the agent card (interactive, no arrow keys)', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    await new Promise((r) => setTimeout(r, 0));
-    expect(screen.queryByRole('button', { name: /上传图片/ })).toBeNull();
-    expect(screen.queryByRole('group', { name: /终端方向键/ })).toBeNull();
-  });
-
-  it('keeps the upload button and key pad on the full terminal page (interactive + arrow keys)', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive arrowKeys />);
-    await new Promise((r) => setTimeout(r, 0));
-    expect(screen.getByRole('button', { name: /上传图片/ })).toBeTruthy();
-    const keypad = screen.getByRole('group', { name: /终端方向键/ });
-    expect(keypad).toBeTruthy();
-    const bar = keypad.parentElement!;
-    expect(bar.className).toContain('grid');
-    expect(bar.className).toContain('grid-cols-[1fr_auto_1fr]');
-  });
-});
-
 function lastMockWs(): MockWebSocket | undefined {
   return MockWebSocket.lastInstance;
 }

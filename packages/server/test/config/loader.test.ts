@@ -137,7 +137,7 @@ describe('prepareConfig type guards', () => {
     ]],
   };
 
-  it('throws on non-array project (was silently coerced to [] before this fix; would hide malformed shape)', () => {
+  it('throws ConfigValidationError when project is not an array', () => {
     // applyDefaults still normalises non-array project to [], so the check must run
     // before defaults — otherwise the validator only sees [] and thinks all is well.
     expect(() => prepareConfig({ project: 'oops' })).toThrow(ConfigValidationError);
@@ -444,7 +444,7 @@ describe('prepareConfig type guards', () => {
     })).toThrow(/server\.https\.certFile/);
   });
 
-  it('rejects empty-string server.https.keyFile (was previously silently dropped)', () => {
+  it('rejects empty-string server.https.keyFile', () => {
     expect(() => prepareConfig({
       review: { rounds: 10 },
       server: { port: 443, https: { keyFile: '', certFile: '/etc/ssl/cert.pem' } },
@@ -460,7 +460,7 @@ describe('prepareConfig type guards', () => {
     })).toThrow(/server\.allowedHosts\[1\]/);
   });
 
-  it('rejects non-object server.https (was silently dropped before)', () => {
+  it('rejects non-object server.https', () => {
     expect(() => prepareConfig({
       review: { rounds: 10 },
       server: { port: 443, https: true },
@@ -478,7 +478,7 @@ describe('prepareConfig type guards', () => {
     })).toThrow(/server\.https/);
   });
 
-  it('rejects non-array server.allowedHosts (was silently dropped before)', () => {
+  it('rejects non-array server.allowedHosts', () => {
     expect(() => prepareConfig({
       review: { rounds: 10 },
       server: { port: 3000, allowedHosts: 'baxian.dev' },

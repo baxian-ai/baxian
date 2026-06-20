@@ -989,7 +989,7 @@ describe('server review mode prompt builders', () => {
   });
 });
 
-describe('round-8 fixes', () => {
+describe('server-phase prompt builders (managed-PR marker, findings compaction)', () => {
   let tempDir: string;
   let registry: SkillRegistry;
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
@@ -1099,7 +1099,7 @@ describe('compactFindings ids-only tier', () => {
   });
 });
 
-describe('round-14 response compaction', () => {
+describe('response compaction', () => {
   let tempDir: string;
   let registry: SkillRegistry;
   const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' };

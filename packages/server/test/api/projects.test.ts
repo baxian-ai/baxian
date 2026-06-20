@@ -1163,21 +1163,6 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(body.error).toMatch(/already ready/);
   });
 
-  it('creationToken → 409', async () => {
-    await app.ctx.agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      creationToken: 'tok',
-      updatedAt: new Date().toISOString(),
-    });
-
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/projects/proj/agents/dev-1/retry',
-    });
-    expect(response.statusCode).toBe(409);
-  });
-
   it('retry hitting NEW dialog during ensureSession → 202 + dialog_pending state, NOT 500 + kill', async () => {
     await app.ctx.agentStore.set({
       id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString(),

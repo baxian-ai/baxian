@@ -264,7 +264,7 @@ describe('validators', () => {
   });
 });
 
-describe('round-14 validators', () => {
+describe('response validators', () => {
   it('rejects duplicate response findingIds', () => {
     expect(() => validateReviewResponse({
       round: 1,

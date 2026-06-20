@@ -20,8 +20,7 @@ const RUNTIME_BADGES: Record<AgentSnapshot['runtimeStatus'], { label: string; cl
 
 type TmuxDotState = AgentSnapshot['tmuxSessionStatus'] | 'starting';
 
-const TMUX_DOTS: Record<TmuxDotState, { label: string; modifier: string }> = {
-  present: { label: 'Session present', modifier: 'status-dot--healthy' },
+const TMUX_DOTS: Record<Exclude<TmuxDotState, 'present'>, { label: string; modifier: string }> = {
   absent: { label: 'No session', modifier: 'status-dot--warn' },
   unreachable: { label: 'Host unreachable', modifier: 'status-dot--danger' },
   unknown: { label: 'Session unknown', modifier: 'status-dot--warn' },
@@ -29,6 +28,7 @@ const TMUX_DOTS: Record<TmuxDotState, { label: string; modifier: string }> = {
 };
 
 function StatusDot({ state }: { state: TmuxDotState }) {
+  if (state === 'present') return null;
   const { label, modifier } = TMUX_DOTS[state];
   return (
     <span

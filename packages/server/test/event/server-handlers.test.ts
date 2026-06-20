@@ -470,7 +470,7 @@ describe('server.spec flow', () => {
   });
 });
 
-describe('crash-replay recovery (PR #288 findings)', () => {
+describe('crash-replay recovery from stored exchange artifacts', () => {
   it('code-reviewed replay with stored findings resumes verdict routing', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
     await fx.store.putRound('t1', 'code', {
@@ -596,7 +596,7 @@ describe('invalid exchange file re-arms the watcher', () => {
   });
 });
 
-describe('Codex round-2 resilience', () => {
+describe('Codex resilience', () => {
   it('findings missing (not stored) → intervention + re-arm code-reviewed', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
     await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
@@ -675,7 +675,7 @@ describe('afterDone snapshot', () => {
   });
 });
 
-describe('round-12 head guard', () => {
+describe('published head guard', () => {
   it('publish with PR number captures the reviewed head sha', async () => {
     const fx = makeFixture({ status: 'approved', afterDone: 'pr', reviewHeadAnchorSha: 'head123' });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready', prNumber: 42 });
@@ -685,7 +685,7 @@ describe('round-12 head guard', () => {
   });
 });
 
-describe('Codex round-5: reviewed-head anchor', () => {
+describe('Codex: reviewed-head anchor', () => {
   it('code review dispatch pins the dev HEAD as reviewHeadAnchorSha', async () => {
     const fx = makeFixture();
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
@@ -822,7 +822,7 @@ describe('guard exits re-arm the consumed signal', () => {
   });
 });
 
-describe('round-18: aggregation id disambiguation', () => {
+describe('aggregation id disambiguation', () => {
   it('a restated namespaced id and a colliding new id stay one-to-one', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 1, batchTotal: 2 });
     await fx.store.putRound('t1', 'code', {
@@ -847,7 +847,7 @@ describe('round-18: aggregation id disambiguation', () => {
   });
 });
 
-describe('round-19 fixes', () => {
+describe('publish robustness: unverified PR number and putRound failure re-arm the entry signal', () => {
   it('unverified PR number → intervention + code-ready re-arm, never recorded', async () => {
     const fx = makeFixture({ status: 'approved', afterDone: 'pr' }, { verifyPr: false });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready', prNumber: 999 });
@@ -871,7 +871,7 @@ describe('round-19 fixes', () => {
   });
 });
 
-describe('round-20: verdict-save failure re-arm', () => {
+describe('verdict-save failure re-arm', () => {
   it('findings save failure re-arms code-reviewed; file is NOT deleted', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
     await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
@@ -907,7 +907,7 @@ describe('round-20: verdict-save failure re-arm', () => {
   });
 });
 
-describe('Codex round-3: cap at verdict', () => {
+describe('Codex: cap at verdict', () => {
   it('request-changes at the cap pauses at max_rounds without dispatching a fix', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 3 }, { rounds: 3 });
     await fx.store.putRound('t1', 'code', { round: 3, phase: 'code', content: 'd', startedAt: 'now' });
@@ -928,7 +928,7 @@ describe('Codex round-3: cap at verdict', () => {
   });
 });
 
-describe('bx-cx round-21: max_rounds releases agents and clears references', () => {
+describe('max_rounds releases agents and clears references', () => {
   const SPEC_FINDINGS_RC: ReviewFindings = {
     round: 3,
     verdict: 'request-changes',

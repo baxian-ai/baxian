@@ -3,7 +3,7 @@ import { redactConfig, redactHosts, redactProjects } from '../../src/api/config.
 import type { BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
-describe('password redaction (f-3 recursive contract)', () => {
+describe('password redaction (recursively masks host and server-token secrets)', () => {
   it('redactHosts replaces top-level registry passwords with ***', () => {
     const out = redactHosts([
       { id: 'a', hostname: 'h1', password: 'secret' },

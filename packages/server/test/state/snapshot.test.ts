@@ -64,7 +64,7 @@ describe('deriveRuntimeStatus', () => {
     expect(deriveRuntimeStatus(b, obs, t)).toBe('waiting');
   });
 
-  it('reports a reserved max_rounds dev as waiting (awaiting human decision), not error (task-097)', () => {
+  it('reports a reserved max_rounds dev as waiting (awaiting human decision), not error', () => {
     const b = binding({ taskId: 'task-1' });
     const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
     expect(deriveRuntimeStatus(b, obs, task('max_rounds'))).toBe('waiting');

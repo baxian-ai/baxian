@@ -229,7 +229,7 @@ describe('createAndStartTask image ordering + rollback', () => {
   });
 });
 
-describe('retryTask image preservation (f-4)', () => {
+describe('retryTask image preservation', () => {
   async function seedFailedTaskWithImage(id: string, filename: string, writeStaged: boolean): Promise<void> {
     const now = new Date().toISOString();
     await taskStore.set({

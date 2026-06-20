@@ -230,7 +230,7 @@ describe('server-mode max_rounds escape', () => {
   });
 });
 
-describe('round-9 snapshot + resume semantics', () => {
+describe('snapshot + resume semantics', () => {
   it('ready confirm uses task.afterDone over hot config', async () => {
     // Config flipped to 'pr' after publish; task snapshot says 'branch' + merge null → done.
     const { manager, taskStore } = await makeFixture(null, 'pr');
@@ -265,7 +265,7 @@ describe('round-9 snapshot + resume semantics', () => {
   });
 });
 
-describe('round-14 fixes', () => {
+describe('cancel a published gate cleans up the remote (pr / branch)', () => {
   it('cancel of a published pr gate closes the PR remotely', async () => {
     const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
     await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
@@ -418,7 +418,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
   });
 });
 
-describe('round-15 fixes', () => {
+describe('merge-ready cancel, legacy review guard, and confirm head guard', () => {
   it('merge-ready cancel closes the published PR', async () => {
     const { manager, taskStore, execCalls } = await makeFixture('auto', null);
     await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 21 }));
@@ -439,7 +439,7 @@ describe('round-15 fixes', () => {
   });
 });
 
-describe('round-16: publish delivery marker', () => {
+describe('publish delivery marker', () => {
   it('approved retry with publishDispatchedAt set → 409 even without a live watcher', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({
@@ -463,7 +463,7 @@ describe('round-16: publish delivery marker', () => {
   });
 });
 
-describe('round-17: pre-paste marker ordering', () => {
+describe('pre-paste marker ordering', () => {
   it('failed publish dispatch clears the delivery marker for retry', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');
     const agents = new AgentStore(join(tempDir, 'state', 'agents'));
@@ -484,7 +484,7 @@ describe('round-17: pre-paste marker ordering', () => {
   });
 });
 
-describe('Codex round-4: dispatch failure recovery + continue/complete race', () => {
+describe('Codex: dispatch failure recovery + continue/complete race', () => {
   const NOW = new Date().toISOString();
   const STORED_FINDINGS = {
     round: 10,
@@ -550,7 +550,7 @@ describe('Codex round-4: dispatch failure recovery + continue/complete race', ()
     expect((await taskStore.get('task-1'))?.status).toBe('review');
   });
 
-  it('dispatchServerFixToDev keeps the QA bound when dev acquire fails (round-5)', async () => {
+  it('dispatchServerFixToDev keeps the QA bound when dev acquire fails', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'review', signalToken: 'tok' }));
     await agentStore.update('qa-1', () => ({

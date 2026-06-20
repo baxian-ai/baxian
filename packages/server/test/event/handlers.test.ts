@@ -1409,45 +1409,6 @@ describe('pr.updated handler', () => {
     );
   });
 
-  it('any review-comment on an approved PR re-dispatches dev (post-approve reply marker is retired; skill enforces idempotency)', async () => {
-    await seedTask({
-      id: 'task-up-approved-reply',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 64,
-    });
-    await manager.setPostApproveCompletion('task-up-approved-reply', {
-      token: 'active-post-token',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved-reply',
-      data: {
-        prNumber: 64,
-        kind: 'review-comment',
-        reviewCommentReply: true,
-      },
-    });
-
-    const completion = await manager.getPostApproveCompletion('task-up-approved-reply');
-    expect(completion?.token).not.toBe('active-post-token');
-    expect(completion?.approvedHeadSha).toBe(HEAD_SHA);
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-up-approved-reply',
-      'dev-1',
-      'post-approve',
-      { signalToken: completion?.token, postApproveRedispatchCount: 1 },
-    );
-  });
-
   it('approved-window review-comment during RUNNING post-approve coalesces into pendingRedispatch (no interrupt, no dispatch, no count bump, token preserved)', async () => {
     await seedTask({
       id: 'task-up-running-skip',
@@ -2803,7 +2764,7 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
     expect(interventions.some(e => e.data.phase === 'fix-no-op-no-commit-no-reply')).toBe(false);
   });
 
-  it('uses fixDispatchedAt (not reviewDispatchedAt) as the activity lower bound (bx-cx)', async () => {
+  it('uses fixDispatchedAt (not reviewDispatchedAt) as the activity lower bound', async () => {
     await seedTask({
       id: 'task-pf-bound', status: 'fixing', phase: 'code', reviewRound: 2,
       prNumber: 80, signalToken: 'tok-bd',

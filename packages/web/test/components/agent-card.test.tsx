@@ -112,7 +112,7 @@ describe('AgentCard', () => {
     });
 
     expect(screen.getByText('Pending user')).toBeTruthy();
-    expect(screen.getByRole('img', { name: 'Session present' })).toBeTruthy();
+    expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(screen.getByText('等待人工介入')).toBeTruthy();
     const terminalLinks = screen.getAllByRole('link', { name: 'Terminal' });
     expect(terminalLinks.map(link => link.getAttribute('href')))
@@ -138,7 +138,7 @@ describe('AgentCard', () => {
     });
 
     expect(screen.getByText('Pending user')).toBeTruthy();
-    expect(screen.getByRole('img', { name: 'Session present' })).toBeTruthy();
+    expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(screen.getByText('等待人工介入')).toBeTruthy();
     const terminalLinks = screen.getAllByRole('link', { name: 'Terminal' });
     expect(terminalLinks.map(link => link.getAttribute('href')))
@@ -333,12 +333,24 @@ describe('AgentCard', () => {
     });
   });
 
+  it('hides the session-present status dot in the normal path', () => {
+    renderCard({
+      id: 'dev-present',
+      projectId: 'proj',
+      runtimeStatus: 'idle',
+      tmuxSessionStatus: 'present',
+      stale: false,
+    });
+
+    expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
+    expect(document.querySelector('.status-dot')).toBeNull();
+  });
+
   it.each([
-    ['present', 'Session present', 'status-dot--healthy'],
     ['absent', 'No session', 'status-dot--warn'],
     ['unreachable', 'Host unreachable', 'status-dot--danger'],
     ['unknown', 'Session unknown', 'status-dot--warn'],
-  ] as const)('renders a %s tmux status as the %s dot (modifier %s)', (status, label, modifier) => {
+  ] as const)('renders a non-normal %s tmux status as the %s dot (modifier %s)', (status, label, modifier) => {
     renderCard({
       id: `dev-${status}`,
       projectId: 'proj',
@@ -350,29 +362,28 @@ describe('AgentCard', () => {
     expect(dot.className).toContain(modifier);
   });
 
-  it('healthy (present) dot does not animate; non-healthy dots breathe', () => {
+  it('non-normal status dots use the warning or danger treatment', () => {
     renderCard({
-      id: 'dev-healthy',
+      id: 'dev-no-session',
       projectId: 'proj',
       runtimeStatus: 'idle',
-      tmuxSessionStatus: 'present',
+      tmuxSessionStatus: 'absent',
       stale: false,
     });
-    const healthy = screen.getByRole('img', { name: 'Session present' });
-    expect(healthy.className).toContain('status-dot--healthy');
-    expect(healthy.className).not.toContain('status-dot--warn');
-    expect(healthy.className).not.toContain('status-dot--danger');
+    const dot = screen.getByRole('img', { name: 'No session' });
+    expect(dot.className).toContain('status-dot--warn');
+    expect(dot.className).not.toContain('status-dot--danger');
   });
 
-  it('status dot sits to the right of the runtime pill in the top-right group', () => {
+  it('abnormal status dot sits to the right of the runtime pill in the top-right group', () => {
     renderCard({
       id: 'dev-position',
       projectId: 'proj',
       runtimeStatus: 'working',
-      tmuxSessionStatus: 'present',
+      tmuxSessionStatus: 'unreachable',
       stale: true,
     });
-    const dot = screen.getByRole('img', { name: 'Session present' });
+    const dot = screen.getByRole('img', { name: 'Host unreachable' });
     const runtimePill = screen.getByText('Working');
     const stalePill = screen.getByText('Stale');
     expect(dot.parentElement).toBe(runtimePill.parentElement);
@@ -382,15 +393,15 @@ describe('AgentCard', () => {
     expect(siblings.indexOf(dot)).toBeGreaterThan(siblings.indexOf(stalePill));
   });
 
-  it('status dot carries an explicit extra left margin so it breathes away from the pill cluster', () => {
+  it('abnormal status dot carries an explicit extra left margin so it breathes away from the pill cluster', () => {
     renderCard({
       id: 'dev-spacing',
       projectId: 'proj',
       runtimeStatus: 'idle',
-      tmuxSessionStatus: 'present',
+      tmuxSessionStatus: 'absent',
       stale: false,
     });
-    const dot = screen.getByRole('img', { name: 'Session present' });
+    const dot = screen.getByRole('img', { name: 'No session' });
     expect(dot.className).toContain('ml-2');
   });
 

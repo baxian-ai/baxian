@@ -260,7 +260,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
-  describe('max_rounds actions (task-097)', () => {
+  describe('max_rounds actions', () => {
     function openMaxRounds(overrides: Partial<TaskState> = {}): void {
       setTasks({ 'task-010': makeTask({ status: 'max_rounds', reviewRound: 10, ...overrides }) });
       render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);

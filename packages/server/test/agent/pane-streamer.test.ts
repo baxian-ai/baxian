@@ -843,7 +843,7 @@ describe('PaneStreamer', () => {
   });
 });
 
-describe('PaneStreamer host re-resolution (round-5 fix)', () => {
+describe('PaneStreamer host re-resolution', () => {
   it('resolves the host per attach from the resolver, so credential/endpoint changes apply on reconnect', async () => {
     const host: HostConfig = { hostname: 'h', port: 2222, user: 'u' };
     let resolveCalls = 0;
