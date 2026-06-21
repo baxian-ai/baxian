@@ -11,6 +11,12 @@ async function createSkill(name: string, content: string): Promise<void> {
   await writeFile(join(tempDir, name, 'SKILL.md'), content);
 }
 
+async function scanned(dir: string = tempDir): Promise<SkillRegistry> {
+  const registry = new SkillRegistry(dir);
+  await registry.scan();
+  return registry;
+}
+
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-skills-'));
 });
@@ -23,8 +29,7 @@ describe('SkillRegistry', () => {
   it('scans skills directory and finds all skills', async () => {
     await createSkill('task-check', '# Task Check\nAnalyze the task.');
     await createSkill('pr-review', '# PR Review\nReview the PR.');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.has('task-check')).toBe(true);
     expect(registry.has('pr-review')).toBe(true);
     expect(registry.has('nonexistent')).toBe(false);
@@ -32,8 +37,7 @@ describe('SkillRegistry', () => {
 
   it('returns skill content', async () => {
     await createSkill('task-check', '# Task Check\nDo the thing.');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     const skill = registry.get('task-check');
     expect(skill?.content).toContain('Task Check');
   });
@@ -41,8 +45,7 @@ describe('SkillRegistry', () => {
   it('lists all skill names', async () => {
     await createSkill('a-skill', 'content');
     await createSkill('b-skill', 'content');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.names().sort()).toEqual(['a-skill', 'b-skill']);
   });
 
@@ -50,8 +53,7 @@ describe('SkillRegistry', () => {
     await createSkill('baxian-task-check', 'content');
     await createSkill('baxian-rules', 'content');
     await createSkill('baxian-pr-review', 'content');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     const devSkills = registry.skillsForPhase('dev', 'develop');
     expect(devSkills).toContain('baxian-task-check');
     expect(devSkills).toContain('baxian-rules');
@@ -59,32 +61,28 @@ describe('SkillRegistry', () => {
   });
 
   it('handles empty skills directory', async () => {
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.names()).toEqual([]);
   });
 
   it('ignores non-directory entries', async () => {
     await writeFile(join(tempDir, 'README.md'), 'not a skill');
     await createSkill('real-skill', 'content');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.names()).toEqual(['real-skill']);
   });
 
   it('survives a broken symlink at the top level', async () => {
     await createSkill('real-skill', 'content');
     await symlink(join(tempDir, 'does-not-exist'), join(tempDir, 'broken-link'));
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.has('real-skill')).toBe(true);
   });
 
   it('does not follow a symlinked directory at the top level into a skill', async () => {
     await createSkill('real-skill', 'content');
     await symlink(join(tempDir, 'real-skill'), join(tempDir, 'linked-skill'));
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.names()).toEqual(['real-skill']);
   });
 
@@ -94,8 +92,7 @@ describe('SkillRegistry', () => {
     await mkdir(join(tempDir, 'symlinked-md-skill'), { recursive: true });
     await symlink(foreignMd, join(tempDir, 'symlinked-md-skill', 'SKILL.md'));
     await createSkill('real-skill', 'content');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     expect(registry.names()).toEqual(['real-skill']);
   });
 
@@ -104,8 +101,7 @@ describe('SkillRegistry', () => {
     await writeFile(secret, 'host secret');
     await createSkill('alpha', '# Alpha');
     await symlink(secret, join(tempDir, 'alpha', 'leak.txt'));
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     const recorded = new Map<string, Buffer>();
     await registry.materialize(async (path, content) => {
       recorded.set(path, content);
@@ -116,8 +112,7 @@ describe('SkillRegistry', () => {
 
 describe('SkillRegistry edge cases', () => {
   it('a nonexistent skills directory yields an empty registry (no crash)', async () => {
-    const registry = new SkillRegistry('/nonexistent/skills/path');
-    await registry.scan();
+    const registry = await scanned('/nonexistent/skills/path');
     expect(registry.names()).toEqual([]);
   });
 
@@ -135,8 +130,7 @@ describe('SkillRegistry.materialize', () => {
     await writeFile(join(tempDir, 'beta', 'SKILL.md'), '# Beta skill');
     await writeFile(join(tempDir, 'beta', 'helpers', 'x.sh'), '#!/bin/sh\necho hi');
 
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
 
     const recorded = new Map<string, Buffer>();
     const recorder = async (path: string, content: Buffer): Promise<void> => {
@@ -159,8 +153,7 @@ describe('SkillRegistry.contentHash', () => {
     await createSkill('alpha', '# Alpha');
     await createSkill('beta', '# Beta');
 
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     const first = registry.contentHash();
     expect(first).toBeTruthy();
     expect(first.length).toBeGreaterThan(0);
@@ -171,8 +164,7 @@ describe('SkillRegistry.contentHash', () => {
 
   it('changes when a skill content changes', async () => {
     await createSkill('alpha', '# Alpha');
-    const registry = new SkillRegistry(tempDir);
-    await registry.scan();
+    const registry = await scanned();
     const before = registry.contentHash();
 
     await writeFile(join(tempDir, 'alpha', 'SKILL.md'), '# Alpha edited');

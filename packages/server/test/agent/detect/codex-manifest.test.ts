@@ -9,369 +9,339 @@ function input(screen: string, oscTitle = ''): DetectionInput {
   return { screen, oscTitle };
 }
 
-describe('codex manifest', () => {
-  it('detects OSC "Action Required" as blocked', () => {
-    const result = evaluateManifest(manifest, input('', 'Action Required'));
-    expect(result.state).toBe('pending');
-    expect(result.visibleBlocker).toBe(true);
-  });
+interface Expectation {
+  state?: string;
+  rule?: string | undefined;
+  notRule?: string;
+  visibleBlocker?: boolean;
+  visibleIdle?: boolean;
+  skipStateUpdate?: boolean;
+}
 
-  it('detects OSC braille spinner as working', () => {
-    const result = evaluateManifest(manifest, input('', '⠁ codex'));
-    expect(result.state).toBe('working');
-  });
+interface Case {
+  name: string;
+  lines: string[];
+  osc?: string;
+  expect: Expectation;
+}
 
-  it('detects transcript viewer as skipStateUpdate', () => {
-    const screen = [
+const cases: Case[] = [
+  {
+    name: 'detects OSC "Action Required" as blocked',
+    lines: [''],
+    osc: 'Action Required',
+    expect: { state: 'pending', visibleBlocker: true },
+  },
+  {
+    name: 'detects OSC braille spinner as working',
+    lines: [''],
+    osc: '⠁ codex',
+    expect: { state: 'working' },
+  },
+  {
+    name: 'detects transcript viewer as skipStateUpdate',
+    lines: [
       '› prompt here',
       '↑/↓ to scroll · pgup/pgdn to page · home/end to jump · q to quit',
       'esc to edit prev',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('transcript_viewer');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('detects strong blocker (allow command) after prompt marker', () => {
-    const screen = [
+    ],
+    expect: { rule: 'transcript_viewer', skipStateUpdate: true },
+  },
+  {
+    name: 'detects strong blocker (allow command) after prompt marker',
+    lines: [
       '› previous prompt',
       'Allow command?',
       'rm -rf /tmp/test',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('live_strong_blocker');
-    expect(result.visibleBlocker).toBe(true);
-  });
-
-  it('blocker with numbered selection is not cut by prompt marker', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending', rule: 'live_strong_blocker', visibleBlocker: true },
+  },
+  {
+    name: 'blocker with numbered selection is not cut by prompt marker',
+    lines: [
       '›',
       'Allow command?',
       '› 1. Yes',
       '  2. No',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('live_strong_blocker');
-  });
-
-  it('detects weak blocker [y/n] with visibleBlocker', () => {
-    const screen = 'Continue? [y/n]';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('weak_blocker');
-    expect(result.visibleBlocker).toBe(true);
-  });
-
-  it('stale weak blocker does not override current working line', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending', rule: 'live_strong_blocker' },
+  },
+  {
+    name: 'detects weak blocker [y/n] with visibleBlocker',
+    lines: ['Continue? [y/n]'],
+    expect: { state: 'pending', rule: 'weak_blocker', visibleBlocker: true },
+  },
+  {
+    name: 'stale weak blocker does not override current working line',
+    lines: [
       'Do you want to continue?',
       'Yes (y)',
       '',
       'Working (8s)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('working_line');
-    expect(result.state).toBe('working');
-  });
-
-  it('OSC non-spinner non-action-required is idle', () => {
-    const result = evaluateManifest(manifest, input('', 'codex ~/project'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('osc_title_idle');
-  });
-
-  it('stale weak blocker is suppressed by bare › prompt', () => {
-    const screen = [
+    ],
+    expect: { rule: 'working_line', state: 'working' },
+  },
+  {
+    name: 'OSC non-spinner non-action-required is idle',
+    lines: [''],
+    osc: 'codex ~/project',
+    expect: { state: 'idle', rule: 'osc_title_idle' },
+  },
+  {
+    name: 'stale weak blocker is suppressed by bare › prompt',
+    lines: [
       'Do you want to continue?',
       'Yes (y)',
       '',
       '›',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('weak_blocker');
-  });
-
-  it('transcript viewer footer does not override active blocker when not on last line', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'weak_blocker' },
+  },
+  {
+    name: 'transcript viewer footer does not override active blocker when not on last line',
+    lines: [
       '› prompt here',
       '↑/↓ to scroll · pgup/pgdn to page · home/end to jump · q to quit',
       'esc to edit prev',
       '',
       'Allow command?',
       'rm -rf /tmp/test',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('transcript_viewer');
-    expect(result.matchedRuleId).toBe('live_strong_blocker');
-  });
-
-  it('falls back to idle on unrecognized screen', () => {
-    const result = evaluateManifest(manifest, input('random output'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBeUndefined();
-  });
-
-  it('visible screen blocker overrides stale OSC working spinner', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'transcript_viewer', rule: 'live_strong_blocker' },
+  },
+  {
+    name: 'falls back to idle on unrecognized screen',
+    lines: ['random output'],
+    expect: { state: 'idle', rule: undefined },
+  },
+  {
+    name: 'visible screen blocker overrides stale OSC working spinner',
+    lines: [
       '› previous prompt',
       'Allow command?',
       'rm -rf /tmp/test',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ codex'));
-    expect(result.state).toBe('pending');
-    expect(result.visibleBlocker).toBe(true);
-    expect(result.matchedRuleId).toBe('live_strong_blocker');
-  });
-
-  it('stale strong blocker loses to current Working line', () => {
-    const screen = [
+    ],
+    osc: '⠁ codex',
+    expect: { state: 'pending', visibleBlocker: true, rule: 'live_strong_blocker' },
+  },
+  {
+    name: 'stale strong blocker loses to current Working line',
+    lines: [
       '› do something',
       'Allow command?',
       'rm -rf test',
       'Working (3s)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_strong_blocker');
-    expect(result.matchedRuleId).toBe('working_line');
-  });
-
-  it('stale OSC Action Required overridden by visible idle prompt', () => {
-    const screen = [
-      '›',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-  });
-
-  it('stale OSC Action Required overridden by visible Working line', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'live_strong_blocker', rule: 'working_line' },
+  },
+  {
+    name: 'stale OSC Action Required overridden by visible idle prompt',
+    lines: ['›'],
+    osc: 'Action Required',
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'stale OSC Action Required overridden by visible Working line',
+    lines: [
       '› do something',
       'Working (5s)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('working_line');
-  });
-
-  it('new blocker after old Working is not suppressed', () => {
-    const screen = [
+    ],
+    osc: 'Action Required',
+    expect: { state: 'working', rule: 'working_line' },
+  },
+  {
+    name: 'new blocker after old Working is not suppressed',
+    lines: [
       '› do something',
       'Working (3s)',
       'Allow command?',
       'Press Enter to confirm or Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('live_strong_blocker');
-  });
-
-  it('arrow composer → at tail excludes stale esc-to-interrupt', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending', rule: 'live_strong_blocker' },
+  },
+  {
+    name: 'arrow composer → at tail excludes stale esc-to-interrupt',
+    lines: [
       '› old prompt',
       'esc to interrupt',
       '→ baxian git:(main)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('esc_to_interrupt_working');
-  });
-
-  it('OSC pending prefers screen blocker over screen idle evidence', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'esc_to_interrupt_working' },
+  },
+  {
+    name: 'OSC pending prefers screen blocker over screen idle evidence',
+    lines: [
       '›',
       'Allow command?',
       'Press Enter to confirm or Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('live_strong_blocker');
-  });
-
-  it('arrow composer → recognized as visible idle', () => {
-    const screen = [
+    ],
+    osc: 'Action Required',
+    expect: { state: 'pending', rule: 'live_strong_blocker' },
+  },
+  {
+    name: 'arrow composer → recognized as visible idle',
+    lines: [
       'some output',
       '→ baxian git:(main)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-    expect(result.visibleIdle).toBe(true);
-  });
-
-  it('stale OSC Action Required overridden by arrow composer →', () => {
-    const screen = [
-      '→ baxian git:(main)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-  });
-
-  it('stale weak blocker suppressed by arrow composer →', () => {
-    const screen = [
+    ],
+    expect: { state: 'idle', rule: 'codex_idle_prompt', visibleIdle: true },
+  },
+  {
+    name: 'stale OSC Action Required overridden by arrow composer →',
+    lines: ['→ baxian git:(main)'],
+    osc: 'Action Required',
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'stale weak blocker suppressed by arrow composer →',
+    lines: [
       'Continue? [y/n]',
       '→ baxian git:(main)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('weak_blocker');
-  });
-
-  it('stale strong blocker suppressed by arrow composer →', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'weak_blocker' },
+  },
+  {
+    name: 'stale strong blocker suppressed by arrow composer →',
+    lines: [
       '› old prompt',
       'Allow command?',
       'Press Enter to confirm or Esc to cancel',
       '→ baxian git:(main)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_strong_blocker');
-  });
-
-  it('arrow composer with user input is NOT idle (strict shape)', () => {
-    const screen = [
-      '→ run tests',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('codex_idle_prompt');
-  });
-
-  it('ready-anchor (› prompt + project footer) recognized as visible idle', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'live_strong_blocker' },
+  },
+  {
+    name: 'arrow composer with user input is NOT idle (strict shape)',
+    lines: ['→ run tests'],
+    expect: { notRule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'ready-anchor (› prompt + project footer) recognized as visible idle',
+    lines: [
       '› do something',
       '',
       '  baxian · idle',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-    expect(result.visibleIdle).toBe(true);
-  });
-
-  it('stale OSC Action Required overridden by ready-anchor', () => {
-    const screen = [
+    ],
+    expect: { state: 'idle', rule: 'codex_idle_prompt', visibleIdle: true },
+  },
+  {
+    name: 'stale OSC Action Required overridden by ready-anchor',
+    lines: [
       '› previous task',
       '',
       '  baxian · idle',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-  });
-
-  it('stale weak blocker suppressed by ready-anchor below', () => {
-    const screen = [
+    ],
+    osc: 'Action Required',
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'stale weak blocker suppressed by ready-anchor below',
+    lines: [
       'Continue? [y/n]',
       '› finished task',
       '',
       '  baxian · idle',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('weak_blocker');
-  });
-
-  it('stale strong blocker suppressed by ready-anchor below', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'weak_blocker' },
+  },
+  {
+    name: 'stale strong blocker suppressed by ready-anchor below',
+    lines: [
       '› old prompt',
       'Allow command?',
       'Press Enter to confirm or Esc to cancel',
       '› finished task',
       '',
       '  baxian · idle',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_strong_blocker');
-  });
-
-  it('ready-anchor in mid-screen does NOT trigger idle (must be at tail end)', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'live_strong_blocker' },
+  },
+  {
+    name: 'ready-anchor in mid-screen does NOT trigger idle (must be at tail end)',
+    lines: [
       '› old prompt',
       '',
       '  baxian · idle',
       'Working (3s)',
       'esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('codex_idle_prompt');
-  });
-
-  it('arrow composer without git context still matches if single word', () => {
-    const screen = [
-      '→ baxian',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-  });
-
-  it('YOLO mode banner recognized as visible idle', () => {
-    const screen = 'permissions: YOLO mode';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-    expect(result.visibleIdle).toBe(true);
-  });
-
-  it('stale OSC Action Required overridden by YOLO mode banner', () => {
-    const screen = 'permissions: YOLO mode';
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-  });
-
-  it('stale weak blocker suppressed by YOLO mode below', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'arrow composer without git context still matches if single word',
+    lines: ['→ baxian'],
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'YOLO mode banner recognized as visible idle',
+    lines: ['permissions: YOLO mode'],
+    expect: { state: 'idle', rule: 'codex_idle_prompt', visibleIdle: true },
+  },
+  {
+    name: 'stale OSC Action Required overridden by YOLO mode banner',
+    lines: ['permissions: YOLO mode'],
+    osc: 'Action Required',
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'stale weak blocker suppressed by YOLO mode below',
+    lines: [
       'Continue? [y/n]',
       'permissions: YOLO mode',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('weak_blocker');
-  });
-
-  it('YOLO text embedded in command does NOT trigger idle', () => {
-    const screen = 'grep "permissions: YOLO mode" config.ts';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('codex_idle_prompt');
-  });
-
-  it('bare › in mid-tail does NOT trigger idle when output follows', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'weak_blocker' },
+  },
+  {
+    name: 'YOLO text embedded in command does NOT trigger idle',
+    lines: ['grep "permissions: YOLO mode" config.ts'],
+    expect: { notRule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'bare › in mid-tail does NOT trigger idle when output follows',
+    lines: [
       'Working (3s)',
       '›',
       'still streaming',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.matchedRuleId).not.toBe('codex_idle_prompt');
-  });
-
-  it('→ composer in mid-tail does NOT trigger idle when output follows', () => {
-    const screen = [
+    ],
+    osc: 'Action Required',
+    expect: { notRule: 'codex_idle_prompt' },
+  },
+  {
+    name: '→ composer in mid-tail does NOT trigger idle when output follows',
+    lines: [
       'still streaming',
       '→ baxian git:(main)',
       'more output',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, 'Action Required'));
-    expect(result.matchedRuleId).not.toBe('codex_idle_prompt');
-  });
-
-  it('stale OSC working overridden by visible screen idle', () => {
-    const screen = [
-      '→ baxian git:(main)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ codex'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
-  });
-
-  it('stale OSC working overridden by ready-anchor idle', () => {
-    const screen = [
+    ],
+    osc: 'Action Required',
+    expect: { notRule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'stale OSC working overridden by visible screen idle',
+    lines: ['→ baxian git:(main)'],
+    osc: '⠁ codex',
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+  {
+    name: 'stale OSC working overridden by ready-anchor idle',
+    lines: [
       '› finished task',
       '',
       '  baxian · idle',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ codex'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('codex_idle_prompt');
+    ],
+    osc: '⠁ codex',
+    expect: { state: 'idle', rule: 'codex_idle_prompt' },
+  },
+];
+
+describe('codex manifest', () => {
+  it.each(cases)('$name', ({ lines, osc, expect: want }) => {
+    const result = evaluateManifest(manifest, input(lines.join('\n'), osc ?? ''));
+    if (want.state !== undefined) expect(result.state).toBe(want.state);
+    if ('rule' in want) expect(result.matchedRuleId).toBe(want.rule);
+    if (want.notRule !== undefined) expect(result.matchedRuleId).not.toBe(want.notRule);
+    if (want.visibleBlocker !== undefined) expect(result.visibleBlocker).toBe(want.visibleBlocker);
+    if (want.visibleIdle !== undefined) expect(result.visibleIdle).toBe(want.visibleIdle);
+    if (want.skipStateUpdate !== undefined) expect(result.skipStateUpdate).toBe(want.skipStateUpdate);
   });
 });

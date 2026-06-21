@@ -50,6 +50,18 @@ async function flushMicrotasks(): Promise<void> {
   await new Promise<void>(resolve => setImmediate(resolve));
 }
 
+type StartArgs = Parameters<PhaseSignalWatcher['start']>[0];
+
+// start() with the common task/project/agent defaults; callers override per case.
+function startWatch(
+  watcher: PhaseSignalWatcher,
+  overrides: Partial<StartArgs> & Pick<StartArgs, 'expectedKinds' | 'token'>,
+): Promise<boolean> {
+  return watcher.start({
+    taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id, ...overrides,
+  });
+}
+
 function makeWatcher() {
   const streamer = createFakeStreamer();
   const paneStreamerManager = { ensure: vi.fn(() => streamer) } as unknown as PaneStreamerManager;
@@ -75,13 +87,7 @@ describe('PhaseSignalWatcher', () => {
   it('emits the configured event type when a single-kind signal matches', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'tok123abc456';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token });
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('server.spec.ready');
@@ -94,17 +100,15 @@ describe('PhaseSignalWatcher', () => {
 
   it('start() returns true when a watch entry is installed', async () => {
     const { watcher } = makeWatcher();
-    const armed = await watcher.start({
-      taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id, expectedKinds: 'spec-done', token: 'tok123abc456',
-    });
+    const armed = await startWatch(watcher, { expectedKinds: 'spec-done', token: 'tok123abc456' });
     expect(armed).toBe(true);
     expect(watcher.has('t1')).toBe(true);
   });
 
   it('start() returns false when the agent cannot be resolved (no entry installed)', async () => {
     const { watcher } = makeWatcher();
-    const armed = await watcher.start({
-      taskId: 't1', projectId: 'p1', agentId: 'unknown-agent', expectedKinds: 'spec-done', token: 'tok123abc456',
+    const armed = await startWatch(watcher, {
+      agentId: 'unknown-agent', expectedKinds: 'spec-done', token: 'tok123abc456',
     });
     expect(armed).toBe(false);
     expect(watcher.has('t1')).toBe(false);
@@ -113,9 +117,7 @@ describe('PhaseSignalWatcher', () => {
   it('start() returns false when subscribeAtomic rejects (transient pane fault)', async () => {
     const { watcher, streamer } = makeWatcher();
     streamer.subscribeAtomic.mockRejectedValueOnce(new Error('streamer destroyed'));
-    const armed = await watcher.start({
-      taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id, expectedKinds: 'pr-approved', token: 'tok123abc456',
-    });
+    const armed = await startWatch(watcher, { expectedKinds: 'pr-approved', token: 'tok123abc456' });
     expect(armed).toBe(false);
     expect(watcher.has('t1')).toBe(false);
   });
@@ -123,13 +125,7 @@ describe('PhaseSignalWatcher', () => {
   it('multi-kind verdict watch: pr-approved match fires review.submitted', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'verdict12345';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: ['pr-approved', 'pr-changes-requested'],
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: ['pr-approved', 'pr-changes-requested'], token });
     streamer.triggerLive(`${buildPhaseSignal('pr-approved', token)}\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('review.submitted');
@@ -146,10 +142,7 @@ describe('PhaseSignalWatcher', () => {
   it('multi-kind verdict watch: pr-changes-requested also fires review.submitted', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'verdict67890';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
+    await startWatch(watcher, {
       expectedKinds: new Set<'pr-approved' | 'pr-changes-requested'>([
         'pr-approved',
         'pr-changes-requested',
@@ -167,26 +160,14 @@ describe('PhaseSignalWatcher', () => {
   it('ignores a signal whose kind is outside expectedKinds', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'tokenABCDEF12';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token });
     streamer.triggerLive(`${buildPhaseSignal('spec-reviewed', token)}\n`);
     expect(captured).toHaveLength(0);
   });
 
   it('ignores a signal with matching kind but mismatched token', async () => {
     const { watcher, streamer, captured } = makeWatcher();
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token: 'correctTok01',
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'correctTok01' });
     streamer.triggerLive(`${buildPhaseSignal('spec-done', 'wrongTok123x')}\n`);
     expect(captured).toHaveLength(0);
   });
@@ -194,13 +175,7 @@ describe('PhaseSignalWatcher', () => {
   it('matches a signal split across two chunks', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'splittok2345';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'pr-merge-ready',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token });
     const literal = buildPhaseSignal('pr-merge-ready', token);
     const half = Math.floor(literal.length / 2);
     streamer.triggerLive(literal.slice(0, half));
@@ -213,13 +188,7 @@ describe('PhaseSignalWatcher', () => {
   it('matches signal wrapped in ANSI color codes', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'ansiTok123ab';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-fixed',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-fixed', token });
     streamer.triggerLive(`\x1b[32m${buildPhaseSignal('spec-fixed', token)}\x1b[0m\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('server.spec.fix.submitted');
@@ -228,13 +197,7 @@ describe('PhaseSignalWatcher', () => {
   it('matches a soft-wrapped signal (TUI breaks mid-token with whitespace)', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'softWrap1234';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'pr-merge-ready',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token });
     streamer.triggerLive('[bx:pr-merge-ready:so\n  ftWrap\n   1234]\n');
     expect(captured).toHaveLength(1);
   });
@@ -242,13 +205,7 @@ describe('PhaseSignalWatcher', () => {
   it('does NOT fire on the rendered prompt template (placeholder, real token on separate line)', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'realtok1234ab';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'pr-merge-ready',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token });
     const promptShape = [
       'Post-approve PR feedback check:',
       `- Emit on its own line, substituting <token>:`,
@@ -262,13 +219,7 @@ describe('PhaseSignalWatcher', () => {
   it('does not double-emit when the same signal appears twice', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'oncetok123ab';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token });
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     expect(captured).toHaveLength(1);
@@ -278,13 +229,7 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'snapshotTok1';
     streamer.setSnapshot(`prior output\n${buildPhaseSignal('pr-merge-ready', token)}\n`);
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'pr-merge-ready',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token });
     expect(captured).toHaveLength(1);
   });
 
@@ -292,10 +237,7 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'snapshotTok2';
     streamer.setSnapshot(`prior output\n${buildPhaseSignal('pr-merge-ready', token)}\n`);
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
+    await startWatch(watcher, {
       expectedKinds: 'pr-merge-ready',
       token,
       skipSnapshot: true,
@@ -305,20 +247,8 @@ describe('PhaseSignalWatcher', () => {
 
   it('start with the same taskId disarms the previous entry', async () => {
     const { watcher, streamer, captured } = makeWatcher();
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token: 'old1tok234ab',
-    });
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token: 'new1tok234ab',
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'old1tok234ab' });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'new1tok234ab' });
     // Old token now stale; only new token should fire.
     streamer.triggerLive(`${buildPhaseSignal('spec-done', 'old1tok234ab')}\n`);
     expect(captured).toHaveLength(0);
@@ -329,13 +259,7 @@ describe('PhaseSignalWatcher', () => {
   it('stop(taskId) removes the entry and prevents further fires', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'stoptok1234a';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token });
     watcher.stop('t1');
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     expect(captured).toHaveLength(0);
@@ -343,13 +267,7 @@ describe('PhaseSignalWatcher', () => {
 
   it('emits human.intervention when the underlying streamer reports session-gone before fire', async () => {
     const { watcher, streamer, captured } = makeWatcher();
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token: 'tokSGone1234',
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'tokSGone1234' });
     streamer.triggerSessionGone();
     expect(captured.length).toBeGreaterThan(0);
     expect(captured[0].type).toBe('human.intervention');
@@ -367,9 +285,7 @@ describe('PhaseSignalWatcher', () => {
       eventBus,
       resolveAgent: () => undefined,
     });
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
+    await startWatch(watcher, {
       agentId: 'unknown-agent',
       expectedKinds: 'spec-done',
       token: 'noagent12345',
@@ -394,13 +310,7 @@ describe('PhaseSignalWatcher', () => {
       resolveAgent: (id) => (id === DEV_AGENT.id ? DEV_AGENT : undefined),
     });
     const token = 'emitFail1234';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'spec-done',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token });
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     await flushMicrotasks();
     expect(captured.length).toBe(1);
@@ -409,13 +319,7 @@ describe('PhaseSignalWatcher', () => {
 
   it('expectedKindsFor(taskId): reports the watched set; empty Set after stop', async () => {
     const { watcher } = makeWatcher();
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: ['pr-approved', 'pr-changes-requested'],
-      token: 'introspct123',
-    });
+    await startWatch(watcher, { expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'introspct123' });
     const armed = watcher.expectedKindsFor('t1');
     expect(armed.has('pr-approved')).toBe(true);
     expect(armed.has('pr-changes-requested')).toBe(true);
@@ -443,7 +347,7 @@ describe('kind → event type routing', () => {
   it.each(ROUTING)('a watched %s signal emits %s', async (kind, eventType) => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'routetok1234';
-    await watcher.start({ taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id, expectedKinds: kind, token });
+    await startWatch(watcher, { expectedKinds: kind, token });
     const wire = kind === 'pr-created' ? buildPhaseSignal('pr-created', token, 7) : buildPhaseSignal(kind, token);
     streamer.triggerLive(`${wire}\n`);
     expect(captured).toHaveLength(1);
@@ -454,7 +358,7 @@ describe('kind → event type routing', () => {
     for (const kind of ['pr-approved', 'pr-changes-requested'] as const) {
       const { watcher, streamer, captured } = makeWatcher();
       const token = 'verdicttok12';
-      await watcher.start({ taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id, expectedKinds: kind, token });
+      await startWatch(watcher, { expectedKinds: kind, token });
       streamer.triggerLive(`${buildPhaseSignal(kind, token)}\n`);
       expect(captured[0].type).toBe('review.submitted');
     }
@@ -465,13 +369,7 @@ describe('server-chain signal watching', () => {
   it('emits the server event type for a server-chain kind', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'srvtok123456';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'code-reviewed',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'code-reviewed', token });
     streamer.triggerLive(`${buildPhaseSignal('code-reviewed', token)}\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('server.code.review.submitted');
@@ -480,13 +378,7 @@ describe('server-chain signal watching', () => {
   it('code-ready event data carries prNumber when present', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'srvtok123456';
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
-      expectedKinds: 'code-ready',
-      token,
-    });
+    await startWatch(watcher, { expectedKinds: 'code-ready', token });
     streamer.triggerLive(`[bx:code-ready:42:${token}]\n`);
     expect(captured).toHaveLength(1);
     expect(captured[0].type).toBe('server.code.published');
@@ -496,10 +388,7 @@ describe('server-chain signal watching', () => {
   it('fires onReadFile once per distinct request, not on tail rescans', async () => {
     const { watcher, streamer } = makeWatcher();
     const seen: string[] = [];
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
+    await startWatch(watcher, {
       expectedKinds: 'code-reviewed',
       token: 'srvtok123456',
       onReadFile: req => seen.push(`${req.file}:${req.startLine}-${req.endLine}`),
@@ -516,10 +405,7 @@ describe('snapshot read-file suppression', () => {
     const { watcher, streamer } = makeWatcher();
     const seen: string[] = [];
     streamer.setSnapshot('[bx:read-file:old/a.ts:1-10]');
-    await watcher.start({
-      taskId: 't1',
-      projectId: 'p1',
-      agentId: DEV_AGENT.id,
+    await startWatch(watcher, {
       expectedKinds: 'code-reviewed',
       token: 'srvtok123456',
       onReadFile: req => seen.push(req.raw),

@@ -67,6 +67,20 @@ vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => 
 
 import { Dashboard } from '../../src/pages/dashboard.tsx';
 
+function seed(projects: ProjectConfig[], agents: AgentSnapshot[] = []): void {
+  projectsHookState.projects = projects;
+  agentsHookState.data = agents;
+  agentsHookState.loaded = true;
+}
+
+function renderDashboard() {
+  return render(
+    <MemoryRouter>
+      <Dashboard />
+    </MemoryRouter>,
+  );
+}
+
 beforeEach(() => {
   cleanup();
   projectsHookState.projects = null;
@@ -81,22 +95,15 @@ beforeEach(() => {
 
 describe('Dashboard layout', () => {
   it('keeps an sr-only h1 "Dashboard" so screen readers see the page heading even though the visible title is removed', () => {
-    projectsHookState.projects = [];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([]);
+    renderDashboard();
 
     const h1 = screen.getByRole('heading', { level: 1, name: 'Dashboard' });
     expect(h1.className).toContain('sr-only');
   });
 
   it('renders each project\'s agent groups in a full-width vertical stack (no xl:grid-cols-2 split)', () => {
-    projectsHookState.projects = [
+    seed([
       {
         id: 'demo',
         repo: '/tmp/demo',
@@ -107,15 +114,9 @@ describe('Dashboard layout', () => {
           ],
         ],
       } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
+    ]);
 
-    const { container } = render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    const { container } = renderDashboard();
 
     const groupWrapper = container.querySelector('[role="group"]')?.parentElement;
     expect(groupWrapper).toBeTruthy();
@@ -125,17 +126,8 @@ describe('Dashboard layout', () => {
   });
 
   it('project header row exposes two narrow click targets (project id + Details) and the surrounding row is not clickable, to avoid mis-taps', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     const heading = screen.getByRole('heading', { level: 2, name: 'demo' });
     const idLink = within(heading).getByRole('link', { name: 'demo' });
@@ -152,18 +144,11 @@ describe('Dashboard layout', () => {
   });
 
   it('multi-project Dashboard gives each Details link a unique accessible name so SR/voice-control users can distinguish destinations', () => {
-    projectsHookState.projects = [
+    seed([
       { id: 'alpha', repo: '/tmp/alpha', agent: [] } as ProjectConfig,
       { id: 'beta', repo: '/tmp/beta', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    ]);
+    renderDashboard();
 
     const alphaDetails = screen.getByRole('link', { name: /Details.*alpha/ });
     const betaDetails = screen.getByRole('link', { name: /Details.*beta/ });
@@ -173,17 +158,8 @@ describe('Dashboard layout', () => {
   });
 
   it('hides the repo path on narrow viewports (mobile) — uses hidden sm:inline-block so 640px+ shows it', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo-repo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo-repo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     const repoSpan = screen.getByText('/tmp/demo-repo');
     expect(repoSpan.className).toContain('hidden');
@@ -191,17 +167,10 @@ describe('Dashboard layout', () => {
   });
 
   it('row keeps a single-line layout via truncate + title so a long repo path can not blow up row height', () => {
-    projectsHookState.projects = [
+    seed([
       { id: 'very-long-project-id', repo: '/some/very/long/repo/path/that/should/not/wrap', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    ]);
+    renderDashboard();
 
     const heading = screen.getByRole('heading', { level: 2, name: 'very-long-project-id' });
     expect(heading.className).toContain('truncate');
@@ -215,7 +184,7 @@ describe('Dashboard layout', () => {
   });
 
   it('multi-group project lays groups out in a 2-column grid at xl so one row holds up to 2 task areas', () => {
-    projectsHookState.projects = [
+    seed([
       {
         id: 'demo',
         repo: '/tmp/demo',
@@ -230,15 +199,9 @@ describe('Dashboard layout', () => {
           ],
         ],
       } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
+    ]);
 
-    const { container } = render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    const { container } = renderDashboard();
 
     const groups = container.querySelectorAll('[role="group"]');
     expect(groups.length).toBe(2);
@@ -251,17 +214,8 @@ describe('Dashboard layout', () => {
   });
 
   it('promotes "新建 Task" to the primary CTA and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     const taskBtn = screen.getByRole('button', { name: '+ 新建 Task' });
     expect(taskBtn.className).toContain('btn-primary');
@@ -283,17 +237,8 @@ describe('Dashboard layout', () => {
   });
 
   it('opens the kebab menu on click and exposes a "新建项目" menuitem that opens the CreateProject modal', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
     fireEvent.click(moreTrigger);
@@ -307,17 +252,8 @@ describe('Dashboard layout', () => {
   });
 
   it('kebab menuitem opens neutral (no default bg, no auto-focus) and only changes text color on hover', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
     fireEvent.click(moreTrigger);
@@ -332,17 +268,8 @@ describe('Dashboard layout', () => {
   });
 
   it('closes the kebab menu when Escape is pressed or an outside click happens', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
     fireEvent.click(moreTrigger);
@@ -358,47 +285,36 @@ describe('Dashboard layout', () => {
   });
 
   it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', () => {
-    projectsHookState.projects = [
-      { id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig,
-    ];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
     projectTasksHookState.data = null;
     projectTasksHookState.error = { code: 'connection_failed', message: 'realtime down' };
 
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    renderDashboard();
 
     expect(screen.getByText(/任务列表加载失败：realtime down/)).toBeTruthy();
   });
 
   it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', () => {
-    projectsHookState.projects = [
-      {
-        id: 'demo',
-        repo: '/tmp/demo',
-        agent: [
-          [
-            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
-            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+    seed(
+      [
+        {
+          id: 'demo',
+          repo: '/tmp/demo',
+          agent: [
+            [
+              { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
+              { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+            ],
           ],
-        ],
-      } as ProjectConfig,
-    ];
-    agentsHookState.data = [
-      { id: 'dev-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-      { id: 'qa-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-    ];
-    agentsHookState.loaded = true;
-
-    const { getAllByTestId } = render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
+        } as ProjectConfig,
+      ],
+      [
+        { id: 'dev-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+        { id: 'qa-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+      ],
     );
+
+    const { getAllByTestId } = renderDashboard();
 
     const terminals = getAllByTestId('pane-terminal');
     expect(terminals.length).toBe(2);
@@ -407,15 +323,8 @@ describe('Dashboard layout', () => {
 
 describe('Dashboard 项目已创建 follow-up modal', () => {
   async function reachContinueDialog(): Promise<HTMLElement> {
-    projectsHookState.projects = [{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig];
-    agentsHookState.data = [];
-    agentsHookState.loaded = true;
-
-    render(
-      <MemoryRouter>
-        <Dashboard />
-      </MemoryRouter>,
-    );
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
 
     fireEvent.click(screen.getByRole('button', { name: '更多操作' }));
     fireEvent.click(screen.getByRole('menuitem', { name: '新建项目' }));

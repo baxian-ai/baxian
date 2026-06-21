@@ -95,6 +95,39 @@ function readyPaneExec(cmd: string): Partial<ExecResult> {
   return {};
 }
 
+// Bind an agent to a task in the given store, stamping updatedAt for the caller.
+function bindAgent(
+  store: AgentStore,
+  id: string,
+  fields: Record<string, unknown>,
+): Promise<unknown> {
+  return store.update(id, () => ({
+    id, projectId: 'proj', updatedAt: new Date().toISOString(), ...fields,
+  }));
+}
+
+// Bind dev-1 (%1) and/or qa-1 (%2) to task-1 with a live pane, the standard
+// starting state for the dispatch-failure-recovery cases.
+function bindToTask(agentStore: AgentStore, id: 'dev-1' | 'qa-1', now: string): Promise<unknown> {
+  const paneId = id === 'dev-1' ? '%1' : '%2';
+  return agentStore.update(id, () => ({ id, projectId: 'proj', taskId: 'task-1', paneId, updatedAt: now }));
+}
+
+// Stub a private AgentManager method that the test does not exercise directly.
+function stubMethod<T>(manager: AgentManager, name: string, impl: T): void {
+  (manager as unknown as Record<string, T>)[name] = impl;
+}
+
+// Record dispatchServerAfterDone calls as `${taskId}:${kind}` while returning the live task.
+function recordAfterDone(manager: AgentManager, taskStore: TaskStore): string[] {
+  const dispatched: string[] = [];
+  stubMethod(manager, 'dispatchServerAfterDone', async (id: string, kind: string) => {
+    dispatched.push(`${id}:${kind}`);
+    return taskStore.get(id);
+  });
+  return dispatched;
+}
+
 function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
   return {
     id: 'task-1',
@@ -114,6 +147,25 @@ function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
   };
 }
 
+// An approved PR gate carrying the publish-dispatched marker (the shape every
+// "cancel after a dispatched-but-unconfirmed publish" case starts from).
+function approvedPrMarkerFixture(overrides: Partial<TaskState> = {}): TaskState {
+  return taskFixture({
+    status: 'approved', afterDone: 'pr', prNumber: 31,
+    publishDispatchedAt: '2026-06-10T01:00:00.000Z',
+    ...overrides,
+  });
+}
+
+function hasRemoteRetirement(execCalls: string[]): boolean {
+  return execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'));
+}
+
+function hasCleanupSkippedEvent(events: { type: string; data?: Record<string, unknown> }[]): boolean {
+  return events.some(e => e.type === 'human.intervention'
+    && e.data?.phase === 'cancel-published-artifact-cleanup-skipped');
+}
+
 describe('confirmHumanGate via markTaskComplete', () => {
   it('ready + afterDone:null → done', async () => {
     const { manager, taskStore } = await makeFixture(null, null);
@@ -131,13 +183,9 @@ describe('confirmHumanGate via markTaskComplete', () => {
   });
 
   it('ready + afterDone:branch + merge:auto → ref-to-ref ff push → merged', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', 'branch', cmd =>
+    const { manager, taskStore, agentStore, execCalls } = await makeFixture('auto', 'branch', cmd =>
       cmd.includes('symbolic-ref') ? { stdout: 'origin/main\n' } : cmd.includes('rev-parse') ? { stdout: 'head123\n' } : {});
-    const { AgentStore: AS } = await import('../../src/state/agent-store.js');
-    const agents = new AS(join(tempDir, 'state', 'agents'));
-    await agents.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', repoPath: '/repo/dev', updatedAt: new Date().toISOString(),
-    }));
+    await bindAgent(agentStore, 'dev-1', { repoPath: '/repo/dev' });
     await taskStore.set(taskFixture({ latestHeadSha: 'head123' }));
     const result = await manager.markTaskComplete('task-1');
     expect(result.status).toBe('merged');
@@ -148,16 +196,12 @@ describe('confirmHumanGate via markTaskComplete', () => {
   });
 
   it('ready + afterDone:branch + merge:auto + non-ff failure → stays at the gate for retry', async () => {
-    const { manager, taskStore } = await makeFixture('auto', 'branch', cmd => {
+    const { manager, taskStore, agentStore } = await makeFixture('auto', 'branch', cmd => {
       if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n' };
       if (cmd.includes(`:'main'`)) return { exitCode: 1, stderr: 'rejected: non-fast-forward' };
       return {};
     });
-    const { AgentStore: AS } = await import('../../src/state/agent-store.js');
-    const agents = new AS(join(tempDir, 'state', 'agents'));
-    await agents.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', repoPath: '/repo/dev', updatedAt: new Date().toISOString(),
-    }));
+    await bindAgent(agentStore, 'dev-1', { repoPath: '/repo/dev' });
     await taskStore.set(taskFixture());
     await expect(manager.markTaskComplete('task-1')).rejects.toThrow(/Merge failed/);
     const task = await taskStore.get('task-1');
@@ -204,12 +248,7 @@ describe('server-mode max_rounds escape', () => {
 
   it('complete + afterDone:branch → approved + publish dispatched', async () => {
     const { manager, taskStore } = await makeFixture(null, 'branch');
-    const dispatched: string[] = [];
-    (manager as unknown as { dispatchServerAfterDone: (id: string, kind: string) => Promise<unknown> })
-      .dispatchServerAfterDone = async (id: string, kind: string) => {
-        dispatched.push(`${id}:${kind}`);
-        return taskStore.get(id);
-      };
+    const dispatched = recordAfterDone(manager, taskStore);
     await taskStore.set(taskFixture({ status: 'max_rounds', reviewRound: 10 }));
     await manager.markTaskComplete('task-1');
     expect(dispatched).toEqual(['task-1:branch']);
@@ -218,12 +257,7 @@ describe('server-mode max_rounds escape', () => {
 
   it('approved (server) retries the publish dispatch', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');
-    const dispatched: string[] = [];
-    (manager as unknown as { dispatchServerAfterDone: (id: string, kind: string) => Promise<unknown> })
-      .dispatchServerAfterDone = async (id: string, kind: string) => {
-        dispatched.push(`${id}:${kind}`);
-        return taskStore.get(id);
-      };
+    const dispatched = recordAfterDone(manager, taskStore);
     await taskStore.set(taskFixture({ status: 'approved' }));
     await manager.markTaskComplete('task-1');
     expect(dispatched).toEqual(['task-1:pr']);
@@ -240,21 +274,18 @@ describe('snapshot + resume semantics', () => {
   });
 
   it('resumeAgent redispatches the code prompt for code-dispatch-failed', async () => {
-    const { manager, taskStore } = await makeFixture(null, null);
+    const { manager, taskStore, agentStore: agents } = await makeFixture(null, null);
     await taskStore.set(taskFixture({ status: 'in_progress', phase: 'code' }));
-    const agents = new AgentStore(join(tempDir, 'state', 'agents'));
-    await agents.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%1',
+    await bindAgent(agents, 'dev-1', {
+      taskId: 'task-1', paneId: '%1',
       status: 'awaiting_human', awaitingPhase: 'code-dispatch-failed',
       awaitingReason: 'x', awaitingSince: 'now',
-      updatedAt: new Date().toISOString(),
-    }));
+    });
     const continued: string[] = [];
-    (manager as unknown as { continueSession: (t: string, a: string, p: string) => Promise<boolean> })
-      .continueSession = async (t: string, a: string, p: string) => {
-        continued.push(`${t}:${a}:${p}`);
-        return true;
-      };
+    stubMethod(manager, 'continueSession', async (t: string, a: string, p: string) => {
+      continued.push(`${t}:${a}:${p}`);
+      return true;
+    });
     const result = await manager.resumeAgent('dev-1');
     expect(result.resumed).toBe(true);
     expect(continued).toEqual(['task-1:dev-1:code']);
@@ -275,12 +306,8 @@ describe('cancel a published gate cleans up the remote (pr / branch)', () => {
   });
 
   it('cancel of a published branch gate deletes the remote branch', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', 'branch');
-    const agents = new AgentStore(join(tempDir, 'state', 'agents'));
-    await agents.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', repoPath: '/repo/dev',
-      updatedAt: new Date().toISOString(),
-    }));
+    const { manager, taskStore, agentStore: agents, execCalls } = await makeFixture('auto', 'branch');
+    await bindAgent(agents, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' });
     await taskStore.set(taskFixture({ status: 'ready', afterDone: 'branch', latestHeadSha: 'h1' }));
     await manager.cancelTask('task-1');
     expect(execCalls.some(c => c.includes('git push origin --delete') && c.includes('bx/task-1'))).toBe(true);
@@ -290,14 +317,8 @@ describe('cancel a published gate cleans up the remote (pr / branch)', () => {
 describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marker)', () => {
   it('approved + publishDispatchedAt + prNumber → interrupts the dev FIRST, then closes the PR remotely', async () => {
     const { manager, taskStore, agentStore, execCalls } = await makeFixture('auto', 'pr', readyPaneExec);
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%5',
-      updatedAt: new Date().toISOString(),
-    }));
-    await taskStore.set(taskFixture({
-      status: 'approved', afterDone: 'pr', prNumber: 31,
-      publishDispatchedAt: '2026-06-10T01:00:00.000Z',
-    }));
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', paneId: '%5' });
+    await taskStore.set(approvedPrMarkerFixture());
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
     const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
@@ -308,10 +329,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
 
   it('approved + publishDispatchedAt without prNumber (branch publish) → interrupts the dev FIRST, then deletes the remote branch', async () => {
     const { manager, taskStore, agentStore, execCalls } = await makeFixture('auto', 'branch', readyPaneExec);
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', repoPath: '/repo/dev', paneId: '%5',
-      updatedAt: new Date().toISOString(),
-    }));
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev', paneId: '%5' });
     await taskStore.set(taskFixture({
       status: 'approved', afterDone: 'branch',
       publishDispatchedAt: '2026-06-10T01:00:00.000Z',
@@ -323,98 +341,70 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     expect(deleteAt).toBeGreaterThan(interruptAt);
   });
 
-  it('approved + marker with a FAILED dev interrupt → skips remote retirement and intervenes (publish may still be running)', async () => {
-    // No paneId and list-panes returns nothing → interruptPaneAndWaitReady fails.
+  // Every case carries the approved-PR delivery marker but the dev interrupt is
+  // unconfirmable, so cancel must skip remote retirement and emit the skip event.
+  it.each([
+    {
+      // No paneId and list-panes returns nothing → interruptPaneAndWaitReady fails.
+      label: 'a FAILED dev interrupt → skips remote retirement and intervenes (publish may still be running)',
+      seed: (agentStore: AgentStore) => bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' }),
+      task: {} as Partial<TaskState>,
+      checkCancelled: true,
+      devAwaiting: true,
+    },
+    {
+      label: 'the dev config hot-removed → skips gh pr close (pane outlives the config)',
+      seed: (agentStore: AgentStore) => bindAgent(agentStore, 'ghost', { taskId: 'task-1', paneId: '%5' }),
+      task: { agentId: 'ghost' } as Partial<TaskState>,
+      checkCancelled: true,
+      devAwaiting: false,
+    },
+    {
+      label: 'NO agentStore record for the dev → skips remote retirement (stop unconfirmed)',
+      seed: undefined,
+      task: {} as Partial<TaskState>,
+      checkCancelled: false,
+      devAwaiting: false,
+    },
+    {
+      label: 'the dev rebound to another task → skips remote retirement (stop unconfirmed)',
+      seed: (agentStore: AgentStore) => bindAgent(agentStore, 'dev-1', { taskId: 'task-OTHER', paneId: '%5' }),
+      task: {} as Partial<TaskState>,
+      checkCancelled: false,
+      devAwaiting: false,
+    },
+  ])('approved + marker with $label', async ({ seed, task, checkCancelled, devAwaiting }) => {
     const { manager, taskStore, agentStore, execCalls, events } = await makeFixture('auto', 'pr');
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', repoPath: '/repo/dev',
-      updatedAt: new Date().toISOString(),
-    }));
-    await taskStore.set(taskFixture({
-      status: 'approved', afterDone: 'pr', prNumber: 31,
-      publishDispatchedAt: '2026-06-10T01:00:00.000Z',
-    }));
+    if (seed) await seed(agentStore);
+    await taskStore.set(approvedPrMarkerFixture(task));
     const result = await manager.cancelTask('task-1');
-    expect(result.status).toBe('cancelled');
-    expect(execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'))).toBe(false);
-    expect(events.some(e => e.type === 'human.intervention'
-      && e.data?.phase === 'cancel-published-artifact-cleanup-skipped')).toBe(true);
-    expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
-  });
-
-  it('approved + marker + prNumber with the dev config hot-removed → skips gh pr close (pane outlives the config)', async () => {
-    const { manager, taskStore, agentStore, execCalls, events } = await makeFixture('auto', 'pr');
-    await agentStore.update('ghost', () => ({
-      id: 'ghost', projectId: 'proj', taskId: 'task-1', paneId: '%5',
-      updatedAt: new Date().toISOString(),
-    }));
-    await taskStore.set(taskFixture({
-      agentId: 'ghost', status: 'approved', afterDone: 'pr', prNumber: 31,
-      publishDispatchedAt: '2026-06-10T01:00:00.000Z',
-    }));
-    const result = await manager.cancelTask('task-1');
-    expect(result.status).toBe('cancelled');
-    expect(execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'))).toBe(false);
-    expect(events.some(e => e.type === 'human.intervention'
-      && e.data?.phase === 'cancel-published-artifact-cleanup-skipped')).toBe(true);
-  });
-
-  it('approved + marker with NO agentStore record for the dev → skips remote retirement (stop unconfirmed)', async () => {
-    const { manager, taskStore, execCalls, events } = await makeFixture('auto', 'pr');
-    await taskStore.set(taskFixture({
-      status: 'approved', afterDone: 'pr', prNumber: 31,
-      publishDispatchedAt: '2026-06-10T01:00:00.000Z',
-    }));
-    await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'))).toBe(false);
-    expect(events.some(e => e.type === 'human.intervention'
-      && e.data?.phase === 'cancel-published-artifact-cleanup-skipped')).toBe(true);
-  });
-
-  it('approved + marker with the dev rebound to another task → skips remote retirement (stop unconfirmed)', async () => {
-    const { manager, taskStore, agentStore, execCalls, events } = await makeFixture('auto', 'pr');
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-OTHER', paneId: '%5',
-      updatedAt: new Date().toISOString(),
-    }));
-    await taskStore.set(taskFixture({
-      status: 'approved', afterDone: 'pr', prNumber: 31,
-      publishDispatchedAt: '2026-06-10T01:00:00.000Z',
-    }));
-    await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'))).toBe(false);
-    expect(events.some(e => e.type === 'human.intervention'
-      && e.data?.phase === 'cancel-published-artifact-cleanup-skipped')).toBe(true);
+    if (checkCancelled) expect(result.status).toBe('cancelled');
+    expect(hasRemoteRetirement(execCalls)).toBe(false);
+    expect(hasCleanupSkippedEvent(events)).toBe(true);
+    if (devAwaiting) expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
   });
 
   it('ready with a FAILED dev interrupt still retires remotely (publish already finished)', async () => {
     const { manager, taskStore, agentStore, execCalls, events } = await makeFixture('auto', 'pr');
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', repoPath: '/repo/dev',
-      updatedAt: new Date().toISOString(),
-    }));
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' });
     await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
     await manager.cancelTask('task-1');
     expect(execCalls.some(c => c.includes('gh pr close 12') && c.includes('--delete-branch'))).toBe(true);
-    expect(events.some(e => e.type === 'human.intervention'
-      && e.data?.phase === 'cancel-published-artifact-cleanup-skipped')).toBe(false);
+    expect(hasCleanupSkippedEvent(events)).toBe(false);
   });
 
   it('approved WITHOUT the delivery marker → nothing was published, no remote retirement', async () => {
     const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
     await taskStore.set(taskFixture({ status: 'approved', afterDone: 'pr' }));
     await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'))).toBe(false);
+    expect(hasRemoteRetirement(execCalls)).toBe(false);
   });
 
   it('approved with a hand-edited null marker → treated as not dispatched, no remote retirement', async () => {
     const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
-    await taskStore.set(taskFixture({
-      status: 'approved', afterDone: 'pr', prNumber: 31,
-      publishDispatchedAt: null as unknown as string,
-    }));
+    await taskStore.set(approvedPrMarkerFixture({ publishDispatchedAt: null as unknown as string }));
     await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close') || c.includes('--delete'))).toBe(false);
+    expect(hasRemoteRetirement(execCalls)).toBe(false);
   });
 });
 
@@ -451,12 +441,7 @@ describe('publish delivery marker', () => {
 
   it('approved retry without the marker dispatches the publish', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');
-    const dispatched: string[] = [];
-    (manager as unknown as { dispatchServerAfterDone: (id: string, kind: string) => Promise<unknown> })
-      .dispatchServerAfterDone = async (id: string, kind: string) => {
-        dispatched.push(`${id}:${kind}`);
-        return taskStore.get(id);
-      };
+    const dispatched = recordAfterDone(manager, taskStore);
     await taskStore.set(taskFixture({ status: 'approved', afterDone: 'pr' }));
     await manager.markTaskComplete('task-1');
     expect(dispatched).toEqual(['task-1:pr']);
@@ -465,17 +450,11 @@ describe('publish delivery marker', () => {
 
 describe('pre-paste marker ordering', () => {
   it('failed publish dispatch clears the delivery marker for retry', async () => {
-    const { manager, taskStore } = await makeFixture(null, 'pr');
-    const agents = new AgentStore(join(tempDir, 'state', 'agents'));
-    await agents.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%1',
-      updatedAt: new Date().toISOString(),
-    }));
+    const { manager, taskStore, agentStore: agents } = await makeFixture(null, 'pr');
+    await bindAgent(agents, 'dev-1', { taskId: 'task-1', paneId: '%1' });
     await taskStore.set(taskFixture({ status: 'approved', afterDone: 'pr', signalToken: 'origTok123' }));
-    (manager as unknown as { acquireAgentForTask: () => Promise<boolean> })
-      .acquireAgentForTask = async () => true;
-    (manager as unknown as { continueSession: () => Promise<boolean> })
-      .continueSession = async () => false;
+    stubMethod(manager, 'acquireAgentForTask', async () => true);
+    stubMethod(manager, 'continueSession', async () => false);
     const result = await manager.dispatchServerAfterDone('task-1', 'pr');
     expect(result).toBeNull();
     const fresh = await taskStore.get('task-1');
@@ -495,9 +474,7 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
   it('transitionToCodePhase holds the dev (code-dispatch-failed) when acquire fails', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'review', phase: 'spec', qaAgentId: undefined, signalToken: 'tok' }));
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%1', updatedAt: NOW,
-    }));
+    await bindToTask(agentStore, 'dev-1', NOW);
     vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
       .mockResolvedValue(true);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
@@ -514,9 +491,7 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
   it('dispatchServerReviewToQa continuation failure re-arms the reviewed watcher and keeps the QA bound', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'review', signalToken: 'tok', batchIndex: 0, batchTotal: 2 }));
-    await agentStore.update('qa-1', () => ({
-      id: 'qa-1', projectId: 'proj', taskId: 'task-1', paneId: '%2', updatedAt: NOW,
-    }));
+    await bindToTask(agentStore, 'qa-1', NOW);
     vi.spyOn(manager, 'continueSession').mockResolvedValue(false);
     const rearmSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
@@ -534,12 +509,8 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
   it('dispatchServerFixToDev resume failure re-arms the QA reviewed watcher after rollback', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'review', signalToken: 'tok' }));
-    await agentStore.update('qa-1', () => ({
-      id: 'qa-1', projectId: 'proj', taskId: 'task-1', paneId: '%2', updatedAt: NOW,
-    }));
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%1', updatedAt: NOW,
-    }));
+    await bindToTask(agentStore, 'qa-1', NOW);
+    await bindToTask(agentStore, 'dev-1', NOW);
     vi.spyOn(manager, 'continueSession').mockResolvedValue(false);
     const rearmSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
 
@@ -553,12 +524,8 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
   it('dispatchServerFixToDev keeps the QA bound when dev acquire fails', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'review', signalToken: 'tok' }));
-    await agentStore.update('qa-1', () => ({
-      id: 'qa-1', projectId: 'proj', taskId: 'task-1', paneId: '%2', updatedAt: NOW,
-    }));
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%1', updatedAt: NOW,
-    }));
+    await bindToTask(agentStore, 'qa-1', NOW);
+    await bindToTask(agentStore, 'dev-1', NOW);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
     const rearmSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
 
@@ -573,9 +540,7 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
   it('dispatchServerFixToDev keeps the dev binding when the fixing transition is refused', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'approved', qaAgentId: undefined, signalToken: 'tok' }));
-    await agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', paneId: '%1', updatedAt: NOW,
-    }));
+    await bindToTask(agentStore, 'dev-1', NOW);
 
     const result = await manager.dispatchServerFixToDev('task-1', '[]');
 

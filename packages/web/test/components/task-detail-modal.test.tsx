@@ -82,6 +82,12 @@ function setTasks(tasks: Record<string, TaskState>): void {
   }));
 }
 
+function openDetail(overrides: Partial<TaskState> = {}): void {
+  setTasks({ 'task-010': makeTask(overrides) });
+  render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
+  fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+}
+
 beforeEach(() => {
   cleanup();
   useProjectsMock.mockReset();
@@ -126,10 +132,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
   });
 
   it('opens a modal with the task title, status, description and meta when openTask fires', () => {
-    setTasks({ 'task-010': makeTask({ title: 'Clean tests' }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail({ title: 'Clean tests' });
 
     const dialog = screen.getByRole('dialog', { name: 'task-010 Clean tests' });
     const titleId = within(dialog).getByText('task-010');
@@ -145,10 +148,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
   });
 
   it('shows runtime labels next to task agent names and exposes runtime hover text', () => {
-    setTasks({ 'task-010': makeTask() });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail();
 
     const devNames = screen.getAllByText('bx-dev');
     expect(devNames.map(el => el.parentElement?.getAttribute('title'))).toEqual(['bx-dev (Claude Code)']);
@@ -159,10 +159,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
   });
 
   it('keeps Round and spec metadata visually consistent when specReviewRound is present', () => {
-    setTasks({ 'task-010': makeTask({ specReviewRound: 3 }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail({ specReviewRound: 3 });
 
     const dialog = screen.getByRole('dialog', { name: 'task-010 Clean tests' });
     const roundMeta = within(dialog).getByText((_, el) => el?.textContent === 'Round: 1 spec: 3');
@@ -171,58 +168,39 @@ describe('TaskDetailProvider / useTaskDetail', () => {
   });
 
   it('falls back to the raw timestamp when the task timestamp is not parseable', () => {
-    setTasks({ 'task-010': makeTask({ createdAt: 'not-a-date', updatedAt: '2026-05-10T13:00:00Z' }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail({ createdAt: 'not-a-date', updatedAt: '2026-05-10T13:00:00Z' });
 
     expect(screen.getByText('Created at not-a-date, Updated at 2026-05-10 13:00:00')).toBeTruthy();
   });
 
   it('formats timestamps without seconds without applying timezone conversion', () => {
-    setTasks({ 'task-010': makeTask({ createdAt: '2026-05-10T13:00+08:00', updatedAt: '2026-05-10 14:30+08:00' }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail({ createdAt: '2026-05-10T13:00+08:00', updatedAt: '2026-05-10 14:30+08:00' });
 
     expect(screen.getByText('Created at 2026-05-10 13:00:00, Updated at 2026-05-10 14:30:00')).toBeTruthy();
   });
 
   it('does not crash when timestamp fields are empty at runtime', () => {
-    setTasks({ 'task-010': makeTask({ createdAt: null as unknown as string, updatedAt: undefined as unknown as string }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail({ createdAt: null as unknown as string, updatedAt: undefined as unknown as string });
 
     expect(screen.getByText('Created at , Updated at')).toBeTruthy();
   });
 
-  it('shows the QA-approved (verifying feedback) banner with a working PR link', () => {
-    setTasks({ 'task-010': makeTask() });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+  const QA_BANNER = 'QA approved · verifying feedback';
+  const MERGE_BANNER = '✅ PR ready · 等待人工确认';
+  it.each([
+    { name: 'QA-approved (verifying feedback)', status: 'approved', shown: QA_BANNER, hidden: MERGE_BANNER },
+    { name: 'ready-to-merge', status: 'merge-ready', shown: MERGE_BANNER, hidden: QA_BANNER },
+  ])('shows the $name banner with a working PR link', ({ status, shown, hidden }) => {
+    openDetail({ status: status as TaskState['status'] });
 
-    expect(screen.getByText('QA approved · verifying feedback')).toBeTruthy();
-    expect(screen.queryByText('✅ PR ready · 等待人工确认')).toBeNull();
-    const link = screen.getByRole('link', { name: 'Open PR #55' });
-    expect(link.getAttribute('href')).toBe('https://github.com/baxian-ai/baxian/pull/55');
-  });
-
-  it('shows the ready-to-merge banner once the task reaches merge-ready', () => {
-    setTasks({ 'task-010': makeTask({ status: 'merge-ready' }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
-
-    expect(screen.getByText('✅ PR ready · 等待人工确认')).toBeTruthy();
-    expect(screen.queryByText('QA approved · verifying feedback')).toBeNull();
+    expect(screen.getByText(shown)).toBeTruthy();
+    expect(screen.queryByText(hidden)).toBeNull();
     const link = screen.getByRole('link', { name: 'Open PR #55' });
     expect(link.getAttribute('href')).toBe('https://github.com/baxian-ai/baxian/pull/55');
   });
 
   it('closes the modal via the close button', () => {
-    setTasks({ 'task-010': makeTask() });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail();
     expect(screen.getByRole('dialog')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
@@ -250,9 +228,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
   });
 
   it('opening Edit swaps to the edit form so the two modals never stack', () => {
-    setTasks({ 'task-010': makeTask({ status: 'pending' }) });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-    fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+    openDetail({ status: 'pending' });
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     expect(screen.getByTestId('edit-modal')).toBeTruthy();
@@ -262,9 +238,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
 
   describe('max_rounds actions', () => {
     function openMaxRounds(overrides: Partial<TaskState> = {}): void {
-      setTasks({ 'task-010': makeTask({ status: 'max_rounds', reviewRound: 10, ...overrides }) });
-      render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
-      fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
+      openDetail({ status: 'max_rounds', reviewRound: 10, ...overrides });
     }
 
     it('code-phase max_rounds shows 标记完成 / 继续一轮 / Call review and the warning, hides Retry', () => {
@@ -277,26 +251,18 @@ describe('TaskDetailProvider / useTaskDetail', () => {
       expect(screen.getByRole('dialog').textContent).toContain('建议先合并本次成果');
     });
 
-    it('继续一轮 calls api.tasks.continue', async () => {
+    it.each([
+      { button: '继续一轮', mock: tasksContinueMock, resolved: makeTask({ status: 'fixing', reviewRound: 11 }) },
+      { button: '标记完成', mock: tasksCompleteMock, resolved: makeTask({ status: 'merged' }) },
+    ])('$button confirms and calls its api', async ({ button, mock, resolved }) => {
       vi.spyOn(window, 'confirm').mockReturnValue(true);
-      tasksContinueMock.mockResolvedValue(makeTask({ status: 'fixing', reviewRound: 11 }));
+      mock.mockResolvedValue(resolved);
       openMaxRounds();
 
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: '继续一轮' }));
+        fireEvent.click(screen.getByRole('button', { name: button }));
       });
-      expect(tasksContinueMock).toHaveBeenCalledWith('task-010');
-    });
-
-    it('标记完成 calls api.tasks.complete', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
-      tasksCompleteMock.mockResolvedValue(makeTask({ status: 'merged' }));
-      openMaxRounds();
-
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: '标记完成' }));
-      });
-      expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
+      expect(mock).toHaveBeenCalledWith('task-010');
     });
 
     it('spec-phase max_rounds shows Retry, hides the new actions and Call review', () => {

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import type { AgentBindingFacts, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
 import { WorktreeManager } from '../../src/agent/worktree.js';
@@ -47,6 +47,76 @@ function noopRunner(): CommandRunner {
   };
 }
 
+function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
+  return agentStore.set({ projectId: 'proj', updatedAt: NOW, ...overrides });
+}
+
+function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void> {
+  return taskStore.set({
+    projectId: 'proj',
+    title: 'T',
+    description: 'D',
+    preferredAgentId: 'dev-1',
+    agentId: 'dev-1',
+    branch: `bx/${overrides.id}`,
+    reviewRound: 0,
+    status: 'in_progress',
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  });
+}
+
+function mockEnsureSessionOk(overrides: Record<string, unknown> = {}): void {
+  vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+    ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
+    ...overrides,
+  } as never);
+}
+
+interface RecoveryScenario {
+  agents: (Partial<AgentBindingFacts> & { id: string })[];
+  tasks?: (Partial<TaskState> & { id: string })[];
+  locks?: string[];
+  emit?: BaxianEvent[];
+  ensureSession?: Record<string, unknown> | { reject: EnsureSessionError };
+  removeImpl?: () => Promise<void>;
+}
+
+interface RecoveryHandles {
+  removeSpy: ReturnType<typeof vi.spyOn>;
+  watchSpy: ReturnType<typeof vi.spyOn>;
+}
+
+async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles> {
+  for (const agent of scenario.agents) await seedAgent(agent);
+  for (const task of scenario.tasks ?? []) await seedTask(task);
+  for (const event of scenario.emit ?? []) await eventBus.emit(event);
+  for (const id of scenario.locks ?? []) await lockManager.acquire(id);
+
+  const session = scenario.ensureSession;
+  if (session && 'reject' in session) {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(session.reject);
+  } else {
+    mockEnsureSessionOk(session ?? {});
+  }
+
+  const removeSpy = scenario.removeImpl
+    ? vi.spyOn(WorktreeManager.prototype, 'remove').mockImplementation(scenario.removeImpl)
+    : vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
+  const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
+
+  await manager.recover();
+  return { removeSpy, watchSpy };
+}
+
+// Common rollback outcome: task reopened to pending, binding + lock cleared.
+async function expectRolledBack(taskId: string, agentId: string): Promise<void> {
+  expect((await taskStore.get(taskId))?.status).toBe('pending');
+  expect((await agentStore.get(agentId))?.taskId).toBeUndefined();
+  expect(await lockManager.isLocked(agentId)).toBe(false);
+}
+
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-recovery-'));
   await initStateDir(tempDir);
@@ -71,42 +141,17 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
 describe('recover()', () => {
   it('revalidates persisted bindings and clears creationToken on success', async () => {
-    await agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      taskId: 'task-1',
-      // legacy binding: no bootstrappingTaskId → revalidate the live REPL, don't roll back
-      creationToken: 'tok',
-      updatedAt: NOW,
+    // legacy binding: no bootstrappingTaskId → revalidate the live REPL, don't roll back
+    const { watchSpy } = await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-1', creationToken: 'tok' }],
+      tasks: [{ id: 'task-1' }],
     });
-    await taskStore.set({
-      id: 'task-1',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-1',
-      reviewRound: 0,
-      status: 'in_progress',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true,
-      createdSession: false,
-      freshRuntime: false,
-      paneId: '%1',
-      workdir: '/tmp/repo',
-    });
-    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
-
-    await manager.recover();
 
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBe('%1');
@@ -116,14 +161,8 @@ describe('recover()', () => {
   });
 
   it('redrives post-merge cleanup for a recovered merged-task binding', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-merged', paneId: '%0', updatedAt: NOW,
-    });
-    await taskStore.set({
-      id: 'task-merged', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', prNumber: 42, branch: 'bx/task-merged',
-      reviewRound: 1, status: 'merged', createdAt: NOW, updatedAt: NOW,
-    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
+    await seedTask({ id: 'task-merged', prNumber: 42, reviewRound: 1, status: 'merged' });
     vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true, createdSession: false, paneId: '%1', workdir: '/tmp/repo',
     });
@@ -148,28 +187,14 @@ describe('recover()', () => {
 
   it('preserves Held state (status=awaiting_human + awaitingPhase/Reason/Since) when recovering an ack_unknown agent with active bound task', async () => {
     // REPL-ready doesn't prove the prompt finished; operator must keep Resume/cancel/DELETE. Only dialog_pending is resolved by recover.
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: 'task-active', paneId: '%0',
-      status: 'awaiting_human',
-      awaitingPhase: 'dispatch-failed:ack_unknown',
-      awaitingReason: 'simulated ack_unknown',
-      awaitingSince: NOW,
-      updatedAt: NOW,
+    await runRecovery({
+      agents: [{
+        id: 'qa-1', taskId: 'task-active', paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'dispatch-failed:ack_unknown', awaitingReason: 'simulated ack_unknown', awaitingSince: NOW,
+      }],
+      tasks: [{ id: 'task-active', preferredAgentId: 'qa-1', agentId: 'qa-1', reviewRound: 1, status: 'review' }], // active
+      locks: ['qa-1'],
     });
-    await taskStore.set({
-      id: 'task-active', projectId: 'proj',
-      title: 'T', description: 'D', preferredAgentId: 'qa-1',
-      agentId: 'qa-1', branch: 'bx/task-active', reviewRound: 1,
-      status: 'review', // active
-      createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
-    });
-
-    await manager.recover();
 
     const state = await agentStore.get('qa-1');
     expect(state?.status).toBe('awaiting_human');
@@ -183,28 +208,14 @@ describe('recover()', () => {
 
   it('preserves Held state for agent_dialog_pending + active bound task (crash window before task fail)', async () => {
     // Crash between markAwaitingHuman and transitionTaskStatus leaves a real Held state; recover must preserve it, not silently clear.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: 'task-active', paneId: '%0',
-      status: 'awaiting_human',
-      awaitingPhase: 'agent_dialog_pending',
-      awaitingReason: 'CLI update notice',
-      awaitingSince: NOW,
-      updatedAt: NOW,
+    await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-active', paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'agent_dialog_pending', awaitingReason: 'CLI update notice', awaitingSince: NOW,
+      }],
+      tasks: [{ id: 'task-active' }], // active
+      locks: ['dev-1'],
     });
-    await taskStore.set({
-      id: 'task-active', projectId: 'proj',
-      title: 'T', description: 'D', preferredAgentId: 'dev-1',
-      agentId: 'dev-1', branch: 'bx/task-active', reviewRound: 0,
-      status: 'in_progress', // active
-      createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
-    });
-
-    await manager.recover();
 
     const state = await agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
@@ -216,20 +227,12 @@ describe('recover()', () => {
 
   it('clears Held state (status=ok) when recovering an agent_dialog_pending agent (recover dismissed the dialog)', async () => {
     // 对比测：agent_dialog_pending 是 recover 直接解决的 phase——ensureSession 成功 = dialog 已 dismissed → 切 ok。
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      paneId: '%0',
-      status: 'awaiting_human',
-      awaitingPhase: 'agent_dialog_pending',
-      awaitingReason: 'CLI update notice',
-      awaitingSince: NOW,
-      updatedAt: NOW,
+    await runRecovery({
+      agents: [{
+        id: 'dev-1', paneId: '%0', status: 'awaiting_human',
+        awaitingPhase: 'agent_dialog_pending', awaitingReason: 'CLI update notice', awaitingSince: NOW,
+      }],
     });
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
-    });
-
-    await manager.recover();
 
     const state = await agentStore.get('dev-1');
     // status='ok' 在 normalizeBinding 内被规范化为 undefined（status 字段只存 awaiting_human）
@@ -240,55 +243,30 @@ describe('recover()', () => {
   });
 
   it('rolls back a mid-bootstrap develop task even when recovery rebuilds a fresh REPL (marker set)', async () => {
-    // Bootstrap crashed before ack AND the tmux session died: marker present → roll back regardless of
-    // freshRuntime. Nothing ran (prompt never delivered), so there's no work to lose.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW,
-      bootstrappingTaskId: 'task-1', updatedAt: NOW,
+    // Marker present → roll back regardless of freshRuntime: the prompt never ran, so no work is lost.
+    const { watchSpy } = await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-1', startedAt: NOW, bootstrappingTaskId: 'task-1' }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: { createdSession: true, freshRuntime: true },
     });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, freshRuntime: true, paneId: '%1', workdir: '/tmp/repo',
-    });
-    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
 
-    await manager.recover();
-
-    expect((await taskStore.get('task-1'))?.status).toBe('pending');
+    await expectRolledBack('task-1', 'dev-1');
     expect((await taskStore.get('task-1'))?.agentId).toBe('');
-    const state = await agentStore.get('dev-1');
-    expect(state?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
     expect(watchSpy).not.toHaveBeenCalled();
   });
 
   it('does NOT roll back / remove worktree for a delivered task whose REPL was lost (freshRuntime=true, no marker)', async () => {
-    // Host reboot after the prompt was delivered (marker cleared): recover rebuilds a fresh REPL. Treating
-    // freshRuntime as "missing" would `worktree remove --force` completed-but-unpushed work and re-dispatch.
-    // The marker is absent, so leave the worktree + binding intact (the pre-existing recover behavior).
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW,
-      worktreePath: '/tmp/repo/.baxian-worktrees/task-1', updatedAt: NOW,
-      // delivered: no bootstrappingTaskId (cleared after ack)
+    // No marker (delivered) → freshRuntime alone must not remove completed-but-unpushed work; leave it intact.
+    const { removeSpy, watchSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW,
+        worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+      }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: { createdSession: true, freshRuntime: true },
     });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, freshRuntime: true, paneId: '%1', workdir: '/tmp/repo',
-    });
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
-    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
-
-    await manager.recover();
 
     expect(removeSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
@@ -299,29 +277,15 @@ describe('recover()', () => {
   });
 
   it('rolls back an in_progress develop task whose live REPL is mid-bootstrap (bootstrappingTaskId set, never ack\'d)', async () => {
-    // The new-dispatch gap: startSession wrote the running-binding (marking bootstrappingTaskId) + the REPL
-    // went ready, then crashed BEFORE injectAndAwaitAck. On restart ensureSession adopts the live REPL
-    // (freshRuntime=false), but the marker positively says the prompt never landed → roll back.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      bootstrappingTaskId: 'task-1', updatedAt: NOW,
+    // Crash before injectAndAwaitAck: recover adopts the live REPL (freshRuntime=false) but the marker says undelivered → roll back.
+    const { watchSpy } = await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0', bootstrappingTaskId: 'task-1' }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: { paneId: '%0' },
     });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
-    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
 
-    await manager.recover();
-
-    expect((await taskStore.get('task-1'))?.status).toBe('pending');
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    await expectRolledBack('task-1', 'dev-1');
     expect(watchSpy).not.toHaveBeenCalled();
   });
 
@@ -329,57 +293,34 @@ describe('recover()', () => {
     // startSession had already created+persisted the worktree (branch bx/task-1) and the bootstrap marker
     // before the crash. The rollback must `git worktree remove` it first — rollbackFailedDispatch only
     // drops the field — or the next dispatch's `git worktree add -B bx/task-1` fails on the busy branch.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1', updatedAt: NOW,
-    });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    // Capture binding at removal time to prove the worktree is gone BEFORE the binding is cleared.
     let boundWhenRemoved: string | undefined;
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockImplementation(async () => {
-      // Capture binding at removal time to prove the worktree is gone BEFORE the binding is cleared.
-      boundWhenRemoved = (await agentStore.get('dev-1'))?.taskId;
+    const { removeSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+        bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+      }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: { paneId: '%0' },
+      removeImpl: async () => { boundWhenRemoved = (await agentStore.get('dev-1'))?.taskId; },
     });
-
-    await manager.recover();
 
     expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/task-1');
     expect(boundWhenRemoved).toBe('task-1');
-    expect((await taskStore.get('task-1'))?.status).toBe('pending');
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    await expectRolledBack('task-1', 'dev-1');
   });
 
   it('does NOT roll back a legacy in_progress binding (no bootstrap marker) on a live REPL — leaves worktree + binding intact', async () => {
-    // Rolling upgrade: a develop task dispatched by an older build has no bootstrappingTaskId, but its
-    // prompt may be running in the still-live REPL that recover adopts (freshRuntime=false). Treating the
-    // missing marker as "never delivered" would remove the worktree out from under the running prompt and
-    // re-open the task for a duplicate dispatch — so recover must leave it alone and just re-attach.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/task-1', updatedAt: NOW,
-      // legacy: NO bootstrappingTaskId
+    // Missing marker on a live REPL = older-build prompt may be running; removing its worktree would re-dispatch a duplicate.
+    const { removeSpy, watchSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+        worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+      }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
     });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
-    });
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
-    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
-
-    await manager.recover();
 
     expect(removeSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
@@ -390,91 +331,61 @@ describe('recover()', () => {
   });
 
   it('rolls back a mid-bootstrap task that comes back blocked on a startup dialog (not held forever)', async () => {
-    // recover()'s ensureSession throws dialogPending. The marker says the prompt was never ack'd, and an
-    // active task can't be Resumed past a dialog — so roll back instead of markDialogPending; the
-    // re-dispatch handles the dialog fresh.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1', updatedAt: NOW,
-    });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: false, agentId: 'dev-1', dialogPending: true }, 'startup dialog'),
-    );
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
+    // Marker says never-ack'd + active task can't Resume past a dialog → roll back, don't markDialogPending.
     const dialogSpy = vi.spyOn(
       manager as never as { markDialogPending: (...a: unknown[]) => Promise<void> }, 'markDialogPending',
     ).mockResolvedValue(undefined);
-
-    await manager.recover();
+    const { removeSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+        bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+      }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: {
+        reject: new EnsureSessionError({ createdSession: false, agentId: 'dev-1', dialogPending: true }, 'startup dialog'),
+      },
+    });
 
     expect(dialogSpy).not.toHaveBeenCalled();
     expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/task-1');
-    expect((await taskStore.get('task-1'))?.status).toBe('pending');
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    await expectRolledBack('task-1', 'dev-1');
   });
 
   it('rolls back a mid-bootstrap task previously held on a dialog once its REPL recovers (marker still set)', async () => {
-    // Held agent_dialog_pending + marker present (never ack'd): once the dialog resolves (ensureSession ok),
-    // the awaiting_human state must not shield the confirmed-undelivered marker from rollback.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      bootstrappingTaskId: 'task-1', status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending',
-      awaitingReason: 'CLI update notice', awaitingSince: NOW, updatedAt: NOW,
-    });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
+    // Held awaiting_human must not shield the never-ack'd marker from rollback once the dialog resolves.
+    await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+        bootstrappingTaskId: 'task-1', status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending',
+        awaitingReason: 'CLI update notice', awaitingSince: NOW,
+      }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
     });
 
-    await manager.recover();
-
-    expect((await taskStore.get('task-1'))?.status).toBe('pending');
+    await expectRolledBack('task-1', 'dev-1');
     const rolled = await agentStore.get('dev-1');
-    expect(rolled?.taskId).toBeUndefined();
     // Held state must be cleared too, else the now-unbound agent stays non-dispatchable (no Resume needed).
     expect(rolled?.status).toBeUndefined();
     expect(rolled?.awaitingPhase).toBeUndefined();
     expect(canDispatchWithBinding(rolled)).toBe(true);
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('does NOT roll back a mid-bootstrap task when a session.started event proves delivery (stale marker)', async () => {
-    // The marker-clear and its held fallback both failed after the prompt was delivered, leaving a stale
-    // marker. The session.started event lives in a separate log (durable proof) — recover must not
-    // re-dispatch a running prompt; it clears the stale marker and re-attaches.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1', updatedAt: NOW,
+    // A durable session.started event overrides a stale marker: recover clears the marker and re-attaches.
+    const { removeSpy, watchSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+        bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+      }],
+      tasks: [{ id: 'task-1' }],
+      emit: [{
+        id: '', type: 'session.started', timestamp: new Date().toISOString(),
+        projectId: 'proj', agentId: 'dev-1', taskId: 'task-1', data: { phase: 'develop' },
+      }],
+      locks: ['dev-1'],
     });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await eventBus.emit({
-      id: '', type: 'session.started', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1', data: { phase: 'develop' },
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
-    });
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
-    const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
-
-    await manager.recover();
 
     expect(removeSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
@@ -488,24 +399,16 @@ describe('recover()', () => {
   it('does NOT roll back a delivered task held on a failed marker-clear (bootstrap-marker-clear-failed)', async () => {
     // Marker present but the hold phase says the prompt WAS delivered (clear write blipped) — its prompt is
     // running, so preserve the binding + worktree; recover must not treat it as never-delivered.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-      bootstrappingTaskId: 'task-1', status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
-      awaitingReason: 'clear failed', awaitingSince: NOW,
-      worktreePath: '/tmp/repo/.baxian-worktrees/task-1', updatedAt: NOW,
+    const { removeSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+        bootstrappingTaskId: 'task-1', status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
+        awaitingReason: 'clear failed', awaitingSince: NOW,
+        worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+      }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
     });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1', reviewRound: 0,
-      status: 'in_progress', createdAt: NOW, updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
-    });
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
-
-    await manager.recover();
 
     expect(removeSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
@@ -514,33 +417,14 @@ describe('recover()', () => {
   });
 
   it('clears unsafe runtime facts and fails active tasks when recovery cannot validate the session', async () => {
-    await agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      taskId: 'task-1',
-      paneId: '%0',
-      creationToken: 'tok',
-      updatedAt: NOW,
+    await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-1', paneId: '%0', creationToken: 'tok' }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: {
+        reject: new EnsureSessionError({ createdSession: false, agentId: 'dev-1' }, 'session claim mismatch'),
+      },
     });
-    await taskStore.set({
-      id: 'task-1',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-1',
-      reviewRound: 0,
-      status: 'in_progress',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: false, agentId: 'dev-1' }, 'session claim mismatch'),
-    );
-
-    await manager.recover();
 
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBeUndefined();
@@ -553,19 +437,7 @@ describe('recover()', () => {
 
 describe('setupRecoveredPostApproveSignals()', () => {
   it('sets up approved tasks with stored completion records', async () => {
-    await taskStore.set({
-      id: 'task-approved',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-approved',
-      reviewRound: 1,
-      status: 'approved',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+    await seedTask({ id: 'task-approved', reviewRound: 1, status: 'approved' });
     await manager.setPostApproveCompletion('task-approved', {
       token: 'tok',
       approvedHeadSha: 'a'.repeat(40),
@@ -626,246 +498,81 @@ describe('setupRecoveredSpecSignals()', () => {
     return { watcher, events: localEvents };
   }
 
-  it('sets up spec-done|pr-created when phase is undefined (pre-spec-review) and status is in_progress', async () => {
-    await taskStore.set({
-      id: 'task-1',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-1',
-      reviewRound: 0,
-      status: 'in_progress',
-      signalToken: 'tok-ready',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+  // Each row arms exactly one task and asserts watcher.start receives the matching options.
+  // spec-review rows use objectContaining because onReadFile is a fresh closure per call.
+  it.each<[string, Partial<TaskState> & { id: string }, unknown]>([
+    ['sets up spec-done|pr-created when phase is undefined (pre-spec-review) and status is in_progress',
+      { id: 'task-1', signalToken: 'tok-ready' },
+      {
+        taskId: 'task-1', projectId: 'proj', agentId: 'dev-1',
+        expectedKinds: ['spec-done', 'pr-created'], token: 'tok-ready',
+        // pre-spec spec-done has only the pane channel (no poller backstop, agents
+        // don't re-emit), so the snapshot must be scanned on recovery.
+        skipSnapshot: false, recovered: true,
+      }],
+    ['sets up pr-created for code-phase tasks (dispatched after spec approval)',
+      { id: 'task-code', phase: 'code', signalToken: 'tok-code' },
+      {
+        taskId: 'task-code', projectId: 'proj', agentId: 'dev-1',
+        expectedKinds: ['pr-created'], token: 'tok-code', skipSnapshot: true, recovered: true,
+      }],
+    ['sets up spec-reviewed for spec-phase review tasks',
+      { id: 'task-2', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec', signalToken: 'tok-review', status: 'review' },
+      expect.objectContaining({
+        taskId: 'task-2', projectId: 'proj', agentId: 'qa-1',
+        expectedKinds: ['spec-reviewed'], token: 'tok-review',
+        // spec phase always uses server protocol (pane signals are the only verdict
+        // channel — no poller backstop), so snapshot scan and read-file are enabled.
+        skipSnapshot: false, onReadFile: expect.any(Function), recovered: true,
+      })],
+    ['sets up spec-fixed for spec-phase fixing tasks',
+      { id: 'task-3', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec', signalToken: 'tok-fix', status: 'fixing' },
+      {
+        taskId: 'task-3', projectId: 'proj', agentId: 'dev-1',
+        expectedKinds: ['spec-fixed'], token: 'tok-fix',
+        // spec phase always uses server protocol — scan snapshot on recovery.
+        skipSnapshot: false, recovered: true,
+      }],
+    ['sets up pr-fixed for code-phase fixing tasks',
+      { id: 'task-code-fix', qaAgentId: 'qa-1', reviewRound: 1, phase: 'code', signalToken: 'tok-prfix', status: 'fixing', prNumber: 60 },
+      {
+        taskId: 'task-code-fix', projectId: 'proj', agentId: 'dev-1',
+        expectedKinds: ['pr-fixed'], token: 'tok-prfix',
+        // pr-fixed is a one-shot completion signal: scan snapshot on recovery so an
+        // already-echoed signal isn't lost (handler is replay-safe via token+status).
+        skipSnapshot: false, recovered: true,
+      }],
+    // phase undefined or 'code' is both fine; 'spec' is excluded.
+    ['sets up PR verdict-choice {pr-approved, pr-changes-requested} for review-phase tasks with qaAgentId',
+      { id: 'task-pr-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review', signalToken: 'tok-verdict', prNumber: 50 },
+      {
+        taskId: 'task-pr-review', projectId: 'proj', agentId: 'qa-1',
+        expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'tok-verdict',
+        // PR verdict recovery scans the snapshot: QA may have echoed before
+        // review.submitted persisted, so we re-read scrollback (token rotation
+        // gates stale verdicts). Other phases stay skipSnapshot=true.
+        skipSnapshot: false, recovered: true,
+      }],
+    ['sets up snapshot scan and read-file for github spec-review tasks',
+      { id: 'task-gh-spec', qaAgentId: 'qa-1', specReviewRound: 1, status: 'review', phase: 'spec', reviewMode: 'github', signalToken: 'tok-spec' },
+      expect.objectContaining({
+        taskId: 'task-gh-spec', agentId: 'qa-1', expectedKinds: ['spec-reviewed'],
+        skipSnapshot: false, onReadFile: expect.any(Function),
+      })],
+  ])('%s', async (_label, task, expectedArg) => {
+    await seedTask(task);
     const { watcher } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
 
-    expect(watcher.start).toHaveBeenCalledWith({
-      taskId: 'task-1',
-      projectId: 'proj',
-      agentId: 'dev-1',
-      expectedKinds: ['spec-done', 'pr-created'],
-      token: 'tok-ready',
-      // pre-spec spec-done has only the pane channel (no poller backstop, agents
-      // don't re-emit), so the snapshot must be scanned on recovery.
-      skipSnapshot: false,
-      recovered: true,
-    });
+    expect(watcher.start).toHaveBeenCalledWith(expectedArg);
   });
 
-  it('sets up pr-created for code-phase tasks (dispatched after spec approval)', async () => {
-    await taskStore.set({
-      id: 'task-code',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-code',
-      reviewRound: 0,
-      status: 'in_progress',
-      phase: 'code',
-      signalToken: 'tok-code',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledWith({
-      taskId: 'task-code',
-      projectId: 'proj',
-      agentId: 'dev-1',
-      expectedKinds: ['pr-created'],
-      token: 'tok-code',
-      skipSnapshot: true,
-      recovered: true,
-    });
-  });
-
-  it('sets up spec-reviewed for spec-phase review tasks', async () => {
-    await taskStore.set({
-      id: 'task-2',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-2',
-      reviewRound: 0,
-      specReviewRound: 1,
-      phase: 'spec',
-      signalToken: 'tok-review',
-      status: 'review',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task-2',
-      projectId: 'proj',
-      agentId: 'qa-1',
-      expectedKinds: ['spec-reviewed'],
-      token: 'tok-review',
-      // spec phase always uses server protocol (pane signals are the only verdict
-      // channel — no poller backstop), so snapshot scan and read-file are enabled.
-      skipSnapshot: false,
-      onReadFile: expect.any(Function),
-      recovered: true,
-    }));
-  });
-
-  it('sets up spec-fixed for spec-phase fixing tasks', async () => {
-    await taskStore.set({
-      id: 'task-3',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-3',
-      reviewRound: 0,
-      specReviewRound: 1,
-      phase: 'spec',
-      signalToken: 'tok-fix',
-      status: 'fixing',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledWith({
-      taskId: 'task-3',
-      projectId: 'proj',
-      agentId: 'dev-1',
-      expectedKinds: ['spec-fixed'],
-      token: 'tok-fix',
-      // spec phase always uses server protocol — scan snapshot on recovery.
-      skipSnapshot: false,
-      recovered: true,
-    });
-  });
-
-  it('sets up pr-fixed for code-phase fixing tasks', async () => {
-    await taskStore.set({
-      id: 'task-code-fix',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-code-fix',
-      reviewRound: 1,
-      phase: 'code',
-      signalToken: 'tok-prfix',
-      status: 'fixing',
-      prNumber: 60,
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledWith({
-      taskId: 'task-code-fix',
-      projectId: 'proj',
-      agentId: 'dev-1',
-      expectedKinds: ['pr-fixed'],
-      token: 'tok-prfix',
-      // pr-fixed is a one-shot completion signal: scan snapshot on recovery so an
-      // already-echoed signal isn't lost (handler is replay-safe via token+status).
-      skipSnapshot: false,
-      recovered: true,
-    });
-  });
-
-  it('sets up PR verdict-choice {pr-approved, pr-changes-requested} for review-phase tasks with qaAgentId', async () => {
-    await taskStore.set({
-      id: 'task-pr-review',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-pr-review',
-      reviewRound: 1,
-      // phase undefined or 'code' is both fine; 'spec' is excluded.
-      status: 'review',
-      signalToken: 'tok-verdict',
-      prNumber: 50,
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledWith({
-      taskId: 'task-pr-review',
-      projectId: 'proj',
-      agentId: 'qa-1',
-      expectedKinds: ['pr-approved', 'pr-changes-requested'],
-      token: 'tok-verdict',
-      // PR verdict recovery scans the snapshot: QA may have echoed before
-      // review.submitted persisted, so we re-read scrollback (token rotation
-      // gates stale verdicts). Other phases stay skipSnapshot=true.
-      skipSnapshot: false,
-      recovered: true,
-    });
-  });
-
-  it('skips tasks without signalToken', async () => {
-    await taskStore.set({
-      id: 'task-4',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-4',
-      reviewRound: 0,
-      status: 'in_progress',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).not.toHaveBeenCalled();
-  });
-
-  it('skips terminal tasks even when signalToken is set', async () => {
-    await taskStore.set({
-      id: 'task-5',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-5',
-      reviewRound: 0,
-      signalToken: 'tok-stale',
-      status: 'merged',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+  it.each<[string, Partial<TaskState> & { id: string }]>([
+    ['skips tasks without signalToken', { id: 'task-4' }],
+    ['skips terminal tasks even when signalToken is set', { id: 'task-5', signalToken: 'tok-stale', status: 'merged' }],
+  ])('%s', async (_label, task) => {
+    await seedTask(task);
     const { watcher } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
@@ -874,39 +581,13 @@ describe('setupRecoveredSpecSignals()', () => {
   });
 
   it('emits info intervention for each recovered spec-phase task', async () => {
-    await taskStore.set({
-      id: 'task-armed-1',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-armed-1',
-      reviewRound: 0,
-      specReviewRound: 1,
-      phase: 'spec',
-      signalToken: 'tok-armed-review',
-      status: 'review',
-      createdAt: NOW,
-      updatedAt: NOW,
+    await seedTask({
+      id: 'task-armed-1', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec',
+      signalToken: 'tok-armed-review', status: 'review',
     });
-    await taskStore.set({
-      id: 'task-armed-2',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-armed-2',
-      reviewRound: 0,
-      specReviewRound: 2,
-      phase: 'spec',
-      signalToken: 'tok-armed-fix',
-      status: 'fixing',
-      createdAt: NOW,
-      updatedAt: NOW,
+    await seedTask({
+      id: 'task-armed-2', qaAgentId: 'qa-1', specReviewRound: 2, phase: 'spec',
+      signalToken: 'tok-armed-fix', status: 'fixing',
     });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
 
@@ -924,34 +605,9 @@ describe('setupRecoveredSpecSignals()', () => {
     expect(kinds).toEqual(['spec-fixed', 'spec-reviewed']);
   });
 
-  it('sets up snapshot scan and read-file for github spec-review tasks', async () => {
-    await taskStore.set({
-      id: 'task-gh-spec', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1',
-      branch: 'bx/task-gh-spec', reviewRound: 0, specReviewRound: 1,
-      status: 'review', phase: 'spec', reviewMode: 'github',
-      signalToken: 'tok-spec', createdAt: NOW, updatedAt: NOW,
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
-      taskId: 'task-gh-spec',
-      agentId: 'qa-1',
-      expectedKinds: ['spec-reviewed'],
-      skipSnapshot: false,
-      onReadFile: expect.any(Function),
-    }));
-  });
-
   it('skips snapshot and read-file for github code-phase tasks', async () => {
-    await taskStore.set({
-      id: 'task-gh-code', projectId: 'proj', title: 'T', description: 'D',
-      preferredAgentId: 'dev-1', agentId: 'dev-1',
-      branch: 'bx/task-gh-code', reviewRound: 0,
-      status: 'in_progress', phase: 'code', reviewMode: 'github',
-      signalToken: 'tok-code', createdAt: NOW, updatedAt: NOW,
+    await seedTask({
+      id: 'task-gh-code', phase: 'code', reviewMode: 'github', signalToken: 'tok-code',
     });
     const { watcher } = await buildManagerWithSpecWatcher();
 
@@ -965,20 +621,7 @@ describe('setupRecoveredSpecSignals()', () => {
   });
 
   it('does NOT emit intervention for pre-spec (spec-done|pr-created) recovered tasks', async () => {
-    await taskStore.set({
-      id: 'task-pre-spec',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      branch: 'bx/task-pre-spec',
-      reviewRound: 0,
-      status: 'in_progress',
-      signalToken: 'tok-pre-spec',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+    await seedTask({ id: 'task-pre-spec', signalToken: 'tok-pre-spec' });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();

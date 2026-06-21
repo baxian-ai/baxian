@@ -1,25 +1,28 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import type { FastifyInstance } from 'fastify';
 import type { BaxianConfig, BaxianEvent, ProjectConfig } from '../../src/shared/index.js';
-import { buildApp } from '../../src/app.js';
-import { createTestContext } from '../helpers/context.js';
+import {
+  requesters,
+  seedConfigPath,
+  setupApiHarness,
+  teardownApiHarness,
+  JSON_HEADERS,
+  type ApiHarness,
+} from './helpers.js';
 
+let harness: ApiHarness;
 let tempDir: string;
 let app: FastifyInstance;
+const { get, patch } = requesters(() => app);
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-other-test-'));
-  const ctx = await createTestContext(tempDir);
-  app = await buildApp(ctx);
+  harness = await setupApiHarness('other');
+  ({ tempDir, app } = harness);
 });
 
-afterEach(async () => {
-  await app.close();
-  await rm(tempDir, { recursive: true });
-});
+afterEach(() => teardownApiHarness(harness));
 
 describe('GET /api/events', () => {
   it('returns events for today (default)', async () => {
@@ -35,7 +38,7 @@ describe('GET /api/events', () => {
     };
     await app.ctx.eventLog.append(event);
 
-    const response = await app.inject({ method: 'GET', url: '/api/events' });
+    const response = await get('/api/events');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as BaxianEvent[];
     expect(body).toHaveLength(1);
@@ -53,7 +56,7 @@ describe('GET /api/events', () => {
     };
     await app.ctx.eventLog.append(event);
 
-    const response = await app.inject({ method: 'GET', url: `/api/events?date=${date}` });
+    const response = await get(`/api/events?date=${date}`);
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as BaxianEvent[];
     expect(body).toHaveLength(1);
@@ -63,7 +66,7 @@ describe('GET /api/events', () => {
 
 describe('GET /api/config', () => {
   it('returns current config', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/config' });
+    const response = await get('/api/config');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as BaxianConfig;
     expect(body.server.port).toBe(3000);
@@ -73,18 +76,14 @@ describe('GET /api/config', () => {
   it('redacts server.token when set', async () => {
     const token = 'super-secret-token';
     app.ctx.config = { ...app.ctx.config, server: { ...app.ctx.config.server, token } };
-    const response = await app.inject({
-      method: 'GET',
-      url: '/api/config',
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const response = await get('/api/config', { headers: { Authorization: `Bearer ${token}` } });
     const body = JSON.parse(response.body) as BaxianConfig;
     expect(body.server.token).toBe('***');
   });
 
   it('redacts registry host passwords', async () => {
     app.ctx.config = { ...app.ctx.config, host: [{ id: 'box', hostname: 'h', password: 'reg-secret' }] };
-    const response = await app.inject({ method: 'GET', url: '/api/config' });
+    const response = await get('/api/config');
     const body = JSON.parse(response.body) as BaxianConfig;
     expect(body.host[0].password).toBe('***');
   });
@@ -97,10 +96,10 @@ describe('GET /api/config', () => {
         agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: { hostname: 'legacy', password: 'inline-secret' } }]],
       }],
     };
-    const cfg = JSON.parse((await app.inject({ method: 'GET', url: '/api/config' })).body) as BaxianConfig;
+    const cfg = JSON.parse((await get('/api/config')).body) as BaxianConfig;
     expect((cfg.project[0].agent[0][0].host as { password?: string }).password).toBe('***');
 
-    const projects = JSON.parse((await app.inject({ method: 'GET', url: '/api/projects' })).body) as ProjectConfig[];
+    const projects = JSON.parse((await get('/api/projects')).body) as ProjectConfig[];
     expect((projects[0].agent[0][0].host as { password?: string }).password).toBe('***');
   });
 
@@ -109,16 +108,11 @@ describe('GET /api/config', () => {
 describe('PATCH /api/config', () => {
   it('preserves existing server.token when client round-trips the redacted placeholder', async () => {
     const original = 'real-token-value';
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = { ...app.ctx.config, server: { ...app.ctx.config.server, token: original } };
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${original}` },
-      payload: { server: { port: 3000, token: '***' } },
+    const response = await patch('/api/config', { server: { port: 3000, token: '***' } }, {
+      headers: { ...JSON_HEADERS, Authorization: `Bearer ${original}` },
     });
     expect(response.statusCode).toBe(200);
     expect(app.ctx.config.server.token).toBe(original);
@@ -126,25 +120,18 @@ describe('PATCH /api/config', () => {
 
   it('clears server.token when client sends an explicit empty/whitespace value', async () => {
     const original = 'abc';
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = { ...app.ctx.config, server: { ...app.ctx.config.server, token: original } };
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${original}` },
-      payload: { server: { port: 3000, token: '   ' } },
+    const response = await patch('/api/config', { server: { port: 3000, token: '   ' } }, {
+      headers: { ...JSON_HEADERS, Authorization: `Bearer ${original}` },
     });
     expect(response.statusCode).toBe(200);
     expect(app.ctx.config.server.token).toBeUndefined();
   });
 
   it('rejects host edits via PATCH /config (registry is managed via /hosts) and preserves current.host', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = { ...app.ctx.config, host: [{ id: 'box', hostname: 'h', port: 22, password: 'real-secret' }] };
 
     // Any host in the body (well-formed or not) is rejected — it would bypass /hosts' connectivity +
@@ -156,12 +143,7 @@ describe('PATCH /api/config', () => {
       'oops',
       { id: 'x' },
     ]) {
-      const response = await app.inject({
-        method: 'PATCH',
-        url: '/api/config',
-        headers: { 'Content-Type': 'application/json' },
-        payload: { host: hostPayload },
-      });
+      const response = await patch('/api/config', { host: hostPayload }, { headers: JSON_HEADERS });
       expect(response.statusCode, JSON.stringify(hostPayload)).toBe(400);
     }
     expect(app.ctx.config.host[0].hostname).toBe('h');
@@ -169,28 +151,19 @@ describe('PATCH /api/config', () => {
   });
 
   it('returns 400 (not 500) for a malformed project on PATCH /config (host-ref guard runs post-validation)', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     for (const bad of [
       { id: 'bad' },                                                     // object, not array
       'oops',                                                            // string
       [{ id: 'pp', repo: 'u/r', merge: null, agent: { not: 'array' } }], // nested agent not an array
     ]) {
-      const response = await app.inject({
-        method: 'PATCH',
-        url: '/api/config',
-        headers: { 'Content-Type': 'application/json' },
-        payload: { project: bad },
-      });
+      const response = await patch('/api/config', { project: bad }, { headers: JSON_HEADERS });
       expect(response.statusCode, JSON.stringify(bad)).toBe(400);
     }
   });
 
   it('rejects changing the host of a live agent via PATCH /config project replace (409)', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
       host: [{ id: 'box', hostname: 'h', port: 22 }, { id: 'box2', hostname: 'h2', port: 22 }],
@@ -201,38 +174,26 @@ describe('PATCH /api/config', () => {
     };
     app.ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' }); // live
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json' },
-      payload: {
-        project: [{
-          id: 'proj', repo: 'user/repo', merge: null,
-          agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box2' }]],
-        }],
-      },
-    });
+    const response = await patch('/api/config', {
+      project: [{
+        id: 'proj', repo: 'user/repo', merge: null,
+        agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box2' }]],
+      }],
+    }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(409);
     // unchanged in memory
     expect((app.ctx.config.project[0].agent[0][0]).host).toBe('box');
   });
 
   it('rejects PATCH with out-of-range server.githubPollIntervalMs and preserves existing valid value', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
       server: { ...app.ctx.config.server, githubPollIntervalMs: 45000 },
     };
 
     for (const bad of [500, 1500.5, 2147483648]) {
-      const response = await app.inject({
-        method: 'PATCH',
-        url: '/api/config',
-        headers: { 'Content-Type': 'application/json' },
-        payload: { server: { port: 3000, githubPollIntervalMs: bad } },
-      });
+      const response = await patch('/api/config', { server: { port: 3000, githubPollIntervalMs: bad } }, { headers: JSON_HEADERS });
       expect(response.statusCode).toBe(400);
       // Existing value preserved — operator's saved 45_000 is not clobbered.
       expect(app.ctx.config.server.githubPollIntervalMs).toBe(45000);
@@ -240,32 +201,18 @@ describe('PATCH /api/config', () => {
   });
 
   it('accepts PATCH with valid server.githubPollIntervalMs and persists it', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json' },
-      payload: { server: { port: 3000, githubPollIntervalMs: 60000 } },
-    });
+    const response = await patch('/api/config', { server: { port: 3000, githubPollIntervalMs: 60000 } }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
     expect(app.ctx.config.server.githubPollIntervalMs).toBe(60000);
   });
 
   it('rejects legacy "codereview" payload with 400 (silent ignore was a migration foot-gun)', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     const originalRounds = app.ctx.config.review.rounds;
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json' },
-      payload: { codereview: { rounds: 99 } },
-    });
+    const response = await patch('/api/config', { codereview: { rounds: 99 } }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body) as { details?: Array<{ path: string }> };
     expect(body.details?.some(e => e.path === 'codereview')).toBe(true);
@@ -274,17 +221,10 @@ describe('PATCH /api/config', () => {
   });
 
   it('rejects non-object JSON bodies (primitive / array) with 400, not 500', async () => {
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
 
     for (const value of ['x', 123, true, null, [1, 2, 3]]) {
-      const response = await app.inject({
-        method: 'PATCH',
-        url: '/api/config',
-        headers: { 'Content-Type': 'application/json' },
-        payload: JSON.stringify(value),
-      });
+      const response = await patch('/api/config', JSON.stringify(value), { headers: JSON_HEADERS });
       expect(response.statusCode).toBe(400);
       const body = JSON.parse(response.body) as { error?: string };
       expect(body.error).toBe('Invalid config');
@@ -295,9 +235,7 @@ describe('PATCH /api/config', () => {
     // PATCH /config bulk-replace must clean up stale bootstrap errors so removed-then-readded
     // ids don't resurrect red cards. Uses same sweep helper as startup so it also catches ids
     // that stay but leave auto-mode (workdir set) — see next test for that case.
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
       project: [{
@@ -308,12 +246,7 @@ describe('PATCH /api/config', () => {
     const sweepStaleBootstrapErrors = vi.fn().mockResolvedValue({ removed: 0 });
     app.ctx.errorRecordStore = { sweepStaleBootstrapErrors } as never;
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json' },
-      payload: { project: [] },
-    });
+    const response = await patch('/api/config', { project: [] }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
     // Sweep called with empty active set (all agents gone) — any stale bootstrap record
     // would be filtered out.
@@ -325,9 +258,7 @@ describe('PATCH /api/config', () => {
     // Round-5 P2: same agent id, but config flips it from auto-bootstrap (no workdir) to
     // manual (workdir set). The id is NOT removed — old diff-by-id logic missed it; sweep
     // by autoBootstrapAgentIds set catches it because the agent left the active set.
-    const tempPath = join(tempDir, 'baxian.json');
-    await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-    app.ctx.configPath = tempPath;
+    await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
       project: [{
@@ -338,15 +269,10 @@ describe('PATCH /api/config', () => {
     const sweepStaleBootstrapErrors = vi.fn().mockResolvedValue({ removed: 1 });
     app.ctx.errorRecordStore = { sweepStaleBootstrapErrors } as never;
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/config',
-      headers: { 'Content-Type': 'application/json' },
-      payload: { project: [{
-        id: 'p1', repo: 'a/b', merge: null,
-        agent: [[{ id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/manual', yolo: true }]],
-      }] },
-    });
+    const response = await patch('/api/config', { project: [{
+      id: 'p1', repo: 'a/b', merge: null,
+      agent: [[{ id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/manual', yolo: true }]],
+    }] }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
     const activeSet = sweepStaleBootstrapErrors.mock.calls[0][0] as Set<string>;
     // becoming-manual now has workdir → NOT in active auto-bootstrap set, sweep would purge it.
@@ -355,15 +281,8 @@ describe('PATCH /api/config', () => {
 
   describe('restart-required diff', () => {
     async function patchAndRead(payload: unknown): Promise<{ statusCode: number; body: { restartRequired: boolean; note: string } }> {
-      const tempPath = join(tempDir, 'baxian.json');
-      await import('node:fs/promises').then(m => m.writeFile(tempPath, '{}'));
-      app.ctx.configPath = tempPath;
-      const response = await app.inject({
-        method: 'PATCH',
-        url: '/api/config',
-        headers: { 'Content-Type': 'application/json' },
-        payload,
-      });
+      await seedConfigPath(app, tempDir);
+      const response = await patch('/api/config', payload, { headers: JSON_HEADERS });
       return { statusCode: response.statusCode, body: JSON.parse(response.body) };
     }
 
@@ -412,9 +331,9 @@ describe('PATCH /api/config', () => {
       const tmpA = join(tempDir, 'a.key');
       const tmpB = join(tempDir, 'b.key');
       const tmpCert = join(tempDir, 'a.cert');
-      await import('node:fs/promises').then(m => Promise.all([
-        m.writeFile(tmpA, 'k'), m.writeFile(tmpB, 'k2'), m.writeFile(tmpCert, 'c'),
-      ]));
+      await Promise.all([
+        writeFile(tmpA, 'k'), writeFile(tmpB, 'k2'), writeFile(tmpCert, 'c'),
+      ]);
       app.ctx.config = {
         ...app.ctx.config,
         server: { ...app.ctx.config.server, https: { keyFile: tmpA, certFile: tmpCert } },
@@ -438,7 +357,7 @@ describe('PATCH /api/config', () => {
 
 describe('GET /api/projects', () => {
   it('returns project list', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/projects' });
+    const response = await get('/api/projects');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as ProjectConfig[];
     expect(body).toHaveLength(1);
@@ -449,7 +368,7 @@ describe('GET /api/projects', () => {
 
 describe('GET /api/projects/:id', () => {
   it('returns project details for known id', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/projects/proj' });
+    const response = await get('/api/projects/proj');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as ProjectConfig;
     expect(body.id).toBe('proj');
@@ -457,7 +376,7 @@ describe('GET /api/projects/:id', () => {
   });
 
   it('returns 404 for unknown project', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/projects/no-such-project' });
+    const response = await get('/api/projects/no-such-project');
     expect(response.statusCode).toBe(404);
   });
 });

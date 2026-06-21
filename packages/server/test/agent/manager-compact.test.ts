@@ -11,7 +11,7 @@ import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
-import type { BaxianConfig } from '../../src/shared/index.js';
+import type { AgentBindingFacts, BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
@@ -41,6 +41,115 @@ function execCalls(): string[] {
 
 function guardSet(): Set<string> {
   return (manager as never as { compactInFlight: Set<string> }).compactInFlight;
+}
+
+function seedAgent(overrides: Partial<AgentBindingFacts> = {}): Promise<void> {
+  return agentStore.set({
+    id: 'dev-1',
+    projectId: 'proj',
+    paneId: '%7',
+    updatedAt: new Date().toISOString(),
+    ...overrides,
+  });
+}
+
+// Make waitForReplPromptReady block until the caller resolves the next queued gate.
+// Each call to compact/clear/dispatch awaits the prompt 3x, so draining gates step-steps it.
+function installGates(): Array<() => void> {
+  const gates: Array<() => void> = [];
+  waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
+  return gates;
+}
+
+function setPollMs(ms: number): void {
+  (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = ms;
+}
+
+// Call a private AgentManager method with `manager` as `this` (the method reads
+// this.agentStore etc., so it must not be detached from the instance).
+function callPrivate<T>(name: string, ...args: unknown[]): T {
+  return (manager as never as Record<string, (...a: unknown[]) => T>)[name](...args);
+}
+
+function runPostMergeCompaction(...args: unknown[]): Promise<void> {
+  return callPrivate('runPostMergeCompaction', ...args);
+}
+
+function injectAndAwaitAck(...args: unknown[]): Promise<{ acked: boolean }> {
+  return callPrivate('injectAndAwaitAck', ...args);
+}
+
+function stubReleasePostMergeAgent(): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(
+    manager as never as { releasePostMergeAgent: (...args: unknown[]) => Promise<void> },
+    'releasePostMergeAgent',
+  ).mockResolvedValue(undefined);
+}
+
+function mockFn(): ReturnType<typeof vi.fn> {
+  return vi.fn().mockResolvedValue(undefined);
+}
+
+function fakeCompactionTmux(): Record<string, ReturnType<typeof vi.fn>> {
+  return { injectPrompt: mockFn(), sendEnter: mockFn(), sendKeysLiteral: mockFn(), sendKeysToPane: mockFn() };
+}
+
+function fakeDispatchTmux(): Record<string, ReturnType<typeof vi.fn>> {
+  return {
+    injectPrompt: mockFn(), captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
+    sendEnter: mockFn(), waitSubmitAck: mockFn(),
+  };
+}
+
+function expectGuardReleased(id: string): Promise<void> {
+  return vi.waitFor(() => expect(guardSet().has(id)).toBe(false));
+}
+
+function waitGates(gates: Array<() => void>, n: number): Promise<void> {
+  return vi.waitFor(() => expect(gates.length).toBe(n));
+}
+
+// Drain the 3 prompt-ready gates a single compact/clear awaits, settling the
+// holder promise mid-way (the third gate is opened last, releasing the guard).
+async function drainHolderGates(gates: Array<() => void>, holder: Promise<unknown>): Promise<void> {
+  gates[0]();
+  await waitGates(gates, 2);
+  gates[1]();
+  await holder;
+  await waitGates(gates, 3);
+  gates[2]();
+}
+
+async function drainHolderAndRelease(
+  gates: Array<() => void>,
+  holder: Promise<unknown>,
+  id: string,
+): Promise<void> {
+  await drainHolderGates(gates, holder);
+  await expectGuardReleased(id);
+}
+
+// Install the gates, kick off a guard-holding operation (compact by default),
+// and wait until it parks on its first prompt-ready gate.
+async function startGuarded(
+  start: () => Promise<unknown> = () => manager.compactAgent('dev-1'),
+): Promise<{ gates: Array<() => void>; holder: Promise<unknown> }> {
+  const gates = installGates();
+  const holder = start();
+  await waitGates(gates, 1);
+  return { gates, holder };
+}
+
+// Start an image upload that blocks inside writeFile until releaseWrite() is
+// called, so the upload holds the shared guard for the duration.
+async function startBlockedUpload(id: string): Promise<{ upload: Promise<unknown>; releaseWrite: () => void }> {
+  let releaseWrite: () => void = () => {};
+  (mockRunner.writeFile as ReturnType<typeof vi.fn>).mockReturnValue(
+    new Promise<void>(r => { releaseWrite = r; }),
+  );
+  const upload = manager.attachImageToRunningAgent(id, Buffer.from([0x89, 0x50]), 'png');
+  await vi.waitFor(() => expect(mockRunner.writeFile).toHaveBeenCalled());
+  return { upload, releaseWrite };
 }
 
 beforeEach(async () => {
@@ -96,15 +205,13 @@ afterEach(async () => {
 
 describe('compactAgent', () => {
   it('waits for an idle prompt, clears the composer with C-c, then sends /compact + Enter', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
+    await seedAgent();
     waitReadySpy.mockResolvedValue(undefined);
 
     await manager.compactAgent('dev-1');
 
     await vi.waitFor(() => expect(waitReadySpy).toHaveBeenCalledTimes(3));
-    await vi.waitFor(() => {
-      expect(guardSet().has('dev-1')).toBe(false);
-    });
+    await expectGuardReleased('dev-1');
     const [, paneId, runtime, timeoutMs] = waitReadySpy.mock.calls[0];
     expect(paneId).toBe('%7');
     expect(runtime).toBe('claude-code');
@@ -121,63 +228,42 @@ describe('compactAgent', () => {
   });
 
   it('rejects 409 when a compact for the same agent is already in flight, and releases the guard after', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    const waitGates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { waitGates.push(r); }));
-
-    const first = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(waitGates.length).toBe(1));
+    await seedAgent();
+    const { gates, holder: first } = await startGuarded();
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    waitGates[0]();
-    await vi.waitFor(() => expect(waitGates.length).toBe(2));
-    waitGates[1]();
-    await first;
-
-    await vi.waitFor(() => expect(waitGates.length).toBe(3));
-    waitGates[2]();
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await drainHolderAndRelease(gates, first, 'dev-1');
 
     waitReadySpy.mockResolvedValue(undefined);
     await expect(manager.compactAgent('dev-1')).resolves.toBeUndefined();
   });
 
-  it('rejects 409 and sends nothing when the agent is re-dispatched (taskId changes) during the wait', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    waitReadySpy.mockImplementation(async () => {
-      await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', taskId: 'task-new', updatedAt: new Date().toISOString() });
-    });
-
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('session changed'),
-    });
-    expect(execCalls().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
-  });
-
-  it('rejects 409 and sends nothing when a same-task re-dispatch bumps updatedAt during the wait', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', taskId: 'task-1', updatedAt: '2026-06-12T08:00:00.000Z' });
-    waitReadySpy.mockImplementation(async () => {
+  // A session change observed mid-wait (taskId flip, same-task updatedAt bump, or
+  // pane rebuild) must abort with 409 before any C-c / /compact reaches tmux.
+  it.each([
+    {
+      label: 're-dispatched (taskId changes)',
+      seed: () => seedAgent(),
+      reseed: () => seedAgent({ taskId: 'task-new' }),
+    },
+    {
+      label: 'same-task re-dispatch bumps updatedAt',
+      seed: () => seedAgent({ taskId: 'task-1', updatedAt: '2026-06-12T08:00:00.000Z' }),
       // 同任务 phase 派发：paneId/taskId 均不变，仅 agent state 被重写。
-      await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', taskId: 'task-1', updatedAt: '2026-06-12T08:00:01.000Z' });
-    });
-
-    await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('session changed'),
-    });
-    expect(execCalls().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
-  });
-
-  it('rejects 409 and sends nothing when the pane is rebuilt during the wait', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    waitReadySpy.mockImplementation(async () => {
-      await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%9', updatedAt: new Date().toISOString() });
-    });
+      reseed: () => seedAgent({ taskId: 'task-1', updatedAt: '2026-06-12T08:00:01.000Z' }),
+    },
+    {
+      label: 'pane is rebuilt',
+      seed: () => seedAgent(),
+      reseed: () => seedAgent({ paneId: '%9' }),
+    },
+  ])('rejects 409 and sends nothing when the $label during the wait', async ({ seed, reseed }) => {
+    await seed();
+    waitReadySpy.mockImplementation(async () => { await reseed(); });
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
@@ -187,7 +273,7 @@ describe('compactAgent', () => {
   });
 
   it('passes the configured runtime through for a codex agent', async () => {
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', paneId: '%3', updatedAt: new Date().toISOString() });
+    await seedAgent({ id: 'qa-1', paneId: '%3' });
     waitReadySpy.mockResolvedValue(undefined);
 
     await manager.compactAgent('qa-1');
@@ -196,7 +282,7 @@ describe('compactAgent', () => {
   });
 
   it('rejects 409 without sending anything when the runtime is not at an idle prompt', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
+    await seedAgent();
     waitReadySpy.mockRejectedValue(new Error('pane %7 stayed busy past 5000ms'));
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
@@ -217,45 +303,34 @@ describe('compactAgent', () => {
   });
 
   it('post-merge compaction waits for an in-flight manual compact instead of running concurrently', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', taskId: 't1', updatedAt: '2026-06-12T09:00:00.000Z' });
-    (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = 1;
-    vi.spyOn(
-      manager as never as { releasePostMergeAgent: (...args: unknown[]) => Promise<void> },
-      'releasePostMergeAgent',
-    ).mockResolvedValue(undefined);
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-    const fakeTmux = {
-      injectPrompt: vi.fn().mockResolvedValue(undefined),
-      sendEnter: vi.fn().mockResolvedValue(undefined),
-      sendKeysLiteral: vi.fn().mockResolvedValue(undefined),
-      sendKeysToPane: vi.fn().mockResolvedValue(undefined),
-    };
+    await seedAgent({ taskId: 't1', updatedAt: '2026-06-12T09:00:00.000Z' });
+    setPollMs(1);
+    stubReleasePostMergeAgent();
+    const gates = installGates();
+    const fakeTmux = fakeCompactionTmux();
 
     const manual = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    await waitGates(gates, 1);
 
-    const postMerge = (manager as never as {
-      runPostMergeCompaction(...args: unknown[]): Promise<void>;
-    }).runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'cleanup prompt');
+    const postMerge = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'cleanup prompt');
     await new Promise(r => setTimeout(r, 20));
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
     expect(gates.length).toBe(1);
 
     gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
+    await waitGates(gates, 2);
     gates[1]();
     await manual;
 
-    await vi.waitFor(() => expect(gates.length).toBe(3));
+    await waitGates(gates, 3);
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
     gates[2]();
-    await vi.waitFor(() => expect(gates.length).toBe(4));
+    await waitGates(gates, 4);
     gates[3]();
     await vi.waitFor(() => expect(fakeTmux.injectPrompt).toHaveBeenCalled());
-    await vi.waitFor(() => expect(gates.length).toBe(5));
+    await waitGates(gates, 5);
     gates[4]();
-    await vi.waitFor(() => expect(gates.length).toBe(6));
+    await waitGates(gates, 6);
     gates[5]();
     await postMerge;
 
@@ -263,12 +338,8 @@ describe('compactAgent', () => {
   });
 
   it('rejects image attach with 409 while a compact holds the guard', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-
-    const manual = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    await seedAgent();
+    const { gates, holder: manual } = await startGuarded();
 
     await expect(
       manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50, 0x4e, 0x47]), 'png'),
@@ -277,24 +348,14 @@ describe('compactAgent', () => {
       message: expect.stringContaining('in progress'),
     });
 
-    gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
-    gates[1]();
-    await manual;
-    await vi.waitFor(() => expect(gates.length).toBe(3));
-    gates[2]();
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await drainHolderAndRelease(gates, manual, 'dev-1');
   });
 
   it('keeps the guard until the runtime is idle again after /compact, blocking uploads meanwhile', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-
-    const manual = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    await seedAgent();
+    const { gates, holder: manual } = await startGuarded();
     gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
+    await waitGates(gates, 2);
     gates[1]();
     await manual;
 
@@ -302,9 +363,9 @@ describe('compactAgent', () => {
       manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
     ).rejects.toMatchObject({ status: 409, message: expect.stringContaining('in progress') });
 
-    await vi.waitFor(() => expect(gates.length).toBe(3));
+    await waitGates(gates, 3);
     gates[2]();
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await expectGuardReleased('dev-1');
 
     await expect(
       manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
@@ -312,32 +373,16 @@ describe('compactAgent', () => {
   });
 
   it('dispatch injection waits for an in-flight compact instead of pasting concurrently', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = 1;
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-    const fakeTmux = {
-      injectPrompt: vi.fn().mockResolvedValue(undefined),
-      captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
-      sendEnter: vi.fn().mockResolvedValue(undefined),
-      waitSubmitAck: vi.fn().mockResolvedValue(undefined),
-    };
+    await seedAgent();
+    setPollMs(1);
+    const fakeTmux = fakeDispatchTmux();
+    const { gates, holder: manual } = await startGuarded();
 
-    const manual = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
-
-    const dispatch = (manager as never as {
-      injectAndAwaitAck(...args: unknown[]): Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(fakeTmux, '%7', 'next prompt', 'dev-1', 'claude-code');
+    const dispatch = injectAndAwaitAck(fakeTmux, '%7', 'next prompt', 'dev-1', 'claude-code');
     await new Promise(r => setTimeout(r, 20));
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
 
-    gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
-    gates[1]();
-    await manual;
-    await vi.waitFor(() => expect(gates.length).toBe(3));
-    gates[2]();
+    await drainHolderGates(gates, manual);
 
     await expect(dispatch).resolves.toMatchObject({ acked: true });
     expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'next prompt', 'dev-1');
@@ -345,24 +390,13 @@ describe('compactAgent', () => {
   });
 
   it('aborts a guarded dispatch when the binding is released while waiting (task cancelled)', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', taskId: 't1', updatedAt: new Date().toISOString() });
-    (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = 1;
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-    const fakeTmux = {
-      injectPrompt: vi.fn().mockResolvedValue(undefined),
-      captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
-      sendEnter: vi.fn().mockResolvedValue(undefined),
-      waitSubmitAck: vi.fn().mockResolvedValue(undefined),
-    };
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const fakeTmux = fakeDispatchTmux();
+    const { gates, holder: manual } = await startGuarded();
 
-    const manual = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
-
-    const dispatch = (manager as never as {
-      injectAndAwaitAck(...args: unknown[]): Promise<unknown>;
-    }).injectAndAwaitAck(fakeTmux, '%7', 'stale prompt', 'dev-1', 'claude-code');
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
+    const dispatch = injectAndAwaitAck(fakeTmux, '%7', 'stale prompt', 'dev-1', 'claude-code');
+    await seedAgent();
 
     gates[0]();
     await expect(manual).rejects.toMatchObject({ status: 409 });
@@ -373,26 +407,17 @@ describe('compactAgent', () => {
   });
 
   it('read-file text injection waits for the guard, then pastes once it is released', async () => {
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', paneId: '%3', taskId: 't1', updatedAt: new Date().toISOString() });
-    (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = 1;
+    await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
+    setPollMs(1);
     const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
     const enterSpy = vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-
-    const manual = manager.compactAgent('qa-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    const { gates, holder: manual } = await startGuarded(() => manager.compactAgent('qa-1'));
 
     const inject = manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 't1' });
     await new Promise(r => setTimeout(r, 20));
     expect(injectSpy).not.toHaveBeenCalled();
 
-    gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
-    gates[1]();
-    await manual;
-    await vi.waitFor(() => expect(gates.length).toBe(3));
-    gates[2]();
+    await drainHolderGates(gates, manual);
 
     await inject;
     expect(injectSpy).toHaveBeenCalledWith('%3', 'file body', 'qa-1');
@@ -401,17 +426,13 @@ describe('compactAgent', () => {
   });
 
   it('drops stale read-file injection when the agent was rebound during the guard wait', async () => {
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', paneId: '%3', taskId: 't1', updatedAt: new Date().toISOString() });
-    (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = 1;
+    await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
+    setPollMs(1);
     const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-
-    const manual = manager.compactAgent('qa-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    const { gates, holder: manual } = await startGuarded(() => manager.compactAgent('qa-1'));
 
     const inject = manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 't1' });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', paneId: '%3', taskId: 't2', updatedAt: new Date().toISOString() });
+    await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't2' });
 
     gates[0]();
     await expect(manual).rejects.toMatchObject({ status: 409 });
@@ -422,14 +443,8 @@ describe('compactAgent', () => {
   });
 
   it('rejects manual compact while an image upload holds the guard, then allows it after the upload completes', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    let releaseWrite: (() => void) | undefined;
-    (mockRunner.writeFile as ReturnType<typeof vi.fn>).mockReturnValue(
-      new Promise<void>(r => { releaseWrite = r; }),
-    );
-
-    const upload = manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png');
-    await vi.waitFor(() => expect(mockRunner.writeFile).toHaveBeenCalled());
+    await seedAgent();
+    const { upload, releaseWrite } = await startBlockedUpload('dev-1');
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
@@ -437,7 +452,7 @@ describe('compactAgent', () => {
     });
     expect(execCalls().some(c => c.includes('C-c') || c.includes('/compact'))).toBe(false);
 
-    releaseWrite?.();
+    releaseWrite();
     await upload;
 
     waitReadySpy.mockResolvedValue(undefined);
@@ -445,20 +460,14 @@ describe('compactAgent', () => {
   });
 
   it('rejects a second image upload while the first still holds the guard', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    let releaseWrite: (() => void) | undefined;
-    (mockRunner.writeFile as ReturnType<typeof vi.fn>).mockReturnValue(
-      new Promise<void>(r => { releaseWrite = r; }),
-    );
-
-    const first = manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png');
-    await vi.waitFor(() => expect(mockRunner.writeFile).toHaveBeenCalled());
+    await seedAgent();
+    const { upload: first, releaseWrite } = await startBlockedUpload('dev-1');
 
     await expect(
       manager.attachImageToRunningAgent('dev-1', Buffer.from([0x89, 0x50]), 'png'),
     ).rejects.toMatchObject({ status: 409, message: expect.stringContaining('in progress') });
 
-    releaseWrite?.();
+    releaseWrite();
     await first;
   });
 
@@ -475,47 +484,26 @@ describe('compactAgent', () => {
   });
 
   it('rejects manual compact with 409 while a clear holds the guard', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-
-    const clear = manager.clearAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    await seedAgent();
+    const { gates, holder: clear } = await startGuarded(() => manager.clearAgent('dev-1'));
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
-    gates[1]();
-    await clear;
-    await vi.waitFor(() => expect(gates.length).toBe(3));
-    gates[2]();
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await drainHolderAndRelease(gates, clear, 'dev-1');
   });
 
   it('rejects manual compact with 409 while post-merge compaction holds the shared guard', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', taskId: 't1', updatedAt: new Date().toISOString() });
-    (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = 1;
-    const releaseSpy = vi.spyOn(
-      manager as never as { releasePostMergeAgent: (...args: unknown[]) => Promise<void> },
-      'releasePostMergeAgent',
-    ).mockResolvedValue(undefined);
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-    const fakeTmux = {
-      injectPrompt: vi.fn().mockResolvedValue(undefined),
-      sendEnter: vi.fn().mockResolvedValue(undefined),
-      sendKeysLiteral: vi.fn().mockResolvedValue(undefined),
-      sendKeysToPane: vi.fn().mockResolvedValue(undefined),
-    };
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    const gates = installGates();
+    const fakeTmux = fakeCompactionTmux();
 
-    const run = (manager as never as {
-      runPostMergeCompaction(...args: unknown[]): Promise<void>;
-    }).runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'cleanup prompt');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    const run = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'cleanup prompt');
+    await waitGates(gates, 1);
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
@@ -523,26 +511,26 @@ describe('compactAgent', () => {
     });
 
     gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
+    await waitGates(gates, 2);
     gates[1]();
-    await vi.waitFor(() => expect(gates.length).toBe(3));
+    await waitGates(gates, 3);
     gates[2]();
     await run;
 
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
-    expect((manager as never as { compactInFlight: Set<string> }).compactInFlight.has('dev-1')).toBe(false);
+    expect(guardSet().has('dev-1')).toBe(false);
   });
 });
 
 describe('clearAgent', () => {
   it('sends /clear instead of /compact', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
+    await seedAgent();
     waitReadySpy.mockResolvedValue(undefined);
 
     await manager.clearAgent('dev-1');
 
     await vi.waitFor(() => expect(waitReadySpy).toHaveBeenCalledTimes(3));
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await expectGuardReleased('dev-1');
 
     const calls = execCalls();
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/clear'));
@@ -553,28 +541,22 @@ describe('clearAgent', () => {
   });
 
   it('clears injectedSkills from the agent store after sending /clear', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString(),
-      injectedSkills: { taskId: 't1', paneId: '%7', skills: ['baxian-rules', 'task-check'] },
-    });
+    await seedAgent({ injectedSkills: { taskId: 't1', paneId: '%7', skills: ['baxian-rules', 'task-check'] } });
     waitReadySpy.mockResolvedValue(undefined);
 
     await manager.clearAgent('dev-1');
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await expectGuardReleased('dev-1');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills).toBeUndefined();
   });
 
   it('does not clear injectedSkills when sending /compact', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString(),
-      injectedSkills: { taskId: 't1', paneId: '%7', skills: ['baxian-rules'] },
-    });
+    await seedAgent({ injectedSkills: { taskId: 't1', paneId: '%7', skills: ['baxian-rules'] } });
     waitReadySpy.mockResolvedValue(undefined);
 
     await manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await expectGuardReleased('dev-1');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills).toEqual({ taskId: 't1', paneId: '%7', skills: ['baxian-rules'] });
@@ -585,24 +567,14 @@ describe('clearAgent', () => {
   });
 
   it('rejects 409 when a compact is already in flight', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', updatedAt: new Date().toISOString() });
-    const gates: Array<() => void> = [];
-    waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
-
-    const compact = manager.compactAgent('dev-1');
-    await vi.waitFor(() => expect(gates.length).toBe(1));
+    await seedAgent();
+    const { gates, holder: compact } = await startGuarded();
 
     await expect(manager.clearAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    gates[0]();
-    await vi.waitFor(() => expect(gates.length).toBe(2));
-    gates[1]();
-    await compact;
-    await vi.waitFor(() => expect(gates.length).toBe(3));
-    gates[2]();
-    await vi.waitFor(() => expect(guardSet().has('dev-1')).toBe(false));
+    await drainHolderAndRelease(gates, compact, 'dev-1');
   });
 });

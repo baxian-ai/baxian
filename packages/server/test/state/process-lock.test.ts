@@ -18,6 +18,14 @@ function probeDeadPid(): number {
 }
 const DEAD_PID = probeDeadPid();
 
+function writeLockFile(target: string, info: object, opts?: { flag?: string }): Promise<void> {
+  return writeFile(target, `${JSON.stringify(info)}\n`, opts);
+}
+
+async function readLockInfo(path: string): Promise<Record<string, unknown>> {
+  return JSON.parse((await readFile(path, 'utf-8')).trim());
+}
+
 describe('ProcessLock', () => {
   let stateDir: string;
 
@@ -36,8 +44,7 @@ describe('ProcessLock', () => {
     expect(info.acquiredAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(lock.isAcquired()).toBe(true);
 
-    const raw = await readFile(lock.getPath(), 'utf-8');
-    const parsed = JSON.parse(raw.trim());
+    const parsed = await readLockInfo(lock.getPath());
     expect(parsed.pid).toBe(process.pid);
     expect(parsed.acquiredAt).toBe(info.acquiredAt);
   });
@@ -53,9 +60,9 @@ describe('ProcessLock', () => {
   it('release on a never-acquired lock is a noop (does not delete other lock files)', async () => {
     const lock = new ProcessLock(stateDir);
     // pre-create a lock file owned by another (real) process — ours
-    await writeFile(
+    await writeLockFile(
       lock.getPath(),
-      `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+      { pid: process.pid, acquiredAt: new Date().toISOString() },
       { flag: 'wx' },
     );
     await lock.release();
@@ -66,9 +73,9 @@ describe('ProcessLock', () => {
 
   it('rejects when another live baxian process already holds the lock', async () => {
     // Simulate another live process holding the lock by recording our own pid.
-    await writeFile(
+    await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
-      `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+      { pid: process.pid, acquiredAt: new Date().toISOString() },
       { flag: 'wx' },
     );
     const lock = new ProcessLock(stateDir);
@@ -76,9 +83,9 @@ describe('ProcessLock', () => {
   });
 
   it('refuses to auto-reclaim a stale lock (operator must verify + rm to avoid race)', async () => {
-    await writeFile(
+    await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
-      `${JSON.stringify({ pid: DEAD_PID, acquiredAt: '2020-01-01T00:00:00.000Z' })}\n`,
+      { pid: DEAD_PID, acquiredAt: '2020-01-01T00:00:00.000Z' },
       { flag: 'wx' },
     );
 
@@ -86,8 +93,7 @@ describe('ProcessLock', () => {
     await expect(lock.acquire()).rejects.toBeInstanceOf(ProcessLockError);
 
     // Stale file must remain — auto-unlink would race a concurrent reclaim.
-    const raw = await readFile(lock.getPath(), 'utf-8');
-    expect(JSON.parse(raw.trim()).pid).toBe(DEAD_PID);
+    expect((await readLockInfo(lock.getPath())).pid).toBe(DEAD_PID);
   });
 
   it('refuses to auto-reclaim when the lock file is corrupted (still requires manual cleanup)', async () => {
@@ -97,9 +103,9 @@ describe('ProcessLock', () => {
   });
 
   it('preserves the existing lock info on the thrown error so callers can report PID/time', async () => {
-    await writeFile(
+    await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
-      `${JSON.stringify({ pid: process.pid, acquiredAt: '2025-12-31T23:59:00.000Z' })}\n`,
+      { pid: process.pid, acquiredAt: '2025-12-31T23:59:00.000Z' },
       { flag: 'wx' },
     );
     const lock = new ProcessLock(stateDir);
@@ -119,8 +125,7 @@ describe('ProcessLock', () => {
     const lock = new ProcessLock(stateDir);
     const info = await lock.acquire();
     expect(info.ownerId).toMatch(/^[0-9a-f-]{36}$/);
-    const raw = await readFile(lock.getPath(), 'utf-8');
-    expect(JSON.parse(raw.trim()).ownerId).toBe(info.ownerId);
+    expect((await readLockInfo(lock.getPath())).ownerId).toBe(info.ownerId);
   });
 
   it('release rejects when ownerId mismatch and preserves the intruder file', async () => {
@@ -132,17 +137,18 @@ describe('ProcessLock', () => {
       acquiredAt: new Date().toISOString(),
       ownerId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     };
-    await writeFile(lock.getPath(), `${JSON.stringify(intruderInfo)}\n`);
+    await writeLockFile(lock.getPath(), intruderInfo);
     await expect(lock.release()).rejects.toBeInstanceOf(ProcessLockError);
     expect(lock.isAcquired()).toBe(false);
-    const raw = await readFile(lock.getPath(), 'utf-8');
-    expect(JSON.parse(raw.trim()).ownerId).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    expect((await readLockInfo(lock.getPath())).ownerId).toBe(
+      'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    );
   });
 
   it('legacy lock file (no ownerId) with dead pid is treated as stale (acquire throws)', async () => {
-    await writeFile(
+    await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
-      `${JSON.stringify({ pid: DEAD_PID, acquiredAt: '2020-01-01T00:00:00.000Z' })}\n`,
+      { pid: DEAD_PID, acquiredAt: '2020-01-01T00:00:00.000Z' },
       { flag: 'wx' },
     );
     const lock = new ProcessLock(stateDir);
@@ -152,9 +158,9 @@ describe('ProcessLock', () => {
   it('legacy lock file (no ownerId) with live pid is treated as held (acquire throws)', async () => {
     // Same scenario but pid is alive — should throw "another server holds the lock"
     // rather than the stale path.
-    await writeFile(
+    await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
-      `${JSON.stringify({ pid: process.pid, acquiredAt: '2025-12-31T23:59:00.000Z' })}\n`,
+      { pid: process.pid, acquiredAt: '2025-12-31T23:59:00.000Z' },
       { flag: 'wx' },
     );
     const lock = new ProcessLock(stateDir);
@@ -200,17 +206,15 @@ describe('ProcessLock', () => {
     it('preserves the file on ownerId mismatch (cannot delete intruder lock)', async () => {
       const lock = new ProcessLock(stateDir);
       await lock.acquire();
-      await writeFile(
-        lock.getPath(),
-        `${JSON.stringify({
-          pid: process.pid,
-          acquiredAt: new Date().toISOString(),
-          ownerId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-        })}\n`,
-      );
+      await writeLockFile(lock.getPath(), {
+        pid: process.pid,
+        acquiredAt: new Date().toISOString(),
+        ownerId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      });
       lock.releaseSync();
-      const raw = await readFile(lock.getPath(), 'utf-8');
-      expect(JSON.parse(raw.trim()).ownerId).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+      expect((await readLockInfo(lock.getPath())).ownerId).toBe(
+        'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      );
     });
 
     it('preserves the file when malformed (best-effort, cannot prove ownership)', async () => {

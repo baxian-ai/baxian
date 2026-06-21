@@ -54,30 +54,36 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true });
 });
 
+function repoStore(ensure: () => Promise<string>): RepoStore {
+  return { ensure: vi.fn(ensure), refresh: vi.fn() } as unknown as RepoStore;
+}
+
+const hasEvent = (type: string): boolean => events.some(e => e.type === type);
+const countEvents = (type: string): number => events.filter(e => e.type === type).length;
+
 describe('bootstrapAutoRepos', () => {
-  it('skips manual-mode agents', async () => {
-    const ensure = vi.fn(async () => '/repo');
-    await bootstrapAutoRepos({
-      config: baseConfig,
+  function autoBootstrapDeps(repoStoreFactory: () => RepoStore, config = baseConfig) {
+    return {
+      config,
       agentStore,
       eventBus,
       runnerFactory: () => mockRunner,
       repoCache: createRepoStoreCache(),
-      repoStoreFactory: () => ({ ensure, refresh: vi.fn() } as unknown as RepoStore),
-    });
+      repoStoreFactory,
+    };
+  }
+
+  it('skips manual-mode agents', async () => {
+    const ensure = vi.fn(async () => '/repo');
+    await bootstrapAutoRepos(autoBootstrapDeps(
+      () => ({ ensure, refresh: vi.fn() } as unknown as RepoStore),
+    ));
     expect(ensure).toHaveBeenCalledTimes(1);
   });
 
   it('on success: emits agent.bootstrap_succeeded but does NOT create state files for never-dispatched agents', async () => {
-    await bootstrapAutoRepos({
-      config: baseConfig,
-      agentStore,
-      eventBus,
-      runnerFactory: () => mockRunner,
-      repoCache: createRepoStoreCache(),
-      repoStoreFactory: () => ({ ensure: vi.fn(async () => '/r'), refresh: vi.fn() } as unknown as RepoStore),
-    });
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
+    await bootstrapAutoRepos(autoBootstrapDeps(() => repoStore(async () => '/r')));
+    expect(hasEvent('agent.bootstrap_succeeded')).toBe(true);
     expect(await agentStore.get('dev-a')).toBeNull();
     expect(await agentStore.get('qa-a')).toBeNull();
   });
@@ -86,32 +92,17 @@ describe('bootstrapAutoRepos', () => {
     await agentStore.set({
       id: 'dev-a', projectId: 'p1', updatedAt: new Date().toISOString(),
     });
-    await bootstrapAutoRepos({
-      config: baseConfig,
-      agentStore,
-      eventBus,
-      runnerFactory: () => mockRunner,
-      repoCache: createRepoStoreCache(),
-      repoStoreFactory: () => ({ ensure: vi.fn(async () => '/r'), refresh: vi.fn() } as unknown as RepoStore),
-    });
+    await bootstrapAutoRepos(autoBootstrapDeps(() => repoStore(async () => '/r')));
     const state = await agentStore.get('dev-a');
     expect(state?.repoPath).toBe('/r');
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
+    expect(hasEvent('agent.bootstrap_succeeded')).toBe(true);
   });
 
   it('on failure: emits agent.bootstrap_failed without creating runtime state', async () => {
-    await bootstrapAutoRepos({
-      config: baseConfig,
-      agentStore,
-      eventBus,
-      runnerFactory: () => mockRunner,
-      repoCache: createRepoStoreCache(),
-      repoStoreFactory: () => ({
-        ensure: vi.fn(async () => { throw new Error('clone refused'); }),
-        refresh: vi.fn(),
-      } as unknown as RepoStore),
-    });
-    expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(true);
+    await bootstrapAutoRepos(autoBootstrapDeps(
+      () => repoStore(async () => { throw new Error('clone refused'); }),
+    ));
+    expect(hasEvent('agent.bootstrap_failed')).toBe(true);
     expect(await agentStore.get('dev-a')).toBeNull();
   });
 
@@ -126,23 +117,16 @@ describe('bootstrapAutoRepos', () => {
       ],
     };
     let calls = 0;
-    await bootstrapAutoRepos({
+    await bootstrapAutoRepos(autoBootstrapDeps(
+      () => repoStore(async () => {
+        calls++;
+        if (calls === 1) throw new Error('first fails');
+        return '/r';
+      }),
       config,
-      agentStore,
-      eventBus,
-      runnerFactory: () => mockRunner,
-      repoCache: createRepoStoreCache(),
-      repoStoreFactory: () => ({
-        ensure: vi.fn(async () => {
-          calls++;
-          if (calls === 1) throw new Error('first fails');
-          return '/r';
-        }),
-        refresh: vi.fn(),
-      } as unknown as RepoStore),
-    });
-    expect(events.filter(e => e.type === 'agent.bootstrap_failed')).toHaveLength(1);
-    expect(events.filter(e => e.type === 'agent.bootstrap_succeeded')).toHaveLength(1);
+    ));
+    expect(countEvents('agent.bootstrap_failed')).toBe(1);
+    expect(countEvents('agent.bootstrap_succeeded')).toBe(1);
   });
 });
 
@@ -156,17 +140,14 @@ describe('runSingleTarget — new behaviors', () => {
     eventBus: overrides.eventBus ?? eventBus,
     runnerFactory: () => mockRunner,
     repoCache: createRepoStoreCache(),
-    repoStoreFactory: () => ({
-      ensure: vi.fn(overrides.ensure ?? (async () => '/r')),
-      refresh: vi.fn(),
-    } as unknown as RepoStore),
+    repoStoreFactory: () => repoStore(overrides.ensure ?? (async () => '/r')),
   });
 
   it('emitOnUnchanged=true + no bootstrapError to clear: emits succeeded', async () => {
     const target = collectTargets(baseConfig)[0];
     events.length = 0;
     await runSingleTarget(target, buildDeps(), { emitOnUnchanged: true });
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
+    expect(hasEvent('agent.bootstrap_succeeded')).toBe(true);
   });
 
   it('purges stale bootstrap error records for the target agents on success', async () => {
@@ -215,62 +196,29 @@ describe('runSingleTarget — new behaviors', () => {
     expect(onAgentAffected).toHaveBeenCalledWith(target.agents.map(a => a.id));
   });
 
-  it('does NOT call onAgentAffected when only updated>0 (AgentStore.onChange already publishes)', async () => {
-    // Pre-seed a binding so agentStore.update goes through wasUpdated=true → updated > 0.
-    // In production AgentStore.onChange is wired to eventPublisher.publishAgentChange already;
-    // calling onAgentAffected here too would double-publish the same snapshot.
-    await agentStore.set({ id: 'dev-a', projectId: 'p1', updatedAt: '2026-05-23T00:00:00Z' });
-    await agentStore.set({ id: 'qa-a', projectId: 'p1', updatedAt: '2026-05-23T00:00:00Z' });
+  // Success path (emitOnUnchanged=false). onAgentAffected only fires when the snapshot actually
+  // changes for a reason AgentStore.onChange doesn't already cover — i.e. a stale bootstrap error
+  // was purged. A binding update (updated>0) does NOT trigger it (onChange already publishes), and
+  // steady-state (no update, no purge) is silent so the 60s poller doesn't spam agents-topic.
+  it.each<{ name: string; seedBindings: boolean; removed: number; called: boolean }>([
+    { name: 'does NOT call onAgentAffected when only updated>0 (AgentStore.onChange already publishes)', seedBindings: true, removed: 0, called: false },
+    { name: 'does NOT call onAgentAffected on steady-state success (no binding update, no stale error)', seedBindings: false, removed: 0, called: false },
+    { name: 'DOES call onAgentAffected on success when a stale bootstrap error was actually cleared', seedBindings: false, removed: 1, called: true },
+  ])('$name', async ({ seedBindings, removed, called }) => {
+    if (seedBindings) {
+      await agentStore.set({ id: 'dev-a', projectId: 'p1', updatedAt: '2026-05-23T00:00:00Z' });
+      await agentStore.set({ id: 'qa-a', projectId: 'p1', updatedAt: '2026-05-23T00:00:00Z' });
+    }
     const onAgentAffected = vi.fn();
-    const purgeBootstrapForAgent = vi.fn().mockResolvedValue({ removed: 0 });
+    const purgeBootstrapForAgent = vi.fn().mockResolvedValue({ removed });
     const target = collectTargets(baseConfig)[0];
     await runSingleTarget(
       target,
-      {
-        ...buildDeps(),
-        onAgentAffected,
-        errorRecordStore: { purgeBootstrapForAgent } as never,
-      },
+      { ...buildDeps(), onAgentAffected, errorRecordStore: { purgeBootstrapForAgent } as never },
       { emitOnUnchanged: false },
     );
-    expect(onAgentAffected).not.toHaveBeenCalled();
-  });
-
-  it('does NOT call onAgentAffected on steady-state success (no binding update, no stale error)', async () => {
-    // Periodic BootstrapPoller path: emitOnUnchanged=false, no existing binding to update,
-    // no stale error to purge → snapshot unchanged → no synthetic publish (otherwise we'd
-    // push agents-topic updates every 60s for every stable agent under load).
-    const onAgentAffected = vi.fn();
-    const purgeBootstrapForAgent = vi.fn().mockResolvedValue({ removed: 0 });
-    const target = collectTargets(baseConfig)[0];
-    await runSingleTarget(
-      target,
-      {
-        ...buildDeps(),
-        onAgentAffected,
-        errorRecordStore: { purgeBootstrapForAgent } as never,
-      },
-      { emitOnUnchanged: false },
-    );
-    expect(onAgentAffected).not.toHaveBeenCalled();
-  });
-
-  it('DOES call onAgentAffected on success when a stale bootstrap error was actually cleared', async () => {
-    // The "Retry resolved the issue" workflow: bootstrap error existed → success path purges
-    // it → snapshot changes (red card disappears) → must notify subscribers even if updated=0.
-    const onAgentAffected = vi.fn();
-    const purgeBootstrapForAgent = vi.fn().mockResolvedValue({ removed: 1 });
-    const target = collectTargets(baseConfig)[0];
-    await runSingleTarget(
-      target,
-      {
-        ...buildDeps(),
-        onAgentAffected,
-        errorRecordStore: { purgeBootstrapForAgent } as never,
-      },
-      { emitOnUnchanged: false },
-    );
-    expect(onAgentAffected).toHaveBeenCalledTimes(1);
+    if (called) expect(onAgentAffected).toHaveBeenCalledTimes(1);
+    else expect(onAgentAffected).not.toHaveBeenCalled();
   });
 
   it('calls onAgentAffected on failure path (so the new red card pushes to open dashboards)', async () => {
@@ -302,7 +250,7 @@ describe('runSingleTarget — new behaviors', () => {
     const target = collectTargets(baseConfig)[0];
     events.length = 0;
     await runSingleTarget(target, buildDeps(), { emitOnUnchanged: false });
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    expect(hasEvent('agent.bootstrap_succeeded')).toBe(false);
   });
 
   it('emitOnUnchanged=false + existing binding updated: emits succeeded with updated count', async () => {
@@ -335,7 +283,7 @@ describe('runSingleTarget — new behaviors', () => {
     await runSingleTarget(target, buildDeps(), { emitOnUnchanged: false });
 
     expect((await agentStore.get('dev-a'))?.repoPath).toBeUndefined();
-    expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    expect(hasEvent('agent.bootstrap_succeeded')).toBe(false);
   });
 
   it('emit reject after successful ensure is swallowed (does not poison ensure path)', async () => {
@@ -360,154 +308,107 @@ describe('runSingleTarget — new behaviors', () => {
     const target = collectTargets(baseConfig)[0];
     events.length = 0;
     await runSingleTarget(target, buildDeps({ ensure: async () => { throw new Error('same err'); } }), { emitOnUnchanged: false });
-    expect(events.filter(e => e.type === 'agent.bootstrap_failed')).toHaveLength(1);
+    expect(countEvents('agent.bootstrap_failed')).toBe(1);
   });
 });
 
 describe('classifyBootstrapError', () => {
   const repo = 'owner/missing';
+  const ACCESS = 'BOOTSTRAP_REPO_ACCESS_DENIED';
+  const ENSURE = 'BOOTSTRAP_REPO_ENSURE_FAILED';
+  type Out = ReturnType<typeof classifyBootstrapError>;
 
-  // Real GraphQL phrasing from `gh repo clone` against a private repo the active gh account
-  // isn't a collaborator on. This must classify as ACCESS_DENIED so the UI surfaces an
-  // actionable "grant collaborator" hint instead of a generic ensure-failed message.
-  it('maps gh GraphQL "Could not resolve to a Repository" to ACCESS_DENIED', () => {
-    const out = classifyBootstrapError(
-      `gh repo clone ${repo} failed: GraphQL: Could not resolve to a Repository with the name 'owner/missing'. (repository)`,
-      repo,
-    );
-    expect(out.reason).toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-    expect(out.message).toContain('"owner/missing"');
-    expect(out.message).toContain('Could not resolve to a Repository');
-    expect(out.recommendation).toContain('collaborator');
-  });
-
-  it('maps "Repository not found" (gh CLI) to ACCESS_DENIED', () => {
-    expect(classifyBootstrapError('fatal: Repository not found', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-  });
-
-  it('maps bare "404" (gh poller failure) to ACCESS_DENIED', () => {
-    expect(classifyBootstrapError('gh: Not Found (HTTP 404)', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-  });
-
-  it('maps "Permission denied (publickey)" (ssh git clone) to ACCESS_DENIED', () => {
+  it.each<{ name: string; input: string; reason: string; extra?: (out: Out) => void }>([
+    {
+      // Real GraphQL phrasing from `gh repo clone` against a private repo the active gh account
+      // isn't a collaborator on. This must classify as ACCESS_DENIED so the UI surfaces an
+      // actionable "grant collaborator" hint instead of a generic ensure-failed message.
+      name: 'maps gh GraphQL "Could not resolve to a Repository" to ACCESS_DENIED',
+      input: `gh repo clone ${repo} failed: GraphQL: Could not resolve to a Repository with the name 'owner/missing'. (repository)`,
+      reason: ACCESS,
+      extra: out => {
+        expect(out.message).toContain('"owner/missing"');
+        expect(out.message).toContain('Could not resolve to a Repository');
+        expect(out.recommendation).toContain('collaborator');
+      },
+    },
+    { name: 'maps "Repository not found" (gh CLI) to ACCESS_DENIED', input: 'fatal: Repository not found', reason: ACCESS },
+    { name: 'maps bare "404" (gh poller failure) to ACCESS_DENIED', input: 'gh: Not Found (HTTP 404)', reason: ACCESS },
     // SSH-specific marker is GitHub context enough.
-    expect(classifyBootstrapError('Permission denied (publickey).', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-  });
-
-  it('falls through to ENSURE_FAILED for network / unknown failures', () => {
-    const out = classifyBootstrapError('connect ETIMEDOUT 140.82.121.4:443', repo);
-    expect(out.reason).toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-    expect(out.message).toBe('connect ETIMEDOUT 140.82.121.4:443');
-  });
-
-  it('does NOT match "404" embedded in longer numbers (word-boundary guard)', () => {
-    expect(classifyBootstrapError('exit code 4040', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('does NOT classify local mkdir EACCES as ACCESS_DENIED — would mislead UI to "grant gh collaborator"', () => {
-    // Local fs permission errors share the keyword "Permission denied" but have no GitHub
-    // context. The repo recommendation would point the user at the wrong fix.
-    const out = classifyBootstrapError(
-      `EACCES: permission denied, mkdir '/var/baxian/repos/${repo}'`,
-      repo,
-    );
-    expect(out.reason).toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-    expect(out.recommendation).not.toContain('collaborator');
-  });
-
-  it('does NOT classify standalone "access denied" without GitHub context as ACCESS_DENIED', () => {
-    expect(classifyBootstrapError('access denied: filesystem readonly', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('treats bare "Permission denied" PAIRED with github.com mention as ACCESS_DENIED', () => {
-    expect(classifyBootstrapError('Permission denied while talking to https://github.com/...', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-  });
-
-  it('does NOT classify "sh: gh: command not found" as ACCESS_DENIED', () => {
-    // Round-3 review: bare /\\bgh:\\s/i was too broad and caught gh CLI runtime errors
+    { name: 'maps "Permission denied (publickey)" (ssh git clone) to ACCESS_DENIED', input: 'Permission denied (publickey).', reason: ACCESS },
+    {
+      name: 'falls through to ENSURE_FAILED for network / unknown failures',
+      input: 'connect ETIMEDOUT 140.82.121.4:443',
+      reason: ENSURE,
+      extra: out => { expect(out.message).toBe('connect ETIMEDOUT 140.82.121.4:443'); },
+    },
+    { name: 'does NOT match "404" embedded in longer numbers (word-boundary guard)', input: 'exit code 4040', reason: ENSURE },
+    {
+      // Local fs permission errors share the keyword "Permission denied" but have no GitHub
+      // context. The repo recommendation would point the user at the wrong fix.
+      name: 'does NOT classify local mkdir EACCES as ACCESS_DENIED — would mislead UI to "grant gh collaborator"',
+      input: `EACCES: permission denied, mkdir '/var/baxian/repos/${repo}'`,
+      reason: ENSURE,
+      extra: out => { expect(out.recommendation).not.toContain('collaborator'); },
+    },
+    { name: 'does NOT classify standalone "access denied" without GitHub context as ACCESS_DENIED', input: 'access denied: filesystem readonly', reason: ENSURE },
+    { name: 'treats bare "Permission denied" PAIRED with github.com mention as ACCESS_DENIED', input: 'Permission denied while talking to https://github.com/...', reason: ACCESS },
+    // Round-3 review: bare /\bgh:\s/i was too broad and caught gh CLI runtime errors
     // (tool missing, rate limited, etc.) which need a different fix (install/auth gh), not
-    // "grant collaborator access". /^gh:\\s/m (line-start) lets `gh: Not Found (HTTP 404)`
+    // "grant collaborator access". /^gh:\s/m (line-start) lets `gh: Not Found (HTTP 404)`
     // upgrade via the 404 generic but stops the `sh: gh:` shell-prefix form.
-    expect(classifyBootstrapError('sh: gh: command not found', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('does NOT classify "gh: API rate limit exceeded" as ACCESS_DENIED (no auth keyword)', () => {
+    { name: 'does NOT classify "sh: gh: command not found" as ACCESS_DENIED', input: 'sh: gh: command not found', reason: ENSURE },
     // Even with line-start `gh:`, no generic-auth keyword means no upgrade.
-    expect(classifyBootstrapError('gh: API rate limit exceeded', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('DOES classify line-start "gh: Not Found (HTTP 404)" as ACCESS_DENIED', () => {
+    { name: 'does NOT classify "gh: API rate limit exceeded" as ACCESS_DENIED (no auth keyword)', input: 'gh: API rate limit exceeded', reason: ENSURE },
     // Line-start `gh:` is real github context; combined with `HTTP 404` generic → upgrade.
-    expect(classifyBootstrapError('gh: Not Found (HTTP 404)', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
+    { name: 'DOES classify line-start "gh: Not Found (HTTP 404)" as ACCESS_DENIED', input: 'gh: Not Found (HTTP 404)', reason: ACCESS },
+  ])('$name', ({ input, reason, extra }) => {
+    const out = classifyBootstrapError(input, repo);
+    expect(out.reason).toBe(reason);
+    extra?.(out);
   });
 });
 
 describe('classifyBootstrapError — non-GitHub (generic git) repos', () => {
   const repo = 'https://gitlab.example.com/group/proj.git';
+  const ACCESS = 'BOOTSTRAP_REPO_ACCESS_DENIED';
+  const ENSURE = 'BOOTSTRAP_REPO_ENSURE_FAILED';
+  const credRepo = 'https://oauth2:SECRETTOKEN@gitlab.example.com/group/proj.git';
+  type Out = ReturnType<typeof classifyBootstrapError>;
 
-  it('maps https auth failure (URL-scheme context) to ACCESS_DENIED with a neutral, host-scoped hint', () => {
-    const out = classifyBootstrapError(
-      `git clone ${repo} failed: fatal: Authentication failed for 'https://gitlab.example.com/group/proj.git/'`,
-      repo,
-    );
-    expect(out.reason).toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-    expect(out.recommendation).toContain('gitlab.example.com');
-    expect(out.recommendation).not.toContain('collaborator');
-  });
-
-  it('maps ssh "Permission denied (publickey)" to ACCESS_DENIED', () => {
-    expect(classifyBootstrapError('git@gitlab.example.com: Permission denied (publickey).', repo).reason)
-      .toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-  });
-
-  it('maps repository-not-found (with scheme) to ACCESS_DENIED', () => {
-    expect(classifyBootstrapError(
-      `fatal: repository 'https://gitlab.example.com/group/proj.git/' not found`, repo,
-    ).reason).toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-  });
-
-  it('host-unreachable (no scheme / auth keyword) stays ENSURE_FAILED', () => {
-    expect(classifyBootstrapError(
-      'fatal: unable to access: Could not resolve host: gitlab.example.com', repo,
-    ).reason).toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('does NOT match a local mkdir error that merely embeds the repos-ext host path', () => {
+  it.each<{ name: string; input: string; repo?: string; reason: string; extra?: (out: Out) => void }>([
+    {
+      name: 'maps https auth failure (URL-scheme context) to ACCESS_DENIED with a neutral, host-scoped hint',
+      input: `git clone ${repo} failed: fatal: Authentication failed for 'https://gitlab.example.com/group/proj.git/'`,
+      reason: ACCESS,
+      extra: out => {
+        expect(out.recommendation).toContain('gitlab.example.com');
+        expect(out.recommendation).not.toContain('collaborator');
+      },
+    },
+    { name: 'maps ssh "Permission denied (publickey)" to ACCESS_DENIED', input: 'git@gitlab.example.com: Permission denied (publickey).', reason: ACCESS },
+    { name: 'maps repository-not-found (with scheme) to ACCESS_DENIED', input: `fatal: repository 'https://gitlab.example.com/group/proj.git/' not found`, reason: ACCESS },
+    { name: 'host-unreachable (no scheme / auth keyword) stays ENSURE_FAILED', input: 'fatal: unable to access: Could not resolve host: gitlab.example.com', reason: ENSURE },
     // The repos-ext dir embeds the host, but a local fs error carries no scheme / git@ / publickey.
-    expect(classifyBootstrapError(
-      "EACCES: permission denied, mkdir '/home/u/.baxian/repos-ext/gitlab.example.com/group/proj'", repo,
-    ).reason).toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('does NOT classify "git: command not found" (with URL context) as ACCESS_DENIED', () => {
+    { name: 'does NOT match a local mkdir error that merely embeds the repos-ext host path', input: "EACCES: permission denied, mkdir '/home/u/.baxian/repos-ext/gitlab.example.com/group/proj'", reason: ENSURE },
     // git binary missing on the agent host — a shell command-not-found, not a remote repo-not-found.
-    expect(classifyBootstrapError(`git clone ${repo} failed: /bin/sh: git: command not found`, repo).reason)
-      .toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('does NOT classify dash\'s "git: not found" (missing binary) as ACCESS_DENIED', () => {
+    { name: 'does NOT classify "git: command not found" (with URL context) as ACCESS_DENIED', input: `git clone ${repo} failed: /bin/sh: git: command not found`, reason: ENSURE },
     // dash (/bin/sh on Debian) prints "git: not found" without "command" — still a missing binary.
-    expect(classifyBootstrapError(`git clone ${repo} failed: /bin/sh: 1: git: not found`, repo).reason)
-      .toBe('BOOTSTRAP_REPO_ENSURE_FAILED');
-  });
-
-  it('redacts an embedded token from the access-denied classification message', () => {
-    const credRepo = 'https://oauth2:SECRETTOKEN@gitlab.example.com/group/proj.git';
-    const out = classifyBootstrapError(
-      `git clone ${credRepo} failed: fatal: Authentication failed for '${credRepo}/'`, credRepo,
-    );
-    expect(out.reason).toBe('BOOTSTRAP_REPO_ACCESS_DENIED');
-    expect(out.message).not.toContain('SECRETTOKEN');
-    expect(out.message).toContain('gitlab.example.com');
+    { name: 'does NOT classify dash\'s "git: not found" (missing binary) as ACCESS_DENIED', input: `git clone ${repo} failed: /bin/sh: 1: git: not found`, reason: ENSURE },
+    {
+      name: 'redacts an embedded token from the access-denied classification message',
+      input: `git clone ${credRepo} failed: fatal: Authentication failed for '${credRepo}/'`,
+      repo: credRepo,
+      reason: ACCESS,
+      extra: out => {
+        expect(out.message).not.toContain('SECRETTOKEN');
+        expect(out.message).toContain('gitlab.example.com');
+      },
+    },
+  ])('$name', ({ input, repo: rowRepo, reason, extra }) => {
+    const out = classifyBootstrapError(input, rowRepo ?? repo);
+    expect(out.reason).toBe(reason);
+    extra?.(out);
   });
 });
 

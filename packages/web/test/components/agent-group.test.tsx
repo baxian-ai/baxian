@@ -88,18 +88,39 @@ function activate(cardOrId: HTMLElement | string): void {
   fireEvent.click(trigger);
 }
 
-function renderGroup(tasks: TaskState[]): void {
+type RenderGroupOptions = {
+  group?: AgentConfig[];
+  agentsById?: Map<string, AgentSnapshot>;
+  agentsLoaded?: boolean;
+  agentsError?: boolean;
+  terminalMode?: 'embedded-full';
+};
+
+function defaultAgentsById(): Map<string, AgentSnapshot> {
+  return new Map([
+    ['dev-1', agent('dev-1')],
+    ['qa-1', agent('qa-1')],
+  ]);
+}
+
+function renderGroup(tasks: TaskState[], options: RenderGroupOptions = {}): void {
+  const {
+    group = GROUP,
+    agentsById = defaultAgentsById(),
+    agentsLoaded = true,
+    agentsError,
+    terminalMode,
+  } = options;
   render(
     <MemoryRouter>
       <AgentGroup
-        group={GROUP}
+        group={group}
         projectId="proj"
-        agentsById={new Map([
-          ['dev-1', agent('dev-1')],
-          ['qa-1', agent('qa-1')],
-        ])}
-        agentsLoaded
+        agentsById={agentsById}
+        agentsLoaded={agentsLoaded}
+        agentsError={agentsError}
         tasks={tasks}
+        terminalMode={terminalMode}
       />
     </MemoryRouter>,
   );
@@ -173,21 +194,7 @@ describe('AgentGroup', () => {
   });
 
   it('embedded mode defaults to non-interactive previews so scroll stays smooth', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const terminals = screen.getAllByTestId('pane-terminal');
     expect(terminals).toHaveLength(2);
@@ -196,21 +203,7 @@ describe('AgentGroup', () => {
   });
 
   it('clicking a preview card upgrades only that one to interactive full', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const devCard = document.querySelector('[data-agent-card="dev-1"]') as HTMLElement;
     activate(devCard);
@@ -224,21 +217,7 @@ describe('AgentGroup', () => {
   });
 
   it('clicking a second card switches active and demotes the first back to preview', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const devCard = document.querySelector('[data-agent-card="dev-1"]') as HTMLElement;
     const qaCard = document.querySelector('[data-agent-card="qa-1"]') as HTMLElement;
@@ -253,21 +232,7 @@ describe('AgentGroup', () => {
   });
 
   it('keeps active when the click target was inside a card but got detached before the document handler ran', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const devCard = document.querySelector('[data-agent-card="dev-1"]') as HTMLElement;
     activate(devCard);
@@ -289,21 +254,7 @@ describe('AgentGroup', () => {
   });
 
   it('clicking outside any card resets every terminal back to preview', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const devCard = document.querySelector('[data-agent-card="dev-1"]') as HTMLElement;
     activate(devCard);
@@ -317,21 +268,7 @@ describe('AgentGroup', () => {
   });
 
   it('pressing Escape resets every terminal back to preview', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const devCard = document.querySelector('[data-agent-card="dev-1"]') as HTMLElement;
     activate(devCard);
@@ -345,21 +282,7 @@ describe('AgentGroup', () => {
   });
 
   it('ignores Escape when focus is inside the active card (Esc goes to the terminal app, not the demote handler)', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', agent('dev-1')],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { terminalMode: 'embedded-full' });
 
     const devCard = document.querySelector('[data-agent-card="dev-1"]') as HTMLElement;
     activate(devCard);
@@ -423,18 +346,7 @@ describe('AgentGroup', () => {
   });
 
   it('defers embedded terminals until agent snapshots are loaded', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map()}
-          agentsLoaded={false}
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], { agentsById: new Map(), agentsLoaded: false, terminalMode: 'embedded-full' });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
     expect(screen.getAllByText('Agent 状态加载中')).toHaveLength(2);
@@ -487,19 +399,14 @@ describe('AgentGroup', () => {
   });
 
   it('Start button is disabled when dev is not in idle runtimeStatus', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map([
-            ['dev-1', { ...agent('dev-1'), runtimeStatus: 'working' as const }],
-            ['qa-1', agent('qa-1')],
-          ])}
-          agentsLoaded
-          tasks={[task({ id: 'task-w', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]}
-        />
-      </MemoryRouter>,
+    renderGroup(
+      [task({ id: 'task-w', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })],
+      {
+        agentsById: new Map([
+          ['dev-1', { ...agent('dev-1'), runtimeStatus: 'working' as const }],
+          ['qa-1', agent('qa-1')],
+        ]),
+      },
     );
 
     const btn = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement;
@@ -542,19 +449,12 @@ describe('AgentGroup', () => {
   });
 
   it('keeps terminal entrypoints enabled when the agents stream has failed before loading', () => {
-    render(
-      <MemoryRouter>
-        <AgentGroup
-          group={GROUP}
-          projectId="proj"
-          agentsById={new Map()}
-          agentsLoaded={false}
-          agentsError
-          tasks={[]}
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderGroup([], {
+      agentsById: new Map(),
+      agentsLoaded: false,
+      agentsError: true,
+      terminalMode: 'embedded-full',
+    });
 
     expect(screen.getAllByTestId('pane-terminal')).toHaveLength(2);
     expect(screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href')))

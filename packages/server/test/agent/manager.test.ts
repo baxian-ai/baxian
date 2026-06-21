@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { AgentConfig, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
+import type { AgentBindingFacts, AgentConfig, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
+import type { AgentManagerDeps } from '../../src/agent/manager.js';
 import { AgentManager, DispatchTerminalError, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
 import { prepareConfig } from '../../src/config/loader.js';
 import { ApiError } from '../../src/errors.js';
@@ -132,6 +133,120 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
   };
 }
 
+// Build an AgentManager over the module-level stores, overriding only what a test cares about.
+// Mirrors the production wiring in beforeEach but lets each test swap runner/skillRegistry/etc.
+function makeManager(overrides: Partial<AgentManagerDeps> = {}): AgentManager {
+  return new AgentManager({
+    config: CONFIG,
+    agentStore,
+    taskStore,
+    lockManager,
+    eventBus,
+    runnerFactory: () => readyRunner(),
+    ...overrides,
+  });
+}
+
+// CommandRunner that records every exec'd command into `execs` and otherwise stays inert
+// (empty stdout / exit 0). `onExec` lets a test react per command.
+function recordingRunner(
+  execs: string[],
+  onExec?: (cmd: string) => void | Promise<void>,
+): CommandRunner {
+  return {
+    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      execs.push(cmd);
+      if (onExec) await onExec(cmd);
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }),
+    writeFile: vi.fn(async (): Promise<void> => undefined),
+  } as unknown as CommandRunner;
+}
+
+function setCompactTiming(mgr: AgentManager, waitMs = 100, pollMs = 10): void {
+  Object.assign(mgr, { compactIdleWaitMs: waitMs, compactIdlePollMs: pollMs });
+}
+
+// Spy the private interruptPaneAndWaitReady (a 10s real wait) to a fixed outcome; returns the spy so
+// callers can assert call counts.
+function mockInterruptPane(mgr: AgentManager, ok: boolean): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(mgr as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
+    .mockResolvedValue(ok) as ReturnType<typeof vi.spyOn>;
+}
+
+function freshRegistry(): SkillRegistry {
+  return new SkillRegistry(join(tempDir, 'skills'));
+}
+
+// Manager wired for the injectAndAwaitAck tests: a fresh registry plus tunable ack/settle timeouts.
+function makeInjectManager(runner: CommandRunner, ackMs: number, settleMs: number): AgentManager {
+  return makeManager({
+    skillRegistry: freshRegistry(),
+    runnerFactory: () => runner,
+    dispatchAckTimeoutMs: ackMs,
+    dispatchSettleTimeoutMs: settleMs,
+  });
+}
+
+type AckResult = { acked: boolean; composerDelivered?: boolean };
+
+// injectAndAwaitAck is private; call it through one typed cast instead of repeating the cast per test.
+function callInjectAndAwaitAck(
+  mgr: AgentManager,
+  tmux: TmuxManager,
+  paneId: string,
+  prompt: string,
+  agentId: string,
+  runtime: 'claude-code' | 'codex',
+): Promise<AckResult> {
+  return (mgr as unknown as {
+    injectAndAwaitAck: (
+      tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex',
+    ) => Promise<AckResult>;
+  }).injectAndAwaitAck(tmux, paneId, prompt, agentId, runtime);
+}
+
+// Write an agent binding with the common defaults (projectId 'proj', updatedAt NOW).
+function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
+  return agentStore.set({ projectId: 'proj', updatedAt: NOW, ...overrides });
+}
+
+// Persist a task fixture and hand it back so callers can read its id/fields.
+async function seedTask(overrides: Partial<TaskState> = {}): Promise<TaskState> {
+  const t = task(overrides);
+  await taskStore.set(t);
+  return t;
+}
+
+// CommandRunner that records execs, answers pane_current_command with `claude`, and returns
+// `capture()` for every capture-pane (capture may run side effects, e.g. mutate the binding).
+function capturePaneRunner(
+  execs: string[],
+  capture: () => string | Promise<string>,
+): CommandRunner {
+  return {
+    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      execs.push(cmd);
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
+        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: await capture(), stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }),
+    writeFile: vi.fn(async (): Promise<void> => undefined),
+  } as unknown as CommandRunner;
+}
+
+// onExec callback that decodes the base64 prompt body from each tmux load-buffer command.
+function captureInjection(into: string[]): (cmd: string) => void {
+  return (cmd: string) => {
+    const m = cmd.match(/printf '%s' '([^']+)'/);
+    if (m && cmd.includes('load-buffer')) into.push(Buffer.from(m[1], 'base64').toString('utf8'));
+  };
+}
+
 async function seedPhaseSkillsAtDir(skillsDir: string): Promise<void> {
   for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
     await mkdir(join(skillsDir, name), { recursive: true });
@@ -157,24 +272,17 @@ beforeEach(async () => {
   const skillRegistry = new SkillRegistry(skillsDir);
   await skillRegistry.scan();
 
-  manager = new AgentManager({
-    config: CONFIG,
-    agentStore,
-    taskStore,
-    lockManager,
-    eventBus,
-    skillRegistry,
-    runnerFactory: () => readyRunner(),
-  });
+  manager = makeManager({ skillRegistry });
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
 describe('AgentManager task binding flow', () => {
   it('createTask binds a free preferred dev and holds its lock', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
 
     const created = await manager.createTask('proj', {
       title: 'build it',
@@ -191,7 +299,7 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('createTask records the QA partner before any review dispatch', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
 
     const created = await manager.createTask('proj', {
       title: 'bind the group',
@@ -209,7 +317,7 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('createTask queues when preferred dev has a creation token or task binding', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', creationToken: 'tok' });
     const pendingDuringCreate = await manager.createTask('proj', {
       title: 'blocked',
       description: 'details',
@@ -217,7 +325,7 @@ describe('AgentManager task binding flow', () => {
     });
     expect(pendingDuringCreate.status).toBe('pending');
 
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'other-task', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', taskId: 'other-task' });
     const pendingWhileBound = await manager.createTask('proj', {
       title: 'blocked again',
       description: 'details',
@@ -227,7 +335,7 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('serializes concurrent createTask calls so only one task binds the preferred dev', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
 
     const [first, second] = await Promise.all([
       manager.createTask('proj', {
@@ -250,7 +358,7 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('safeEmit failures do not block createTask state transitions', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     vi.spyOn(eventBus, 'emit').mockRejectedValueOnce(new Error('event log down'));
 
     const created = await manager.createTask('proj', {
@@ -265,7 +373,7 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('createTask stores custom branch in TaskState', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     const created = await manager.createTask('proj', {
       title: 'custom branch',
       description: 'details',
@@ -275,28 +383,8 @@ describe('AgentManager task binding flow', () => {
     expect(created.branch).toBe('feat/my-feature');
   });
 
-  it('createTask rejects branch names starting with a dash', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
-    await expect(manager.createTask('proj', {
-      title: 'bad branch',
-      description: 'details',
-      preferredAgentId: 'dev-1',
-      branch: '-flag-like',
-    })).rejects.toThrow(/Invalid branch name/);
-  });
-
-  it('createTask rejects branch names containing ".."', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
-    await expect(manager.createTask('proj', {
-      title: 'bad branch',
-      description: 'details',
-      preferredAgentId: 'dev-1',
-      branch: 'feat/../escape',
-    })).rejects.toThrow(/Invalid branch name/);
-  });
-
   it('createTask rejects custom branch starting with reserved bx/ prefix', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     await expect(manager.createTask('proj', {
       title: 'reserved prefix',
       description: 'details',
@@ -305,24 +393,17 @@ describe('AgentManager task binding flow', () => {
     })).rejects.toThrow(/reserved prefix/);
   });
 
-  it('createTask rejects branch names containing "@{"', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
-    await expect(manager.createTask('proj', {
-      title: 'bad branch',
-      description: 'details',
-      preferredAgentId: 'dev-1',
-      branch: 'feat@{0}',
-    })).rejects.toThrow(/Invalid branch name/);
-  });
-
   it.each([
+    '-flag-like',
+    'feat/../escape',
+    'feat@{0}',
     'feat/.hidden',
     'feat/foo.lock',
     'feat/',
     'feat//x',
     'feat/x.',
   ])('createTask rejects git-invalid branch name: %s', async (branch) => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     await expect(manager.createTask('proj', {
       title: 'bad branch',
       description: 'details',
@@ -332,7 +413,7 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('createTask rejects duplicate custom branch within the same project', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     await manager.createTask('proj', {
       title: 'first',
       description: 'details',
@@ -340,7 +421,7 @@ describe('AgentManager task binding flow', () => {
       branch: 'feat/unique',
     });
 
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     await expect(manager.createTask('proj', {
       title: 'second',
       description: 'details',
@@ -350,12 +431,10 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('cancelTask delegates releaseAgentForTask for dev and qa after cancelling the task', async () => {
-    const t = task({ qaAgentId: 'qa-1' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW });
-    vi.spyOn(manager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockResolvedValue(true);
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    mockInterruptPane(manager, true);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await manager.cancelTask(t.id);
@@ -366,14 +445,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('cancelTask releases a bound dev through the real release path without task-lock deadlock', async () => {
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask();
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -390,15 +466,12 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('rollbackFailedDispatch clears only the matching binding and releases the lock', async () => {
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask();
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       worktreePath: '/tmp/wt',
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -478,9 +551,7 @@ describe('AgentManager task binding flow', () => {
 
   it('createAndStartTask({ background: true }): cancel mid-bootstrap interrupts the pane, then idle-releases', async () => {
     mockStartSessionThatCancels();
-    const interruptSpy = vi
-      .spyOn(manager as never as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockResolvedValue(true);
+    const interruptSpy = mockInterruptPane(manager, true);
     let released!: () => void;
     const releaseDone = new Promise<void>((resolve) => { released = resolve; });
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async () => { released(); return true; });
@@ -504,8 +575,7 @@ describe('AgentManager task binding flow', () => {
 
   it('createAndStartTask({ background: true }): cancel mid-bootstrap holds the agent when the pane can not be interrupted', async () => {
     mockStartSessionThatCancels();
-    vi.spyOn(manager as never as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockResolvedValue(false);
+    mockInterruptPane(manager, false);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     let held!: () => void;
     const holdDone = new Promise<void>((resolve) => { held = resolve; });
@@ -568,15 +638,11 @@ describe('AgentManager task binding flow', () => {
     // Non-verdict path: develop's pane only exists after startSession, so the watcher arms after
     // dispatch. A transient subscribeAtomic failure must hold the dev (explicit, recoverable) — not
     // leave the task silently waiting for a spec-done/pr-created signal with no consumer.
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
     const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
     await skillRegistry.scan();
-    const m = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry, runnerFactory: () => readyRunner(),
-      phaseSignalWatcher: watcher as never,
-    });
+    const m = makeManager({ skillRegistry, phaseSignalWatcher: watcher as never });
     vi.spyOn(m, 'startSession').mockResolvedValue(true);
     const holdSpy = vi.spyOn(m, 'markAwaitingHuman');
 
@@ -595,14 +661,12 @@ describe('AgentManager task binding flow', () => {
     // The watcher's resolveAgent is the same getAgentConfig a guard exit just saw fail,
     // so a missing-config re-arm can never install a consumer — callers must observe
     // false and hold instead of trusting the arm.
-    const t = task({ id: 'task-ghost', agentId: 'ghost', signalToken: 'tok-1' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'ghost', projectId: 'proj', taskId: t.id, updatedAt: NOW });
+    const t = await seedTask({ id: 'task-ghost', agentId: 'ghost', signalToken: 'tok-1' });
+    await seedAgent({ id: 'ghost', taskId: t.id });
     const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
     await skillRegistry.scan();
-    const m = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry, runnerFactory: () => readyRunner(),
+    const m = makeManager({
+      skillRegistry,
       paneStreamerManager: {
         ensure: () => { throw new Error('unreachable: resolveAgent fails before ensure'); },
       } as never,
@@ -623,13 +687,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('setupPhaseSignal through the REAL watcher arms and reports true for a configured agent', async () => {
-    const t = task({ id: 'task-armed', signalToken: 'tok-2' });
-    await taskStore.set(t);
+    const t = await seedTask({ id: 'task-armed', signalToken: 'tok-2' });
     const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
     await skillRegistry.scan();
-    const m = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry, runnerFactory: () => readyRunner(),
+    const m = makeManager({
+      skillRegistry,
       paneStreamerManager: {
         ensure: () => ({
           subscribeAtomic: async () => ({ unsubscribe: () => undefined, snapshot: { data: '' } }),
@@ -643,14 +705,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('failTaskForDispatchError fails the task and releases its agent binding', async () => {
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask();
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -675,16 +734,8 @@ describe('AgentManager task binding flow', () => {
     await mkdir(unseededSkillsDir, { recursive: true });
     const emptyRegistry = new SkillRegistry(unseededSkillsDir);
     await emptyRegistry.scan();
-    const badManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: emptyRegistry,
-      runnerFactory: () => readyRunner(),
-    });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    const badManager = makeManager({ skillRegistry: emptyRegistry });
+    await seedAgent({ id: 'dev-1' });
 
     let caught: unknown;
     try {
@@ -702,14 +753,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('failTaskForDispatchError accepts required_skills_missing reason', async () => {
-    const t = task({ id: 'task-skills' });
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask({ id: 'task-skills' });
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -725,10 +773,9 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('startSession ack_unknown preserves binding/lock/worktree (so downstream markAwaitingHuman can take over)', async () => {
-    const t = task({ id: 'task-startsession-ack-unknown', branch: 'bx/task-startsession-ack-unknown' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-startsession-ack-unknown', branch: 'bx/task-startsession-ack-unknown' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('dev-1');
     const beforeUpdatedAt = NOW;
@@ -760,25 +807,18 @@ describe('AgentManager task binding flow', () => {
     expect(stateAfter?.worktreePath).toBeTruthy();
     expect(stateAfter?.updatedAt).not.toBe(beforeUpdatedAt); // agentStore 第一次 set 过 startedAt
     expect(await lockManager.isLocked('dev-1')).toBe(true);
-
-    vi.restoreAllMocks();
   });
 
   it('failTaskForDispatchError on ack_unknown releases partner agents (terminal cleanup)', async () => {
     // Task pushed to failed → partner binding must clear too, else it stays stale.
-    const t = task({ id: 'task-ack-partner', status: 'review', qaAgentId: 'qa-1' });
-    await taskStore.set(t);
+    const t = await seedTask({ id: 'task-ack-partner', status: 'review', qaAgentId: 'qa-1' });
     // QA hit ack_unknown
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1',
     });
     // dev 仍绑该 task（QA review 期间 dev waiting）
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('qa-1');
     await lockManager.acquire('dev-1');
@@ -797,14 +837,11 @@ describe('AgentManager task binding flow', () => {
   });
 
   it('failTaskForDispatchError preserves binding on ack_unknown (prompt may already be running)', async () => {
-    const t = task({ id: 'task-ack-unknown' });
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask({ id: 'task-ack-unknown' });
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
@@ -838,7 +875,7 @@ describe('AgentManager task binding flow', () => {
 
 describe('AgentManager transitionTaskStatus', () => {
   it('persists a valid non-terminal transition and returns the previous status', async () => {
-    await taskStore.set(task({ id: 'task-transition', status: 'in_progress', updatedAt: NOW }));
+    await seedTask({ id: 'task-transition', status: 'in_progress', updatedAt: NOW });
 
     const result = await manager.transitionTaskStatus(
       'task-transition',
@@ -855,7 +892,7 @@ describe('AgentManager transitionTaskStatus', () => {
   });
 
   it('returns null and leaves the task unchanged when fromStatus does not match', async () => {
-    await taskStore.set(task({ id: 'task-guard', status: 'in_progress', updatedAt: NOW }));
+    await seedTask({ id: 'task-guard', status: 'in_progress', updatedAt: NOW });
 
     const result = await manager.transitionTaskStatus(
       'task-guard',
@@ -874,7 +911,7 @@ describe('AgentManager transitionTaskStatus', () => {
     // max_rounds is intentionally absent: it is non-terminal (paused awaiting a human
     // decision), so transitions out of it (continue → fixing, complete → merged) must work.
     for (const terminal of ['merged', 'failed', 'cancelled'] as const) {
-      await taskStore.set(task({ id: `task-${terminal}`, status: terminal }));
+      await seedTask({ id: `task-${terminal}`, status: terminal });
       await expect(
         manager.transitionTaskStatus(`task-${terminal}`, 'review', { fromStatus: [terminal] }),
       ).resolves.toBeNull();
@@ -889,7 +926,7 @@ describe('AgentManager transitionTaskStatus', () => {
   });
 
   it('persists the supplied task patch with the transition', async () => {
-    await taskStore.set(task({ id: 'task-patch', status: 'in_progress', reviewRound: 0 }));
+    await seedTask({ id: 'task-patch', status: 'in_progress', reviewRound: 0 });
 
     const result = await manager.transitionTaskStatus(
       'task-patch',
@@ -935,10 +972,19 @@ describe('AgentManager dispatchReviewToQa', () => {
     });
   }
 
+  // Persist a reviewable task and seed the QA partner; seed the dev too unless `dev` is null
+  // (some gates run with no bound dev). `dev` overrides merge onto the default dev binding.
+  async function seedReviewable(
+    overrides: Partial<TaskState> = {},
+    dev: Partial<AgentBindingFacts> | null = {},
+  ): Promise<void> {
+    await taskStore.set(reviewable(overrides));
+    if (dev !== null) await seedAgent({ id: 'dev-1', taskId: 'task-review', ...dev });
+    await seedAgent({ id: 'qa-1' });
+  }
+
   it('dispatches a fixing task as recheck after parking dev and acquiring QA', async () => {
-    await taskStore.set(reviewable());
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable();
     const markWaitingSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -951,9 +997,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('throws + rolls back without dispatching when the verdict watcher fails to arm', async () => {
-    await taskStore.set(reviewable());
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable();
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: false });
@@ -971,9 +1015,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('dispatches an in-progress task as first review', async () => {
-    await taskStore.set(reviewable({ status: 'in_progress', reviewRound: 0 }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({ status: 'in_progress', reviewRound: 0 });
     const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask');
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
@@ -986,9 +1028,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
   it('dispatchReviewToQa: markAgentWaiting reject (IO error) still releases QA (no bind/lock leak)', async () => {
     // Without the catch, markAgentWaiting reject jumps the try/finally → QA acquired but never started → stuck.
-    await taskStore.set(reviewable({ status: 'approved' }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({ status: 'approved' }, { paneId: '%0' });
     vi.spyOn(manager, 'markAgentWaiting').mockRejectedValue(new Error('store IO failure'));
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
@@ -1000,9 +1040,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('parks an approved dev into waiting before recheck (no C-c, no separate release path)', async () => {
-    await taskStore.set(reviewable({ status: 'approved' }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({ status: 'approved' }, { paneId: '%0' });
     const markWaitingSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -1012,8 +1050,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('can dispatch terminal tasks without changing their terminal status', async () => {
-    await taskStore.set(reviewable({ status: 'merged' }));
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({ status: 'merged' }, null);
     const markWaitingSpy = vi.spyOn(manager, 'markAgentWaiting');
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -1025,10 +1062,8 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('does not mutate the task when the dev gate fails', async () => {
-    await taskStore.set(reviewable());
     // dev must be bound for the park to be attempted (park is now skipped for an unbound dev).
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable();
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(false);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
@@ -1075,9 +1110,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
   // Code-phase max_rounds Call review remains supported (regression guard for the scoped guard).
   it('allows code-phase max_rounds Call review (only spec is rejected)', async () => {
-    await taskStore.set(reviewable({ status: 'max_rounds' }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', status: 'waiting', taskId: 'task-review', worktreePath: '/tmp/wt', paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({ status: 'max_rounds' }, { status: 'waiting', worktreePath: '/tmp/wt', paneId: '%0' });
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -1086,8 +1119,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('falls back to the configured QA partner when task.qaAgentId is missing', async () => {
-    await taskStore.set(reviewable({ qaAgentId: undefined }));
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({ qaAgentId: undefined }, null);
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -1098,9 +1130,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('releases QA and leaves task fields unchanged when startSession returns false', async () => {
-    await taskStore.set(reviewable());
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable();
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
@@ -1119,9 +1149,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
   it('startSession throws EnsureSessionError(handled=true) → skips releaseAgentForTask (preserves Held dialog state)', async () => {
     // Re-releasing on the catch path would clear the still-stuck dialog pane lock.
-    await taskStore.set(reviewable());
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable();
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     const dialogErr = new EnsureSessionError(
       { createdSession: true, agentId: 'qa-1', dialogPending: true, handled: true },
@@ -1137,8 +1165,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('serializes concurrent manual dispatches for the same task', async () => {
-    await taskStore.set(reviewable());
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedReviewable({}, null);
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
@@ -1170,19 +1197,8 @@ describe('AgentManager dispatchReviewToQa', () => {
       stop: vi.fn(),
       has: vi.fn(() => false),
     };
-    const m2 = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => readyRunner(),
-      phaseSignalWatcher: watcher as never,
-    });
-    await taskStore.set(reviewable());
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-review', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    const m2 = makeManager({ skillRegistry: freshRegistry(), phaseSignalWatcher: watcher as never });
+    await seedReviewable();
     vi.spyOn(m2, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(m2, 'startSession').mockResolvedValue(true);
     vi.spyOn(m2, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
@@ -1200,7 +1216,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
 describe('AgentManager.transitionToCodePhase', () => {
   it('flips task review→in_progress, phase=code, rotates signalToken, calls continueSession code', async () => {
-    await taskStore.set(task({
+    await seedTask({
       id: 'task-spec-1',
       branch: 'bx/task-spec-1',
       status: 'review',
@@ -1208,12 +1224,12 @@ describe('AgentManager.transitionToCodePhase', () => {
       specReviewRound: 1,
       signalToken: 'old-token',
       qaAgentId: 'qa-1',
-    }));
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-spec-1',
-      paneId: '%0', updatedAt: NOW,
     });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: 'task-spec-1', updatedAt: NOW });
+    await seedAgent({
+      id: 'dev-1', taskId: 'task-spec-1',
+      paneId: '%0',
+    });
+    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
@@ -1233,17 +1249,8 @@ describe('AgentManager.transitionToCodePhase', () => {
       stop: vi.fn(),
       has: vi.fn(() => false),
     };
-    const m2 = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => readyRunner(),
-      phaseSignalWatcher: watcher as never,
-    });
-    await taskStore.set(task({
+    const m2 = makeManager({ skillRegistry: freshRegistry(), phaseSignalWatcher: watcher as never });
+    await seedTask({
       id: 'task-spec-1',
       branch: 'bx/task-spec-1',
       status: 'review',
@@ -1251,8 +1258,8 @@ describe('AgentManager.transitionToCodePhase', () => {
       specReviewRound: 1,
       signalToken: 'old-token',
       qaAgentId: 'qa-1',
-    }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-spec-1', updatedAt: NOW });
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     vi.spyOn(m2, 'continueSession').mockResolvedValue(true);
     vi.spyOn(m2, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m2, 'acquireAgentForTask').mockResolvedValue(true);
@@ -1265,21 +1272,12 @@ describe('AgentManager.transitionToCodePhase', () => {
     // The arm runs BEFORE acquire+continueSession, so holding here would block reentry. pr-created
     // is poller-detected, so a missed pane watcher is non-fatal: stay best-effort, never hold.
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
-    const m = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => readyRunner(),
-      phaseSignalWatcher: watcher as never,
-    });
-    await taskStore.set(task({
+    const m = makeManager({ skillRegistry: freshRegistry(), phaseSignalWatcher: watcher as never });
+    await seedTask({
       id: 'task-spec-1', branch: 'bx/task-spec-1',
       status: 'review', phase: 'spec', specReviewRound: 1, signalToken: 'old-token', qaAgentId: 'qa-1',
-    }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-spec-1', updatedAt: NOW });
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
     vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
@@ -1293,7 +1291,7 @@ describe('AgentManager.transitionToCodePhase', () => {
   });
 
   it('atomically writes status + phase + signalToken in single transitionTaskStatus call', async () => {
-    await taskStore.set(task({
+    await seedTask({
       id: 'task-spec-1',
       branch: 'bx/task-spec-1',
       status: 'review',
@@ -1301,8 +1299,8 @@ describe('AgentManager.transitionToCodePhase', () => {
       specReviewRound: 1,
       signalToken: 'old-token',
       qaAgentId: 'qa-1',
-    }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-spec-1', updatedAt: NOW });
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
@@ -1325,16 +1323,16 @@ describe('AgentManager.transitionToCodePhase', () => {
 
 describe('transitionToCodePhase qa release fail-loud', () => {
   it('emits intervention when releaseAgentForTask(qa) returns false', async () => {
-    await taskStore.set(task({
+    await seedTask({
       id: 'task-spec-1',
       branch: 'bx/task-spec-1',
       status: 'review',
       phase: 'spec',
       specReviewRound: 1,
       qaAgentId: 'qa-1',
-    }));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-spec-1', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: 'task-spec-1', updatedAt: NOW });
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
     vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async (agentId: string) => {
@@ -1354,8 +1352,8 @@ describe('AgentManager.startSession status gate', () => {
     // bypass 只用于跳过 expectedStatuses gate (dispatch 在 task 仍处 pre-status 时主动驱动)，
     // 不能让 cancelled/failed/merged/max_rounds 的任务再启动 — 否则 QA 会在 task 已 cancel 后
     // 仍然 emit signal / 写 commit。
-    await taskStore.set(task({ status: 'cancelled' }));
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'qa-1' });
 
     const result = await manager.startSession('task-1', 'qa-1', 'server-spec-review', {
       bypassTaskStatusGate: true,
@@ -1378,33 +1376,55 @@ describe('injectedSkills dedup across phase dispatches', () => {
     };
   }
 
+  type InjectAck = (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean; composerDelivered: boolean }>;
+  function spyInject(mgr: AgentManager, impl: InjectAck): void {
+    vi.spyOn(mgr as unknown as { injectAndAwaitAck: InjectAck }, 'injectAndAwaitAck').mockImplementation(impl);
+  }
+
   function capturePrompts(mgr: AgentManager, opts: { acked?: boolean; composerDelivered?: boolean } = {}): string[] {
     const prompts: string[] = [];
     const acked = opts.acked ?? true;
     const composerDelivered = opts.composerDelivered ?? true;
-    vi.spyOn(
-      mgr as unknown as {
-        injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean; composerDelivered: boolean }>;
-      },
-      'injectAndAwaitAck',
-    ).mockImplementation(async (_tmux, _paneId, prompt) => {
+    spyInject(mgr, async (_tmux, _paneId, prompt) => {
       prompts.push(prompt);
       return { acked, composerDelivered };
     });
     return prompts;
   }
 
+  // ensureSession resolves to a reused pane unless overridden (createdSession/freshRuntime/paneId).
+  function mockEnsureSession(over: { createdSession?: boolean; freshRuntime?: boolean; paneId?: string } = {}): void {
+    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo', ...over,
+    });
+  }
+
+  function useWorkdirRunner(): void {
+    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+  }
+
+  const persistInjectedSkills = (
+    agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuse: string[] | null,
+  ): Promise<void> => (manager as unknown as {
+    persistInjectedSkills: (a: string, t: string, p: string, r: 'dev' | 'qa', ph: string, reuse: string[] | null) => Promise<void>;
+  }).persistInjectedSkills(agentId, taskId, paneId, role, phase, reuse);
+
+  type ProvisionFn = (runner: CommandRunner, agent: AgentConfig, workdir: string) => Promise<void>;
+  const provision = (mgr: AgentManager): ProvisionFn =>
+    (mgr as unknown as { provisionRepoSkills: ProvisionFn }).provisionRepoSkills.bind(mgr);
+
+  function agentConfig(over: Partial<AgentConfig> & { id: string }): AgentConfig {
+    return { projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', ...over } as unknown as AgentConfig;
+  }
+
   it('startSession on a fresh agent inlines full phase skills and records the set', async () => {
-    const t = task({ id: 'task-dedup-1', branch: 'bx/task-dedup-1' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-dedup-1', branch: 'bx/task-dedup-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
@@ -1417,69 +1437,49 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
-
-    vi.restoreAllMocks();
   });
 
   it('startSession develop prompt drops the spec route when the dev has no QA partner', async () => {
-    const t = task({ id: 'task-noqa-1', branch: 'bx/task-noqa-1', signalToken: 'devtok1234ab' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-noqa-1', branch: 'bx/task-noqa-1', signalToken: 'devtok1234ab' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     vi.spyOn(manager, 'findQaPartner').mockReturnValue(undefined);
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
     expect(prompts[0]).toContain('[bx:pr-created:');
     expect(prompts[0]).not.toContain('Specification-Driven Development (SDD)');
     expect(prompts[0]).not.toContain('[bx:spec-done:');
-
-    vi.restoreAllMocks();
   });
 
   it('startSession develop prompt keeps the spec route when the config pair has a QA', async () => {
-    const t = task({ id: 'task-hasqa-1', branch: 'bx/task-hasqa-1', signalToken: 'devtok5678cd' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-hasqa-1', branch: 'bx/task-hasqa-1', signalToken: 'devtok5678cd' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
     expect(prompts[0]).toContain('Specification-Driven Development (SDD)');
     expect(prompts[0]).toContain('[bx:spec-done:');
-
-    vi.restoreAllMocks();
   });
 
   it('startSession marks bootstrappingTaskId during dispatch and clears it once the prompt is ack\'d', async () => {
-    const t = task({ id: 'task-deliver-1', branch: 'bx/task-deliver-1' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-deliver-1', branch: 'bx/task-deliver-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
     expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     let markerDuringInject: string | undefined;
-    vi.spyOn(
-      manager as never as {
-        injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean; composerDelivered: boolean }>;
-      },
-      'injectAndAwaitAck',
-    ).mockImplementation(async () => {
+    spyInject(manager, async () => {
       // After the running-binding write, before ack: the in-flight marker must name this task.
       markerDuringInject = (await agentStore.get('dev-1'))?.bootstrappingTaskId;
       return { acked: true, composerDelivered: true };
@@ -1492,39 +1492,29 @@ describe('injectedSkills dedup across phase dispatches', () => {
       if (ev.type === 'session.started') markerAtSessionStarted = (await agentStore.get('dev-1'))?.bootstrappingTaskId;
       return realEmit(ev);
     });
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
     expect(markerDuringInject).toBe(t.id);
     expect(markerAtSessionStarted).toBeUndefined();
     expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
-
-    vi.restoreAllMocks();
   });
 
   it('startSession holds (not destructively cleans up) when clearing the bootstrap marker fails after delivery', async () => {
     // The prompt is already delivered; a storage blip clearing the marker must NOT fall into the
     // dispatch-failure path (worktree remove + rollback) — it holds for human and keeps the worktree.
-    const t = task({ id: 'task-deliver-2', branch: 'bx/task-deliver-2' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-deliver-2', branch: 'bx/task-deliver-2' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    mockEnsureSession();
+    useWorkdirRunner();
 
     // Make only the marker-clear write fail — it's the first agentStore write after ack; let the rest pass.
     let afterAck = false;
     let threwOnce = false;
-    vi.spyOn(
-      manager as never as {
-        injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean; composerDelivered: boolean }>;
-      },
-      'injectAndAwaitAck',
-    ).mockImplementation(async () => { afterAck = true; return { acked: true, composerDelivered: true }; });
+    spyInject(manager, async () => { afterAck = true; return { acked: true, composerDelivered: true }; });
     const realUpdate = agentStore.update.bind(agentStore);
     vi.spyOn(agentStore, 'update').mockImplementation(async (id, updater) => {
       if (afterAck && !threwOnce) { threwOnce = true; throw new Error('marker-clear write blip'); }
@@ -1540,26 +1530,21 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(holdSpy).toHaveBeenCalledWith(
       'dev-1', 'bootstrap-marker-clear-failed', expect.any(String), { expectedTaskId: t.id },
     );
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession with matching (taskId, paneId) omits the <skills> tag entirely when phase skills are all already injected', async () => {
-    const t = task({ id: 'task-dedup-2', branch: 'bx/task-dedup-2', status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-dedup-2', branch: 'bx/task-dedup-2', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
@@ -1574,13 +1559,10 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession with a different paneId resets dedup — full skills re-injected', async () => {
-    const t = task({ id: 'task-dedup-3', branch: 'bx/task-dedup-3', status: 'approved' });
-    await taskStore.set(t);
+    const t = await seedTask({ id: 'task-dedup-3', branch: 'bx/task-dedup-3', status: 'approved' });
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%9', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
@@ -1589,11 +1571,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%9', workdir: '/tmp/repo',
-    });
+    mockEnsureSession({ paneId: '%9' });
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
@@ -1603,26 +1583,21 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.paneId).toBe('%9');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
-
-    vi.restoreAllMocks();
   });
 
   it('startSession on a freshly-created tmux session re-injects full skills even when paneId string matches', async () => {
     // tmux server / session 重启后 buildFreshSession 跑过，paneId 字符串可能与旧记录恰好相同
     // （fresh server 第一个 pane 通常就是 %0）。此时 REPL 是全新的，绝不能让 dedup 沿用旧 skill 集。
-    const t = task({ id: 'task-fresh-pane', branch: 'bx/task-fresh-pane' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-fresh-pane', branch: 'bx/task-fresh-pane' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, freshRuntime: true, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession({ createdSession: true, freshRuntime: true });
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
@@ -1635,26 +1610,21 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession on a freshly-created tmux session re-injects full skills even when paneId string matches', async () => {
-    const t = task({ id: 'task-fresh-pane-cont', branch: 'bx/task-fresh-pane-cont', status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-fresh-pane-cont', branch: 'bx/task-fresh-pane-cont', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, freshRuntime: true, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession({ createdSession: true, freshRuntime: true });
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
@@ -1665,15 +1635,12 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession post-approve: freshRuntime suppresses incremental nudge — full preamble always sent', async () => {
-    const t = task({ id: 'task-fresh-redispatch', branch: 'bx/task-fresh-redispatch', status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-fresh-redispatch', branch: 'bx/task-fresh-redispatch', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
     });
     await lockManager.acquire('dev-1');
@@ -1682,11 +1649,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
     });
 
     // freshRuntime=true: tmux/REPL 刚新建，旧 post-approve 上下文已丢失。
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, freshRuntime: true, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession({ createdSession: true, freshRuntime: true });
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', {
       signalToken: 'tok',
@@ -1701,15 +1666,12 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts[0]).toContain('Idempotency');
     expect(prompts[0]).toContain('Do not merge the PR yourself from this phase');
     expect(prompts[0]).not.toContain('Post-approve recheck (redispatch');
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession post-approve: reused runtime + redispatchCount>0 uses incremental nudge', async () => {
-    const t = task({ id: 'task-reuse-redispatch', branch: 'bx/task-reuse-redispatch', status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-reuse-redispatch', branch: 'bx/task-reuse-redispatch', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
@@ -1718,11 +1680,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
       token: 'tok', approvedHeadSha: 'sha', redispatchCount: 2,
     });
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', {
       signalToken: 'tok',
@@ -1733,8 +1693,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts.length).toBe(1);
     expect(prompts[0]).toContain('Post-approve recheck (redispatch #2)');
     expect(prompts[0]).not.toContain('Post-approve PR feedback check:');
-
-    vi.restoreAllMocks();
   });
 
   it('persistInjectedSkills skips agentStore write when phase brings no new skill', async () => {
@@ -1743,18 +1701,13 @@ describe('injectedSkills dedup across phase dispatches', () => {
       injectedSkills: { taskId: 't-no-write', paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     const setSpy = vi.spyOn(agentStore, 'set');
-    await (manager as unknown as {
-      persistInjectedSkills: (agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuseInjectedSkills: string[] | null) => Promise<void>;
-    }).persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-rules', 'baxian-task-check']);
+    await persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-rules', 'baxian-task-check']);
     expect(setSpy).not.toHaveBeenCalled();
-    vi.restoreAllMocks();
   });
 
   it('persistInjectedSkills writes baseline when reuseInjectedSkills is null (fresh REPL)', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 't-fresh-base', paneId: '%0', updatedAt: NOW });
-    await (manager as unknown as {
-      persistInjectedSkills: (agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuseInjectedSkills: string[] | null) => Promise<void>;
-    }).persistInjectedSkills('dev-1', 't-fresh-base', '%0', 'dev', 'develop', null);
+    await seedAgent({ id: 'dev-1', taskId: 't-fresh-base', paneId: '%0' });
+    await persistInjectedSkills('dev-1', 't-fresh-base', '%0', 'dev', 'develop', null);
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe('t-fresh-base');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
@@ -1765,9 +1718,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
       id: 'dev-1', projectId: 'proj', taskId: 't-add', paneId: '%0', updatedAt: NOW,
       injectedSkills: { taskId: 't-add', paneId: '%0', skills: ['baxian-rules'] },
     });
-    await (manager as unknown as {
-      persistInjectedSkills: (agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuseInjectedSkills: string[] | null) => Promise<void>;
-    }).persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-rules']);
+    await persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-rules']);
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
   });
@@ -1777,19 +1728,16 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // 仍返回 createdSession=false——只看 createdSession 会误判上下文未变，进而沿用旧 skill 集
     // 让下一轮派发空 <skills/>。这里专测：paneId 字符串相同 + 旧 injectedSkills 完备 + freshRuntime=true
     // → 必须全量重注入 + 落盘新 baseline。
-    const t = task({ id: 'task-pane-relaunch', branch: 'bx/task-pane-relaunch' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-pane-relaunch', branch: 'bx/task-pane-relaunch' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: true, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession({ freshRuntime: true });
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
@@ -1802,26 +1750,21 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession resets dedup when adoptOrRestartSession relaunches REPL inside an existing pane', async () => {
-    const t = task({ id: 'task-pane-relaunch-cont', branch: 'bx/task-pane-relaunch-cont', status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-pane-relaunch-cont', branch: 'bx/task-pane-relaunch-cont', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: true, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession({ freshRuntime: true });
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
@@ -1831,21 +1774,16 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
-
-    vi.restoreAllMocks();
   });
 
   it('startSession records injectedSkills even when injectAndAwaitAck returns acked=false — paste delivered the skills', async () => {
-    const t = task({ id: 'task-ack-false', branch: 'bx/task-ack-false' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-ack-false', branch: 'bx/task-ack-false' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     capturePrompts(manager, { acked: false });
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
@@ -1856,26 +1794,21 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
-
-    vi.restoreAllMocks();
   });
 
   it('continueSession expands injectedSkills even when injectAndAwaitAck returns acked=false', async () => {
-    const t = task({ id: 'task-ack-false-cont', branch: 'bx/task-ack-false-cont', status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-ack-false-cont', branch: 'bx/task-ack-false-cont', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
       injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     capturePrompts(manager, { acked: false });
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
@@ -1883,48 +1816,38 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // post-approve phase skills = baxian-rules / baxian-pr-feedback；paste 后即合并落盘，与 ack 无关。
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
-
-    vi.restoreAllMocks();
   });
 
   it('does NOT record injectedSkills when paste landed on a busy baseline', async () => {
-    const t = task({ id: 'task-busy-baseline', branch: 'bx/task-busy-baseline' });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-busy-baseline', branch: 'bx/task-busy-baseline' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     // Busy-baseline race: ack timed out AND the prompt was pasted into a running input stream, not an
     // idle composer → skills never entered context → baseline must stay empty (else recovery loses skills).
     capturePrompts(manager, { acked: false, composerDelivered: false });
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills).toBeUndefined();
-
-    vi.restoreAllMocks();
   });
 
   it('startSession on a different taskId resets a stale injectedSkills record', async () => {
-    const t = task({ id: 'task-dedup-4', branch: 'bx/task-dedup-4' });
-    await taskStore.set(t);
+    const t = await seedTask({ id: 'task-dedup-4', branch: 'bx/task-dedup-4' });
     // Agent currently bound to t but carries a STALE injectedSkills record from a prior task.
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       injectedSkills: { taskId: 'task-OLD', paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    mockEnsureSession();
     const prompts = capturePrompts(manager);
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
+    useWorkdirRunner();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
@@ -1934,8 +1857,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
-
-    vi.restoreAllMocks();
   });
 
   it('provisionRepoSkills materializes skills under .claude/skills for claude-code and .agents/skills for codex', async () => {
@@ -1947,10 +1868,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
         writeFile: vi.fn(async (): Promise<void> => undefined),
       };
     }
-    type ProvisionFn = (runner: CommandRunner, agent: AgentConfig, workdir: string) => Promise<void>;
-    const provision = (mgr: AgentManager) => (mgr as unknown as { provisionRepoSkills: ProvisionFn }).provisionRepoSkills.bind(mgr);
-
-    const devAgent = { id: 'dev-1', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    const devAgent = agentConfig({ id: 'dev-1' });
     const devRunner = capturingRunner();
     await provision(manager)(devRunner as unknown as CommandRunner, devAgent, '/tmp/repo');
     // Atomic per-file replace: every skill file is staged as a sibling `.baxian-tmp` (writeFile never
@@ -1985,7 +1903,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(guardCmd).toContain('-type f ! -name'); // drop stale helper files...
     expect(guardCmd).toContain('SKILL.md'); // ...but keep SKILL.md so a concurrent live read is never blanked
 
-    const qaAgent = { id: 'qa-1', projectId: 'proj', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    const qaAgent = agentConfig({ id: 'qa-1', runtime: 'codex', role: 'qa' });
     const qaRunner = capturingRunner();
     await provision(manager)(qaRunner as unknown as CommandRunner, qaAgent, '/tmp/repo');
     const qaStaged = qaRunner.writeFile.mock.calls.map(c => c[0] as string);
@@ -2002,9 +1920,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
           : { stdout: '', stderr: '', exitCode: 0 }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const provision = (mgr: AgentManager) =>
-      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
-    const agent = { id: 'dev-1', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    const agent = agentConfig({ id: 'dev-1' });
     // Skills are already materialized, so a non-git workdir / git hiccup must not throw.
     await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).resolves.toBeUndefined();
     expect(runner.writeFile.mock.calls.some(c => (c[0] as string).includes('/.claude/skills/baxian-rules/SKILL.md'))).toBe(true);
@@ -2015,9 +1931,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
       exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const provision = (mgr: AgentManager) =>
-      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
-    const agent = { id: 'dev-nocache', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/repo-a' } as unknown as AgentConfig;
+    const agent = agentConfig({ id: 'dev-nocache', workdir: '/repo-a' });
     await provision(manager)(runner as unknown as CommandRunner, agent, '/repo-a');
     expect(runner.writeFile.mock.calls.length).toBeGreaterThan(0);
     runner.writeFile.mockClear();
@@ -2043,9 +1957,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const provision = (mgr: AgentManager) =>
-      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
-    const agent = { id: 'dev-race', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/repo' } as unknown as AgentConfig;
+    const agent = agentConfig({ id: 'dev-race', workdir: '/repo' });
     await Promise.all([
       provision(manager)(runner as unknown as CommandRunner, agent, '/repo'),
       provision(manager)(runner as unknown as CommandRunner, agent, '/repo'),
@@ -2063,9 +1975,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
           : { stdout: '', stderr: '', exitCode: 0 }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const provision = (mgr: AgentManager) =>
-      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
-    const agent = { id: 'dev-sym', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    const agent = agentConfig({ id: 'dev-sym' });
     await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).rejects.toThrow(/symlink-safe/);
     // Fail-fast precedes materialize: nothing is written THROUGH the symlinked parent.
     expect(runner.writeFile.mock.calls.length).toBe(0);
@@ -2077,10 +1987,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
     await skillRegistry.scan();
     const cfg: BaxianConfig = { ...CONFIG, host: [{ id: 'box', hostname: 'h', user: 'u', port: 22 }] };
-    const m = new AgentManager({
-      config: cfg, agentStore, taskStore, lockManager, eventBus, skillRegistry,
-      runnerFactory: () => readyRunner(),
-    });
+    const m = makeManager({ config: cfg, skillRegistry });
     const key = (a: object, w: string) =>
       (m as unknown as { skillDirLockKey: (a: AgentConfig, w: string) => string }).skillDirLockKey(a as AgentConfig, w);
     const byId = { runtime: 'claude-code', mode: 'remote', host: 'box' };
@@ -2111,23 +2018,13 @@ describe('AgentManager runtime menu marker', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: manager['eventBus'],
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-    });
+    manager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
     manager['runtimeMenuPollIntervalMs'] = 5;
-    await taskStore.set(task());
-    await agentStore.set({
+    await seedTask();
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: 'task-1',
       paneId: '%0',
-      updatedAt: NOW,
     });
 
     manager.startRuntimeMenuWatch('dev-1');
@@ -2164,31 +2061,18 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => capturingRunner,
-    });
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => capturingRunner });
 
-    const t = task({ qaAgentId: 'qa-1' });
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
-    await agentStore.set({
+    await seedAgent({
       id: 'qa-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%1',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
     await lockManager.acquire('qa-1');
@@ -2221,26 +2105,16 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-    });
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
 
     const oldTask = task({ id: 'task-old' });
     const newTask = task({ id: 'task-new' });
     await taskStore.set(oldTask);
     await taskStore.set(newTask);
-    await agentStore.set({
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: oldTask.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -2266,8 +2140,6 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
     expect(sentKeys.filter(k => k.includes('C-c'))).toHaveLength(0);
     // 不能解绑 dev-1：它现在归属 task-new。
     expect((await agentStore.get('dev-1'))?.taskId).toBe(newTask.id);
-
-    vi.restoreAllMocks();
   });
 
   it('preserves binding and emits intervention when interrupt fails', async () => {
@@ -2284,31 +2156,16 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      // 让 waitReplReady 快速超时：通过缩短 bootstrap timeout 不行（它走另一条路），
-      // interruptPaneAndWaitReady 内部 hardcoded 10s——这测试会真等 10s 偏慢。
-      // 改方案：直接 spy interruptPaneAndWaitReady 返 false。
-    });
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
 
-    // 直接 spy private 方法返 false——更稳定且快。
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockResolvedValue(false);
+    // interruptPaneAndWaitReady hardcodes a 10s wait; spy it to false instead of really waiting it out.
+    mockInterruptPane(localManager, false);
 
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
+    const t = await seedTask();
+    await seedAgent({
       id: 'dev-1',
-      projectId: 'proj',
       taskId: t.id,
       paneId: '%0',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -2331,8 +2188,6 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
       agentId: 'dev-1',
       taskId: t.id,
     });
-
-    vi.restoreAllMocks();
   });
 });
 
@@ -2340,13 +2195,7 @@ describe('AgentManager.prHasDevReplySince', () => {
   const SINCE = '2026-06-01T00:00:00.500Z';
 
   function mgrWithExec(execImpl: (cmd: string) => ExecResult): AgentManager {
-    return new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      runnerFactory: () => readyRunner(),
+    return makeManager({
       platformRunner: {
         exec: vi.fn(async (cmd: string) => execImpl(cmd)),
         writeFile: vi.fn(async () => undefined),
@@ -2355,7 +2204,7 @@ describe('AgentManager.prHasDevReplySince', () => {
   }
 
   beforeEach(async () => {
-    await taskStore.set(task({ id: 'task-r', prNumber: 90, reviewDispatchedAt: SINCE }));
+    await seedTask({ id: 'task-r', prNumber: 90, reviewDispatchedAt: SINCE });
   });
 
   it('counts an inline thread reply created after sinceIso', async () => {
@@ -2408,14 +2257,8 @@ describe('AgentManager.prHasDevReplySince', () => {
 describe('AgentManager dispatchPostMergeCleanup', () => {
   it('releases the agent when it has no paneId in the store (no compact possible)', async () => {
     const execs: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => ({
-        exec: vi.fn(async (cmd: string) => { execs.push(cmd); return { stdout: '', stderr: '', exitCode: 0 }; }),
-        writeFile: vi.fn(async () => undefined),
-      }) as unknown as CommandRunner,
-    });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-x', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => recordingRunner(execs) });
+    await seedAgent({ id: 'dev-1', taskId: 'task-x' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 1, taskId: 'task-x', branch: 'bx/task-x' });
 
@@ -2425,15 +2268,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
   it('runs the full cycle: idle → cleanup prompt (busy→idle) → /clear (busy→idle) → release', async () => {
     const execs: string[] = [];
     const promptInjections: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => compactRunner(execs, (cmd) => {
-        const m = cmd.match(/printf '%s' '([^']+)'/);
-        if (m && cmd.includes('load-buffer')) promptInjections.push(Buffer.from(m[1], 'base64').toString('utf8'));
-      }),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs, captureInjection(promptInjections)) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 99, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2451,12 +2288,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
   it('releases after post-merge clear when a small claude pane hides the footer ready anchor', async () => {
     const execs: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => smallPaneClaudeCompactRunner(execs),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => smallPaneClaudeCompactRunner(execs) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 99, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2468,15 +2302,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
   it('runs server-side fetch+prune + branch -D in repoPath, and surfaces the "deleted" outcome in the prompt', async () => {
     const execs: string[] = [];
     const promptInjections: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => compactRunner(execs, (cmd) => {
-        const m = cmd.match(/printf '%s' '([^']+)'/);
-        if (m && cmd.includes('load-buffer')) promptInjections.push(Buffer.from(m[1], 'base64').toString('utf8'));
-      }),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', repoPath: '/repo/main-clone', taskId: 'merged-task', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs, captureInjection(promptInjections)) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main-clone', taskId: 'merged-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 17, taskId: 'merged-task', branch: 'bx/task-merge' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2492,12 +2320,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
   it('removes the worktree before deleting the branch (branch -D would fail while the worktree holds the ref)', async () => {
     const execs: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => compactRunner(execs),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', worktreePath: '/wt/merged-task', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', worktreePath: '/wt/merged-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 9, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2513,14 +2338,13 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
   it('holds taskId on the binding during cleanup and releases after', async () => {
     const execs: string[] = [];
     let taskIdDuringBranchDelete: string | undefined;
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
+    manager = makeManager({
       runnerFactory: () => compactRunner(execs, async (cmd) => {
         if (cmd.includes('git branch -D')) taskIdDuringBranchDelete = (await agentStore.get('dev-1'))?.taskId;
       }),
     });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', repoPath: '/repo/main', updatedAt: NOW });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 5, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2536,13 +2360,12 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     let busyLeft = 0;
     const execs: string[] = [];
     const promptInjections: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
+    const record = captureInjection(promptInjections);
+    manager = makeManager({
       runnerFactory: () => ({
         exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
           execs.push(cmd);
-          const m = cmd.match(/printf '%s' '([^']+)'/);
-          if (m && cmd.includes('load-buffer')) promptInjections.push(Buffer.from(m[1], 'base64').toString('utf8'));
+          record(cmd);
           if (cmd.includes('git branch -D')) {
             return { stdout: '', stderr: "error: Cannot delete branch 'bx/merged-task' checked out at '/tmp/wt'", exitCode: 1 };
           }
@@ -2559,8 +2382,8 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
         writeFile: vi.fn(async (): Promise<void> => undefined),
       }) as unknown as CommandRunner,
     });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', repoPath: '/repo/main', taskId: 'merged-task', updatedAt: NOW });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main', taskId: 'merged-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 99, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2575,12 +2398,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
   it('treats a fast /clear (busy seen only briefly) as success, not a failed start', async () => {
     const execs: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => compactRunner(execs, undefined, 1),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs, undefined, 1) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 9, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -2593,12 +2413,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
   it('bails without touching the agent when its binding has moved to a different task', async () => {
     const execs: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => compactRunner(execs),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 50, compactIdlePollMs: 5 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', repoPath: '/repo/main', taskId: 'next-task', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
+    setCompactTiming(manager, 50, 5);
+    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main', taskId: 'next-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 17, taskId: 'merged-task', branch: 'bx/task-merge' });
     await new Promise(r => setTimeout(r, 60));
@@ -2611,8 +2428,8 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
   });
 
   it('dispatchPendingTask refuses an agent still bound to a just-merged task (post-merge cleanup in flight → Start disabled)', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', updatedAt: NOW });
-    await taskStore.set(task({ id: 'next-task', status: 'pending', agentId: 'dev-1', preferredAgentId: 'dev-1' }));
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task' });
+    await seedTask({ id: 'next-task', status: 'pending', agentId: 'dev-1', preferredAgentId: 'dev-1' });
 
     const result = await manager.dispatchPendingTask('next-task', 'dev-1');
 
@@ -2623,22 +2440,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
   it('retries once and releases agent on persistent failure', async () => {
     const execs: string[] = [];
     const alwaysBusy = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => ({
-        exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-          execs.push(cmd);
-          if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-            return { stdout: 'claude\n', stderr: '', exitCode: 0 };
-          }
-          if (cmd.includes('capture-pane')) return { stdout: alwaysBusy, stderr: '', exitCode: 0 };
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }),
-        writeFile: vi.fn(async () => undefined),
-      }) as unknown as CommandRunner,
-    });
-    Object.assign(manager, { compactIdleWaitMs: 50, compactIdlePollMs: 5 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => capturePaneRunner(execs, () => alwaysBusy) });
+    setCompactTiming(manager, 50, 5);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 3, taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId, 5000);
@@ -2650,12 +2454,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
   it('does not write taskId when paneId changes between initial read and update (race with retry/restart)', async () => {
     const execs: string[] = [];
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => compactRunner(execs),
-    });
-    Object.assign(manager, { compactIdleWaitMs: 100, compactIdlePollMs: 10 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', updatedAt: NOW });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5' });
 
     const origUpdate = agentStore.update.bind(agentStore);
     vi.spyOn(agentStore, 'update').mockImplementationOnce(async (id, cb) => {
@@ -2678,29 +2479,18 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const execs: string[] = [];
     const BUSY = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
     let captureCount = 0;
-    manager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      runnerFactory: () => ({
-        exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-          execs.push(cmd);
-          if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-            return { stdout: 'claude\n', stderr: '', exitCode: 0 };
-          }
-          if (cmd.includes('capture-pane')) {
-            captureCount++;
-            if (captureCount === 3) {
-              const cur = await agentStore.get('dev-1');
-              if (cur) await agentStore.set({ ...cur, taskId: 'new-review-task', updatedAt: new Date().toISOString() });
-            }
-            return { stdout: BUSY, stderr: '', exitCode: 0 };
-          }
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }),
-        writeFile: vi.fn(async () => undefined),
-      }) as unknown as CommandRunner,
+    manager = makeManager({
+      runnerFactory: () => capturePaneRunner(execs, async () => {
+        captureCount++;
+        if (captureCount === 3) {
+          const cur = await agentStore.get('dev-1');
+          if (cur) await agentStore.set({ ...cur, taskId: 'new-review-task', updatedAt: new Date().toISOString() });
+        }
+        return BUSY;
+      }),
     });
-    Object.assign(manager, { compactIdleWaitMs: 50, compactIdlePollMs: 5 });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', updatedAt: NOW });
+    setCompactTiming(manager, 50, 5);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 1, taskId: 'merged-task', branch: 'bx/merged-task' });
     await new Promise(r => setTimeout(r, 500));
@@ -2713,10 +2503,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
 describe('AgentManager awaiting_human lifecycle', () => {
   it('markAwaitingHuman sets status + emits intervention, preserving binding and lock', async () => {
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask();
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('dev-1');
 
@@ -2736,72 +2525,38 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(emitted).toHaveLength(1);
   });
 
-  it('resumeAgent on awaiting_human with terminal task: clears binding, releases lock, status=ok', async () => {
-    const t = task({ status: 'cancelled' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed', updatedAt: NOW,
-    });
+  // cancel-interrupt-failed is a recoverable phase: Resume clears the held status, then releases the
+  // binding when the task is terminal or keeps it (operator cancels later) while the task is active.
+  it.each([
+    { name: 'terminal task clears binding + releases lock', taskStatus: 'cancelled' as const, expectRelease: true },
+    { name: 'active task clears status only, keeps binding', taskStatus: 'in_progress' as const, expectRelease: false },
+  ])('resumeAgent on awaiting_human (cancel-interrupt-failed): $name', async ({ taskStatus, expectRelease }) => {
+    const t = await seedTask({ status: taskStatus });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
     await lockManager.acquire('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
 
-    expect(result).toEqual({ resumed: true, releasedBinding: true });
+    expect(result).toEqual({ resumed: true, releasedBinding: expectRelease });
     const state = await agentStore.get('dev-1');
     expect(state?.status).toBeUndefined();
-    expect(state?.taskId).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    if (expectRelease) {
+      expect(state?.taskId).toBeUndefined();
+      expect(state?.awaitingPhase).toBeUndefined();
+    } else {
+      expect(state?.taskId).toBe(t.id);
+    }
+    expect(await lockManager.isLocked('dev-1')).toBe(!expectRelease);
   });
 
-  it('resumeAgent on awaiting_human (non-dialog/non-ack_unknown phase) with active task: clears status only, keeps binding', async () => {
-    // cancel-interrupt-failed: cancel 内 C-c 失败的 phase。Resume 让 operator 把 agent 切 ok，
-    // binding 仍指向 active task（之后再走 cancelTask 推 task terminal → 触发 release）。
-    const t = task({ status: 'in_progress' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed', updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-
-    const result = await manager.resumeAgent('dev-1');
-
-    expect(result).toEqual({ resumed: true, releasedBinding: false });
-    const state = await agentStore.get('dev-1');
-    expect(state?.status).toBeUndefined();
-    expect(state?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('dev-1')).toBe(true);
-  });
-
-  it('resumeAgent REFUSES on awaitingPhase=agent_dialog_resolved_runtime + active task (crash window: prompt never injected)', async () => {
-    // Crash before fail-task with task still active → silently stuck; force operator cancel/DELETE.
-    const t = task({ status: 'in_progress' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'agent_dialog_resolved_runtime', updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
-
-    const result = await manager.resumeAgent('dev-1');
-
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
-    expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
-    expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('dev-1')).toBe(true);
-  });
-
-  it('resumeAgent REFUSES on awaitingPhase=signal-arm-failed:* + active task (Resume cannot rebuild the watcher)', async () => {
-    // Resume here would flip status→ok without re-arming → the dispatched prompt's signal still has
-    // no consumer (silent deadlock). Force operator cancel/DELETE instead.
-    const t = task({ status: 'in_progress' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'signal-arm-failed:spec-done,pr-created', updatedAt: NOW,
-    });
+  // These phases mark an unrecoverable-by-Resume state on an active task (crash before fail-task / a
+  // watcher that can't be rebuilt); Resume must refuse and force operator cancel/DELETE.
+  it.each([
+    'agent_dialog_resolved_runtime',
+    'signal-arm-failed:spec-done,pr-created',
+  ])('resumeAgent REFUSES on awaitingPhase=%s + active task', async (phase) => {
+    const t = await seedTask({ status: 'in_progress' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: phase });
     await lockManager.acquire('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
@@ -2813,11 +2568,11 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 
   it('resumeAgent ALLOWS release on awaitingPhase=agent_dialog_resolved_runtime (slowPoll detected REPL ready)', async () => {
-    const t = task({ status: 'failed' }); // terminal (handleDialogPendingFromRuntime already pushed to failed)
+    const t = await seedTask({ status: 'failed' }); // terminal (handleDialogPendingFromRuntime already pushed to failed)
     await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'agent_dialog_resolved_runtime', updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'agent_dialog_resolved_runtime',
     });
     await lockManager.acquire('dev-1');
 
@@ -2832,9 +2587,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
     // Pane still stuck on dialog; Resume would let new prompts hit it. Recovery requires operator dismiss → slowPoll.
     const t = task({ status: 'failed' }); // terminal
     await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending', updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending',
     });
     await lockManager.acquire('dev-1');
 
@@ -2847,7 +2602,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 
   it('resumeAgent on agent that is not awaiting_human: noop', async () => {
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
 
     const result = await manager.resumeAgent('dev-1');
 
@@ -2855,13 +2610,11 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 
   it('resumeAgent refuses when creationToken still set (bootstrap dialog unresolved)', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      creationToken: 'tok-still-pending',
+    await seedAgent({
+      id: 'dev-1', creationToken: 'tok-still-pending',
       paneId: '%0',
       status: 'awaiting_human',
       awaitingPhase: 'agent_dialog_pending',
-      updatedAt: NOW,
     });
 
     const result = await manager.resumeAgent('dev-1');
@@ -2872,53 +2625,29 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect((await agentStore.get('dev-1'))?.creationToken).toBe('tok-still-pending');
   });
 
-  it('resumeAgent REFUSES on dev-wait-gate-failed-after-qa-started + active task (QA prompt may still be running)', async () => {
-    // QA prompt may still be running (ack_unknown semantics); outcome handler releases via allowAwaitingHuman.
-    const t = task({ id: 'task-qa-stale', status: 'fixing' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dev-wait-gate-failed-after-qa-started',
-      updatedAt: NOW,
-    });
+  // dev-wait-gate-failed = QA prompt may still be running; Resume refuses while the task is active and
+  // releases once it is terminal (operator recovery).
+  it.each([
+    { name: 'active task (fixing) refuses', taskId: 'task-qa-stale', taskStatus: 'fixing' as const, expectRelease: false },
+    { name: 'terminal task (cancelled) releases', taskId: 'task-qa-cancelled', taskStatus: 'cancelled' as const, expectRelease: true },
+  ])('resumeAgent on dev-wait-gate-failed-after-qa-started: $name', async ({ taskId, taskStatus, expectRelease }) => {
+    const t = await seedTask({ id: taskId, status: taskStatus });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', status: 'awaiting_human', awaitingPhase: 'dev-wait-gate-failed-after-qa-started' });
     await lockManager.acquire('qa-1');
 
     const result = await manager.resumeAgent('qa-1');
 
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
-    expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
-    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('qa-1')).toBe(true);
-  });
-
-  it('resumeAgent ALLOWS release on dev-wait-gate-failed-after-qa-started + terminal task', async () => {
-    // task terminal → shouldReleaseHeldBinding 第一条规则放行；Resume 必须能清 binding 让 operator 恢复。
-    const t = task({ id: 'task-qa-cancelled', status: 'cancelled' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dev-wait-gate-failed-after-qa-started',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const result = await manager.resumeAgent('qa-1');
-
-    expect(result).toEqual({ resumed: true, releasedBinding: true });
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('qa-1')).toBe(false);
+    expect(result).toEqual({ resumed: expectRelease, releasedBinding: expectRelease });
+    expect((await agentStore.get('qa-1'))?.taskId).toBe(expectRelease ? undefined : t.id);
+    if (!expectRelease) expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
+    expect(await lockManager.isLocked('qa-1')).toBe(!expectRelease);
   });
 
   it('releaseAgentForTask with allowAwaitingHuman=true bypasses gate (explicit recovery path)', async () => {
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
+    const t = await seedTask();
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -2930,10 +2659,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 
   it('validateTaskDispatch ALLOWS create against awaiting_human agent (queues to pending; dispatch-time gates availability)', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
 
     await expect(
@@ -2944,13 +2671,10 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 
   it('resumeAgent no longer triggers drainQueue (pending tasks wait for explicit dispatchPendingTask)', async () => {
-    const t = task({ id: 'task-resume-drain', status: 'cancelled' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id,
+    const t = await seedTask({ id: 'task-resume-drain', status: 'cancelled' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id,
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -2961,167 +2685,64 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect('drainQueue' in (manager as unknown as Record<string, unknown>)).toBe(false);
   });
 
-  it('releaseAgentForTask gate allows release when task is terminal even if status=awaiting_human', async () => {
-    // Terminal cleanup (pr.merged / partner cleanup) must bypass the gate, else binding leaks to a terminal task.
-    const t = task({ status: 'merged' }); // terminal
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('dev-1');
+  // The release gate refuses to free a Held agent while its prompt may still be running, unless the
+  // task is terminal (cleanup must not leak the binding) or the caller explicitly opts in.
+  it.each([
+    { name: 'task terminal → bypass even without opt', agentId: 'dev-1', paneId: '%0', taskStatus: 'merged' as const, phase: 'cancel-interrupt-failed', opt: undefined, expectedOk: true },
+    { name: 'dev-wait-gate-failed + active task refuses', agentId: 'qa-1', paneId: '%1', taskStatus: 'fixing' as const, phase: 'dev-wait-gate-failed-after-qa-started', opt: undefined, expectedOk: false },
+    { name: 'dev-wait-gate-failed WITH allowAwaitingHuman releases', agentId: 'qa-1', paneId: '%1', taskStatus: 'approved' as const, phase: 'dev-wait-gate-failed-after-qa-started', opt: { allowAwaitingHuman: true }, expectedOk: true },
+    { name: 'dispatch-failed:ack_unknown without opt refuses', agentId: 'qa-1', paneId: '%1', taskStatus: 'review' as const, phase: 'dispatch-failed:ack_unknown', opt: undefined, expectedOk: false },
+    { name: 'dispatch-failed:ack_unknown WITH allowAwaitingHuman releases', agentId: 'qa-1', paneId: '%1', taskStatus: 'approved' as const, phase: 'dispatch-failed:ack_unknown', opt: { allowAwaitingHuman: true }, expectedOk: true },
+  ])('releaseAgentForTask gate: $name', async ({ agentId, paneId, taskStatus, phase, opt, expectedOk }) => {
+    const t = await seedTask({ status: taskStatus });
+    await seedAgent({ id: agentId, taskId: t.id, paneId, status: 'awaiting_human', awaitingPhase: phase });
+    await lockManager.acquire(agentId);
 
-    // 不传 allowAwaitingHuman，但 task terminal → shouldReleaseHeldBinding=true → gate 放行
-    const ok = await manager.releaseAgentForTask('dev-1', t.id, 'idle');
+    const ok = await manager.releaseAgentForTask(agentId, t.id, 'idle', opt);
 
-    expect(ok).toBe(true);
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(ok).toBe(expectedOk);
+    expect((await agentStore.get(agentId))?.taskId).toBe(expectedOk ? undefined : t.id);
+    expect(await lockManager.isLocked(agentId)).toBe(!expectedOk);
   });
 
-  it('releaseAgentForTask gate REFUSES release on dev-wait-gate-failed-after-qa-started + active task (QA prompt may still be running)', async () => {
-    // Same ack_unknown semantics: outcome handler releases explicitly via allowAwaitingHuman.
-    const t = task({ status: 'fixing' }); // active
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dev-wait-gate-failed-after-qa-started',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const ok = await manager.releaseAgentForTask('qa-1', t.id, 'idle');
-
-    expect(ok).toBe(false);
-    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('qa-1')).toBe(true);
-  });
-
-  it('releaseAgentForTask gate ALLOWS release on dev-wait-gate-failed-after-qa-started WITH allowAwaitingHuman opt (outcome handler path)', async () => {
-    const t = task({ status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dev-wait-gate-failed-after-qa-started',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const ok = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { allowAwaitingHuman: true });
-
-    expect(ok).toBe(true);
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('qa-1')).toBe(false);
-  });
-
-  it('releaseAgentForTask gate REFUSES release when awaitingPhase=dispatch-failed:ack_unknown without allowAwaitingHuman opt', async () => {
-    // ack_unknown = prompt may still be running in pane; gate refuses unless caller explicitly opts in.
-    const t = task({ status: 'review' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const ok = await manager.releaseAgentForTask('qa-1', t.id, 'idle');
-
-    expect(ok).toBe(false);
-    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('qa-1')).toBe(true);
-  });
-
-  it('releaseAgentForTask gate ALLOWS release when awaitingPhase=dispatch-failed:ack_unknown WITH allowAwaitingHuman opt (outcome handler path)', async () => {
-    // outcome handler (review.submitted) 显式传 allowAwaitingHuman=true → 放行 Held QA。
-    const t = task({ status: 'approved' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const ok = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { allowAwaitingHuman: true });
-
-    expect(ok).toBe(true);
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('qa-1')).toBe(false);
-  });
-
-  it('resumeAgent refuses to resume when awaitingPhase=dispatch-failed:ack_unknown AND bound task is still active', async () => {
-    const t = task({ status: 'review' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
-      updatedAt: NOW,
-    });
+  // dispatch-failed:ack_unknown = prompt may still be running; Resume refuses while the bound task is
+  // active, releases when it is terminal or missing (boundTask null → first release rule fires).
+  it.each([
+    { name: 'bound task still active refuses', boundTaskId: undefined, taskStatus: 'review' as const, expectRelease: false },
+    { name: 'bound task TERMINAL releases', boundTaskId: undefined, taskStatus: 'failed' as const, expectRelease: true },
+    { name: 'bound task MISSING releases', boundTaskId: 'ghost-task', taskStatus: undefined, expectRelease: true },
+  ])('resumeAgent on dispatch-failed:ack_unknown: $name', async ({ boundTaskId, taskStatus, expectRelease }) => {
+    let taskId = boundTaskId ?? 'ghost-task';
+    if (taskStatus) {
+      const t = await seedTask({ status: taskStatus });
+      taskId = t.id;
+    }
+    await seedAgent({ id: 'qa-1', taskId, paneId: '%1', status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown' });
     await lockManager.acquire('qa-1');
 
     const result = await manager.resumeAgent('qa-1');
 
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
-    expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
-    expect((await agentStore.get('qa-1'))?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('qa-1')).toBe(true);
-  });
-
-  it('resumeAgent ALLOWS release when awaitingPhase=dispatch-failed:ack_unknown but bound task is TERMINAL', async () => {
-    // Task terminal + agent Held → Resume must release binding+lock, else only DELETE agent can recover.
-    const t = task({ status: 'failed' }); // terminal
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const result = await manager.resumeAgent('qa-1');
-
-    expect(result).toEqual({ resumed: true, releasedBinding: true });
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    // status='ok' 在 normalizeBinding 内被规范化为 undefined（schema 只存 awaiting_human）
-    expect((await agentStore.get('qa-1'))?.status).toBeUndefined();
-    expect(await lockManager.isLocked('qa-1')).toBe(false);
-  });
-
-  it('resumeAgent ALLOWS release when awaitingPhase=dispatch-failed:ack_unknown and bound task is MISSING', async () => {
-    // boundTask null (taskStore 缺失) → shouldReleaseHeldBinding 第一条规则放行，Resume 能清 binding。
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: 'ghost-task', paneId: '%1',
-      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
-      updatedAt: NOW,
-    });
-    await lockManager.acquire('qa-1');
-
-    const result = await manager.resumeAgent('qa-1');
-
-    expect(result).toEqual({ resumed: true, releasedBinding: true });
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('qa-1')).toBe(false);
+    expect(result).toEqual({ resumed: expectRelease, releasedBinding: expectRelease });
+    const after = await agentStore.get('qa-1');
+    if (expectRelease) {
+      expect(after?.taskId).toBeUndefined();
+      // status='ok' normalizes to undefined (schema only persists awaiting_human).
+      if (taskStatus === 'failed') expect(after?.status).toBeUndefined();
+    } else {
+      expect(after?.status).toBe('awaiting_human');
+      expect(after?.taskId).toBe(taskId);
+    }
+    expect(await lockManager.isLocked('qa-1')).toBe(!expectRelease);
   });
 
   it('dispatchReviewToQa on ack_unknown still transitions task to review (so outcome can be processed)', async () => {
     // QA prompt already sent → skip transition would make outcome handler drop the result on fromStatus mismatch.
-    const t = task({ id: 'task-manual-ack', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-manual-ack', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW,
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1',
     });
     await lockManager.acquire('dev-1');
     await lockManager.acquire('qa-1');
@@ -3143,17 +2764,15 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(updated?.qaAgentId).toBe('qa-1');
     // QA 仍 Held
     expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa: emits manual-review-dev-parked-qa-failed (not "interrupted") when QA fails after dev parked', async () => {
     // Phase + note must match actual behavior (parked, no C-c) so operators don't misread.
-    const t = task({ id: 'task-park-qa-fail', status: 'in_progress', prNumber: 50, branch: 'bx/x' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-park-qa-fail', status: 'in_progress', prNumber: 50, branch: 'bx/x' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'qa-1' });
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
 
@@ -3172,13 +2791,12 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('dispatchReviewToQa dialog: fails task from taskStatusAtClaim (approved) via dialogFailFromStatuses opt', async () => {
     // Manual review can enter from approved/fixing; caller must widen fail-from list beyond default ['review'].
-    const t = task({ id: 'task-manual-dialog', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
+    const t = await seedTask({ id: 'task-manual-dialog', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW,
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1',
     });
     await lockManager.acquire('dev-1');
     await lockManager.acquire('qa-1');
@@ -3201,7 +2819,6 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(updated?.status).toBe('failed');
     // QA Held + UI Retry 通路打开
     expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa ack_unknown preserves verdict-installed status; new design persists anchor+bump BEFORE startSession', async () => {
@@ -3212,10 +2829,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
     // verdict (mocked here by startSession writing 'fixing' before throwing)
     // changes status post-PHASE-1, that change must survive: ack_unknown means
     // the prompt was sent and the verdict is real, so we don't roll back.
-    const t = task({ id: 'task-claim-approved', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-claim-approved', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     await lockManager.acquire('dev-1');
     await lockManager.acquire('qa-1');
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
@@ -3234,7 +2850,6 @@ describe('AgentManager awaiting_human lifecycle', () => {
     // ack_unknown does NOT roll back PHASE 1 — the prompt was sent and the
     // dispatch attempt is recorded).
     expect(updated?.reviewRound).toBe(2);
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa: PHASE 1 persists status="review" + reviewHeadAnchorSha + reviewRound bump BEFORE startSession sees the task', async () => {
@@ -3243,10 +2858,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
     // handler must see the new anchor + status + qaAgentId. We assert by
     // checking what taskStore.get returns INSIDE the startSession mock — that
     // snapshot is what the handler would read if it ran right then.
-    const t = task({ id: 'task-phase-order', status: 'in_progress', prNumber: 42, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 0 });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW });
+    const t = await seedTask({ id: 'task-phase-order', status: 'in_progress', prNumber: 42, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 0 });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
 
@@ -3263,7 +2877,6 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(snapshotInsideStartSession?.reviewRound).toBe(1);
     expect(snapshotInsideStartSession?.reviewHeadAnchorSha).toBe('a'.repeat(40));
     expect(snapshotInsideStartSession?.qaAgentId).toBe('qa-1');
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa rotates signalToken atomically with the anchor before arming the watcher', async () => {
@@ -3271,13 +2884,12 @@ describe('AgentManager awaiting_human lifecycle', () => {
     // per-pass token together with reviewDispatchedAt, not leave it lagging until PHASE 2.
     // Mock rotateAndSetupPhaseSignal (PHASE 2) to a no-op so the token seen at startSession
     // could only have been rotated by PHASE 1.
-    const t = task({
+    const t = await seedTask({
       id: 'task-phase1-tokrot', status: 'review', prNumber: 42, branch: 'bx/x',
       qaAgentId: 'qa-1', reviewRound: 1, signalToken: 'old-pass-token-1',
     });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'unused-token', armed: true });
@@ -3303,7 +2915,6 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(patch.signalToken).toBeTruthy();
     expect(patch.signalToken).not.toBe('old-pass-token-1');
     expect(patch.reviewDispatchedAt).toBeTruthy();
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa rollback re-sets up pr-merge-ready watcher when originalStatus=approved + PostApproveCompletion exists', async () => {
@@ -3317,23 +2928,13 @@ describe('AgentManager awaiting_human lifecycle', () => {
       stop: vi.fn(),
       has: vi.fn(() => false),
     };
-    const m3 = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => readyRunner(),
-      phaseSignalWatcher: watcher as never,
-    });
-    const t = task({
+    const m3 = makeManager({ skillRegistry: freshRegistry(), phaseSignalWatcher: watcher as never });
+    const t = await seedTask({
       id: 'task-rb-rearm', status: 'approved', prNumber: 88, branch: 'bx/x',
       qaAgentId: 'qa-1', reviewRound: 1,
     });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', taskId: t.id, paneId: '%1', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     await m3.setPostApproveCompletion(t.id, { token: 'completion-tok-XYZ', approvedHeadSha: 'b'.repeat(40) });
     watcher.start.mockClear(); // ignore the arm from setPostApproveCompletion
     vi.spyOn(m3, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
@@ -3352,7 +2953,6 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(mergeReadyReArm).toMatchObject({
       taskId: t.id, expectedKinds: 'pr-merge-ready', token: 'completion-tok-XYZ',
     });
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa rollback restores snapshot fields', async () => {
@@ -3361,15 +2961,14 @@ describe('AgentManager awaiting_human lifecycle', () => {
     // subsequent push-driven recheck reads a stale qaAgentId (release returns
     // false → qa-release-failed-cannot-recheck) and dev's pending emit with
     // the old token strands silently.
-    const t = task({
+    const t = await seedTask({
       id: 'task-rb-snap', status: 'review', prNumber: 99, branch: 'bx/x',
       qaAgentId: 'qa-orig', signalToken: 'tok-old-12345', reviewHeadAnchorSha: 'c'.repeat(40),
       reviewRound: 2,
     });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-orig', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1' });
+    await seedAgent({ id: 'qa-orig' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
@@ -3382,20 +2981,18 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(restored?.reviewHeadAnchorSha).toBe('c'.repeat(40));
     expect(restored?.status).toBe('review');
     expect(restored?.reviewRound).toBe(2);                 // PHASE 1 bumped to 3, rolled back
-    vi.restoreAllMocks();
   });
 
   it('dispatchReviewToQa PHASE 1 always overwrites reviewHeadAnchorSha — fetchPrHeadSha failure clears stale anchor', async () => {
     // Without explicit overwrite, fetch failure preserves a stale anchor from
     // a prior round → pane-signal approvals fall back to it → false stale-head
     // rejection or use of an old commit as "reviewed head".
-    const t = task({
+    const t = await seedTask({
       id: 'task-stale-anchor', status: 'fixing', prNumber: 99, branch: 'bx/x',
       qaAgentId: 'qa-1', reviewHeadAnchorSha: 'd'.repeat(40), reviewRound: 1,
     });
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await agentStore.set({ id: 'qa-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh offline'));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
@@ -3404,24 +3001,18 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const updated = await taskStore.get(t.id);
     expect(updated?.reviewHeadAnchorSha).toBeUndefined();  // stale anchor cleared, NOT preserved
-    vi.restoreAllMocks();
   });
 
   it('handleDialogPendingFromRuntime also releases partner agents on task fail (UI Retry path truly opens)', async () => {
     // Without clearing partner binding, retryTask's validateTaskDispatch sees dev still bound to the terminal task → 409 blocks UI Retry.
-    const t = task({ id: 'task-partner-cleanup', status: 'in_progress', qaAgentId: 'qa-1' });
-    await taskStore.set(t);
+    const t = await seedTask({ id: 'task-partner-cleanup', status: 'in_progress', qaAgentId: 'qa-1' });
     // QA 触发 runtime dialog
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: t.id, paneId: '%1',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1',
     });
     // dev 同时绑该 task
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('qa-1');
     await lockManager.acquire('dev-1');
@@ -3442,12 +3033,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 
   it('handleDialogPendingFromRuntime fails active task (prompt not injected; UI Retry path opens)', async () => {
-    const t = task({ status: 'in_progress' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      updatedAt: NOW,
+    const t = await seedTask({ status: 'in_progress' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('dev-1');
 
@@ -3469,12 +3057,10 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime task fail SKIPS when outcome moved task past dispatch phase expected status', async () => {
     // fromStatus guard: concurrent outcome already advanced task past expected → skip the fail.
-    const t = task({ id: 'task-outcome-arrived', status: 'approved' }); // 并发 outcome 已推 approved
+    const t = await seedTask({ id: 'task-outcome-arrived', status: 'approved' }); // 并发 outcome 已推 approved
     await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('dev-1');
 
@@ -3493,12 +3079,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime task fail WORKS when task still in dispatch expected fromStatus', async () => {
     // 对照测试：expectedFromStatuses=['in_progress'] (develop dispatch) + task 仍 'in_progress' → fail。
-    const t = task({ id: 'task-still-in-progress', status: 'in_progress' });
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      updatedAt: NOW,
+    const t = await seedTask({ id: 'task-still-in-progress', status: 'in_progress' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('dev-1');
 
@@ -3515,12 +3098,10 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime task fail is serialized via transitionTaskStatus (does not overwrite concurrent terminal)', async () => {
     // Unserialized get+set raced with concurrent terminal mutations; transitionTaskStatus locks + fromStatus-guards.
-    const t = task({ id: 'task-already-cancelled', status: 'cancelled' }); // terminal but not failed
+    const t = await seedTask({ id: 'task-already-cancelled', status: 'cancelled' }); // terminal but not failed
     await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
-      updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
     });
     await lockManager.acquire('dev-1');
 
@@ -3539,7 +3120,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime: retry path (state empty + createdSession=true) probes tmux paneId and marks awaiting_human', async () => {
     // Without probing paneId, markDialogPending refuses (empty state) → 202 lets next dispatch hit the dialog pane.
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     const probingRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('list-panes')) {
@@ -3566,7 +3147,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime: retry path with tmux probe failure returns false (caller rollbacks)', async () => {
     // tmux 探 paneId 失败 → 无法证明 generation → 返回 false 让 caller 走 killSession 回滚。
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
     const failingProbeRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('list-panes')) {
@@ -3592,7 +3173,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
   it('handleDialogPendingFromRuntime retry path: paneId guard rejects writes when fresh agent already has paneId (DELETE+recreate covered)', async () => {
     // updatedAt guard mis-fired on background updates; paneId presence is the actual generation evidence.
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%new', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', paneId: '%new' });
     const probingRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('list-panes')) {
@@ -3622,7 +3203,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   it('handleDialogPendingFromRuntime: state empty + createdSession=false returns false (no generation evidence available)', async () => {
     // adoptOrRestartSession 路径抛 dialogPending 时 createdSession=false → 不从 tmux 取 paneId
     // （session 是别人创建的，不能确定我看到的 pane 是我刚操作的那个）→ 返回 false。
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
 
     const err = new EnsureSessionError(
       { createdSession: false, agentId: 'dev-1', dialogPending: true },
@@ -3635,64 +3216,58 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(state?.status).toBeUndefined();
   });
 
-  it('markAwaitingHuman with expectedTaskId guard: noop when binding has shifted to a different task', async () => {
-    // Late mark races with release+reassign; atomic-update guards on expectedTaskId to avoid polluting the new task.
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: 'task-new', paneId: '%0',
-      updatedAt: NOW,
-    });
+  // Late mark races with release+reassign; the atomic update guards on expectedTaskId so a stale mark
+  // can't pollute a rebound task.
+  it.each([
+    { name: 'noop when binding has shifted to a different task', boundTaskId: 'task-new', expectedTaskId: 'task-old', expectWrite: false },
+    { name: 'writes when binding still matches', boundTaskId: 'task-current', expectedTaskId: 'task-current', expectWrite: true },
+  ])('markAwaitingHuman with expectedTaskId guard: $name', async ({ boundTaskId, expectedTaskId, expectWrite }) => {
+    await seedAgent({ id: 'qa-1', taskId: boundTaskId, paneId: '%0' });
 
-    await manager.markAwaitingHuman('qa-1', 'dispatch-failed:ack_unknown', 'stale ack_unknown', {
-      expectedTaskId: 'task-old',
-    });
+    await manager.markAwaitingHuman('qa-1', 'dispatch-failed:ack_unknown', 'ack_unknown', { expectedTaskId });
 
     const state = await agentStore.get('qa-1');
-    expect(state?.status).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
-    expect(state?.taskId).toBe('task-new');
+    if (expectWrite) {
+      expect(state?.status).toBe('awaiting_human');
+      expect(state?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
+    } else {
+      expect(state?.status).toBeUndefined();
+      expect(state?.awaitingPhase).toBeUndefined();
+      expect(state?.taskId).toBe('task-new');
+    }
   });
 
-  it('markAwaitingHuman with expectedTaskId guard: writes when binding still matches', async () => {
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj',
-      taskId: 'task-current', paneId: '%0',
-      updatedAt: NOW,
-    });
+  // expectedCreationToken guards against a DELETE+recreate race: a stale runtime callback must not
+  // mark a newer generation. null = caller expected "still no token"; a string = exact-token match.
+  it.each([
+    { name: 'expectedCreationToken=null noop when token has been set', seededToken: 'tok-recreated', expectedToken: null, reason: 'stale runtime callback', expectWrite: false, checkNoEmit: false },
+    { name: 'noop on token mismatch', seededToken: 'tok-new', expectedToken: 'tok-old', reason: 'stale token holder', expectWrite: false, checkNoEmit: true },
+    { name: 'writes on token match', seededToken: 'tok-match', expectedToken: 'tok-match', reason: 'good', expectWrite: true, checkNoEmit: false },
+  ])('markAwaitingHuman with expectedCreationToken: $name (DELETE+recreate race)', async ({ seededToken, expectedToken, reason, expectWrite, checkNoEmit }) => {
+    await seedAgent({ id: 'dev-1', creationToken: seededToken });
 
-    await manager.markAwaitingHuman('qa-1', 'dispatch-failed:ack_unknown', 'ack_unknown', {
-      expectedTaskId: 'task-current',
-    });
-
-    const state = await agentStore.get('qa-1');
-    expect(state?.status).toBe('awaiting_human');
-    expect(state?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
-  });
-
-  it('markAwaitingHuman with expectedCreationToken=null is noop when token has been set (DELETE+recreate race)', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      creationToken: 'tok-recreated', // 新 agent 已被创建
-      updatedAt: NOW,
-    });
-
-    await manager.markAwaitingHuman('dev-1', 'agent_dialog_pending', 'stale runtime callback', {
-      expectedCreationToken: null, // 旧 runtime callback：期待"仍无 token"
-    });
+    await manager.markAwaitingHuman('dev-1', 'agent_dialog_pending', reason, { expectedCreationToken: expectedToken });
 
     const state = await agentStore.get('dev-1');
-    expect(state?.status).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
+    if (expectWrite) {
+      expect(state?.status).toBe('awaiting_human');
+    } else {
+      expect(state?.status).toBeUndefined();
+      expect(state?.awaitingPhase).toBeUndefined();
+    }
+    if (checkNoEmit) {
+      const emitted = events.filter(
+        e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'agent_dialog_pending',
+      );
+      expect(emitted).toHaveLength(0);
+    }
   });
 
   it('releaseAgentForTask refuses to release when status=awaiting_human (no allowAwaitingHuman opt)', async () => {
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: t.id, paneId: '%0',
+    const t = await seedTask();
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
@@ -3717,57 +3292,73 @@ describe('AgentManager awaiting_human lifecycle', () => {
     })).toBe(true);
   });
 
-  it('markAwaitingHuman with expectedCreationToken: noop on token mismatch (DELETE+recreate race)', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      creationToken: 'tok-new', // newer generation already swapped in
-      updatedAt: NOW,
-    });
-
-    await manager.markAwaitingHuman('dev-1', 'agent_dialog_pending', 'stale token holder', {
-      expectedCreationToken: 'tok-old',
-    });
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.status).toBeUndefined();
-    expect(state?.awaitingPhase).toBeUndefined();
-    const emitted = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'agent_dialog_pending',
-    );
-    expect(emitted).toHaveLength(0);
-  });
-
   it('canDispatchWithBinding rejects same-task reentry when awaiting_human (cannot bypass via reentry phase)', async () => {
     // 此场景：agent 已 awaiting_human 但仍绑同一 task；reentry phase 试图 acquire。
     // acquireAgentForTask 走 sameTaskReentry 分支需要校验 status，否则绕过 gate。
-    await taskStore.set(task({ id: 'task-reentry-block' }));
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      taskId: 'task-reentry-block', paneId: '%0',
+    await seedTask({ id: 'task-reentry-block' });
+    await seedAgent({
+      id: 'dev-1', taskId: 'task-reentry-block', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      updatedAt: NOW,
     });
     await lockManager.acquire('dev-1');
 
     const ok = await manager.acquireAgentForTask('dev-1', 'task-reentry-block', 'fix');
     expect(ok).toBe(false);
   });
-
-  it('markAwaitingHuman with expectedCreationToken: writes on token match', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj',
-      creationToken: 'tok-match',
-      updatedAt: NOW,
-    });
-
-    await manager.markAwaitingHuman('dev-1', 'agent_dialog_pending', 'good', {
-      expectedCreationToken: 'tok-match',
-    });
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.status).toBe('awaiting_human');
-  });
 });
+
+const ACK_SEP = '___bx-snap-sep___';
+
+// The dispatch-ack-timeout interventions recorded on the bus during an ack attempt.
+function ackInterventions(): BaxianEvent[] {
+  return events.filter(
+    e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
+  );
+}
+
+// A CommandRunner for the snapshot-driven ack tests: display-message returns the visible frame plus
+// the SEP-prefixed scrollback line; a submitted Enter flips `enterSent` so `frame` can react to it.
+// `sawEnter()` lets a test assert the Enter was actually delivered.
+type SnapRunner = CommandRunner & { sawEnter: () => boolean };
+function snapRunner(
+  frame: (enterSent: boolean) => string,
+  scrollback: (enterSent: boolean) => number = () => 0,
+): SnapRunner {
+  let enterSent = false;
+  return {
+    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('display-message')) {
+        return { stdout: `${frame(enterSent)}${ACK_SEP}\n${scrollback(enterSent)}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }),
+    writeFile: vi.fn(async (): Promise<void> => undefined),
+    sawEnter: () => enterSent,
+  } as unknown as SnapRunner;
+}
+
+// Seed the task+dev+lock that every ack test shares, then invoke injectAndAwaitAck over `runner`,
+// capturing either the resolved result or the thrown error.
+async function runAck(
+  runner: CommandRunner,
+  opts: { ackMs: number; settleMs: number; prompt?: string; lock?: boolean } = { ackMs: 150, settleMs: 150 },
+): Promise<{ result?: AckResult; caught?: unknown; taskId: string }> {
+  const localManager = makeInjectManager(runner, opts.ackMs, opts.settleMs);
+  const t = await seedTask();
+  await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+  if (opts.lock !== false) await lockManager.acquire('dev-1');
+  const tmux = new TmuxManager(runner);
+  try {
+    const result = await callInjectAndAwaitAck(localManager, tmux, '%0', opts.prompt ?? 'hello prompt', 'dev-1', 'claude-code');
+    return { result, taskId: t.id };
+  } catch (caught) {
+    return { caught, taskId: t.id };
+  }
+}
 
 describe('injectAndAwaitAck ack timeout', () => {
   it('emits human.intervention dispatch-ack-timeout, does not throw, does not send C-c', async () => {
@@ -3776,55 +3367,29 @@ describe('injectAndAwaitAck ack timeout', () => {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         sentCommands.push(cmd);
         if (cmd.includes('capture-pane')) {
-          return {
-            stdout: 'stuck-screen\n___bx-snap-sep___\n42\n',
-            stderr: '',
-            exitCode: 0,
-          };
+          return { stdout: `stuck-screen\n${ACK_SEP}\n42\n`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
       runnerFactory: () => stuckRunner,
       dispatchAckTimeoutMs: 50,
     });
 
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      taskId: t.id,
-      paneId: '%0',
-      updatedAt: NOW,
-    });
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
     const tmux = new TmuxManager(stuckRunner);
 
     await expect(
-      (localManager as unknown as {
-        injectAndAwaitAck: (
-          tmux: TmuxManager,
-          paneId: string,
-          prompt: string,
-          agentId: string,
-          runtime: 'claude-code' | 'codex',
-        ) => Promise<{ acked: boolean }>;
-      }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code'),
+      callInjectAndAwaitAck(localManager, tmux, '%0', 'hello prompt', 'dev-1', 'claude-code'),
     ).resolves.toEqual({ acked: false, composerDelivered: true });
 
-    const interventions = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
-    );
+    const interventions = ackInterventions();
     expect(interventions).toHaveLength(1);
     expect(interventions[0]).toMatchObject({
       type: 'human.intervention',
@@ -3856,35 +3421,17 @@ describe('injectAndAwaitAck ack timeout', () => {
         if (cmd.includes('capture-pane')) {
           // First Enter is swallowed; only the resent Enter flips the pane busy.
           const visible = enterCount >= 2 ? 'working\n  esc to interrupt\n' : 'idle composer\n';
-          return { stdout: `${visible}___bx-snap-sep___\n0\n`, stderr: '', exitCode: 0 };
+          return { stdout: `${visible}${ACK_SEP}\n0\n`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => flakyRunner,
-      dispatchAckTimeoutMs: 3000,
-      dispatchSettleTimeoutMs: 10,
-    });
+    const localManager = makeInjectManager(flakyRunner, 3000, 10);
     (localManager as unknown as { dispatchAckResendIntervalMs: number }).dispatchAckResendIntervalMs = 50;
     const tmux = new TmuxManager(flakyRunner);
 
-    const result = await (localManager as unknown as {
-      injectAndAwaitAck: (
-        tmux: TmuxManager,
-        paneId: string,
-        prompt: string,
-        agentId: string,
-        runtime: 'claude-code' | 'codex',
-      ) => Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
+    const result = await callInjectAndAwaitAck(localManager, tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
 
     expect(result).toEqual({ acked: true, composerDelivered: true });
     expect(enterCount).toBeGreaterThanOrEqual(2);
@@ -3892,7 +3439,7 @@ describe('injectAndAwaitAck ack timeout', () => {
 
   it('infrastructure failure during the post-Enter ack wait throws DispatchTerminalError, not human.intervention', async () => {
     let enterSent = false;
-    const SETTLED = 'idle\n___bx-snap-sep___\n10\n';
+    const SETTLED = `idle\n${ACK_SEP}\n10\n`;
     const failingRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
@@ -3909,51 +3456,15 @@ describe('injectAndAwaitAck ack timeout', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => failingRunner,
-      dispatchAckTimeoutMs: 50,
-      dispatchSettleTimeoutMs: 200,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      taskId: t.id,
-      paneId: '%0',
-      updatedAt: NOW,
-    });
-    const tmux = new TmuxManager(failingRunner);
-
-    await expect(
-      (localManager as unknown as {
-        injectAndAwaitAck: (
-          tmux: TmuxManager,
-          paneId: string,
-          prompt: string,
-          agentId: string,
-          runtime: 'claude-code' | 'codex',
-        ) => Promise<{ acked: boolean }>;
-      }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code'),
-    ).rejects.toBeInstanceOf(DispatchTerminalError);
-
-    const ackTimeouts = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
-    );
-    expect(ackTimeouts).toHaveLength(0);
+    const { caught } = await runAck(failingRunner, { ackMs: 50, settleMs: 200, lock: false });
+    expect(caught).toBeInstanceOf(DispatchTerminalError);
+    expect(ackInterventions()).toHaveLength(0);
   });
 });
 
 describe('injectAndAwaitAck settles the pane before Enter', () => {
   it('settles the pane before Enter, then acks on submission evidence (idle→busy) after Enter', async () => {
     const order: string[] = [];
-    const SEP = '___bx-snap-sep___';
     // Pre-Enter: image-attach redraw settles to a stable idle composer. Post-Enter: runtime goes busy.
     const preEnter = [
       'box: read /img.png\n',
@@ -3969,7 +3480,7 @@ describe('injectAndAwaitAck settles the pane before Enter', () => {
           const visible = enterSent
             ? 'box: [Image #1]\nThinking\n  esc to interrupt\n'
             : preEnter[Math.min(snap++, preEnter.length - 1)];
-          return { stdout: `${visible}${SEP}\n0\n`, stderr: '', exitCode: 0 };
+          return { stdout: `${visible}${ACK_SEP}\n0\n`, stderr: '', exitCode: 0 };
         }
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
           enterSent = true;
@@ -3980,32 +3491,7 @@ describe('injectAndAwaitAck settles the pane before Enter', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 2000,
-      dispatchSettleTimeoutMs: 2000,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-
-    const result = await (localManager as unknown as {
-      injectAndAwaitAck: (
-        tmux: TmuxManager,
-        paneId: string,
-        prompt: string,
-        agentId: string,
-        runtime: 'claude-code' | 'codex',
-      ) => Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
+    const { result } = await runAck(runner, { ackMs: 2000, settleMs: 2000 });
 
     expect(result).toEqual({ acked: true, composerDelivered: true });
     const enterIdx = order.indexOf('enter');
@@ -4019,12 +3505,11 @@ describe('injectAndAwaitAck settles the pane before Enter', () => {
 describe('injectAndAwaitAck never-settle + swallowed Enter is non-ackable', () => {
   it('does NOT false-ack from redraw deltas when the runtime never goes busy', async () => {
     let n = 0;
-    const SEP = '___bx-snap-sep___';
     let enterSent = false;
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('display-message')) {
-          return { stdout: `frame ${n++}\n${SEP}\n0\n`, stderr: '', exitCode: 0 };
+          return { stdout: `frame ${n++}\n${ACK_SEP}\n0\n`, stderr: '', exitCode: 0 };
         }
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
           enterSent = true;
@@ -4037,127 +3522,40 @@ describe('injectAndAwaitAck never-settle + swallowed Enter is non-ackable', () =
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 60,
-      dispatchSettleTimeoutMs: 60,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-
-    const result = await (localManager as unknown as {
-      injectAndAwaitAck: (
-        tmux: TmuxManager,
-        paneId: string,
-        prompt: string,
-        agentId: string,
-        runtime: 'claude-code' | 'codex',
-      ) => Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
+    const { result, taskId } = await runAck(runner, { ackMs: 60, settleMs: 60 });
 
     expect(result).toEqual({ acked: false, composerDelivered: true });
     expect(enterSent).toBe(true);
-    const interventions = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
-    );
-    expect(interventions).toHaveLength(1);
-    expect((await taskStore.get(t.id))?.status).toBe('in_progress');
+    expect(ackInterventions()).toHaveLength(1);
+    expect((await taskStore.get(taskId))?.status).toBe('in_progress');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 });
 
 describe('injectAndAwaitAck post-approve edge cases', () => {
-  const SEP = '___bx-snap-sep___';
-
   it('acks a quick task on its brief idle-to-busy flash after Enter', async () => {
-    let enterSent = false;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message')) {
-          // pre-Enter: settled idle. post-Enter: runtime flashes busy (the one fakeable-proof signal).
-          const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
-          return { stdout: `${visible}${SEP}\n5\n`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const localManager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 1000, dispatchSettleTimeoutMs: 1000,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-    const result = await (localManager as unknown as {
-      injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
+    // pre-Enter: settled idle. post-Enter: runtime flashes busy (the one fakeable-proof signal).
+    const runner = snapRunner(enterSent => (enterSent ? 'working\n  esc to interrupt\n' : 'composer\n'), () => 5);
+    const { result } = await runAck(runner, { ackMs: 1000, settleMs: 1000 });
     expect(result).toEqual({ acked: true, composerDelivered: true });
-    expect(enterSent).toBe(true);
+    expect(runner.sawEnter()).toBe(true);
   });
 
   it('does NOT ack on scrollback growth from an uncommitted attach redraw when runtime never gets busy', async () => {
-    let enterSent = false;
+    // post-Enter the attach redraw keeps pushing scrollback, but the pane never goes busy.
     let h = 5;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message')) {
-          // post-Enter the attach redraw keeps pushing scrollback, but the pane never goes busy.
-          if (enterSent) h += 1;
-          return { stdout: `composer still open\n${SEP}\n${h}\n`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const localManager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: 80,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-    const result = await (localManager as unknown as {
-      injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
+    const runner = snapRunner(() => 'composer still open\n', enterSent => (enterSent ? ++h : h));
+    const { result } = await runAck(runner, { ackMs: 150, settleMs: 80 });
     expect(result).toEqual({ acked: false, composerDelivered: true });
-    expect(enterSent).toBe(true);
-    const interventions = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
-    );
-    expect(interventions).toHaveLength(1);
+    expect(runner.sawEnter()).toBe(true);
+    expect(ackInterventions()).toHaveLength(1);
   });
 
   it('a failed sendEnter is raw cleanup, not ack_unknown', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('display-message')) {
-          return { stdout: `idle\n${SEP}\n5\n`, stderr: '', exitCode: 0 };
+          return { stdout: `idle\n${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
         }
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
           return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
@@ -4166,25 +3564,7 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 100, dispatchSettleTimeoutMs: 100,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-    let caught: unknown;
-    try {
-      await (localManager as unknown as {
-        injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean }>;
-      }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
-    } catch (e) {
-      caught = e;
-    }
+    const { caught } = await runAck(runner, { ackMs: 100, settleMs: 100 });
     expect(caught).toBeInstanceOf(Error);
     expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
   });
@@ -4195,7 +3575,7 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('display-message')) {
-          return { stdout: `${screen}${SEP}\n3\n`, stderr: '', exitCode: 0 };
+          return { stdout: `${screen}${ACK_SEP}\n3\n`, stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
           return { stdout: screen, stderr: '', exitCode: 0 };
@@ -4204,25 +3584,9 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: 150,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-    const result = await (localManager as unknown as {
-      injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean }>;
-    }).injectAndAwaitAck(tmux, '%0', 'do X\n  esc to interrupt', 'dev-1', 'claude-code');
+    const { result } = await runAck(runner, { ackMs: 150, settleMs: 150, prompt: 'do X\n  esc to interrupt' });
     expect(result).toEqual({ acked: false, composerDelivered: false });
-    const interventions = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
-    );
-    expect(interventions).toHaveLength(1);
+    expect(ackInterventions()).toHaveLength(1);
   });
 
   it('a pre-Enter settle/capture failure is not ack_unknown and never sends Enter', async () => {
@@ -4233,33 +3597,14 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
         sent.push(cmd);
         if (cmd.includes('display-message')) {
           snaps++;
-          if (snaps === 1) return { stdout: `composer\n${SEP}\n1\n`, stderr: '', exitCode: 0 };
+          if (snaps === 1) return { stdout: `composer\n${ACK_SEP}\n1\n`, stderr: '', exitCode: 0 };
           return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
-    const localManager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: 150,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-
-    let caught: unknown;
-    try {
-      await (localManager as unknown as {
-        injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean }>;
-      }).injectAndAwaitAck(tmux, '%0', 'hello prompt', 'dev-1', 'claude-code');
-    } catch (e) {
-      caught = e;
-    }
+    const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150 });
     expect(caught).toBeInstanceOf(Error);
     expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
     const enterCmds = sent.filter(c => c.includes('send-keys') && c.includes('Enter'));
@@ -4268,53 +3613,35 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
 });
 
 describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () => {
-  const SEP = '___bx-snap-sep___';
   const ccCmds = (sent: string[]): string[] =>
     sent.filter(c => c.includes('send-keys') && c.includes('C-c'));
   const hasSessionCmds = (sent: string[]): string[] =>
     sent.filter(c => c.includes('has-session'));
 
-  const runInject = async (
-    runner: CommandRunner,
-    prompt = 'hello prompt',
-  ): Promise<{ result?: { acked: boolean; composerDelivered: boolean }; caught?: unknown }> => {
-    const localManager = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner,
-      dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: 150,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-    try {
-      const result = await (localManager as unknown as {
-        injectAndAwaitAck: (tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex') => Promise<{ acked: boolean; composerDelivered: boolean }>;
-      }).injectAndAwaitAck(tmux, '%0', prompt, 'dev-1', 'claude-code');
-      return { result };
-    } catch (caught) {
-      return { caught };
-    }
-  };
+  // A recording runner whose per-command behaviour is supplied by `respond`; falls through to a
+  // benign empty result so a spec only has to describe the arms it cares about.
+  function recordRunner(sent: string[], respond: (cmd: string) => ExecResult | undefined): CommandRunner {
+    return {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        sent.push(cmd);
+        return respond(cmd) ?? { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    } as unknown as CommandRunner;
+  }
 
   it('clears the composer with C-c after a pre-Enter capture failure → raw, never Enter, no kill probe', async () => {
     const sent: string[] = [];
     let snaps = 0;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('display-message')) {
-          snaps++;
-          if (snaps === 1) return { stdout: `composer\n${SEP}\n1\n`, stderr: '', exitCode: 0 };
-          return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { caught } = await runInject(runner);
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('display-message')) {
+        snaps++;
+        if (snaps === 1) return { stdout: `composer\n${ACK_SEP}\n1\n`, stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+      }
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
     expect(caught).toBeInstanceOf(Error);
     expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
     expect(ccCmds(sent)).toHaveLength(1);
@@ -4322,105 +3649,79 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
   });
 
-  it('clears the composer with C-c after a failed sendEnter → raw', async () => {
+  // Pre-Enter the pane settles idle, then sendEnter fails; how C-c cleanup is classified depends on
+  // whether the session is confirmably alive/dead. Every case clears with exactly one C-c.
+  it.each([
+    {
+      name: 'clears the composer with C-c after a failed sendEnter → raw',
+      // only the Enter send-keys fails; the follow-up C-c lands cleanly → raw without probing.
+      onHasSession: undefined as ExecResult | undefined,
+      failKeys: 'enter' as 'enter' | 'all',
+      sendKeys: { stdout: '', stderr: 'no such pane: %0', exitCode: 1 },
+      expectAckUnknown: false,
+      hasSessionCount: undefined as number | undefined, // not asserted in the original
+    },
+    {
+      name: 'a transient C-c failure on a still-live session escalates to ack_unknown',
+      // The transient tmux/SSH fault that broke sendEnter also breaks the follow-up C-c — but it is
+      // a generic transient error, NOT "no such pane": the pane is still live with the leftover.
+      onHasSession: { stdout: '', stderr: '', exitCode: 0 }, // alive
+      failKeys: 'all' as 'enter' | 'all',
+      sendKeys: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 },
+      expectAckUnknown: true,
+      hasSessionCount: 1, // probed → still alive → cannot release for reuse
+    },
+    {
+      name: 'a C-c failure on a CONFIRMED-DEAD session is reuse-safe → raw (next dispatch rebuilds fresh)',
+      onHasSession: { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }, // gone
+      failKeys: 'all' as 'enter' | 'all',
+      sendKeys: { stdout: '', stderr: 'no such pane: %0', exitCode: 1 },
+      expectAckUnknown: false,
+      hasSessionCount: 1, // probed → confirmed dead → safe no-op
+    },
+    {
+      name: 'an UNCONFIRMABLE session (C-c fails AND has-session probe fails) escalates to ack_unknown',
+      onHasSession: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 2 }, // unexpected → throws
+      failKeys: 'all' as 'enter' | 'all',
+      sendKeys: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 },
+      expectAckUnknown: true,
+      hasSessionCount: 1,
+    },
+  ])('$name', async ({ onHasSession, failKeys, sendKeys, expectAckUnknown, hasSessionCount }) => {
     const sent: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('display-message')) {
-          return { stdout: `idle\n${SEP}\n5\n`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { caught } = await runInject(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('has-session')) return onHasSession;
+      if (cmd.includes('send-keys') && (failKeys === 'all' || cmd.includes('Enter'))) return sendKeys;
+      if (cmd.includes('display-message')) return { stdout: `idle\n${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
+    if (expectAckUnknown) {
+      expect(caught).toBeInstanceOf(DispatchTerminalError);
+      expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
+    } else {
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
+    }
     expect(ccCmds(sent)).toHaveLength(1);
-  });
-
-  it('a transient C-c failure on a still-live session escalates to ack_unknown', async () => {
-    const sent: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('has-session')) return { stdout: '', stderr: '', exitCode: 0 }; // alive
-        // The transient tmux/SSH fault that broke sendEnter also breaks the follow-up C-c — but it is
-        // a generic transient error, NOT "no such pane": the pane is still live with the leftover.
-        if (cmd.includes('send-keys')) return { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 };
-        if (cmd.includes('display-message')) return { stdout: `idle\n${SEP}\n5\n`, stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { caught } = await runInject(runner);
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(ccCmds(sent)).toHaveLength(1);
-    expect(hasSessionCmds(sent)).toHaveLength(1); // probed → still alive → cannot release for reuse
-  });
-
-  it('a C-c failure on a CONFIRMED-DEAD session is reuse-safe → raw (next dispatch rebuilds fresh)', async () => {
-    const sent: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('has-session')) return { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }; // gone
-        if (cmd.includes('send-keys')) return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        if (cmd.includes('display-message')) return { stdout: `idle\n${SEP}\n5\n`, stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { caught } = await runInject(runner);
-    expect(caught).toBeInstanceOf(Error);
-    expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
-    expect(ccCmds(sent)).toHaveLength(1);
-    expect(hasSessionCmds(sent)).toHaveLength(1); // probed → confirmed dead → safe no-op
-  });
-
-  it('an UNCONFIRMABLE session (C-c fails AND has-session probe fails) escalates to ack_unknown', async () => {
-    const sent: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('has-session')) return { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 2 }; // unexpected → throws
-        if (cmd.includes('send-keys')) return { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 };
-        if (cmd.includes('display-message')) return { stdout: `idle\n${SEP}\n5\n`, stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { caught } = await runInject(runner);
-    expect(caught).toBeInstanceOf(DispatchTerminalError);
-    expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(ccCmds(sent)).toHaveLength(1);
-    expect(hasSessionCmds(sent)).toHaveLength(1);
+    if (hasSessionCount !== undefined) expect(hasSessionCmds(sent)).toHaveLength(hasSessionCount);
   });
 
   it('does NOT touch the composer on a post-Enter ack_unknown — the prompt may be running', async () => {
     const sent: string[] = [];
     let enterSent = false;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane') || cmd.includes('display-message')) {
-          if (!enterSent) return { stdout: `idle\n${SEP}\n10\n`, stderr: '', exitCode: 0 };
-          return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
-        }
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
         return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { caught } = await runInject(runner);
+      }
+      if (cmd.includes('capture-pane') || cmd.includes('display-message')) {
+        if (!enterSent) return { stdout: `idle\n${ACK_SEP}\n10\n`, stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+      }
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
     expect(caught).toBeInstanceOf(DispatchTerminalError);
     expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
     expect(ccCmds(sent)).toHaveLength(0);
@@ -4430,22 +3731,18 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
   it('does NOT touch the composer on a clean ack', async () => {
     const sent: string[] = [];
     let enterSent = false;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        sent.push(cmd);
-        if (cmd.includes('display-message')) {
-          const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
-          return { stdout: `${visible}${SEP}\n5\n`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) {
-          enterSent = true;
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('display-message')) {
+        const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
+        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
         return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const { result } = await runInject(runner);
+      }
+      return undefined;
+    });
+    const { result } = await runAck(runner);
     expect(result).toEqual({ acked: true, composerDelivered: true });
     expect(ccCmds(sent)).toHaveLength(0);
     expect(hasSessionCmds(sent)).toHaveLength(0);
@@ -4453,55 +3750,31 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
 });
 
 describe('injectAndAwaitAck busy-baseline is non-ackable', () => {
-  const SEP = '___bx-snap-sep___';
-
   // A prompt whose own text looks busy ("esc to interrupt" / spinner) gives no observable idle→busy
   // transition, so dispatch can't confirm submission by screen-scrape and conservatively times out.
   // This is rare (real image dispatch carries plain file paths → idle baseline) and a loud intervention
   // beats a silent false ack. Every busy-baseline outcome is acked:false + intervention.
-  const expectNonAck = async (frames: (enterSent: boolean) => string, settleMs: number): Promise<void> => {
-    let enterSent = false;
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message')) {
-          return { stdout: `${frames(enterSent)}${SEP}\n0\n`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('send-keys') && cmd.includes('Enter')) { enterSent = true; return { stdout: '', stderr: '', exitCode: 0 }; }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const m = new AgentManager({
-      config: CONFIG, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner, dispatchAckTimeoutMs: 150, dispatchSettleTimeoutMs: settleMs,
-    });
-    const t = task();
-    await taskStore.set(t);
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW });
-    await lockManager.acquire('dev-1');
-    const tmux = new TmuxManager(runner);
-    const result = await (m as unknown as { injectAndAwaitAck: (a: TmuxManager, b: string, c: string, d: string, e: 'claude-code'|'codex') => Promise<{acked:boolean}> })
-      .injectAndAwaitAck(tmux, '%0', 'review:\n  esc to interrupt', 'dev-1', 'claude-code');
+  it.each([
+    {
+      name: 'composer "clears" after submit but baseline was busy → still non-ackable',
+      settleMs: 150,
+      frames: () => (enterSent: boolean) => (enterSent ? 'running the task now\n' : 'review:\n  esc to interrupt\n'),
+    },
+    {
+      name: 'swallowed Enter plus ongoing attach redraw is non-ackable',
+      settleMs: 80,
+      frames: () => { let n = 0; return () => `review:\n  esc to interrupt\n[Image #1] frame ${n++}\n`; },
+    },
+    {
+      name: 'settled busy baseline plus late attach redraw and swallowed Enter is non-ackable',
+      settleMs: 150,
+      frames: () => { let post = 0; return (enterSent: boolean) => (enterSent ? `review:\n  esc to interrupt\n[Image #1] frame ${post++}\n` : 'review:\n  esc to interrupt\n'); },
+    },
+  ])('$name', async ({ frames, settleMs }) => {
+    const runner = snapRunner(frames());
+    const { result } = await runAck(runner, { ackMs: 150, settleMs, prompt: 'review:\n  esc to interrupt' });
     expect(result).toEqual({ acked: false, composerDelivered: false });
-    const interventions = events.filter(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
-    );
-    expect(interventions.length).toBeGreaterThanOrEqual(1);
-  };
-
-  it('composer "clears" after submit but baseline was busy → still non-ackable', async () => {
-    await expectNonAck(enterSent => (enterSent ? 'running the task now\n' : 'review:\n  esc to interrupt\n'), 150);
-  });
-
-  it('swallowed Enter plus ongoing attach redraw is non-ackable', async () => {
-    let n = 0;
-    await expectNonAck(() => `review:\n  esc to interrupt\n[Image #1] frame ${n++}\n`, 80);
-  });
-
-  it('settled busy baseline plus late attach redraw and swallowed Enter is non-ackable', async () => {
-    let post = 0;
-    await expectNonAck(enterSent => (enterSent ? `review:\n  esc to interrupt\n[Image #1] frame ${post++}\n` : 'review:\n  esc to interrupt\n'), 150);
+    expect(ackInterventions().length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -4535,8 +3808,13 @@ describe('AgentManager max_rounds manual actions', () => {
       expect(result.id).toBe('task-mr');
     });
 
-    it('rejects a non-max_rounds task with 409', async () => {
-      await taskStore.set(maxRoundsTask({ status: 'review' }));
+    // A non-max_rounds task and a spec-phase max_rounds (escapes via Retry/Cancel only) must both be
+    // refused with 409 and never merge — a direct API call / older client can't slip through.
+    it.each([
+      { name: 'non-max_rounds task', overrides: { status: 'review' as const } },
+      { name: 'spec-phase task', overrides: { phase: 'spec' as const } },
+    ])('rejects a $name with 409 (no merge)', async ({ overrides }) => {
+      await taskStore.set(maxRoundsTask(overrides));
       const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
       await expect(manager.markTaskComplete('task-mr')).rejects.toMatchObject({ status: 409 });
       expect(mergeSpy).not.toHaveBeenCalled();
@@ -4547,23 +3825,14 @@ describe('AgentManager max_rounds manual actions', () => {
       await expect(manager.markTaskComplete('task-mr')).rejects.toMatchObject({ status: 400 });
     });
 
-    // I4: spec-phase max_rounds escapes via Retry/Cancel only — the endpoint must reject it too,
-    // so a direct API call / older client can't merge a spec cap through complete.
-    it('rejects a spec-phase task with 409 (no merge)', async () => {
-      await taskStore.set(maxRoundsTask({ phase: 'spec' }));
-      const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
-      await expect(manager.markTaskComplete('task-mr')).rejects.toMatchObject({ status: 409 });
-      expect(mergeSpy).not.toHaveBeenCalled();
-    });
-
     // G3: a held (awaiting_human) dev would survive post-merge cleanup (it skips awaiting_human),
     // orphaning a merged task on a bound+locked dev — refuse before merging.
     it('rejects with 409 (no merge) when the dev is awaiting_human (held)', async () => {
       await taskStore.set(maxRoundsTask());
-      await agentStore.set({
-        id: 'dev-1', projectId: 'proj', status: 'awaiting_human',
+      await seedAgent({
+        id: 'dev-1', status: 'awaiting_human',
         awaitingPhase: 'signal-arm-failed:pr-fixed', taskId: 'task-mr',
-        worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1', updatedAt: NOW,
+        worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
       });
       const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
       await expect(manager.markTaskComplete('task-mr')).rejects.toMatchObject({ status: 409 });
@@ -4575,13 +3844,13 @@ describe('AgentManager max_rounds manual actions', () => {
     // Otherwise merge would land + pr.merged cleanup skips the held QA → merged + bound QA orphan.
     it('rejects with 409 (no merge) when the QA is awaiting_human and bound to the task', async () => {
       await taskStore.set(maxRoundsTask({ qaAgentId: 'qa-1' }));
-      await agentStore.set({
-        id: 'dev-1', projectId: 'proj', status: 'waiting',
-        taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1', updatedAt: NOW,
+      await seedAgent({
+        id: 'dev-1', status: 'waiting',
+        taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
       });
-      await agentStore.set({
-        id: 'qa-1', projectId: 'proj', status: 'awaiting_human',
-        awaitingPhase: 'ack_unknown', taskId: 'task-mr', paneId: '%2', updatedAt: NOW,
+      await seedAgent({
+        id: 'qa-1', status: 'awaiting_human',
+        awaitingPhase: 'ack_unknown', taskId: 'task-mr', paneId: '%2',
       });
       const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
       await expect(manager.markTaskComplete('task-mr')).rejects.toMatchObject({ status: 409 });
@@ -4592,9 +3861,9 @@ describe('AgentManager max_rounds manual actions', () => {
     // A stale qaAgentId whose agent has moved on (bound elsewhere) must NOT block completion.
     it('does not block completion when a held QA is bound to a DIFFERENT task (stale ref)', async () => {
       await taskStore.set(maxRoundsTask({ qaAgentId: 'qa-1' }));
-      await agentStore.set({
-        id: 'qa-1', projectId: 'proj', status: 'awaiting_human',
-        taskId: 'some-other-task', paneId: '%2', updatedAt: NOW,
+      await seedAgent({
+        id: 'qa-1', status: 'awaiting_human',
+        taskId: 'some-other-task', paneId: '%2',
       });
       const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
       await manager.markTaskComplete('task-mr');
@@ -4616,10 +3885,10 @@ describe('AgentManager max_rounds manual actions', () => {
     // concurrent Continue / Cancel / Call review — none may act on the same max_rounds snapshot.
     async function completeInFlight(): Promise<{ release: () => void; done: Promise<TaskState> }> {
       await taskStore.set(maxRoundsTask());
-      await agentStore.set({
-        id: 'dev-1', projectId: 'proj', status: 'waiting',
+      await seedAgent({
+        id: 'dev-1', status: 'waiting',
         taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc',
-        paneId: '%1', updatedAt: NOW,
+        paneId: '%1',
       });
       let release: () => void = () => {};
       vi.spyOn(manager, 'mergePr').mockImplementation(
@@ -4656,19 +3925,25 @@ describe('AgentManager max_rounds manual actions', () => {
 
   describe('continueDevRound', () => {
     async function bindReservedDev(): Promise<void> {
-      await agentStore.set({
-        id: 'dev-1', projectId: 'proj', status: 'waiting',
+      await seedAgent({
+        id: 'dev-1', status: 'waiting',
         taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc',
-        paneId: '%1', updatedAt: NOW,
+        paneId: '%1',
       });
     }
 
-    it('transitions max_rounds → fixing, bumps the round, and dispatches the fix', async () => {
+    // Seed a max_rounds task + reserved dev, then mock the acquire + pr-fixed watcher arm so the
+    // continueDevRound dispatch reaches continueSession; `armed` toggles the watcher outcome.
+    async function setupContinueDev(armed: boolean): Promise<void> {
       await taskStore.set(maxRoundsTask());
       await bindReservedDev();
       vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
       vi.spyOn(manager as unknown as { rotateAndSetupPhaseSignal: () => Promise<{ armed: boolean }> },
-        'rotateAndSetupPhaseSignal').mockResolvedValue({ armed: true });
+        'rotateAndSetupPhaseSignal').mockResolvedValue({ armed });
+    }
+
+    it('transitions max_rounds → fixing, bumps the round, and dispatches the fix', async () => {
+      await setupContinueDev(true);
       const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
 
       const result = await manager.continueDevRound('task-mr');
@@ -4678,21 +3953,18 @@ describe('AgentManager max_rounds manual actions', () => {
       expect(continueSpy).toHaveBeenCalledWith('task-mr', 'dev-1', 'fix');
     });
 
-    it('rejects a non-max_rounds task with 409', async () => {
-      await taskStore.set(maxRoundsTask({ status: 'fixing' }));
-      await bindReservedDev();
-      await expect(manager.continueDevRound('task-mr')).rejects.toMatchObject({ status: 409 });
-    });
-
-    it('rejects a spec-phase task with 409', async () => {
-      await taskStore.set(maxRoundsTask({ phase: 'spec' }));
+    it.each([
+      { name: 'non-max_rounds task', overrides: { status: 'fixing' as const } },
+      { name: 'spec-phase task', overrides: { phase: 'spec' as const } },
+    ])('rejects a $name with 409', async ({ overrides }) => {
+      await taskStore.set(maxRoundsTask(overrides));
       await bindReservedDev();
       await expect(manager.continueDevRound('task-mr')).rejects.toMatchObject({ status: 409 });
     });
 
     it('rejects with 409 when the reserved worktree is gone, pointing at complete/cancel (not Retry)', async () => {
       await taskStore.set(maxRoundsTask());
-      await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-mr', updatedAt: NOW }); // no worktreePath
+      await seedAgent({ id: 'dev-1', taskId: 'task-mr' }); // no worktreePath
       await expect(manager.continueDevRound('task-mr')).rejects.toMatchObject({
         status: 409,
         message: expect.stringMatching(/mark-complete|cancel/),
@@ -4701,11 +3973,7 @@ describe('AgentManager max_rounds manual actions', () => {
     });
 
     it('rolls back to max_rounds and Holds the dev when the pr-fixed watcher fails to arm', async () => {
-      await taskStore.set(maxRoundsTask());
-      await bindReservedDev();
-      vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-      vi.spyOn(manager as unknown as { rotateAndSetupPhaseSignal: () => Promise<{ armed: boolean }> },
-        'rotateAndSetupPhaseSignal').mockResolvedValue({ armed: false });
+      await setupContinueDev(false);
       const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
       const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
 
@@ -4719,11 +3987,7 @@ describe('AgentManager max_rounds manual actions', () => {
 
     // F2: a failed dispatch must roll the task back to max_rounds AND re-park the dev to waiting.
     it('rolls back to max_rounds and re-parks the dev when continueSession returns false', async () => {
-      await taskStore.set(maxRoundsTask());
-      await bindReservedDev();
-      vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-      vi.spyOn(manager as unknown as { rotateAndSetupPhaseSignal: () => Promise<{ armed: boolean }> },
-        'rotateAndSetupPhaseSignal').mockResolvedValue({ armed: true });
+      await setupContinueDev(true);
       vi.spyOn(manager, 'continueSession').mockResolvedValue(false);
       const waitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
 
@@ -4737,17 +4001,17 @@ describe('AgentManager max_rounds manual actions', () => {
 
   it('markAgentWaiting succeeds for a dev bound to a max_rounds task (active set unification)', async () => {
     await taskStore.set(maxRoundsTask());
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', status: 'running',
-      taskId: 'task-mr', paneId: '%1', updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', status: 'running',
+      taskId: 'task-mr', paneId: '%1',
     });
     await expect(manager.markAgentWaiting('dev-1', 'task-mr')).resolves.toBe(true);
   });
 
   it('failTasksForAgent fails a max_rounds task when its reserved dev dies', async () => {
     await taskStore.set(maxRoundsTask());
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', status: 'waiting', taskId: 'task-mr', updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', status: 'waiting', taskId: 'task-mr',
     });
     const { failedTaskIds } = await manager.failTasksForAgent('dev-1', 'tmux-absent');
     expect(failedTaskIds).toContain('task-mr');
@@ -4787,12 +4051,11 @@ describe('AgentManager max_rounds manual actions', () => {
 
   it('cancelTask cancels a max_rounds task (non-terminal) and releases the reserved dev', async () => {
     await taskStore.set(maxRoundsTask());
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', status: 'waiting',
-      taskId: 'task-mr', paneId: '%1', updatedAt: NOW,
+    await seedAgent({
+      id: 'dev-1', status: 'waiting',
+      taskId: 'task-mr', paneId: '%1',
     });
-    vi.spyOn(manager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockResolvedValue(true);
+    mockInterruptPane(manager, true);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await manager.cancelTask('task-mr');
@@ -4824,11 +4087,7 @@ describe('AgentManager — non-GitHub platform derivation', () => {
   const GL = 'https://gitlab.example.com/group/proj.git';
 
   function makeMgr(config: BaxianConfig): AgentManager {
-    return new AgentManager({
-      config, agentStore, taskStore, lockManager, eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => readyRunner(),
-    });
+    return makeManager({ config, skillRegistry: freshRegistry() });
   }
 
   function cfg(opts: {

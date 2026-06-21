@@ -10,9 +10,19 @@ function mockRunner(): CommandRunner & { exec: ReturnType<typeof vi.fn> } {
   };
 }
 
+const exitOk: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
+const out = (stdout: string): ExecResult => ({ stdout, stderr: '', exitCode: 0 });
+const fail = (stderr: string, exitCode = 1): ExecResult => ({ stdout: '', stderr, exitCode });
+
 describe('WorktreeManager', () => {
   let runner: ReturnType<typeof mockRunner>;
   let wt: WorktreeManager;
+
+  // Stub the exec sequence in call order; each entry is one mockResolvedValueOnce.
+  function queueExec(...results: ExecResult[]): void {
+    for (const r of results) runner.exec.mockResolvedValueOnce(r);
+  }
+  const cmdAt = (n: number): string => runner.exec.mock.calls[n][0];
 
   beforeEach(() => {
     runner = mockRunner();
@@ -21,20 +31,20 @@ describe('WorktreeManager', () => {
 
   describe('remove', () => {
     it('throws when git worktree remove exits non-zero (so callers can react)', async () => {
-      runner.exec.mockResolvedValue({ stdout: '', stderr: 'fatal: worktree is locked', exitCode: 1 });
+      runner.exec.mockResolvedValue(fail('fatal: worktree is locked'));
       await expect(wt.remove('/repo', '/repo/.baxian-worktrees/x')).rejects.toThrow(/Failed to remove worktree/);
     });
 
     it('resolves on exit 0', async () => {
       await expect(wt.remove('/repo', '/repo/.baxian-worktrees/x')).resolves.toBeUndefined();
-      expect(runner.exec.mock.calls[0][0]).toContain('git worktree remove');
+      expect(cmdAt(0)).toContain('git worktree remove');
     });
   });
 
   describe('create', () => {
     it('without baseRef: command has no commit-ish suffix', async () => {
       await wt.create('/repo', 'task-001');
-      const cmd = runner.exec.mock.calls[0][0];
+      const cmd = cmdAt(0);
       expect(cmd).toContain('git worktree add');
       expect(cmd).toContain('-B');
       expect(cmd).toContain('bx/task-001');
@@ -43,8 +53,7 @@ describe('WorktreeManager', () => {
 
     it('with baseRef: command appends the ref at the end', async () => {
       await wt.create('/repo', 'task-001', 'origin/HEAD');
-      const cmd = runner.exec.mock.calls[0][0];
-      expect(cmd).toContain("-B 'bx/task-001' 'origin/HEAD'");
+      expect(cmdAt(0)).toContain("-B 'bx/task-001' 'origin/HEAD'");
     });
 
     it('returns the worktree path (regardless of baseRef)', async () => {
@@ -55,112 +64,113 @@ describe('WorktreeManager', () => {
 
   describe('create with custom branchName', () => {
     it('checks local and remote ref before creating with -b (not -B)', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 128 })  // rev-parse: not found
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // ls-remote: no match
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // worktree add -b
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });   // excludeBaxianDir
+      queueExec(
+        fail('', 128),  // rev-parse: not found
+        exitOk,         // ls-remote: no match
+        exitOk,         // worktree add -b
+        exitOk,         // excludeBaxianDir
+      );
       const path = await wt.create('/repo', 'task-001', 'origin/HEAD', 'feat/my-feature');
       expect(path).toMatch(/task-001_[0-9a-f]{16}$/);
-      const addCmd = runner.exec.mock.calls[2][0];
+      const addCmd = cmdAt(2);
       expect(addCmd).toContain('-b');
       expect(addCmd).not.toContain('-B');
       expect(addCmd).toContain('feat/my-feature');
     });
 
     it('throws if local branch already exists', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: 'abc123', stderr: '', exitCode: 0 });
+      queueExec(out('abc123'));
       await expect(wt.create('/repo', 'task-001', undefined, 'feat/exists'))
         .rejects.toThrow(/already exists locally/);
     });
 
     it('throws if ls-remote exits non-zero (network/auth error)', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 128 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'fatal: auth failed', exitCode: 128 });
+      queueExec(fail('', 128), fail('fatal: auth failed', 128));
       await expect(wt.create('/repo', 'task-001', undefined, 'feat/new'))
         .rejects.toThrow(/Failed to check remote.*auth failed/);
     });
 
     it('throws if remote branch already exists', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 128 })
-        .mockResolvedValueOnce({ stdout: 'abc123\trefs/heads/feat/taken', stderr: '', exitCode: 0 });
+      queueExec(fail('', 128), out('abc123\trefs/heads/feat/taken'));
       await expect(wt.create('/repo', 'task-001', undefined, 'feat/taken'))
         .rejects.toThrow(/already exists on remote/);
     });
 
     it('uses full ref path for ls-remote so team/foo does not block foo', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 128 })  // rev-parse: not found
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // ls-remote: empty (no exact match)
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // worktree add -b
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });   // excludeBaxianDir
+      queueExec(
+        fail('', 128),  // rev-parse: not found
+        exitOk,         // ls-remote: empty (no exact match)
+        exitOk,         // worktree add -b
+        exitOk,         // excludeBaxianDir
+      );
       await wt.create('/repo', 'task-001', undefined, 'foo');
-      const lsRemoteCmd = runner.exec.mock.calls[1][0];
-      expect(lsRemoteCmd).toContain('refs/heads/foo');
+      expect(cmdAt(1)).toContain('refs/heads/foo');
     });
   });
 
   describe('adopt', () => {
     it('fetches and creates worktree with -b on happy path', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // fetch + worktree add -b
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // set-upstream-to
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });   // excludeBaxianDir
+      queueExec(
+        exitOk,  // fetch + worktree add -b
+        exitOk,  // set-upstream-to
+        exitOk,  // excludeBaxianDir
+      );
       const path = await wt.adopt('/repo', 'task-001', 'feat/existing');
       expect(path).toMatch(/task-001_[0-9a-f]{16}$/);
-      const addCmd = runner.exec.mock.calls[0][0];
+      const addCmd = cmdAt(0);
       expect(addCmd).toContain('git fetch origin');
       expect(addCmd).toContain('git worktree add -b');
       expect(addCmd).toContain('FETCH_HEAD');
     });
 
     it('throws if fetch fails', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'fatal: no such ref', exitCode: 128 });
+      queueExec(fail('fatal: no such ref', 128));
       await expect(wt.adopt('/repo', 'task-001', 'no-exist'))
         .rejects.toThrow(/Failed to adopt branch/);
     });
 
     it('rolls back worktree if set-upstream-to fails', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'error: no upstream', exitCode: 1 })
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });   // remove
+      queueExec(
+        exitOk,
+        fail('error: no upstream'),
+        exitOk,  // remove
+      );
       await expect(wt.adopt('/repo', 'task-001', 'feat/x'))
         .rejects.toThrow(/Failed to set upstream tracking/);
-      const removeCmd = runner.exec.mock.calls[2][0];
-      expect(removeCmd).toContain('git worktree remove');
+      expect(cmdAt(2)).toContain('git worktree remove');
     });
 
     it('handles local branch already exists with matching SHA', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: "fatal: 'feat/x' already exists", exitCode: 128 })
-        .mockResolvedValueOnce({ stdout: 'worktree /repo\nbranch refs/heads/main\n', stderr: '', exitCode: 0 })  // list
-        .mockResolvedValueOnce({ stdout: 'abc123\n', stderr: '', exitCode: 0 })   // local sha
-        .mockResolvedValueOnce({ stdout: 'abc123\n', stderr: '', exitCode: 0 })   // remote sha
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })            // worktree add (retry)
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })            // set-upstream-to
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });           // excludeBaxianDir
+      queueExec(
+        fail("fatal: 'feat/x' already exists", 128),
+        out('worktree /repo\nbranch refs/heads/main\n'),  // list
+        out('abc123\n'),   // local sha
+        out('abc123\n'),   // remote sha
+        exitOk,            // worktree add (retry)
+        exitOk,            // set-upstream-to
+        exitOk,            // excludeBaxianDir
+      );
       const path = await wt.adopt('/repo', 'task-001', 'feat/x');
       expect(path).toMatch(/task-001_[0-9a-f]{16}$/);
     });
 
     it('throws when local branch is checked out in another worktree', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: "fatal: 'feat/x' already exists", exitCode: 128 })
-        .mockResolvedValueOnce({ stdout: 'worktree /repo/.baxian-worktrees/other\nbranch refs/heads/feat/x\n', stderr: '', exitCode: 0 });
+      queueExec(
+        fail("fatal: 'feat/x' already exists", 128),
+        out('worktree /repo/.baxian-worktrees/other\nbranch refs/heads/feat/x\n'),
+      );
       await expect(wt.adopt('/repo', 'task-001', 'feat/x'))
         .rejects.toThrow(/checked out in another worktree/);
     });
 
     it('throws when local and remote branches diverge', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: "fatal: 'feat/x' already exists", exitCode: 128 })
-        .mockResolvedValueOnce({ stdout: 'worktree /repo\nbranch refs/heads/main\n', stderr: '', exitCode: 0 })
-        .mockResolvedValueOnce({ stdout: 'aaa111\n', stderr: '', exitCode: 0 })   // local sha
-        .mockResolvedValueOnce({ stdout: 'bbb222\n', stderr: '', exitCode: 0 })   // remote sha
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 });           // merge-base: not ancestor
+      queueExec(
+        fail("fatal: 'feat/x' already exists", 128),
+        out('worktree /repo\nbranch refs/heads/main\n'),
+        out('aaa111\n'),   // local sha
+        out('bbb222\n'),   // remote sha
+        fail('', 1),       // merge-base: not ancestor
+      );
       await expect(wt.adopt('/repo', 'task-001', 'feat/x'))
         .rejects.toThrow(/diverges from/);
     });
@@ -169,7 +179,7 @@ describe('WorktreeManager', () => {
   describe('createDetached', () => {
     it('creates detached worktree for QA review using FETCH_HEAD', async () => {
       const path = await wt.createDetached('/repo', 'task-001', 'bx/task-001');
-      const cmd = runner.exec.mock.calls[0][0];
+      const cmd = cmdAt(0);
       expect(cmd).toContain('git fetch origin');
       expect(cmd).toContain('bx/task-001');
       expect(cmd).toContain('git worktree add --detach');
@@ -187,8 +197,8 @@ describe('WorktreeManager', () => {
     it('create issues the exclude command in the worktree, after the add', async () => {
       const worktreePath = await wt.create('/repo', 'task-001');
       expect(runner.exec).toHaveBeenCalledTimes(2);
-      expect(isExcludeCmd(runner.exec.mock.calls[0][0])).toBe(false);
-      const cmd = runner.exec.mock.calls[1][0];
+      expect(isExcludeCmd(cmdAt(0))).toBe(false);
+      const cmd = cmdAt(1);
       expect(isExcludeCmd(cmd)).toBe(true);
       expect(cmd).toContain(`cd '${worktreePath}'`);
       expect(cmd).toContain('git rev-parse --git-path info/exclude');
@@ -198,73 +208,65 @@ describe('WorktreeManager', () => {
     it('createDetached issues the exclude command after the add', async () => {
       await wt.createDetached('/repo', 'task-001', 'bx/task-001');
       expect(runner.exec).toHaveBeenCalledTimes(2);
-      expect(isExcludeCmd(runner.exec.mock.calls[1][0])).toBe(true);
+      expect(isExcludeCmd(cmdAt(1))).toBe(true);
     });
 
     it('createDetachedAtBase issues the exclude command after the add', async () => {
       await wt.createDetachedAtBase('/repo', 'task-001');
       expect(runner.exec).toHaveBeenCalledTimes(2);
-      expect(isExcludeCmd(runner.exec.mock.calls[1][0])).toBe(true);
+      expect(isExcludeCmd(cmdAt(1))).toBe(true);
     });
 
     it('throws when the exclude write fails, and removes the just-created worktree', async () => {
       // First exec (add) succeeds; second exec (exclude) is a real failure.
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'permission denied', exitCode: 1 });
+      queueExec(exitOk, fail('permission denied'));
       await expect(wt.create('/repo', 'task-001')).rejects.toThrow(/exclude/i);
       expect(runner.exec).toHaveBeenCalledTimes(3);
-      const removeCmd = runner.exec.mock.calls[2][0];
+      const removeCmd = cmdAt(2);
       expect(removeCmd).toContain('git worktree remove');
       expect(removeCmd).toContain('task-001_');
       expect(removeCmd).toContain('--force');
     });
 
     it('custom branch: exclude failure also deletes the orphaned branch ref', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 128 })  // rev-parse: not found
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // ls-remote: no match
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // worktree add -b
-        .mockResolvedValueOnce({ stdout: '', stderr: 'permission denied', exitCode: 1 })  // exclude fails
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })    // worktree remove (inside excludeBaxianDir)
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });   // git branch -D
+      queueExec(
+        fail('', 128),               // rev-parse: not found
+        exitOk,                      // ls-remote: no match
+        exitOk,                      // worktree add -b
+        fail('permission denied'),   // exclude fails
+        exitOk,                      // worktree remove (inside excludeBaxianDir)
+        exitOk,                      // git branch -D
+      );
       await expect(wt.create('/repo', 'task-001', 'origin/HEAD', 'feat/my-feature'))
         .rejects.toThrow(/exclude/i);
-      const branchDeleteCmd = runner.exec.mock.calls[5][0];
+      const branchDeleteCmd = cmdAt(5);
       expect(branchDeleteCmd).toContain('git branch -D');
       expect(branchDeleteCmd).toContain('feat/my-feature');
     });
 
     it('still throws the exclude error when the cleanup remove also fails', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'disk full', exitCode: 1 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'worktree is locked', exitCode: 1 });
+      queueExec(exitOk, fail('disk full'), fail('worktree is locked'));
       await expect(wt.create('/repo', 'task-001')).rejects.toThrow(/exclude/i);
     });
 
     it('createDetached removes the just-created worktree when exclude fails', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'permission denied', exitCode: 1 });
+      queueExec(exitOk, fail('permission denied'));
       await expect(wt.createDetached('/repo', 'task-001', 'bx/task-001')).rejects.toThrow(/exclude/i);
-      const removeCmd = runner.exec.mock.calls[2][0];
+      const removeCmd = cmdAt(2);
       expect(removeCmd).toContain('git worktree remove');
       expect(removeCmd).toContain('task-001-review_');
     });
 
     it('createDetachedAtBase removes the just-created worktree when exclude fails', async () => {
-      runner.exec
-        .mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
-        .mockResolvedValueOnce({ stdout: '', stderr: 'permission denied', exitCode: 1 });
+      queueExec(exitOk, fail('permission denied'));
       await expect(wt.createDetachedAtBase('/repo', 'task-001')).rejects.toThrow(/exclude/i);
-      const removeCmd = runner.exec.mock.calls[2][0];
+      const removeCmd = cmdAt(2);
       expect(removeCmd).toContain('git worktree remove');
       expect(removeCmd).toContain('task-001-review_');
     });
 
     it('does not run the exclude command when the add itself fails', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'fatal', exitCode: 1 });
+      queueExec(fail('fatal'));
       await expect(wt.create('/repo', 'task-001')).rejects.toThrow(/Failed to create worktree/);
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
@@ -274,8 +276,8 @@ describe('WorktreeManager', () => {
     it('removes worktree then deletes branch when branchName is provided', async () => {
       await wt.removeWithBranch('/repo', '/repo/.baxian-worktrees/x', 'feat/custom');
       expect(runner.exec).toHaveBeenCalledTimes(2);
-      expect(runner.exec.mock.calls[0][0]).toContain('git worktree remove');
-      const branchCmd = runner.exec.mock.calls[1][0];
+      expect(cmdAt(0)).toContain('git worktree remove');
+      const branchCmd = cmdAt(1);
       expect(branchCmd).toContain('git branch -D');
       expect(branchCmd).toContain('feat/custom');
     });
@@ -283,14 +285,14 @@ describe('WorktreeManager', () => {
     it('skips branch delete when branchName is undefined', async () => {
       await wt.removeWithBranch('/repo', '/repo/.baxian-worktrees/x');
       expect(runner.exec).toHaveBeenCalledTimes(1);
-      expect(runner.exec.mock.calls[0][0]).toContain('git worktree remove');
+      expect(cmdAt(0)).toContain('git worktree remove');
     });
   });
 
   describe('remove', () => {
     it('runs git worktree remove', async () => {
       await wt.remove('/repo', '/repo/.baxian-worktrees/task-001_abcd');
-      const cmd = runner.exec.mock.calls[0][0];
+      const cmd = cmdAt(0);
       expect(cmd).toContain('git worktree remove');
       expect(cmd).toContain('task-001_abcd');
       expect(cmd).toContain('--force');

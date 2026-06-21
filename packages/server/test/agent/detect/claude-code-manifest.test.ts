@@ -9,513 +9,446 @@ function input(screen: string, oscTitle = ''): DetectionInput {
   return { screen, oscTitle };
 }
 
-describe('claude-code manifest', () => {
-  it('detects OSC braille spinner as working', () => {
-    const result = evaluateManifest(manifest, input('', '⠁ Reading file'));
-    expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('osc_title_working');
-  });
+interface Expectation {
+  state?: string;
+  rule?: string | undefined;
+  notRule?: string;
+  visibleBlocker?: boolean;
+  visibleIdle?: boolean;
+  skipStateUpdate?: boolean;
+}
 
-  it('detects OSC ✳ as idle', () => {
-    const result = evaluateManifest(manifest, input('', '✳ ~/code/project'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('osc_title_idle');
-  });
+interface Case {
+  name: string;
+  lines: string[];
+  osc?: string;
+  expect: Expectation;
+}
 
-  it('detects bash permission prompt as blocked', () => {
-    const screen = [
-      '  herdr wants to run this bash command:',
-      '    rm -rf /tmp/test',
-      '',
-      '  Do you want to proceed?',
-      '  Tab to amend',
-      '  ❯ Yes',
-      '  2. No',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.visibleBlocker).toBe(true);
-  });
+// The canonical "herdr wants to run this bash command" permission block, reused across cases.
+const BASH_PERMISSION_PROMPT = [
+  '  herdr wants to run this bash command:',
+  '    rm -rf /tmp/test',
+  '',
+  '  Do you want to proceed?',
+  '  Tab to amend',
+  '  ❯ Yes',
+  '  2. No',
+];
 
-  it('detects transcript viewer as skipStateUpdate', () => {
-    const screen = [
+const cases: Case[] = [
+  {
+    name: 'detects OSC braille spinner as working',
+    lines: [''],
+    osc: '⠁ Reading file',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
+    name: 'detects OSC ✳ as idle',
+    lines: [''],
+    osc: '✳ ~/code/project',
+    expect: { state: 'idle', rule: 'osc_title_idle' },
+  },
+  {
+    name: 'detects bash permission prompt as blocked',
+    lines: [...BASH_PERMISSION_PROMPT],
+    expect: { state: 'pending', visibleBlocker: true },
+  },
+  {
+    name: 'detects transcript viewer as skipStateUpdate',
+    lines: [
       'Showing detailed transcript',
       '↑↓ scroll',
       '? for shortcuts',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('unknown');
-    expect(result.matchedRuleId).toBe('transcript_viewer');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('detects live blocked form (enter to select + navigation)', () => {
-    const screen = [
+    ],
+    expect: { state: 'unknown', rule: 'transcript_viewer', skipStateUpdate: true },
+  },
+  {
+    name: 'detects live blocked form (enter to select + navigation)',
+    lines: [
       'some output',
       '────────────────',
       '  Enter to select · Esc to cancel',
       '  ↑/↓ to navigate',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('live_blocked_form');
-  });
-
-  it('detects dynamic workflow prompt as blocked', () => {
-    const screen = 'Run a dynamic workflow?\nEsc to cancel';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('dynamic_workflow_prompt');
-  });
-
-  it('detects live prompt box as idle (prompt between horizontal rules)', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending', rule: 'live_blocked_form' },
+  },
+  {
+    name: 'detects dynamic workflow prompt as blocked',
+    lines: ['Run a dynamic workflow?', 'Esc to cancel'],
+    expect: { state: 'pending', rule: 'dynamic_workflow_prompt' },
+  },
+  {
+    name: 'detects live prompt box as idle (prompt between horizontal rules)',
+    lines: [
       'output above',
       '────────────────',
       '  ❯ ',
       '────────────────',
       'status line',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('live_prompt_box');
-    expect(result.visibleIdle).toBe(true);
-  });
-
-  it('model picker menu triggers skipStateUpdate', () => {
-    const screen = [
+    ],
+    expect: { state: 'idle', rule: 'live_prompt_box', visibleIdle: true },
+  },
+  {
+    name: 'model picker menu triggers skipStateUpdate',
+    lines: [
       'Select model',
       'Enter to set as default',
       'Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('detects active spinner as working', () => {
-    const screen = [
+    ],
+    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'detects active spinner as working',
+    lines: [
       'some previous output',
       '',
       '· Reading packages/server/src/agent/tmux.ts… (12s',
       '',
       '  esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('working');
-  });
-
-  it('detects idle composer prompt', () => {
-    const screen = [
+    ],
+    expect: { state: 'working' },
+  },
+  {
+    name: 'detects idle composer prompt',
+    lines: [
       'previous output done.',
       '',
       '❯ ',
       '',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('idle_composer_prompt');
-  });
-
-  it('falls back to idle on unrecognized screen', () => {
-    const result = evaluateManifest(manifest, input('Welcome to Claude Code'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBeUndefined();
-  });
-
-  it('screen idle overrides stale OSC working when no screen working signals', () => {
-    const screen = '❯ \n';
-    const result = evaluateManifest(manifest, input(screen, '⠁ Thinking'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('idle_composer_prompt');
-  });
-
-  it('spinner_working outranks live_prompt_box when OSC title is empty', () => {
-    const screen = [
+    ],
+    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'falls back to idle on unrecognized screen',
+    lines: ['Welcome to Claude Code'],
+    expect: { state: 'idle', rule: undefined },
+  },
+  {
+    name: 'screen idle overrides stale OSC working when no screen working signals',
+    lines: ['❯ ', ''],
+    osc: '⠁ Thinking',
+    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'spinner_working outranks live_prompt_box when OSC title is empty',
+    lines: [
       '· Stewing… (5s',
       '────────────────',
       '❯ ',
       '────────────────',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, ''));
-    expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('spinner_working');
-  });
-
-  it('model_picker_menu outranks runtime_menu', () => {
-    const screen = [
+    ],
+    osc: '',
+    expect: { state: 'working', rule: 'spinner_working' },
+  },
+  {
+    name: 'model_picker_menu outranks runtime_menu',
+    lines: [
       'Select model',
       '  Claude Sonnet 4',
       '  Claude Opus 4',
       'Enter to set as default · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('blocked wins over working spinner', () => {
-    const screen = [
+    ],
+    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'blocked wins over working spinner',
+    lines: [
       '· Reading file… (3s',
       'Do you want to proceed?',
       'bash command',
       '❯ Yes',
       '2. No',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-  });
-
-  it('legacy blocker "waiting for permission" sets visibleBlocker', () => {
-    const screen = 'waiting for permission\nyes\n';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('legacy_no_prompt_blocker');
-    expect(result.visibleBlocker).toBe(true);
-  });
-
-  it('legacy blocker "tab to amend" sets visibleBlocker', () => {
-    const screen = 'Run this command?\nTab to amend\n';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('legacy_no_prompt_blocker');
-    expect(result.visibleBlocker).toBe(true);
-  });
-
-  it('stale transcript text does not suppress runtime_menu footer', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending' },
+  },
+  {
+    name: 'legacy blocker "waiting for permission" sets visibleBlocker',
+    lines: ['waiting for permission', 'yes', ''],
+    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker', visibleBlocker: true },
+  },
+  {
+    name: 'legacy blocker "tab to amend" sets visibleBlocker',
+    lines: ['Run this command?', 'Tab to amend', ''],
+    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker', visibleBlocker: true },
+  },
+  {
+    name: 'stale transcript text does not suppress runtime_menu footer',
+    lines: [
       'Showing detailed transcript',
       'line a',
       'ctrl+o to toggle',
       '',
       'Enter to confirm · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('transcript_viewer');
-    expect(result.matchedRuleId).toBe('runtime_menu');
-    expect(result.state).toBe('pending');
-  });
-
-  it('live_prompt_box does not match selection indicator ❯ Yes between rules', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'transcript_viewer', rule: 'runtime_menu', state: 'pending' },
+  },
+  {
+    name: 'live_prompt_box does not match selection indicator ❯ Yes between rules',
+    lines: [
       'Would you like to proceed?',
       '────────────────',
       '❯ Yes',
       '────────────────',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_prompt_box');
-  });
-
-  it('transcript viewer content with historical menu footer still matches as transcript', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'live_prompt_box' },
+  },
+  {
+    name: 'transcript viewer content with historical menu footer still matches as transcript',
+    lines: [
       'Showing detailed transcript',
       'Earlier output from a previous menu:',
       'Enter to confirm · Esc to cancel',
       '',
       'ctrl+o to toggle',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('transcript_viewer');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('legacy blocker is suppressed by bare > prompt', () => {
-    const screen = 'waiting for permission\n>\n';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('legacy_no_prompt_blocker');
-  });
-
-  it('legacy blocker is suppressed by esc to interrupt', () => {
-    const screen = 'waiting for permission\nEsc to interrupt\n';
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('legacy_no_prompt_blocker');
-  });
-
-  it('stale bash permission prompt is suppressed by bare ❯ prompt', () => {
-    const screen = [
-      '  herdr wants to run this bash command:',
-      '    rm -rf /tmp/test',
-      '',
-      '  Do you want to proceed?',
-      '  Tab to amend',
-      '  ❯ Yes',
-      '  2. No',
+    ],
+    expect: { rule: 'transcript_viewer', skipStateUpdate: true },
+  },
+  {
+    name: 'legacy blocker is suppressed by bare > prompt',
+    lines: ['waiting for permission', '>', ''],
+    expect: { notRule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'legacy blocker is suppressed by esc to interrupt',
+    lines: ['waiting for permission', 'Esc to interrupt', ''],
+    expect: { notRule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'stale bash permission prompt is suppressed by bare ❯ prompt',
+    lines: [
+      ...BASH_PERMISSION_PROMPT,
       '────────────────',
       '  ❯ ',
       '────────────────',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('bash_permission_prompt');
-  });
-
-  it('stale bash permission prompt above horizontal rules loses to current spinner', () => {
-    const screen = [
-      '  herdr wants to run this bash command:',
-      '    rm -rf /tmp/test',
-      '',
-      '  Do you want to proceed?',
-      '  Tab to amend',
-      '  ❯ Yes',
-      '  2. No',
+    ],
+    expect: { notRule: 'bash_permission_prompt' },
+  },
+  {
+    name: 'stale bash permission prompt above horizontal rules loses to current spinner',
+    lines: [
+      ...BASH_PERMISSION_PROMPT,
       '────────────────',
       '  ❯ continue',
       '────────────────',
       '· Running… (3s',
       '  esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('bash_permission_prompt');
-    expect(result.matchedRuleId).toBe('spinner_working');
-  });
-
-  it('stale esc-to-interrupt above idle prompt does not stay working', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'bash_permission_prompt', rule: 'spinner_working' },
+  },
+  {
+    name: 'stale esc-to-interrupt above idle prompt does not stay working',
+    lines: [
       '────────────────',
       '  ❯ previous',
       '────────────────',
       '  esc to interrupt',
       '',
       '❯ ',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('esc_to_interrupt_working');
-  });
-
-  it('visible screen blocker overrides stale OSC working spinner', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'esc_to_interrupt_working' },
+  },
+  {
+    name: 'visible screen blocker overrides stale OSC working spinner',
+    lines: [
       '  Do you want to proceed?',
       '  bash command',
       '  Tab to amend',
       '  ❯ Yes',
       '  2. No',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.state).toBe('pending');
-    expect(result.visibleBlocker).toBe(true);
-    expect(result.matchedRuleId).toBe('bash_permission_prompt');
-  });
-
-  it('screen idle overrides stale OSC working even with other output', () => {
-    const screen = 'some output\n❯ \n';
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('idle_composer_prompt');
-  });
-
-  it('stale dynamic workflow prompt suppressed by bare ❯ prompt', () => {
-    const screen = [
+    ],
+    osc: '⠁ Reading file',
+    expect: { state: 'pending', visibleBlocker: true, rule: 'bash_permission_prompt' },
+  },
+  {
+    name: 'screen idle overrides stale OSC working even with other output',
+    lines: ['some output', '❯ ', ''],
+    osc: '⠁ Reading file',
+    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'stale dynamic workflow prompt suppressed by bare ❯ prompt',
+    lines: [
       'Run a dynamic workflow?',
       'Esc to cancel',
       '',
       '────────────────',
       '  ❯ ',
       '────────────────',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('dynamic_workflow_prompt');
-  });
-
-  it('runtime_menu matches lowercase footer', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'dynamic_workflow_prompt' },
+  },
+  {
+    name: 'runtime_menu matches lowercase footer',
+    lines: [
       'some output',
       'enter to confirm · esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('runtime_menu');
-  });
-
-  it('stale live_blocked_form suppressed by current spinner', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending', rule: 'runtime_menu' },
+  },
+  {
+    name: 'stale live_blocked_form suppressed by current spinner',
+    lines: [
       'Enter to select · Esc to cancel',
       '↑/↓ to navigate',
       'agent continued',
       '· Running… (3s',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_blocked_form');
-  });
-
-  it('stale model_picker_menu loses to current spinner', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'live_blocked_form' },
+  },
+  {
+    name: 'stale model_picker_menu loses to current spinner',
+    lines: [
       'Select model',
       '  Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
       '· Running… (3s',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
-  });
-
-  it('stale model_picker_menu loses to current runtime_menu', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+  {
+    name: 'stale model_picker_menu loses to current runtime_menu',
+    lines: [
       'Select model',
       '  Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
       'output',
       'Enter to confirm · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
-  });
-
-  it('generic_permission_prompt suppressed by bare ❯ prompt', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+  {
+    name: 'generic_permission_prompt suppressed by bare ❯ prompt',
+    lines: [
       'Do you want to proceed?',
       'Esc to cancel',
       '❯ 1. Yes',
       '2. No',
       '',
       '❯ ',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('generic_permission_prompt');
-  });
-
-  it('legacy_no_prompt_blocker scoped to after last horizontal rule', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'generic_permission_prompt' },
+  },
+  {
+    name: 'legacy_no_prompt_blocker scoped to after last horizontal rule',
+    lines: [
       'waiting for permission',
       'yes',
       '────────────────',
       '  ❯ continue',
       '────────────────',
       '· Running… (3s',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('legacy_no_prompt_blocker');
-  });
-
-  it('spinner still matches when completed marker is above in tail(10)', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'spinner still matches when completed marker is above in tail(10)',
+    lines: [
       '✻ Worked for 3s',
       '· Reading file… (1s',
       '  esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('spinner_working');
-  });
-
-  it('stale model picker is suppressed by esc to interrupt', () => {
-    const screen = [
+    ],
+    expect: { state: 'working', rule: 'spinner_working' },
+  },
+  {
+    name: 'stale model picker is suppressed by esc to interrupt',
+    lines: [
       'Select model',
       '  Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
       '  esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
-  });
-
-  it('low-priority legacy blocker does not override OSC working', () => {
-    const screen = 'waiting for permission\nyes\n';
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.state).toBe('working');
-    expect(result.matchedRuleId).toBe('osc_title_working');
-  });
-
-  it('old bare prompt above current blocker does not suppress (notAfter position-aware)', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+  {
+    name: 'low-priority legacy blocker does not override OSC working',
+    lines: ['waiting for permission', 'yes', ''],
+    osc: '⠁ Reading file',
+    expect: { state: 'working', rule: 'osc_title_working' },
+  },
+  {
+    name: 'old bare prompt above current blocker does not suppress (notAfter position-aware)',
+    lines: [
       '❯ ',
       'some output',
-      '  herdr wants to run this bash command:',
-      '    rm -rf /tmp/test',
-      '',
-      '  Do you want to proceed?',
-      '  Tab to amend',
-      '  ❯ Yes',
-      '  2. No',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('bash_permission_prompt');
-  });
-
-  it('old esc-to-interrupt above current legacy blocker does not suppress', () => {
-    const screen = [
+      ...BASH_PERMISSION_PROMPT,
+    ],
+    expect: { state: 'pending', rule: 'bash_permission_prompt' },
+  },
+  {
+    name: 'old esc-to-interrupt above current legacy blocker does not suppress',
+    lines: [
       'esc to interrupt',
       'some output',
       'waiting for permission',
       'yes',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('legacy_no_prompt_blocker');
-  });
-
-  it('stale runtime menu suppressed by current spinner (notAfter)', () => {
-    const screen = [
+    ],
+    expect: { state: 'pending', rule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'stale runtime menu suppressed by current spinner (notAfter)',
+    lines: [
       'Enter to confirm · Esc to cancel',
       '· Running… (3s',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('runtime_menu');
-    expect(result.state).toBe('working');
-  });
-
-  it('completed spinner does not match when Worked-for follows (notAfter)', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'runtime_menu', state: 'working' },
+  },
+  {
+    name: 'completed spinner does not match when Worked-for follows (notAfter)',
+    lines: [
       '· Running… (3s',
       '✻ Worked for 3s',
       '❯ ',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('spinner_working');
-    expect(result.state).toBe('idle');
-  });
-
-  it('model picker skip overrides stale OSC working', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'spinner_working', state: 'idle' },
+  },
+  {
+    name: 'model picker skip overrides stale OSC working',
+    lines: [
       'Select model',
       '  Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.skipStateUpdate).toBe(true);
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-  });
-
-  it('stale generic permission prompt suppressed by current spinner', () => {
-    const screen = [
+    ],
+    osc: '⠁ Reading file',
+    expect: { skipStateUpdate: true, rule: 'model_picker_menu' },
+  },
+  {
+    name: 'stale generic permission prompt suppressed by current spinner',
+    lines: [
       'Do you want to proceed?',
       'Esc to cancel',
       '❯ 1. Yes',
       '2. No',
       '· Running… (3s',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('generic_permission_prompt');
-    expect(result.state).toBe('working');
-  });
-
-  it('screen blocker wins over stale model picker when OSC is working', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'generic_permission_prompt', state: 'working' },
+  },
+  {
+    name: 'screen blocker wins over stale model picker when OSC is working',
+    lines: [
       'Select model',
       '  Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
       '────────────────',
       'Run a dynamic workflow?',
       'Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.state).toBe('pending');
-    expect(result.matchedRuleId).toBe('dynamic_workflow_prompt');
-  });
-
-  it('legacy blocker ❯ in options does not pollute notAfter anchor', () => {
-    const screen = [
+    ],
+    osc: '⠁ Reading file',
+    expect: { state: 'pending', rule: 'dynamic_workflow_prompt' },
+  },
+  {
+    name: 'legacy blocker ❯ in options does not pollute notAfter anchor',
+    lines: [
       'Do you want to proceed?',
       '❯ Yes',
       '',
       '❯ ',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('legacy_no_prompt_blocker');
-  });
-
-  it('model picker survives stale "Do you want to proceed?" in scrollback', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'legacy_no_prompt_blocker' },
+  },
+  {
+    name: 'model picker survives stale "Do you want to proceed?" in scrollback',
+    lines: [
       'Do you want to proceed?',
       'Tab to amend',
       '❯ Yes',
@@ -524,23 +457,20 @@ describe('claude-code manifest', () => {
       'Select model',
       '  Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('stale runtime menu suppressed by current esc-to-interrupt', () => {
-    const screen = [
+    ],
+    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'stale runtime menu suppressed by current esc-to-interrupt',
+    lines: [
       'Enter to confirm · Esc to cancel',
       '  esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('runtime_menu');
-  });
-
-  it('stale bash permission prompt suppressed by current esc-to-interrupt', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'runtime_menu' },
+  },
+  {
+    name: 'stale bash permission prompt suppressed by current esc-to-interrupt',
+    lines: [
       '─────────────────',
       'Do you want to proceed?',
       'Bash command: ls',
@@ -548,114 +478,224 @@ describe('claude-code manifest', () => {
       '  2. No',
       'Tab to amend · Ctrl+E to explain',
       'esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('bash_permission_prompt');
-  });
-
-  it('stale generic permission prompt suppressed by current esc-to-interrupt', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'bash_permission_prompt' },
+  },
+  {
+    name: 'stale generic permission prompt suppressed by current esc-to-interrupt',
+    lines: [
       '─────────────────',
       'Do you want to proceed? Esc to cancel',
       '  1. Yes',
       '  2. No',
       'esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('generic_permission_prompt');
-  });
-
-  it('stale live_blocked_form suppressed by current esc-to-interrupt', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'generic_permission_prompt' },
+  },
+  {
+    name: 'stale live_blocked_form suppressed by current esc-to-interrupt',
+    lines: [
       '─────────────────',
       'Enter to select · Esc to cancel',
       'Tab/arrow keys to navigate',
       'esc to interrupt',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_blocked_form');
-  });
-
-  it('stale model picker suppressed by legacy blocker below', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'live_blocked_form' },
+  },
+  {
+    name: 'stale model picker suppressed by legacy blocker below',
+    lines: [
       'Select model',
       'Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
       '─────────────────',
       'Review your answers',
       '❯ Yes',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
-  });
-
-  it('stale model picker suppressed by "would you like to" blocker below', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+  {
+    name: 'stale model picker suppressed by "would you like to" blocker below',
+    lines: [
       'Select model',
       'Claude Sonnet 4',
       'Enter to set as default · Esc to cancel',
       '─────────────────',
       'Would you like to install this extension?',
       '❯ Yes',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
-  });
-
-  it('bypass permissions banner recognized as visible idle', () => {
-    const screen = [
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+  {
+    name: 'bypass permissions banner recognized as visible idle',
+    lines: [
       '❯ summarize previous task',
       '────────────────────────────────────────────────────────────────────────────────',
       '  Opus 4.7 [#################   ] 87%',
       '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('idle_composer_prompt');
-    expect(result.visibleIdle).toBe(true);
-  });
-
-  it('stale OSC working overridden by bypass permissions banner', () => {
-    const screen = [
+    ],
+    expect: { state: 'idle', rule: 'idle_composer_prompt', visibleIdle: true },
+  },
+  {
+    name: 'stale OSC working overridden by bypass permissions banner',
+    lines: [
       '❯ summarize previous task',
       '────────────────────────────────────────────────────────────────────────────────',
       '  Opus 4.7 [#################   ] 87%',
       '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.state).toBe('idle');
-    expect(result.matchedRuleId).toBe('idle_composer_prompt');
-  });
-
-  it('bypass permissions in mid-output does NOT trigger idle', () => {
-    const screen = [
+    ],
+    osc: '⠁ Reading file',
+    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'bypass permissions in mid-output does NOT trigger idle',
+    lines: [
       'still streaming',
       '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
       'more output',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ Reading file'));
-    expect(result.matchedRuleId).not.toBe('idle_composer_prompt');
-  });
-
-  it('bare ❯ in mid-tail does NOT trigger idle when output follows', () => {
-    const screen = [
+    ],
+    osc: '⠁ Reading file',
+    expect: { notRule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'bare ❯ in mid-tail does NOT trigger idle when output follows',
+    lines: [
       'some output',
       '❯',
       'more streaming',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen, '⠁ Working'));
-    expect(result.matchedRuleId).not.toBe('idle_composer_prompt');
-  });
-
-  it('stale model picker suppressed by bypass permissions below', () => {
-    const screen = [
+    ],
+    osc: '⠁ Working',
+    expect: { notRule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'stale model picker suppressed by bypass permissions below',
+    lines: [
       'Select model',
       'Enter to set as default · Esc to cancel',
       '─────────────────',
       '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+  {
+    name: 'stale live_blocked_form loses to current model picker (footer with Esc)',
+    lines: [
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+    ],
+    expect: { notRule: 'live_blocked_form', rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'stale live_blocked_form loses to current model picker (footer without Esc)',
+    lines: [
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+    ],
+    expect: { notRule: 'live_blocked_form', rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'stale dynamic_workflow_prompt loses to current model picker (footer with Esc)',
+    lines: [
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+    ],
+    expect: { notRule: 'dynamic_workflow_prompt', rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'stale dynamic_workflow_prompt loses to current model picker (footer without Esc)',
+    lines: [
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+    ],
+    expect: { notRule: 'dynamic_workflow_prompt', rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'detects live_blocked_form with split footer (Enter/Esc on separate lines)',
+    lines: [
+      'Enter to select',
+      '↑/↓ to navigate',
+      'Esc to cancel',
+    ],
+    expect: { rule: 'live_blocked_form', state: 'pending' },
+  },
+  {
+    name: 'current live_blocked_form wins over stale model picker above',
+    lines: [
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+    ],
+    expect: { rule: 'live_blocked_form', state: 'pending' },
+  },
+  {
+    name: 'current dynamic_workflow_prompt wins over stale model picker above',
+    lines: [
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+    ],
+    expect: { rule: 'dynamic_workflow_prompt', state: 'pending' },
+  },
+  {
+    name: 'stale live_blocked_form loses to current model picker (split footer)',
+    lines: [
+      'Enter to select · Esc to cancel',
+      '↑/↓ to navigate',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+      'Esc to cancel',
+    ],
+    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'stale dynamic_workflow_prompt loses to current model picker (split footer)',
+    lines: [
+      'Run a dynamic workflow?',
+      'Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'Select model',
+      'Enter to set as default',
+      'Esc to cancel',
+    ],
+    expect: { rule: 'model_picker_menu', skipStateUpdate: true },
+  },
+  {
+    name: 'stale model picker suppressed by mid-screen bypass with working output',
+    lines: [
+      'Select model',
+      'Enter to set as default · Esc to cancel',
+      '⏵⏵ bypass permissions on',
+      'some working output',
+      'more output',
+    ],
+    expect: { notRule: 'model_picker_menu' },
+  },
+];
+
+describe('claude-code manifest', () => {
+  it.each(cases)('$name', ({ lines, osc, expect: want }) => {
+    const result = evaluateManifest(manifest, input(lines.join('\n'), osc ?? ''));
+    if (want.state !== undefined) expect(result.state).toBe(want.state);
+    if ('rule' in want) expect(result.matchedRuleId).toBe(want.rule);
+    if (want.notRule !== undefined) expect(result.matchedRuleId).not.toBe(want.notRule);
+    if (want.visibleBlocker !== undefined) expect(result.visibleBlocker).toBe(want.visibleBlocker);
+    if (want.visibleIdle !== undefined) expect(result.visibleIdle).toBe(want.visibleIdle);
+    if (want.skipStateUpdate !== undefined) expect(result.skipStateUpdate).toBe(want.skipStateUpdate);
   });
 
   it.each([
@@ -669,136 +709,5 @@ describe('claude-code manifest', () => {
     expect(result.state).toBe(state);
     if (blocker) expect(result.visibleBlocker).toBe(true);
     expect(result.matchedRuleId).toBe(rule);
-  });
-
-  it('stale live_blocked_form loses to current model picker (footer with Esc)', () => {
-    const screen = [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_blocked_form');
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('stale live_blocked_form loses to current model picker (footer without Esc)', () => {
-    const screen = [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('live_blocked_form');
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('stale dynamic_workflow_prompt loses to current model picker (footer with Esc)', () => {
-    const screen = [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('dynamic_workflow_prompt');
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('stale dynamic_workflow_prompt loses to current model picker (footer without Esc)', () => {
-    const screen = [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('dynamic_workflow_prompt');
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('detects live_blocked_form with split footer (Enter/Esc on separate lines)', () => {
-    const screen = [
-      'Enter to select',
-      '↑/↓ to navigate',
-      'Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('live_blocked_form');
-    expect(result.state).toBe('pending');
-  });
-
-  it('current live_blocked_form wins over stale model picker above', () => {
-    const screen = [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('live_blocked_form');
-    expect(result.state).toBe('pending');
-  });
-
-  it('current dynamic_workflow_prompt wins over stale model picker above', () => {
-    const screen = [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('dynamic_workflow_prompt');
-    expect(result.state).toBe('pending');
-  });
-
-  it('stale live_blocked_form loses to current model picker (split footer)', () => {
-    const screen = [
-      'Enter to select · Esc to cancel',
-      '↑/↓ to navigate',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-      'Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('stale dynamic_workflow_prompt loses to current model picker (split footer)', () => {
-    const screen = [
-      'Run a dynamic workflow?',
-      'Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'Select model',
-      'Enter to set as default',
-      'Esc to cancel',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).toBe('model_picker_menu');
-    expect(result.skipStateUpdate).toBe(true);
-  });
-
-  it('stale model picker suppressed by mid-screen bypass with working output', () => {
-    const screen = [
-      'Select model',
-      'Enter to set as default · Esc to cancel',
-      '⏵⏵ bypass permissions on',
-      'some working output',
-      'more output',
-    ].join('\n');
-    const result = evaluateManifest(manifest, input(screen));
-    expect(result.matchedRuleId).not.toBe('model_picker_menu');
   });
 });

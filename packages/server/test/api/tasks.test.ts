@@ -1,11 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import type { FastifyInstance } from 'fastify';
 import type { TaskState } from '../../src/shared/index.js';
-import { buildApp } from '../../src/app.js';
-import { createTestContext } from '../helpers/context.js';
 import { ApiError } from '../../src/errors.js';
 import {
   TASK_IMAGE_MAX_COUNT,
@@ -13,22 +8,20 @@ import {
   TASK_CREATE_ROUTE_BODY_LIMIT,
   IMAGE_UPLOAD_ROUTE_BODY_LIMIT,
 } from '../../src/shared/index.js';
+import { expectStatus, requesters, setupApiHarness, teardownApiHarness, type ApiHarness } from './helpers.js';
 
 const PNG_B64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString('base64');
 
-let tempDir: string;
+let harness: ApiHarness;
 let app: FastifyInstance;
+const { get, post, patch } = requesters(() => app);
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-tasks-test-'));
-  const ctx = await createTestContext(tempDir);
-  app = await buildApp(ctx);
+  harness = await setupApiHarness('tasks');
+  app = harness.app;
 });
 
-afterEach(async () => {
-  await app.close();
-  await rm(tempDir, { recursive: true });
-});
+afterEach(() => teardownApiHarness(harness));
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   const now = new Date().toISOString();
@@ -48,14 +41,21 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   };
 }
 
+// The canonical valid create payload; spread + override per case.
+function createPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', ...overrides };
+}
+
+// Persist a task built from makeTask overrides — the dominant arrange step in this file.
+function seedTask(overrides: Partial<TaskState> = {}): Promise<void> {
+  return app.ctx.taskStore.set(makeTask(overrides));
+}
+
 describe('POST /api/tasks with images', () => {
   it('decodes images and passes {bytes, ext} to createAndStartTask', async () => {
     const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask')
       .mockResolvedValue(makeTask({ images: ['x.png'] }));
-    const res = await app.inject({
-      method: 'POST', url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', images: [{ dataBase64: PNG_B64 }] },
-    });
+    const res = await post('/api/tasks', createPayload({ images: [{ dataBase64: PNG_B64 }] }));
     expect(res.statusCode).toBe(201);
     const arg = spy.mock.calls[0][1] as { images?: { bytes: Buffer; ext: string }[] };
     expect(arg.images).toHaveLength(1);
@@ -66,47 +66,25 @@ describe('POST /api/tasks with images', () => {
   it('accepts exactly the max legal image count', async () => {
     const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(makeTask());
     const images = Array.from({ length: TASK_IMAGE_MAX_COUNT }, () => ({ dataBase64: PNG_B64 }));
-    const res = await app.inject({
-      method: 'POST', url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', images },
-    });
+    const res = await post('/api/tasks', createPayload({ images }));
     expect(res.statusCode).toBe(201);
     expect((spy.mock.calls[0][1] as { images?: unknown[] }).images).toHaveLength(TASK_IMAGE_MAX_COUNT);
   });
 
-  it('rejects more than the max image count with 400 and does not dispatch', async () => {
+  // Each rejected image payload → 400 before dispatch. `images` built per-row to keep buffer construction explicit.
+  it.each([
+    ['more than the max image count', () => Array.from({ length: TASK_IMAGE_MAX_COUNT + 1 }, () => ({ dataBase64: PNG_B64 }))],
+    ['a non-image payload', () => [{ dataBase64: Buffer.from('not an image').toString('base64') }]],
+    ['an oversized image', () => {
+      const big = Buffer.alloc(IMAGE_UPLOAD_MAX_BYTES + 16);
+      Buffer.from([0x89, 0x50, 0x4e, 0x47]).copy(big);
+      return [{ dataBase64: big.toString('base64') }];
+    }],
+  ] as const)('rejects %s with 400 and does not dispatch', async (_label, buildImages) => {
     const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask');
-    const images = Array.from({ length: TASK_IMAGE_MAX_COUNT + 1 }, () => ({ dataBase64: PNG_B64 }));
-    const res = await app.inject({
-      method: 'POST', url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', images },
-    });
+    const res = await post('/api/tasks', createPayload({ images: buildImages() }));
     expect(res.statusCode).toBe(400);
     expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('rejects a non-image payload with 400', async () => {
-    const res = await app.inject({
-      method: 'POST', url: '/api/tasks',
-      payload: {
-        projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1',
-        images: [{ dataBase64: Buffer.from('not an image').toString('base64') }],
-      },
-    });
-    expect(res.statusCode).toBe(400);
-  });
-
-  it('rejects an oversized image with 400', async () => {
-    const big = Buffer.alloc(IMAGE_UPLOAD_MAX_BYTES + 16);
-    Buffer.from([0x89, 0x50, 0x4e, 0x47]).copy(big);
-    const res = await app.inject({
-      method: 'POST', url: '/api/tasks',
-      payload: {
-        projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1',
-        images: [{ dataBase64: big.toString('base64') }],
-      },
-    });
-    expect(res.statusCode).toBe(400);
   });
 
   it('route bodyLimits cover the max legal base64 payload', () => {
@@ -121,24 +99,24 @@ describe('POST /api/tasks with images', () => {
 
 describe('GET /api/tasks', () => {
   it('缺 projectId → 400（全局查询已下线）', async () => {
-    await app.ctx.taskStore.set(makeTask());
-    const response = await app.inject({ method: 'GET', url: '/api/tasks' });
+    await seedTask();
+    const response = await get('/api/tasks');
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(/projectId is required/);
   });
 
   it('projectId 全 whitespace → 400', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=%20%20' });
+    const response = await get('/api/tasks?projectId=%20%20');
     expect(response.statusCode).toBe(400);
   });
 
   it('默认返回该项目的 open（active 在前 + pending）分页，已处理被排除', async () => {
-    await app.ctx.taskStore.set(makeTask({ id: 'task-001', status: 'in_progress' }));
-    await app.ctx.taskStore.set(makeTask({ id: 'task-002', status: 'pending' }));
-    await app.ctx.taskStore.set(makeTask({ id: 'task-003', status: 'merged' }));
-    await app.ctx.taskStore.set(makeTask({ id: 'task-004', status: 'cancelled' }));
+    await seedTask({ id: 'task-001', status: 'in_progress' });
+    await seedTask({ id: 'task-002', status: 'pending' });
+    await seedTask({ id: 'task-003', status: 'merged' });
+    await seedTask({ id: 'task-004', status: 'cancelled' });
 
-    const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj' });
+    const response = await get('/api/tasks?projectId=proj');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as { tasks: TaskState[]; hasMore: boolean; nextOffset: number };
     expect(body.tasks.map((t) => t.id)).toEqual(['task-001', 'task-002']);
@@ -148,9 +126,9 @@ describe('GET /api/tasks', () => {
 
   it('open 默认分页每页最多 20', async () => {
     for (let i = 1; i <= 25; i += 1) {
-      await app.ctx.taskStore.set(makeTask({ id: `task-${String(i).padStart(3, '0')}`, status: 'pending' }));
+      await seedTask({ id: `task-${String(i).padStart(3, '0')}`, status: 'pending' });
     }
-    const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj' });
+    const response = await get('/api/tasks?projectId=proj');
     const body = JSON.parse(response.body) as { tasks: TaskState[]; hasMore: boolean; nextOffset: number };
     expect(body.tasks).toHaveLength(20);
     expect(body.hasMore).toBe(true);
@@ -158,10 +136,10 @@ describe('GET /api/tasks', () => {
   });
 
   it('open 查询按 projectId 隔离', async () => {
-    await app.ctx.taskStore.set(makeTask({ id: 'task-001', projectId: 'proj', status: 'in_progress' }));
-    await app.ctx.taskStore.set(makeTask({ id: 'task-002', projectId: 'other', status: 'in_progress' }));
+    await seedTask({ id: 'task-001', projectId: 'proj', status: 'in_progress' });
+    await seedTask({ id: 'task-002', projectId: 'other', status: 'in_progress' });
 
-    const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj' });
+    const response = await get('/api/tasks?projectId=proj');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as { tasks: TaskState[] };
     expect(body.tasks).toHaveLength(1);
@@ -169,13 +147,13 @@ describe('GET /api/tasks', () => {
   });
 
   it('does not expose post-approve completion secrets', async () => {
-    await app.ctx.taskStore.set(makeTask({ status: 'in_progress' }));
+    await seedTask({ status: 'in_progress' });
     await app.ctx.agentManager.setPostApproveCompletion('task-001', {
       token: 'secret-token',
       approvedHeadSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
 
-    const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj' });
+    const response = await get('/api/tasks?projectId=proj');
 
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as { tasks: Array<Record<string, unknown>> };
@@ -185,23 +163,21 @@ describe('GET /api/tasks', () => {
 
   describe('category=active', () => {
     it('只返回 active 任务，按 updatedAt 倒序，分页', async () => {
-      await app.ctx.taskStore.set(makeTask({ id: 'task-001', status: 'in_progress', updatedAt: '2026-05-16T00:00:00Z' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-002', status: 'review', updatedAt: '2026-05-18T00:00:00Z' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-003', status: 'pending' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-004', status: 'merged' }));
+      await seedTask({ id: 'task-001', status: 'in_progress', updatedAt: '2026-05-16T00:00:00Z' });
+      await seedTask({ id: 'task-002', status: 'review', updatedAt: '2026-05-18T00:00:00Z' });
+      await seedTask({ id: 'task-003', status: 'pending' });
+      await seedTask({ id: 'task-004', status: 'merged' });
 
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&category=active' });
+      const response = await get('/api/tasks?projectId=proj&category=active');
       const body = JSON.parse(response.body) as { tasks: TaskState[] };
       expect(body.tasks.map((t) => t.id)).toEqual(['task-002', 'task-001']);
     });
 
     it('active 排序容忍缺失 updatedAt，不抛错', async () => {
-      await app.ctx.taskStore.set(makeTask({ id: 'task-001', status: 'in_progress', updatedAt: '2026-05-16T00:00:00Z' }));
-      await app.ctx.taskStore.set(
-        makeTask({ id: 'task-002', status: 'review', updatedAt: undefined as unknown as string }),
-      );
+      await seedTask({ id: 'task-001', status: 'in_progress', updatedAt: '2026-05-16T00:00:00Z' });
+      await seedTask({ id: 'task-002', status: 'review', updatedAt: undefined as unknown as string });
 
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&category=active' });
+      const response = await get('/api/tasks?projectId=proj&category=active');
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body) as { tasks: TaskState[] };
       // the timestamped task sorts before the timestamp-less one under desc order.
@@ -211,12 +187,12 @@ describe('GET /api/tasks', () => {
 
   describe('category=pending', () => {
     it('只返回 pending 任务，按 id 升序，分页', async () => {
-      await app.ctx.taskStore.set(makeTask({ id: 'task-003', status: 'pending' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-001', status: 'pending' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-002', status: 'pending' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-010', status: 'in_progress' }));
+      await seedTask({ id: 'task-003', status: 'pending' });
+      await seedTask({ id: 'task-001', status: 'pending' });
+      await seedTask({ id: 'task-002', status: 'pending' });
+      await seedTask({ id: 'task-010', status: 'in_progress' });
 
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&category=pending' });
+      const response = await get('/api/tasks?projectId=proj&category=pending');
       const body = JSON.parse(response.body) as { tasks: TaskState[] };
       expect(body.tasks.map((t) => t.id)).toEqual(['task-001', 'task-002', 'task-003']);
     });
@@ -224,17 +200,17 @@ describe('GET /api/tasks', () => {
 
   describe('status filter (CLI)', () => {
     it('honor 精确 status：只返回该状态的任务', async () => {
-      await app.ctx.taskStore.set(makeTask({ id: 'task-001', status: 'pending' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-002', status: 'in_progress' }));
-      await app.ctx.taskStore.set(makeTask({ id: 'task-003', status: 'review' }));
+      await seedTask({ id: 'task-001', status: 'pending' });
+      await seedTask({ id: 'task-002', status: 'in_progress' });
+      await seedTask({ id: 'task-003', status: 'review' });
 
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&status=pending' });
+      const response = await get('/api/tasks?projectId=proj&status=pending');
       const body = JSON.parse(response.body) as { tasks: TaskState[] };
       expect(body.tasks.map((t) => t.id)).toEqual(['task-001']);
     });
 
     it('未知 status → 400（不静默返回错误集合）', async () => {
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&status=bogus' });
+      const response = await get('/api/tasks?projectId=proj&status=bogus');
       expect(response.statusCode).toBe(400);
       expect(JSON.parse(response.body).error).toMatch(/unknown status/);
     });
@@ -243,15 +219,12 @@ describe('GET /api/tasks', () => {
   describe('category=done 分页', () => {
     it('只返回 terminal 任务，按 id 倒序，每页最多 20', async () => {
       for (let i = 1; i <= 25; i += 1) {
-        await app.ctx.taskStore.set(makeTask({
-          id: `task-${String(i).padStart(3, '0')}`,
-          status: 'merged',
-        }));
+        await seedTask({ id: `task-${String(i).padStart(3, '0')}`, status: 'merged' });
       }
       // open 任务不应出现在 done 列表里
-      await app.ctx.taskStore.set(makeTask({ id: 'task-999', status: 'in_progress' }));
+      await seedTask({ id: 'task-999', status: 'in_progress' });
 
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&category=done' });
+      const response = await get('/api/tasks?projectId=proj&category=done');
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body) as { tasks: TaskState[]; hasMore: boolean; nextOffset: number };
       expect(body.tasks).toHaveLength(20);
@@ -264,13 +237,10 @@ describe('GET /api/tasks', () => {
 
     it('第二页返回剩余项且 hasMore=false', async () => {
       for (let i = 1; i <= 25; i += 1) {
-        await app.ctx.taskStore.set(makeTask({
-          id: `task-${String(i).padStart(3, '0')}`,
-          status: 'failed',
-        }));
+        await seedTask({ id: `task-${String(i).padStart(3, '0')}`, status: 'failed' });
       }
 
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&category=done&offset=20' });
+      const response = await get('/api/tasks?projectId=proj&category=done&offset=20');
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body) as { tasks: TaskState[]; hasMore: boolean; nextOffset: number };
       expect(body.tasks).toHaveLength(5);
@@ -281,8 +251,8 @@ describe('GET /api/tasks', () => {
     });
 
     it('offset 超出范围 → 空页 + hasMore=false', async () => {
-      await app.ctx.taskStore.set(makeTask({ id: 'task-001', status: 'merged' }));
-      const response = await app.inject({ method: 'GET', url: '/api/tasks?projectId=proj&category=done&offset=999' });
+      await seedTask({ id: 'task-001', status: 'merged' });
+      const response = await get('/api/tasks?projectId=proj&category=done&offset=999');
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body) as { tasks: TaskState[]; hasMore: boolean };
       expect(body.tasks).toHaveLength(0);
@@ -300,7 +270,7 @@ describe('GET /api/tasks/:id', () => {
       approvedHeadSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
 
-    const response = await app.inject({ method: 'GET', url: '/api/tasks/task-001' });
+    const response = await get('/api/tasks/task-001');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as TaskState & Record<string, unknown>;
     expect(body.id).toBe('task-001');
@@ -310,7 +280,7 @@ describe('GET /api/tasks/:id', () => {
   });
 
   it('returns 404 for unknown task', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/tasks/task-999' });
+    const response = await get('/api/tasks/task-999');
     expect(response.statusCode).toBe(404);
   });
 });
@@ -327,16 +297,10 @@ describe('POST /api/tasks', () => {
       .spyOn(app.ctx.agentManager, 'createAndStartTask')
       .mockResolvedValue(created);
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'New manual task',
-        description: 'do the thing',
-        preferredAgentId: 'dev-1',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({
+      title: 'New manual task',
+      description: 'do the thing',
+    }));
 
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body) as TaskState;
@@ -354,17 +318,11 @@ describe('POST /api/tasks', () => {
       .spyOn(app.ctx.agentManager, 'createAndStartTask')
       .mockResolvedValue(makeTask({ id: 'task-branch', branch: 'feat/custom' }));
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'custom branch task',
-        description: 'details',
-        preferredAgentId: 'dev-1',
-        branch: 'feat/custom',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({
+      title: 'custom branch task',
+      description: 'details',
+      branch: 'feat/custom',
+    }));
 
     expect(response.statusCode).toBe(201);
     expect(spy).toHaveBeenCalledWith('proj', expect.objectContaining({
@@ -377,11 +335,7 @@ describe('POST /api/tasks', () => {
       .spyOn(app.ctx.agentManager, 'createAndStartTask')
       .mockResolvedValue(makeTask({ id: 'task-bg', status: 'in_progress' }));
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1' },
-    });
+    const response = await post('/api/tasks', createPayload());
 
     expect(response.statusCode).toBe(201);
     expect(spy).toHaveBeenLastCalledWith('proj', expect.any(Object), { background: true });
@@ -392,16 +346,7 @@ describe('POST /api/tasks', () => {
       .spyOn(app.ctx.agentManager, 'createAndStartTask')
       .mockResolvedValue(makeTask({ id: 'task-101', title: 'hello' }));
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: '  hello  ',
-        description: '  body  ',
-        preferredAgentId: 'dev-1',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({ title: '  hello  ', description: '  body  ' }));
 
     expect(response.statusCode).toBe(201);
     expect(spy).toHaveBeenCalledWith('proj', {
@@ -411,249 +356,62 @@ describe('POST /api/tasks', () => {
     }, { background: true });
   });
 
-  it('同时传 title + issueNumber → 400 mutually exclusive', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'x',
-        description: 'y',
-        preferredAgentId: 'dev-1',
-        issueNumber: 5,
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    const body = JSON.parse(response.body);
-    expect(body.error).toMatch(/mutually exclusive/);
+  // Payload validation that rejects before reaching the manager. Each row: [label, body, status, errorMatch].
+  it.each([
+    ['title + issueNumber → 400 mutually exclusive', createPayload({ title: 'x', description: 'y', issueNumber: 5 }), 400, /mutually exclusive/],
+    ['only issueNumber → 400 (issue-bound unsupported)', { projectId: 'proj', issueNumber: 5 }, 400, undefined],
+    ['missing title → 400', { projectId: 'proj', description: 'y', preferredAgentId: 'dev-1' }, 400, undefined],
+    ['missing description → 400', { projectId: 'proj', title: 't', preferredAgentId: 'dev-1' }, 400, undefined],
+    ['missing projectId → 400', { title: 't', description: 'd', preferredAgentId: 'dev-1' }, 400, undefined],
+    ['projectId not found → 404', createPayload({ projectId: 'no-such' }), 404, undefined],
+    ['title all-whitespace → 400 1-200', createPayload({ title: '   ' }), 400, /1-200/],
+    ['title over 200 → 400 1-200', createPayload({ title: 'x'.repeat(201) }), 400, /1-200/],
+    ['description all-whitespace → 400 1-16000', createPayload({ description: '   ' }), 400, /1-16000/],
+    ['description over 16000 → 400 1-16000', createPayload({ description: 'x'.repeat(16001) }), 400, /1-16000/],
+    ['projectId all-whitespace → 400', createPayload({ projectId: '   ' }), 400, /projectId is required/],
+    ['title with newline → 400 single line', createPayload({ title: 'line1\nline2' }), 400, /single line/],
+    ['preferredAgentId null → 400', createPayload({ preferredAgentId: null }), 400, undefined],
+    ['preferredAgentId object → 400', createPayload({ preferredAgentId: { id: 'x' } }), 400, undefined],
+  ] as const)('validation %s', async (_label, body, status, errorMatch) => {
+    const response = await post('/api/tasks', body);
+    expectStatus(response, status, errorMatch);
   });
 
-  it('只传 issueNumber → 400 issue-bound 不再支持', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { projectId: 'proj', issueNumber: 5 },
-    });
+  it('preferredAgentId provided but number → 400 (do not silently coerce to unassigned)', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask');
+    const response = await post('/api/tasks', createPayload({ preferredAgentId: 42 }));
     expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/preferredAgentId must be a string/);
+    expect(spy).not.toHaveBeenCalled();
   });
 
-  it('缺 title → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        description: 'y',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('缺 description → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('缺 preferredAgentId → 201（允许 unassigned 创建）', async () => {
+  // Empty/whitespace preferredAgentId (and omission) all resolve to the unassigned-create path → 201.
+  it.each([
+    ['missing preferredAgentId → 201', { projectId: 'proj', title: 't', description: 'd' }, 'task-unassigned'],
+    ['empty preferredAgentId → 201', createPayload({ preferredAgentId: '' }), 'task-empty'],
+    ['whitespace preferredAgentId → 201', createPayload({ preferredAgentId: '   ' }), 'task-ws'],
+  ] as const)('unassigned create %s', async (_label, body, id) => {
     vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
-      makeTask({ id: 'task-unassigned', preferredAgentId: '', agentId: '', status: 'pending', branch: '' }),
+      makeTask({ id, preferredAgentId: '', agentId: '', status: 'pending', branch: '' }),
     );
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd' },
-    });
+    const response = await post('/api/tasks', body);
     expect(response.statusCode).toBe(201);
-  });
-
-  it('缺 projectId → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { title: 't', description: 'd', preferredAgentId: 'dev-1' },
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('projectId 不存在 → 404', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'no-such',
-        title: 't',
-        description: 'd',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(404);
-  });
-
-  it('title 全空白（trim 后空）→ 400 1-200 characters', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: '   ',
-        description: 'd',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/1-200/);
-  });
-
-  it('title 超 200 → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'x'.repeat(201),
-        description: 'd',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/1-200/);
-  });
-
-  it('description 全空白 → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: '   ',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/1-16000/);
-  });
-
-  it('description 超 16000 → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: 'x'.repeat(16001),
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/1-16000/);
-  });
-
-  it('preferredAgentId 空字符串 → 201（等价于稍后分配）', async () => {
-    vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
-      makeTask({ id: 'task-empty', preferredAgentId: '', agentId: '', status: 'pending', branch: '' }),
-    );
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: 'd',
-        preferredAgentId: '',
-      },
-    });
-    expect(response.statusCode).toBe(201);
-  });
-
-  it('projectId 全 whitespace → 400（不让 404 Project not found 误导）', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: '   ',
-        title: 't',
-        description: 'd',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/projectId is required/);
   });
 
   it('projectId 前后 whitespace → trim 后 lookup', async () => {
     const createSpy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
       makeTask({ id: 'task-y', projectId: 'proj', status: 'pending', branch: '' }),
     );
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: '  proj  ',
-        title: 't',
-        description: 'd',
-        preferredAgentId: 'dev-1',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({ projectId: '  proj  ' }));
     expect(response.statusCode).toBe(201);
     expect(createSpy).toHaveBeenCalledWith('proj', expect.anything(), { background: true });
-  });
-
-  it('title 含换行 → 400（H1 markdown 必须 single-line）', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'line1\nline2',
-        description: 'd',
-        preferredAgentId: 'dev-1',
-      },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/single line/);
-  });
-
-  it('preferredAgentId 全 whitespace → 201（trim 后等价于空，走 unassigned 路径）', async () => {
-    vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
-      makeTask({ id: 'task-ws', preferredAgentId: '', agentId: '', status: 'pending', branch: '' }),
-    );
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: 'd',
-        preferredAgentId: '   ',
-      },
-    });
-    expect(response.statusCode).toBe(201);
   });
 
   it('preferredAgentId 前后 whitespace → trim 后传给 manager', async () => {
     const createSpy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask').mockResolvedValue(
       makeTask({ id: 'task-x', preferredAgentId: 'dev-1', status: 'pending', branch: '' }),
     );
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: 'd',
-        preferredAgentId: '  dev-1  ',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({ preferredAgentId: '  dev-1  ' }));
     expect(response.statusCode).toBe(201);
     expect(createSpy).toHaveBeenCalledWith('proj', expect.objectContaining({
       preferredAgentId: 'dev-1', // trimmed
@@ -664,48 +422,9 @@ describe('POST /api/tasks', () => {
     vi.spyOn(app.ctx.agentManager, 'createAndStartTask')
       .mockRejectedValue(new ApiError(400, 'Unknown agent: nope'));
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: 'd',
-        preferredAgentId: 'nope',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({ preferredAgentId: 'nope' }));
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(/Unknown agent/);
-  });
-
-  it('preferredAgentId provided but number → 400 (do not silently coerce to unassigned)', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'createAndStartTask');
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 42 },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/preferredAgentId must be a string/);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('preferredAgentId provided but null → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: null },
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('preferredAgentId provided but object → 400', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: { projectId: 'proj', title: 't', description: 'd', preferredAgentId: { id: 'x' } },
-    });
-    expect(response.statusCode).toBe(400);
   });
 });
 
@@ -714,10 +433,7 @@ describe('POST /api/tasks/:id/retry', () => {
     const fresh = makeTask({ id: 'task-fresh', status: 'in_progress' });
     const spy = vi.spyOn(app.ctx.agentManager, 'retryTask').mockResolvedValue(fresh);
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-001/retry',
-    });
+    const response = await post('/api/tasks/task-001/retry');
 
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body) as TaskState;
@@ -729,10 +445,7 @@ describe('POST /api/tasks/:id/retry', () => {
     vi.spyOn(app.ctx.agentManager, 'retryTask')
       .mockRejectedValue(new ApiError(409, 'Task task-001 cannot be retried in status "in_progress"'));
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-001/retry',
-    });
+    const response = await post('/api/tasks/task-001/retry');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/cannot be retried/);
@@ -742,10 +455,7 @@ describe('POST /api/tasks/:id/retry', () => {
     vi.spyOn(app.ctx.agentManager, 'retryTask')
       .mockRejectedValue(new ApiError(404, 'Task not found'));
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-missing/retry',
-    });
+    const response = await post('/api/tasks/task-missing/retry');
 
     expect(response.statusCode).toBe(404);
   });
@@ -756,7 +466,7 @@ describe('POST /api/tasks/:id/complete', () => {
     const updated = makeTask({ id: 'task-001', status: 'merged' });
     const spy = vi.spyOn(app.ctx.agentManager, 'markTaskComplete').mockResolvedValue(updated);
 
-    const response = await app.inject({ method: 'POST', url: '/api/tasks/task-001/complete' });
+    const response = await post('/api/tasks/task-001/complete');
 
     expect(response.statusCode).toBe(202);
     expect(spy).toHaveBeenCalledWith('task-001');
@@ -766,7 +476,7 @@ describe('POST /api/tasks/:id/complete', () => {
     vi.spyOn(app.ctx.agentManager, 'markTaskComplete')
       .mockRejectedValue(new ApiError(409, 'Merge failed for task task-001: not approved'));
 
-    const response = await app.inject({ method: 'POST', url: '/api/tasks/task-001/complete' });
+    const response = await post('/api/tasks/task-001/complete');
 
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/Merge failed/);
@@ -778,7 +488,7 @@ describe('POST /api/tasks/:id/continue', () => {
     const updated = makeTask({ id: 'task-001', status: 'fixing', reviewRound: 3 });
     const spy = vi.spyOn(app.ctx.agentManager, 'continueDevRound').mockResolvedValue(updated);
 
-    const response = await app.inject({ method: 'POST', url: '/api/tasks/task-001/continue' });
+    const response = await post('/api/tasks/task-001/continue');
 
     expect(response.statusCode).toBe(202);
     expect(JSON.parse(response.body).reviewRound).toBe(3);
@@ -789,7 +499,7 @@ describe('POST /api/tasks/:id/continue', () => {
     vi.spyOn(app.ctx.agentManager, 'continueDevRound')
       .mockRejectedValue(new ApiError(409, 'Task task-001 is not at max_rounds (status=review)'));
 
-    const response = await app.inject({ method: 'POST', url: '/api/tasks/task-001/continue' });
+    const response = await post('/api/tasks/task-001/continue');
 
     expect(response.statusCode).toBe(409);
   });
@@ -797,29 +507,15 @@ describe('POST /api/tasks/:id/continue', () => {
 
 describe('POST /api/tasks/:id/dispatch', () => {
   beforeEach(async () => {
-    await app.ctx.taskStore.set(makeTask({
-      id: 'task-pending',
-      status: 'pending',
-      preferredAgentId: 'dev-1',
-      agentId: '',
-    }));
-    await app.ctx.taskStore.set(makeTask({
-      id: 'task-unassigned',
-      status: 'pending',
-      preferredAgentId: '',
-      agentId: '',
-    }));
+    await seedTask({ id: 'task-pending', status: 'pending', preferredAgentId: 'dev-1', agentId: '' });
+    await seedTask({ id: 'task-unassigned', status: 'pending', preferredAgentId: '', agentId: '' });
   });
 
   it('200: pending task + agentId in body → dispatch ok', async () => {
     const dispatched = makeTask({ id: 'task-pending', status: 'in_progress', agentId: 'dev-1' });
     vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({ task: dispatched });
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: { agentId: 'dev-1' },
-    });
+    const response = await post('/api/tasks/task-pending/dispatch', { agentId: 'dev-1' });
 
     expect(response.statusCode).toBe(200);
     expect(JSON.parse(response.body).id).toBe('task-pending');
@@ -829,126 +525,44 @@ describe('POST /api/tasks/:id/dispatch', () => {
     const dispatched = makeTask({ id: 'task-pending', status: 'in_progress', agentId: 'dev-1' });
     const spy = vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({ task: dispatched });
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: {},
-    });
+    const response = await post('/api/tasks/task-pending/dispatch', {});
 
     expect(response.statusCode).toBe(200);
     expect(spy).toHaveBeenCalledWith('task-pending', undefined);
   });
 
-  it('400: dispatchPendingTask returns 400 when task is unassigned and no agentId provided', async () => {
-    vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({
-      task: null,
-      errorCode: 400,
-      error: 'Task task-unassigned has no preferredAgentId; agentId is required in request body',
-    });
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-unassigned/dispatch',
-      payload: {},
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/agentId is required/);
-  });
-
-  it('400: request body is a JSON primitive (number) → reject before manager call', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask');
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: 123 as unknown,
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/JSON object/);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('400: request body is an array → reject', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: ['dev-1'] as unknown,
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('400: request body is explicitly null → reject (not coerced to {})', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask');
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: 'null',
-      headers: { 'content-type': 'application/json' },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/JSON object/);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('400: dispatchPendingTask returns errorCode=400', async () => {
-    vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({
-      task: null, errorCode: 400, error: 'Unknown agent: ghost',
-    });
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: { agentId: 'ghost' },
-    });
-    expect(response.statusCode).toBe(400);
+  // Manager returns an errorCode → route surfaces it verbatim (no body-shape guard fires first).
+  it.each([
+    ['unassigned task, no agentId → 400', 'task-unassigned', {},
+      { task: null, errorCode: 400, error: 'Task task-unassigned has no preferredAgentId; agentId is required in request body' }, 400, /agentId is required/],
+    ['errorCode=400 (unknown agent)', 'task-pending', { agentId: 'ghost' },
+      { task: null, errorCode: 400, error: 'Unknown agent: ghost' }, 400, undefined],
+    ['errorCode=409 (agent busy)', 'task-pending', { agentId: 'dev-1' },
+      { task: null, errorCode: 409, error: 'Agent dev-1 is busy or awaiting human' }, 409, undefined],
+  ] as const)('manager %s', async (_label, taskId, body, managerResult, status, errorMatch) => {
+    vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue(managerResult);
+    const response = await post(`/api/tasks/${taskId}/dispatch`, body);
+    expectStatus(response, status, errorMatch);
   });
 
   it('404: task does not exist', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-missing/dispatch',
-      payload: { agentId: 'dev-1' },
-    });
+    const response = await post('/api/tasks/task-missing/dispatch', { agentId: 'dev-1' });
     expect(response.statusCode).toBe(404);
   });
 
-  it('409: dispatchPendingTask returns errorCode=409', async () => {
-    vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask').mockResolvedValue({
-      task: null, errorCode: 409, error: 'Agent dev-1 is busy or awaiting human',
-    });
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: { agentId: 'dev-1' },
-    });
-    expect(response.statusCode).toBe(409);
-  });
-
-  it('400: agentId provided but not a string (number) → reject before manager call', async () => {
+  // Body-shape guards reject before any manager call.
+  it.each([
+    ['primitive number body → 400', 123 as unknown, undefined, 400, /JSON object/],
+    ['array body → 400', ['dev-1'] as unknown, undefined, 400, undefined],
+    ['explicit JSON null body → 400', 'null', { headers: { 'content-type': 'application/json' } }, 400, /JSON object/],
+    ['agentId number → 400', { agentId: 123 }, undefined, 400, /agentId must be a string/],
+    ['agentId null → 400', { agentId: null }, undefined, 400, undefined],
+    ['agentId object → 400', { agentId: { id: 'dev-1' } }, undefined, 400, undefined],
+  ] as const)('guard %s', async (_label, body, opts, status, errorMatch) => {
     const spy = vi.spyOn(app.ctx.agentManager, 'dispatchPendingTask');
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: { agentId: 123 },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/agentId must be a string/);
+    const response = await post('/api/tasks/task-pending/dispatch', body, opts);
+    expectStatus(response, status, errorMatch);
     expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('400: agentId provided but null → reject', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: { agentId: null },
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('400: agentId provided but object → reject', async () => {
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks/task-pending/dispatch',
-      payload: { agentId: { id: 'dev-1' } },
-    });
-    expect(response.statusCode).toBe(400);
   });
 });
 
@@ -957,11 +571,7 @@ describe('PATCH /api/tasks/:id', () => {
     const updated = makeTask({ status: 'pending', title: 'new title' });
     const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(updated);
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { title: '  new title  ' },
-    });
+    const response = await patch('/api/tasks/task-001', { title: '  new title  ' });
 
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as TaskState;
@@ -973,11 +583,7 @@ describe('PATCH /api/tasks/:id', () => {
     const updated = makeTask({ status: 'pending', description: 'new desc' });
     const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(updated);
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { description: '  new desc  ' },
-    });
+    const response = await patch('/api/tasks/task-001', { description: '  new desc  ' });
 
     expect(response.statusCode).toBe(200);
     expect(spy).toHaveBeenCalledWith('task-001', { description: 'new desc' });
@@ -991,11 +597,7 @@ describe('PATCH /api/tasks/:id', () => {
     });
     const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(refreshed);
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { preferredAgentId: 'dev-2' },
-    });
+    const response = await patch('/api/tasks/task-001', { preferredAgentId: 'dev-2' });
 
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as TaskState;
@@ -1004,76 +606,40 @@ describe('PATCH /api/tasks/:id', () => {
     expect(spy).toHaveBeenCalledWith('task-001', { preferredAgentId: 'dev-2' });
   });
 
-  it('title 全空白 → 400', async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { title: '   ' },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/1-200/);
-  });
-
-  it('title 超 200 → 400', async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { title: 'x'.repeat(201) },
-    });
-    expect(response.statusCode).toBe(400);
-  });
-
-  it('description 全空白 → 400', async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { description: '   ' },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/1-16000/);
+  // Pure PATCH body validation, rejected before manager. Each row: [label, body, errorMatch].
+  it.each([
+    ['title all-whitespace → 400 1-200', { title: '   ' }, /1-200/],
+    ['title over 200 → 400', { title: 'x'.repeat(201) }, undefined],
+    ['description all-whitespace → 400 1-16000', { description: '   ' }, /1-16000/],
+    ['preferredAgentId null → 400', { preferredAgentId: null }, undefined],
+    ["status 'failed' → 400 only cancelled accepted", { status: 'failed' }, /Only 'cancelled'/],
+    ["title + status='cancelled' → 400 cannot combine", { title: 't', status: 'cancelled' }, /Cannot combine cancellation with edits/],
+    ['empty body → 400 no fields to update', {}, /no fields to update/],
+  ] as const)('validation %s', async (_label, body, errorMatch) => {
+    const response = await patch('/api/tasks/task-001', body);
+    expectStatus(response, 400, errorMatch);
   });
 
   it('preferredAgentId 空字符串 → 200（清空当前分配）', async () => {
     const cleared = makeTask({ id: 'task-001', preferredAgentId: '', qaAgentId: undefined });
     vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(cleared);
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { preferredAgentId: '' },
-    });
+    const response = await patch('/api/tasks/task-001', { preferredAgentId: '' });
     expect(response.statusCode).toBe(200);
   });
 
   it('preferredAgentId provided but number → 400 (do not coerce to empty/clear)', async () => {
     const spy = vi.spyOn(app.ctx.agentManager, 'editTask');
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { preferredAgentId: 123 },
-    });
+    const response = await patch('/api/tasks/task-001', { preferredAgentId: 123 });
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(/preferredAgentId must be a string/);
     expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('preferredAgentId provided but null → 400', async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { preferredAgentId: null },
-    });
-    expect(response.statusCode).toBe(400);
   });
 
   it('in_progress 改 title → 409（editTask 抛 ApiError 透传）', async () => {
     vi.spyOn(app.ctx.agentManager, 'editTask')
       .mockRejectedValue(new ApiError(409, 'Task not editable in status in_progress'));
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { title: 'new' },
-    });
+    const response = await patch('/api/tasks/task-001', { title: 'new' });
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/not editable/);
   });
@@ -1082,11 +648,7 @@ describe('PATCH /api/tasks/:id', () => {
     const cancelled = makeTask({ status: 'cancelled' });
     const spy = vi.spyOn(app.ctx.agentManager, 'cancelTask').mockResolvedValue(cancelled);
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { status: 'cancelled' },
-    });
+    const response = await patch('/api/tasks/task-001', { status: 'cancelled' });
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as TaskState;
     expect(body.status).toBe('cancelled');
@@ -1101,11 +663,7 @@ describe('PATCH /api/tasks/:id', () => {
     });
     vi.spyOn(app.ctx.agentManager, 'cancelTask').mockResolvedValue(cancelled);
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { status: 'cancelled' },
-    });
+    const response = await patch('/api/tasks/task-001', { status: 'cancelled' });
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as TaskState;
     expect(body.prNumber).toBe(42);
@@ -1116,53 +674,15 @@ describe('PATCH /api/tasks/:id', () => {
     vi.spyOn(app.ctx.agentManager, 'cancelTask')
       .mockRejectedValue(new ApiError(409, 'Cannot cancel task in status merged'));
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { status: 'cancelled' },
-    });
+    const response = await patch('/api/tasks/task-001', { status: 'cancelled' });
     expect(response.statusCode).toBe(409);
-  });
-
-  it("body { status: 'failed' } → 400 only cancelled accepted", async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { status: 'failed' },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/Only 'cancelled'/);
-  });
-
-  it("同时 title + status='cancelled' → 400 不能合并", async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: { title: 't', status: 'cancelled' },
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/Cannot combine cancellation with edits/);
-  });
-
-  it('全空 body → 400 no fields to update', async () => {
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-001',
-      payload: {},
-    });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/no fields to update/);
   });
 
   it('未知 task → 404（manager 抛 ApiError 透传）', async () => {
     vi.spyOn(app.ctx.agentManager, 'editTask')
       .mockRejectedValue(new ApiError(404, 'Task not found'));
 
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/no-such',
-      payload: { title: 't' },
-    });
+    const response = await patch('/api/tasks/no-such', { title: 't' });
     expect(response.statusCode).toBe(404);
   });
 });
@@ -1176,16 +696,10 @@ describe('POST /api/tasks - op-aware gates', () => {
       updatedAt: new Date().toISOString(),
     });
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'should be queued',
-        description: 'agent is still being created, but queue is allowed now',
-        preferredAgentId: 'dev-1',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({
+      title: 'should be queued',
+      description: 'agent is still being created, but queue is allowed now',
+    }));
 
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
@@ -1202,16 +716,10 @@ describe('POST /api/tasks - op-aware gates', () => {
       updatedAt: new Date().toISOString(),
     });
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'should be queued',
-        description: 'agent is bound to another task',
-        preferredAgentId: 'dev-1',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({
+      title: 'should be queued',
+      description: 'agent is bound to another task',
+    }));
 
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
@@ -1223,16 +731,10 @@ describe('POST /api/tasks - op-aware gates', () => {
     vi.spyOn(app.ctx.agentManager, 'previewPromptBytesForTaskInput')
       .mockReturnValue(100 * 1024); // > MAX_PROMPT_BYTES_ROUTE_LIMIT (79KB)
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 'tiny title',
-        description: 'tiny body',
-        preferredAgentId: 'dev-1',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({
+      title: 'tiny title',
+      description: 'tiny body',
+    }));
 
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body);
@@ -1244,16 +746,7 @@ describe('POST /api/tasks - op-aware gates', () => {
     vi.spyOn(app.ctx.agentManager, 'previewPromptBytesForTaskInput')
       .mockImplementation(() => { throw new Error('Unknown agent: ghost'); });
 
-    const response = await app.inject({
-      method: 'POST',
-      url: '/api/tasks',
-      payload: {
-        projectId: 'proj',
-        title: 't',
-        description: 'd',
-        preferredAgentId: 'ghost',
-      },
-    });
+    const response = await post('/api/tasks', createPayload({ preferredAgentId: 'ghost' }));
 
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(/Unknown agent/);
@@ -1262,7 +755,7 @@ describe('POST /api/tasks - op-aware gates', () => {
 
 describe('server review mode API', () => {
   it('GET /api/tasks/:id/reviews returns [] when no rounds exist', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/tasks/task-x/reviews' });
+    const response = await get('/api/tasks/task-x/reviews');
     expect(response.statusCode).toBe(200);
     expect(JSON.parse(response.body)).toEqual([]);
   });
@@ -1276,29 +769,21 @@ describe('server review mode API', () => {
       round: 1, phase: 'code', content: 'C', startedAt: 'now',
       findings: { round: 1, verdict: 'approve', findings: [] },
     });
-    const response = await app.inject({ method: 'GET', url: '/api/tasks/task-r/reviews' });
+    const response = await get('/api/tasks/task-r/reviews');
     const rounds = JSON.parse(response.body) as Array<{ phase: string; round: number }>;
     expect(rounds.map(r => `${r.phase}-${r.round}`)).toEqual(['spec-1', 'code-1']);
   });
 
   it('POST /api/tasks/:id/complete confirms a ready task to done', async () => {
-    await app.ctx.taskStore.set(makeTask({
-      id: 'task-ready', status: 'ready', reviewMode: 'server', branch: 'bx/task-ready',
-    }));
-    const response = await app.inject({ method: 'POST', url: '/api/tasks/task-ready/complete' });
+    await seedTask({ id: 'task-ready', status: 'ready', reviewMode: 'server', branch: 'bx/task-ready' });
+    const response = await post('/api/tasks/task-ready/complete');
     expect(response.statusCode).toBe(202);
     expect(JSON.parse(response.body).status).toBe('done');
   });
 
   it('PATCH cancel works from ready', async () => {
-    await app.ctx.taskStore.set(makeTask({
-      id: 'task-ready2', status: 'ready', reviewMode: 'server', branch: 'bx/task-ready2',
-    }));
-    const response = await app.inject({
-      method: 'PATCH',
-      url: '/api/tasks/task-ready2',
-      payload: { status: 'cancelled' },
-    });
+    await seedTask({ id: 'task-ready2', status: 'ready', reviewMode: 'server', branch: 'bx/task-ready2' });
+    const response = await patch('/api/tasks/task-ready2', { status: 'cancelled' });
     expect(response.statusCode).toBe(200);
     expect(JSON.parse(response.body).status).toBe('cancelled');
   });

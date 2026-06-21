@@ -12,6 +12,31 @@ import type { CommandRunner } from '../../src/agent/runner.js';
 const REPO = 'user/repo';
 const PROJECT_ID = 'test-proj';
 
+type ManagedPrOverrides = {
+  number?: number;
+  html_url?: string;
+  ref?: string;
+  sha?: string;
+  updated_at?: string;
+};
+
+function managedPr(o: ManagedPrOverrides = {}): Record<string, unknown> {
+  const number = o.number ?? 42;
+  return {
+    number,
+    html_url: o.html_url ?? `https://github.com/u/r/pull/${number}`,
+    body: '<!-- baxian:managed -->',
+    head: { ref: o.ref ?? `bx/task-${number}`, sha: o.sha ?? 'a'.repeat(40) },
+    state: 'open',
+    merged_at: null,
+    updated_at: o.updated_at ?? '2026-05-12T00:00:00Z',
+  };
+}
+
+function managedPrListJson(...prs: ManagedPrOverrides[]): string {
+  return JSON.stringify(prs.map(managedPr));
+}
+
 function okRunner(): CommandRunner {
   return {
     exec: vi.fn(async (cmd: string) => {
@@ -50,6 +75,20 @@ function makePoller(runner: CommandRunner): GitHubPoller {
   return new GitHubPoller(opts);
 }
 
+// Silences console.error/console.warn for an entire describe block.
+function suppressConsole(): void {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+}
+
 describe('computePollerHealth', () => {
   it('returns unknown when never polled and no failure', () => {
     expect(computePollerHealth(0, undefined)).toBe('unknown');
@@ -68,17 +107,7 @@ describe('computePollerHealth', () => {
 });
 
 describe('GitHubPoller.snapshots()', () => {
-  let errSpy: ReturnType<typeof vi.spyOn>;
-  let warnSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  });
-  afterEach(() => {
-    errSpy.mockRestore();
-    warnSpy.mockRestore();
-  });
+  suppressConsole();
 
   it('returns one snapshot per added entry with initial unknown health', () => {
     const p = makePoller(okRunner());
@@ -135,14 +164,20 @@ describe('GitHubPoller.snapshots()', () => {
     expect(p.snapshots()[0].consecutiveFailures).toBe(3);
   });
 
-  it('gh exit code != 0 → cycle counted as failure (degraded, error message captured)', async () => {
-    const p = makePoller(nonZeroExitRunner('gh: not authenticated'));
+  // Each list-PR failure mode (non-zero exit / bad JSON / non-array) counts the cycle
+  // as a single failure and captures a matching lastErrorMessage.
+  it.each([
+    ['gh exit code != 0', nonZeroExitRunner('gh: not authenticated'), /pollPullRequests failed.*gh: not authenticated/],
+    ['stdout JSON parse failure', badJsonRunner('not valid json {'), /JSON parse failed/],
+    ['response not an array', badJsonRunner('{"message":"unauthorized"}'), /expected array, got object/],
+  ])('%s → cycle counted as failure (degraded, error captured)', async (_label, runner, pattern) => {
+    const p = makePoller(runner);
     p.add({ projectId: PROJECT_ID, repo: REPO });
     await p.poll();
     const snap = p.snapshots()[0];
     expect(snap.health).toBe('degraded');
     expect(snap.consecutiveFailures).toBe(1);
-    expect(snap.lastErrorMessage).toMatch(/pollPullRequests failed.*gh: not authenticated/);
+    expect(snap.lastErrorMessage).toMatch(pattern);
   });
 
   it('3 consecutive gh exit != 0 cycles escalate to failed health', async () => {
@@ -155,36 +190,8 @@ describe('GitHubPoller.snapshots()', () => {
     expect(p.snapshots()[0].consecutiveFailures).toBe(3);
   });
 
-  it('stdout JSON parse failure → cycle counted as failure', async () => {
-    const p = makePoller(badJsonRunner('not valid json {'));
-    p.add({ projectId: PROJECT_ID, repo: REPO });
-    await p.poll();
-    const snap = p.snapshots()[0];
-    expect(snap.health).toBe('degraded');
-    expect(snap.consecutiveFailures).toBe(1);
-    expect(snap.lastErrorMessage).toMatch(/JSON parse failed/);
-  });
-
-  it('response not an array → cycle counted as failure', async () => {
-    const p = makePoller(badJsonRunner('{"message":"unauthorized"}'));
-    p.add({ projectId: PROJECT_ID, repo: REPO });
-    await p.poll();
-    const snap = p.snapshots()[0];
-    expect(snap.health).toBe('degraded');
-    expect(snap.consecutiveFailures).toBe(1);
-    expect(snap.lastErrorMessage).toMatch(/expected array, got object/);
-  });
-
   it('list-PR succeeds but all sub-polls fail → cycle counted as degraded', async () => {
-    const prData = JSON.stringify([{
-      number: 42,
-      html_url: 'https://github.com/u/r/pull/42',
-      body: '<!-- baxian:managed -->',
-      head: { ref: 'bx/task-something', sha: 'a'.repeat(40) },
-      state: 'open',
-      merged_at: null,
-      updated_at: '2026-05-12T00:00:00Z',
-    }]);
+    const prData = managedPrListJson({ number: 42, ref: 'bx/task-something' });
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('/pulls?')) {
@@ -204,15 +211,7 @@ describe('GitHubPoller.snapshots()', () => {
   });
 
   it('onEvent throw on pr.created → cycle counted as degraded; cursor not stamped', async () => {
-    const prData = JSON.stringify([{
-      number: 700,
-      html_url: 'https://github.com/u/r/pull/700',
-      body: '<!-- baxian:managed -->',
-      head: { ref: 'bx/task-emit', sha: 'a'.repeat(40) },
-      state: 'open',
-      merged_at: null,
-      updated_at: '2026-05-12T00:00:00Z',
-    }]);
+    const prData = managedPrListJson({ number: 700, ref: 'bx/task-emit' });
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('/pulls?')) return { stdout: prData, stderr: '', exitCode: 0 };
@@ -239,15 +238,7 @@ describe('GitHubPoller.snapshots()', () => {
   });
 
   it('onEvent throw inside sub-poll (review.submitted) → cycle counted as degraded', async () => {
-    const prData = JSON.stringify([{
-      number: 701,
-      html_url: 'https://github.com/u/r/pull/701',
-      body: '<!-- baxian:managed -->',
-      head: { ref: 'bx/task-review-emit', sha: 'a'.repeat(40) },
-      state: 'open',
-      merged_at: null,
-      updated_at: '2026-05-12T00:00:00Z',
-    }]);
+    const prData = managedPrListJson({ number: 701, ref: 'bx/task-review-emit' });
     const reviewData = JSON.stringify([{ id: 9000, state: 'APPROVED' }]);
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
@@ -320,10 +311,10 @@ describe('GitHubPoller.snapshots()', () => {
     // Two managed PRs; pollReviewsForPr fails for the first PR, comments succeed.
     // The second PR's sub-polls all succeed. We verify both PRs reached emit by
     // counting onEvent invocations.
-    const prData = JSON.stringify([
-      { number: 1, html_url: 'u1', body: '<!-- baxian:managed -->', head: { ref: 'bx/a', sha: 'a'.repeat(40) }, state: 'open', merged_at: null, updated_at: '2026-05-12T00:00:00Z' },
-      { number: 2, html_url: 'u2', body: '<!-- baxian:managed -->', head: { ref: 'bx/b', sha: 'b'.repeat(40) }, state: 'open', merged_at: null, updated_at: '2026-05-12T00:00:00Z' },
-    ]);
+    const prData = managedPrListJson(
+      { number: 1, html_url: 'u1', ref: 'bx/a', sha: 'a'.repeat(40) },
+      { number: 2, html_url: 'u2', ref: 'bx/b', sha: 'b'.repeat(40) },
+    );
     let reviewsForPr1Call = 0;
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
@@ -398,16 +389,7 @@ describe('GitHubPoller.snapshots()', () => {
 });
 
 describe('GitHubPoller lifecycle hook', () => {
-  let errSpy: ReturnType<typeof vi.spyOn>;
-  let warnSpy: ReturnType<typeof vi.spyOn>;
-  beforeEach(() => {
-    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  });
-  afterEach(() => {
-    errSpy.mockRestore();
-    warnSpy.mockRestore();
-  });
+  suppressConsole();
 
   it('fires twice per entry per cycle (start + end)', async () => {
     const p = makePoller(okRunner());
@@ -452,16 +434,7 @@ describe('GitHubPoller lifecycle hook', () => {
 });
 
 describe('GitHubPoller.start()', () => {
-  let errSpy: ReturnType<typeof vi.spyOn>;
-  let warnSpy: ReturnType<typeof vi.spyOn>;
-  beforeEach(() => {
-    errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  });
-  afterEach(() => {
-    errSpy.mockRestore();
-    warnSpy.mockRestore();
-  });
+  suppressConsole();
 
   it('captures intervalMs in snapshots after start()', () => {
     const p = makePoller(okRunner());

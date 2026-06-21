@@ -88,6 +88,16 @@ function renderProjectPage() {
   );
 }
 
+async function openProjectMenu(): Promise<void> {
+  fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ })));
+}
+
+async function openDeleteDialog(): Promise<HTMLElement> {
+  await openProjectMenu();
+  fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' })));
+  return waitFor(() => screen.getByRole('dialog', { name: '删除项目' }));
+}
+
 beforeEach(() => {
   cleanup();
   __resetProjectsCacheForTests();
@@ -155,7 +165,7 @@ describe('Project header actions', () => {
 
     expect(screen.queryByRole('button', { name: /添加 Agent/ })).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
+    await openProjectMenu();
     const item = await screen.findByRole('menuitem', { name: '添加 Agent' });
     expect(item.className).not.toContain('text-danger');
 
@@ -222,9 +232,7 @@ describe('Project delete entry', () => {
     } as ProjectConfig;
     renderProjectPage();
 
-    const menuButton = await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
-    fireEvent.click(menuButton);
-
+    await openProjectMenu();
     const item = await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' }));
     expect((item as HTMLButtonElement).disabled).toBe(true);
     expect(item.getAttribute('title')).toMatch(/请先删除项目下的 1 个 Agent/);
@@ -232,10 +240,7 @@ describe('Project delete entry', () => {
 
   it('validates exact project id before delete and resets confirmation on cancel', async () => {
     renderProjectPage();
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ })));
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' })));
-
-    const dialog = await waitFor(() => screen.getByRole('dialog', { name: '删除项目' }));
+    const dialog = await openDeleteDialog();
     const confirm = within(dialog).getByRole('button', { name: '确认删除' }) as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
 
@@ -250,9 +255,7 @@ describe('Project delete entry', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog', { name: '删除项目' })).toBeNull());
 
-    fireEvent.click(screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' })));
-    const reopened = await waitFor(() => screen.getByRole('dialog', { name: '删除项目' }));
+    const reopened = await openDeleteDialog();
     const reopenedInput = within(reopened).getByLabelText('输入项目 ID 以确认删除') as HTMLInputElement;
     expect(reopenedInput.value).toBe('');
   });
@@ -272,9 +275,7 @@ describe('Project delete entry', () => {
       </MemoryRouter>,
     );
 
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ })));
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' })));
-    const dialog = await waitFor(() => screen.getByRole('dialog', { name: '删除项目' }));
+    const dialog = await openDeleteDialog();
     fireEvent.change(within(dialog).getByLabelText('输入项目 ID 以确认删除'), {
       target: { value: 'demo' },
     });
@@ -293,10 +294,7 @@ describe('Project delete entry', () => {
   it('surfaces server error in the modal and keeps the user on the project page', async () => {
     projectsDelete.mockRejectedValueOnce(new Error('boom — config locked'));
     renderProjectPage();
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ })));
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' })));
-
-    const dialog = await waitFor(() => screen.getByRole('dialog', { name: '删除项目' }));
+    const dialog = await openDeleteDialog();
     fireEvent.change(within(dialog).getByLabelText('输入项目 ID 以确认删除'), {
       target: { value: 'demo' },
     });

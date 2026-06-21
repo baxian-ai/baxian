@@ -65,6 +65,8 @@ function createFakePty(): FakePty {
   return fake as FakePty;
 }
 
+const makePtys = (n: number): FakePty[] => Array.from({ length: n }, createFakePty);
+
 const TEST_AGENT: AgentConfig = {
   id: 'dev-1',
   runtime: 'codex',
@@ -72,52 +74,149 @@ const TEST_AGENT: AgentConfig = {
   mode: 'local',
 };
 
-function makeStreamer(opts?: {
+type StreamerOptions = Omit<NonNullable<ConstructorParameters<typeof PaneStreamer>[4]>, 'ptyFactory'>;
+
+interface MakeStreamerOpts extends StreamerOptions {
   agent?: AgentConfig;
   fakePty?: FakePty;
-  idleGraceMs?: number;
-  reattachDelayMs?: number;
-  sessionProbeTimeoutMs?: number;
-  scrollbackLines?: number;
-}): {
+  ptyFactory?: PtyFactory;
+  runner?: ReturnType<typeof mockRunner>;
+}
+
+interface MadeStreamer {
   streamer: PaneStreamer;
   fakePty: FakePty;
   runner: ReturnType<typeof mockRunner>;
-} {
-  const fakePty = opts?.fakePty ?? createFakePty();
-  const ptyFactory: PtyFactory = () => fakePty;
-  const runner = mockRunner();
+}
+
+function makeStreamer(opts: MakeStreamerOpts = {}): MadeStreamer {
+  const { agent, fakePty: explicitPty, ptyFactory, runner: explicitRunner, idleGraceMs, ...rest } = opts;
+  const fakePty = explicitPty ?? createFakePty();
+  const runner = explicitRunner ?? mockRunner();
   const tmux = new TmuxManager(runner);
-  const streamer = new PaneStreamer(opts?.agent ?? TEST_AGENT, tmux, runner, () => undefined, {
-    ptyFactory,
-    idleGraceMs: opts?.idleGraceMs ?? 50,
-    reattachDelayMs: opts?.reattachDelayMs,
-    sessionProbeTimeoutMs: opts?.sessionProbeTimeoutMs,
-    scrollbackLines: opts?.scrollbackLines,
+  const streamer = new PaneStreamer(agent ?? TEST_AGENT, tmux, runner, () => undefined, {
+    ptyFactory: ptyFactory ?? (() => fakePty),
+    idleGraceMs: idleGraceMs ?? 50,
+    ...rest,
   });
   return { streamer, fakePty, runner };
 }
 
+// makeStreamer + the near-universal first subscribe (registers the shared `cbs`).
+async function subscribed(opts: MakeStreamerOpts = {}): Promise<MadeStreamer> {
+  const made = makeStreamer(opts);
+  await made.streamer.subscribeAtomic(cbs);
+  return made;
+}
+
 async function flush(streamer: PaneStreamer): Promise<void> {
   await streamer._waitForChainDrain();
-  await new Promise<void>(r => setImmediate(r));
+  await tick();
   await streamer._waitForChainDrain();
 }
 
+function tick(): Promise<void> {
+  return new Promise<void>(r => setImmediate(r));
+}
+
+const execCmds = (runner: ReturnType<typeof mockRunner>): string[] =>
+  runner.exec.mock.calls.map((c: unknown[]) => c[0] as string);
+
+const findCmd = (runner: ReturnType<typeof mockRunner>, pred: (cmd: string) => boolean): string | undefined =>
+  execCmds(runner).find(pred);
+
+async function expectDims(streamer: PaneStreamer, cols: number, rows: number): Promise<void> {
+  const { snapshot } = await streamer.getSnapshotAtomic();
+  expect(snapshot.cols).toBe(cols);
+  expect(snapshot.rows).toBe(rows);
+}
+
+// `tmux has-session` reports the session is gone; everything else succeeds.
+function mockSessionGone(runner: ReturnType<typeof mockRunner>): void {
+  runner.exec.mockImplementation(async (cmd: string) =>
+    cmd.includes('has-session')
+      ? { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }
+      : { stdout: '', stderr: '', exitCode: 0 },
+  );
+}
+
+interface CountingFactory {
+  factory: PtyFactory;
+  calls: () => number;
+  // advance fake timers by `ms`, then assert the factory has been invoked `expected` times.
+  expectAfter: (ms: number, expected: number) => Promise<void>;
+}
+
+// A counting PTY factory: returns ptys[0], ptys[1], … in order. `failAt` indices throw
+// (simulating a failed reattach); any call past the provided ptys also throws.
+function countingFactory(ptys: FakePty[], failAt: number[] = []): CountingFactory {
+  let calls = 0;
+  const factory: PtyFactory = () => {
+    const i = calls++;
+    if (failAt.includes(i) || ptys[i] === undefined) throw new Error('ssh down');
+    return ptys[i];
+  };
+  const expectAfter = async (ms: number, expected: number): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(ms);
+    expect(calls).toBe(expected);
+  };
+  return { factory, calls: () => calls, expectAfter };
+}
+
+// Most timer-driven reconnect tests share the same scaffold: spy on console, build a
+// streamer with a counting factory, subscribe, switch to fake timers, then advance.
+async function withTimerHarness(
+  run: (ctx: {
+    streamer: PaneStreamer;
+    warnSpy: ReturnType<typeof vi.spyOn>;
+    logSpy: ReturnType<typeof vi.spyOn>;
+  }) => Promise<void>,
+  opts: MakeStreamerOpts = {},
+): Promise<void> {
+  const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  let streamer: PaneStreamer | null = null;
+  let usingFakeTimers = false;
+  try {
+    const made = makeStreamer(opts);
+    streamer = made.streamer;
+    await streamer.subscribeAtomic(cbs);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    usingFakeTimers = true;
+    await run({ streamer, warnSpy, logSpy });
+  } finally {
+    streamer?.destroy();
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
+    if (usingFakeTimers) vi.useRealTimers();
+  }
+}
+
+async function withFakeTimers(run: () => Promise<void>): Promise<void> {
+  vi.useFakeTimers();
+  try {
+    await run();
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+let liveCalls: Array<{ data: string; seq: number }>;
+let _sessionGoneCalls: number;
+let cbs: SubscriberCallbacks;
+
+const NOOP_CBS: SubscriberCallbacks = { onLive: () => undefined, onSessionGone: () => undefined };
+
+beforeEach(() => {
+  liveCalls = [];
+  _sessionGoneCalls = 0;
+  cbs = {
+    onLive: (data: string, seq: number) => liveCalls.push({ data, seq }),
+    onSessionGone: () => { _sessionGoneCalls++; },
+  };
+});
+
 describe('PaneStreamer', () => {
-  let liveCalls: Array<{ data: string; seq: number }>;
-  let _sessionGoneCalls: number;
-  let cbs: SubscriberCallbacks;
-
-  beforeEach(() => {
-    liveCalls = [];
-    _sessionGoneCalls = 0;
-    cbs = {
-      onLive: (data: string, seq: number) => liveCalls.push({ data, seq }),
-      onSessionGone: () => { _sessionGoneCalls++; },
-    };
-  });
-
   describe('subscribeAtomic', () => {
     it('returns initial empty snapshot + snapshotSeq=-1 when no prior data', async () => {
       const { streamer } = makeStreamer();
@@ -130,8 +229,7 @@ describe('PaneStreamer', () => {
     });
 
     it('lazy-starts PTY on first subscribe', async () => {
-      const { streamer, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
       expect(fakePty.killCalled).toBe(0);  // pty alive
       streamer.destroy();
     });
@@ -144,10 +242,7 @@ describe('PaneStreamer', () => {
       fakePty.emitData('hello world');
       await flush(streamer);
 
-      const sub2 = await streamer.subscribeAtomic({
-        onLive: () => undefined,
-        onSessionGone: () => undefined,
-      });
+      const sub2 = await streamer.subscribeAtomic(NOOP_CBS);
       expect(sub2.snapshot.data.length).toBeGreaterThan(0);
       expect(sub2.snapshot.data).toContain('hello world');
       expect(sub2.snapshotSeq).toBe(0);
@@ -201,14 +296,9 @@ describe('PaneStreamer', () => {
 
   describe('getSnapshotAtomic', () => {
     it('returns snapshot with current snapshotSeq, does NOT register live cb', async () => {
-      const { streamer, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
       fakePty.emitData('hello');
       await flush(streamer);
-
-      const probeLive: Array<{ data: string; seq: number }> = [];
-      const probeOnLive = (d: string, s: number) => { probeLive.push({ data: d, seq: s }); };
-      const onSessionGone = () => undefined;
 
       const result = await streamer.getSnapshotAtomic();
       expect(result.snapshot.data).toContain('hello');
@@ -216,26 +306,19 @@ describe('PaneStreamer', () => {
 
       fakePty.emitData('world');
       await flush(streamer);
-      expect(probeLive).toEqual([]);
+      // getSnapshotAtomic never registered a live cb, so only the original `cbs` saw the data.
       expect(liveCalls.map(c => c.data)).toEqual(['hello', 'world']);
 
-      void probeOnLive; void onSessionGone;
       streamer.destroy();
     });
   });
 
   describe('onPtyData chain ordering', () => {
     it('subscribe queued during in-flight onPtyData sees that chunk in snapshot, not in live', async () => {
-      const { streamer, fakePty } = makeStreamer();
-
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
 
       fakePty.emitData('X');
-      const subPromise = streamer.subscribeAtomic({
-        onLive: () => undefined,
-        onSessionGone: () => undefined,
-      });
-      const sub = await subPromise;
+      const sub = await streamer.subscribeAtomic(NOOP_CBS);
       await flush(streamer);
 
       expect(sub.snapshot.data).toContain('X');
@@ -244,8 +327,7 @@ describe('PaneStreamer', () => {
     });
 
     it('seq increments monotonically per onPtyData chunk', async () => {
-      const { streamer, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
 
       fakePty.emitData('a');
       fakePty.emitData('b');
@@ -260,157 +342,77 @@ describe('PaneStreamer', () => {
 
   describe('onSessionGone (PTY exit)', () => {
     it('reattaches hidden tmux client instead of ending the session when tmux session still exists', async () => {
-      let streamer: PaneStreamer | null = null;
-      let usingFakeTimers = false;
-      try {
-        const ptys = [createFakePty(), createFakePty()];
-        let factoryCalls = 0;
-        const runner = mockRunner();
-        const tmux = new TmuxManager(runner);
-        streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-          ptyFactory: () => ptys[factoryCalls++],
-          idleGraceMs: 50,
-          reattachDelayMs: 1000,
-          random: () => 0,
-        });
-        let gone = 0;
-        const liveAfterReattach: string[] = [];
-        await streamer.subscribeAtomic({
-          onLive: (data) => liveAfterReattach.push(data),
-          onSessionGone: () => { gone++; },
-        });
-
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        usingFakeTimers = true;
+      const ptys = makePtys(2);
+      const { factory, calls, expectAfter } = countingFactory(ptys);
+      await withTimerHarness(async ({ streamer }) => {
         ptys[0].emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
+        await tick();
 
-        expect(gone).toBe(0);
+        expect(_sessionGoneCalls).toBe(0);
         expect(streamer.isDestroyed()).toBe(false);
-        expect(factoryCalls).toBe(1);
-        await vi.advanceTimersByTimeAsync(999);
-        expect(factoryCalls).toBe(1);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(2);
+        expect(calls()).toBe(1);
+        await expectAfter(999, 1);
+        await expectAfter(1, 2);
         vi.useRealTimers();
-        usingFakeTimers = false;
         ptys[1].emitData('after');
         await flush(streamer);
-        expect(liveAfterReattach).toEqual(['after']);
-      } finally {
-        streamer?.destroy();
-        if (usingFakeTimers) vi.useRealTimers();
-      }
+        expect(liveCalls.map(c => c.data)).toEqual(['after']);
+      }, { ptyFactory: factory, reattachDelayMs: 1000, random: () => 0 });
     });
 
     it('bounds the attach-exit tmux session probe with a timeout', async () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      let streamer: PaneStreamer | null = null;
-      let usingFakeTimers = false;
-      try {
-        const ptys = [createFakePty(), createFakePty()];
-        let factoryCalls = 0;
-        const runner = mockRunner();
-        runner.exec.mockImplementation(async (cmd: string, options?: ExecOptions) => {
-          if (cmd.includes('has-session')) {
-            expect(options?.timeout).toBe(1234);
-            throw new Error('probe timeout');
-          }
-          return { stdout: '', stderr: '', exitCode: 0 };
-        });
-        const tmux = new TmuxManager(runner);
-        streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-          ptyFactory: () => ptys[factoryCalls++],
-          idleGraceMs: 50,
-          reattachDelayMs: 1000,
-          sessionProbeTimeoutMs: 1234,
-        });
-        await streamer.subscribeAtomic(cbs);
-
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        usingFakeTimers = true;
+      const ptys = makePtys(2);
+      const { factory, calls, expectAfter } = countingFactory(ptys);
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string, options?: ExecOptions) => {
+        if (cmd.includes('has-session')) {
+          expect(options?.timeout).toBe(1234);
+          throw new Error('probe timeout');
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      await withTimerHarness(async ({ warnSpy }) => {
         ptys[0].emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
+        await tick();
 
-        expect(factoryCalls).toBe(1);
+        expect(calls()).toBe(1);
         expect(warnSpy).toHaveBeenCalledWith(
           '[pane-streamer] dev-1 attach failing; backing off retries: probe timeout',
         );
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(factoryCalls).toBe(2);
-      } finally {
-        streamer?.destroy();
-        warnSpy.mockRestore();
-        if (usingFakeTimers) vi.useRealTimers();
-      }
+        await expectAfter(1000, 2);
+      }, { ptyFactory: factory, runner, reattachDelayMs: 1000, sessionProbeTimeoutMs: 1234 });
     });
 
     it('backs off between failed hidden attach retries even when caller requested immediate reattach', async () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-      let streamer: PaneStreamer | null = null;
-      let usingFakeTimers = false;
-      try {
-        const initialPty = createFakePty();
-        const recoveredPty = createFakePty();
-        let factoryCalls = 0;
-        const runner = mockRunner();
-        const tmux = new TmuxManager(runner);
-        streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-          ptyFactory: () => {
-            factoryCalls++;
-            if (factoryCalls === 1) return initialPty;
-            if (factoryCalls === 2) throw new Error('ssh unavailable');
-            return recoveredPty;
-          },
-          idleGraceMs: 50,
-          reattachDelayMs: 1000,
-          random: () => 0,
-        });
-        await streamer.subscribeAtomic(cbs);
-
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        usingFakeTimers = true;
+      const initialPty = createFakePty();
+      const recoveredPty = createFakePty();
+      const { factory, expectAfter } = countingFactory([initialPty, recoveredPty, recoveredPty], [1]);
+      await withTimerHarness(async ({ streamer, warnSpy }) => {
         initialPty.emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
-        await vi.advanceTimersByTimeAsync(999);
-        expect(factoryCalls).toBe(1);
-
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(2);
+        await tick();
+        await expectAfter(999, 1);
+        await expectAfter(1, 2);
         expect(warnSpy).toHaveBeenCalledTimes(1);
 
         // backoff doubled: the second retry waits 2000ms, not another 1000ms
-        await vi.advanceTimersByTimeAsync(1999);
-        expect(factoryCalls).toBe(2);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(3);
+        await expectAfter(1999, 2);
+        await expectAfter(1, 3);
         vi.useRealTimers();
-        usingFakeTimers = false;
         recoveredPty.emitData('after');
         await flush(streamer);
         expect(liveCalls.map(c => c.data)).toEqual(['after']);
-      } finally {
-        streamer?.destroy();
-        warnSpy.mockRestore();
-        logSpy.mockRestore();
-        if (usingFakeTimers) vi.useRealTimers();
-      }
+      }, { ptyFactory: factory, reattachDelayMs: 1000, random: () => 0 });
     });
 
     it('fires onSessionGone for all subscribers when tmux session is gone', async () => {
       const { streamer, fakePty, runner } = makeStreamer();
-      runner.exec.mockImplementation(async (cmd: string) =>
-        cmd.includes('has-session')
-          ? { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }
-          : { stdout: '', stderr: '', exitCode: 0 },
-      );
+      mockSessionGone(runner);
       let goneA = 0, goneB = 0;
       await streamer.subscribeAtomic({ onLive: () => undefined, onSessionGone: () => { goneA++; } });
       await streamer.subscribeAtomic({ onLive: () => undefined, onSessionGone: () => { goneB++; } });
 
       fakePty.emitExit(0);
-      await new Promise<void>(r => setImmediate(r));
+      await tick();
       expect(goneA).toBe(1);
       expect(goneB).toBe(1);
       expect(streamer.isDestroyed()).toBe(true);
@@ -418,53 +420,40 @@ describe('PaneStreamer', () => {
 
     it('subsequent subscribe attempts throw after tmux session is gone', async () => {
       const { streamer, fakePty, runner } = makeStreamer();
-      runner.exec.mockImplementation(async (cmd: string) =>
-        cmd.includes('has-session')
-          ? { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }
-          : { stdout: '', stderr: '', exitCode: 0 },
-      );
+      mockSessionGone(runner);
       await streamer.subscribeAtomic(cbs);
       fakePty.emitExit(0);
-      await new Promise<void>(r => setImmediate(r));
+      await tick();
       expect(streamer.isDestroyed()).toBe(true);
       await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow(/destroyed/);
     });
 
     it('kills a replacement PTY if tmux disappears during the session-gone probe window', async () => {
-      const ptys = [createFakePty(), createFakePty()];
-      let factoryCalls = 0;
+      const ptys = makePtys(2);
+      const { factory, calls } = countingFactory(ptys);
       let resolveProbe!: (value: ExecResult) => void;
       let probeStarted!: () => void;
-      const probeStartedPromise = new Promise<void>((resolve) => {
-        probeStarted = resolve;
-      });
+      const probeStartedPromise = new Promise<void>((resolve) => { probeStarted = resolve; });
       const runner = mockRunner();
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('has-session')) {
           probeStarted();
-          return new Promise<ExecResult>((resolve) => {
-            resolveProbe = resolve;
-          });
+          return new Promise<ExecResult>((resolve) => { resolveProbe = resolve; });
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
-      const tmux = new TmuxManager(runner);
-      const streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-        ptyFactory: () => ptys[factoryCalls++],
-        idleGraceMs: 50,
-        reattachDelayMs: 1000,
-      });
+      const { streamer } = makeStreamer({ ptyFactory: factory, runner, reattachDelayMs: 1000 });
       await streamer.subscribeAtomic(cbs);
 
       ptys[0].emitExit(0);
       await probeStartedPromise;
       await streamer.sendInput('x');
-      expect(factoryCalls).toBe(2);
+      expect(calls()).toBe(2);
       expect(ptys[1].writes).toEqual(['x']);
       expect(ptys[1].killCalled).toBe(0);
 
       resolveProbe({ stdout: '', stderr: "can't find session: dev-1", exitCode: 1 });
-      await new Promise<void>(r => setImmediate(r));
+      await tick();
 
       expect(streamer.isDestroyed()).toBe(true);
       expect(ptys[1].killCalled).toBe(1);
@@ -474,139 +463,65 @@ describe('PaneStreamer', () => {
 
   describe('reconnect backoff + log collapse', () => {
     it('grows the reattach delay exponentially while attaches keep failing', async () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      let streamer: PaneStreamer | null = null;
-      let usingFakeTimers = false;
-      try {
-        const initialPty = createFakePty();
-        let factoryCalls = 0;
-        const runner = mockRunner();
-        const tmux = new TmuxManager(runner);
-        streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-          ptyFactory: () => {
-            factoryCalls++;
-            if (factoryCalls === 1) return initialPty;
-            throw new Error('ssh down');
-          },
-          idleGraceMs: 50,
-          reattachDelayMs: 1000,
-          reattachMaxDelayMs: 15_000,
-          random: () => 0,
-        });
-        await streamer.subscribeAtomic(cbs);
-
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        usingFakeTimers = true;
+      const initialPty = createFakePty();
+      const { factory, calls, expectAfter } = countingFactory([initialPty]);
+      await withTimerHarness(async ({ warnSpy }) => {
         initialPty.emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
-        expect(factoryCalls).toBe(1);
+        await tick();
+        expect(calls()).toBe(1);
 
-        await vi.advanceTimersByTimeAsync(999);
-        expect(factoryCalls).toBe(1);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(2);
-
-        await vi.advanceTimersByTimeAsync(1999);
-        expect(factoryCalls).toBe(2);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(3);
-
-        await vi.advanceTimersByTimeAsync(3999);
-        expect(factoryCalls).toBe(3);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(4);
+        await expectAfter(999, 1);
+        await expectAfter(1, 2);
+        await expectAfter(1999, 2);
+        await expectAfter(1, 3);
+        await expectAfter(3999, 3);
+        await expectAfter(1, 4);
 
         expect(warnSpy).toHaveBeenCalledTimes(1);
-      } finally {
-        streamer?.destroy();
-        warnSpy.mockRestore();
-        if (usingFakeTimers) vi.useRealTimers();
-      }
+      }, { ptyFactory: factory, reattachDelayMs: 1000, reattachMaxDelayMs: 15_000, random: () => 0 });
     });
 
     // Regression: a failing reattach often emits bytes (SSH banner, "Connection closed"
     // stderr, login text) before the connection dies. Those bytes must NOT count as recovery
     // or the backoff resets to base every cycle and the storm returns.
     it('keeps backing off when a reattach emits output then exits without staying stable', async () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-      let streamer: PaneStreamer | null = null;
-      let usingFakeTimers = false;
-      try {
-        const ptys = [createFakePty(), createFakePty(), createFakePty()];
-        let factoryCalls = 0;
-        const runner = mockRunner();
-        const tmux = new TmuxManager(runner);
-        streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-          ptyFactory: () => ptys[factoryCalls++],
-          idleGraceMs: 50,
-          reattachDelayMs: 1000,
-          reattachMaxDelayMs: 15_000,
-          reattachStableAfterMs: 5000,
-          random: () => 0,
-        });
-        await streamer.subscribeAtomic(cbs);
-
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        usingFakeTimers = true;
+      const ptys = makePtys(3);
+      const { factory, expectAfter } = countingFactory(ptys);
+      await withTimerHarness(async () => {
         ptys[0].emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
+        await tick();
 
-        await vi.advanceTimersByTimeAsync(1000);
-        expect(factoryCalls).toBe(2);
+        await expectAfter(1000, 2);
 
         // ptys[1] spews failure noise as PTY data, then dies inside the stability window
         ptys[1].emitData('Connection closed by 1.2.3.4 port 6003\r\n');
         ptys[1].emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
+        await tick();
 
         // backoff must have grown to 2000ms — interim data must not reset it to 1000
-        await vi.advanceTimersByTimeAsync(1999);
-        expect(factoryCalls).toBe(2);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(3);
-      } finally {
-        streamer?.destroy();
-        warnSpy.mockRestore();
-        logSpy.mockRestore();
-        if (usingFakeTimers) vi.useRealTimers();
-      }
+        await expectAfter(1999, 2);
+        await expectAfter(1, 3);
+      }, {
+        ptyFactory: factory,
+        reattachDelayMs: 1000,
+        reattachMaxDelayMs: 15_000,
+        reattachStableAfterMs: 5000,
+        random: () => 0,
+      });
     });
 
     it('resets backoff and logs recovery only after a reattach survives the stability window', async () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-      let streamer: PaneStreamer | null = null;
-      let usingFakeTimers = false;
-      const recoveredLines = () =>
-        logSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('attach recovered'));
-      try {
-        const ptys = [createFakePty(), createFakePty(), createFakePty(), createFakePty()];
-        let factoryCalls = 0;
-        const runner = mockRunner();
-        const tmux = new TmuxManager(runner);
-        streamer = new PaneStreamer(TEST_AGENT, tmux, runner, () => undefined, {
-          ptyFactory: () => {
-            const i = factoryCalls++;
-            if (i === 1) throw new Error('ssh down');
-            return ptys[i];
-          },
-          idleGraceMs: 50,
-          reattachDelayMs: 1000,
-          reattachStableAfterMs: 5000,
-          random: () => 0,
-        });
-        await streamer.subscribeAtomic(cbs);
-
-        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-        usingFakeTimers = true;
+      const ptys = makePtys(4);
+      const { factory, expectAfter } = countingFactory(ptys, [1]);
+      await withTimerHarness(async ({ warnSpy, logSpy }) => {
+        const recoveredLines = () =>
+          logSpy.mock.calls.map(c => String(c[0])).filter(l => l.includes('attach recovered'));
         ptys[0].emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
+        await tick();
 
         await vi.advanceTimersByTimeAsync(1000);   // attempt1 → factory throws → outage warn
         expect(warnSpy).toHaveBeenCalledTimes(1);
-        await vi.advanceTimersByTimeAsync(2000);   // attempt2 → ptys[2] attaches, stays alive
-        expect(factoryCalls).toBe(3);
+        await expectAfter(2000, 3);                // attempt2 → ptys[2] attaches, stays alive
 
         await vi.advanceTimersByTimeAsync(4999);
         expect(recoveredLines()).toEqual([]);      // not recovered until the window elapses
@@ -615,24 +530,16 @@ describe('PaneStreamer', () => {
 
         // backoff was reset: a later drop reschedules from base (1000), not the grown delay
         ptys[2].emitExit(0);
-        await new Promise<void>(r => setImmediate(r));
-        await vi.advanceTimersByTimeAsync(999);
-        expect(factoryCalls).toBe(3);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(factoryCalls).toBe(4);
-      } finally {
-        streamer?.destroy();
-        warnSpy.mockRestore();
-        logSpy.mockRestore();
-        if (usingFakeTimers) vi.useRealTimers();
-      }
+        await tick();
+        await expectAfter(999, 3);
+        await expectAfter(1, 4);
+      }, { ptyFactory: factory, reattachDelayMs: 1000, reattachStableAfterMs: 5000, random: () => 0 });
     });
   });
 
   describe('idle grace + lazy GC', () => {
     it('keeps PTY alive when subscribers come and go within graceMs', async () => {
-      vi.useFakeTimers();
-      try {
+      await withFakeTimers(async () => {
         const { streamer, fakePty } = makeStreamer({ idleGraceMs: 100 });
         const sub = await streamer.subscribeAtomic(cbs);
         sub.unsubscribe();
@@ -643,30 +550,24 @@ describe('PaneStreamer', () => {
         await vi.advanceTimersByTimeAsync(200);
         expect(streamer.isDestroyed()).toBe(false);
         streamer.destroy();
-      } finally {
-        vi.useRealTimers();
-      }
+      });
     });
 
     it('destroys PTY after graceMs with no subscribers', async () => {
-      vi.useFakeTimers();
-      try {
+      await withFakeTimers(async () => {
         const { streamer, fakePty } = makeStreamer({ idleGraceMs: 100 });
         const sub = await streamer.subscribeAtomic(cbs);
         sub.unsubscribe();
         await vi.advanceTimersByTimeAsync(150);
         expect(streamer.isDestroyed()).toBe(true);
         expect(fakePty.killCalled).toBe(1);
-      } finally {
-        vi.useRealTimers();
-      }
+      });
     });
   });
 
   describe('scrollback line bound (the serialized snapshot IS the buffer; no separate byte copy)', () => {
     it('caps the snapshot at the configured scrollbackLines instead of retaining every emitted line', async () => {
-      const { streamer, fakePty } = makeStreamer({ scrollbackLines: 5 });
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed({ scrollbackLines: 5 });
       for (let i = 0; i < 200; i++) fakePty.emitData(`line-${i}\r\n`);
       await flush(streamer);
       const { snapshot } = await streamer.getSnapshotAtomic();
@@ -680,28 +581,25 @@ describe('PaneStreamer', () => {
 
   describe('sendInput (PTY stdin path — lets tmux client process keybinds)', () => {
     it('forwards bytes to pty.write (NOT tmux paste-buffer) so wheel/mouse-events trigger tmux keybinds', async () => {
-      const { streamer, fakePty, runner } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty, runner } = await subscribed();
       const mouseSeq = '\x1b[<64;42;7M';
       await streamer.sendInput(mouseSeq);
       expect(fakePty.writes).toEqual([mouseSeq]);
-      const calls = runner.exec.mock.calls.map((c: unknown[]) => c[0] as string);
+      const calls = execCmds(runner);
       expect(calls.some((c: string) => c.includes('paste-buffer'))).toBe(false);
       expect(calls.some((c: string) => c.includes('load-buffer'))).toBe(false);
       streamer.destroy();
     });
 
     it('empty input is a no-op (no pty.write)', async () => {
-      const { streamer, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
       await streamer.sendInput('');
       expect(fakePty.writes).toEqual([]);
       streamer.destroy();
     });
 
     it('sendInput after destroy rejects (does not silently swallow)', async () => {
-      const { streamer } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer } = await subscribed();
       streamer.destroy();
       await expect(streamer.sendInput('x')).rejects.toThrow(/destroyed/);
     });
@@ -709,38 +607,29 @@ describe('PaneStreamer', () => {
 
   describe('resize', () => {
     it('updates headless cols/rows + calls TmuxManager.resizeWindow', async () => {
-      const { streamer, runner } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, runner } = await subscribed();
       await streamer.resize(160, 40);
-      const calls = runner.exec.mock.calls.map((c: unknown[]) => c[0] as string);
-      const resizeCmd = calls.find(c => c.includes('tmux resize-window'));
+      const resizeCmd = findCmd(runner, c => c.includes('tmux resize-window'));
       expect(resizeCmd).toBeDefined();
       expect(resizeCmd).toContain('-x 160');
       expect(resizeCmd).toContain('-y 40');
       expect(resizeCmd).toContain("-t '=dev-1'");
-      const snap = await streamer.getSnapshotAtomic();
-      expect(snap.snapshot.cols).toBe(160);
-      expect(snap.snapshot.rows).toBe(40);
+      await expectDims(streamer, 160, 40);
       streamer.destroy();
     });
 
     it('restores window-size=latest after explicit web resize so the latest attached client controls size', async () => {
-      const { streamer, runner } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, runner } = await subscribed();
       await streamer.resize(160, 40);
-      const calls = runner.exec.mock.calls.map((c: unknown[]) => c[0] as string);
-      const latestCall = calls.find(c =>
-        c.includes('tmux set-option')
-        && c.includes('window-size')
-        && c.includes('latest')
+      const latestCall = findCmd(runner, c =>
+        c.includes('tmux set-option') && c.includes('window-size') && c.includes('latest'),
       );
       expect(latestCall).toBeDefined();
       streamer.destroy();
     });
 
     it('also resizes the attach PTY so tmux client viewport tracks web terminal (mouse hit-testing depends on it)', async () => {
-      const { streamer, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
       const beforeResizes = fakePty.resizeCalls.length;
       await streamer.resize(160, 40);
       expect(fakePty.resizeCalls.slice(beforeResizes)).toEqual([{ cols: 160, rows: 40 }]);
@@ -748,26 +637,23 @@ describe('PaneStreamer', () => {
     });
 
     it('still resizes tmux when requested dimensions match headless so web can reclaim latest sizing', async () => {
-      const { streamer, runner, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, runner, fakePty } = await subscribed();
       const beforeExecs = runner.exec.mock.calls.length;
       await streamer.resize(200, 50);
       expect(runner.exec.mock.calls.length).toBeGreaterThan(beforeExecs);
-      const calls = runner.exec.mock.calls.map((c: unknown[]) => c[0] as string);
-      const resizeCmd = calls.find(c => c.includes('tmux resize-window') && c.includes('-x 200') && c.includes('-y 50'));
+      const resizeCmd = findCmd(runner, c =>
+        c.includes('tmux resize-window') && c.includes('-x 200') && c.includes('-y 50'),
+      );
       expect(resizeCmd).toBeDefined();
       expect(fakePty.resizeCalls).toEqual([{ cols: 200, rows: 50 }]);
-      const snap = await streamer.getSnapshotAtomic();
-      expect(snap.snapshot.cols).toBe(200);
-      expect(snap.snapshot.rows).toBe(50);
+      await expectDims(streamer, 200, 50);
       streamer.destroy();
     });
 
     it('still resizes PTY/headless when window-size=latest repair fails after tmux resize succeeds', async () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       try {
-        const { streamer, runner, fakePty } = makeStreamer();
-        await streamer.subscribeAtomic(cbs);
+        const { streamer, runner, fakePty } = await subscribed();
         runner.exec.mockImplementation(async (cmd: string) =>
           cmd.includes('set-option') && cmd.includes('window-size') && cmd.includes('latest')
             ? { stdout: '', stderr: 'bad option', exitCode: 1 }
@@ -775,9 +661,7 @@ describe('PaneStreamer', () => {
         );
         await streamer.resize(160, 40);
         expect(fakePty.resizeCalls).toEqual([{ cols: 160, rows: 40 }]);
-        const snap = await streamer.getSnapshotAtomic();
-        expect(snap.snapshot.cols).toBe(160);
-        expect(snap.snapshot.rows).toBe(40);
+        await expectDims(streamer, 160, 40);
         expect(warnSpy).toHaveBeenCalledWith(
           '[pane-streamer] set window-size=latest failed after resize(dev-1):',
           expect.any(Error),
@@ -789,8 +673,7 @@ describe('PaneStreamer', () => {
     });
 
     it('tmux resize failure leaves headless dims AND PTY size unchanged (atomic rollback)', async () => {
-      const { streamer, runner, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, runner, fakePty } = await subscribed();
       const beforeCols = (await streamer.getSnapshotAtomic()).snapshot.cols;
       const beforeRows = (await streamer.getSnapshotAtomic()).snapshot.rows;
       const beforePtyResizes = fakePty.resizeCalls.length;
@@ -810,8 +693,7 @@ describe('PaneStreamer', () => {
 
   describe('destroy', () => {
     it('idempotent: second destroy is a no-op', async () => {
-      const { streamer, fakePty } = makeStreamer();
-      await streamer.subscribeAtomic(cbs);
+      const { streamer, fakePty } = await subscribed();
       streamer.destroy();
       streamer.destroy();
       expect(fakePty.killCalled).toBe(1);
@@ -856,8 +738,7 @@ describe('PaneStreamer host re-resolution', () => {
       () => { resolveCalls++; return host; },
       { ptyFactory: (cmd) => { captured.push(cmd); return fakePty; }, idleGraceMs: 50 },
     );
-    const cbs = { onLive: () => undefined, onSessionGone: () => undefined };
-    await streamer.subscribeAtomic(cbs);
+    await streamer.subscribeAtomic(NOOP_CBS);
 
     // The host was resolved at attach time (not captured in the constructor) and drives the command.
     expect(resolveCalls).toBeGreaterThanOrEqual(1);

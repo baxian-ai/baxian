@@ -56,6 +56,11 @@ class MockWebSocket {
   }
 }
 
+function ackSubscribe(ws: MockWebSocket, subscriberId: string, opts: { data: string; seq: number }): void {
+  ws.push({ type: 'snapshot', subscriberId, cols: 80, rows: 24, data: opts.data, snapshotSeq: opts.seq });
+  ws.push({ type: 'subscribed', subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: opts.seq });
+}
+
 function makeClient(opts: { wsUrl?: string } = {}): { client: PaneStreamClient; lastWs: () => MockWebSocket } {
   const factory = (url: string, protocols?: string[]) => {
     return new MockWebSocket(url, protocols) as unknown as WebSocket;
@@ -133,8 +138,7 @@ describe('PaneStreamClient', () => {
     const handle = client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot, onData });
     const ws = lastWs();
     ws.open();
-    ws.push({ type: 'snapshot', subscriberId: handle.subscriberId, cols: 80, rows: 24, data: 'INIT', snapshotSeq: 5 });
-    ws.push({ type: 'subscribed', subscriberId: handle.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 5 });
+    ackSubscribe(ws, handle.subscriberId, { data: 'INIT', seq: 5 });
     expect(onSnapshot).toHaveBeenCalledWith({ cols: 80, rows: 24, data: 'INIT' });
     expect(onData).not.toHaveBeenCalled();
   });
@@ -163,8 +167,7 @@ describe('PaneStreamClient', () => {
     const h1 = client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot: onSnap1, onData: onData1 });
     const ws = lastWs();
     ws.open();
-    ws.push({ type: 'snapshot', subscriberId: h1.subscriberId, cols: 80, rows: 24, data: 'INIT', snapshotSeq: 0 });
-    ws.push({ type: 'subscribed', subscriberId: h1.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 0 });
+    ackSubscribe(ws, h1.subscriberId, { data: 'INIT', seq: 0 });
 
     const onSnap2 = vi.fn();
     const onData2 = vi.fn();
@@ -174,8 +177,7 @@ describe('PaneStreamClient', () => {
     ws.push({ type: 'data', agentId: 'dev-1', data: 'X', seq: 4 });
     expect(onData1).toHaveBeenCalledWith('X');
 
-    ws.push({ type: 'snapshot', subscriberId: h2.subscriberId, cols: 80, rows: 24, data: 'INIT_X', snapshotSeq: 4 });
-    ws.push({ type: 'subscribed', subscriberId: h2.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 4 });
+    ackSubscribe(ws, h2.subscriberId, { data: 'INIT_X', seq: 4 });
 
     expect(onSnap2).toHaveBeenCalledWith({ cols: 80, rows: 24, data: 'INIT_X' });
     // 'X' had seq=4, snapshotSeq for h2 = 4 → not greater, must be skipped (already in snapshot).
@@ -194,8 +196,7 @@ describe('PaneStreamClient', () => {
     const h = client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot: onSnap, onData });
     const ws1 = lastWs();
     ws1.open();
-    ws1.push({ type: 'snapshot', subscriberId: h.subscriberId, cols: 80, rows: 24, data: 'BEFORE', snapshotSeq: 1 });
-    ws1.push({ type: 'subscribed', subscriberId: h.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
+    ackSubscribe(ws1, h.subscriberId, { data: 'BEFORE', seq: 1 });
     expect(onSnap).toHaveBeenCalledTimes(1);
 
     ws1.closeFromServer();
@@ -207,8 +208,7 @@ describe('PaneStreamClient', () => {
     const sent = ws2.sentParsed();
     expect(sent[0]).toMatchObject({ op: 'subscribe', subscriberId: h.subscriberId, agentId: 'dev-1', mode: 'full' });
 
-    ws2.push({ type: 'snapshot', subscriberId: h.subscriberId, cols: 80, rows: 24, data: 'AFTER', snapshotSeq: 9 });
-    ws2.push({ type: 'subscribed', subscriberId: h.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 9 });
+    ackSubscribe(ws2, h.subscriberId, { data: 'AFTER', seq: 9 });
     expect(onSnap).toHaveBeenCalledTimes(2);
     expect(onSnap.mock.calls[1][0]).toEqual({ cols: 80, rows: 24, data: 'AFTER' });
   });
@@ -223,8 +223,7 @@ describe('PaneStreamClient', () => {
     // No resize op should have been emitted yet.
     expect(ws.sentParsed().filter((m) => m.op === 'resize')).toHaveLength(0);
 
-    ws.push({ type: 'snapshot', subscriberId: h.subscriberId, cols: 80, rows: 24, data: '', snapshotSeq: 0 });
-    ws.push({ type: 'subscribed', subscriberId: h.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 0 });
+    ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
 
     const resizes = ws.sentParsed().filter((m) => m.op === 'resize');
     expect(resizes).toHaveLength(1);
@@ -260,8 +259,7 @@ describe('PaneStreamClient', () => {
     const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData });
     const ws = lastWs();
     ws.open();
-    ws.push({ type: 'snapshot', subscriberId: h.subscriberId, cols: 80, rows: 24, data: '', snapshotSeq: 0 });
-    ws.push({ type: 'subscribed', subscriberId: h.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 0 });
+    ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
     h.unsubscribe();
     ws.push({ type: 'data', agentId: 'dev-1', data: 'late', seq: 1 });
     expect(onData).not.toHaveBeenCalled();
@@ -314,8 +312,7 @@ describe('PaneStreamClient', () => {
     // ws is OPEN, subscribe was forwarded, but server hasn't ack'd yet → sub is pending.
     client.send(h.subscriberId, 'pre-ack-keystroke');
     expect(ws.sentParsed().some((m) => m.op === 'input')).toBe(false);
-    ws.push({ type: 'snapshot', subscriberId: h.subscriberId, cols: 80, rows: 24, data: '', snapshotSeq: 0 });
-    ws.push({ type: 'subscribed', subscriberId: h.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 0 });
+    ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
     const inputs = ws.sentParsed().filter((m) => m.op === 'input');
     expect(inputs).toHaveLength(1);
     expect(inputs[0]).toMatchObject({ subscriberId: h.subscriberId, data: 'pre-ack-keystroke' });
@@ -336,8 +333,7 @@ describe('PaneStreamClient', () => {
     // Right after onopen, the sub is back in pending; outbox flush MUST NOT
     // drop the input. It belongs in outbox until subscribed ack arrives.
     expect(ws2.sentParsed().some((m) => m.op === 'input')).toBe(false);
-    ws2.push({ type: 'snapshot', subscriberId: h.subscriberId, cols: 80, rows: 24, data: '', snapshotSeq: 0 });
-    ws2.push({ type: 'subscribed', subscriberId: h.subscriberId, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 0 });
+    ackSubscribe(ws2, h.subscriberId, { data: '', seq: 0 });
     const inputs = ws2.sentParsed().filter((m) => m.op === 'input');
     expect(inputs).toHaveLength(1);
     expect(inputs[0]).toMatchObject({ subscriberId: h.subscriberId, data: 'typed-while-down' });

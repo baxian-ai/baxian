@@ -30,6 +30,28 @@ let agentStore: AgentStore;
 let eventBus: EventBus;
 const events: BaxianEvent[] = [];
 
+type PollerOverrides = {
+  config?: BaxianConfig;
+  ensure?: () => Promise<string>;
+  repoStoreFactory?: unknown;
+  errorRecordStore?: ErrorRecordStore;
+  intervalMs?: number;
+};
+
+function makePoller(overrides: PollerOverrides = {}): BootstrapPoller {
+  const { config: cfg = config, ensure, repoStoreFactory, errorRecordStore, intervalMs = 60_000 } = overrides;
+  return new BootstrapPoller({
+    config: cfg,
+    agentStore,
+    eventBus,
+    errorRecordStore,
+    repoCache: createRepoStoreCache(),
+    runnerFactory: () => noopRunner as never,
+    repoStoreFactory: (repoStoreFactory ?? (() => ({ ensure: ensure ?? (async () => '/p') }))) as never,
+    intervalMs,
+  });
+}
+
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-br-'));
   await initStateDir(tempDir);
@@ -48,13 +70,7 @@ describe('BootstrapPoller', () => {
     // 60_000ms advance can race with a still-in-flight first tick.
     vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
     const ensure = vi.fn().mockResolvedValue('/repo/path');
-    const poller = new BootstrapPoller({
-      config, agentStore, eventBus,
-      repoCache: createRepoStoreCache(),
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => ({ ensure })) as never,
-      intervalMs: 60_000,
-    });
+    const poller = makePoller({ ensure });
     poller.start();
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(0);
@@ -69,26 +85,14 @@ describe('BootstrapPoller', () => {
   });
 
   it('does NOT emit agent.bootstrap_succeeded when no existing binding is updated', async () => {
-    const poller = new BootstrapPoller({
-      config, agentStore, eventBus,
-      repoCache: createRepoStoreCache(),
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => ({ ensure: async () => '/p' })) as never,
-      intervalMs: 60_000,
-    });
+    const poller = makePoller();
     await poller.pollOnce();
     expect(events.filter(e => e.type === 'agent.bootstrap_succeeded')).toHaveLength(0);
   });
 
   it('updates repoPath and emits succeeded when an existing binding is updated', async () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
-    const poller = new BootstrapPoller({
-      config, agentStore, eventBus,
-      repoCache: createRepoStoreCache(),
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => ({ ensure: async () => '/p' })) as never,
-      intervalMs: 60_000,
-    });
+    const poller = makePoller();
     await poller.pollOnce();
     expect((await agentStore.get('dev-1'))?.repoPath).toBe('/p');
     expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
@@ -103,31 +107,20 @@ describe('BootstrapPoller', () => {
       ],
     };
     let ensureCalls = 0;
-    const poller = new BootstrapPoller({
-      config: cfg2, agentStore, eventBus,
-      repoCache: createRepoStoreCache(),
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => {
+    const poller = makePoller({
+      config: cfg2,
+      repoStoreFactory: () => {
         ensureCalls++;
         const id = ensureCalls;
         return { ensure: async () => { if (id === 1) throw new Error('first down'); return '/p'; } };
-      }) as never,
-      intervalMs: 60_000,
+      },
     });
     await poller.pollOnce();
     expect(ensureCalls).toBe(2);
   });
 
   it('deduplicates repeated bootstrap_failed events for the same target and error', async () => {
-    const poller = new BootstrapPoller({
-      config,
-      agentStore,
-      eventBus,
-      repoCache: createRepoStoreCache(),
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => ({ ensure: async () => { throw new Error('clone refused'); } })) as never,
-      intervalMs: 60_000,
-    });
+    const poller = makePoller({ ensure: async () => { throw new Error('clone refused'); } });
 
     await poller.pollOnce();
     await poller.pollOnce();
@@ -137,15 +130,9 @@ describe('BootstrapPoller', () => {
 
   it('records bootstrap failures once per emitted failure event', async () => {
     const errorRecordStore = new ErrorRecordStore(join(tempDir, 'state', 'errors'));
-    const poller = new BootstrapPoller({
-      config,
-      agentStore,
-      eventBus,
-      repoCache: createRepoStoreCache(),
+    const poller = makePoller({
       errorRecordStore,
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => ({ ensure: async () => { throw new Error('clone refused'); } })) as never,
-      intervalMs: 60_000,
+      ensure: async () => { throw new Error('clone refused'); },
     });
 
     await poller.pollOnce();
@@ -161,13 +148,7 @@ describe('BootstrapPoller', () => {
     let releaseEnsure!: () => void;
     const gate = new Promise<string>(r => { releaseEnsure = () => r('/p'); });
     const ensure = vi.fn().mockReturnValue(gate);
-    const poller = new BootstrapPoller({
-      config, agentStore, eventBus,
-      repoCache: createRepoStoreCache(),
-      runnerFactory: () => noopRunner as never,
-      repoStoreFactory: (() => ({ ensure })) as never,
-      intervalMs: 60_000,
-    });
+    const poller = makePoller({ ensure });
     const p1 = poller.pollOnce();
     const p2 = poller.pollOnce();
     releaseEnsure();
@@ -186,26 +167,14 @@ describe('BootstrapPoller', () => {
 
     it('runs only the matching project (not the whole config)', async () => {
       const ensure = vi.fn().mockResolvedValue('/p');
-      const poller = new BootstrapPoller({
-        config: cfgTwoProjects, agentStore, eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-        intervalMs: 60_000,
-      });
+      const poller = makePoller({ config: cfgTwoProjects, ensure });
       await poller.pollProject('p-yes');
       expect(ensure).toHaveBeenCalledTimes(1);
     });
 
     it('returns knownProject=false for unknown projectId so endpoint can distinguish 404 vs ran=0', async () => {
       const ensure = vi.fn().mockResolvedValue('/p');
-      const poller = new BootstrapPoller({
-        config: cfgTwoProjects, agentStore, eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-        intervalMs: 60_000,
-      });
+      const poller = makePoller({ config: cfgTwoProjects, ensure });
       expect(await poller.pollProject('nope')).toEqual({ ok: false, ran: 0, knownProject: false });
       expect(ensure).not.toHaveBeenCalled();
     });
@@ -221,26 +190,14 @@ describe('BootstrapPoller', () => {
         }],
       };
       const ensure = vi.fn().mockResolvedValue('/p');
-      const poller = new BootstrapPoller({
-        config: cfgOnlyManual, agentStore, eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-        intervalMs: 60_000,
-      });
+      const poller = makePoller({ config: cfgOnlyManual, ensure });
       expect(await poller.pollProject('manual-only')).toEqual({ ok: true, ran: 0, knownProject: true });
       expect(ensure).not.toHaveBeenCalled();
     });
 
     it('returns ok=false when the bootstrap actually fails', async () => {
       const ensure = vi.fn().mockRejectedValue(new Error('access denied'));
-      const poller = new BootstrapPoller({
-        config: cfgTwoProjects, agentStore, eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-        intervalMs: 60_000,
-      });
+      const poller = makePoller({ config: cfgTwoProjects, ensure });
       expect(await poller.pollProject('p-yes')).toEqual({ ok: false, ran: 1, knownProject: true });
     });
 
@@ -248,13 +205,7 @@ describe('BootstrapPoller', () => {
       // Operator clicked Retry expecting a fresh signal. The automatic poll path dedupes by
       // last-seen message; manual retry should NOT inherit that suppression.
       const ensure = vi.fn().mockRejectedValue(new Error('access denied'));
-      const poller = new BootstrapPoller({
-        config: cfgTwoProjects, agentStore, eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-        intervalMs: 60_000,
-      });
+      const poller = makePoller({ config: cfgTwoProjects, ensure });
       await poller.pollOnce();
       events.length = 0;
       await poller.pollProject('p-yes');
@@ -271,14 +222,7 @@ describe('BootstrapPoller', () => {
         ...config,
         server: { ...config.server, bootstrapRetryIntervalMs: 5000 },
       };
-      const poller = new BootstrapPoller({
-        config: customConfig,
-        agentStore,
-        eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-      });
+      const poller = makePoller({ config: customConfig, ensure, intervalMs: 5000 });
       poller.start();
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(0);
@@ -308,14 +252,7 @@ describe('BootstrapPoller', () => {
         ...config,
         server: { ...config.server, bootstrapRetryIntervalMs: 2000 },
       };
-      const poller = new BootstrapPoller({
-        config: baseConfig,
-        agentStore,
-        eventBus,
-        repoCache: createRepoStoreCache(),
-        runnerFactory: () => noopRunner as never,
-        repoStoreFactory: (() => ({ ensure })) as never,
-      });
+      const poller = makePoller({ config: baseConfig, ensure, intervalMs: 2000 });
       poller.start();
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(0);

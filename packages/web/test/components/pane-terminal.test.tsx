@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, onTestFinished, vi } from 'vitest';
 import { render, cleanup, act, fireEvent, screen } from '@testing-library/react';
 
 const fakeTerminals: FakeTerminal[] = [];
@@ -122,6 +122,17 @@ class MockWebSocket {
   }
 }
 
+class MockResizeObserver {
+  static lastCallback: ResizeObserverCallback | null = null;
+  callback: ResizeObserverCallback;
+  constructor(cb: ResizeObserverCallback) {
+    this.callback = cb;
+    MockResizeObserver.lastCallback = cb;
+  }
+  observe(): void { /* no-op */ }
+  disconnect(): void { /* no-op */ }
+}
+
 beforeEach(() => {
   fakeTerminals.length = 0;
   FakeFitAddon.fitCount = 0;
@@ -150,114 +161,88 @@ afterEach(() => {
   cleanup();
 });
 
-class MockResizeObserver {
-  static lastCallback: ResizeObserverCallback | null = null;
-  callback: ResizeObserverCallback;
-  constructor(cb: ResizeObserverCallback) {
-    this.callback = cb;
-    MockResizeObserver.lastCallback = cb;
-  }
-  observe(): void { /* no-op */ }
-  disconnect(): void { /* no-op */ }
+type PaneModule = typeof import('../../src/components/pane-terminal.tsx');
+type PaneProps = Omit<import('../../src/components/pane-terminal.tsx').PaneTerminalProps, 'agentId'> & {
+  agentId?: string;
+};
+
+function importPane(): Promise<PaneModule> {
+  return import('../../src/components/pane-terminal.tsx');
+}
+
+// Import the mocked module and render a pane (agentId defaults to 'dev-1'). Returns the render
+// result plus the freshly constructed FakeTerminal — the common preamble for render-only tests.
+async function renderPane(props: PaneProps): Promise<ReturnType<typeof render> & { term: FakeTerminal }> {
+  const { PaneTerminal } = await importPane();
+  const result = render(<PaneTerminal agentId="dev-1" {...props} />);
+  return Object.assign(result, { term: lastTerminal() });
+}
+
+// Install a mock navigator.clipboard.writeText and return the spy for assertions.
+function stubClipboard(): ReturnType<typeof vi.fn> {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+  return writeText;
 }
 
 describe('stripTerminalAutoReplies (filter for xterm.js capability-query replies)', () => {
-  it('strips secondary DA reply that hz1 was leaking into codex stdin', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[>0;276;0c')).toBe('');
-  });
-
-  it('strips primary DA reply', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[?64;1;2;6;9;15;18;21;22c')).toBe('');
-  });
-
-  it('strips standard cursor-position report (DSR 6n response)', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[24;80R')).toBe('');
-  });
-
-  it('strips DEC private cursor-position report (DSR ?6n response, leading "?")', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[?24;80R')).toBe('');
-  });
-
-  it('strips device-status report (DSR 5n response)', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[0n')).toBe('');
-  });
-
-  it('strips multiple replies arriving in a single onData chunk', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[>0;276;0c\x1b[?64;1c\x1b[24;80R')).toBe('');
-  });
-
-  it('preserves residue when auto-replies are interleaved with real input', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('hello\x1b[>0;276;0cworld')).toBe('helloworld');
-  });
-
-  it('does NOT strip arrow keys (legit input sharing the CSI prefix)', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1b[A')).toBe('\x1b[A');
-    expect(stripTerminalAutoReplies('\x1b[B')).toBe('\x1b[B');
-    expect(stripTerminalAutoReplies('\x1b[C')).toBe('\x1b[C');
-    expect(stripTerminalAutoReplies('\x1b[D')).toBe('\x1b[D');
-  });
-
-  it('does NOT strip function keys / home / end / ctrl chars / regular text', async () => {
-    const { stripTerminalAutoReplies } = await import('../../src/components/pane-terminal.tsx');
-    expect(stripTerminalAutoReplies('\x1bOP')).toBe('\x1bOP'); // F1
-    expect(stripTerminalAutoReplies('\x1b[H')).toBe('\x1b[H'); // Home
-    expect(stripTerminalAutoReplies('\x1b[F')).toBe('\x1b[F'); // End
-    expect(stripTerminalAutoReplies('\x03')).toBe('\x03');     // Ctrl+C
-    expect(stripTerminalAutoReplies('hello')).toBe('hello');
-    expect(stripTerminalAutoReplies('\r')).toBe('\r');
+  // Each case lists [input chunk, expected residue] pairs. Auto-replies (DA1/DA2, DSR cursor /
+  // device-status) get stripped to ''. Legit input that shares the CSI prefix (arrows, F-keys,
+  // Home/End, ctrl chars, text) must pass through unchanged.
+  it.each<[string, Array<[string, string]>]>([
+    ['strips secondary DA reply that hz1 was leaking into codex stdin', [['\x1b[>0;276;0c', '']]],
+    ['strips primary DA reply', [['\x1b[?64;1;2;6;9;15;18;21;22c', '']]],
+    ['strips standard cursor-position report (DSR 6n response)', [['\x1b[24;80R', '']]],
+    ['strips DEC private cursor-position report (DSR ?6n response, leading "?")', [['\x1b[?24;80R', '']]],
+    ['strips device-status report (DSR 5n response)', [['\x1b[0n', '']]],
+    ['strips multiple replies arriving in a single onData chunk', [['\x1b[>0;276;0c\x1b[?64;1c\x1b[24;80R', '']]],
+    ['preserves residue when auto-replies are interleaved with real input', [['hello\x1b[>0;276;0cworld', 'helloworld']]],
+    ['does NOT strip arrow keys (legit input sharing the CSI prefix)', [
+      ['\x1b[A', '\x1b[A'],
+      ['\x1b[B', '\x1b[B'],
+      ['\x1b[C', '\x1b[C'],
+      ['\x1b[D', '\x1b[D'],
+    ]],
+    ['does NOT strip function keys / home / end / ctrl chars / regular text', [
+      ['\x1bOP', '\x1bOP'], // F1
+      ['\x1b[H', '\x1b[H'], // Home
+      ['\x1b[F', '\x1b[F'], // End
+      ['\x03', '\x03'],     // Ctrl+C
+      ['hello', 'hello'],
+      ['\r', '\r'],
+    ]],
+  ])('%s', async (_label, pairs) => {
+    const { stripTerminalAutoReplies } = await importPane();
+    for (const [input, expected] of pairs) {
+      expect(stripTerminalAutoReplies(input)).toBe(expected);
+    }
   });
 });
 
 describe('parseOsc52Clipboard (OSC 52 clipboard payload parsing)', () => {
-  it('decodes a payload with empty selector (tmux emits `;<base64>`)', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard(';' + btoa('hello'))).toBe('hello');
+  const utf8Text = '复制 👍 café';
+  const utf8B64 = btoa(String.fromCharCode(...new TextEncoder().encode(utf8Text)));
+
+  it.each([
+    ['a payload with empty selector (tmux emits `;<base64>`)', ';' + btoa('hello'), 'hello'],
+    ['a payload with an explicit `c` selector', 'c;' + btoa('world'), 'world'],
+    ['UTF-8 multibyte text (round-trip)', 'c;' + utf8B64, utf8Text],
+  ])('decodes %s', async (_label, payload, expected) => {
+    const { parseOsc52Clipboard } = await importPane();
+    expect(parseOsc52Clipboard(payload)).toBe(expected);
   });
 
-  it('decodes a payload with an explicit `c` selector', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard('c;' + btoa('world'))).toBe('world');
-  });
-
-  it('round-trips UTF-8 multibyte text', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    const text = '复制 👍 café';
-    const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(text)));
-    expect(parseOsc52Clipboard('c;' + b64)).toBe(text);
-  });
-
-  it('ignores read requests (`?`) so the clipboard is never exfiltrated', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard('c;?')).toBeNull();
-    expect(parseOsc52Clipboard(';?')).toBeNull();
-  });
-
-  it('returns null when there is no `;` separator', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard('garbage')).toBeNull();
-  });
-
-  it('returns null for an empty base64 payload', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard('c;')).toBeNull();
-  });
-
-  it('returns null for invalid base64', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard('c;@@@@')).toBeNull();
-  });
-
-  it('returns null for an oversize payload (>1MB base64)', async () => {
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
-    expect(parseOsc52Clipboard('c;' + 'A'.repeat(1024 * 1024 + 4))).toBeNull();
+  it.each<[string, string[]]>([
+    ['ignores read requests (`?`) so the clipboard is never exfiltrated', ['c;?', ';?']],
+    ['there is no `;` separator', ['garbage']],
+    ['an empty base64 payload', ['c;']],
+    ['invalid base64', ['c;@@@@']],
+    ['an oversize payload (>1MB base64)', ['c;' + 'A'.repeat(1024 * 1024 + 4)]],
+  ])('returns null when %s', async (_label, payloads) => {
+    const { parseOsc52Clipboard } = await importPane();
+    for (const payload of payloads) {
+      expect(parseOsc52Clipboard(payload)).toBeNull();
+    }
   });
 });
 
@@ -266,7 +251,7 @@ describe('parseOsc52Clipboard (OSC 52 clipboard payload parsing)', () => {
 describe('parseOsc52Clipboard wired to the real xterm OSC parser (chunk reassembly)', () => {
   it('reassembles a fragmented OSC 52 sequence and invokes the handler once with the full payload', async () => {
     const { Terminal } = await import('@xterm/headless');
-    const { parseOsc52Clipboard } = await import('../../src/components/pane-terminal.tsx');
+    const { parseOsc52Clipboard } = await importPane();
     const term = new Terminal({ allowProposedApi: true });
     const seen: string[] = [];
     term.parser.registerOscHandler(52, (payload) => {
@@ -284,11 +269,9 @@ describe('parseOsc52Clipboard wired to the real xterm OSC parser (chunk reassemb
 
 describe('PaneTerminal', () => {
   it('applies Zed light theme to the xterm instance', async () => {
-    const { PaneTerminal, ZED_LIGHT_THEME, TERMINAL_BG } = await import(
-      '../../src/components/pane-terminal.tsx'
-    );
+    const { PaneTerminal, ZED_LIGHT_THEME, TERMINAL_BG } = await importPane();
     const { container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const term = lastTerminal();
     expect(term.opts.theme).toBe(ZED_LIGHT_THEME);
     expect(ZED_LIGHT_THEME.background).toBe(TERMINAL_BG);
     expect(ZED_LIGHT_THEME.foreground).toBe('#474c55');
@@ -298,52 +281,21 @@ describe('PaneTerminal', () => {
   });
 
   it('forwards Ctrl+Q as terminal input', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-
+    const { term, ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true });
     const before = ws.sent.length;
     term.onDataCallback!(String.fromCharCode(17));
-    const sentAfterInput = ws.sent
-      .slice(before)
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string; data?: string });
+    const sentAfterInput = inputsSince(ws, before);
     expect(sentAfterInput).toContainEqual({ op: 'input', subscriberId: sid, data: String.fromCharCode(17) });
-    _resetPaneStreamClientForTest(null);
   });
 
   it('non-interactive mode does not register an onData handler', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const { term } = await renderPane({ mode: 'preview', interactive: false });
     expect(term.onDataCallback).toBeNull();
   });
 
   it('interactive mode registers an OSC 52 handler that writes decoded text to the clipboard', async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const writeText = stubClipboard();
+    const { term } = await renderPane({ mode: 'full', interactive: true });
     const handler = term.oscHandlers.get(52);
     expect(handler).toBeTypeOf('function');
     const handled = handler!(';' + btoa('copied text'));
@@ -353,160 +305,92 @@ describe('PaneTerminal', () => {
   });
 
   it('interactive OSC 52 handler ignores read requests (no clipboard read/exfiltration)', async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const writeText = stubClipboard();
+    const { term } = await renderPane({ mode: 'full', interactive: true });
     const handled = term.oscHandlers.get(52)!('c;?');
     expect(handled).toBe(true);
     expect(writeText).not.toHaveBeenCalled();
   });
 
   it('non-interactive mode does not register an OSC 52 handler', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const { term } = await renderPane({ mode: 'preview', interactive: false });
     expect(term.oscHandlers.get(52)).toBeUndefined();
   });
 
   it('interactive but deferred (preview until focus) does NOT register an OSC 52 handler yet', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive autoFocus={false} deferFullUntilFocus />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const { term } = await renderPane({ mode: 'full', interactive: true, autoFocus: false, deferFullUntilFocus: true });
     // streamMode stays 'preview' until the user activates the pane — background tmux copies must not
     // reach the clipboard before the user engages this terminal.
     expect(term.oscHandlers.get(52)).toBeUndefined();
   });
 
   it('preview mode never calls FitAddon.fit (preserves server-side pane geometry)', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+    await renderPane({ mode: 'preview', interactive: false });
     expect(FakeFitAddon.fitCount).toBe(0);
   });
 
   it('full+interactive mode does call FitAddon.fit', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
+    await renderPane({ mode: 'full', interactive: true });
     expect(FakeFitAddon.fitCount).toBeGreaterThan(0);
   });
 
   it('can keep an interactive embedded terminal from stealing focus on mount', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive autoFocus={false} />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    const { term } = await renderPane({ mode: 'full', interactive: true, autoFocus: false });
     expect(term.onDataCallback).not.toBeNull();
     expect(term.focusCount).toBe(0);
   });
 
   it('defers embedded full subscription until the terminal is focused', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    const { container } = render(
-      <PaneTerminal agentId="dev-1" mode="full" interactive autoFocus={false} deferFullUntilFocus />,
-    );
-    await new Promise((r) => setTimeout(r, 0));
-    const ws1 = lastMockWs()!;
-    const sent = (ws: MockWebSocket) => ws.sent.map((s) => JSON.parse(s) as { op?: string; mode?: string });
-    expect(sent(ws1).find((m) => m.op === 'subscribe')?.mode).toBe('preview');
+    const { container, ws1 } = await renderDeferredPane();
+    expect(sentMessages(ws1).find((m) => m.op === 'subscribe')?.mode).toBe('preview');
     expect(FakeFitAddon.fitCount).toBe(0);
 
     const xtermHost = container.querySelector('.overflow-hidden') as HTMLDivElement;
     await act(async () => {
       fireEvent.mouseDown(xtermHost);
-      await new Promise((r) => setTimeout(r, 0));
+      await flushMacrotask();
     });
     expect(fakeTerminals[0].focusCount).toBe(1);
     expect(fakeTerminals.length).toBeGreaterThan(1);
 
     const ws2 = lastMockWs()!;
     await act(async () => {
-      await new Promise((r) => setTimeout(r, 0));
+      await flushMacrotask();
     });
-    const subscribeModes = [
-      ...sent(ws1).filter((m) => m.op === 'subscribe').map((m) => m.mode),
-      ...(ws2 === ws1 ? [] : sent(ws2).filter((m) => m.op === 'subscribe').map((m) => m.mode)),
-    ];
-    expect(subscribeModes)
-      .toEqual(['preview', 'full']);
+    expect(subscribeModesAcross(ws1, ws2)).toEqual(['preview', 'full']);
     expect(FakeFitAddon.fitCount).toBeGreaterThan(0);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('forwards the first deferred keystroke after the full subscription is active', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive autoFocus={false} deferFullUntilFocus />);
-    await new Promise((r) => setTimeout(r, 0));
-    const ws1 = lastMockWs()!;
+    const { ws1 } = await renderDeferredPane();
     const term = fakeTerminals[0];
-    const sent = (ws: MockWebSocket) =>
-      ws.sent.map((s) => JSON.parse(s) as { op?: string; subscriberId?: string; mode?: string; data?: string });
 
     await act(async () => {
       term.onDataCallback!('a');
-      await new Promise((r) => setTimeout(r, 0));
+      await flushMacrotask();
     });
     expect(fakeTerminals.length).toBeGreaterThan(1);
 
-    const ws2 = lastMockWs()!;
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 0));
-    });
-    const fullSubscribe = sent(ws2).find((m) => m.op === 'subscribe' && m.mode === 'full');
-    expect(fullSubscribe?.subscriberId).toBeTruthy();
-    const fullSid = fullSubscribe!.subscriberId!;
-    const allBeforeSubscribed = [
-      ...sent(ws1),
-      ...(ws2 === ws1 ? [] : sent(ws2)),
-    ];
-    expect(allBeforeSubscribed.filter((m) => m.op === 'input')).toHaveLength(0);
+    const { ws2, fullSid } = await activateFullSubscription();
+    expect(messagesAcross(ws1, ws2).filter((m) => m.op === 'input')).toHaveLength(0);
 
-    ws2.deliver({ type: 'snapshot', subscriberId: fullSid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws2.deliver({ type: 'subscribed', subscriberId: fullSid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(sent(ws2).filter((m) => m.op === 'input'))
+    await deliverHandshake(ws2, fullSid);
+    expect(sentMessages(ws2).filter((m) => m.op === 'input'))
       .toContainEqual({ op: 'input', subscriberId: fullSid, data: 'a' });
-    _resetPaneStreamClientForTest(null);
   });
 
   it('debounces ResizeObserver fires: window-drag bursts collapse to a single trailing fit', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
-      const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-      render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-      const term = fakeTerminals[fakeTerminals.length - 1];
+      const { term } = await renderPane({ mode: 'full', interactive: true });
       expect(FakeFitAddon.fitCount).toBe(1);
       expect(MockResizeObserver.lastCallback).not.toBeNull();
       const scrollsAfterInitialFit = term.scrollToBottomCount;
       const cb = MockResizeObserver.lastCallback!;
-      cb([], {} as ResizeObserver);
-      vi.advanceTimersByTime(20);
-      cb([], {} as ResizeObserver);
-      vi.advanceTimersByTime(20);
-      cb([], {} as ResizeObserver);
-      vi.advanceTimersByTime(20);
-      cb([], {} as ResizeObserver);
-      vi.advanceTimersByTime(20);
-      cb([], {} as ResizeObserver);
+      for (let i = 0; i < 5; i++) {
+        cb([], {} as ResizeObserver);
+        vi.advanceTimersByTime(20);
+      }
       expect(FakeFitAddon.fitCount).toBe(1);
       vi.advanceTimersByTime(150);
       expect(FakeFitAddon.fitCount).toBe(2);
@@ -517,139 +401,38 @@ describe('PaneTerminal', () => {
   });
 
   it('snapshot path calls term.reset() before write so reconnects do not append', async () => {
-    const { getPaneStreamClient, _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    const client = getPaneStreamClient();
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    expect(subscribeMsg?.subscriberId).toBeTruthy();
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'AAA', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-    const resetsAfterFirst = term.resetCount;
-    expect(resetsAfterFirst).toBe(1);
+    const { term, ws, sid } = await mountWithHandshake({ mode: 'preview', interactive: false }, { data: 'AAA' });
+    expect(sid).toBeTruthy();
+    expect(term.resetCount).toBe(1);
     expect(term.writes).toEqual(['AAA']);
     ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'BBB', snapshotSeq: 2 });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await flushMicrotask();
     expect(term.resetCount).toBe(2);
     expect(term.writes).toEqual(['BBB']);
-    void client;
-    _resetPaneStreamClientForTest(null);
   });
 
   it('resizable snapshot fits the container instead of adopting server pane geometry, then pins to bottom (keeps the agent bottom bar in view)', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const sid = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe')!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 200, rows: 50, data: 'AAA', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 200, rows: 50, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-
+    const { term } = await mountWithHandshake({ mode: 'full', interactive: true }, { cols: 200, rows: 50, data: 'AAA' });
     // The taller server geometry (200x50) is NOT adopted — the fitted container size is kept.
     expect(term.cols).toBe(80);
     expect(term.rows).toBe(24);
     expect(term.writes).toEqual(['AAA']);
     expect(term.scrollToBottomCount).toBeGreaterThan(0);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('preview snapshot adopts server pane geometry and never force-scrolls xterm to bottom', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const sid = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe')!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 200, rows: 50, data: 'AAA', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 200, rows: 50, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-
+    const { term } = await mountWithHandshake({ mode: 'preview', interactive: false }, { cols: 200, rows: 50, data: 'AAA' });
     expect(term.cols).toBe(200);
     expect(term.rows).toBe(50);
     expect(term.scrollToBottomCount).toBe(0);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('batches live data into one xterm write per animation frame and keeps the resizable pane pinned to bottom', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'base', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true }, { data: 'base' });
     expect(term.writes).toEqual(['base']);
     const scrollsAfterSnapshot = term.scrollToBottomCount;
 
-    const rafCallbacks: FrameRequestCallback[] = [];
-    (globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame =
-      (cb) => {
-        rafCallbacks.push(cb);
-        return rafCallbacks.length;
-      };
+    const rafCallbacks = captureRaf();
     ws.deliver({ type: 'data', agentId: 'dev-1', data: 'A', seq: 2 });
     ws.deliver({ type: 'data', agentId: 'dev-1', data: 'B', seq: 3 });
     expect(rafCallbacks).toHaveLength(1);
@@ -660,40 +443,11 @@ describe('PaneTerminal', () => {
     });
     expect(term.writes).toEqual(['base', 'AB']);
     expect(term.scrollToBottomCount).toBeGreaterThan(scrollsAfterSnapshot);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('flushes live data via timeout when animation frames are throttled', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'base', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-
-    const rafCallbacks: FrameRequestCallback[] = [];
-    (globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame =
-      (cb) => {
-        rafCallbacks.push(cb);
-        return rafCallbacks.length;
-      };
+    const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true }, { data: 'base' });
+    const rafCallbacks = captureRaf();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
       ws.deliver({ type: 'data', agentId: 'dev-1', data: 'A', seq: 2 });
@@ -714,89 +468,36 @@ describe('PaneTerminal', () => {
       expect(term.writes).toEqual(['base', 'AB']);
     } finally {
       vi.useRealTimers();
-      _resetPaneStreamClientForTest(null);
     }
   });
 
   it('flushes immediately when the live queue reaches its memory cap', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'base', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-
+    const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true }, { data: 'base' });
     const rafSpy = vi.fn<(cb: FrameRequestCallback) => number>(() => 1);
     (globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame =
       rafSpy;
     const largeChunk = 'x'.repeat(256 * 1024);
     ws.deliver({ type: 'data', agentId: 'dev-1', data: largeChunk, seq: 2 });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await flushMicrotask();
 
     expect(rafSpy).not.toHaveBeenCalled();
     expect(term.writes).toHaveLength(2);
     expect(term.writes[1]).toHaveLength(largeChunk.length);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('queues snapshot reset behind an in-flight live write so stale live output is cleared', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'base', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    const { term, ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true }, { data: 'base' });
     expect(term.writes).toEqual(['base']);
     expect(term.resetCount).toBe(1);
 
     term.deferWrites = true;
     ws.deliver({ type: 'data', agentId: 'dev-1', data: 'old-live', seq: 2 });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await flushMicrotask();
     expect(term.writes).toEqual(['base', 'old-live']);
     expect(term.pendingWriteCallbacks).toHaveLength(1);
 
     ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'fresh', snapshotSeq: 3 });
-    await act(async () => {
-      await Promise.resolve();
-    });
+    await flushMicrotask();
     expect(term.resetCount).toBe(1);
     expect(term.writes).toEqual(['base', 'old-live']);
 
@@ -808,32 +509,19 @@ describe('PaneTerminal', () => {
     expect(term.resetCount).toBe(2);
     expect(term.writes).toEqual(['fresh']);
     term.flushNextWrite();
-    _resetPaneStreamClientForTest(null);
   });
 
   it('focuses on mouse down', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    const { container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
+    await installPaneStreamForTest();
+    const { container, term } = await renderPane({ mode: 'full', interactive: true });
     const xtermHost = container.querySelector('.overflow-hidden') as HTMLDivElement;
     expect(term.focusCount).toBe(1);
     fireEvent.mouseDown(xtermHost);
     expect(term.focusCount).toBe(2);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('scroll container is padding-free (vertical padding lives on the outer wrapper so scrollTop stays a pure row offset)', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    const { container } = render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} maxLines={6} />);
+    const { container } = await renderPane({ mode: 'preview', interactive: false, maxLines: 6 });
     const scrollEl = container.querySelector('.overflow-hidden') as HTMLDivElement;
     expect(scrollEl).toBeTruthy();
     expect(scrollEl.className).not.toMatch(/(^|\s)p[ytb]?-/);
@@ -844,111 +532,28 @@ describe('PaneTerminal', () => {
   });
 
   it('preview clipping scrolls container so cursor row anchors to the bottom (not the top)', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-
-    const scrollState = { value: 0 };
-    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
-      configurable: true,
-      get() { return scrollState.value; },
-      set(v: number) { scrollState.value = v; },
+    // Agent has filled the 50-row server pane; cursor sits near the bottom at row 42 (0-indexed).
+    const { scrollState } = await mountWithScrollAnchor({
+      scroll: { scrollHeight: 900, clientHeight: 108 },
+      props: { mode: 'preview', interactive: false, maxLines: 6 },
+      cursorY: 42,
+      handshake: { cols: 200, rows: 50, data: 'AAA' },
     });
-    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
-      configurable: true,
-      get: () => 900,
-    });
-    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
-      configurable: true,
-      get: () => 108,
-    });
-
-    try {
-      const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} maxLines={6} />);
-      const term = fakeTerminals[fakeTerminals.length - 1];
-      // Agent has filled the 50-row server pane; cursor sits near the bottom at row 42 (0-indexed).
-      term.buffer.active.cursorY = 42;
-      await new Promise((r) => setTimeout(r, 0));
-      const ws = lastMockWs()!;
-      const subscribeMsg = ws.sent
-        .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-        .find((m) => m.op === 'subscribe');
-      const sid = subscribeMsg!.subscriberId!;
-      ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 200, rows: 50, data: 'AAA', snapshotSeq: 1 });
-      ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 200, rows: 50, snapshotSeq: 1 });
-      await act(async () => {
-        await Promise.resolve();
-      });
-
-      // (cursorY+1) * LINE_HEIGHT(18) - clientHeight(108) = 43*18 - 108 = 666
-      expect(scrollState.value).toBe(666);
-    } finally {
-      // @ts-expect-error deliberately remove the shim so other tests get jsdom defaults again
-      delete HTMLElement.prototype.scrollTop;
-      // @ts-expect-error remove scrollHeight shim
-      delete HTMLElement.prototype.scrollHeight;
-      // @ts-expect-error remove clientHeight shim — beforeEach re-installs the default 480 for the next case
-      delete HTMLElement.prototype.clientHeight;
-      _resetPaneStreamClientForTest(null);
-    }
+    // (cursorY+1) * LINE_HEIGHT(18) - clientHeight(108) = 43*18 - 108 = 666
+    expect(scrollState.value).toBe(666);
   });
 
   it('embedded preview (no maxLines) still anchors the cursor row to the bottom so the card shows the latest, not the top', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-
-    const scrollState = { value: 0 };
-    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
-      configurable: true,
-      get() { return scrollState.value; },
-      set(v: number) { scrollState.value = v; },
+    // Embedded card preview: full server geometry, no maxLines clip — the h-80 box overflow-hides it.
+    // Agent filled the 50-row server pane; cursor sits near the bottom at row 42 (0-indexed).
+    const { scrollState } = await mountWithScrollAnchor({
+      scroll: { clientHeight: 300 },
+      props: { mode: 'preview', interactive: false },
+      cursorY: 42,
+      handshake: { cols: 200, rows: 50, data: 'AAA' },
     });
-    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
-      configurable: true,
-      get: () => 300,
-    });
-
-    try {
-      const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-      // Embedded card preview: full server geometry, no maxLines clip — the h-80 box overflow-hides it.
-      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
-      const term = fakeTerminals[fakeTerminals.length - 1];
-      // Agent filled the 50-row server pane; cursor sits near the bottom at row 42 (0-indexed).
-      term.buffer.active.cursorY = 42;
-      await new Promise((r) => setTimeout(r, 0));
-      const ws = lastMockWs()!;
-      const sid = ws.sent
-        .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-        .find((m) => m.op === 'subscribe')!.subscriberId!;
-      ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 200, rows: 50, data: 'AAA', snapshotSeq: 1 });
-      ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 200, rows: 50, snapshotSeq: 1 });
-      await act(async () => {
-        await Promise.resolve();
-      });
-
-      // (cursorY+1) * LINE_HEIGHT(18) - clientHeight(300) = 43*18 - 300 = 474 → anchored to bottom, not 0 (top).
-      expect(scrollState.value).toBe(474);
-    } finally {
-      // @ts-expect-error remove scrollTop shim
-      delete HTMLElement.prototype.scrollTop;
-      // @ts-expect-error remove clientHeight shim — beforeEach re-installs the default 480 for the next case
-      delete HTMLElement.prototype.clientHeight;
-      _resetPaneStreamClientForTest(null);
-    }
+    // (cursorY+1) * LINE_HEIGHT(18) - clientHeight(300) = 43*18 - 300 = 474 → anchored to bottom, not 0 (top).
+    expect(scrollState.value).toBe(474);
   });
 
   it('preview re-anchors when its card becomes measurable after the first snapshot', async () => {
@@ -1069,125 +674,48 @@ describe('PaneTerminal', () => {
   });
 
   it('non-preview (no maxLines) leaves container scrollTop alone — no clipping to compensate for', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-
-    const scrollState = { value: 0, writes: 0 };
-    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
-      configurable: true,
-      get() { return scrollState.value; },
-      set(v: number) { scrollState.value = v; scrollState.writes++; },
+    const { scrollState } = await mountWithScrollAnchor({
+      props: { mode: 'full', interactive: false },
+      cursorY: 23,
+      handshake: { data: 'AAA' },
     });
-
-    try {
-      const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-      render(<PaneTerminal agentId="dev-1" mode="full" interactive={false} />);
-      const term = fakeTerminals[fakeTerminals.length - 1];
-      term.buffer.active.cursorY = 23;
-      await new Promise((r) => setTimeout(r, 0));
-      const ws = lastMockWs()!;
-      const subscribeMsg = ws.sent
-        .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-        .find((m) => m.op === 'subscribe');
-      const sid = subscribeMsg!.subscriberId!;
-      ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: 'AAA', snapshotSeq: 1 });
-      ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-      await act(async () => {
-        await Promise.resolve();
-      });
-
-      expect(scrollState.writes).toBe(0);
-      expect(MockResizeObserver.lastCallback).toBeNull();
-    } finally {
-      // @ts-expect-error restore default
-      delete HTMLElement.prototype.scrollTop;
-      _resetPaneStreamClientForTest(null);
-    }
+    expect(scrollState.writes).toBe(0);
+    expect(MockResizeObserver.lastCallback).toBeNull();
   });
 
   it('arrowKeys prop defaults off — no virtual key pad rendered', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
+    await renderPane({ mode: 'full', interactive: true });
     expect(screen.queryByRole('group', { name: /终端方向键/ })).toBeNull();
   });
 
   it('arrowKeys prop renders the key pad and clicking an arrow forwards its CSI sequence as terminal input', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive arrowKeys />);
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-
+    const { ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before = ws.sent.length;
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /方向键 上/ }));
     });
-    const sentAfterInput = ws.sent
-      .slice(before)
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string; data?: string });
-    expect(sentAfterInput).toContainEqual({ op: 'input', subscriberId: sid, data: '\x1b[A' });
-    _resetPaneStreamClientForTest(null);
+    expect(inputsSince(ws, before)).toContainEqual({ op: 'input', subscriberId: sid, data: '\x1b[A' });
   });
 
   it('arrowKeyToSequence picks CSI in normal mode and SS3 when xterm reports application cursor mode (DECCKM)', async () => {
-    const { arrowKeyToSequence } = await import('../../src/components/pane-terminal.tsx');
-    expect(arrowKeyToSequence('up', false)).toBe('\x1b[A');
-    expect(arrowKeyToSequence('down', false)).toBe('\x1b[B');
-    expect(arrowKeyToSequence('right', false)).toBe('\x1b[C');
-    expect(arrowKeyToSequence('left', false)).toBe('\x1b[D');
-    expect(arrowKeyToSequence('up', true)).toBe('\x1bOA');
-    expect(arrowKeyToSequence('down', true)).toBe('\x1bOB');
-    expect(arrowKeyToSequence('right', true)).toBe('\x1bOC');
-    expect(arrowKeyToSequence('left', true)).toBe('\x1bOD');
+    const { arrowKeyToSequence } = await importPane();
+    const cases: Array<['up' | 'down' | 'left' | 'right', boolean, string]> = [
+      ['up', false, '\x1b[A'],
+      ['down', false, '\x1b[B'],
+      ['right', false, '\x1b[C'],
+      ['left', false, '\x1b[D'],
+      ['up', true, '\x1bOA'],
+      ['down', true, '\x1bOB'],
+      ['right', true, '\x1bOC'],
+      ['left', true, '\x1bOD'],
+    ];
+    for (const [key, appCursor, expected] of cases) {
+      expect(arrowKeyToSequence(key, appCursor)).toBe(expected);
+    }
   });
 
   it('keypad reads live applicationCursorKeysMode at click time — flipping the mode switches CSI ↔ SS3 without re-render', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive arrowKeys />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => { await Promise.resolve(); });
-
+    const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before1 = ws.sent.length;
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /方向键 上/ }));
@@ -1200,195 +728,76 @@ describe('PaneTerminal', () => {
       fireEvent.click(screen.getByRole('button', { name: /方向键 上/ }));
     });
     expect(ws.sent.slice(before2).map((s) => JSON.parse(s).data)).toContain('\x1bOA');
-    _resetPaneStreamClientForTest(null);
   });
 
   it('rapid keypad taps in defer mode all queue or land on the post-activation full subscriber (no input lost to preview sid)', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(
-      <PaneTerminal
-        agentId="dev-1"
-        mode="full"
-        interactive
-        arrowKeys
-        autoFocus={false}
-        deferFullUntilFocus
-      />,
-    );
-    await new Promise((r) => setTimeout(r, 0));
-    const ws1 = lastMockWs()!;
-    const sent = (ws: MockWebSocket) =>
-      ws.sent.map((s) => JSON.parse(s) as { op?: string; subscriberId?: string; mode?: string; data?: string });
-    const previewSid = sent(ws1).find((m) => m.op === 'subscribe' && m.mode === 'preview')!.subscriberId!;
+    const { ws1 } = await renderDeferredPane({ arrowKeys: true });
+    const previewSid = sentMessages(ws1).find((m) => m.op === 'subscribe' && m.mode === 'preview')!.subscriberId!;
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /方向键 上/ }));
       fireEvent.click(screen.getByRole('button', { name: /方向键 下/ }));
       fireEvent.click(screen.getByRole('button', { name: /方向键 右/ }));
-      await new Promise((r) => setTimeout(r, 0));
+      await flushMacrotask();
     });
-    const ws2 = lastMockWs()!;
-    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
-    const fullSubscribe = sent(ws2).find((m) => m.op === 'subscribe' && m.mode === 'full');
-    const fullSid = fullSubscribe!.subscriberId!;
-    ws2.deliver({ type: 'snapshot', subscriberId: fullSid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws2.deliver({ type: 'subscribed', subscriberId: fullSid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => { await Promise.resolve(); });
+    const { ws2, fullSid } = await activateFullSubscription();
+    await deliverHandshake(ws2, fullSid);
 
-    const allInputs = [
-      ...sent(ws1).filter((m) => m.op === 'input'),
-      ...(ws2 === ws1 ? [] : sent(ws2).filter((m) => m.op === 'input')),
-    ];
+    const allInputs = messagesAcross(ws1, ws2).filter((m) => m.op === 'input');
     expect(allInputs.every((m) => m.subscriberId !== previewSid)).toBe(true);
     expect(allInputs.map((m) => m.data).join('')).toBe('\x1b[A\x1b[B\x1b[C');
-    _resetPaneStreamClientForTest(null);
   });
 
   it('keypad input flows through the same input pipeline as keyboard (shares stripTerminalAutoReplies + defer logic)', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive arrowKeys />);
-    const term = fakeTerminals[fakeTerminals.length - 1];
-    await new Promise((r) => setTimeout(r, 0));
-    const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
-    ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => { await Promise.resolve(); });
-
+    const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before = ws.sent.length;
     await act(async () => {
       term.onDataCallback!('\x1b[24;80Rhello');
       fireEvent.click(screen.getByRole('button', { name: /方向键 上/ }));
     });
-    const inputs = ws.sent
-      .slice(before)
-      .map((s) => JSON.parse(s) as { op?: string; data?: string })
+    const inputs = inputsSince(ws, before)
       .filter((m) => m.op === 'input')
       .map((m) => m.data);
     expect(inputs).toEqual(['hello', '\x1b[A']);
-    _resetPaneStreamClientForTest(null);
   });
 
   it('arrowKeys + deferFullUntilFocus: first arrow click activates the full stream and forwards the keystroke', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(
-      <PaneTerminal
-        agentId="dev-1"
-        mode="full"
-        interactive
-        arrowKeys
-        autoFocus={false}
-        deferFullUntilFocus
-      />,
-    );
-    await new Promise((r) => setTimeout(r, 0));
-    const ws1 = lastMockWs()!;
-    const sent = (ws: MockWebSocket) =>
-      ws.sent.map((s) => JSON.parse(s) as { op?: string; subscriberId?: string; mode?: string; data?: string });
-    expect(sent(ws1).find((m) => m.op === 'subscribe')?.mode).toBe('preview');
+    const { ws1 } = await renderDeferredPane({ arrowKeys: true });
+    expect(sentMessages(ws1).find((m) => m.op === 'subscribe')?.mode).toBe('preview');
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /方向键 下/ }));
-      await new Promise((r) => setTimeout(r, 0));
+      await flushMacrotask();
     });
     expect(fakeTerminals.length).toBeGreaterThan(1);
 
-    const ws2 = lastMockWs()!;
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 0));
-    });
-    const fullSubscribe = sent(ws2).find((m) => m.op === 'subscribe' && m.mode === 'full');
-    expect(fullSubscribe?.subscriberId).toBeTruthy();
-    const fullSid = fullSubscribe!.subscriberId!;
-    ws2.deliver({ type: 'snapshot', subscriberId: fullSid, cols: 80, rows: 24, data: '', snapshotSeq: 1 });
-    ws2.deliver({ type: 'subscribed', subscriberId: fullSid, agentId: 'dev-1', cols: 80, rows: 24, snapshotSeq: 1 });
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(sent(ws2).filter((m) => m.op === 'input'))
+    const { ws2, fullSid } = await activateFullSubscription();
+    await deliverHandshake(ws2, fullSid);
+    expect(sentMessages(ws2).filter((m) => m.op === 'input'))
       .toContainEqual({ op: 'input', subscriberId: fullSid, data: '\x1b[B' });
-    _resetPaneStreamClientForTest(null);
   });
 
   it('non-interactive: wheel events are stopped in capture phase so the page (not xterm) handles scroll', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    const { container } = render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+    const { container } = await renderPane({ mode: 'preview', interactive: false });
     const xtermHost = container.querySelector('.overflow-hidden') as HTMLDivElement;
     expect(xtermHost).toBeTruthy();
-    const child = document.createElement('div');
-    xtermHost.appendChild(child);
-
-    const bubbleListener = vi.fn();
-    xtermHost.addEventListener('wheel', bubbleListener);
-
-    fireEvent.wheel(child, { deltaY: 100 });
-
+    const bubbleListener = fireWheelFromChild(xtermHost);
     expect(bubbleListener).not.toHaveBeenCalled();
   });
 
   it('interactive: wheel events propagate normally so xterm can drive its own scrollback', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    const { container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
+    const { container } = await renderPane({ mode: 'full', interactive: true });
     const xtermHost = container.querySelector('.overflow-hidden') as HTMLDivElement;
-    const child = document.createElement('div');
-    xtermHost.appendChild(child);
-
-    const bubbleListener = vi.fn();
-    xtermHost.addEventListener('wheel', bubbleListener);
-
-    fireEvent.wheel(child, { deltaY: 100 });
-
+    const bubbleListener = fireWheelFromChild(xtermHost);
     expect(bubbleListener).toHaveBeenCalledTimes(1);
   });
 
   it('changing agentId clears stale error/session-gone banner', async () => {
-    const { _resetPaneStreamClientForTest, PaneStreamClient } =
-      await import('../../src/stores/pane-stream-store.ts');
-    _resetPaneStreamClientForTest(
-      new PaneStreamClient({
-        wsUrl: 'ws://test.local/api/stream',
-        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
-        tokenProvider: () => null,
-      }),
-    );
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
+    await installPaneStreamForTest();
+    const { PaneTerminal } = await importPane();
     const { rerender, container } = render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    await new Promise((r) => setTimeout(r, 0));
+    await flushMacrotask();
     const ws = lastMockWs()!;
-    const subscribeMsg = ws.sent
-      .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string; agentId?: string })
-      .find((m) => m.op === 'subscribe');
-    const sid = subscribeMsg!.subscriberId!;
     await act(async () => {
       ws.deliver({ type: 'session_gone', agentId: 'dev-1' });
     });
@@ -1397,26 +806,22 @@ describe('PaneTerminal', () => {
       rerender(<PaneTerminal agentId="dev-2" mode="full" interactive />);
     });
     expect(container.textContent).not.toContain('session ended');
-    void sid;
-    _resetPaneStreamClientForTest(null);
   });
 });
 
 describe('PaneTerminal image upload bar', () => {
   it('shows the upload button on the full terminal page (interactive + arrow keys)', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
     const { _resetPaneStreamClientForTest } = await import('../../src/stores/pane-stream-store.ts');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive arrowKeys />);
-    await new Promise((r) => setTimeout(r, 0));
+    await renderPane({ mode: 'full', interactive: true, arrowKeys: true });
+    await flushMacrotask();
     expect(screen.getByRole('button', { name: /上传图片/ })).toBeTruthy();
     _resetPaneStreamClientForTest(null);
   });
 
   it('does not show the upload button in non-interactive preview mode', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
     const { _resetPaneStreamClientForTest } = await import('../../src/stores/pane-stream-store.ts');
-    render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
-    await new Promise((r) => setTimeout(r, 0));
+    await renderPane({ mode: 'preview', interactive: false });
+    await flushMacrotask();
     expect(screen.queryByRole('button', { name: /上传图片/ })).toBeNull();
     _resetPaneStreamClientForTest(null);
   });
@@ -1424,9 +829,8 @@ describe('PaneTerminal image upload bar', () => {
 
 describe('PaneTerminal control bar layout', () => {
   it('centers the key pad relative to the whole bar via symmetric gutters, not the space beside the upload button', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive arrowKeys />);
-    await new Promise((r) => setTimeout(r, 0));
+    await renderPane({ mode: 'full', interactive: true, arrowKeys: true });
+    await flushMacrotask();
 
     const keypad = screen.getByRole('group', { name: /终端方向键/ });
     const bar = keypad.parentElement!;
@@ -1444,9 +848,8 @@ describe('PaneTerminal control bar layout', () => {
   });
 
   it('hides the whole bar (upload + key pad) when arrow keys are disabled', async () => {
-    const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
-    render(<PaneTerminal agentId="dev-1" mode="full" interactive />);
-    await new Promise((r) => setTimeout(r, 0));
+    await renderPane({ mode: 'full', interactive: true });
+    await flushMacrotask();
     expect(screen.queryByRole('button', { name: /上传图片/ })).toBeNull();
     expect(screen.queryByRole('group', { name: /终端方向键/ })).toBeNull();
   });
@@ -1454,4 +857,226 @@ describe('PaneTerminal control bar layout', () => {
 
 function lastMockWs(): MockWebSocket | undefined {
   return MockWebSocket.lastInstance;
+}
+
+function lastTerminal(): FakeTerminal {
+  return fakeTerminals[fakeTerminals.length - 1];
+}
+
+function flushMacrotask(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 0));
+}
+
+function flushMicrotask(): Promise<void> {
+  return act(async () => {
+    await Promise.resolve();
+  });
+}
+
+type StreamMessage = {
+  op?: string;
+  subscriberId?: string;
+  mode?: string;
+  data?: string;
+  agentId?: string;
+};
+
+function sentMessages(ws: MockWebSocket): StreamMessage[] {
+  return ws.sent.map((s) => JSON.parse(s) as StreamMessage);
+}
+
+function subscriberIdOf(ws: MockWebSocket): string {
+  return sentMessages(ws).find((m) => m.op === 'subscribe')!.subscriberId!;
+}
+
+function inputsSince(ws: MockWebSocket, before: number): StreamMessage[] {
+  return ws.sent.slice(before).map((s) => JSON.parse(s) as StreamMessage);
+}
+
+// Flatten messages across the deferred-subscription handoff: the pane swaps WebSockets when it
+// upgrades preview→full, so ws1 and ws2 may differ (or be the same instance).
+function messagesAcross(ws1: MockWebSocket, ws2: MockWebSocket): StreamMessage[] {
+  return [...sentMessages(ws1), ...(ws2 === ws1 ? [] : sentMessages(ws2))];
+}
+
+function subscribeModesAcross(ws1: MockWebSocket, ws2: MockWebSocket): Array<string | undefined> {
+  return messagesAcross(ws1, ws2)
+    .filter((m) => m.op === 'subscribe')
+    .map((m) => m.mode);
+}
+
+// Append a child to the xterm host, attach a bubble-phase wheel listener on the host, then dispatch
+// a wheel from the child. Returns the listener so the caller asserts whether the event reached it.
+function fireWheelFromChild(xtermHost: HTMLElement): ReturnType<typeof vi.fn> {
+  const child = document.createElement('div');
+  xtermHost.appendChild(child);
+  const bubbleListener = vi.fn();
+  xtermHost.addEventListener('wheel', bubbleListener);
+  fireEvent.wheel(child, { deltaY: 100 });
+  return bubbleListener;
+}
+
+function captureRaf(): FrameRequestCallback[] {
+  const rafCallbacks: FrameRequestCallback[] = [];
+  (globalThis as unknown as { requestAnimationFrame: (cb: FrameRequestCallback) => number }).requestAnimationFrame =
+    (cb) => {
+      rafCallbacks.push(cb);
+      return rafCallbacks.length;
+    };
+  return rafCallbacks;
+}
+
+interface ScrollStub {
+  value: number;
+  writes: number;
+  restore: () => void;
+}
+
+function stubScroll(overrides: { scrollHeight?: number; clientHeight?: number } = {}): ScrollStub {
+  const state: ScrollStub = { value: 0, writes: 0, restore: () => undefined };
+  Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+    configurable: true,
+    get() { return state.value; },
+    set(v: number) { state.value = v; state.writes++; },
+  });
+  if (overrides.scrollHeight !== undefined) {
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => overrides.scrollHeight!,
+    });
+  }
+  if (overrides.clientHeight !== undefined) {
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => overrides.clientHeight!,
+    });
+  }
+  state.restore = () => {
+    // beforeEach re-installs default clientHeight (480) for the next case.
+    delete (HTMLElement.prototype as { scrollTop?: unknown }).scrollTop;
+    if (overrides.scrollHeight !== undefined) {
+      delete (HTMLElement.prototype as { scrollHeight?: unknown }).scrollHeight;
+    }
+    if (overrides.clientHeight !== undefined) {
+      delete (HTMLElement.prototype as { clientHeight?: unknown }).clientHeight;
+    }
+  };
+  return state;
+}
+
+async function deliverHandshake(
+  ws: MockWebSocket,
+  sid: string,
+  opts: { cols?: number; rows?: number; data?: string; snapshotSeq?: number } = {},
+): Promise<void> {
+  const { cols = 80, rows = 24, data = '', snapshotSeq = 1 } = opts;
+  ws.deliver({ type: 'snapshot', subscriberId: sid, cols, rows, data, snapshotSeq });
+  ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols, rows, snapshotSeq });
+  await act(async () => {
+    await Promise.resolve();
+  });
+}
+
+interface MountOptions {
+  mode: 'full' | 'preview';
+  interactive: boolean;
+  arrowKeys?: boolean;
+}
+
+interface MountedPane {
+  term: FakeTerminal;
+  ws: MockWebSocket;
+  sid: string;
+}
+
+// Point the singleton pane-stream client at a MockWebSocket, then reset it to null after the test
+// (onTestFinished runs even if assertions throw, so the client never leaks into the next case).
+async function installPaneStreamForTest(): Promise<void> {
+  const { _resetPaneStreamClientForTest, PaneStreamClient } =
+    await import('../../src/stores/pane-stream-store.ts');
+  _resetPaneStreamClientForTest(
+    new PaneStreamClient({
+      wsUrl: 'ws://test.local/api/stream',
+      wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
+      tokenProvider: () => null,
+    }),
+  );
+  onTestFinished(() => _resetPaneStreamClientForTest(null));
+}
+
+// Render a pane, install the mock stream, wait for the WebSocket to open, and deliver the initial
+// snapshot+subscribed handshake — the standard preamble for the live-stream behavior tests.
+async function mountWithHandshake(
+  props: MountOptions,
+  handshake: { cols?: number; rows?: number; data?: string } = {},
+): Promise<MountedPane> {
+  await installPaneStreamForTest();
+  const { PaneTerminal } = await importPane();
+  render(
+    <PaneTerminal
+      agentId="dev-1"
+      mode={props.mode}
+      interactive={props.interactive}
+      arrowKeys={props.arrowKeys}
+    />,
+  );
+  const term = lastTerminal();
+  await flushMacrotask();
+  const ws = lastMockWs()!;
+  const sid = subscriberIdOf(ws);
+  await deliverHandshake(ws, sid, handshake);
+  return { term, ws, sid };
+}
+
+// Stub container scrollTop/scrollHeight/clientHeight, render a pane, place the cursor row, then
+// deliver the handshake — exercises the cursor-anchor scroll math. Stub + stream are torn down
+// after the test via onTestFinished so assertion failures still restore jsdom defaults.
+async function mountWithScrollAnchor(spec: {
+  scroll?: { scrollHeight?: number; clientHeight?: number };
+  props: PaneProps;
+  cursorY: number;
+  handshake?: { cols?: number; rows?: number; data?: string };
+}): Promise<{ scrollState: ScrollStub }> {
+  const scrollState = stubScroll(spec.scroll ?? {});
+  onTestFinished(() => scrollState.restore());
+  await installPaneStreamForTest();
+  const { term } = await renderPane(spec.props);
+  term.buffer.active.cursorY = spec.cursorY;
+  await flushMacrotask();
+  const ws = lastMockWs()!;
+  await deliverHandshake(ws, subscriberIdOf(ws), spec.handshake);
+  return { scrollState };
+}
+
+// Render a deferred pane (preview-until-focus) and wait for its initial preview WebSocket to open.
+// The full subscription only activates later via focus/keystroke (see activateFullSubscription).
+async function renderDeferredPane(
+  opts: { arrowKeys?: boolean } = {},
+): Promise<{ container: HTMLElement; ws1: MockWebSocket }> {
+  await installPaneStreamForTest();
+  const { PaneTerminal } = await importPane();
+  const { container } = render(
+    <PaneTerminal
+      agentId="dev-1"
+      mode="full"
+      interactive
+      arrowKeys={opts.arrowKeys}
+      autoFocus={false}
+      deferFullUntilFocus
+    />,
+  );
+  await flushMacrotask();
+  return { container, ws1: lastMockWs()! };
+}
+
+// After a deferred pane is activated, settle the WebSocket handoff and return the full-mode
+// subscriber: the pane swaps to a fresh socket (ws2) carrying the 'full' subscribe.
+async function activateFullSubscription(): Promise<{ ws2: MockWebSocket; fullSid: string }> {
+  const ws2 = lastMockWs()!;
+  await act(async () => {
+    await flushMacrotask();
+  });
+  const fullSubscribe = sentMessages(ws2).find((m) => m.op === 'subscribe' && m.mode === 'full');
+  expect(fullSubscribe?.subscriberId).toBeTruthy();
+  return { ws2, fullSid: fullSubscribe!.subscriberId! };
 }

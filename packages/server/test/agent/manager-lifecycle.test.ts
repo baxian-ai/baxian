@@ -61,6 +61,14 @@ async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise
   return task;
 }
 
+function seedPending(id: string, preferredAgentId: string): Promise<TaskState> {
+  return seedTask({ id, status: 'pending', agentId: '', preferredAgentId });
+}
+
+function stubStartSession(result: boolean): void {
+  vi.spyOn(manager, 'startSession').mockResolvedValue(result);
+}
+
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-lifecycle-test-'));
   await initStateDir(tempDir);
@@ -116,14 +124,9 @@ afterEach(async () => {
 
 describe('dispatchPendingTask', () => {
   it('promotes a pending task whose preferredAgentId matches and dev is idle', async () => {
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    stubStartSession(true);
 
-    const task = await seedTask({
-      id: 'task-001',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: 'dev-1',
-    });
+    const task = await seedPending('task-001', 'dev-1');
 
     const result = await manager.dispatchPendingTask(task.id, 'dev-1');
 
@@ -134,14 +137,9 @@ describe('dispatchPendingTask', () => {
   });
 
   it('claims an unassigned task atomically: preferredAgentId/qaAgentId/agentId/status all in one set', async () => {
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    stubStartSession(true);
 
-    const task = await seedTask({
-      id: 'task-002',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: '',
-    });
+    const task = await seedPending('task-002', '');
 
     const result = await manager.dispatchPendingTask(task.id, 'dev-1');
 
@@ -154,13 +152,8 @@ describe('dispatchPendingTask', () => {
   });
 
   it('omitting requestedAgentId falls back to task.preferredAgentId inside lock (no stale snapshot race)', async () => {
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const task = await seedTask({
-      id: 'task-fallback',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: 'dev-1',
-    });
+    stubStartSession(true);
+    const task = await seedPending('task-fallback', 'dev-1');
 
     const result = await manager.dispatchPendingTask(task.id);
 
@@ -169,13 +162,8 @@ describe('dispatchPendingTask', () => {
   });
 
   it('returns 409 when startSession refuses (returns false without throwing) — task state changed during dispatch', async () => {
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
-    const task = await seedTask({
-      id: 'task-state-changed',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: 'dev-1',
-    });
+    stubStartSession(false);
+    const task = await seedPending('task-state-changed', 'dev-1');
 
     const result = await manager.dispatchPendingTask(task.id, 'dev-1');
 
@@ -184,19 +172,14 @@ describe('dispatchPendingTask', () => {
   });
 
   it('returns 400 when both requestedAgentId and task.preferredAgentId are empty (unassigned + no body)', async () => {
-    const task = await seedTask({
-      id: 'task-no-agent',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: '',
-    });
+    const task = await seedPending('task-no-agent', '');
     const result = await manager.dispatchPendingTask(task.id);
     expect(result.errorCode).toBe(400);
     expect(result.error).toMatch(/agentId is required/);
   });
 
   it('falls back to current QA partner when fresh.qaAgentId is missing (task created before QA was paired)', async () => {
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    stubStartSession(true);
 
     const task = await seedTask({
       id: 'task-002b',
@@ -220,12 +203,7 @@ describe('dispatchPendingTask', () => {
       taskId: 'task-other',
       updatedAt: new Date().toISOString(),
     });
-    const task = await seedTask({
-      id: 'task-003',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: 'dev-1',
-    });
+    const task = await seedPending('task-003', 'dev-1');
 
     const result = await manager.dispatchPendingTask(task.id, 'dev-1');
 
@@ -254,23 +232,13 @@ describe('dispatchPendingTask', () => {
   });
 
   it('returns 400 when agentId mismatches existing preferredAgentId', async () => {
-    const task = await seedTask({
-      id: 'task-006',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: 'dev-1',
-    });
+    const task = await seedPending('task-006', 'dev-1');
     const result = await manager.dispatchPendingTask(task.id, 'ghost-dev');
     expect(result.errorCode).toBe(400);
   });
 
   it('returns 400 when agentId is unknown to config', async () => {
-    const task = await seedTask({
-      id: 'task-007',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: '',
-    });
+    const task = await seedPending('task-007', '');
     const result = await manager.dispatchPendingTask(task.id, 'ghost-dev');
     expect(result.errorCode).toBe(400);
   });
@@ -282,12 +250,7 @@ describe('dispatchPendingTask', () => {
       taskId: 'task-bound',
       updatedAt: new Date().toISOString(),
     });
-    const task = await seedTask({
-      id: 'task-008',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: '',
-    });
+    const task = await seedPending('task-008', '');
     const setSpy = vi.spyOn(taskStore, 'set');
     setSpy.mockClear();
 

@@ -43,6 +43,18 @@ const VALID_CONFIG = {
   ],
 };
 
+const PROJECT = {
+  id: 'pp', repo: 'u/r',
+  agent: [[
+    { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
+    { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+  ]],
+};
+
+function withServer(server: Record<string, unknown>): BaxianConfig {
+  return prepareConfig({ server, project: [PROJECT] });
+}
+
 describe('loadConfig', () => {
   it('loads and returns a valid config', async () => {
     const path = join(tempDir, 'baxian.json');
@@ -129,14 +141,6 @@ describe('loadConfig', () => {
 });
 
 describe('prepareConfig type guards', () => {
-  const PROJECT = {
-    id: 'pp', repo: 'u/r',
-    agent: [[
-      { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-      { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
-    ]],
-  };
-
   it('throws ConfigValidationError when project is not an array', () => {
     // applyDefaults still normalises non-array project to [], so the check must run
     // before defaults — otherwise the validator only sees [] and thinks all is well.
@@ -218,82 +222,41 @@ describe('prepareConfig type guards', () => {
   });
 
   it('falls back to default port when server.port is non-finite', () => {
-    const cfg = prepareConfig({
-      server: { port: 'eight thousand' },
-      project: [PROJECT],
-    });
+    const cfg = withServer({ port: 'eight thousand' });
     expect(cfg.server.port).toBe(3000);
   });
 
   it('drops server.token when not string, falls back host to default when not string', () => {
-    const cfg = prepareConfig({
-      server: { token: { x: 1 }, host: 7 },
-      project: [PROJECT],
-    });
+    const cfg = withServer({ token: { x: 1 }, host: 7 });
     expect(cfg.server.token).toBeUndefined();
     expect(cfg.server.host).toBe('127.0.0.1');
   });
 
   it('keeps a valid positive integer server.githubPollIntervalMs within [1000ms, 2^31-1]', () => {
-    expect(
-      prepareConfig({ server: { githubPollIntervalMs: 1000 }, project: [PROJECT] })
-        .server.githubPollIntervalMs,
-    ).toBe(1000);
-    expect(
-      prepareConfig({ server: { githubPollIntervalMs: 60000 }, project: [PROJECT] })
-        .server.githubPollIntervalMs,
-    ).toBe(60000);
-    expect(
-      prepareConfig({ server: { githubPollIntervalMs: 2147483647 }, project: [PROJECT] })
-        .server.githubPollIntervalMs,
-    ).toBe(2147483647);
+    for (const value of [1000, 60000, 2147483647]) {
+      expect(withServer({ githubPollIntervalMs: value }).server.githubPollIntervalMs).toBe(value);
+    }
   });
 
   it('falls back non-number / non-finite server.githubPollIntervalMs to default (out-of-range finite numbers go to the validator pass)', () => {
-    expect(
-      prepareConfig({ server: { githubPollIntervalMs: undefined }, project: [PROJECT] })
-        .server.githubPollIntervalMs,
-    ).toBe(30_000);
-    expect(
-      prepareConfig({ server: { githubPollIntervalMs: '30000' }, project: [PROJECT] })
-        .server.githubPollIntervalMs,
-    ).toBe(30_000);
-    expect(
-      prepareConfig({ server: { githubPollIntervalMs: NaN }, project: [PROJECT] })
-        .server.githubPollIntervalMs,
-    ).toBe(30_000);
+    for (const value of [undefined, '30000', NaN]) {
+      expect(withServer({ githubPollIntervalMs: value }).server.githubPollIntervalMs).toBe(30_000);
+    }
   });
 
   it('rejects out-of-range / non-integer server.githubPollIntervalMs via ConfigValidationError (so PATCH returns 400 instead of silently falling back)', () => {
-    // 500 — below 1s floor (would exhaust GitHub rate limit)
-    expect(() =>
-      prepareConfig({ server: { githubPollIntervalMs: 500 }, project: [PROJECT] }),
-    ).toThrow(ConfigValidationError);
-    // 1500.5 — non-integer (setInterval clamps to 1ms)
-    expect(() =>
-      prepareConfig({ server: { githubPollIntervalMs: 1500.5 }, project: [PROJECT] }),
-    ).toThrow(ConfigValidationError);
-    // 0 / negative
-    expect(() =>
-      prepareConfig({ server: { githubPollIntervalMs: 0 }, project: [PROJECT] }),
-    ).toThrow(ConfigValidationError);
-    expect(() =>
-      prepareConfig({ server: { githubPollIntervalMs: -1000 }, project: [PROJECT] }),
-    ).toThrow(ConfigValidationError);
-    // 2^31 — above timer ceiling (TimeoutOverflowWarning)
-    expect(() =>
-      prepareConfig({ server: { githubPollIntervalMs: 2147483648 }, project: [PROJECT] }),
-    ).toThrow(ConfigValidationError);
+    // 500: below 1s floor (would exhaust GitHub rate limit); 1500.5: non-integer (setInterval clamps
+    // to 1ms); 0 / negative; 2^31: above timer ceiling (TimeoutOverflowWarning).
+    for (const value of [500, 1500.5, 0, -1000, 2147483648]) {
+      expect(() => withServer({ githubPollIntervalMs: value })).toThrow(ConfigValidationError);
+    }
   });
 
   it('keeps valid server tmux probe settings', () => {
-    const cfg = prepareConfig({
-      server: {
-        tmuxProbePollIntervalMs: 10000,
-        tmuxProbeTimeoutMs: 3000,
-        tmuxProbeConcurrency: 4,
-      },
-      project: [PROJECT],
+    const cfg = withServer({
+      tmuxProbePollIntervalMs: 10000,
+      tmuxProbeTimeoutMs: 3000,
+      tmuxProbeConcurrency: 4,
     });
     expect(cfg.server.tmuxProbePollIntervalMs).toBe(10000);
     expect(cfg.server.tmuxProbeTimeoutMs).toBe(3000);
@@ -301,13 +264,10 @@ describe('prepareConfig type guards', () => {
   });
 
   it('falls back non-number server tmux probe settings to defaults', () => {
-    const cfg = prepareConfig({
-      server: {
-        tmuxProbePollIntervalMs: '10000',
-        tmuxProbeTimeoutMs: null,
-        tmuxProbeConcurrency: Number.POSITIVE_INFINITY,
-      },
-      project: [PROJECT],
+    const cfg = withServer({
+      tmuxProbePollIntervalMs: '10000',
+      tmuxProbeTimeoutMs: null,
+      tmuxProbeConcurrency: Number.POSITIVE_INFINITY,
     });
     expect(cfg.server.tmuxProbePollIntervalMs).toBe(10_000);
     expect(cfg.server.tmuxProbeTimeoutMs).toBe(3_000);
@@ -315,18 +275,12 @@ describe('prepareConfig type guards', () => {
   });
 
   it('passes through server.bootstrapRetryIntervalMs', () => {
-    const config = prepareConfig({
-      server: { port: 3000, bootstrapRetryIntervalMs: 30_000 },
-      project: [PROJECT],
-    });
+    const config = withServer({ port: 3000, bootstrapRetryIntervalMs: 30_000 });
     expect(config.server.bootstrapRetryIntervalMs).toBe(30_000);
   });
 
   it('falls back non-finite server.bootstrapRetryIntervalMs to default', () => {
-    const config = prepareConfig({
-      server: { port: 3000, bootstrapRetryIntervalMs: 'oops' as unknown as number },
-      project: [PROJECT],
-    });
+    const config = withServer({ port: 3000, bootstrapRetryIntervalMs: 'oops' as unknown as number });
     expect(config.server.bootstrapRetryIntervalMs).toBe(60_000);
   });
 

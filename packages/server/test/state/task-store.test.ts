@@ -31,6 +31,26 @@ async function writeRawTask(id: string, raw: Record<string, unknown>): Promise<v
   await writeFile(join(tasksDir, `${id}.json`), JSON.stringify(raw, null, 2) + '\n');
 }
 
+// On-disk shape with the common required fields pre-filled; overrides win, and an explicit
+// `undefined` deletes a key so callers can exercise the "field absent on disk" sanitize paths.
+async function writeLegacyTask(id: string, overrides: Record<string, unknown> = {}): Promise<void> {
+  const raw: Record<string, unknown> = {
+    id,
+    projectId: 'proj',
+    preferredAgentId: 'dev-1',
+    agentId: 'dev-1',
+    reviewRound: 0,
+    status: 'pending',
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides,
+  };
+  for (const key of Object.keys(raw)) {
+    if (raw[key] === undefined) delete raw[key];
+  }
+  await writeRawTask(id, raw);
+}
+
 async function readRawTask(id: string): Promise<Record<string, unknown>> {
   const content = await readFile(join(tasksDir, `${id}.json`), 'utf-8');
   return JSON.parse(content);
@@ -155,17 +175,9 @@ describe('TaskStore', () => {
 
 describe('TaskStore sanitize', () => {
   it('strips legacy issueNumber/issueUrl on get', async () => {
-    await writeRawTask('task-100', {
-      id: 'task-100',
-      projectId: 'proj',
+    await writeLegacyTask('task-100', {
       title: 'Old task',
       description: 'desc',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
       issueNumber: 42,
       issueUrl: 'https://github.com/foo/bar/issues/42',
     });
@@ -190,17 +202,9 @@ describe('TaskStore sanitize', () => {
   });
 
   it('double-sanitizes across get -> set -> get', async () => {
-    await writeRawTask('task-102', {
-      id: 'task-102',
-      projectId: 'proj',
+    await writeLegacyTask('task-102', {
       title: 'Round-trip',
       description: 'desc',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
       issueNumber: 99,
       issueUrl: 'https://github.com/foo/bar/issues/99',
     });
@@ -219,15 +223,7 @@ describe('TaskStore sanitize', () => {
   });
 
   it('list also sanitizes legacy entries', async () => {
-    await writeRawTask('task-103', {
-      id: 'task-103',
-      projectId: 'proj',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
+    await writeLegacyTask('task-103', {
       issueNumber: 21,
       issueUrl: 'https://github.com/foo/bar/issues/21',
     });
@@ -244,47 +240,20 @@ describe('TaskStore sanitize', () => {
   });
 
   it('falls back to (legacy) Issue #N title when issueNumber present', async () => {
-    await writeRawTask('task-200', {
-      id: 'task-200',
-      projectId: 'proj',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
-      issueNumber: 42,
-    });
+    await writeLegacyTask('task-200', { issueNumber: 42 });
     const loaded = await store.get('task-200');
     expect(loaded!.title).toBe('(legacy) Issue #42');
   });
 
   it('falls back to (legacy) ${id} title when issueNumber missing', async () => {
-    await writeRawTask('task-201', {
-      id: 'task-201',
-      projectId: 'proj',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+    await writeLegacyTask('task-201');
     const loaded = await store.get('task-201');
     expect(loaded!.title).toBe('(legacy) task-201');
   });
 
   it('falls back description to "Migrated from <issueUrl>." when issueUrl present', async () => {
-    await writeRawTask('task-202', {
-      id: 'task-202',
-      projectId: 'proj',
+    await writeLegacyTask('task-202', {
       title: 'has title',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
       issueUrl: 'https://github.com/foo/bar/issues/42',
     });
     const loaded = await store.get('task-202');
@@ -292,49 +261,28 @@ describe('TaskStore sanitize', () => {
   });
 
   it('falls back description to empty string when issueUrl missing', async () => {
-    await writeRawTask('task-203', {
-      id: 'task-203',
-      projectId: 'proj',
-      title: 'has title',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+    await writeLegacyTask('task-203', { title: 'has title' });
     const loaded = await store.get('task-203');
     expect(loaded!.description).toBe('');
   });
 
   it('falls back preferredAgentId to agentId when preferredAgentId missing', async () => {
-    await writeRawTask('task-204', {
-      id: 'task-204',
-      projectId: 'proj',
+    await writeLegacyTask('task-204', {
       title: 'has title',
       description: 'desc',
+      preferredAgentId: undefined,
       agentId: 'dev1',
-      reviewRound: 0,
       status: 'in_progress',
-      createdAt: NOW,
-      updatedAt: NOW,
     });
     const loaded = await store.get('task-204');
     expect(loaded!.preferredAgentId).toBe('dev1');
   });
 
   it('coerces whitespace-only title/preferredAgentId via fallback', async () => {
-    await writeRawTask('task-ws', {
-      id: 'task-ws',
-      projectId: 'proj',
+    await writeLegacyTask('task-ws', {
       title: '   ',
       description: '',
       preferredAgentId: '   ',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
     });
     const loaded = await store.get('task-ws');
     expect(loaded!.title).toBe('(legacy) task-ws'); // ' ' 不算合法 title
@@ -342,17 +290,10 @@ describe('TaskStore sanitize', () => {
   });
 
   it('coerces null/wrong-typed fields via fallback (hand-edit corruption)', async () => {
-    await writeRawTask('task-corrupt', {
-      id: 'task-corrupt',
-      projectId: 'proj',
+    await writeLegacyTask('task-corrupt', {
       title: null, // wrong type
       description: 42, // wrong type
       preferredAgentId: null,
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
     });
     const loaded = await store.get('task-corrupt');
     expect(loaded!.title).toBe('(legacy) task-corrupt');
@@ -361,16 +302,11 @@ describe('TaskStore sanitize', () => {
   });
 
   it('falls back preferredAgentId to empty when both preferredAgentId and agentId empty', async () => {
-    await writeRawTask('task-205', {
-      id: 'task-205',
-      projectId: 'proj',
+    await writeLegacyTask('task-205', {
       title: 'has title',
       description: 'desc',
+      preferredAgentId: undefined,
       agentId: '',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
     });
     const loaded = await store.get('task-205');
     expect(loaded!.preferredAgentId).toBe('');
@@ -401,16 +337,11 @@ describe('TaskStore sanitize', () => {
 
 describe('TaskStore.migrateLegacyFiles', () => {
   it('rewrites files containing issueNumber/issueUrl to clean shape', async () => {
-    await writeRawTask('task-leg-1', {
-      id: 'task-leg-1',
-      projectId: 'proj',
+    await writeLegacyTask('task-leg-1', {
       issueNumber: 42,
       issueUrl: 'https://github.com/foo/bar/issues/42',
-      agentId: 'dev-1',
-      reviewRound: 0,
+      preferredAgentId: undefined,
       status: 'in_progress',
-      createdAt: NOW,
-      updatedAt: NOW,
     });
 
     const result = await store.migrateLegacyFiles();
@@ -438,14 +369,10 @@ describe('TaskStore.migrateLegacyFiles', () => {
 
   it('counts failed migrations without aborting the rest', async () => {
     await writeFile(join(tasksDir, 'task-bad.json'), '{ this is not valid json');
-    await writeRawTask('task-leg-2', {
-      id: 'task-leg-2',
-      projectId: 'proj',
+    await writeLegacyTask('task-leg-2', {
       issueNumber: 7,
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
+      preferredAgentId: undefined,
+      agentId: undefined,
     });
 
     const result = await store.migrateLegacyFiles();
@@ -462,14 +389,7 @@ describe('TaskStore.migrateLegacyFiles', () => {
   });
 
   it('raw missing id: title fallback uses filename id, not "(legacy) unknown"', async () => {
-    await writeRawTask('task-noid', {
-      projectId: 'proj',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+    await writeLegacyTask('task-noid', { id: undefined, preferredAgentId: undefined });
 
     const result = await store.migrateLegacyFiles();
     expect(result.migrated).toBe(1);
@@ -480,14 +400,11 @@ describe('TaskStore.migrateLegacyFiles', () => {
   });
 
   it('uses filename as authoritative id; rewrites raw.id mismatch instead of writing to undefined.json', async () => {
-    await writeRawTask('task-fix', {
+    await writeLegacyTask('task-fix', {
       id: 'wrong-id',
-      projectId: 'proj',
       issueNumber: 5,
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
+      preferredAgentId: undefined,
+      agentId: undefined,
     });
 
     const result = await store.migrateLegacyFiles();
@@ -499,17 +416,10 @@ describe('TaskStore.migrateLegacyFiles', () => {
   });
 
   it('migrates files with null/whitespace fields (predicate aligned with sanitize)', async () => {
-    await writeRawTask('task-corrupt-disk', {
-      id: 'task-corrupt-disk',
-      projectId: 'proj',
+    await writeLegacyTask('task-corrupt-disk', {
       title: null, // wrong type
       description: 42, // wrong type
       preferredAgentId: '   ', // whitespace-only
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
     });
 
     const result = await store.migrateLegacyFiles();
@@ -523,15 +433,7 @@ describe('TaskStore.migrateLegacyFiles', () => {
   });
 
   it('migrates partial-migration files missing required fields (no longer has issue keys)', async () => {
-    await writeRawTask('task-partial', {
-      id: 'task-partial',
-      projectId: 'proj',
-      agentId: 'dev-1',
-      reviewRound: 0,
-      status: 'pending',
-      createdAt: NOW,
-      updatedAt: NOW,
-    });
+    await writeLegacyTask('task-partial', { preferredAgentId: undefined });
 
     const result = await store.migrateLegacyFiles();
     expect(result.migrated).toBe(1);

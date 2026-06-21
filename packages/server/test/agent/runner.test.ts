@@ -15,22 +15,34 @@ describe('shellQuote', () => {
 });
 
 describe('wrapRemoteCommand', () => {
-  it('defaults to login non-interactive (-l -c) so .zprofile loads but .zshrc is skipped (avoids stdout banner pollution)', () => {
-    expect(wrapRemoteCommand('which claude')).toBe(
+  it.each<[string, Parameters<typeof wrapRemoteCommand>, string]>([
+    [
+      'defaults to login non-interactive (-l -c) so .zprofile loads but .zshrc is skipped (avoids stdout banner pollution)',
+      ['which claude'],
       `sh -c 'exec "\${SHELL:-/bin/sh}" -l -c "$1"' _ 'which claude'`,
-    );
-  });
-
-  it('opt-in login-interactive (-l -i -c) covers .zshrc PATH (nvm / $HOME/.local/bin)', () => {
-    expect(wrapRemoteCommand('which claude', 'login-interactive')).toBe(
+    ],
+    [
+      'opt-in login-interactive (-l -i -c) covers .zshrc PATH (nvm / $HOME/.local/bin)',
+      ['which claude', 'login-interactive'],
       `sh -c 'exec "\${SHELL:-/bin/sh}" -l -i -c "$1"' _ 'which claude'`,
-    );
-  });
-
-  it('explicit login mode is identical to default', () => {
-    expect(wrapRemoteCommand('echo hi', 'login')).toBe(
+    ],
+    [
+      'explicit login mode is identical to default',
+      ['echo hi', 'login'],
       `sh -c 'exec "\${SHELL:-/bin/sh}" -l -c "$1"' _ 'echo hi'`,
-    );
+    ],
+    [
+      'escapes single quotes inside the inner command',
+      ["echo it's"],
+      `sh -c 'exec "\${SHELL:-/bin/sh}" -l -c "$1"' _ 'echo it'\\''s'`,
+    ],
+    [
+      'handles empty command',
+      [''],
+      `sh -c 'exec "\${SHELL:-/bin/sh}" -l -c "$1"' _ ''`,
+    ],
+  ])('%s', (_name, args, expected) => {
+    expect(wrapRemoteCommand(...args)).toBe(expected);
   });
 
   it('outer sh is a literal command name (not a variable) so login shells like fish accept it; sh expands $SHELL via POSIX rules and exec-replaces itself', () => {
@@ -41,18 +53,6 @@ describe('wrapRemoteCommand', () => {
   it('passes the inner command via positional $1 so embedded $VARs / quotes are not re-evaluated by the outer sh', () => {
     expect(wrapRemoteCommand('echo $HOME')).toContain(`'echo $HOME'`);
     expect(wrapRemoteCommand('echo $HOME')).toContain(`"$1"`);
-  });
-
-  it('escapes single quotes inside the inner command', () => {
-    expect(wrapRemoteCommand("echo it's")).toBe(
-      `sh -c 'exec "\${SHELL:-/bin/sh}" -l -c "$1"' _ 'echo it'\\''s'`,
-    );
-  });
-
-  it('handles empty command', () => {
-    expect(wrapRemoteCommand('')).toBe(
-      `sh -c 'exec "\${SHELL:-/bin/sh}" -l -c "$1"' _ ''`,
-    );
   });
 
   it('uses separate -l / -i / -c short options (not combined -lic) so shells like fish that do not group short flags still work', () => {
@@ -238,6 +238,30 @@ describe('SshRunner', () => {
     expect(calls[0].cmd).toContain('-o ControlPersist=5m');
   });
 
+  it('default remote shell is login non-interactive (-l -c) so .zshrc cannot pollute stdout for parsing-heavy callers (RepoStore $HOME etc.)', async () => {
+    const { runner: local, calls } = captureLocal();
+    const ssh = new SshRunner({ hostname: 'box' }, local);
+    await ssh.exec('which claude');
+    expect(calls[0].cmd).toContain('-l -c');
+    expect(calls[0].cmd).not.toContain('-i -c');
+    expect(calls[0].cmd).toContain('which claude');
+  });
+
+  it('opt-in remoteShell:"login-interactive" switches to -l -i -c so probe / preflight which X can find nvm / .local/bin', async () => {
+    const { runner: local, calls } = captureLocal();
+    const ssh = new SshRunner({ hostname: 'box' }, local);
+    await ssh.exec('which claude', { remoteShell: 'login-interactive' });
+    expect(calls[0].cmd).toContain('-l -i -c');
+  });
+
+  it('keeps the inner command quoted so locally undefined $VARs are expanded by the remote shell', async () => {
+    const { runner: local, calls } = captureLocal();
+    const ssh = new SshRunner({ hostname: 'box' }, local);
+    await ssh.exec('echo $HOME');
+    expect(calls[0].cmd).toContain('echo $HOME');
+    expect(calls[0].cmd).toContain('sh -c');
+  });
+
   it('reuses identical ssh option string across back-to-back calls so the second invocation hits the existing mux socket', async () => {
     const { runner: local, calls } = captureLocal();
     const ssh = new SshRunner({ hostname: 'box' }, local);
@@ -283,30 +307,6 @@ describe('SshRunner', () => {
     await ssh.exec('whoami', { timeout: 500, signal: controller.signal });
     expect(calls[0]?.options?.timeout).toBe(500);
     expect(calls[0]?.options?.signal).toBe(controller.signal);
-  });
-
-  it('default remote shell is login non-interactive (-l -c) so .zshrc cannot pollute stdout for parsing-heavy callers (RepoStore $HOME etc.)', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.exec('which claude');
-    expect(calls[0].cmd).toContain('-l -c');
-    expect(calls[0].cmd).not.toContain('-i -c');
-    expect(calls[0].cmd).toContain('which claude');
-  });
-
-  it('opt-in remoteShell:"login-interactive" switches to -l -i -c so probe / preflight which X can find nvm / .local/bin', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.exec('which claude', { remoteShell: 'login-interactive' });
-    expect(calls[0].cmd).toContain('-l -i -c');
-  });
-
-  it('keeps the inner command quoted so locally undefined $VARs are expanded by the remote shell', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.exec('echo $HOME');
-    expect(calls[0].cmd).toContain('echo $HOME');
-    expect(calls[0].cmd).toContain('sh -c');
   });
 });
 
@@ -433,11 +433,14 @@ describe('SshRunner.writeFile', () => {
     expect(m1?.[1]).not.toBe(m2?.[1]);
   });
 
-  it('embeds base64 payload inside the heredoc body', async () => {
+  it.each<[string, string]>([
+    ['embeds base64 payload inside the heredoc body', 'hello world'],
+    ['treats string content as utf8 and base64-encodes the utf8 bytes', '中文 🚀'],
+  ])('%s', async (_name, text) => {
     const { runner: local, calls } = captureLocal();
     const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.writeFile('/tmp/x', 'hello world');
-    const expectedB64 = Buffer.from('hello world', 'utf8').toString('base64');
+    await ssh.writeFile('/tmp/x', text);
+    const expectedB64 = Buffer.from(text, 'utf8').toString('base64');
     expect(calls[0].cmd).toContain(expectedB64);
   });
 
@@ -451,15 +454,6 @@ describe('SshRunner.writeFile', () => {
     expect(cmd).toContain(expectedB64);
     const decoded = Buffer.from(expectedB64, 'base64');
     expect(decoded.equals(payload)).toBe(true);
-  });
-
-  it('treats string content as utf8 and base64-encodes the utf8 bytes', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    const text = '中文 🚀';
-    await ssh.writeFile('/tmp/x', text);
-    const expectedB64 = Buffer.from(text, 'utf8').toString('base64');
-    expect(calls[0].cmd).toContain(expectedB64);
   });
 
   it('runs mkdir -p on the parent directory of the target path', async () => {

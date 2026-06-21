@@ -1,31 +1,28 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import type { FastifyInstance } from 'fastify';
 import type { AgentBindingFacts, AgentSnapshot } from '../../src/shared/index.js';
-import { buildApp } from '../../src/app.js';
-import { createTestContext } from '../helpers/context.js';
+import { requesters, setupApiHarness, teardownApiHarness, type ApiHarness } from './helpers.js';
 
 const PNG_B64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString('base64');
 
-let tempDir: string;
+let harness: ApiHarness;
 let app: FastifyInstance;
+const { get, post, del } = requesters(() => app);
+
+function setAgent(facts: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
+  return app.ctx.agentStore.set({ projectId: 'proj', updatedAt: new Date().toISOString(), ...facts });
+}
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-agents-test-'));
-  const ctx = await createTestContext(tempDir);
-  app = await buildApp(ctx);
+  harness = await setupApiHarness('agents');
+  app = harness.app;
 });
 
-afterEach(async () => {
-  await app.close();
-  await rm(tempDir, { recursive: true });
-});
+afterEach(() => teardownApiHarness(harness));
 
 describe('GET /api/agents', () => {
   it('returns configured agents with unknown runtime status initially', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/agents' });
+    const response = await get('/api/agents');
     expect(response.statusCode).toBe(200);
     expect(JSON.parse(response.body)).toEqual([
       {
@@ -46,18 +43,13 @@ describe('GET /api/agents', () => {
   });
 
   it('merges configured agents, binding facts, and tmux probe status', async () => {
-    const state: AgentBindingFacts = {
-      id: 'dev-1',
-      projectId: 'proj',
-      updatedAt: new Date().toISOString(),
-    };
-    await app.ctx.agentStore.set(state);
+    await setAgent({ id: 'dev-1' });
     app.ctx.tmuxSessionStatusStore.set('dev-1', {
       tmuxSessionStatus: 'present',
       observedAt: '2026-05-01T00:00:00.000Z',
     });
 
-    const response = await app.inject({ method: 'GET', url: '/api/agents' });
+    const response = await get('/api/agents');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as AgentSnapshot[];
     expect(body).toHaveLength(2);
@@ -76,7 +68,7 @@ describe('GET /api/agents', () => {
 
 describe('GET /api/agents/:id', () => {
   it('returns configured agent details before state exists', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/agents/dev-1' });
+    const response = await get('/api/agents/dev-1');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as AgentSnapshot;
     expect(body).toMatchObject({
@@ -89,19 +81,13 @@ describe('GET /api/agents/:id', () => {
   });
 
   it('returns agent details for known agent', async () => {
-    const state: AgentBindingFacts = {
-      id: 'dev-1',
-      projectId: 'proj',
-      taskId: 'task-001',
-      updatedAt: new Date().toISOString(),
-    };
-    await app.ctx.agentStore.set(state);
+    await setAgent({ id: 'dev-1', taskId: 'task-001' });
     app.ctx.tmuxSessionStatusStore.set('dev-1', {
       tmuxSessionStatus: 'present',
       observedAt: '2026-05-01T00:00:00.000Z',
     });
 
-    const response = await app.inject({ method: 'GET', url: '/api/agents/dev-1' });
+    const response = await get('/api/agents/dev-1');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as AgentSnapshot;
     expect(body.id).toBe('dev-1');
@@ -111,42 +97,35 @@ describe('GET /api/agents/:id', () => {
   });
 
   it('returns 404 for unknown agent', async () => {
-    const response = await app.inject({ method: 'GET', url: '/api/agents/no-such-agent' });
+    const response = await get('/api/agents/no-such-agent');
     expect(response.statusCode).toBe(404);
   });
 });
 
 describe('POST /api/agents/:id/images', () => {
   it('writes the image to the agent host and returns its path', async () => {
-    await app.ctx.agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%1', updatedAt: new Date().toISOString() });
-    const res = await app.inject({
-      method: 'POST', url: '/api/agents/dev-1/images', payload: { dataBase64: PNG_B64 },
-    });
+    await setAgent({ id: 'dev-1', paneId: '%1' });
+    const res = await post('/api/agents/dev-1/images', { dataBase64: PNG_B64 });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).path).toMatch(/^\/tmp\/baxian\/upload\/dev-1\/[0-9a-f-]+\.png$/);
   });
 
   it('400 for a non-image payload', async () => {
-    await app.ctx.agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%1', updatedAt: new Date().toISOString() });
-    const res = await app.inject({
-      method: 'POST', url: '/api/agents/dev-1/images',
-      payload: { dataBase64: Buffer.from('not an image').toString('base64') },
+    await setAgent({ id: 'dev-1', paneId: '%1' });
+    const res = await post('/api/agents/dev-1/images', {
+      dataBase64: Buffer.from('not an image').toString('base64'),
     });
     expect(res.statusCode).toBe(400);
   });
 
   it('404 for an unknown agent', async () => {
-    const res = await app.inject({
-      method: 'POST', url: '/api/agents/nope/images', payload: { dataBase64: PNG_B64 },
-    });
+    const res = await post('/api/agents/nope/images', { dataBase64: PNG_B64 });
     expect(res.statusCode).toBe(404);
   });
 
   it('409 when the agent has no live session (no paneId)', async () => {
-    await app.ctx.agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
-    const res = await app.inject({
-      method: 'POST', url: '/api/agents/dev-1/images', payload: { dataBase64: PNG_B64 },
-    });
+    await setAgent({ id: 'dev-1' });
+    const res = await post('/api/agents/dev-1/images', { dataBase64: PNG_B64 });
     expect(res.statusCode).toBe(409);
   });
 });
@@ -154,7 +133,7 @@ describe('POST /api/agents/:id/images', () => {
 describe('POST /api/agents/:id/clear', () => {
   it('delegates to clearAgent and returns 200', async () => {
     const spy = vi.spyOn(app.ctx.agentManager, 'clearAgent').mockResolvedValue(undefined);
-    const res = await app.inject({ method: 'POST', url: '/api/agents/dev-1/clear' });
+    const res = await post('/api/agents/dev-1/clear');
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ cleared: true });
     expect(spy).toHaveBeenCalledWith('dev-1');
@@ -162,13 +141,13 @@ describe('POST /api/agents/:id/clear', () => {
   });
 
   it('returns 404 for an unknown agent', async () => {
-    const res = await app.inject({ method: 'POST', url: '/api/agents/nope/clear' });
+    const res = await post('/api/agents/nope/clear');
     expect(res.statusCode).toBe(404);
   });
 
   it('returns 409 when the agent has no live session', async () => {
-    await app.ctx.agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
-    const res = await app.inject({ method: 'POST', url: '/api/agents/dev-1/clear' });
+    await setAgent({ id: 'dev-1' });
+    const res = await post('/api/agents/dev-1/clear');
     expect(res.statusCode).toBe(409);
   });
 });
@@ -189,14 +168,9 @@ describe('DELETE /api/agents/:id/session', () => {
       createdAt: now,
       updatedAt: now,
     });
-    await app.ctx.agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      taskId: 'task-001',
-      updatedAt: now,
-    });
+    await setAgent({ id: 'dev-1', taskId: 'task-001' });
 
-    const response = await app.inject({ method: 'DELETE', url: '/api/agents/dev-1/session' });
+    const response = await del('/api/agents/dev-1/session');
     expect(response.statusCode).toBe(204);
 
     const task = await app.ctx.taskStore.get('task-001');
@@ -204,13 +178,8 @@ describe('DELETE /api/agents/:id/session', () => {
   });
 
   it('with no active task → returns 204 (no-op)', async () => {
-    await app.ctx.agentStore.set({
-      id: 'dev-1',
-      projectId: 'proj',
-      updatedAt: new Date().toISOString(),
-    });
-
-    const response = await app.inject({ method: 'DELETE', url: '/api/agents/dev-1/session' });
+    await setAgent({ id: 'dev-1' });
+    const response = await del('/api/agents/dev-1/session');
     expect(response.statusCode).toBe(204);
   });
 });

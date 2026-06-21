@@ -42,6 +42,24 @@ function emptyPage() {
   return { tasks: [], hasMore: false, nextOffset: 0 };
 }
 
+function donePage(tasks: TaskState[], extra: { hasMore?: boolean; nextOffset?: number } = {}) {
+  return { tasks, hasMore: false, nextOffset: tasks.length, ...extra };
+}
+
+function mockDoneOnly(page: ReturnType<typeof donePage>): void {
+  pageMock.mockImplementation(async (_p: string, opts?: { category?: string }) =>
+    opts?.category === 'done' ? page : emptyPage(),
+  );
+}
+
+function clickDone(): void {
+  fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+}
+
+function doneCalls() {
+  return pageMock.mock.calls.filter((c) => c[1]?.category === 'done');
+}
+
 function renderPanel(
   openTasks: TaskState[],
   handlers: { onClose?: () => void } = {},
@@ -172,17 +190,13 @@ describe('TaskPanel', () => {
   });
 
   it('does NOT query 已处理 until expanded, then fetches and renders it', async () => {
-    pageMock.mockImplementation(async (_p: string, opts?: { category?: string }) =>
-      opts?.category === 'done'
-        ? { tasks: [task({ id: 'task-090', status: 'merged', title: 'shipped' })], hasMore: false, nextOffset: 1 }
-        : emptyPage(),
-    );
+    mockDoneOnly(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
     expect(pageMock).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+    clickDone();
     expect(await screen.findByText('shipped')).toBeTruthy();
-    expect(pageMock.mock.calls.some((c) => c[1]?.category === 'done' && (c[1]?.offset ?? 0) === 0)).toBe(true);
+    expect(doneCalls().some((c) => (c[1]?.offset ?? 0) === 0)).toBe(true);
   });
 
   it('paginates 已处理 via 加载更多 using the server nextOffset', async () => {
@@ -194,31 +208,25 @@ describe('TaskPanel', () => {
     });
     renderPanel([]);
 
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+    clickDone();
     await screen.findByText('090');
     fireEvent.click(screen.getByRole('button', { name: '加载更多' }));
     expect(await screen.findByText('070')).toBeTruthy();
     await waitFor(() =>
-      expect(pageMock.mock.calls.some((c) => c[1]?.category === 'done' && c[1]?.offset === 20)).toBe(true),
+      expect(doneCalls().some((c) => c[1]?.offset === 20)).toBe(true),
     );
   });
 
   it('re-expanding 已处理 re-queries the first page (acts as a refresh)', async () => {
-    pageMock.mockResolvedValue({
-      tasks: [task({ id: 'task-090', status: 'merged', title: 'shipped' })],
-      hasMore: false,
-      nextOffset: 1,
-    });
+    pageMock.mockResolvedValue(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
     renderPanel([]);
 
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+    clickDone();
     await screen.findByText('shipped');
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ })); // collapse
+    clickDone(); // collapse
     expect(screen.queryByText('shipped')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ })); // expand again
-    await waitFor(() =>
-      expect(pageMock.mock.calls.filter((c) => c[1]?.category === 'done').length).toBe(2),
-    );
+    clickDone(); // expand again
+    await waitFor(() => expect(doneCalls().length).toBe(2));
   });
 
   it('surfaces a 已处理 load error instead of failing silently', async () => {
@@ -227,7 +235,7 @@ describe('TaskPanel', () => {
       return emptyPage();
     });
     renderPanel([]);
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+    clickDone();
     expect(await screen.findByText(/加载失败：boom/)).toBeTruthy();
   });
 
@@ -268,22 +276,14 @@ describe('TaskPanel', () => {
   });
 
   it('colors terminal DONE status dots by outcome', async () => {
-    pageMock.mockImplementation(async (_p: string, opts?: { category?: string }) =>
-      opts?.category === 'done'
-        ? {
-            tasks: [
-              task({ id: 'task-090', status: 'merged' }),
-              task({ id: 'task-091', status: 'max_rounds' }),
-              task({ id: 'task-092', status: 'failed' }),
-              task({ id: 'task-093', status: 'cancelled' }),
-            ],
-            hasMore: false,
-            nextOffset: 4,
-          }
-        : emptyPage(),
-    );
+    mockDoneOnly(donePage([
+      task({ id: 'task-090', status: 'merged' }),
+      task({ id: 'task-091', status: 'max_rounds' }),
+      task({ id: 'task-092', status: 'failed' }),
+      task({ id: 'task-093', status: 'cancelled' }),
+    ]));
     renderPanel([]);
-    fireEvent.click(screen.getByRole('button', { name: /DONE/ }));
+    clickDone();
     expect((await screen.findByRole('img', { name: 'merged' })).className).toContain('bg-success');
     expect(screen.getByRole('img', { name: 'max_rounds' }).className).toContain('bg-warn');
     expect(screen.getByRole('img', { name: 'failed' }).className).toContain('bg-warn');
@@ -328,14 +328,19 @@ describe('TaskPanel', () => {
     beforeEach(() => { vi.useFakeTimers(); });
     afterEach(() => { vi.useRealTimers(); });
 
-    it('shows ! after the timeout threshold elapses via interval tick', () => {
+    function renderVerdictTask(dispatchOffset: number, overrides: Partial<TaskState>): void {
       const now = new Date('2026-06-19T12:00:00Z').getTime();
       vi.setSystemTime(now);
-      const dispatchedAt = new Date(now - REVIEW_VERDICT_TIMEOUT_MS + 60_000).toISOString();
       renderPanel([task({
-        id: 'task-100', status: 'review', title: 'stuck',
-        qaAgentId: 'qa-1', reviewDispatchedAt: dispatchedAt,
+        ...overrides,
+        reviewDispatchedAt: new Date(now + dispatchOffset).toISOString(),
       })]);
+    }
+
+    it('shows ! after the timeout threshold elapses via interval tick', () => {
+      renderVerdictTask(-REVIEW_VERDICT_TIMEOUT_MS + 60_000, {
+        id: 'task-100', status: 'review', title: 'stuck', qaAgentId: 'qa-1',
+      });
 
       expect(screen.queryByTitle('Review verdict missing')).toBeNull();
 
@@ -344,42 +349,12 @@ describe('TaskPanel', () => {
       expect(screen.getByTitle('Review verdict missing')).toBeTruthy();
     });
 
-    it('stays hidden when within the timeout window', () => {
-      const now = new Date('2026-06-19T12:00:00Z').getTime();
-      vi.setSystemTime(now);
-      const dispatchedAt = new Date(now - 60_000).toISOString();
-      renderPanel([task({
-        id: 'task-101', status: 'review', title: 'fresh',
-        qaAgentId: 'qa-1', reviewDispatchedAt: dispatchedAt,
-      })]);
-
-      act(() => { vi.advanceTimersByTime(30_000); });
-
-      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
-    });
-
-    it('stays hidden for non-review status even if dispatched long ago', () => {
-      const now = new Date('2026-06-19T12:00:00Z').getTime();
-      vi.setSystemTime(now);
-      const dispatchedAt = new Date(now - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString();
-      renderPanel([task({
-        id: 'task-102', status: 'in_progress', title: 'not reviewing',
-        qaAgentId: 'qa-1', reviewDispatchedAt: dispatchedAt,
-      })]);
-
-      act(() => { vi.advanceTimersByTime(30_000); });
-
-      expect(screen.queryByTitle('Review verdict missing')).toBeNull();
-    });
-
-    it('stays hidden when qaAgentId is missing', () => {
-      const now = new Date('2026-06-19T12:00:00Z').getTime();
-      vi.setSystemTime(now);
-      const dispatchedAt = new Date(now - REVIEW_VERDICT_TIMEOUT_MS - 60_000).toISOString();
-      renderPanel([task({
-        id: 'task-103', status: 'review', title: 'no qa',
-        reviewDispatchedAt: dispatchedAt,
-      })]);
+    it.each([
+      { name: 'within the timeout window', dispatchOffset: -60_000, overrides: { id: 'task-101', status: 'review', title: 'fresh', qaAgentId: 'qa-1' } },
+      { name: 'non-review status even if dispatched long ago', dispatchOffset: -REVIEW_VERDICT_TIMEOUT_MS - 60_000, overrides: { id: 'task-102', status: 'in_progress', title: 'not reviewing', qaAgentId: 'qa-1' } },
+      { name: 'qaAgentId is missing', dispatchOffset: -REVIEW_VERDICT_TIMEOUT_MS - 60_000, overrides: { id: 'task-103', status: 'review', title: 'no qa' } },
+    ])('stays hidden when $name', ({ dispatchOffset, overrides }) => {
+      renderVerdictTask(dispatchOffset, overrides as Partial<TaskState>);
 
       act(() => { vi.advanceTimersByTime(30_000); });
 

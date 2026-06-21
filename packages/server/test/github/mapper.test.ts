@@ -36,34 +36,6 @@ describe('mapGitHubEvent', () => {
     expect(result?.data.headSha).toBe('abc1234567890123456789012345678901234567');
   });
 
-  it('returns null for pull_request.opened with bx/ branch but null body (no marker)', () => {
-    const payload = {
-      action: 'opened',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
-        body: null,
-      },
-    };
-    expect(mapGitHubEvent('pull_request', payload)).toBeNull();
-  });
-
-  it('returns null for pull_request.opened with bx/ branch but body lacking marker', () => {
-    const payload = {
-      action: 'opened',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
-        body: 'Just a regular PR description with no marker.',
-      },
-    };
-    expect(mapGitHubEvent('pull_request', payload)).toBeNull();
-  });
-
   it('accepts pull_request.opened with bx/ branch and body containing the marker', () => {
     const payload = {
       action: 'opened',
@@ -76,19 +48,6 @@ describe('mapGitHubEvent', () => {
       },
     };
     expect(mapGitHubEvent('pull_request', payload)).not.toBeNull();
-  });
-
-  it('returns null for pull_request.opened without bx/ prefix', () => {
-    const payload = {
-      action: 'opened',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'feature/other' },
-      },
-    };
-    expect(mapGitHubEvent('pull_request', payload)).toBeNull();
   });
 
   it('maps pull_request.edited with bx/ branch to pr.updated with kind=pr-edit', () => {
@@ -139,19 +98,6 @@ describe('mapGitHubEvent', () => {
         kind: 'push',
       },
     });
-  });
-
-  it('returns null for pull_request.edited without bx/ prefix', () => {
-    const payload = {
-      action: 'edited',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'main' },
-      },
-    };
-    expect(mapGitHubEvent('pull_request', payload)).toBeNull();
   });
 
   it('maps pull_request.closed merged with bx/ to pr.merged with prUrl', () => {
@@ -314,49 +260,6 @@ describe('mapGitHubEvent', () => {
     });
   });
 
-  it('returns null for pull_request_review without bx/ prefix', () => {
-    const payload = {
-      action: 'submitted',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        head: { ref: 'main' },
-      },
-      review: { state: 'approved' },
-    };
-    expect(mapGitHubEvent('pull_request_review', payload)).toBeNull();
-  });
-
-  it('returns null for pull_request_review with unrecognized state', () => {
-    const payload = {
-      action: 'submitted',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        head: { ref: 'bx/task-123' },
-      },
-      review: { state: 'commented' },
-    };
-    expect(mapGitHubEvent('pull_request_review', payload)).toBeNull();
-  });
-
-
-  it('returns null for push event (synchronize covers it; avoid double emit)', () => {
-    const payload = {
-      repository: { full_name: REPO },
-      ref: 'refs/heads/bx/task-123',
-    };
-    expect(mapGitHubEvent('push', payload)).toBeNull();
-  });
-
-  it('returns null for push to non-bx/ branch', () => {
-    const payload = {
-      repository: { full_name: REPO },
-      ref: 'refs/heads/main',
-    };
-    expect(mapGitHubEvent('push', payload)).toBeNull();
-  });
-
   it('maps issue_comment.created on a PR (issue.pull_request present) to pr.updated with prUrl from html_url', () => {
     const payload = {
       action: 'created',
@@ -425,47 +328,128 @@ describe('mapGitHubEvent', () => {
     expect(result?.data.prUrl).toBe('https://github.com/user/repo/pull/42');
   });
 
-  it('returns null for issue_comment.created on a real Issue (no issue.pull_request)', () => {
-    const payload = {
-      action: 'created',
-      repository: { full_name: REPO },
-      issue: { number: 42, html_url: 'https://github.com/user/repo/issues/42' },
-      comment: { id: 999, body: 'real issue comment' },
-    };
-    expect(mapGitHubEvent('issue_comment', payload)).toBeNull();
-  });
-
-  it('returns null for issue_comment.edited (only created is mapped)', () => {
-    const payload = {
-      action: 'edited',
-      repository: { full_name: REPO },
-      issue: {
-        number: 42,
-        pull_request: { html_url: 'https://github.com/user/repo/pull/42' },
+  it.each<[string, string, unknown]>([
+    [
+      'pull_request.opened with bx/ branch but null body (no marker)',
+      'pull_request',
+      {
+        action: 'opened',
+        repository: { full_name: REPO },
+        pull_request: {
+          number: 7,
+          html_url: 'https://github.com/user/repo/pull/7',
+          head: { ref: 'bx/task-123' },
+          body: null,
+        },
       },
-      comment: { id: 999, body: 'LGTM!' },
-    };
-    expect(mapGitHubEvent('issue_comment', payload)).toBeNull();
-  });
-
-  it('returns null for issue_comment.deleted (only created is mapped)', () => {
-    const payload = {
-      action: 'deleted',
-      repository: { full_name: REPO },
-      issue: {
-        number: 42,
-        pull_request: { html_url: 'https://github.com/user/repo/pull/42' },
+    ],
+    [
+      'pull_request.opened with bx/ branch but body lacking marker',
+      'pull_request',
+      {
+        action: 'opened',
+        repository: { full_name: REPO },
+        pull_request: {
+          number: 7,
+          html_url: 'https://github.com/user/repo/pull/7',
+          head: { ref: 'bx/task-123' },
+          body: 'Just a regular PR description with no marker.',
+        },
       },
-      comment: { id: 999, body: 'LGTM!' },
-    };
-    expect(mapGitHubEvent('issue_comment', payload)).toBeNull();
-  });
-
-  it('returns null for unrecognized event type', () => {
-    const payload = {
-      repository: { full_name: REPO },
-    };
-    expect(mapGitHubEvent('deployment', payload)).toBeNull();
+    ],
+    [
+      'pull_request.opened without bx/ prefix',
+      'pull_request',
+      {
+        action: 'opened',
+        repository: { full_name: REPO },
+        pull_request: {
+          number: 7,
+          html_url: 'https://github.com/user/repo/pull/7',
+          head: { ref: 'feature/other' },
+        },
+      },
+    ],
+    [
+      'pull_request.edited without bx/ prefix',
+      'pull_request',
+      {
+        action: 'edited',
+        repository: { full_name: REPO },
+        pull_request: {
+          number: 7,
+          html_url: 'https://github.com/user/repo/pull/7',
+          head: { ref: 'main' },
+        },
+      },
+    ],
+    [
+      'pull_request_review without bx/ prefix',
+      'pull_request_review',
+      {
+        action: 'submitted',
+        repository: { full_name: REPO },
+        pull_request: { number: 7, head: { ref: 'main' } },
+        review: { state: 'approved' },
+      },
+    ],
+    [
+      'pull_request_review with unrecognized state',
+      'pull_request_review',
+      {
+        action: 'submitted',
+        repository: { full_name: REPO },
+        pull_request: { number: 7, head: { ref: 'bx/task-123' } },
+        review: { state: 'commented' },
+      },
+    ],
+    [
+      'push event (synchronize covers it; avoid double emit)',
+      'push',
+      { repository: { full_name: REPO }, ref: 'refs/heads/bx/task-123' },
+    ],
+    [
+      'push to non-bx/ branch',
+      'push',
+      { repository: { full_name: REPO }, ref: 'refs/heads/main' },
+    ],
+    [
+      'issue_comment.created on a real Issue (no issue.pull_request)',
+      'issue_comment',
+      {
+        action: 'created',
+        repository: { full_name: REPO },
+        issue: { number: 42, html_url: 'https://github.com/user/repo/issues/42' },
+        comment: { id: 999, body: 'real issue comment' },
+      },
+    ],
+    [
+      'issue_comment.edited (only created is mapped)',
+      'issue_comment',
+      {
+        action: 'edited',
+        repository: { full_name: REPO },
+        issue: { number: 42, pull_request: { html_url: 'https://github.com/user/repo/pull/42' } },
+        comment: { id: 999, body: 'LGTM!' },
+      },
+    ],
+    [
+      'issue_comment.deleted (only created is mapped)',
+      'issue_comment',
+      {
+        action: 'deleted',
+        repository: { full_name: REPO },
+        issue: { number: 42, pull_request: { html_url: 'https://github.com/user/repo/pull/42' } },
+        comment: { id: 999, body: 'LGTM!' },
+      },
+    ],
+    [
+      'unrecognized event type',
+      'deployment',
+      { repository: { full_name: REPO } },
+    ],
+  ])('returns null for %s', (_label, eventType, payload) => {
+    expect(mapGitHubEvent(eventType, payload)).toBeNull();
   });
 });
 

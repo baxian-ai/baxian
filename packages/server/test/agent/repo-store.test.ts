@@ -12,6 +12,33 @@ function makeRunner(handler: (cmd: string) => ExecResult): CommandRunner & { exe
 const OK: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
 const FAIL: ExecResult = { stdout: '', stderr: 'fail', exitCode: 1 };
 
+function originStdout(url: string): ExecResult {
+  return { stdout: `${url}\n`, stderr: '', exitCode: 0 };
+}
+
+// Handler for an existing checkout whose origin reports the given URL:
+// dir + origin probe pass, sync/fetch commands succeed, everything else fails.
+function existingOrigin(originUrl: string): (cmd: string) => ExecResult {
+  return cmd => {
+    if (cmd.includes('test -d')) return OK;
+    if (cmd.includes('remote get-url origin')) return originStdout(originUrl);
+    if (cmd.includes('config --replace-all')) return OK;
+    if (cmd.includes('config --unset-all')) return OK;
+    if (cmd.includes('git fetch')) return OK;
+    return FAIL;
+  };
+}
+
+const GH_ORIGIN = 'https://github.com/user/repo.git';
+const fetchCount = (runner: { exec: ExecMock }): number =>
+  runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
+
+// Existing GitHub checkout where every non-origin command (incl. fetch) succeeds.
+function existingGitHubOriginAllOk(cmd: string): ExecResult {
+  if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
+  return OK;
+}
+
 describe('RepoStore.ensure (clone path)', () => {
   let cache: RepoStoreCache;
   beforeEach(() => { cache = createRepoStoreCache(); });
@@ -102,30 +129,14 @@ describe('RepoStore.ensure (clone path)', () => {
   });
 
   it('accepts case-insensitive slug match (GitHub repo names are case-insensitive)', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin(GH_ORIGIN));
     const store = new RepoStore(runner, 'User/Repo', 'local', undefined, cache);
     const path = await store.ensure();
     expect(path).toBe(`${homedir()}/.baxian/repos/user/repo`);
   });
 
   it('updates origin when GitHub config is a full SSH URL but clone uses HTTPS', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('config --replace-all')) return OK;
-      if (cmd.includes('config --unset-all')) return OK;
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin(GH_ORIGIN));
     const store = new RepoStore(runner, 'git@github.com:user/repo.git', 'local', undefined, cache);
     await store.ensure();
     const cmds = runner.exec.mock.calls.map(c => c[0]);
@@ -135,14 +146,7 @@ describe('RepoStore.ensure (clone path)', () => {
   });
 
   it('does not update origin when GitHub config is a bare slug', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin(GH_ORIGIN));
     const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
     await store.ensure();
     const cmds = runner.exec.mock.calls.map(c => c[0]);
@@ -165,37 +169,22 @@ describe('RepoStore.refresh — throttle', () => {
   beforeEach(() => { cache = createRepoStoreCache(); });
 
   it('skips fetch when called within 30s of last fetch', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    });
+    const runner = makeRunner(existingGitHubOriginAllOk);
     const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
     const absPath = await store.ensure();
-    const fetchCallsBefore = runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
+    const fetchCallsBefore = fetchCount(runner);
     await store.refresh(absPath);
-    const fetchCallsAfter = runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(fetchCallsAfter).toBe(fetchCallsBefore);
+    expect(fetchCount(runner)).toBe(fetchCallsBefore);
   });
 
   it('refetches once throttle window passes', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    });
+    const runner = makeRunner(existingGitHubOriginAllOk);
     const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
     const absPath = await store.ensure();
-    const before = runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    const cacheKey = `local:${absPath}`;
-    cache.lastFetchAt.set(cacheKey, Date.now() - 31_000);
+    const before = fetchCount(runner);
+    cache.lastFetchAt.set(`local:${absPath}`, Date.now() - 31_000);
     await store.refresh(absPath);
-    const after = runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(after).toBe(before + 1);
+    expect(fetchCount(runner)).toBe(before + 1);
   });
 
   it('fetch command pairs set-head with || true so empty repos do not block ensure', async () => {
@@ -233,116 +222,48 @@ describe('RepoStore — mutex serialization', () => {
 });
 
 describe('RepoStore — hostKey isolation', () => {
-  it('local and remote with same $HOME do NOT share fetch throttle', async () => {
+  // Each case seeds HOME cache keys (so resolveHome never shells out), runs a "first" store then a
+  // "second" store sharing the same $HOME, and asserts the second still fetches — i.e. they don't
+  // collapse into one throttle key.
+  type Host = ConstructorParameters<typeof RepoStore>[3];
+  it.each<{ name: string; homeKeys: string[]; first: ['local' | 'remote', Host]; second: ['local' | 'remote', Host] }>([
+    {
+      name: 'local and remote with same $HOME do NOT share fetch throttle',
+      homeKeys: ['remote:rock@host:default'],
+      first: ['local', undefined],
+      second: ['remote', { hostname: 'host', user: 'rock' }],
+    },
+    {
+      name: 'local mode and remote mode with hostname literally "local" do NOT share cache',
+      homeKeys: ['remote:local:default'],
+      first: ['local', undefined],
+      second: ['remote', { hostname: 'local' }],
+    },
+    {
+      name: 'same hostname/user on different ports do NOT share fetch throttle (port in hostKey)',
+      homeKeys: ['remote:u@h:22', 'remote:u@h:2222'],
+      first: ['remote', { hostname: 'h', user: 'u', port: 22 }],
+      second: ['remote', { hostname: 'h', user: 'u', port: 2222 }],
+    },
+    {
+      name: 'inline host without a port (:default) does NOT share cache with an explicit-22 registry host',
+      homeKeys: ['remote:u@h:default', 'remote:u@h:22'],
+      first: ['remote', { hostname: 'h', user: 'u' }],
+      second: ['remote', { hostname: 'h', user: 'u', port: 22 }],
+    },
+  ])('$name', async ({ homeKeys, first, second }) => {
     const cache = createRepoStoreCache();
-    cache.homes.set('remote:rock@host:default', homedir());
+    for (const key of homeKeys) cache.homes.set(key, homedir());
 
-    const localRunner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    });
-    const remoteRunner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    });
+    const firstRunner = makeRunner(existingGitHubOriginAllOk);
+    const secondRunner = makeRunner(existingGitHubOriginAllOk);
+    const firstStore = new RepoStore(firstRunner, 'user/repo', first[0], first[1], cache);
+    const secondStore = new RepoStore(secondRunner, 'user/repo', second[0], second[1], cache);
 
-    const localStore = new RepoStore(localRunner, 'user/repo', 'local', undefined, cache);
-    const remoteStore = new RepoStore(remoteRunner, 'user/repo', 'remote',
-      { hostname: 'host', user: 'rock' }, cache);
+    await firstStore.ensure();
+    await secondStore.ensure();
 
-    await localStore.ensure();
-    await remoteStore.ensure();
-
-    const remoteFetchCount = remoteRunner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(remoteFetchCount).toBeGreaterThanOrEqual(1);
-  });
-
-  it('local mode and remote mode with hostname literally "local" do NOT share cache', async () => {
-    const cache = createRepoStoreCache();
-    cache.homes.set('remote:local:default', homedir());
-
-    const localRunner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    });
-    const remoteRunner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    });
-
-    const localStore = new RepoStore(localRunner, 'user/repo', 'local', undefined, cache);
-    const remoteStore = new RepoStore(remoteRunner, 'user/repo', 'remote', { hostname: 'local' }, cache);
-
-    await localStore.ensure();
-    await remoteStore.ensure();
-
-    const remoteFetchCount = remoteRunner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(remoteFetchCount).toBeGreaterThanOrEqual(1);
-  });
-
-  it('same hostname/user on different ports do NOT share fetch throttle (port in hostKey)', async () => {
-    const cache = createRepoStoreCache();
-    // Pre-seed each port's HOME so resolveHome does not shell out; keys must carry the port.
-    cache.homes.set('remote:u@h:22', homedir());
-    cache.homes.set('remote:u@h:2222', homedir());
-
-    const handler = (cmd: string): ExecResult => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    };
-    const runner22 = makeRunner(handler);
-    const runner2222 = makeRunner(handler);
-
-    const store22 = new RepoStore(runner22, 'user/repo', 'remote', { hostname: 'h', user: 'u', port: 22 }, cache);
-    const store2222 = new RepoStore(runner2222, 'user/repo', 'remote', { hostname: 'h', user: 'u', port: 2222 }, cache);
-
-    // port 22 fetches first and stamps lastFetchAt for its own key…
-    await store22.ensure();
-    // …port 2222 must still fetch (distinct cache key), not be throttled by port 22's fetch.
-    await store2222.ensure();
-
-    const fetch2222 = runner2222.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(fetch2222).toBeGreaterThanOrEqual(1);
-  });
-
-  it('inline host without a port (:default) does NOT share cache with an explicit-22 registry host', async () => {
-    const cache = createRepoStoreCache();
-    cache.homes.set('remote:u@h:default', homedir());
-    cache.homes.set('remote:u@h:22', homedir());
-
-    const handler = (cmd: string): ExecResult => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return OK;
-    };
-    const inlineRunner = makeRunner(handler);   // no port → may reach a non-22 port via ~/.ssh/config
-    const registryRunner = makeRunner(handler); // explicit 22
-
-    const inlineStore = new RepoStore(inlineRunner, 'user/repo', 'remote', { hostname: 'h', user: 'u' }, cache);
-    const registryStore = new RepoStore(registryRunner, 'user/repo', 'remote', { hostname: 'h', user: 'u', port: 22 }, cache);
-
-    await inlineStore.ensure();
-    await registryStore.ensure(); // must fetch independently (distinct :default vs :22 key)
-
-    const registryFetch = registryRunner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(registryFetch).toBeGreaterThanOrEqual(1);
+    expect(fetchCount(secondRunner)).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -443,16 +364,7 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
   });
 
   it('updates origin when access method changes (https→ssh)', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://gitlab.example.com/group/proj.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('config --replace-all')) return OK;
-      if (cmd.includes('config --unset-all')) return OK;
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin('https://gitlab.example.com/group/proj.git'));
     const store = new RepoStore(runner, 'ssh://git@gitlab.example.com/group/proj.git', 'local', undefined, cache);
     await store.ensure();
     const cmds = runner.exec.mock.calls.map(c => c[0]);
@@ -463,14 +375,7 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
 
   it('skips sync when origin already matches the configured URL', async () => {
     const url = 'https://gitlab.example.com/group/proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: `${url}\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin(url));
     const store = new RepoStore(runner, url, 'local', undefined, cache);
     await store.ensure();
     const cmds = runner.exec.mock.calls.map(c => c[0]);
@@ -510,14 +415,7 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
   });
 
   it('skips sync for cosmetic .git suffix difference (same access method)', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://gitlab.example.com/group/proj.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin('https://gitlab.example.com/group/proj.git'));
     const store = new RepoStore(runner, 'https://gitlab.example.com/group/proj', 'local', undefined, cache);
     await store.ensure();
     const cmds = runner.exec.mock.calls.map(c => c[0]);
@@ -526,23 +424,13 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
   });
 
   it('clears fetch throttle when origin URL changes so new URL is validated immediately', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://gitlab.example.com/group/proj.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('config --replace-all')) return OK;
-      if (cmd.includes('config --unset-all')) return OK;
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
+    const runner = makeRunner(existingOrigin('https://gitlab.example.com/group/proj.git'));
     const absPath = `${homedir()}/.baxian/repos-ext/gitlab.example.com/group/proj`;
     const cacheKey = `local:${absPath}`;
     cache.lastFetchAt.set(cacheKey, Date.now());
     const store = new RepoStore(runner, 'ssh://git@gitlab.example.com/group/proj.git', 'local', undefined, cache);
     await store.ensure();
-    const fetchCount = runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-    expect(fetchCount).toBeGreaterThanOrEqual(1);
+    expect(fetchCount(runner)).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -565,60 +453,17 @@ describe('nonGitHubSubpath', () => {
 });
 
 describe('accessMethodDiffers', () => {
-  it('detects https↔ssh scheme change', () => {
-    expect(accessMethodDiffers(
-      'https://gitlab.example.com/g/p.git',
-      'ssh://git@gitlab.example.com/g/p.git',
-    )).toBe(true);
-  });
-
-  it('detects https↔scp scheme change', () => {
-    expect(accessMethodDiffers(
-      'https://gitlab.example.com/g/p.git',
-      'git@gitlab.example.com:g/p.git',
-    )).toBe(true);
-  });
-
-  it('detects ssh user change', () => {
-    expect(accessMethodDiffers(
-      'ssh://git@host/g/p.git',
-      'ssh://deploy@host/g/p.git',
-    )).toBe(true);
-  });
-
-  it('detects userinfo addition (https with token)', () => {
-    expect(accessMethodDiffers(
-      'https://oauth2:token@host/g/p.git',
-      'https://host/g/p.git',
-    )).toBe(true);
-  });
-
-  it('returns false for .git suffix difference', () => {
-    expect(accessMethodDiffers(
-      'https://host/g/p.git',
-      'https://host/g/p',
-    )).toBe(false);
-  });
-
-  it('returns false for host case difference', () => {
-    expect(accessMethodDiffers(
-      'https://HOST.example.com/g/p.git',
-      'https://host.example.com/g/p.git',
-    )).toBe(false);
-  });
-
-  it('returns false for scp↔ssh URL with same user (both are SSH)', () => {
-    expect(accessMethodDiffers(
-      'git@gitlab.example.com:group/proj.git',
-      'ssh://git@gitlab.example.com/group/proj.git',
-    )).toBe(false);
-  });
-
-  it('returns false for identical URLs', () => {
-    expect(accessMethodDiffers(
-      'https://host/g/p.git',
-      'https://host/g/p.git',
-    )).toBe(false);
+  it.each<[string, string, string, boolean]>([
+    ['detects https↔ssh scheme change', 'https://gitlab.example.com/g/p.git', 'ssh://git@gitlab.example.com/g/p.git', true],
+    ['detects https↔scp scheme change', 'https://gitlab.example.com/g/p.git', 'git@gitlab.example.com:g/p.git', true],
+    ['detects ssh user change', 'ssh://git@host/g/p.git', 'ssh://deploy@host/g/p.git', true],
+    ['detects userinfo addition (https with token)', 'https://oauth2:token@host/g/p.git', 'https://host/g/p.git', true],
+    ['returns false for .git suffix difference', 'https://host/g/p.git', 'https://host/g/p', false],
+    ['returns false for host case difference', 'https://HOST.example.com/g/p.git', 'https://host.example.com/g/p.git', false],
+    ['returns false for scp↔ssh URL with same user (both are SSH)', 'git@gitlab.example.com:group/proj.git', 'ssh://git@gitlab.example.com/group/proj.git', false],
+    ['returns false for identical URLs', 'https://host/g/p.git', 'https://host/g/p.git', false],
+  ])('%s', (_name, a, b, expected) => {
+    expect(accessMethodDiffers(a, b)).toBe(expected);
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentStore, AGENT_STORE_NOOP } from '../../src/state/agent-store.js';
@@ -14,10 +14,20 @@ function makeState(id: string, overrides: Partial<AgentBindingFacts> = {}): Agen
   return { id, projectId: 'proj', updatedAt: NOW, ...overrides };
 }
 
+function agentsDir(): string {
+  return join(tempDir, 'state', 'agents');
+}
+
+function captureChanges(): Array<['set' | 'delete', string]> {
+  const fired: Array<['set' | 'delete', string]> = [];
+  store.onChange((kind, id) => fired.push([kind, id]));
+  return fired;
+}
+
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-test-'));
   await initStateDir(tempDir);
-  store = new AgentStore(join(tempDir, 'state', 'agents'));
+  store = new AgentStore(agentsDir());
 });
 
 afterEach(async () => {
@@ -30,8 +40,7 @@ describe('AgentStore', () => {
   });
 
   it('throws on unparseable JSON instead of reporting the binding as absent', async () => {
-    const dir = join(tempDir, 'state', 'agents');
-    await writeFile(join(dir, 'dev-1.json'), '{ corrupt');
+    await writeFile(join(agentsDir(), 'dev-1.json'), '{ corrupt');
     await expect(store.get('dev-1')).rejects.toThrow();
   });
 
@@ -63,7 +72,7 @@ describe('AgentStore', () => {
     };
     await store.set(oldShape as AgentBindingFacts);
     const disk = JSON.parse(
-      await readFile(join(tempDir, 'state', 'agents', 'dev-1.json'), 'utf-8'),
+      await readFile(join(agentsDir(), 'dev-1.json'), 'utf-8'),
     ) as Record<string, unknown>;
     expect(disk).toEqual({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
   });
@@ -96,15 +105,13 @@ describe('AgentStore', () => {
 
   it('delete fires onChange("delete") on success', async () => {
     await store.set(makeState('dev-1'));
-    const fired: Array<['set' | 'delete', string]> = [];
-    store.onChange((kind, id) => fired.push([kind, id]));
+    const fired = captureChanges();
     await store.delete('dev-1');
     expect(fired).toEqual([['delete', 'dev-1']]);
   });
 
   it('delete fires onChange("delete") on ENOENT (idempotent semantics)', async () => {
-    const fired: Array<['set' | 'delete', string]> = [];
-    store.onChange((kind, id) => fired.push([kind, id]));
+    const fired = captureChanges();
     // No prior set; unlink will throw ENOENT but callers depend on idempotent
     // delete, so the delete event is still legitimate ("it's gone, as you asked").
     await store.delete('nonexistent');
@@ -115,11 +122,9 @@ describe('AgentStore', () => {
     // Create a directory at the path the store would unlink, so unlink throws
     // EISDIR (or EPERM on macOS) rather than ENOENT — simulates "file still on
     // disk after delete attempt", where firing 'delete' would lie.
-    const { mkdir } = await import('node:fs/promises');
-    const dir = join(tempDir, 'state', 'agents', 'stuck.json');
+    const dir = join(agentsDir(), 'stuck.json');
     await mkdir(dir, { recursive: true });
-    const fired: Array<['set' | 'delete', string]> = [];
-    store.onChange((kind, id) => fired.push([kind, id]));
+    const fired = captureChanges();
     await store.delete('stuck');
     expect(fired).toEqual([]);
   });

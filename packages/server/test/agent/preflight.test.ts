@@ -27,6 +27,9 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/code', ...overrides };
 }
 
+const execCmds = (runner: CommandRunner): string[] =>
+  (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as string);
+
 beforeEach(() => { runnerModule.__resetMuxDirReadyForTests(); });
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -116,9 +119,7 @@ describe('runPreflight', () => {
   it('checks for codex CLI when runtime is codex', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAgent({ runtime: 'codex' }), 'user/repo');
-    expect((runner.exec as ReturnType<typeof vi.fn>).mock.calls.some(
-      (c: string[]) => c[0].includes('which codex'),
-    )).toBe(true);
+    expect(execCmds(runner).some(c => c.includes('which codex'))).toBe(true);
   });
 
   it('detects git access failure', async () => {
@@ -241,7 +242,7 @@ describe('runPreflight — auto mode', () => {
   it('runs mkdir -p ~/.baxian/repos and test -w on parent', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAutoAgent(), 'user/repo');
-    const calls = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]);
+    const calls = execCmds(runner);
     expect(calls.some(c => c.includes('mkdir -p') && c.includes('.baxian/repos'))).toBe(true);
     expect(calls.some(c => c.includes('test -w') && c.includes('.baxian/repos'))).toBe(true);
   });
@@ -249,7 +250,7 @@ describe('runPreflight — auto mode', () => {
   it('lowercases the slug in absRepoPath so it stays consistent with RepoStore.resolveAbsPath', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAutoAgent(), 'Owner/Repo');
-    const calls = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]);
+    const calls = execCmds(runner);
     expect(calls.some(c => c.includes('test -d ~/.baxian/repos/owner/repo'))).toBe(true);
     expect(calls.some(c => /test -d .*Owner\/Repo/.test(c))).toBe(false);
   });
@@ -259,7 +260,7 @@ describe('runPreflight — auto mode', () => {
       'gh config get git_protocol': { stdout: 'https\n', stderr: '', exitCode: 0 },
     });
     const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
-    const calls = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]);
+    const calls = execCmds(runner);
     expect(calls.some(c => c.includes('git ls-remote') && c.includes('https://github.com/user/repo.git'))).toBe(true);
     expect(results.find(r => r.step === 'git')?.ok).toBe(true);
   });
@@ -269,7 +270,7 @@ describe('runPreflight — auto mode', () => {
       'gh config get git_protocol': { stdout: 'ssh\n', stderr: '', exitCode: 0 },
     });
     const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
-    const calls = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]);
+    const calls = execCmds(runner);
     expect(calls.some(c => c.includes('git ls-remote') && c.includes('git@github.com:user/repo.git'))).toBe(true);
     expect(results.find(r => r.step === 'git')?.ok).toBe(true);
   });
@@ -339,7 +340,7 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
     const results = await runPreflight(runner, makeAgent(), GL);
     expect(results.find(r => r.step === 'gh')).toBeUndefined();
     expect(results.find(r => r.step === 'gh-repo')).toBeUndefined();
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as string);
+    const cmds = execCmds(runner);
     expect(cmds.some(c => c.includes('gh auth') || c.includes('gh api'))).toBe(false);
     expect(cmds.some(c => c.includes('git ls-remote') && c.includes(GL))).toBe(true);
     expect(results.find(r => r.step === 'git')?.ok).toBe(true);
@@ -348,7 +349,7 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
   it('auto mode: uses repos-ext/<host>/<path> and git ls-remote, never gh', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAgent({ workdir: undefined }), GL);
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as string);
+    const cmds = execCmds(runner);
     expect(cmds.some(c => c.includes('.baxian/repos-ext/gitlab.example.com/group/proj'))).toBe(true);
     expect(cmds.some(c => c.includes('gh config get git_protocol'))).toBe(false);
     expect(cmds.some(c => c.includes('gh auth') || c.includes('gh api'))).toBe(false);
@@ -359,7 +360,7 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
     const runner = mockRunner({});
     const evil = 'https://gitlab.example.com;touch pwned/group/proj.git';
     await expect(runPreflight(runner, makeAgent({ workdir: undefined }), evil)).rejects.toThrow(/unsafe host/i);
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as string);
+    const cmds = execCmds(runner);
     expect(cmds.some(c => c.includes(';touch pwned'))).toBe(false);
   });
 
@@ -376,7 +377,7 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
   it('auto mode: trims a whitespace-padded repo URL before ls-remote', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAgent({ workdir: undefined }), '  https://gitlab.example.com/group/proj.git  ');
-    const cmds = (runner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0] as string);
+    const cmds = execCmds(runner);
     expect(cmds.some(c => c.includes("git ls-remote 'https://gitlab.example.com/group/proj.git'"))).toBe(true);
     expect(cmds.some(c => c.includes('  https'))).toBe(false);
   });

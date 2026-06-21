@@ -138,22 +138,121 @@ async function emitAndWait(event: Omit<BaxianEvent, 'id'>): Promise<void> {
   await eventBus.emit({ id: '', ...event } as BaxianEvent);
 }
 
+type EventData = Record<string, unknown>;
+
+function emitPrCreated(taskId: string, data: EventData): Promise<void> {
+  return emitAndWait({
+    type: 'pr.created', timestamp: new Date().toISOString(),
+    projectId: 'proj', agentId: 'dev-1', taskId, data,
+  });
+}
+
+function emitPrUpdated(taskId: string, data: EventData): Promise<void> {
+  return emitAndWait({
+    type: 'pr.updated', timestamp: new Date().toISOString(),
+    projectId: 'proj', agentId: 'dev-1', taskId, data,
+  });
+}
+
+function emitPrFixSubmitted(taskId: string, data: EventData): Promise<void> {
+  return emitAndWait({
+    type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
+    projectId: 'proj', agentId: 'dev-1', taskId, data,
+  });
+}
+
+function emitPrMerged(taskId: string, data: EventData): Promise<void> {
+  return emitAndWait({
+    type: 'pr.merged', timestamp: new Date().toISOString(),
+    projectId: 'proj', taskId, data,
+  });
+}
+
+function emitReview(taskId: string, data: EventData, agentId = 'qa-1'): Promise<void> {
+  return emitAndWait({
+    type: 'review.submitted', timestamp: new Date().toISOString(),
+    projectId: 'proj', agentId, taskId, data,
+  });
+}
+
+type ManagerMethod = {
+  [K in keyof AgentManager]: AgentManager[K] extends (...args: never[]) => Promise<unknown> ? K : never;
+}[keyof AgentManager];
+
+type StubSpec = Partial<Record<ManagerMethod, unknown>>;
+type StubSpies = Record<string, ReturnType<typeof vi.spyOn>>;
+
+// Spy each listed manager method and resolve it to the given value (undefined → resolves void).
+function stubManager(spec: StubSpec, target: AgentManager = manager): StubSpies {
+  const spies: StubSpies = {};
+  for (const [method, value] of Object.entries(spec)) {
+    const spy = vi.spyOn(target as never, method as never) as ReturnType<typeof vi.spyOn>;
+    spy.mockResolvedValue(value as never);
+    spies[method] = spy;
+  }
+  return spies;
+}
+
+type InterventionData = Record<string, unknown> & { phase?: string };
+
+function findIntervention(taskId: string, phase?: string): BaxianEvent | undefined {
+  return emittedEvents.find(e =>
+    e.type === 'human.intervention'
+    && e.taskId === taskId
+    && (phase === undefined || (e.data as InterventionData).phase === phase),
+  );
+}
+
+function findInterventionByPhase(phase: string): BaxianEvent | undefined {
+  return emittedEvents.find(e =>
+    e.type === 'human.intervention' && (e.data as InterventionData).phase === phase,
+  );
+}
+
+// A QA review pass mid-flight: status=review, round 1, PR #214, head anchored at HEAD_SHA.
+// The head/time/token gate tests share this exact shape and vary only by id + one extra field.
+function seedReviewPass(id: string, extra: Partial<TaskState> = {}): Promise<TaskState> {
+  return seedTask({
+    id, status: 'review', reviewRound: 1, prNumber: 214,
+    latestHeadSha: HEAD_SHA, reviewHeadAnchorSha: HEAD_SHA, qaAgentId: 'qa-1',
+    ...extra,
+  });
+}
+
+// The accept-path stub: QA released, dev acquired + resumed, merge stubbed, authoritative head = HEAD_SHA.
+function stubApproveFlow(): StubSpies {
+  return stubManager({
+    releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true,
+    mergePr: undefined, fetchPrHeadSha: HEAD_SHA,
+  });
+}
+
+// A self-contained manager + bus + handlers on its own EventLog dir, for tests that need a
+// non-default config (no-QA pairing, manual merge) without disturbing the shared `manager`.
+async function makeLocalHandlers(
+  config: BaxianConfig,
+  eventsDirName: string,
+): Promise<{ manager: AgentManager; bus: EventBus; events: BaxianEvent[] }> {
+  const eventsDir = join(tempDir, eventsDirName);
+  await mkdir(eventsDir, { recursive: true });
+  const bus = new EventBus(new EventLog(eventsDir));
+  const localManager = new AgentManager({
+    config, agentStore, taskStore, lockManager, eventBus: bus,
+    runnerFactory: () => mockRunner, platformRunner: mockRunner,
+  });
+  registerEventHandlers(bus, localManager);
+  const events: BaxianEvent[] = [];
+  bus.on('*', evt => { events.push(evt); });
+  return { manager: localManager, bus, events };
+}
+
 describe('pr.created handler', () => {
   it('transitions in_progress → review and starts QA review session', async () => {
     await seedTask({ id: 'task-001', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-001');
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const updateSpy = vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    const { startSession: startSpy, markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-001',
-      data: { prNumber: 58, prUrl: 'https://github.com/user/repo/pull/58' },
-    });
+    await emitPrCreated('task-001', { prNumber: 58, prUrl: 'https://github.com/user/repo/pull/58' });
 
     const task = await taskStore.get('task-001');
     expect(task!.status).toBe('review');
@@ -165,23 +264,11 @@ describe('pr.created handler', () => {
   });
 
   it('verdict watcher fails to arm → atomically rolls back to in_progress (status+token+anchor), releases QA + intervention', async () => {
-    await seedTask({
-      id: 'task-noarm', status: 'in_progress', reviewRound: 0,
-      signalToken: 'dev-token', reviewHeadAnchorSha: undefined,
-    });
+    await seedTask({ id: 'task-noarm', status: 'in_progress', reviewRound: 0, signalToken: 'dev-token', reviewHeadAnchorSha: undefined });
     await seedDevAgent('task-noarm');
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: false });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const { startSession: startSpy, releaseAgentForTask: releaseSpy } = stubManager({ startSession: true, rotateAndSetupPhaseSignal: { token: 'tok', armed: false }, releaseAgentForTask: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-noarm',
-      data: { prNumber: 58, prUrl: 'https://github.com/user/repo/pull/58' },
-    });
+    await emitPrCreated('task-noarm', { prNumber: 58, prUrl: 'https://github.com/user/repo/pull/58' });
 
     expect(startSpy).not.toHaveBeenCalled();
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-noarm', 'idle');
@@ -191,10 +278,7 @@ describe('pr.created handler', () => {
     expect(task!.status).toBe('in_progress');
     expect(task!.signalToken).toBe('dev-token');
     expect(task!.qaAgentId).toBeUndefined();
-    expect(
-      emittedEvents.some(e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'qa-review-arm-failed'),
-    ).toBe(true);
+    expect(findInterventionByPhase('qa-review-arm-failed')).toBeDefined();
   });
 
   it('pane-signal pr.created (no event.data.headSha) verifies prNumber via gh + pins latestHeadSha + reviewHeadAnchorSha', async () => {
@@ -204,24 +288,15 @@ describe('pr.created handler', () => {
     // immutable reviewHeadAnchorSha for the upcoming QA review.
     await seedTask({ id: 'task-pane-create', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-pane-create');
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
     const verifySpy = vi.spyOn(manager, 'verifyPaneSignalPrNumber')
       .mockResolvedValue({ headRefName: 'bx/task-pane-create', headSha: HEAD_SHA });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-create',
-      data: {
-        kind: 'pr-created',
-        prNumber: 199,
-        source: 'pane-signal',
-        // intentionally no headSha — pane signal does not carry it
-      },
+    await emitPrCreated('task-pane-create', {
+      kind: 'pr-created',
+      prNumber: 199,
+      source: 'pane-signal',
+      // intentionally no headSha — pane signal does not carry it
     });
 
     expect(verifySpy).toHaveBeenCalledWith('task-pane-create', 199);
@@ -232,26 +307,15 @@ describe('pr.created handler', () => {
 
   it('pane-signal pr.created REJECTS when verify returns undefined (no transition, intervention emitted)', async () => {
     await seedTask({ id: 'task-pane-bad', status: 'in_progress', reviewRound: 0 });
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+    const { startSession: startSpy } = stubManager({ startSession: true, verifyPaneSignalPrNumber: undefined, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-bad',
-      data: { prNumber: 9999, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-bad', { prNumber: 9999, source: 'pane-signal' });
 
     const task = await taskStore.get('task-pane-bad');
     expect(task!.status).toBe('in_progress');
     expect(task!.prNumber).toBe(58);
     expect(startSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-pane-bad',
-    );
+    const intervention = findIntervention('task-pane-bad');
     expect(intervention!.data.phase).toBe('pane-pr-created-branch-mismatch');
     expect(intervention!.data.claimedPrNumber).toBe(9999);
   });
@@ -259,21 +323,12 @@ describe('pr.created handler', () => {
   it('pane-signal pr.created reconciles task.branch atomically via transition patch', async () => {
     await seedTask({ id: 'task-pane-recon', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-pane-recon');
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    stubManager({ startSession: true, markAgentWaiting: true, verifyPaneSignalPrNumber: undefined });
     vi.spyOn(manager, 'fetchPrHeadRef')
       .mockResolvedValue({ headRefName: 'fix/custom-branch', headSha: HEAD_SHA, body: '<!-- baxian:managed -->\nsome description' });
     vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-recon',
-      data: { prNumber: 200, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-recon', { prNumber: 200, source: 'pane-signal' });
 
     const task = await taskStore.get('task-pane-recon');
     expect(task!.status).toBe('review');
@@ -283,73 +338,35 @@ describe('pr.created handler', () => {
 
   it('pane-signal pr.created REJECTS when PR branch is bound to another task', async () => {
     await seedTask({ id: 'task-pane-bound', status: 'in_progress', reviewRound: 0 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    stubManager({ startSession: true, verifyPaneSignalPrNumber: undefined });
     vi.spyOn(manager, 'fetchPrHeadRef')
       .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
     vi.spyOn(manager, 'findTaskByBranch')
       .mockResolvedValue({ id: 'task-other', branch: 'bx/task-other' } as TaskState);
     vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-bound',
-      data: { prNumber: 9999, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-bound', { prNumber: 9999, source: 'pane-signal' });
 
     const task = await taskStore.get('task-pane-bound');
     expect(task!.status).toBe('in_progress');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-pane-bound',
-    );
+    const intervention = findIntervention('task-pane-bound');
     expect(intervention!.data.phase).toBe('pane-pr-created-branch-mismatch');
   });
 
-  it('pane-signal pr.created REJECTS when PR branch has foreign bx/ prefix', async () => {
-    await seedTask({ id: 'task-pane-bx', status: 'in_progress', reviewRound: 0 });
+  it.each([
+    ['foreign bx/ prefix', 'task-pane-bx', { headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' }],
+    ['PR body lacks managed marker', 'task-pane-nomark', { headRefName: 'fix/unmanaged', headSha: HEAD_SHA, body: 'just a plain PR' }],
+  ])('pane-signal pr.created REJECTS when %s', async (_label, id, headRef) => {
+    await seedTask({ id, status: 'in_progress', reviewRound: 0 });
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'fetchPrHeadRef')
-      .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
-    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadRef').mockResolvedValue(headRef);
+    stubManager({ findTaskByBranch: undefined, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-bx',
-      data: { prNumber: 9999, source: 'pane-signal' },
-    });
+    await emitPrCreated(id, { prNumber: 9999, source: 'pane-signal' });
 
-    const task = await taskStore.get('task-pane-bx');
+    const task = await taskStore.get(id);
     expect(task!.status).toBe('in_progress');
-    expect(task!.branch).toBe('bx/task-pane-bx');
-  });
-
-  it('pane-signal pr.created REJECTS when PR body lacks managed marker', async () => {
-    await seedTask({ id: 'task-pane-nomark', status: 'in_progress', reviewRound: 0 });
-    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'fetchPrHeadRef')
-      .mockResolvedValue({ headRefName: 'fix/unmanaged', headSha: HEAD_SHA, body: 'just a plain PR' });
-    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-nomark',
-      data: { prNumber: 9999, source: 'pane-signal' },
-    });
-
-    const task = await taskStore.get('task-pane-nomark');
-    expect(task!.status).toBe('in_progress');
-    expect(task!.branch).toBe('bx/task-pane-nomark');
+    expect(task!.branch).toBe(`bx/${id}`);
   });
 
   it('pane-signal pr.created reject re-sets up develop watcher so a corrected emit can be consumed', async () => {
@@ -357,17 +374,9 @@ describe('pr.created handler', () => {
     // re-arm, dev's corrected `[bx:pr-created:<right-num>:token]` would be
     // unconsumed until a server restart.
     await seedTask({ id: 'task-pane-rearm', status: 'in_progress', reviewRound: 0 });
-    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
-    const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+    const { setupPhaseSignal: armSpy } = stubManager({ verifyPaneSignalPrNumber: undefined, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-rearm',
-      data: { prNumber: 9999, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-rearm', { prNumber: 9999, source: 'pane-signal' });
 
     expect(armSpy).toHaveBeenCalledWith(
       'task-pane-rearm', 'dev-1', ['spec-done', 'pr-created'], { skipSnapshot: true },
@@ -376,17 +385,9 @@ describe('pr.created handler', () => {
 
   it('pane-signal pr.created re-sets up with [pr-created] only when task.phase=code', async () => {
     await seedTask({ id: 'task-pane-rearm-code', status: 'in_progress', phase: 'code', reviewRound: 0 });
-    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
-    const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+    const { setupPhaseSignal: armSpy } = stubManager({ verifyPaneSignalPrNumber: undefined, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-rearm-code',
-      data: { prNumber: 9999, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-rearm-code', { prNumber: 9999, source: 'pane-signal' });
 
     expect(armSpy).toHaveBeenCalledWith('task-pane-rearm-code', 'dev-1', ['pr-created'], { skipSnapshot: true });
   });
@@ -396,21 +397,12 @@ describe('pr.created handler', () => {
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockRejectedValue(new Error('gh transient'));
     const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-rearm-err',
-      data: { prNumber: 100, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-rearm-err', { prNumber: 100, source: 'pane-signal' });
 
     expect(armSpy).toHaveBeenCalledWith(
       'task-pane-rearm-err', 'dev-1', ['spec-done', 'pr-created'], { skipSnapshot: false },
     );
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-pane-rearm-err',
-    );
+    const intervention = findIntervention('task-pane-rearm-err');
     expect(intervention).toBeDefined();
     expect(intervention!.data.phase).toBe('pane-pr-created-verify-error');
   });
@@ -420,27 +412,16 @@ describe('pr.created handler', () => {
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
     vi.spyOn(manager, 'fetchPrHeadRef')
       .mockResolvedValue({ headRefName: 'fix/conflict-branch', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
-    vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'transitionTaskStatus').mockResolvedValue(null);
-    const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+    const { setupPhaseSignal: armSpy } = stubManager({ findTaskByBranch: undefined, transitionTaskStatus: null, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-pane-txfail',
-      data: { prNumber: 200, source: 'pane-signal' },
-    });
+    await emitPrCreated('task-pane-txfail', { prNumber: 200, source: 'pane-signal' });
 
     expect(armSpy).toHaveBeenCalledWith(
       'task-pane-txfail', 'dev-1', ['spec-done', 'pr-created'], { skipSnapshot: true },
     );
     const task = await taskStore.get('task-pane-txfail');
     expect(task!.status).toBe('in_progress');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-pane-txfail',
-    );
+    const intervention = findIntervention('task-pane-txfail');
     expect(intervention).toBeDefined();
     expect(intervention!.data.phase).toBe('pane-pr-created-transition-failed');
   });
@@ -448,18 +429,9 @@ describe('pr.created handler', () => {
   it('writes task.latestHeadSha from pr.created event headSha', async () => {
     await seedTask({ id: 'task-seed-head', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-seed-head');
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-seed-head',
-      data: { prNumber: 70, headSha: HEAD_SHA },
-    });
+    await emitPrCreated('task-seed-head', { prNumber: 70, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-seed-head');
     expect(task!.latestHeadSha).toBe(HEAD_SHA);
@@ -468,18 +440,10 @@ describe('pr.created handler', () => {
   it('pins task.reviewDispatchedAt when dispatching the QA review pass (freshness anchor)', async () => {
     await seedTask({ id: 'task-dispatched-at', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-dispatched-at');
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    stubManager({ startSession: true, markAgentWaiting: true });
 
     const before = Date.now();
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-dispatched-at',
-      data: { prNumber: 70, headSha: HEAD_SHA },
-    });
+    await emitPrCreated('task-dispatched-at', { prNumber: 70, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-dispatched-at');
     expect(task!.reviewDispatchedAt).toBeTruthy();
@@ -487,32 +451,16 @@ describe('pr.created handler', () => {
   });
 
   it('pr.created rotates signalToken in the transition so a failed QA dispatch invalidates the old pass token', async () => {
-    await seedTask({
-      id: 'task-cr-tokrot',
-      status: 'fixing',
-      reviewRound: 1,
-      prNumber: 70,
-      signalToken: 'old-pass-token-1',
-    });
+    await seedTask({ id: 'task-cr-tokrot', status: 'fixing', reviewRound: 1, prNumber: 70, signalToken: 'old-pass-token-1' });
     await seedDevAgent('task-cr-tokrot');
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false); // QA dispatch fails here
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-cr-tokrot',
-      data: { prNumber: 70, headSha: HEAD_SHA },
-    });
+    await emitPrCreated('task-cr-tokrot', { prNumber: 70, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-cr-tokrot');
     expect(task!.signalToken).toBeTruthy();
     expect(task!.signalToken).not.toBe('old-pass-token-1'); // rotated despite the failed acquire
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-cr-tokrot'
-        && (e.data.phase as string) === 'qa-acquire-failed',
-    );
+    const intervention = findIntervention('task-cr-tokrot', 'qa-acquire-failed');
     expect(intervention).toBeTruthy();
   });
 
@@ -521,14 +469,7 @@ describe('pr.created handler', () => {
     await seedDevAgent('task-001b');
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-001b',
-      data: { prNumber: 60 },
-    });
+    await emitPrCreated('task-001b', { prNumber: 60 });
 
     const task = await taskStore.get('task-001b');
     expect(task!.status).toBe('review');
@@ -537,18 +478,9 @@ describe('pr.created handler', () => {
 
   it('cancelled task → no-op (terminal guard)', async () => {
     await seedTask({ id: 'task-cancel', status: 'cancelled', reviewRound: 0 });
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const updateSpy = vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    const { startSession: startSpy, markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-cancel',
-      data: { prNumber: 1 },
-    });
+    await emitPrCreated('task-cancel', { prNumber: 1 });
 
     const task = await taskStore.get('task-cancel');
     expect(task!.status).toBe('cancelled');
@@ -566,14 +498,7 @@ describe('pr.created handler', () => {
     await seedTask({ id: 'task-rv', status: 'review', reviewRound: 1, prNumber: 99 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rv',
-      data: { prNumber: 99 },
-    });
+    await emitPrCreated('task-rv', { prNumber: 99 });
 
     expect(startSpy).not.toHaveBeenCalled();
   });
@@ -586,19 +511,7 @@ describe('pr.created handler', () => {
         agent: [[CONFIG.project[0].agent[0][0]]], // dev only
       }],
     };
-    const lonelyManager = new AgentManager({
-      config: noQaConfig,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      runnerFactory: () => mockRunner,
-      platformRunner: mockRunner,
-    });
-    await mkdir(join(tempDir, 'events-lonely'), { recursive: true });
-    const localEventLog = new EventLog(join(tempDir, 'events-lonely'));
-    const localBus = new EventBus(localEventLog);
-    registerEventHandlers(localBus, lonelyManager);
+    const { manager: lonelyManager, bus: localBus } = await makeLocalHandlers(noQaConfig, 'events-lonely');
 
     await seedTask({ id: 'task-noqa', status: 'in_progress', reviewRound: 0 });
     const startSpy = vi.spyOn(lonelyManager, 'startSession').mockResolvedValue(true);
@@ -631,18 +544,9 @@ describe('pr.created handler', () => {
 
   it('startSession resolve(false) from in_progress → stay in review + emit human.intervention (qaAgentId pre-arm rolled back)', async () => {
     await seedTask({ id: 'task-rb1', status: 'in_progress', reviewRound: 0 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const updateSpy = vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: false, markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rb1',
-      data: { prNumber: 22 },
-    });
+    await emitPrCreated('task-rb1', { prNumber: 22 });
 
     const task = await taskStore.get('task-rb1');
     expect(task!.status).toBe('review');
@@ -658,9 +562,7 @@ describe('pr.created handler', () => {
       ['task-rb1', { qaAgentId: 'qa-1' }],
       ['task-rb1', { qaAgentId: undefined }],
     ]);
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-rb1',
-    );
+    const intervention = findIntervention('task-rb1');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
   });
@@ -673,61 +575,32 @@ describe('pr.created handler', () => {
       'runtime dialog (already handled)',
     );
     vi.spyOn(manager, 'startSession').mockRejectedValue(dialogErr);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const { releaseAgentForTask: releaseSpy } = stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-dialog-handled',
-      data: { prNumber: 81 },
-    });
+    await emitPrCreated('task-dialog-handled', { prNumber: 81 });
 
     expect(releaseSpy).not.toHaveBeenCalled();
-    const startFailedIntervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && (e.data?.phase as string) === 'qa-review-start-failed',
-    );
+    const startFailedIntervention = findInterventionByPhase('qa-review-start-failed');
     expect(startFailedIntervention).toBeUndefined();
   });
 
   it('startSession returns false → QA acquire is rolled back via releaseAgentForTask("idle")', async () => {
     await seedTask({ id: 'task-rb-rollback', status: 'in_progress', reviewRound: 0 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const { releaseAgentForTask: releaseSpy } = stubManager({ startSession: false, releaseAgentForTask: true, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rb-rollback',
-      data: { prNumber: 80 },
-    });
+    await emitPrCreated('task-rb-rollback', { prNumber: 80 });
 
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-rb-rollback', 'idle');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-rb-rollback',
-    );
+    const intervention = findIntervention('task-rb-rollback');
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
   });
 
   it('startSession hard error from fixing → stay in review + emit human.intervention (qaAgentId pre-arm rolled back)', async () => {
     await seedTask({ id: 'task-rb2', status: 'fixing', reviewRound: 1, prNumber: 30 });
     vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('boom'));
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const updateSpy = vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rb2',
-      data: { prNumber: 30 },
-    });
+    await emitPrCreated('task-rb2', { prNumber: 30 });
 
     const task = await taskStore.get('task-rb2');
     expect(task!.status).toBe('review');
@@ -739,9 +612,7 @@ describe('pr.created handler', () => {
       ['task-rb2', { qaAgentId: 'qa-1' }],
       ['task-rb2', { qaAgentId: undefined }],
     ]);
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-rb2',
-    );
+    const intervention = findIntervention('task-rb2');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
   });
@@ -754,14 +625,7 @@ describe('pr.created handler', () => {
       return false;
     });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rb3',
-      data: { prNumber: 31 },
-    });
+    await emitPrCreated('task-rb3', { prNumber: 31 });
 
     const task = await taskStore.get('task-rb3');
     expect(task!.status).toBe('cancelled');
@@ -775,23 +639,9 @@ describe('pr.created handler', () => {
         agent: [[{ id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' }]],
       }],
     };
-    const lonelyManager = new AgentManager({
-      config: noQaConfig,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      runnerFactory: () => mockRunner,
-      platformRunner: mockRunner,
-    });
-    // Single Date.now() call: two reads can differ by 1ms under CI and leave EventLog pointing at a missing dir.
-    const lonelyDir = join(tempDir, `events-lonely-${Date.now()}`);
-    const localEventLog = new EventLog(lonelyDir);
-    await mkdir(lonelyDir, { recursive: true });
-    const localBus = new EventBus(localEventLog);
-    registerEventHandlers(localBus, lonelyManager);
-    const localEvents: BaxianEvent[] = [];
-    localBus.on('*', evt => { localEvents.push(evt); });
+    const { manager: lonelyManager, bus: localBus, events: localEvents } = await makeLocalHandlers(
+      noQaConfig, `events-lonely-${Date.now()}`,
+    );
 
     await seedTask({ id: 'task-no-qa-fail', status: 'in_progress', reviewRound: 0 });
     vi.spyOn(lonelyManager, 'markAgentWaiting').mockResolvedValue(false);
@@ -815,20 +665,9 @@ describe('pr.created handler', () => {
 
   it('dev-wait-gate-failed-after-qa-started: paired QA started + markAgentWaiting false → markAwaitingHuman on QA (do NOT release; review prompt may still be running)', async () => {
     await seedTask({ id: 'task-mk-fail', status: 'in_progress', reviewRound: 0 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'updateTask').mockResolvedValue();
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(false);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const awaitingSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
+    const { releaseAgentForTask: releaseSpy, markAwaitingHuman: awaitingSpy } = stubManager({ startSession: true, updateTask: undefined, markAgentWaiting: false, releaseAgentForTask: true, markAwaitingHuman: undefined });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-mk-fail',
-      data: { prNumber: 51 },
-    });
+    await emitPrCreated('task-mk-fail', { prNumber: 51 });
 
     // 关键差异：不再裸 release QA pane（review prompt 可能仍在跑），改为 markAwaitingHuman
     expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-mk-fail', 'idle');
@@ -859,38 +698,17 @@ describe('pr.created handler', () => {
       if (patch && 'qaAgentId' in patch) calls.push('updateTask(qaAgentId)');
     });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-order',
-      data: { prNumber: 1 },
-    });
+    await emitPrCreated('task-order', { prNumber: 1 });
 
     expect(calls).toEqual(['updateTask(qaAgentId)', 'startSession', 'markAgentWaiting']);
   });
 
   it('spec phase: pr.created early-exits — no transition, no QA dispatch', async () => {
-    await seedTask({
-      id: 'task-spec-pr-created',
-      status: 'review',
-      phase: 'spec',
-      reviewRound: 0,
-      specReviewRound: 1,
-      signalToken: 'spec-tok-a',
-    });
+    await seedTask({ id: 'task-spec-pr-created', status: 'review', phase: 'spec', reviewRound: 0, specReviewRound: 1, signalToken: 'spec-tok-a' });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-spec-pr-created',
-      data: { prNumber: 99 },
-    });
+    await emitPrCreated('task-spec-pr-created', { prNumber: 99 });
 
     expect(transitionSpy).not.toHaveBeenCalled();
     expect(startSpy).not.toHaveBeenCalled();
@@ -898,101 +716,43 @@ describe('pr.created handler', () => {
 });
 
 describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
-  it('pr.created from in_progress (reviewRound 0) → reviewRound 1 + status review', async () => {
-    await seedTask({ id: 'task-rr-created', status: 'in_progress', reviewRound: 0 });
-    await seedDevAgent('task-rr-created');
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+  // Only the FIRST review pass (from in_progress, round 0) bumps to round 1; a re-push from
+  // fixing (round 2) is a recheck and keeps the round.
+  it.each([
+    ['in_progress' as TaskStatus, 0, 'task-rr-created', 58, 1],
+    ['fixing' as TaskStatus, 2, 'task-rr-created-fixing', 60, 2],
+  ])('pr.created from %s (reviewRound %i) → status review, reviewRound %i', async (status, roundIn, id, prNumber, roundOut) => {
+    await seedTask({ id, status, reviewRound: roundIn, prNumber });
+    await seedDevAgent(id);
+    stubManager({ startSession: true, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-created',
-      data: { prNumber: 58 },
-    });
+    await emitPrCreated(id, { prNumber });
 
-    const task = await taskStore.get('task-rr-created');
+    const task = await taskStore.get(id);
     expect(task!.status).toBe('review');
-    expect(task!.reviewRound).toBe(1);
+    expect(task!.reviewRound).toBe(roundOut);
   });
 
-  it('pr.created from fixing (reviewRound 2) → reviewRound stays 2 (no bump when not first review)', async () => {
-    await seedTask({ id: 'task-rr-created-fixing', status: 'fixing', reviewRound: 2, prNumber: 60 });
-    await seedDevAgent('task-rr-created-fixing');
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+  it.each([
+    ['in_progress' as TaskStatus, 0, 'task-rr-push', 50, 1],
+    ['fixing' as TaskStatus, 2, 'task-rr-push-fixing', 62, 2],
+  ])('pr.updated push from %s (reviewRound %i) → status review, reviewRound %i', async (status, roundIn, id, prNumber, roundOut) => {
+    await seedTask({ id, status, reviewRound: roundIn, prNumber });
+    stubManager({ startSession: true, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-created-fixing',
-      data: { prNumber: 60 },
-    });
+    await emitPrUpdated(id, { prNumber, kind: 'push' });
 
-    const task = await taskStore.get('task-rr-created-fixing');
+    const task = await taskStore.get(id);
     expect(task!.status).toBe('review');
-    expect(task!.reviewRound).toBe(2);
-  });
-
-  it('pr.updated push from in_progress (reviewRound 0) → reviewRound 1 (catch-up first review bumps)', async () => {
-    await seedTask({ id: 'task-rr-push', status: 'in_progress', reviewRound: 0, prNumber: 50 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-push',
-      data: { prNumber: 50, kind: 'push' },
-    });
-
-    const task = await taskStore.get('task-rr-push');
-    expect(task!.status).toBe('review');
-    expect(task!.reviewRound).toBe(1);
-  });
-
-  it('pr.updated push from fixing (reviewRound 2) → reviewRound stays 2 (recheck does NOT bump), status review', async () => {
-    await seedTask({ id: 'task-rr-push-fixing', status: 'fixing', reviewRound: 2, prNumber: 62 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-push-fixing',
-      data: { prNumber: 62, kind: 'push' },
-    });
-
-    const task = await taskStore.get('task-rr-push-fixing');
-    expect(task!.status).toBe('review');
-    expect(task!.reviewRound).toBe(2);
+    expect(task!.reviewRound).toBe(roundOut);
   });
 
   it('review.submitted catch-up from in_progress (reviewRound 0) + APPROVE → reviewRound 1, status approved', async () => {
     await seedTask({ id: 'task-rr-catchup-approve', status: 'in_progress', reviewRound: 0, prNumber: undefined });
     await seedDevAgent('task-rr-catchup-approve');
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    stubManager({ markAgentWaiting: true, releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-catchup-approve',
-      data: { action: 'APPROVE', prNumber: 99, headSha: HEAD_SHA },
-    });
+    await emitReview('task-rr-catchup-approve', { action: 'APPROVE', prNumber: 99, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-rr-catchup-approve');
     expect(task!.status).toBe('approved');
@@ -1002,19 +762,9 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
   it('review.submitted catch-up from in_progress (reviewRound 0) + REQUEST_CHANGES → reviewRound 2, status fixing (catch-up bump feeds REQUEST_CHANGES pre-increment)', async () => {
     await seedTask({ id: 'task-rr-catchup-rc', status: 'in_progress', reviewRound: 0, prNumber: 50 });
     await seedDevAgent('task-rr-catchup-rc');
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    stubManager({ markAgentWaiting: true, releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-catchup-rc',
-      data: { action: 'REQUEST_CHANGES', prNumber: 50 },
-    });
+    await emitReview('task-rr-catchup-rc', { action: 'REQUEST_CHANGES', prNumber: 50 });
 
     const task = await taskStore.get('task-rr-catchup-rc');
     expect(task!.status).toBe('fixing');
@@ -1024,21 +774,10 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
   it('REQUEST_CHANGES pr-fixed watcher fails to arm → does NOT dispatch fix; holds dev awaiting_human (recoverable), not silent waiting', async () => {
     await seedTask({ id: 'task-prfix-noarm', status: 'review', reviewRound: 1, prNumber: 50, qaAgentId: 'qa-1' });
     await seedDevAgent('task-prfix-noarm');
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: false });
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const { continueSession: continueSpy, markAgentWaiting: markWaitSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'tok', armed: false }, continueSession: true, markAgentWaiting: true });
     const holdSpy = vi.spyOn(manager, 'markAwaitingHuman');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-prfix-noarm',
-      data: { action: 'REQUEST_CHANGES', prNumber: 50 },
-    });
+    await emitReview('task-prfix-noarm', { action: 'REQUEST_CHANGES', prNumber: 50 });
 
     expect(continueSpy).not.toHaveBeenCalled();
     // Explicit recoverable hold (resumeAgent refuses signal-arm-failed) instead of a silent
@@ -1052,60 +791,28 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     );
   });
 
-  it('cap (1-based meaning): rounds=2, review reviewRound 2 + REQUEST_CHANGES → max_rounds (3 > 2)', async () => {
-    await seedTask({ id: 'task-rr-cap-over', status: 'review', reviewRound: 2, prNumber: 32, qaAgentId: 'qa-1' });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+  // 1-based cap with rounds=2: round 2 + REQUEST_CHANGES overflows (3 > 2) → max_rounds;
+  // round 1 is still allowed to advance to fixing round 2.
+  it.each([
+    ['2 + REQUEST_CHANGES → max_rounds (3 > 2)', 'task-rr-cap-over', 2, 32, 'max_rounds' as TaskStatus, undefined],
+    ['1 + REQUEST_CHANGES → fixing reviewRound 2 (allowed)', 'task-rr-cap-allow', 1, 33, 'fixing' as TaskStatus, 2],
+  ])('cap (1-based meaning): rounds=2, review reviewRound %s', async (_label, id, roundIn, prNumber, expectStatus, expectRound) => {
+    await seedTask({ id, status: 'review', reviewRound: roundIn, prNumber, qaAgentId: 'qa-1' });
+    stubManager({ releaseAgentForTask: true, continueSession: true });
     manager.replaceConfig({ ...CONFIG, review: { rounds: 2 } });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-cap-over',
-      data: { action: 'REQUEST_CHANGES', prNumber: 32 },
-    });
+    await emitReview(id, { action: 'REQUEST_CHANGES', prNumber });
 
-    const task = await taskStore.get('task-rr-cap-over');
-    expect(task!.status).toBe('max_rounds');
-  });
-
-  it('cap (1-based meaning): rounds=2, review reviewRound 1 + REQUEST_CHANGES → fixing reviewRound 2 (allowed)', async () => {
-    await seedTask({ id: 'task-rr-cap-allow', status: 'review', reviewRound: 1, prNumber: 33, qaAgentId: 'qa-1' });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    manager.replaceConfig({ ...CONFIG, review: { rounds: 2 } });
-
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-cap-allow',
-      data: { action: 'REQUEST_CHANGES', prNumber: 33 },
-    });
-
-    const task = await taskStore.get('task-rr-cap-allow');
-    expect(task!.status).toBe('fixing');
-    expect(task!.reviewRound).toBe(2);
+    const task = await taskStore.get(id);
+    expect(task!.status).toBe(expectStatus);
+    if (expectRound !== undefined) expect(task!.reviewRound).toBe(expectRound);
   });
 
   it('pr.updated push after approval (approved → review re-review) bumps reviewRound (new QA pass)', async () => {
     await seedTask({ id: 'task-rr-approved-push', status: 'approved', reviewRound: 1, prNumber: 73, qaAgentId: 'qa-1' });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    stubManager({ startSession: true, releaseAgentForTask: true, markAgentWaiting: true, acquireAgentForTask: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-approved-push',
-      data: { prNumber: 73, kind: 'push' },
-    });
+    await emitPrUpdated('task-rr-approved-push', { prNumber: 73, kind: 'push' });
 
     const task = await taskStore.get('task-rr-approved-push');
     expect(task!.status).toBe('review');
@@ -1114,19 +821,9 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
 
   it('pr.updated first review (in_progress) + startSession fails → reviewRound restored to 0 (rollback)', async () => {
     await seedTask({ id: 'task-rr-rollback', status: 'in_progress', reviewRound: 0, prNumber: 75 });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true, acquireAgentForTask: true, startSession: false });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-rollback',
-      data: { prNumber: 75, kind: 'push' },
-    });
+    await emitPrUpdated('task-rr-rollback', { prNumber: 75, kind: 'push' });
 
     const task = await taskStore.get('task-rr-rollback');
     expect(task!.status).toBe('in_progress');
@@ -1139,15 +836,7 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh offline'));
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-stale',
-      // reviewed an old head; authoritative head (latestHeadSha) differs → stale, rejected.
-      data: { action: 'APPROVE', prNumber: 80, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA },
-    });
+    await emitReview('task-rr-stale', { action: 'APPROVE', prNumber: 80, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA });
 
     const task = await taskStore.get('task-rr-stale');
     expect(task!.reviewRound).toBe(0);
@@ -1159,35 +848,17 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     // count the first review — reviewRound 0 in the APPROVE branch ⇒ Round 1.
     await seedTask({ id: 'task-rr-stale-then-valid', status: 'in_progress', reviewRound: 0, prNumber: 81, latestHeadSha: NEXT_HEAD_SHA });
     await seedDevAgent('task-rr-stale-then-valid');
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    stubManager({ markAgentWaiting: true, releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
     vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh offline'));
 
     // 1) stale APPROVE (reviewed an old head; authoritative head = NEXT_HEAD_SHA) → rejected.
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-stale-then-valid',
-      data: { action: 'APPROVE', prNumber: 81, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA },
-    });
+    await emitReview('task-rr-stale-then-valid', { action: 'APPROVE', prNumber: 81, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA });
     const afterStale = await taskStore.get('task-rr-stale-then-valid');
     expect(afterStale!.status).toBe('review');
     expect(afterStale!.reviewRound).toBe(0);
 
     // 2) valid APPROVE on the current head → approved, first review finally counted as Round 1.
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rr-stale-then-valid',
-      data: { action: 'APPROVE', prNumber: 81, headSha: NEXT_HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA },
-    });
+    await emitReview('task-rr-stale-then-valid', { action: 'APPROVE', prNumber: 81, headSha: NEXT_HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA });
     const afterValid = await taskStore.get('task-rr-stale-then-valid');
     expect(afterValid!.status).toBe('approved');
     expect(afterValid!.reviewRound).toBe(1);
@@ -1207,14 +878,7 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
       return true;
     });
 
-    await emitAndWait({
-      type: 'pr.created',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-race',
-      data: { prNumber: 90 },
-    });
+    await emitPrCreated('task-rr-race', { prNumber: 90 });
 
     const task = await taskStore.get('task-rr-race');
     expect(task!.reviewRound).toBe(1);
@@ -1229,23 +893,14 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     // no-opped here, leaving round 1).
     await seedTask({ id: 'task-rr-appr-race', status: 'approved', reviewRound: 1, prNumber: 91, qaAgentId: 'qa-1' });
     await seedDevAgent('task-rr-appr-race');
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true, acquireAgentForTask: true });
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
       const t = await taskStore.get('task-rr-appr-race');
       await taskStore.set({ ...t!, status: 'approved', reviewRound: 1 });
       return true;
     });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-rr-appr-race',
-      data: { prNumber: 91, kind: 'push' },
-    });
+    await emitPrUpdated('task-rr-appr-race', { prNumber: 91, kind: 'push' });
 
     const task = await taskStore.get('task-rr-appr-race');
     expect(task!.reviewRound).toBe(2);
@@ -1257,14 +912,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-up1', status: 'in_progress', reviewRound: 0, prNumber: 50 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up1',
-      data: { prNumber: 50 },
-    });
+    await emitPrUpdated('task-up1', { prNumber: 50 });
 
     const task = await taskStore.get('task-up1');
     expect(task!.status).toBe('review');
@@ -1272,26 +920,11 @@ describe('pr.updated handler', () => {
   });
 
   it('spec phase: pr.updated push early-exits — no transition, no recheck dispatch', async () => {
-    await seedTask({
-      id: 'task-spec-pr-push',
-      status: 'review',
-      phase: 'spec',
-      reviewRound: 0,
-      specReviewRound: 1,
-      signalToken: 'spec-tok-b',
-      prNumber: 70,
-    });
+    await seedTask({ id: 'task-spec-pr-push', status: 'review', phase: 'spec', reviewRound: 0, specReviewRound: 1, signalToken: 'spec-tok-b', prNumber: 70 });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-spec-pr-push',
-      data: { prNumber: 70, kind: 'push', headSha: HEAD_SHA },
-    });
+    await emitPrUpdated('task-spec-pr-push', { prNumber: 70, kind: 'push', headSha: HEAD_SHA });
 
     expect(transitionSpy).not.toHaveBeenCalled();
     expect(startSpy).not.toHaveBeenCalled();
@@ -1301,25 +934,10 @@ describe('pr.updated handler', () => {
   });
 
   it('spec phase: pr.updated comment/review-comment also early-exits', async () => {
-    await seedTask({
-      id: 'task-spec-pr-comment',
-      status: 'review',
-      phase: 'spec',
-      reviewRound: 0,
-      specReviewRound: 1,
-      signalToken: 'spec-tok-c',
-      prNumber: 71,
-    });
+    await seedTask({ id: 'task-spec-pr-comment', status: 'review', phase: 'spec', reviewRound: 0, specReviewRound: 1, signalToken: 'spec-tok-c', prNumber: 71 });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-spec-pr-comment',
-      data: { prNumber: 71, kind: 'review-comment' },
-    });
+    await emitPrUpdated('task-spec-pr-comment', { prNumber: 71, kind: 'review-comment' });
 
     expect(transitionSpy).not.toHaveBeenCalled();
   });
@@ -1329,14 +947,7 @@ describe('pr.updated handler', () => {
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-c',
-      data: { prNumber: 60, prUrl: 'https://github.com/u/r/pull/60', kind: 'comment' },
-    });
+    await emitPrUpdated('task-up-c', { prNumber: 60, prUrl: 'https://github.com/u/r/pull/60', kind: 'comment' });
 
     expect(startSpy).not.toHaveBeenCalled();
     expect(transitionSpy).not.toHaveBeenCalled();
@@ -1349,14 +960,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-up-rc', status: 'fixing', reviewRound: 1, prNumber: 61, prUrl: 'https://x/61' });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-rc',
-      data: { prNumber: 61, kind: 'review-comment' },
-    });
+    await emitPrUpdated('task-up-rc', { prNumber: 61, kind: 'review-comment' });
 
     expect(startSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-up-rc');
@@ -1364,31 +968,14 @@ describe('pr.updated handler', () => {
   });
 
   it('comment-only kind=comment after approval preserves the approved head and re-dispatches dev check', async () => {
-    await seedTask({
-      id: 'task-up-approved-comment',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 63,
-    });
-    await manager.setPostApproveCompletion('task-up-approved-comment', {
-      token: 'old-post-token',
-      approvedHeadSha: HEAD_SHA,
-    });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-approved-comment', status: 'approved', reviewRound: 1, prNumber: 63 });
+    await manager.setPostApproveCompletion('task-up-approved-comment', { token: 'old-post-token', approvedHeadSha: HEAD_SHA });
+    const { releaseAgentForTask: releaseSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved-comment',
-      data: {
-        prNumber: 63,
-        kind: 'comment',
-        headSha: NEXT_HEAD_SHA,
-      },
+    await emitPrUpdated('task-up-approved-comment', {
+      prNumber: 63,
+      kind: 'comment',
+      headSha: NEXT_HEAD_SHA,
     });
 
     const task = await taskStore.get('task-up-approved-comment');
@@ -1410,31 +997,13 @@ describe('pr.updated handler', () => {
   });
 
   it('approved-window review-comment during RUNNING post-approve coalesces into pendingRedispatch (no interrupt, no dispatch, no count bump, token preserved)', async () => {
-    await seedTask({
-      id: 'task-up-running-skip',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 99,
-    });
+    await seedTask({ id: 'task-up-running-skip', status: 'approved', reviewRound: 1, prNumber: 99 });
     await seedDevAgent('task-up-running-skip', 'dev-1');
-    await manager.setPostApproveCompletion('task-up-running-skip', {
-      token: 'active-token-skip',
-      approvedHeadSha: HEAD_SHA,
-      redispatchCount: 3,
-    });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await manager.setPostApproveCompletion('task-up-running-skip', { token: 'active-token-skip', approvedHeadSha: HEAD_SHA, redispatchCount: 3 });
+    const { releaseAgentForTask: releaseSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
     const clearSpy = vi.spyOn(manager, 'clearPostApproveCompletion');
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-running-skip',
-      data: { prNumber: 99, kind: 'review-comment', reviewCommentReply: true },
-    });
+    await emitPrUpdated('task-up-running-skip', { prNumber: 99, kind: 'review-comment', reviewCommentReply: true });
 
     expect(releaseSpy).not.toHaveBeenCalled();
     expect(acquireSpy).not.toHaveBeenCalled();
@@ -1447,38 +1016,17 @@ describe('pr.updated handler', () => {
   });
 
   it('pr-merge-ready with pendingRedispatch=true triggers redispatch instead of mergePr', async () => {
-    await seedTask({
-      id: 'task-up-pending-redispatch',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 101,
-    });
+    await seedTask({ id: 'task-up-pending-redispatch', status: 'approved', reviewRound: 1, prNumber: 101 });
     await seedDevAgent('task-up-pending-redispatch', 'dev-1');
-    await manager.setPostApproveCompletion('task-up-pending-redispatch', {
-      token: 'token-with-pending',
-      approvedHeadSha: HEAD_SHA,
-      redispatchCount: 2,
-      pendingRedispatch: true,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await manager.setPostApproveCompletion('task-up-pending-redispatch', { token: 'token-with-pending', approvedHeadSha: HEAD_SHA, redispatchCount: 2, pendingRedispatch: true });
+    const { markAgentWaiting: markWaitSpy, continueSession: continueSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, markAgentWaiting: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-pending-redispatch',
-      data: {
-        prNumber: 101,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'token-with-pending',
-        source: 'pane-signal',
-      },
+    await emitPrUpdated('task-up-pending-redispatch', {
+      prNumber: 101,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'token-with-pending',
+      source: 'pane-signal',
     });
 
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-up-pending-redispatch');
@@ -1497,42 +1045,21 @@ describe('pr.updated handler', () => {
   });
 
   it('pr-merge-ready with pendingRedispatch=true AT cap escalates to intervention (no merge, no dispatch)', async () => {
-    await seedTask({
-      id: 'task-up-pending-cap',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 102,
-    });
-    await manager.setPostApproveCompletion('task-up-pending-cap', {
-      token: 'token-pending-cap',
-      approvedHeadSha: HEAD_SHA,
-      redispatchCount: 10,
-      pendingRedispatch: true,
-    });
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-up-pending-cap', status: 'approved', reviewRound: 1, prNumber: 102 });
+    await manager.setPostApproveCompletion('task-up-pending-cap', { token: 'token-pending-cap', approvedHeadSha: HEAD_SHA, redispatchCount: 10, pendingRedispatch: true });
+    const { continueSession: continueSpy, mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-pending-cap',
-      data: {
-        prNumber: 102,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'token-pending-cap',
-        source: 'pane-signal',
-      },
+    await emitPrUpdated('task-up-pending-cap', {
+      prNumber: 102,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'token-pending-cap',
+      source: 'pane-signal',
     });
 
     expect(mergeSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-pending-cap',
-    );
+    const intervention = findIntervention('task-up-pending-cap');
     expect(intervention?.data.phase).toBe('post-approve-redispatch-cap-exceeded');
     await expect(
       manager.getPostApproveCompletion('task-up-pending-cap'),
@@ -1540,12 +1067,7 @@ describe('pr.updated handler', () => {
   });
 
   it('approved-window review-comment redispatches when Dev has no active task binding', async () => {
-    await seedTask({
-      id: 'task-up-waiting-redispatch',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 100,
-    });
+    await seedTask({ id: 'task-up-waiting-redispatch', status: 'approved', reviewRound: 1, prNumber: 100 });
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
@@ -1553,22 +1075,10 @@ describe('pr.updated handler', () => {
       updatedAt: new Date().toISOString(),
     });
     await mkdir(join(tempDir, 'worktrees', 'task-up-waiting-redispatch'), { recursive: true });
-    await manager.setPostApproveCompletion('task-up-waiting-redispatch', {
-      token: 'active-token-waiting',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await manager.setPostApproveCompletion('task-up-waiting-redispatch', { token: 'active-token-waiting', approvedHeadSha: HEAD_SHA });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-waiting-redispatch',
-      data: { prNumber: 100, kind: 'review-comment' },
-    });
+    await emitPrUpdated('task-up-waiting-redispatch', { prNumber: 100, kind: 'review-comment' });
 
     expect(continueSpy).toHaveBeenCalledOnce();
     const completion = await manager.getPostApproveCompletion('task-up-waiting-redispatch');
@@ -1577,31 +1087,14 @@ describe('pr.updated handler', () => {
   });
 
   it('human review-comment replies after approval invalidate token and re-dispatch dev check', async () => {
-    await seedTask({
-      id: 'task-up-approved-human-reply',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 65,
-    });
-    await manager.setPostApproveCompletion('task-up-approved-human-reply', {
-      token: 'active-post-token',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-approved-human-reply', status: 'approved', reviewRound: 1, prNumber: 65 });
+    await manager.setPostApproveCompletion('task-up-approved-human-reply', { token: 'active-post-token', approvedHeadSha: HEAD_SHA });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved-human-reply',
-      data: {
-        prNumber: 65,
-        kind: 'review-comment',
-        reviewCommentReply: true,
-      },
+    await emitPrUpdated('task-up-approved-human-reply', {
+      prNumber: 65,
+      kind: 'review-comment',
+      reviewCommentReply: true,
     });
 
     const completion = await manager.getPostApproveCompletion('task-up-approved-human-reply');
@@ -1617,34 +1110,15 @@ describe('pr.updated handler', () => {
   });
 
   it('redispatch cap: 11th approved review-comment escalates AND clears completion token', async () => {
-    await seedTask({
-      id: 'task-up-redispatch-cap',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 88,
-    });
-    await manager.setPostApproveCompletion('task-up-redispatch-cap', {
-      token: 'pre-cap-token',
-      approvedHeadSha: HEAD_SHA,
-      redispatchCount: 10,
-    });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-redispatch-cap', status: 'approved', reviewRound: 1, prNumber: 88 });
+    await manager.setPostApproveCompletion('task-up-redispatch-cap', { token: 'pre-cap-token', approvedHeadSha: HEAD_SHA, redispatchCount: 10 });
+    const { releaseAgentForTask: releaseSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-redispatch-cap',
-      data: { prNumber: 88, kind: 'review-comment' },
-    });
+    await emitPrUpdated('task-up-redispatch-cap', { prNumber: 88, kind: 'review-comment' });
 
     expect(continueSpy).not.toHaveBeenCalled();
     expect(releaseSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-redispatch-cap',
-    );
+    const intervention = findIntervention('task-up-redispatch-cap');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('post-approve-redispatch-cap-exceeded');
     expect(intervention!.data.redispatchCount).toBe(10);
@@ -1655,46 +1129,21 @@ describe('pr.updated handler', () => {
   });
 
   it('redispatch cap: signal arriving after cap-exceeded does NOT trigger mergePr', async () => {
-    await seedTask({
-      id: 'task-up-cap-late-marker',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 89,
-    });
-    await manager.setPostApproveCompletion('task-up-cap-late-marker', {
-      token: 'live-token-pre-cap',
-      approvedHeadSha: HEAD_SHA,
-      redispatchCount: 10,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-up-cap-late-marker', status: 'approved', reviewRound: 1, prNumber: 89 });
+    await manager.setPostApproveCompletion('task-up-cap-late-marker', { token: 'live-token-pre-cap', approvedHeadSha: HEAD_SHA, redispatchCount: 10 });
+    const { markAgentWaiting: markWaitSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, markAgentWaiting: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-cap-late-marker',
-      data: { prNumber: 89, kind: 'review-comment' },
-    });
+    await emitPrUpdated('task-up-cap-late-marker', { prNumber: 89, kind: 'review-comment' });
     await expect(
       manager.getPostApproveCompletion('task-up-cap-late-marker'),
     ).resolves.toBeNull();
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-cap-late-marker',
-      data: {
-        prNumber: 89,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'live-token-pre-cap',
-        source: 'pane-signal',
-      },
+    await emitPrUpdated('task-up-cap-late-marker', {
+      prNumber: 89,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'live-token-pre-cap',
+      source: 'pane-signal',
     });
 
     expect(markWaitSpy).not.toHaveBeenCalled();
@@ -1702,30 +1151,13 @@ describe('pr.updated handler', () => {
   });
 
   it('new feedback after approval keeps the old token if dev cannot be interrupted for redispatch', async () => {
-    await seedTask({
-      id: 'task-up-approved-redispatch-fail',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 66,
-    });
-    await manager.setPostApproveCompletion('task-up-approved-redispatch-fail', {
-      token: 'active-post-token',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-approved-redispatch-fail', status: 'approved', reviewRound: 1, prNumber: 66 });
+    await manager.setPostApproveCompletion('task-up-approved-redispatch-fail', { token: 'active-post-token', approvedHeadSha: HEAD_SHA });
+    const { acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: false, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved-redispatch-fail',
-      data: {
-        prNumber: 66,
-        kind: 'comment',
-      },
+    await emitPrUpdated('task-up-approved-redispatch-fail', {
+      prNumber: 66,
+      kind: 'comment',
     });
 
     await expect(manager.getPostApproveCompletion('task-up-approved-redispatch-fail')).resolves.toEqual(
@@ -1736,9 +1168,7 @@ describe('pr.updated handler', () => {
     );
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-approved-redispatch-fail',
-    );
+    const intervention = findIntervention('task-up-approved-redispatch-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('post-approve-dev-wait-gate-failed-before-redispatch');
   });
@@ -1747,14 +1177,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-up-p', status: 'fixing', reviewRound: 1, prNumber: 62 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-p',
-      data: { prNumber: 62, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-p', { prNumber: 62, kind: 'push' });
 
     expect(startSpy).toHaveBeenCalledWith('task-up-p', 'qa-1', 'recheck');
     const task = await taskStore.get('task-up-p');
@@ -1770,39 +1193,18 @@ describe('pr.updated handler', () => {
       qaAgentId: 'qa-1',
       latestHeadSha: HEAD_SHA, // older
     });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    stubManager({ releaseAgentForTask: true, startSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-head-update',
-      data: { prNumber: 71, kind: 'push', headSha: NEXT_HEAD_SHA },
-    });
+    await emitPrUpdated('task-up-head-update', { prNumber: 71, kind: 'push', headSha: NEXT_HEAD_SHA });
 
     const task = await taskStore.get('task-up-head-update');
     expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
   });
 
   it('default kind (no kind field) with headSha does NOT overwrite latestHeadSha — regression guard', async () => {
-    await seedTask({
-      id: 'task-up-legacy',
-      status: 'in_progress',
-      reviewRound: 0,
-      prNumber: 90,
-      latestHeadSha: HEAD_SHA,
-    });
+    await seedTask({ id: 'task-up-legacy', status: 'in_progress', reviewRound: 0, prNumber: 90, latestHeadSha: HEAD_SHA });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-legacy',
-      data: { prNumber: 90, headSha: NEXT_HEAD_SHA },
-    });
+    await emitPrUpdated('task-up-legacy', { prNumber: 90, headSha: NEXT_HEAD_SHA });
 
     const task = await taskStore.get('task-up-legacy');
     expect(task!.latestHeadSha).toBe(HEAD_SHA);
@@ -1813,24 +1215,10 @@ describe('pr.updated handler', () => {
     // neutrally ("re-check the new commits and any prior feedback"), so it does NOT
     // make the false "dev addressed your prior changes-requested" claim even when no
     // verdict was issued yet — and a push during an actual recheck keeps recheck framing.
-    await seedTask({
-      id: 'task-up-rr',
-      status: 'review',
-      reviewRound: 0,
-      prNumber: 70,
-      qaAgentId: 'qa-1',
-    });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-rr', status: 'review', reviewRound: 0, prNumber: 70, qaAgentId: 'qa-1' });
+    const { releaseAgentForTask: stopSpy, startSession: startSpy } = stubManager({ releaseAgentForTask: true, startSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-rr',
-      data: { prNumber: 70, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-rr', { prNumber: 70, kind: 'push' });
 
     expect(stopSpy).toHaveBeenCalledWith('qa-1', 'task-up-rr', 'idle');
     expect(startSpy).toHaveBeenCalledWith('task-up-rr', 'qa-1', 'recheck');
@@ -1843,29 +1231,13 @@ describe('pr.updated handler', () => {
   });
 
   it('qa-release-failed-cannot-recheck: review→review push + QA release returns false → short-circuit, no startSession', async () => {
-    await seedTask({
-      id: 'task-up-rr-rel-fail',
-      status: 'review',
-      reviewRound: 0,
-      prNumber: 72,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-rr-rel-fail', status: 'review', reviewRound: 0, prNumber: 72, qaAgentId: 'qa-1' });
+    const { startSession: startSpy } = stubManager({ releaseAgentForTask: false, startSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-rr-rel-fail',
-      data: { prNumber: 72, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-rr-rel-fail', { prNumber: 72, kind: 'push' });
 
     expect(startSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-rr-rel-fail',
-    );
+    const intervention = findIntervention('task-up-rr-rel-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-release-failed-cannot-recheck');
     expect(intervention!.data.qaAgentId).toBe('qa-1');
@@ -1875,56 +1247,25 @@ describe('pr.updated handler', () => {
     // If acquire/startSession of the new QA fails, the token must already have rotated
     // (atomic with the anchors) — otherwise an old QA pass could submit a verdict whose
     // stamp still equals the un-rotated task.signalToken and slip past the token gate.
-    await seedTask({
-      id: 'task-up-tokrot',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 70,
-      signalToken: 'old-pass-token-1',
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-up-tokrot', status: 'review', reviewRound: 1, prNumber: 70, signalToken: 'old-pass-token-1', qaAgentId: 'qa-1' });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false); // redispatch fails here
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-tokrot',
-      data: { prNumber: 70, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-tokrot', { prNumber: 70, kind: 'push' });
 
     const task = await taskStore.get('task-up-tokrot');
     expect(task!.signalToken).toBeTruthy();
     expect(task!.signalToken).not.toBe('old-pass-token-1'); // rotated despite the failed acquire
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-tokrot'
-        && (e.data.phase as string) === 'qa-acquire-failed',
-    );
+    const intervention = findIntervention('task-up-tokrot', 'qa-acquire-failed');
     expect(intervention).toBeTruthy();
   });
 
   it('push kind in review with QA start failure: no rollback + emit human.intervention', async () => {
-    await seedTask({
-      id: 'task-up-rr-fail',
-      status: 'review',
-      reviewRound: 0,
-      prNumber: 71,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+    await seedTask({ id: 'task-up-rr-fail', status: 'review', reviewRound: 0, prNumber: 71, qaAgentId: 'qa-1' });
+    stubManager({ releaseAgentForTask: true, startSession: false });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-rr-fail',
-      data: { prNumber: 71, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-rr-fail', { prNumber: 71, kind: 'push' });
 
     const rollbackCalls = transitionSpy.mock.calls.filter(
       args => args[1] === 'review' && Array.isArray((args[2] as { fromStatus?: unknown }).fromStatus)
@@ -1936,33 +1277,16 @@ describe('pr.updated handler', () => {
     const task = await taskStore.get('task-up-rr-fail');
     expect(task!.status).toBe('review');
 
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-rr-fail',
-    );
+    const intervention = findIntervention('task-up-rr-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-recheck-failed-after-stop');
   });
 
   it('push kind after QA approval transitions approved → review and starts QA recheck', async () => {
-    await seedTask({
-      id: 'task-up-approved',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 73,
-      qaAgentId: 'qa-1',
-    });
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-approved', status: 'approved', reviewRound: 1, prNumber: 73, qaAgentId: 'qa-1' });
+    const { startSession: startSpy, releaseAgentForTask: releaseSpy, markAgentWaiting: markWaitSpy } = stubManager({ startSession: true, releaseAgentForTask: true, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved',
-      data: { prNumber: 73, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-approved', { prNumber: 73, kind: 'push' });
 
     const task = await taskStore.get('task-up-approved');
     expect(task!.status).toBe('review');
@@ -1981,27 +1305,10 @@ describe('pr.updated handler', () => {
   it('fixing → review recheck: QA started + markAgentWaiting false → markAwaitingHuman on QA (do NOT release)', async () => {
     // 用 fixing 作为 previousStatus 走 markAgentWaiting 分支（approved 走 early release，
     // 不经过 line 553 的 markAgentWaiting）。
-    await seedTask({
-      id: 'task-up-mk-fail',
-      status: 'fixing',
-      reviewRound: 1,
-      prNumber: 75,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'updateTask').mockResolvedValue();
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(false);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const awaitingSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
+    await seedTask({ id: 'task-up-mk-fail', status: 'fixing', reviewRound: 1, prNumber: 75, qaAgentId: 'qa-1' });
+    const { releaseAgentForTask: releaseSpy, markAwaitingHuman: awaitingSpy } = stubManager({ startSession: true, updateTask: undefined, markAgentWaiting: false, releaseAgentForTask: true, markAwaitingHuman: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-mk-fail',
-      data: { prNumber: 75, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-mk-fail', { prNumber: 75, kind: 'push' });
 
     // 不再裸 release QA pane（recheck prompt 可能仍在跑），改为 markAwaitingHuman
     expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-up-mk-fail', 'idle');
@@ -2014,30 +1321,14 @@ describe('pr.updated handler', () => {
   });
 
   it('push kind after QA approval with QA start failure stays in review and emits intervention', async () => {
-    await seedTask({
-      id: 'task-up-approved-fail',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 74,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-approved-fail', status: 'approved', reviewRound: 1, prNumber: 74, qaAgentId: 'qa-1' });
+    stubManager({ startSession: false, releaseAgentForTask: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved-fail',
-      data: { prNumber: 74, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-approved-fail', { prNumber: 74, kind: 'push' });
 
     const task = await taskStore.get('task-up-approved-fail');
     expect(task!.status).toBe('review');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-approved-fail',
-    );
+    const intervention = findIntervention('task-up-approved-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-recheck-failed-after-approved-push');
   });
@@ -2045,133 +1336,47 @@ describe('pr.updated handler', () => {
   it('approved-push recheck verdict arm fails → stays in review (NOT rolled back to approved), releases QA + intervention', async () => {
     // Rolling back to approved would re-mark the task approved while the new push is unreviewed and
     // the post-approve completion was already cleared by the transition. Stay in review instead.
-    await seedTask({
-      id: 'task-up-approved-noarm', status: 'approved', reviewRound: 1, prNumber: 74, qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'rotated', armed: false });
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-approved-noarm', status: 'approved', reviewRound: 1, prNumber: 74, qaAgentId: 'qa-1' });
+    const { startSession: startSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'rotated', armed: false }, startSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-approved-noarm',
-      data: { prNumber: 74, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-approved-noarm', { prNumber: 74, kind: 'push' });
 
     expect(startSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-up-approved-noarm');
     expect(task!.status).toBe('review');
     expect(task!.qaAgentId).toBeUndefined();
-    expect(
-      emittedEvents.some(e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'qa-recheck-arm-failed-after-approved-push'),
-    ).toBe(true);
+    expect(findInterventionByPhase('qa-recheck-arm-failed-after-approved-push')).toBeDefined();
   });
 
-  it('post-approve complete signal transitions to merge-ready awaiting human confirm (no auto-merge)', async () => {
-    await seedTask({
-      id: 'task-up-post-approved',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 75,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-up-post-approved', {
-      token: 'post-token-75',
-      approvedHeadSha: HEAD_SHA,
-    });
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+  // A post-approve complete signal (poller-sourced or pane-signal) reaches the same merge-ready
+  // gate: transition to merge-ready, clear the completion, mark dev waiting, never auto-merge.
+  it.each([
+    ['poller signal', 'task-up-post-approved', 75, 'post-token-75', {}],
+    ['pane signal source', 'task-up-post-pane', 76, 'post-token-76', { source: 'pane-signal' }],
+  ])('post-approve complete via %s → merge-ready awaiting human confirm (no auto-merge)', async (_label, id, prNumber, token, extra) => {
+    await seedTask({ id, status: 'approved', reviewRound: 1, prNumber, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion(id, { token, approvedHeadSha: HEAD_SHA });
+    const { markAgentWaiting: markWaitSpy, mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-approved',
-      data: {
-        prNumber: 75,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'post-token-75',
-      },
-    });
+    await emitPrUpdated(id, { prNumber, kind: 'pr-merge-ready', verdictAgentId: 'dev-1', token, ...extra });
 
-    const task = await taskStore.get('task-up-post-approved');
+    const task = await taskStore.get(id);
     expect(task!.status).toBe('merge-ready');
-    await expect(manager.getPostApproveCompletion('task-up-post-approved')).resolves.toBeNull();
-    expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-up-post-approved');
+    await expect(manager.getPostApproveCompletion(id)).resolves.toBeNull();
+    expect(markWaitSpy).toHaveBeenCalledWith('dev-1', id);
     expect(mergeSpy).not.toHaveBeenCalled();
-  });
-
-  it('post-approve complete via pane signal source reaches the same merge-ready gate', async () => {
-    await seedTask({
-      id: 'task-up-post-pane',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 76,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-up-post-pane', {
-      token: 'post-token-76',
-      approvedHeadSha: HEAD_SHA,
-    });
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
-
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-pane',
-      data: {
-        prNumber: 76,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'post-token-76',
-        source: 'pane-signal',
-      },
-    });
-
-    const task = await taskStore.get('task-up-post-pane');
-    expect(task!.status).toBe('merge-ready');
-    expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-up-post-pane');
-    expect(mergeSpy).not.toHaveBeenCalled();
-    await expect(manager.getPostApproveCompletion('task-up-post-pane')).resolves.toBeNull();
   });
 
   it('human confirm from merge-ready executes the merge (merge:auto moved to confirm)', async () => {
-    await seedTask({
-      id: 'task-up-post-merge-fail',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 80,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-up-post-merge-fail', {
-      token: 'post-token-80',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-up-post-merge-fail', status: 'approved', reviewRound: 1, prNumber: 80, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion('task-up-post-merge-fail', { token: 'post-token-80', approvedHeadSha: HEAD_SHA });
+    const { mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-merge-fail',
-      data: {
-        prNumber: 80,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'post-token-80',
-      },
+    await emitPrUpdated('task-up-post-merge-fail', {
+      prNumber: 80,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'post-token-80',
     });
     expect((await taskStore.get('task-up-post-merge-fail'))!.status).toBe('merge-ready');
     expect(mergeSpy).not.toHaveBeenCalled();
@@ -2184,33 +1389,15 @@ describe('pr.updated handler', () => {
   it('manual-merge post-approve completion → merge-ready (completion cleared, later comment is a no-op)', async () => {
     CONFIG.project[0]!.merge = null;
     manager.replaceConfig(CONFIG);
-    await seedTask({
-      id: 'task-up-post-manual-complete',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 81,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-up-post-manual-complete', {
-      token: 'post-token-81',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-post-manual-complete', status: 'approved', reviewRound: 1, prNumber: 81, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion('task-up-post-manual-complete', { token: 'post-token-81', approvedHeadSha: HEAD_SHA });
+    const { mergePr: mergeSpy, continueSession: continueSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined, continueSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-manual-complete',
-      data: {
-        prNumber: 81,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'post-token-81',
-      },
+    await emitPrUpdated('task-up-post-manual-complete', {
+      prNumber: 81,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'post-token-81',
     });
 
     const readied = await taskStore.get('task-up-post-manual-complete');
@@ -2222,14 +1409,7 @@ describe('pr.updated handler', () => {
 
     // Once merge-ready, baxian hands off to the human: a later plain comment does not
     // re-run the post-approve check (REQUEST_CHANGES / push are the formal re-open paths).
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-manual-complete',
-      data: { prNumber: 81, kind: 'comment' },
-    });
+    await emitPrUpdated('task-up-post-manual-complete', { prNumber: 81, kind: 'comment' });
 
     const afterComment = await taskStore.get('task-up-post-manual-complete');
     expect(afterComment!.status).toBe('merge-ready');
@@ -2237,25 +1417,10 @@ describe('pr.updated handler', () => {
   });
 
   it('push kind on a merge-ready task re-opens to review and starts QA recheck', async () => {
-    await seedTask({
-      id: 'task-up-mr-push',
-      status: 'merge-ready',
-      reviewRound: 1,
-      prNumber: 82,
-      qaAgentId: 'qa-1',
-    });
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    await seedTask({ id: 'task-up-mr-push', status: 'merge-ready', reviewRound: 1, prNumber: 82, qaAgentId: 'qa-1' });
+    const { startSession: startSpy, releaseAgentForTask: releaseSpy } = stubManager({ startSession: true, releaseAgentForTask: true, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-mr-push',
-      data: { prNumber: 82, kind: 'push' },
-    });
+    await emitPrUpdated('task-up-mr-push', { prNumber: 82, kind: 'push' });
 
     const task = await taskStore.get('task-up-mr-push');
     expect(task!.status).toBe('review');
@@ -2264,140 +1429,55 @@ describe('pr.updated handler', () => {
   });
 
   it('post-approve complete signal with dev wait-gate failure does not auto-merge', async () => {
-    await seedTask({
-      id: 'task-up-post-wait-fail',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 76,
-    });
-    await manager.setPostApproveCompletion('task-up-post-wait-fail', {
-      token: 'post-token-76',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(false);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-up-post-wait-fail', status: 'approved', reviewRound: 1, prNumber: 76 });
+    await manager.setPostApproveCompletion('task-up-post-wait-fail', { token: 'post-token-76', approvedHeadSha: HEAD_SHA });
+    const { mergePr: mergeSpy } = stubManager({ markAgentWaiting: false, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-wait-fail',
-      data: {
-        prNumber: 76,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'post-token-76',
-      },
+    await emitPrUpdated('task-up-post-wait-fail', {
+      prNumber: 76,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'post-token-76',
     });
 
     expect(mergeSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-post-wait-fail',
-    );
+    const intervention = findIntervention('task-up-post-wait-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('post-approve-dev-wait-gate-failed');
   });
 
-  it('post-approve complete signal from a different agent is ignored', async () => {
-    await seedTask({
-      id: 'task-up-post-wrong-agent',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 77,
-    });
-    await manager.setPostApproveCompletion('task-up-post-wrong-agent', {
-      token: 'post-token-77',
-      approvedHeadSha: HEAD_SHA,
-    });
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+  it.each([
+    ['from a different agent', 'task-up-post-wrong-agent', 'post-token-77', 77, { verdictAgentId: 'other-agent', token: 'post-token-77' }],
+    ['with the wrong token', 'task-up-post-wrong-token', 'post-token-78', 78, { verdictAgentId: 'dev-1', token: 'different-token' }],
+  ])('post-approve complete signal %s is ignored', async (_label, id, storedToken, prNumber, signal) => {
+    await seedTask({ id, status: 'approved', reviewRound: 1, prNumber });
+    await manager.setPostApproveCompletion(id, { token: storedToken, approvedHeadSha: HEAD_SHA });
+    const { markAgentWaiting: markWaitSpy, mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-wrong-agent',
-      data: {
-        prNumber: 77,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'other-agent',
-        token: 'post-token-77',
-      },
-    });
-
-    expect(markWaitSpy).not.toHaveBeenCalled();
-    expect(mergeSpy).not.toHaveBeenCalled();
-  });
-
-  it('post-approve complete signal with the wrong token is ignored', async () => {
-    await seedTask({
-      id: 'task-up-post-wrong-token',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 78,
-    });
-    await manager.setPostApproveCompletion('task-up-post-wrong-token', {
-      token: 'post-token-78',
-      approvedHeadSha: HEAD_SHA,
-    });
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
-
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-wrong-token',
-      data: {
-        prNumber: 78,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'different-token',
-      },
-    });
+    await emitPrUpdated(id, { prNumber, kind: 'pr-merge-ready', ...signal });
 
     expect(markWaitSpy).not.toHaveBeenCalled();
     expect(mergeSpy).not.toHaveBeenCalled();
   });
 
   it('post-approve complete signal rechecks approved state after the dev wait gate before merge', async () => {
-    await seedTask({
-      id: 'task-up-post-stale-before-merge',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 79,
-    });
-    await manager.setPostApproveCompletion('task-up-post-stale-before-merge', {
-      token: 'post-token-79',
-      approvedHeadSha: HEAD_SHA,
-    });
+    await seedTask({ id: 'task-up-post-stale-before-merge', status: 'approved', reviewRound: 1, prNumber: 79 });
+    await manager.setPostApproveCompletion('task-up-post-stale-before-merge', { token: 'post-token-79', approvedHeadSha: HEAD_SHA });
     vi.spyOn(manager, 'markAgentWaiting').mockImplementation(async () => {
       await manager.updateTaskStatus('task-up-post-stale-before-merge', 'review');
       return true;
     });
     const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-post-stale-before-merge',
-      data: {
-        prNumber: 79,
-        kind: 'pr-merge-ready',
-        verdictAgentId: 'dev-1',
-        token: 'post-token-79',
-      },
+    await emitPrUpdated('task-up-post-stale-before-merge', {
+      prNumber: 79,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'post-token-79',
     });
 
     expect(mergeSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-up-post-stale-before-merge',
-    );
+    const intervention = findIntervention('task-up-post-stale-before-merge');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('post-approve-merge-skipped-stale-task');
   });
@@ -2406,14 +1486,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-up2', status: 'fixing', reviewRound: 1, prNumber: 51 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up2',
-      data: { prNumber: 51 },
-    });
+    await emitPrUpdated('task-up2', { prNumber: 51 });
 
     expect(startSpy).toHaveBeenCalledWith('task-up2', 'qa-1', 'recheck');
   });
@@ -2422,14 +1495,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-defer', status: 'in_progress', reviewRound: 0, prNumber: undefined });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-defer',
-      data: {}, // no prNumber
-    });
+    await emitPrUpdated('task-defer', {});
 
     const task = await taskStore.get('task-defer');
     expect(task!.status).toBe('in_progress');
@@ -2440,14 +1506,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-haspr', status: 'in_progress', reviewRound: 0, prNumber: 88 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-haspr',
-      data: {}, // event has no prNumber, but task already has one
-    });
+    await emitPrUpdated('task-haspr', {});
 
     const task = await taskStore.get('task-haspr');
     expect(task!.status).toBe('review');
@@ -2458,32 +1517,16 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-fix-no-pr', status: 'fixing', reviewRound: 1, prNumber: 12 });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-fix-no-pr',
-      data: {},
-    });
+    await emitPrUpdated('task-fix-no-pr', {});
 
     expect(startSpy).toHaveBeenCalledWith('task-fix-no-pr', 'qa-1', 'recheck');
   });
 
   it('startSession success → markAgentWaiting + updateTask qaAgentId', async () => {
     await seedTask({ id: 'task-up-ok', status: 'fixing', reviewRound: 1, prNumber: 70 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const updateSpy = vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-ok',
-      data: { prNumber: 70, prUrl: 'https://github.com/user/repo/pull/70' },
-    });
+    await emitPrUpdated('task-up-ok', { prNumber: 70, prUrl: 'https://github.com/user/repo/pull/70' });
 
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-up-ok');
     expect(updateSpy).toHaveBeenCalledWith('task-up-ok', { qaAgentId: 'qa-1' });
@@ -2493,18 +1536,9 @@ describe('pr.updated handler', () => {
 
   it('startSession resolve(false) from fixing → rollback to fixing, qaAgentId pre-arm rolled back, no other side effects', async () => {
     await seedTask({ id: 'task-up-rb', status: 'fixing', reviewRound: 1, prNumber: 71 });
-    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    const updateSpy = vi.spyOn(manager, 'updateTask').mockResolvedValue();
+    const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: false, markAgentWaiting: true, updateTask: undefined });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-rb',
-      data: { prNumber: 71 },
-    });
+    await emitPrUpdated('task-up-rb', { prNumber: 71 });
 
     const task = await taskStore.get('task-up-rb');
     expect(task!.status).toBe('fixing');
@@ -2521,19 +1555,9 @@ describe('pr.updated handler', () => {
   it('recheck verdict watcher fails to arm → rolls back to fixing + restores token, releases QA + intervention', async () => {
     await seedTask({ id: 'task-up-noarm', status: 'fixing', reviewRound: 1, prNumber: 71, signalToken: 'fixing-token' });
     await seedDevAgent('task-up-noarm');
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'rotated', armed: false });
-    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    const { releaseAgentForTask: releaseSpy, startSession: startSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'rotated', armed: false }, startSession: true });
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-noarm',
-      data: { prNumber: 71 },
-    });
+    await emitPrUpdated('task-up-noarm', { prNumber: 71 });
 
     expect(startSpy).not.toHaveBeenCalled();
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-noarm', 'idle');
@@ -2543,24 +1567,14 @@ describe('pr.updated handler', () => {
     expect(task!.status).toBe('fixing');
     expect(task!.signalToken).toBe('fixing-token');
     expect(task!.qaAgentId).toBeUndefined();
-    expect(
-      emittedEvents.some(e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'qa-recheck-arm-failed'),
-    ).toBe(true);
+    expect(findInterventionByPhase('qa-recheck-arm-failed')).toBeDefined();
   });
 
   it('startSession hard error from in_progress → rollback to in_progress', async () => {
     await seedTask({ id: 'task-up-rb2', status: 'in_progress', reviewRound: 0, prNumber: 72 });
     vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('boom'));
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-rb2',
-      data: { prNumber: 72 },
-    });
+    await emitPrUpdated('task-up-rb2', { prNumber: 72 });
 
     const task = await taskStore.get('task-up-rb2');
     expect(task!.status).toBe('in_progress');
@@ -2570,14 +1584,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-up-cx', status: 'cancelled' });
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-cx',
-      data: { prNumber: 1 },
-    });
+    await emitPrUpdated('task-up-cx', { prNumber: 1 });
 
     expect(startSpy).not.toHaveBeenCalled();
   });
@@ -2586,14 +1593,7 @@ describe('pr.updated handler', () => {
     await seedTask({ id: 'task-up-patch', status: 'fixing', reviewRound: 1, prNumber: 1 });
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'pr.updated',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-up-patch',
-      data: { prNumber: 99, prUrl: 'https://github.com/user/repo/pull/99' },
-    });
+    await emitPrUpdated('task-up-patch', { prNumber: 99, prUrl: 'https://github.com/user/repo/pull/99' });
 
     const task = await taskStore.get('task-up-patch');
     expect(task!.prNumber).toBe(99);
@@ -2602,67 +1602,42 @@ describe('pr.updated handler', () => {
 });
 
 describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
-  it('no new commit + dev replied → advances fixing→review (option C)', async () => {
-    await seedTask({
-      id: 'task-pf-adv', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 70, signalToken: 'tok-pf', qaAgentId: 'qa-1',
+  // A dev fix in flight: status=fixing, phase=code, head anchored at HEAD_SHA, dispatched now.
+  function seedFixingPass(id: string, extra: Partial<TaskState> = {}): Promise<TaskState> {
+    return seedTask({
+      id, status: 'fixing', phase: 'code', reviewRound: 1,
       reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
       reviewDispatchedAt: new Date().toISOString(),
+      ...extra,
     });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
-    vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok2', armed: true });
+  }
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-adv',
-      data: { kind: 'pr-fixed', token: 'tok-pf', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+  it('no new commit + dev replied → advances fixing→review (option C)', async () => {
+    await seedFixingPass('task-pf-adv', { prNumber: 70, signalToken: 'tok-pf', qaAgentId: 'qa-1' });
+    stubManager({ fetchPrHeadSha: HEAD_SHA, prHasDevReplySince: true, acquireAgentForTask: true, startSession: true, rotateAndSetupPhaseSignal: { token: 'tok2', armed: true } });
+
+    await emitPrFixSubmitted('task-pf-adv', { kind: 'pr-fixed', token: 'tok-pf', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-adv');
     expect(task!.status).toBe('review');
   });
 
   it('no new commit + no reply → stays fixing + emits no-op intervention', async () => {
-    await seedTask({
-      id: 'task-pf-noop', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 71, signalToken: 'tok-pf2',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(),
-    });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
-    vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false);
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
+    await seedFixingPass('task-pf-noop', { prNumber: 71, signalToken: 'tok-pf2' });
+    stubManager({ fetchPrHeadSha: HEAD_SHA, prHasDevReplySince: false });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-noop',
-      data: { kind: 'pr-fixed', token: 'tok-pf2', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-noop', { kind: 'pr-fixed', token: 'tok-pf2', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-noop');
     expect(task!.status).toBe('fixing');
-    expect(interventions.some(e => e.data.phase === 'fix-no-op-no-commit-no-reply')).toBe(true);
+    expect(findInterventionByPhase('fix-no-op-no-commit-no-reply')).toBeDefined();
   });
 
   it('new commit → defers to the poller push event (handler no-op, no double dispatch)', async () => {
-    await seedTask({
-      id: 'task-pf-commit', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 72, signalToken: 'tok-pf3',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(),
-    });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA);
-    const replySpy = vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(true);
+    await seedFixingPass('task-pf-commit', { prNumber: 72, signalToken: 'tok-pf3' });
+    const { prHasDevReplySince: replySpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, prHasDevReplySince: true });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-commit',
-      data: { kind: 'pr-fixed', token: 'tok-pf3', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-commit', { kind: 'pr-fixed', token: 'tok-pf3', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-commit');
     expect(task!.status).toBe('fixing');
@@ -2670,118 +1645,65 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
   });
 
   it('stale token → rejected before any GitHub fetch, stays fixing', async () => {
-    await seedTask({
-      id: 'task-pf-stale', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 73, signalToken: 'current-tok',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(),
-    });
+    await seedFixingPass('task-pf-stale', { prNumber: 73, signalToken: 'current-tok' });
     const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha');
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-stale',
-      data: { kind: 'pr-fixed', token: 'stale-tok', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-stale', { kind: 'pr-fixed', token: 'stale-tok', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-stale');
     expect(task!.status).toBe('fixing');
     expect(fetchSpy).not.toHaveBeenCalled();
-    expect(interventions.some(e => e.data.phase === 'stale-pr-fixed-wrong-pass')).toBe(true);
+    expect(findInterventionByPhase('stale-pr-fixed-wrong-pass')).toBeDefined();
   });
 
   it('missing token → rejected (fail-closed), stays fixing', async () => {
-    await seedTask({
-      id: 'task-pf-notok', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 74, signalToken: 'armed-tok',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(),
-    });
+    await seedFixingPass('task-pf-notok', { prNumber: 74, signalToken: 'armed-tok' });
     const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha');
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-notok',
-      data: { kind: 'pr-fixed', verdictAgentId: 'dev-1', source: 'pane-signal' }, // no token
-    });
+    await emitPrFixSubmitted('task-pf-notok', { kind: 'pr-fixed', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-notok');
     expect(task!.status).toBe('fixing');
     expect(fetchSpy).not.toHaveBeenCalled();
-    expect(interventions.some(e => e.data.phase === 'stale-pr-fixed-wrong-pass')).toBe(true);
+    expect(findInterventionByPhase('stale-pr-fixed-wrong-pass')).toBeDefined();
   });
 
   it('head fetch fails → fail-closed escalation, no no-op verdict', async () => {
-    await seedTask({
-      id: 'task-pf-headfail', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 75, signalToken: 'tok-hf',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(),
-    });
+    await seedFixingPass('task-pf-headfail', { prNumber: 75, signalToken: 'tok-hf' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh api offline'));
     const replySpy = vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false);
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-headfail',
-      data: { kind: 'pr-fixed', token: 'tok-hf', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-headfail', { kind: 'pr-fixed', token: 'tok-hf', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-headfail');
     expect(task!.status).toBe('fixing');
     expect(replySpy).not.toHaveBeenCalled(); // never reaches reply/no-op path
-    expect(interventions.some(e => e.data.phase === 'fix-verify-head-fetch-failed')).toBe(true);
-    expect(interventions.some(e => e.data.phase === 'fix-no-op-no-commit-no-reply')).toBe(false);
+    expect(findInterventionByPhase('fix-verify-head-fetch-failed')).toBeDefined();
+    expect(findInterventionByPhase('fix-no-op-no-commit-no-reply')).toBeUndefined();
   });
 
   it('reply fetch fails → fail-closed escalation, not treated as no-op', async () => {
-    await seedTask({
-      id: 'task-pf-replyfail', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 76, signalToken: 'tok-rf',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(),
-    });
+    await seedFixingPass('task-pf-replyfail', { prNumber: 76, signalToken: 'tok-rf' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA); // no new commit
     vi.spyOn(manager, 'prHasDevReplySince').mockRejectedValue(new Error('gh api offline'));
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-replyfail',
-      data: { kind: 'pr-fixed', token: 'tok-rf', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-replyfail', { kind: 'pr-fixed', token: 'tok-rf', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-replyfail');
     expect(task!.status).toBe('fixing');
-    expect(interventions.some(e => e.data.phase === 'fix-verify-replies-fetch-failed')).toBe(true);
-    expect(interventions.some(e => e.data.phase === 'fix-no-op-no-commit-no-reply')).toBe(false);
+    expect(findInterventionByPhase('fix-verify-replies-fetch-failed')).toBeDefined();
+    expect(findInterventionByPhase('fix-no-op-no-commit-no-reply')).toBeUndefined();
   });
 
   it('uses fixDispatchedAt (not reviewDispatchedAt) as the activity lower bound', async () => {
-    await seedTask({
-      id: 'task-pf-bound', status: 'fixing', phase: 'code', reviewRound: 2,
-      prNumber: 80, signalToken: 'tok-bd',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
+    await seedFixingPass('task-pf-bound', {
+      reviewRound: 2, prNumber: 80, signalToken: 'tok-bd',
       reviewDispatchedAt: '2026-06-01T00:00:00.000Z',
       fixDispatchedAt: '2026-06-01T00:05:00.000Z',
     });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
-    const replySpy = vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false);
-    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
-    eventBus.on('human.intervention', () => {});
+    const { prHasDevReplySince: replySpy } = stubManager({ fetchPrHeadSha: HEAD_SHA, prHasDevReplySince: false, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-bound',
-      data: { kind: 'pr-fixed', token: 'tok-bd', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-bound', { kind: 'pr-fixed', token: 'tok-bd', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     // QA/human comments left during the prior review (after reviewDispatchedAt,
     // before fixing) must NOT count — bound is fixDispatchedAt.
@@ -2789,210 +1711,92 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
   });
 
   it('re-sets up the pr-fixed watcher with skipSnapshot when it leaves the task in fixing', async () => {
-    await seedTask({
-      id: 'task-pf-rearm', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 81, signalToken: 'tok-ra',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(), fixDispatchedAt: new Date().toISOString(),
+    await seedFixingPass('task-pf-rearm', {
+      prNumber: 81, signalToken: 'tok-ra', fixDispatchedAt: new Date().toISOString(),
     });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
     vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false); // no-op
     const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
-    eventBus.on('human.intervention', () => {});
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-rearm',
-      data: { kind: 'pr-fixed', token: 'tok-ra', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-rearm', { kind: 'pr-fixed', token: 'tok-ra', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     expect(armSpy).toHaveBeenCalledWith('task-pf-rearm', 'dev-1', 'pr-fixed', { skipSnapshot: true });
   });
 
   it('missing reviewHeadAnchorSha fails closed with escalation instead of no-op', async () => {
-    await seedTask({
-      id: 'task-pf-noanchor', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 82, signalToken: 'tok-na', latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(), fixDispatchedAt: new Date().toISOString(),
-      // NO reviewHeadAnchorSha
+    await seedFixingPass('task-pf-noanchor', {
+      prNumber: 82, signalToken: 'tok-na', fixDispatchedAt: new Date().toISOString(),
+      reviewHeadAnchorSha: undefined, // bail at no-anchor before the reply check
     });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA);
-    const replySpy = vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false);
-    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
+    const { prHasDevReplySince: replySpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, prHasDevReplySince: false, setupPhaseSignal: true });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-noanchor',
-      data: { kind: 'pr-fixed', token: 'tok-na', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-noanchor', { kind: 'pr-fixed', token: 'tok-na', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-noanchor');
     expect(task!.status).toBe('fixing');
     expect(replySpy).not.toHaveBeenCalled(); // bailed at no-anchor before the reply check
-    expect(interventions.some(e => e.data.phase === 'fix-verify-no-anchor')).toBe(true);
+    expect(findInterventionByPhase('fix-verify-no-anchor')).toBeDefined();
   });
 
   it('synthetic advance rolls back to fixing and escalates when QA dispatch fails', async () => {
-    await seedTask({
-      id: 'task-pf-rollback', status: 'fixing', phase: 'code', reviewRound: 1,
-      prNumber: 83, signalToken: 'tok-rb', qaAgentId: 'qa-1',
-      reviewHeadAnchorSha: HEAD_SHA, latestHeadSha: HEAD_SHA,
-      reviewDispatchedAt: new Date().toISOString(), fixDispatchedAt: new Date().toISOString(),
+    await seedFixingPass('task-pf-rollback', {
+      prNumber: 83, signalToken: 'tok-rb', qaAgentId: 'qa-1', fixDispatchedAt: new Date().toISOString(),
     });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA); // no new commit
     vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(true); // has replies → advance
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok2', armed: true });
-    vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+    stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'tok2', armed: true }, setupPhaseSignal: true });
     // QA dispatch fails → pr.updated push handler rolls review back to fixing.
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
-    const interventions: BaxianEvent[] = [];
-    eventBus.on('human.intervention', e => { interventions.push(e); });
 
-    await emitAndWait({
-      type: 'pr.fix.submitted', timestamp: new Date().toISOString(),
-      projectId: 'proj', agentId: 'dev-1', taskId: 'task-pf-rollback',
-      data: { kind: 'pr-fixed', token: 'tok-rb', verdictAgentId: 'dev-1', source: 'pane-signal' },
-    });
+    await emitPrFixSubmitted('task-pf-rollback', { kind: 'pr-fixed', token: 'tok-rb', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-rollback');
     expect(task!.status).toBe('fixing'); // rolled back by the push handler
-    expect(interventions.some(e => e.data.phase === 'fix-advance-rolled-back')).toBe(true);
+    expect(findInterventionByPhase('fix-advance-rolled-back')).toBeDefined();
   });
 });
 
 describe('pr.merged handler', () => {
-  it('in_progress → merged + cleanupAfterMerge', async () => {
-    await seedTask({ id: 'task-m1', status: 'in_progress', reviewRound: 0, prNumber: 10 });
+  // max_rounds is non-terminal (paused awaiting a human decision), so a merge of its PR —
+  // manual mark-complete or an externally-merged PR the poller detects — must still transition
+  // to merged and run the normal post-merge cleanup, like the active statuses.
+  it.each([
+    ['in_progress' as TaskStatus, 'task-m1', 10, { reviewRound: 0 }],
+    ['merge-ready' as TaskStatus, 'task-mr-merged', 18, { reviewRound: 1 }],
+    ['fixing' as TaskStatus, 'task-m2', 11, { reviewRound: 1 }],
+    ['max_rounds' as TaskStatus, 'task-m-max', 19, { branch: 'bx/task-m-max' }],
+  ])('%s → merged + cleanupAfterMerge', async (status, id, prNumber, extra) => {
+    await seedTask({ id, status, prNumber, ...extra });
     const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m1',
-      data: { prNumber: 10 },
-    });
+    await emitPrMerged(id, { prNumber });
 
-    const task = await taskStore.get('task-m1');
+    const task = await taskStore.get(id);
     expect(task!.status).toBe('merged');
-    expect(cleanupSpy).toHaveBeenCalledWith('task-m1');
+    expect(cleanupSpy).toHaveBeenCalledWith(id);
   });
 
-  it('merge-ready → merged (human merges the ready PR)', async () => {
-    await seedTask({ id: 'task-mr-merged', status: 'merge-ready', reviewRound: 1, prNumber: 18 });
-    const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
+  // review → merged dispatches post-merge cleanup to QA WITHOUT an up-front release. The cleanup
+  // flow keeps QA bound (non-dispatchable / Start disabled) and releases only after /clear, so the
+  // next task can't start before QA cleaned its branch + cleared context.
+  it.each([
+    ['task-m3', 12],
+    ['task-m3-cleanup', 77],
+  ])('review → merged → dispatchPostMergeCleanup(QA), not an up-front release (%s)', async (id, prNumber) => {
+    await seedTask({ id, status: 'review', reviewRound: 1, prNumber, qaAgentId: 'qa-1', branch: `bx/${id}` });
+    const { dispatchPostMergeCleanup: dispatchSpy, releaseAgentForTask: stopSpy } = stubManager({ cleanupAfterMerge: undefined, dispatchPostMergeCleanup: undefined, releaseAgentForTask: true });
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-mr-merged',
-      data: { prNumber: 18 },
-    });
+    await emitPrMerged(id, { prNumber });
 
-    const task = await taskStore.get('task-mr-merged');
-    expect(task!.status).toBe('merged');
-    expect(cleanupSpy).toHaveBeenCalledWith('task-mr-merged');
-  });
-
-  it('fixing → merged', async () => {
-    await seedTask({ id: 'task-m2', status: 'fixing', reviewRound: 1, prNumber: 11 });
-    vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m2',
-      data: { prNumber: 11 },
-    });
-
-    const task = await taskStore.get('task-m2');
-    expect(task!.status).toBe('merged');
-  });
-
-  it('review → merged → dispatchPostMergeCleanup(QA), not an up-front release (QA held until compact)', async () => {
-    await seedTask({
-      id: 'task-m3',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 12,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m3',
-      data: { prNumber: 12 },
-    });
-
-    expect(dispatchSpy).toHaveBeenCalledWith('qa-1', {
-      prNumber: 12,
-      taskId: 'task-m3',
-      branch: 'bx/task-m3',
-    });
-    expect(stopSpy).not.toHaveBeenCalledWith('qa-1', 'task-m3', 'idle');
-  });
-
-  it('dispatches post-merge cleanup to QA WITHOUT releasing first (cleanup holds QA bound until branch delete + compact finish)', async () => {
-    await seedTask({
-      id: 'task-m3-cleanup',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 77,
-      qaAgentId: 'qa-1',
-      branch: 'bx/task-m3-cleanup',
-    });
-    vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m3-cleanup',
-      data: { prNumber: 77 },
-    });
-
-    expect(dispatchSpy).toHaveBeenCalledWith('qa-1', {
-      prNumber: 77,
-      taskId: 'task-m3-cleanup',
-      branch: 'bx/task-m3-cleanup',
-    });
-    // Invariant: with a branch to clean, the handler must NOT release QA up front. The cleanup
-    // flow keeps QA bound (non-dispatchable / Start disabled) and releases only after /clear
-    // completes, so the next task can't start before QA cleaned its branch + cleared context.
-    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-m3-cleanup', 'idle');
+    expect(dispatchSpy).toHaveBeenCalledWith('qa-1', { prNumber, taskId: id, branch: `bx/${id}` });
+    expect(stopSpy).not.toHaveBeenCalledWith('qa-1', id, 'idle');
   });
 
   it('approved → merged → dispatchPostMergeCleanup(QA) (idempotent even if APPROVE already released QA)', async () => {
-    await seedTask({
-      id: 'task-m4',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 13,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
+    await seedTask({ id: 'task-m4', status: 'approved', reviewRound: 1, prNumber: 13, qaAgentId: 'qa-1' });
+    const { dispatchPostMergeCleanup: dispatchSpy } = stubManager({ cleanupAfterMerge: undefined, dispatchPostMergeCleanup: undefined });
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m4',
-      data: { prNumber: 13 },
-    });
+    await emitPrMerged('task-m4', { prNumber: 13 });
 
     expect(dispatchSpy).toHaveBeenCalledWith('qa-1', {
       prNumber: 13,
@@ -3004,23 +1808,12 @@ describe('pr.merged handler', () => {
   });
 
   it('approved external merge routes the post-approve dev through post-merge cleanup', async () => {
-    await seedTask({
-      id: 'task-m4-post-approve',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 130,
-    });
+    await seedTask({ id: 'task-m4-post-approve', status: 'approved', reviewRound: 1, prNumber: 130 });
     // cleanupAfterMerge runs for real and must delegate dev cleanup to dispatchPostMergeCleanup,
     // which keeps the dev bound until branch delete + /clear finish.
     const dispatchSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m4-post-approve',
-      data: { prNumber: 130 },
-    });
+    await emitPrMerged('task-m4-post-approve', { prNumber: 130 });
 
     const task = await taskStore.get('task-m4-post-approve');
     expect(task!.status).toBe('merged');
@@ -3033,38 +1826,18 @@ describe('pr.merged handler', () => {
 
   it('qaAgentId missing → skip releaseAgentForTask', async () => {
     await seedTask({ id: 'task-m5', status: 'review', reviewRound: 1, prNumber: 14 });
-    vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const { releaseAgentForTask: stopSpy } = stubManager({ cleanupAfterMerge: undefined, releaseAgentForTask: true });
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m5',
-      data: { prNumber: 14 },
-    });
+    await emitPrMerged('task-m5', { prNumber: 14 });
 
     expect(stopSpy).not.toHaveBeenCalled();
   });
 
   it('releaseAgentForTask returns false (taskId mismatch) → safe no-op, rest of flow continues', async () => {
-    await seedTask({
-      id: 'task-m6',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 15,
-      qaAgentId: 'qa-1',
-    });
-    const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+    await seedTask({ id: 'task-m6', status: 'review', reviewRound: 1, prNumber: 15, qaAgentId: 'qa-1' });
+    const { cleanupAfterMerge: cleanupSpy } = stubManager({ cleanupAfterMerge: undefined, releaseAgentForTask: false });
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m6',
-      data: { prNumber: 15 },
-    });
+    await emitPrMerged('task-m6', { prNumber: 15 });
 
     expect(cleanupSpy).toHaveBeenCalledWith('task-m6');
   });
@@ -3073,13 +1846,7 @@ describe('pr.merged handler', () => {
     await seedTask({ id: 'task-m7', status: 'in_progress', reviewRound: 0, prNumber: undefined });
     vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m7',
-      data: { prNumber: 16, prUrl: 'https://github.com/user/repo/pull/16' },
-    });
+    await emitPrMerged('task-m7', { prNumber: 16, prUrl: 'https://github.com/user/repo/pull/16' });
 
     const task = await taskStore.get('task-m7');
     expect(task!.prNumber).toBe(16);
@@ -3090,13 +1857,7 @@ describe('pr.merged handler', () => {
     await seedTask({ id: 'task-m8', status: 'merged', prNumber: 17 });
     const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
 
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m8',
-      data: { prNumber: 17 },
-    });
+    await emitPrMerged('task-m8', { prNumber: 17 });
 
     expect(cleanupSpy).not.toHaveBeenCalled();
   });
@@ -3109,36 +1870,12 @@ describe('pr.merged handler', () => {
     const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
 
     for (const status of ['cancelled', 'failed'] as const) {
-      await emitAndWait({
-        type: 'pr.merged',
-        timestamp: new Date().toISOString(),
-        projectId: 'proj',
-        taskId: `task-m-${status}`,
-        data: { prNumber: 18 },
-      });
+      await emitPrMerged(`task-m-${status}`, { prNumber: 18 });
     }
 
     expect(cleanupSpy).not.toHaveBeenCalled();
   });
 
-  // max_rounds is non-terminal (paused awaiting a human decision), so a merge of its
-  // PR — manual mark-complete or an externally-merged PR the poller detects — must
-  // transition to merged and run the normal post-merge cleanup.
-  it('max_rounds → merged + cleanup (non-terminal)', async () => {
-    await seedTask({ id: 'task-m-max', status: 'max_rounds', prNumber: 19, branch: 'bx/task-m-max' });
-    const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
-
-    await emitAndWait({
-      type: 'pr.merged',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      taskId: 'task-m-max',
-      data: { prNumber: 19 },
-    });
-
-    expect((await taskStore.get('task-m-max'))?.status).toBe('merged');
-    expect(cleanupSpy).toHaveBeenCalledWith('task-m-max');
-  });
 });
 
 describe('review.submitted (manual review terminal-task escape)', () => {
@@ -3160,25 +1897,12 @@ describe('review.submitted (manual review terminal-task escape)', () => {
     ['cancelled' as TaskStatus, 'REQUEST_CHANGES'],
     ['failed' as TaskStatus, 'APPROVE'],
   ])('terminal task (%s) + QA still bound to task → release QA + emit intervention + no transition', async (status, action) => {
-    await seedTask({
-      id: `task-tm-${status}`,
-      status,
-      reviewRound: 2,
-      prNumber: 99,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: `task-tm-${status}`, status, reviewRound: 2, prNumber: 99, qaAgentId: 'qa-1' });
     await seedQaBound(`task-tm-${status}`);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: `task-tm-${status}`,
-      data: { action, prNumber: 99, headSha: HEAD_SHA },
-    });
+    await emitReview(`task-tm-${status}`, { action, prNumber: 99, headSha: HEAD_SHA }, 'dev-1');
 
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', `task-tm-${status}`, 'idle');
     expect(transitionSpy).not.toHaveBeenCalled();
@@ -3186,7 +1910,7 @@ describe('review.submitted (manual review terminal-task escape)', () => {
     const task = await taskStore.get(`task-tm-${status}`);
     expect(task!.status).toBe(status);
 
-    const intervention = emittedEvents.find(e => e.type === 'human.intervention' && e.taskId === `task-tm-${status}`);
+    const intervention = findIntervention(`task-tm-${status}`);
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('manual-review-on-terminal-task-completed');
     expect(intervention!.data.qaAgentId).toBe('qa-1');
@@ -3194,54 +1918,26 @@ describe('review.submitted (manual review terminal-task escape)', () => {
   });
 
   it('terminal task with no qaAgentId → no escape', async () => {
-    await seedTask({
-      id: 'task-tm-no-qa',
-      status: 'merged',
-      reviewRound: 2,
-      prNumber: 100,
-      qaAgentId: undefined,
-    });
+    await seedTask({ id: 'task-tm-no-qa', status: 'merged', reviewRound: 2, prNumber: 100, qaAgentId: undefined });
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-tm-no-qa',
-      data: { action: 'APPROVE', prNumber: 100, headSha: HEAD_SHA },
-    });
+    await emitReview('task-tm-no-qa', { action: 'APPROVE', prNumber: 100, headSha: HEAD_SHA }, 'dev-1');
 
     expect(releaseSpy).not.toHaveBeenCalled();
   });
 
   it('terminal task + QA already released (taskId mismatch) → escape NOT triggered (idempotent on replayed events)', async () => {
-    await seedTask({
-      id: 'task-tm-replay',
-      status: 'merged',
-      reviewRound: 2,
-      prNumber: 101,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-tm-replay', status: 'merged', reviewRound: 2, prNumber: 101, qaAgentId: 'qa-1' });
     await agentStore.set({
       id: 'qa-1', projectId: 'proj', status: 'idle',
       sessionStatus: 'ready', updatedAt: new Date().toISOString(),
     });
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-tm-replay',
-      data: { action: 'APPROVE', prNumber: 101, headSha: HEAD_SHA },
-    });
+    await emitReview('task-tm-replay', { action: 'APPROVE', prNumber: 101, headSha: HEAD_SHA }, 'dev-1');
 
     expect(releaseSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(e => e.type === 'human.intervention'
-      && (e.data as Record<string, unknown>).phase === 'manual-review-on-terminal-task-completed');
-    expect(intervention).toBeUndefined();
+    expect(findInterventionByPhase('manual-review-on-terminal-task-completed')).toBeUndefined();
   });
 
   // max_rounds is non-terminal now, so a spec-phase max_rounds review.submitted no longer
@@ -3265,24 +1961,14 @@ describe('review.submitted (manual review terminal-task escape)', () => {
     });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'dev-1',
-      taskId: 'task-spec-max-rounds',
-      data: { action: 'REQUEST_CHANGES', prNumber: 110, headSha: HEAD_SHA },
-    });
+    await emitReview('task-spec-max-rounds', { action: 'REQUEST_CHANGES', prNumber: 110, headSha: HEAD_SHA }, 'dev-1');
 
     // 状态不被改（spec gate 早退），且未触发 terminal escape 的 intervention。
     expect(transitionSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-spec-max-rounds');
     expect(task!.status).toBe('max_rounds');
     expect(task!.phase).toBe('spec');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data as Record<string, unknown>).phase === 'manual-review-on-terminal-task-completed',
-    );
+    const intervention = findInterventionByPhase('manual-review-on-terminal-task-completed');
     expect(intervention).toBeUndefined();
   });
 });
@@ -3300,17 +1986,9 @@ describe('review.submitted spec-phase gate', () => {
       qaAgentId: 'qa-1',
     });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const { acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-spec-approve',
-      data: { action: 'APPROVE', prNumber: 80, headSha: HEAD_SHA },
-    });
+    await emitReview('task-spec-approve', { action: 'APPROVE', prNumber: 80, headSha: HEAD_SHA });
 
     expect(transitionSpy).not.toHaveBeenCalled();
     expect(acquireSpy).not.toHaveBeenCalled();
@@ -3333,14 +2011,7 @@ describe('review.submitted spec-phase gate', () => {
     });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-spec-changes',
-      data: { action: 'REQUEST_CHANGES', prNumber: 81, headSha: HEAD_SHA },
-    });
+    await emitReview('task-spec-changes', { action: 'REQUEST_CHANGES', prNumber: 81, headSha: HEAD_SHA });
 
     expect(transitionSpy).not.toHaveBeenCalled();
   });
@@ -3352,43 +2023,22 @@ describe('review.submitted APPROVE', () => {
     // headSha — the agent doesn't observe SHAs). Handler must pin reviewedHeadSha
     // to task.reviewHeadAnchorSha (snapshotted at dispatch), NOT task.latestHeadSha
     // (which can be re-anchored by a mid-review push).
-    await seedTask({
-      id: 'task-pane-approve',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 200,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedReviewPass('task-pane-approve', { prNumber: 200 });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-pane-approve',
-      data: {
-        kind: 'pr-approved',
-        action: 'APPROVE',
-        verdictAgentId: 'qa-1',
-        source: 'pane-signal',
-        // intentionally no headSha — that's the fallback case under test.
-      },
+    await emitReview('task-pane-approve', {
+      kind: 'pr-approved',
+      action: 'APPROVE',
+      verdictAgentId: 'qa-1',
+      source: 'pane-signal',
+      // intentionally no headSha — that's the fallback case under test.
     });
 
     const task = await taskStore.get('task-pane-approve');
     expect(task!.status).toBe('approved');
     const completion = await manager.getPostApproveCompletion('task-pane-approve');
     expect(completion?.approvedHeadSha).toBe(HEAD_SHA);
-    const stranded = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'approval-reviewed-head-unavailable',
-    );
+    const stranded = findInterventionByPhase('approval-reviewed-head-unavailable');
     expect(stranded).toBeUndefined();
   });
 
@@ -3396,43 +2046,21 @@ describe('review.submitted APPROVE', () => {
     // QA dispatched at head A → reviewHeadAnchorSha=A (immutable). Dev pushes head
     // B mid-review → latestHeadSha=B. QA pane-approves (no headSha). reviewedHeadSha
     // = anchor A, GitHub authoritative head = B, A != B → stale-approval-head-mismatch.
-    const HEAD_A = HEAD_SHA;
     const HEAD_B = NEXT_HEAD_SHA;
-    await seedTask({
-      id: 'task-race',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 300,
-      latestHeadSha: HEAD_B,
-      reviewHeadAnchorSha: HEAD_A,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_B);
+    // anchor pinned at A (dispatch head); latestHeadSha moved to B by a mid-review push.
+    await seedReviewPass('task-race', { prNumber: 300, latestHeadSha: HEAD_B });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined, fetchPrHeadSha: HEAD_B });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-race',
-      data: {
-        kind: 'pr-approved',
-        action: 'APPROVE',
-        verdictAgentId: 'qa-1',
-        source: 'pane-signal',
-      },
+    await emitReview('task-race', {
+      kind: 'pr-approved',
+      action: 'APPROVE',
+      verdictAgentId: 'qa-1',
+      source: 'pane-signal',
     });
 
     const completion = await manager.getPostApproveCompletion('task-race');
     expect(completion).toBeNull();
-    const stale = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-approval-head-mismatch',
-    );
+    const stale = findInterventionByPhase('stale-approval-head-mismatch');
     expect(stale).toBeDefined();
   });
 
@@ -3440,34 +2068,15 @@ describe('review.submitted APPROVE', () => {
     // Distinct identity: QA approves via `gh pr review`, never emits a pane signal.
     // The fallback verdict watcher stays armed; the poller verdict must tear it
     // down so it neither leaks the subscription nor raises a spurious session-gone.
-    await seedTask({
-      id: 'task-teardown',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 210,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    await seedReviewPass('task-teardown', { prNumber: 210 });
+    stubApproveFlow();
     const stopSpy = vi.spyOn(manager, 'stopPhaseSignalWatcher');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-teardown',
-      data: {
-        action: 'APPROVE',
-        prNumber: 210,
-        headSha: HEAD_SHA,       // poller-sourced commit_id
-        currentHeadSha: HEAD_SHA,
-      },
+    await emitReview('task-teardown', {
+      action: 'APPROVE',
+      prNumber: 210,
+      headSha: HEAD_SHA,       // poller-sourced commit_id
+      currentHeadSha: HEAD_SHA,
     });
 
     expect(stopSpy).toHaveBeenCalledWith('task-teardown');
@@ -3480,37 +2089,19 @@ describe('review.submitted APPROVE', () => {
     // A head-stale verdict is rejected (stale-approval-head-mismatch) before the
     // approved transition — tearing the watcher down there would strand a same-identity
     // 422 fallback (no watcher to catch a corrected emit) or clobber pr-merge-ready.
-    await seedTask({
-      id: 'task-stale-noteardown',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 220,
-      latestHeadSha: NEXT_HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      qaAgentId: 'qa-1',
-    });
+    await seedReviewPass('task-stale-noteardown', { prNumber: 220, latestHeadSha: NEXT_HEAD_SHA });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA); // current head moved on
     const stopSpy = vi.spyOn(manager, 'stopPhaseSignalWatcher');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-stale-noteardown',
-      data: {
-        action: 'APPROVE',
-        prNumber: 220,
-        headSha: HEAD_SHA,          // verdict reviewed the OLD head
-        currentHeadSha: NEXT_HEAD_SHA,
-      },
+    await emitReview('task-stale-noteardown', {
+      action: 'APPROVE',
+      prNumber: 220,
+      headSha: HEAD_SHA,          // verdict reviewed the OLD head
+      currentHeadSha: NEXT_HEAD_SHA,
     });
 
-    const stale = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-approval-head-mismatch',
-    );
+    const stale = findInterventionByPhase('stale-approval-head-mismatch');
     expect(stale).toBeDefined();
     expect(stopSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-stale-noteardown');
@@ -3518,26 +2109,10 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('review → approved + release QA + dispatch dev post-approve feedback check', async () => {
-    await seedTask({
-      id: 'task-a1',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 20,
-      qaAgentId: 'qa-1',
-    });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-a1', status: 'review', reviewRound: 1, prNumber: 20, qaAgentId: 'qa-1' });
+    const { releaseAgentForTask: stopSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a1',
-      data: { action: 'APPROVE', prNumber: 20, headSha: HEAD_SHA },
-    });
+    await emitReview('task-a1', { action: 'APPROVE', prNumber: 20, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-a1');
     expect(task!.status).toBe('approved');
@@ -3556,26 +2131,10 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('auto-merge waits for dev post-approve feedback check instead of merging immediately', async () => {
-    await seedTask({
-      id: 'task-a2',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 21,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-a2', status: 'review', reviewRound: 1, prNumber: 21, qaAgentId: 'qa-1' });
+    const { continueSession: continueSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a2',
-      data: { action: 'APPROVE', prNumber: 21, headSha: HEAD_SHA },
-    });
+    await emitReview('task-a2', { action: 'APPROVE', prNumber: 21, headSha: HEAD_SHA });
 
     expect(mergeSpy).not.toHaveBeenCalled();
     expect(continueSpy).toHaveBeenCalledWith(
@@ -3587,29 +2146,12 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('post-approve dev acquire failure → emits human.intervention', async () => {
-    await seedTask({
-      id: 'task-a3',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 22,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-a3', status: 'review', reviewRound: 1, prNumber: 22, qaAgentId: 'qa-1' });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: false, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a3',
-      data: { action: 'APPROVE', prNumber: 22, headSha: HEAD_SHA },
-    });
+    await emitReview('task-a3', { action: 'APPROVE', prNumber: 22, headSha: HEAD_SHA });
 
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.data.phase === 'post-approve-dev-acquire-failed',
-    );
+    const intervention = findInterventionByPhase('post-approve-dev-acquire-failed');
     expect(intervention).toBeTruthy();
     expect(intervention!.taskId).toBe('task-a3');
     expect(intervention!.data.devAgentId).toBe('dev-1');
@@ -3617,15 +2159,8 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('post-approve dispatch fail + emit fail → handler swallows emit error (no rethrow)', async () => {
-    await seedTask({
-      id: 'task-a4',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 23,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    await seedTask({ id: 'task-a4', status: 'review', reviewRound: 1, prNumber: 23, qaAgentId: 'qa-1' });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true });
     vi.spyOn(manager, 'continueSession').mockRejectedValue(new Error('boom'));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     const realEmit = eventBus.emit.bind(eventBus);
@@ -3634,40 +2169,18 @@ describe('review.submitted APPROVE', () => {
       return realEmit(evt);
     });
 
-    await expect(emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a4',
-      data: { action: 'APPROVE', prNumber: 23, headSha: HEAD_SHA },
-    })).resolves.not.toThrow();
+    await expect(emitReview('task-a4', { action: 'APPROVE', prNumber: 23, headSha: HEAD_SHA })).resolves.not.toThrow();
   });
 
   it('post-approve terminal dispatch error fails the task and releases dev', async () => {
-    await seedTask({
-      id: 'task-a-terminal',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 26,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    await seedTask({ id: 'task-a-terminal', status: 'review', reviewRound: 1, prNumber: 26, qaAgentId: 'qa-1' });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true });
     vi.spyOn(manager, 'continueSession').mockRejectedValue(
       new DispatchTerminalError('prompt_too_large', 'prompt too large'),
     );
-    const failSpy = vi.spyOn(manager, 'failTaskForDispatchError').mockResolvedValue();
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const { failTaskForDispatchError: failSpy, markAgentWaiting: markWaitSpy } = stubManager({ failTaskForDispatchError: undefined, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a-terminal',
-      data: { action: 'APPROVE', prNumber: 26, headSha: HEAD_SHA },
-    });
+    await emitReview('task-a-terminal', { action: 'APPROVE', prNumber: 26, headSha: HEAD_SHA });
 
     expect(failSpy).toHaveBeenCalledWith(
       'task-a-terminal',
@@ -3683,26 +2196,9 @@ describe('review.submitted APPROVE', () => {
       ...CONFIG,
       project: [{ ...CONFIG.project[0], merge: null }],
     };
-    await mkdir(join(tempDir, 'events-manual'), { recursive: true });
-    const localBus = new EventBus(new EventLog(join(tempDir, 'events-manual')));
-    const localManager = new AgentManager({
-      config: manualConfig,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: localBus,
-      runnerFactory: () => mockRunner,
-      platformRunner: mockRunner,
-    });
-    registerEventHandlers(localBus, localManager);
+    const { manager: localManager, bus: localBus } = await makeLocalHandlers(manualConfig, 'events-manual');
 
-    await seedTask({
-      id: 'task-a-manual',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 24,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-a-manual', status: 'review', reviewRound: 1, prNumber: 24, qaAgentId: 'qa-1' });
     vi.spyOn(localManager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(localManager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(localManager, 'continueSession').mockResolvedValue(true);
@@ -3731,46 +2227,23 @@ describe('review.submitted APPROVE', () => {
 
   it('cancelled task → no-op', async () => {
     await seedTask({ id: 'task-a-cx', status: 'cancelled', prNumber: 25 });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    const { releaseAgentForTask: stopSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a-cx',
-      data: { action: 'APPROVE', prNumber: 25, headSha: HEAD_SHA },
-    });
+    await emitReview('task-a-cx', { action: 'APPROVE', prNumber: 25, headSha: HEAD_SHA });
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(mergeSpy).not.toHaveBeenCalled();
   });
 
   it('stale approval for an older reviewed commit stays in review and does not dispatch post-approve', async () => {
-    await seedTask({
-      id: 'task-a-stale',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 27,
-      qaAgentId: 'qa-1',
-    });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-a-stale', status: 'review', reviewRound: 1, prNumber: 27, qaAgentId: 'qa-1' });
+    const { releaseAgentForTask: stopSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a-stale',
-      data: {
-        action: 'APPROVE',
-        prNumber: 27,
-        headSha: HEAD_SHA,
-        currentHeadSha: NEXT_HEAD_SHA,
-      },
+    await emitReview('task-a-stale', {
+      action: 'APPROVE',
+      prNumber: 27,
+      headSha: HEAD_SHA,
+      currentHeadSha: NEXT_HEAD_SHA,
     });
 
     const task = await taskStore.get('task-a-stale');
@@ -3779,40 +2252,21 @@ describe('review.submitted APPROVE', () => {
     expect(stopSpy).not.toHaveBeenCalled();
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-a-stale',
-    );
+    const intervention = findIntervention('task-a-stale');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('stale-approval-head-mismatch');
   });
 
   it('stale approval for an older reviewed commit does not clear an active approved post-approve token', async () => {
-    await seedTask({
-      id: 'task-a-stale-approved',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 28,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-a-stale-approved', {
-      token: 'active-post-token',
-      approvedHeadSha: NEXT_HEAD_SHA,
-    });
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-a-stale-approved', status: 'approved', reviewRound: 1, prNumber: 28, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion('task-a-stale-approved', { token: 'active-post-token', approvedHeadSha: NEXT_HEAD_SHA });
+    const { acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a-stale-approved',
-      data: {
-        action: 'APPROVE',
-        prNumber: 28,
-        headSha: HEAD_SHA,
-        currentHeadSha: NEXT_HEAD_SHA,
-      },
+    await emitReview('task-a-stale-approved', {
+      action: 'APPROVE',
+      prNumber: 28,
+      headSha: HEAD_SHA,
+      currentHeadSha: NEXT_HEAD_SHA,
     });
 
     const task = await taskStore.get('task-a-stale-approved');
@@ -3825,36 +2279,17 @@ describe('review.submitted APPROVE', () => {
     );
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-a-stale-approved',
-    );
+    const intervention = findIntervention('task-a-stale-approved');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('stale-approval-head-mismatch');
   });
 
   it('authoritative fetch returns fresh head matching reviewedHeadSha → APPROVE proceeds + latestHeadSha refreshed', async () => {
-    await seedTask({
-      id: 'task-fetch-fresh',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 300,
-      qaAgentId: 'qa-1',
-      latestHeadSha: HEAD_SHA,
-    });
-    const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-fetch-fresh', status: 'review', reviewRound: 1, prNumber: 300, qaAgentId: 'qa-1', latestHeadSha: HEAD_SHA });
+    const { fetchPrHeadSha: fetchSpy, continueSession: continueSpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
     const updateSpy = vi.spyOn(manager, 'updateTask');
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-fresh',
-      data: { action: 'APPROVE', prNumber: 300, headSha: NEXT_HEAD_SHA },
-    });
+    await emitReview('task-fetch-fresh', { action: 'APPROVE', prNumber: 300, headSha: NEXT_HEAD_SHA });
 
     expect(fetchSpy).toHaveBeenCalledWith('task-fetch-fresh');
     expect(continueSpy).toHaveBeenCalled();
@@ -3862,33 +2297,16 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('authoritative fetch returns head different from reviewedHeadSha → APPROVE rejected even when store agrees with reviewed (replay-after-store-lag)', async () => {
-    await seedTask({
-      id: 'task-fetch-stale-replay',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 301,
-      qaAgentId: 'qa-1',
-      latestHeadSha: HEAD_SHA,
-    });
-    const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-fetch-stale-replay', status: 'review', reviewRound: 1, prNumber: 301, qaAgentId: 'qa-1', latestHeadSha: HEAD_SHA });
+    const { fetchPrHeadSha: fetchSpy, continueSession: continueSpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-stale-replay',
-      data: { action: 'APPROVE', prNumber: 301, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA },
-    });
+    await emitReview('task-fetch-stale-replay', { action: 'APPROVE', prNumber: 301, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA });
 
     expect(fetchSpy).toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-fetch-stale-replay');
     expect(task!.status).toBe('review');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-fetch-stale-replay',
-    );
+    const intervention = findIntervention('task-fetch-stale-replay');
     expect(intervention?.data.phase).toBe('stale-approval-head-mismatch');
     expect(intervention?.data.currentHeadSha).toBe(NEXT_HEAD_SHA);
     expect(intervention?.data.source).toBe('fetch');
@@ -3896,153 +2314,62 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('stale APPROVE rejected once via fetch; replay during fetch failure cannot bypass via the (now-refreshed) store fallback', async () => {
-    await seedTask({
-      id: 'task-fetch-then-fail',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 305,
-      qaAgentId: 'qa-1',
-      latestHeadSha: HEAD_SHA,
-    });
+    await seedTask({ id: 'task-fetch-then-fail', status: 'review', reviewRound: 1, prNumber: 305, qaAgentId: 'qa-1', latestHeadSha: HEAD_SHA });
     const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha')
       .mockResolvedValueOnce(NEXT_HEAD_SHA)
       .mockRejectedValueOnce(new Error('gh api offline'));
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-then-fail',
-      data: { action: 'APPROVE', prNumber: 305, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA },
-    });
+    await emitReview('task-fetch-then-fail', { action: 'APPROVE', prNumber: 305, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA });
     const taskAfterStep1 = await taskStore.get('task-fetch-then-fail');
     expect(taskAfterStep1!.latestHeadSha).toBe(NEXT_HEAD_SHA);
 
     emittedEvents.length = 0;
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-then-fail',
-      data: { action: 'APPROVE', prNumber: 305, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA },
-    });
+    await emitReview('task-fetch-then-fail', { action: 'APPROVE', prNumber: 305, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention2 = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-fetch-then-fail',
-    );
+    const intervention2 = findIntervention('task-fetch-then-fail');
     expect(intervention2?.data.phase).toBe('stale-approval-head-mismatch');
     expect(intervention2?.data.currentHeadSha).toBe(NEXT_HEAD_SHA);
     expect(intervention2?.data.source).toBe('task-store');
     expect(intervention2?.data.fetchError).toContain('gh api offline');
   });
 
-  it('fetch failure → falls back to task.latestHeadSha; stale APPROVE still rejected with source=task-store', async () => {
-    await seedTask({
-      id: 'task-fetch-fallback-store',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 302,
-      qaAgentId: 'qa-1',
-      latestHeadSha: NEXT_HEAD_SHA,
-    });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh api offline'));
+  // On fetch failure the staleness check falls back: to task.latestHeadSha when present
+  // (source=task-store, surfacing the fetchError), else to the verdict's own currentHeadSha
+  // (source=payload-self). Either way the stale APPROVE is rejected.
+  it.each([
+    ['task.latestHeadSha (source=task-store)', 'task-fetch-fallback-store', 302, 'gh api offline', { latestHeadSha: NEXT_HEAD_SHA }, HEAD_SHA, 'task-store', 'gh api offline'],
+    ['payload-self (source=payload-self)', 'task-fetch-fallback-payload', 303, 'gh pr view: 404', {}, NEXT_HEAD_SHA, 'payload-self', undefined],
+  ])('fetch failure → falls back to %s; stale APPROVE rejected', async (_label, id, prNumber, fetchErr, seedExtra, currentHeadSha, source, fetchError) => {
+    await seedTask({ id, status: 'review', reviewRound: 1, prNumber, qaAgentId: 'qa-1', ...seedExtra });
+    vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error(fetchErr));
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-fallback-store',
-      data: { action: 'APPROVE', prNumber: 302, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA },
-    });
+    await emitReview(id, { action: 'APPROVE', prNumber, headSha: HEAD_SHA, currentHeadSha });
 
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-fetch-fallback-store',
-    );
+    const intervention = findIntervention(id);
     expect(intervention?.data.phase).toBe('stale-approval-head-mismatch');
-    expect(intervention?.data.source).toBe('task-store');
-    expect(intervention?.data.fetchError).toContain('gh api offline');
-  });
-
-  it('fetch failure + no store → falls back to payload-self with source=payload-self', async () => {
-    await seedTask({
-      id: 'task-fetch-fallback-payload',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 303,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh pr view: 404'));
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-fallback-payload',
-      data: { action: 'APPROVE', prNumber: 303, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA },
-    });
-
-    expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-fetch-fallback-payload',
-    );
-    expect(intervention?.data.phase).toBe('stale-approval-head-mismatch');
-    expect(intervention?.data.source).toBe('payload-self');
+    expect(intervention?.data.source).toBe(source);
+    if (fetchError !== undefined) expect(intervention?.data.fetchError).toContain(fetchError);
   });
 
   it('fetch failure + no store + no payload → proceeds (cannot prove staleness, behaviour matches pre-PR)', async () => {
-    await seedTask({
-      id: 'task-fetch-no-anchor',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 304,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-fetch-no-anchor', status: 'review', reviewRound: 1, prNumber: 304, qaAgentId: 'qa-1' });
     vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('boom'));
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fetch-no-anchor',
-      data: { action: 'APPROVE', prNumber: 304, headSha: HEAD_SHA },
-    });
+    await emitReview('task-fetch-no-anchor', { action: 'APPROVE', prNumber: 304, headSha: HEAD_SHA });
 
     expect(continueSpy).toHaveBeenCalled();
   });
 
   it('approval without reviewed head stays in review and does not bind the current PR head', async () => {
-    await seedTask({
-      id: 'task-a-missing-head',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 29,
-      qaAgentId: 'qa-1',
-    });
-    const fetchHeadSpy = vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-a-missing-head', status: 'review', reviewRound: 1, prNumber: 29, qaAgentId: 'qa-1' });
+    const { fetchPrHeadSha: fetchHeadSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-a-missing-head',
-      data: { action: 'APPROVE', prNumber: 29 },
-    });
+    await emitReview('task-a-missing-head', { action: 'APPROVE', prNumber: 29 });
 
     const task = await taskStore.get('task-a-missing-head');
     expect(task!.status).toBe('review');
@@ -4050,9 +2377,7 @@ describe('review.submitted APPROVE', () => {
     expect(fetchHeadSpy).not.toHaveBeenCalled();
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-a-missing-head',
-    );
+    const intervention = findIntervention('task-a-missing-head');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('approval-reviewed-head-unavailable');
   });
@@ -4063,84 +2388,42 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
     // Race: an earlier QA pass reviewed the old head and posted CHANGES_REQUESTED,
     // but a recheck was dispatched (reviewDispatchedAt) BEFORE that late
     // verdict arrived. The verdict belongs to the superseded pass — must not apply.
-    await seedTask({
-      id: 'task-stale-pass',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      reviewDispatchedAt: '2026-05-30T04:02:59.000Z',
-      qaAgentId: 'qa-1',
-    });
+    await seedReviewPass('task-stale-pass', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z' });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-stale-pass',
-      data: {
-        action: 'REQUEST_CHANGES',
-        prNumber: 214,
-        headSha: HEAD_SHA,
-        currentHeadSha: HEAD_SHA,
-        submittedAt: '2026-05-30T04:02:50Z', // before reviewDispatchedAt → stale
-      },
+    await emitReview('task-stale-pass', {
+      action: 'REQUEST_CHANGES',
+      prNumber: 214,
+      headSha: HEAD_SHA,
+      currentHeadSha: HEAD_SHA,
+      submittedAt: '2026-05-30T04:02:50Z', // before reviewDispatchedAt → stale
     });
 
     const task = await taskStore.get('task-stale-pass');
     expect(task!.status).toBe('review'); // unchanged — not driven into fixing
     expect(task!.reviewRound).toBe(1); // not bumped
     expect(transitionSpy).not.toHaveBeenCalled();
-    const stale = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-verdict-superseded-pass',
-    );
+    const stale = findInterventionByPhase('stale-verdict-superseded-pass');
     expect(stale).toBeDefined();
   });
 
   it('accepts a poller verdict submitted after the current review pass was dispatched', async () => {
     // The fresh recheck verdict (submitted after pass #2 dispatch) must pass the gate.
-    await seedTask({
-      id: 'task-fresh-pass',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      reviewDispatchedAt: '2026-05-30T04:02:59.000Z',
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    await seedReviewPass('task-fresh-pass', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z' });
+    stubApproveFlow();
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-fresh-pass',
-      data: {
-        action: 'APPROVE',
-        prNumber: 214,
-        headSha: HEAD_SHA,
-        currentHeadSha: HEAD_SHA,
-        submittedAt: '2026-05-30T04:06:01Z', // after reviewDispatchedAt → fresh
-      },
+    await emitReview('task-fresh-pass', {
+      action: 'APPROVE',
+      prNumber: 214,
+      headSha: HEAD_SHA,
+      currentHeadSha: HEAD_SHA,
+      submittedAt: '2026-05-30T04:06:01Z', // after reviewDispatchedAt → fresh
     });
 
     const task = await taskStore.get('task-fresh-pass');
     expect(task!.status).toBe('approved');
-    const stale = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-verdict-superseded-pass',
-    );
+    const stale = findInterventionByPhase('stale-verdict-superseded-pass');
     expect(stale).toBeUndefined();
   });
 
@@ -4148,43 +2431,20 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
     // GitHub submitted_at is second-granular; baxian reviewDispatchedAt is ms. A
     // verdict submitted in (or just before) the same wall-clock second as dispatch
     // must NOT be killed by sub-second rounding / minor clock drift.
-    await seedTask({
-      id: 'task-skew',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      reviewDispatchedAt: '2026-05-30T04:03:00.500Z',
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    await seedReviewPass('task-skew', { reviewDispatchedAt: '2026-05-30T04:03:00.500Z' });
+    stubApproveFlow();
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-skew',
-      data: {
-        action: 'APPROVE',
-        prNumber: 214,
-        headSha: HEAD_SHA,
-        currentHeadSha: HEAD_SHA,
-        submittedAt: '2026-05-30T04:03:00Z', // 0.5s before dispatch, within skew budget
-      },
+    await emitReview('task-skew', {
+      action: 'APPROVE',
+      prNumber: 214,
+      headSha: HEAD_SHA,
+      currentHeadSha: HEAD_SHA,
+      submittedAt: '2026-05-30T04:03:00Z', // 0.5s before dispatch, within skew budget
     });
 
     const task = await taskStore.get('task-skew');
     expect(task!.status).toBe('approved');
-    const stale = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-verdict-superseded-pass',
-    );
+    const stale = findInterventionByPhase('stale-verdict-superseded-pass');
     expect(stale).toBeUndefined();
   });
 });
@@ -4195,74 +2455,35 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
     // push re-dispatched (signalToken rotated). Its review body stamps the OLD token;
     // GitHub attributes the verdict to the new head, so the head/time gates miss it —
     // only the stamp catches it.
-    await seedTask({
-      id: 'task-wrongpass',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      signalToken: 'current-token-22',
-      qaAgentId: 'qa-1',
-    });
+    await seedReviewPass('task-wrongpass', { signalToken: 'current-token-22' });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-wrongpass',
-      data: {
-        action: 'APPROVE',
-        prNumber: 214,
-        headSha: HEAD_SHA,
-        currentHeadSha: HEAD_SHA,
-        reviewPassToken: 'stale-token-11', // != current signalToken → superseded pass
-      },
+    await emitReview('task-wrongpass', {
+      action: 'APPROVE',
+      prNumber: 214,
+      headSha: HEAD_SHA,
+      currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11', // != current signalToken → superseded pass
     });
 
     const task = await taskStore.get('task-wrongpass');
     expect(task!.status).toBe('review'); // unchanged
     expect(transitionSpy).not.toHaveBeenCalled();
-    const wrong = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-verdict-wrong-pass',
-    );
+    const wrong = findInterventionByPhase('stale-verdict-wrong-pass');
     expect(wrong).toBeDefined();
   });
 
   it('accepts a verdict whose review-pass token matches the current signalToken', async () => {
-    await seedTask({
-      id: 'task-rightpass',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      signalToken: 'current-token-22',
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    await seedReviewPass('task-rightpass', { signalToken: 'current-token-22' });
+    stubApproveFlow();
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rightpass',
-      data: {
-        action: 'APPROVE',
-        prNumber: 214,
-        headSha: HEAD_SHA,
-        currentHeadSha: HEAD_SHA,
-        reviewPassToken: 'current-token-22', // matches → fresh
-      },
+    await emitReview('task-rightpass', {
+      action: 'APPROVE',
+      prNumber: 214,
+      headSha: HEAD_SHA,
+      currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'current-token-22', // matches → fresh
     });
 
     const task = await taskStore.get('task-rightpass');
@@ -4270,43 +2491,20 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
   });
 
   it('accepts a verdict with NO review-pass token (e.g. a human review) — verify-if-present', async () => {
-    await seedTask({
-      id: 'task-notoken',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      signalToken: 'current-token-22',
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    await seedReviewPass('task-notoken', { signalToken: 'current-token-22' });
+    stubApproveFlow();
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-notoken',
-      data: {
-        action: 'APPROVE',
-        prNumber: 214,
-        headSha: HEAD_SHA,
-        currentHeadSha: HEAD_SHA,
-        // no reviewPassToken
-      },
+    await emitReview('task-notoken', {
+      action: 'APPROVE',
+      prNumber: 214,
+      headSha: HEAD_SHA,
+      currentHeadSha: HEAD_SHA,
+      // no reviewPassToken
     });
 
     const task = await taskStore.get('task-notoken');
     expect(task!.status).toBe('approved');
-    const wrong = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-verdict-wrong-pass',
-    );
+    const wrong = findInterventionByPhase('stale-verdict-wrong-pass');
     expect(wrong).toBeUndefined();
   });
 
@@ -4314,75 +2512,36 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
     // After a redispatch rotated task.signalToken, an old QA's not-yet-replaced watcher
     // can still fire [bx:pr-approved:<old-token>]. The gate must reject it via data.token,
     // not bind a headSha-less pane verdict to the new reviewHeadAnchorSha.
-    await seedTask({
-      id: 'task-stale-pane',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      signalToken: 'current-token-22', // already rotated by the redispatch
-      qaAgentId: 'qa-1',
-    });
+    await seedReviewPass('task-stale-pane', { signalToken: 'current-token-22' }); // already rotated by the redispatch
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-stale-pane',
-      data: {
-        kind: 'pr-approved',
-        action: 'APPROVE',
-        verdictAgentId: 'qa-1',
-        source: 'pane-signal',
-        token: 'stale-token-11', // old watcher's token != current signalToken
-      },
+    await emitReview('task-stale-pane', {
+      kind: 'pr-approved',
+      action: 'APPROVE',
+      verdictAgentId: 'qa-1',
+      source: 'pane-signal',
+      token: 'stale-token-11', // old watcher's token != current signalToken
     });
 
     const task = await taskStore.get('task-stale-pane');
     expect(task!.status).toBe('review'); // not approved
     expect(transitionSpy).not.toHaveBeenCalled();
-    const wrong = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data.phase as string) === 'stale-verdict-wrong-pass',
-    );
+    const wrong = findInterventionByPhase('stale-verdict-wrong-pass');
     expect(wrong).toBeDefined();
     expect(wrong!.data.source).toBe('pane-signal');
   });
 
   it('accepts a PANE-fallback verdict whose data.token matches the current signalToken (legit same-identity)', async () => {
-    await seedTask({
-      id: 'task-legit-pane',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 214,
-      latestHeadSha: HEAD_SHA,
-      reviewHeadAnchorSha: HEAD_SHA,
-      signalToken: 'current-token-22',
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    await seedReviewPass('task-legit-pane', { signalToken: 'current-token-22' });
+    stubApproveFlow();
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-legit-pane',
-      data: {
-        kind: 'pr-approved',
-        action: 'APPROVE',
-        verdictAgentId: 'qa-1',
-        source: 'pane-signal',
-        token: 'current-token-22', // matches current pass → accept
-      },
+    await emitReview('task-legit-pane', {
+      kind: 'pr-approved',
+      action: 'APPROVE',
+      verdictAgentId: 'qa-1',
+      source: 'pane-signal',
+      token: 'current-token-22', // matches current pass → accept
     });
 
     const task = await taskStore.get('task-legit-pane');
@@ -4392,25 +2551,10 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
 
 describe('review.submitted REQUEST_CHANGES', () => {
   it('merge-ready → fixing on REQUEST_CHANGES (formal re-open after ready)', async () => {
-    await seedTask({
-      id: 'task-mr-rc',
-      status: 'merge-ready',
-      reviewRound: 1,
-      prNumber: 31,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-mr-rc', status: 'merge-ready', reviewRound: 1, prNumber: 31, qaAgentId: 'qa-1' });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-mr-rc',
-      data: { action: 'REQUEST_CHANGES', prNumber: 31 },
-    });
+    await emitReview('task-mr-rc', { action: 'REQUEST_CHANGES', prNumber: 31 });
 
     const task = await taskStore.get('task-mr-rc');
     expect(task!.status).toBe('fixing');
@@ -4419,24 +2563,10 @@ describe('review.submitted REQUEST_CHANGES', () => {
   });
 
   it('within rounds → fixing + reviewRound++ + continueSession + releaseAgentForTask QA', async () => {
-    await seedTask({
-      id: 'task-r1',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 30,
-      qaAgentId: 'qa-1',
-    });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-r1', status: 'review', reviewRound: 1, prNumber: 30, qaAgentId: 'qa-1' });
+    const { releaseAgentForTask: stopSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r1',
-      data: { action: 'REQUEST_CHANGES', prNumber: 30 },
-    });
+    await emitReview('task-r1', { action: 'REQUEST_CHANGES', prNumber: 30 });
 
     const task = await taskStore.get('task-r1');
     expect(task!.status).toBe('fixing');
@@ -4446,29 +2576,11 @@ describe('review.submitted REQUEST_CHANGES', () => {
   });
 
   it('approved + REQUEST_CHANGES clears post-approve token and dispatches dev fix', async () => {
-    await seedTask({
-      id: 'task-r-approved',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 35,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-r-approved', {
-      token: 'stale-post-token',
-      approvedHeadSha: HEAD_SHA,
-    });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-r-approved', status: 'approved', reviewRound: 1, prNumber: 35, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion('task-r-approved', { token: 'stale-post-token', approvedHeadSha: HEAD_SHA });
+    const { releaseAgentForTask: releaseSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r-approved',
-      data: { action: 'REQUEST_CHANGES', prNumber: 35 },
-    });
+    await emitReview('task-r-approved', { action: 'REQUEST_CHANGES', prNumber: 35 });
 
     const task = await taskStore.get('task-r-approved');
     expect(task!.status).toBe('fixing');
@@ -4484,29 +2596,11 @@ describe('review.submitted REQUEST_CHANGES', () => {
   });
 
   it('approved + REQUEST_CHANGES leaves task approved when dev cannot be interrupted for fix', async () => {
-    await seedTask({
-      id: 'task-r-approved-gate-fail',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 36,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-r-approved-gate-fail', {
-      token: 'stale-post-token',
-      approvedHeadSha: HEAD_SHA,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-r-approved-gate-fail', status: 'approved', reviewRound: 1, prNumber: 36, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion('task-r-approved-gate-fail', { token: 'stale-post-token', approvedHeadSha: HEAD_SHA });
+    const { acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: false, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r-approved-gate-fail',
-      data: { action: 'REQUEST_CHANGES', prNumber: 36 },
-    });
+    await emitReview('task-r-approved-gate-fail', { action: 'REQUEST_CHANGES', prNumber: 36 });
 
     const task = await taskStore.get('task-r-approved-gate-fail');
     expect(task!.status).toBe('approved');
@@ -4519,110 +2613,58 @@ describe('review.submitted REQUEST_CHANGES', () => {
     );
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-r-approved-gate-fail',
-    );
+    const intervention = findIntervention('task-r-approved-gate-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('post-approve-dev-wait-gate-failed-before-fix');
   });
 
-  it('stale approved REQUEST_CHANGES for an older head preserves approval and active token', async () => {
-    await seedTask({
-      id: 'task-r-approved-stale',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 37,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-r-approved-stale', {
-      token: 'active-post-token',
-      approvedHeadSha: NEXT_HEAD_SHA,
-    });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+  // A stale REQUEST_CHANGES (verdict reviewed an older head) on an approved task is rejected:
+  // approval + round + active token preserved, no dev/QA dispatch, and it can never push an
+  // approved newer head into max_rounds even at the round cap.
+  it.each([
+    ['for an older head preserves approval and active token', 'task-r-approved-stale', 1, 37, false],
+    ['cannot move an approved newer head to max_rounds', 'task-r-approved-stale-max', 3, 38, true],
+  ])('stale approved REQUEST_CHANGES %s', async (_label, id, reviewRound, prNumber, atCap) => {
+    await seedTask({ id, status: 'approved', reviewRound, prNumber, qaAgentId: 'qa-1' });
+    await manager.setPostApproveCompletion(id, { token: 'active-post-token', approvedHeadSha: NEXT_HEAD_SHA });
+    const { releaseAgentForTask: releaseSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r-approved-stale',
-      data: {
-        action: 'REQUEST_CHANGES',
-        prNumber: 37,
-        headSha: HEAD_SHA,
-        currentHeadSha: NEXT_HEAD_SHA,
-      },
-    });
+    await emitReview(id, { action: 'REQUEST_CHANGES', prNumber, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA });
 
-    const task = await taskStore.get('task-r-approved-stale');
+    const task = await taskStore.get(id);
     expect(task!.status).toBe('approved');
-    expect(task!.reviewRound).toBe(1);
-    await expect(manager.getPostApproveCompletion('task-r-approved-stale')).resolves.toEqual(
-      expect.objectContaining({
-        token: 'active-post-token',
-        approvedHeadSha: NEXT_HEAD_SHA,
-      }),
+    expect(task!.reviewRound).toBe(reviewRound);
+    await expect(manager.getPostApproveCompletion(id)).resolves.toEqual(
+      expect.objectContaining({ token: 'active-post-token', approvedHeadSha: NEXT_HEAD_SHA }),
     );
     expect(releaseSpy).not.toHaveBeenCalled();
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-r-approved-stale',
-    );
+    if (atCap) expect(emittedEvents.some(e => e.type === 'review.max_rounds')).toBe(false);
+    const intervention = findIntervention(id);
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('stale-request-changes-head-mismatch');
   });
 
   it('qa-release-failed-but-dev-dispatched: QA release returns false → still dispatch dev fix + emit intervention', async () => {
-    await seedTask({
-      id: 'task-r-rel-fail',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 33,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-r-rel-fail', status: 'review', reviewRound: 1, prNumber: 33, qaAgentId: 'qa-1' });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: false, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r-rel-fail',
-      data: { action: 'REQUEST_CHANGES', prNumber: 33 },
-    });
+    await emitReview('task-r-rel-fail', { action: 'REQUEST_CHANGES', prNumber: 33 });
 
     expect(continueSpy).toHaveBeenCalledWith('task-r-rel-fail', 'dev-1', 'fix');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-r-rel-fail',
-    );
+    const intervention = findIntervention('task-r-rel-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-release-failed-but-dev-dispatched');
     expect(intervention!.data.qaAgentId).toBe('qa-1');
   });
 
   it('continueSession failure does NOT roll back fixing status', async () => {
-    await seedTask({
-      id: 'task-r2',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 31,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-r2', status: 'review', reviewRound: 1, prNumber: 31, qaAgentId: 'qa-1' });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'continueSession').mockRejectedValue(new Error('dev tmux dead'));
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r2',
-      data: { action: 'REQUEST_CHANGES', prNumber: 31 },
-    });
+    await emitReview('task-r2', { action: 'REQUEST_CHANGES', prNumber: 31 });
 
     const task = await taskStore.get('task-r2');
     expect(task!.status).toBe('fixing');
@@ -4630,31 +2672,14 @@ describe('review.submitted REQUEST_CHANGES', () => {
   });
 
   it('continueSession returns false (dev unresumable) → emit human.intervention + markAgentWaiting rollback', async () => {
-    await seedTask({
-      id: 'task-r2b',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 311,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(false);
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    await seedTask({ id: 'task-r2b', status: 'review', reviewRound: 1, prNumber: 311, qaAgentId: 'qa-1' });
+    const { markAgentWaiting: markWaitSpy } = stubManager({ releaseAgentForTask: true, continueSession: false, markAgentWaiting: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r2b',
-      data: { action: 'REQUEST_CHANGES', prNumber: 311 },
-    });
+    await emitReview('task-r2b', { action: 'REQUEST_CHANGES', prNumber: 311 });
 
     const task = await taskStore.get('task-r2b');
     expect(task!.status).toBe('fixing');
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-r2b',
-    );
+    const intervention = findIntervention('task-r2b');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('fix-resume-failed');
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-r2b');
@@ -4664,52 +2689,24 @@ describe('review.submitted REQUEST_CHANGES', () => {
     // PATCH /config rounds=10 → 1 must NOT require a server restart. Issue #167 regression:
     // handlers used to close over the initial config at boot time; if they still do, this
     // test fails because the captured rounds=3 would let round-2 continue instead of capping.
-    await seedTask({
-      id: 'task-rounds-live',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 77,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await seedTask({ id: 'task-rounds-live', status: 'review', reviewRound: 1, prNumber: 77, qaAgentId: 'qa-1' });
+    stubManager({ releaseAgentForTask: true, continueSession: true });
 
     manager.replaceConfig({ ...CONFIG, review: { rounds: 1 } });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-rounds-live',
-      data: { action: 'REQUEST_CHANGES', prNumber: 77 },
-    });
+    await emitReview('task-rounds-live', { action: 'REQUEST_CHANGES', prNumber: 77 });
 
     const task = await taskStore.get('task-rounds-live');
     expect(task!.status).toBe('max_rounds');
   });
 
   it('exceeds rounds → max_rounds + emit review.max_rounds', async () => {
-    await seedTask({
-      id: 'task-r3',
-      status: 'review',
-      reviewRound: 3,
-      prNumber: 32,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-r3', status: 'review', reviewRound: 3, prNumber: 32, qaAgentId: 'qa-1' });
     // QA bound to the task (it was reviewing) → release path runs.
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'running', taskId: 'task-r3', paneId: '%2', updatedAt: new Date().toISOString() });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const { releaseAgentForTask: stopSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r3',
-      data: { action: 'REQUEST_CHANGES', prNumber: 32 },
-    });
+    await emitReview('task-r3', { action: 'REQUEST_CHANGES', prNumber: 32 });
 
     const task = await taskStore.get('task-r3');
     expect(task!.status).toBe('max_rounds');
@@ -4730,26 +2727,12 @@ describe('review.submitted REQUEST_CHANGES', () => {
   // G1: if the QA release is REFUSED (e.g. still bound/held and the gate declines), the stale
   // qaAgentId must NOT be cleared — keep the reference so a later Cancel/Complete can reclaim it.
   it('exceeds rounds → does NOT clear qaAgentId when the QA release is refused', async () => {
-    await seedTask({
-      id: 'task-r3b',
-      status: 'review',
-      reviewRound: 3,
-      prNumber: 33,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-r3b', status: 'review', reviewRound: 3, prNumber: 33, qaAgentId: 'qa-1' });
     // QA still bound (held) → release path runs but is refused → keep the reference.
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'awaiting_human', taskId: 'task-r3b', paneId: '%2', updatedAt: new Date().toISOString() });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    stubManager({ releaseAgentForTask: false, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r3b',
-      data: { action: 'REQUEST_CHANGES', prNumber: 33 },
-    });
+    await emitReview('task-r3b', { action: 'REQUEST_CHANGES', prNumber: 33 });
 
     const task = await taskStore.get('task-r3b');
     expect(task!.status).toBe('max_rounds');
@@ -4760,84 +2743,19 @@ describe('review.submitted REQUEST_CHANGES', () => {
   // released the QA WITHOUT clearing qaAgentId. The stale id must still be cleared at max_rounds so
   // the released QA's later failure can't false-fail this paused (active) task.
   it('merge-ready → max_rounds clears the stale qaAgentId of an already-released QA', async () => {
-    await seedTask({
-      id: 'task-mr-cap',
-      status: 'merge-ready',
-      reviewRound: 3,
-      prNumber: 34,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-mr-cap', status: 'merge-ready', reviewRound: 3, prNumber: 34, qaAgentId: 'qa-1' });
     // QA already released by the approve path: unbound (no taskId).
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'idle', paneId: '%2', updatedAt: new Date().toISOString() });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-mr-cap',
-      data: { action: 'REQUEST_CHANGES', prNumber: 34 },
-    });
+    await emitReview('task-mr-cap', { action: 'REQUEST_CHANGES', prNumber: 34 });
 
     const task = await taskStore.get('task-mr-cap');
     expect(task!.status).toBe('max_rounds');
     expect(task!.qaAgentId).toBeUndefined();
   });
 
-  it('stale approved REQUEST_CHANGES cannot move an approved newer head to max_rounds', async () => {
-    await seedTask({
-      id: 'task-r-approved-stale-max',
-      status: 'approved',
-      reviewRound: 3,
-      prNumber: 38,
-      qaAgentId: 'qa-1',
-    });
-    await manager.setPostApproveCompletion('task-r-approved-stale-max', {
-      token: 'active-post-token',
-      approvedHeadSha: NEXT_HEAD_SHA,
-    });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r-approved-stale-max',
-      data: {
-        action: 'REQUEST_CHANGES',
-        prNumber: 38,
-        headSha: HEAD_SHA,
-        currentHeadSha: NEXT_HEAD_SHA,
-      },
-    });
-
-    const task = await taskStore.get('task-r-approved-stale-max');
-    expect(task!.status).toBe('approved');
-    expect(task!.reviewRound).toBe(3);
-    await expect(manager.getPostApproveCompletion('task-r-approved-stale-max')).resolves.toEqual(
-      expect.objectContaining({
-        token: 'active-post-token',
-        approvedHeadSha: NEXT_HEAD_SHA,
-      }),
-    );
-    expect(releaseSpy).not.toHaveBeenCalled();
-    expect(emittedEvents.some(e => e.type === 'review.max_rounds')).toBe(false);
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention' && e.taskId === 'task-r-approved-stale-max',
-    );
-    expect(intervention).toBeTruthy();
-    expect(intervention!.data.phase).toBe('stale-request-changes-head-mismatch');
-  });
-
   it('max_rounds emit failure → handler swallows emit error', async () => {
-    await seedTask({
-      id: 'task-r4',
-      status: 'review',
-      reviewRound: 3,
-      prNumber: 33,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-r4', status: 'review', reviewRound: 3, prNumber: 33, qaAgentId: 'qa-1' });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     const realEmit = eventBus.emit.bind(eventBus);
     vi.spyOn(eventBus, 'emit').mockImplementation(async (evt) => {
@@ -4845,14 +2763,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
       return realEmit(evt);
     });
 
-    await expect(emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r4',
-      data: { action: 'REQUEST_CHANGES', prNumber: 33 },
-    })).resolves.not.toThrow();
+    await expect(emitReview('task-r4', { action: 'REQUEST_CHANGES', prNumber: 33 })).resolves.not.toThrow();
 
     const task = await taskStore.get('task-r4');
     expect(task!.status).toBe('max_rounds');
@@ -4862,14 +2773,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
     await seedTask({ id: 'task-r-cx', status: 'cancelled', prNumber: 34 });
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-r-cx',
-      data: { action: 'REQUEST_CHANGES', prNumber: 34 },
-    });
+    await emitReview('task-r-cx', { action: 'REQUEST_CHANGES', prNumber: 34 });
 
     expect(continueSpy).not.toHaveBeenCalled();
   });
@@ -4877,27 +2781,11 @@ describe('review.submitted REQUEST_CHANGES', () => {
 
 describe('review.submitted late-review catch-up', () => {
   it('in_progress + event prNumber → catch-up to review then APPROVE → approved', async () => {
-    await seedTask({
-      id: 'task-late1',
-      status: 'in_progress',
-      reviewRound: 0,
-      prNumber: undefined,
-    });
+    await seedTask({ id: 'task-late1', status: 'in_progress', reviewRound: 0, prNumber: undefined });
     await seedDevAgent('task-late1');
-    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    const { markAgentWaiting: markWaitSpy } = stubManager({ markAgentWaiting: true, releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-late1',
-      data: { action: 'APPROVE', prNumber: 99, headSha: HEAD_SHA },
-    });
+    await emitReview('task-late1', { action: 'APPROVE', prNumber: 99, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-late1');
     expect(task!.status).toBe('approved');
@@ -4906,26 +2794,11 @@ describe('review.submitted late-review catch-up', () => {
   });
 
   it('fixing + event prNumber + REQUEST_CHANGES → catch-up to review then fixing again', async () => {
-    await seedTask({
-      id: 'task-late2',
-      status: 'fixing',
-      reviewRound: 1,
-      prNumber: 50,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-late2', status: 'fixing', reviewRound: 1, prNumber: 50, qaAgentId: 'qa-1' });
     await seedDevAgent('task-late2');
-    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const { continueSession: continueSpy } = stubManager({ markAgentWaiting: true, releaseAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-late2',
-      data: { action: 'REQUEST_CHANGES', prNumber: 50 },
-    });
+    await emitReview('task-late2', { action: 'REQUEST_CHANGES', prNumber: 50 });
 
     const task = await taskStore.get('task-late2');
     expect(task!.status).toBe('fixing');
@@ -4934,22 +2807,10 @@ describe('review.submitted late-review catch-up', () => {
   });
 
   it('in_progress + event has NO prNumber → no catch-up, no transition', async () => {
-    await seedTask({
-      id: 'task-late3',
-      status: 'in_progress',
-      reviewRound: 0,
-      prNumber: undefined,
-    });
+    await seedTask({ id: 'task-late3', status: 'in_progress', reviewRound: 0, prNumber: undefined });
     const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-late3',
-      data: { action: 'APPROVE', headSha: HEAD_SHA },
-    });
+    await emitReview('task-late3', { action: 'APPROVE', headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-late3');
     expect(task!.status).toBe('in_progress');
@@ -4958,42 +2819,19 @@ describe('review.submitted late-review catch-up', () => {
 
   it('catch-up sees terminal task → return early (no APPROVE/REQUEST_CHANGES path)', async () => {
     await seedTask({ id: 'task-late4', status: 'cancelled' });
-    const stopSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    const { releaseAgentForTask: stopSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-late4',
-      data: { action: 'APPROVE', prNumber: 60, headSha: HEAD_SHA },
-    });
+    await emitReview('task-late4', { action: 'APPROVE', prNumber: 60, headSha: HEAD_SHA });
 
     expect(stopSpy).not.toHaveBeenCalled();
     expect(mergeSpy).not.toHaveBeenCalled();
   });
 
   it('event prNumber overrides task.prNumber when both present', async () => {
-    await seedTask({
-      id: 'task-late5',
-      status: 'review',
-      reviewRound: 1,
-      prNumber: 10,
-    });
-    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    await seedTask({ id: 'task-late5', status: 'review', reviewRound: 1, prNumber: 10 });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-late5',
-      data: { action: 'APPROVE', prNumber: 11, headSha: NEXT_HEAD_SHA },
-    });
+    await emitReview('task-late5', { action: 'APPROVE', prNumber: 11, headSha: NEXT_HEAD_SHA });
 
     const task = await taskStore.get('task-late5');
     expect(task!.prNumber).toBe(11);
@@ -5003,14 +2841,7 @@ describe('review.submitted late-review catch-up', () => {
 describe('event-driven release does not interrupt agent mid-action', () => {
   // Regression: PR webhook → release path must not send C-c to a busy dev pane.
   it('review.submitted REQUEST_CHANGES on approved task with busy dev pane: no C-c, dev binding preserved through waiting release', async () => {
-    await seedTask({
-      id: 'task-busy-redispatch',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 113,
-      latestHeadSha: HEAD_SHA,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-busy-redispatch', status: 'approved', reviewRound: 1, prNumber: 113, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
     await seedDevAgent('task-busy-redispatch');
     await lockManager.acquire('dev-1');
 
@@ -5038,17 +2869,9 @@ describe('event-driven release does not interrupt agent mid-action', () => {
       },
     );
 
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const { acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ acquireAgentForTask: true, continueSession: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-busy-redispatch',
-      data: { action: 'REQUEST_CHANGES', prNumber: 113, headSha: HEAD_SHA },
-    });
+    await emitReview('task-busy-redispatch', { action: 'REQUEST_CHANGES', prNumber: 113, headSha: HEAD_SHA });
 
     const cCancelKeys = sentCommands.filter(
       cmd => cmd.includes('send-keys') && cmd.includes('C-c'),
@@ -5076,33 +2899,14 @@ describe('event-driven release does not interrupt agent mid-action', () => {
 
   it('REQUEST_CHANGES on approved + post-approve completion still active: emits intervention + skips fix dispatch (avoid prompt collision)', async () => {
     // Dev still running post-approve check; release(waiting) just bumps updatedAt → fix prompt would land in the busy pane.
-    await seedTask({
-      id: 'task-postapprove-busy',
-      status: 'approved',
-      reviewRound: 1,
-      prNumber: 200,
-      latestHeadSha: HEAD_SHA,
-      qaAgentId: 'qa-1',
-    });
+    await seedTask({ id: 'task-postapprove-busy', status: 'approved', reviewRound: 1, prNumber: 200, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
     await seedDevAgent('task-postapprove-busy');
     await lockManager.acquire('dev-1');
-    await manager.setPostApproveCompletion('task-postapprove-busy', {
-      token: 'tok-pa',
-      approvedHeadSha: HEAD_SHA,
-    });
+    await manager.setPostApproveCompletion('task-postapprove-busy', { token: 'tok-pa', approvedHeadSha: HEAD_SHA });
 
-    const acquireSpy = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const { acquireAgentForTask: acquireSpy, continueSession: continueSpy, releaseAgentForTask: releaseSpy } = stubManager({ acquireAgentForTask: true, continueSession: true, releaseAgentForTask: true });
 
-    await emitAndWait({
-      type: 'review.submitted',
-      timestamp: new Date().toISOString(),
-      projectId: 'proj',
-      agentId: 'qa-1',
-      taskId: 'task-postapprove-busy',
-      data: { action: 'REQUEST_CHANGES', prNumber: 200, headSha: HEAD_SHA },
-    });
+    await emitReview('task-postapprove-busy', { action: 'REQUEST_CHANGES', prNumber: 200, headSha: HEAD_SHA });
 
     // fix dispatch 必须跳过——既不 release(waiting) 也不 acquire(fix) 也不 continueSession(fix)
     expect(releaseSpy).not.toHaveBeenCalledWith('dev-1', 'task-postapprove-busy', 'waiting');
@@ -5114,10 +2918,7 @@ describe('event-driven release does not interrupt agent mid-action', () => {
     expect(task!.status).toBe('approved');
 
     // intervention 已 emit
-    const intervention = emittedEvents.find(
-      e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'request-changes-during-post-approve',
-    );
+    const intervention = findInterventionByPhase('request-changes-during-post-approve');
     expect(intervention).toBeTruthy();
 
     // PostApproveCompletion must clear, else signal completion + pendingRedispatch=false would auto-merge despite the REQUEST_CHANGES.

@@ -31,6 +31,19 @@ function task(status: TaskState['status']): TaskState {
   };
 }
 
+function presentObs(overrides: Partial<TmuxSessionObservation> = {}): TmuxSessionObservation {
+  return { tmuxSessionStatus: 'present', observedAt: NOW, ...overrides };
+}
+
+const reviewQaTask = (): TaskState => ({ ...task('review'), qaAgentId: 'qa-1' });
+
+// Unreachable probe still inside the grace window (20s after last present sighting).
+const withinGraceUnreachable: TmuxSessionObservation = {
+  tmuxSessionStatus: 'unreachable',
+  observedAt: '2026-05-14T05:00:20.000Z',
+  lastPresentAt: '2026-05-14T05:00:00.000Z',
+};
+
 describe('deriveRuntimeStatus', () => {
   it('reports creationToken as pending before the first tmux probe completes', () => {
     expect(
@@ -44,7 +57,7 @@ describe('deriveRuntimeStatus', () => {
 
   it('maps active task statuses while tmux is present', () => {
     const b = binding({ taskId: 'task-1' });
-    const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
+    const obs = presentObs();
     expect(deriveRuntimeStatus(b, obs, task('in_progress'))).toBe('working');
     expect(deriveRuntimeStatus(b, obs, task('review'))).toBe('waiting');
     expect(deriveRuntimeStatus(b, obs, task('failed'))).toBe('error');
@@ -52,61 +65,36 @@ describe('deriveRuntimeStatus', () => {
 
   it('reports a QA agent bound to a review task as working (it IS doing the review)', () => {
     const b = binding({ id: 'qa-1', taskId: 'task-1' });
-    const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
-    const t = { ...task('review'), qaAgentId: 'qa-1' };
-    expect(deriveRuntimeStatus(b, obs, t)).toBe('working');
+    expect(deriveRuntimeStatus(b, presentObs(), reviewQaTask())).toBe('working');
   });
 
   it('reports a dev agent bound to a review task as waiting (QA is reviewing, dev waits)', () => {
     const b = binding({ id: 'dev-1', taskId: 'task-1' });
-    const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
-    const t = { ...task('review'), qaAgentId: 'qa-1' };
-    expect(deriveRuntimeStatus(b, obs, t)).toBe('waiting');
+    expect(deriveRuntimeStatus(b, presentObs(), reviewQaTask())).toBe('waiting');
   });
 
   it('reports a reserved max_rounds dev as waiting (awaiting human decision), not error', () => {
     const b = binding({ taskId: 'task-1' });
-    const obs: TmuxSessionObservation = { tmuxSessionStatus: 'present', observedAt: NOW };
-    expect(deriveRuntimeStatus(b, obs, task('max_rounds'))).toBe('waiting');
+    expect(deriveRuntimeStatus(b, presentObs(), task('max_rounds'))).toBe('waiting');
   });
 
   it('reports a still-bound merged task as working (post-merge cleanup + compact in flight, not yet idle)', () => {
     expect(
-      deriveRuntimeStatus(
-        binding({ taskId: 'task-1' }),
-        { tmuxSessionStatus: 'present', observedAt: NOW },
-        task('merged'),
-      ),
+      deriveRuntimeStatus(binding({ taskId: 'task-1' }), presentObs(), task('merged')),
     ).toBe('working');
   });
 
   it('keeps a recently-present active task in its task-derived status during transient unreachable probes', () => {
     const b = binding({ taskId: 'task-1' });
     expect(
-      deriveRuntimeStatus(
-        b,
-        {
-          tmuxSessionStatus: 'unreachable',
-          observedAt: '2026-05-14T05:00:20.000Z',
-          lastPresentAt: '2026-05-14T05:00:00.000Z',
-        },
-        task('in_progress'),
-      ),
+      deriveRuntimeStatus(b, withinGraceUnreachable, task('in_progress')),
     ).toBe('working');
   });
 
   it('reports QA agent as working during unreachable grace when task is in review', () => {
     const b = binding({ id: 'qa-1', taskId: 'task-1' });
     expect(
-      deriveRuntimeStatus(
-        b,
-        {
-          tmuxSessionStatus: 'unreachable',
-          observedAt: '2026-05-14T05:00:20.000Z',
-          lastPresentAt: '2026-05-14T05:00:00.000Z',
-        },
-        { ...task('review'), qaAgentId: 'qa-1' },
-      ),
+      deriveRuntimeStatus(b, withinGraceUnreachable, reviewQaTask()),
     ).toBe('working');
   });
 
@@ -138,19 +126,14 @@ describe('deriveRuntimeStatus', () => {
     expect(
       deriveRuntimeStatus(
         binding({ taskId: 'task-1' }),
-        {
-          tmuxSessionStatus: 'present',
-          observedAt: NOW,
-          runtimeStatusHint: 'pending',
-          reason: 'PENDING_HUMAN',
-        },
+        presentObs({ runtimeStatusHint: 'pending', reason: 'PENDING_HUMAN' }),
         task('in_progress'),
       ),
     ).toBe('pending');
     expect(
       deriveRuntimeStatus(
         binding({ taskId: 'task-1' }),
-        { tmuxSessionStatus: 'present', observedAt: NOW, paneState: 'shell' },
+        presentObs({ paneState: 'shell' }),
         task('in_progress'),
       ),
     ).toBe('error');
@@ -160,11 +143,7 @@ describe('deriveRuntimeStatus', () => {
     expect(
       deriveRuntimeStatus(
         binding({ taskId: 'task-1' }),
-        {
-          tmuxSessionStatus: 'present',
-          observedAt: NOW,
-          runtimeStatusHint: 'working',
-        },
+        presentObs({ runtimeStatusHint: 'working' }),
         task('review'),
       ),
     ).toBe('working');
@@ -172,12 +151,7 @@ describe('deriveRuntimeStatus', () => {
 
   it('PENDING_IDLE hint is honored when the bound task is actively running (in_progress / fixing)', () => {
     const b = binding({ taskId: 'task-1' });
-    const obs: TmuxSessionObservation = {
-      tmuxSessionStatus: 'present',
-      observedAt: NOW,
-      runtimeStatusHint: 'pending',
-      reason: 'PENDING_IDLE',
-    };
+    const obs = presentObs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
     expect(deriveRuntimeStatus(b, obs, task('in_progress'))).toBe('pending');
     expect(deriveRuntimeStatus(b, obs, task('fixing'))).toBe('pending');
   });
@@ -186,13 +160,8 @@ describe('deriveRuntimeStatus', () => {
     expect(
       deriveRuntimeStatus(
         binding({ taskId: 'task-1' }),
-        {
-          tmuxSessionStatus: 'present',
-          observedAt: NOW,
-          runtimeStatusHint: 'pending',
-          reason: 'PENDING_IDLE',
-        },
-        { ...task('review'), qaAgentId: 'qa-1' },
+        presentObs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' }),
+        reviewQaTask(),
       ),
     ).toBe('waiting');
   });
@@ -201,13 +170,8 @@ describe('deriveRuntimeStatus', () => {
     expect(
       deriveRuntimeStatus(
         binding({ id: 'qa-1', taskId: 'task-1' }),
-        {
-          tmuxSessionStatus: 'present',
-          observedAt: NOW,
-          runtimeStatusHint: 'pending',
-          reason: 'PENDING_IDLE',
-        },
-        { ...task('review'), qaAgentId: 'qa-1' },
+        presentObs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' }),
+        reviewQaTask(),
       ),
     ).toBe('pending');
   });
@@ -216,12 +180,7 @@ describe('deriveRuntimeStatus', () => {
     expect(
       deriveRuntimeStatus(
         binding({ taskId: 'task-1' }),
-        {
-          tmuxSessionStatus: 'present',
-          observedAt: NOW,
-          runtimeStatusHint: 'pending',
-          reason: 'PENDING_IDLE',
-        },
+        presentObs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' }),
         undefined,
       ),
     ).toBe('working');
@@ -229,19 +188,14 @@ describe('deriveRuntimeStatus', () => {
 
   it('PENDING_HUMAN hint is honored regardless of task status (physical menu signal — never gated)', () => {
     const b = binding({ taskId: 'task-1' });
-    const obs: TmuxSessionObservation = {
-      tmuxSessionStatus: 'present',
-      observedAt: NOW,
-      runtimeStatusHint: 'pending',
-      reason: 'PENDING_HUMAN',
-    };
+    const obs = presentObs({ runtimeStatusHint: 'pending', reason: 'PENDING_HUMAN' });
     expect(deriveRuntimeStatus(b, obs, task('in_progress'))).toBe('pending');
     expect(deriveRuntimeStatus(b, obs, task('review'))).toBe('pending');
     expect(deriveRuntimeStatus(b, obs, task('approved'))).toBe('pending');
   });
 
   it('does not show an unbound absent or unverified agent as idle', () => {
-    expect(deriveRuntimeStatus(binding(), { tmuxSessionStatus: 'present', observedAt: NOW }, undefined)).toBe('idle');
+    expect(deriveRuntimeStatus(binding(), presentObs(), undefined)).toBe('idle');
     expect(deriveRuntimeStatus(binding(), { tmuxSessionStatus: 'absent', observedAt: NOW }, undefined)).toBe('unknown');
     expect(deriveRuntimeStatus(binding(), { tmuxSessionStatus: 'unknown' }, undefined)).toBe('unknown');
   });
@@ -252,9 +206,7 @@ describe('agentSnapshot', () => {
     const snapshot = agentSnapshot(
       { id: 'dev-1', projectId: 'proj' },
       binding({ taskId: 'task-1' }),
-      {
-        tmuxSessionStatus: 'present',
-        observedAt: NOW,
+      presentObs({
         runtimeStatusHint: 'pending',
         reason: 'PENDING_IDLE',
         message: 'Agent runtime has been idle while a task is active — likely waiting on user input.',
@@ -265,7 +217,7 @@ describe('agentSnapshot', () => {
           message: 'idle',
           occurredAt: NOW,
         },
-      },
+      }),
       task('review'),
     );
     expect(snapshot.runtimeStatus).toBe('waiting');
@@ -278,9 +230,7 @@ describe('agentSnapshot', () => {
     const snapshot = agentSnapshot(
       { id: 'qa-1', projectId: 'proj' },
       binding({ id: 'qa-1', taskId: 'task-1' }),
-      {
-        tmuxSessionStatus: 'present',
-        observedAt: NOW,
+      presentObs({
         runtimeStatusHint: 'pending',
         reason: 'PENDING_IDLE',
         message: 'Agent runtime has been idle while a task is active — likely waiting on user input.',
@@ -291,8 +241,8 @@ describe('agentSnapshot', () => {
           message: 'idle',
           occurredAt: NOW,
         },
-      },
-      { ...task('review'), qaAgentId: 'qa-1' },
+      }),
+      reviewQaTask(),
     );
     expect(snapshot.runtimeStatus).toBe('pending');
     expect(snapshot.reason).toBe('PENDING_IDLE');
@@ -304,9 +254,7 @@ describe('agentSnapshot', () => {
     const snapshot = agentSnapshot(
       { id: 'dev-1', projectId: 'proj' },
       binding({ taskId: 'task-1' }),
-      {
-        tmuxSessionStatus: 'present',
-        observedAt: NOW,
+      presentObs({
         runtimeStatusHint: 'pending',
         reason: 'PENDING_IDLE',
         message: 'idle',
@@ -317,7 +265,7 @@ describe('agentSnapshot', () => {
           message: 'idle',
           occurredAt: NOW,
         },
-      },
+      }),
       task('in_progress'),
     );
     expect(snapshot.runtimeStatus).toBe('pending');

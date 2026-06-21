@@ -8,6 +8,7 @@ import type {
   BaxianEvent,
   ReviewFindings,
   ReviewResponse,
+  ReviewRound,
   TaskState,
 } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
@@ -169,6 +170,54 @@ const FINDINGS_RC: ReviewFindings = {
   findings: [{ id: 'f-1', severity: 'major', message: 'broken', file: 'a.ts', line: 1 }],
 };
 
+const APPROVE_R1: ReviewFindings = { round: 1, verdict: 'approve', findings: [] };
+
+function putRound(
+  store: ReviewStore,
+  phase: 'code' | 'spec',
+  round: number,
+  extra: Partial<ReviewRound> = {},
+): Promise<void> {
+  const content = phase === 'spec' ? 's' : 'd';
+  return store.putRound('t1', phase, { round, phase, content, startedAt: 'now', ...extra });
+}
+
+type SeedRound = { phase: 'code' | 'spec'; round: number; extra?: Partial<ReviewRound> };
+
+interface Scenario {
+  task?: Partial<TaskState>;
+  config?: Parameters<typeof makeFixture>[1];
+  seed?: SeedRound;
+  findings?: ReviewFindings | null;
+  response?: ReviewResponse | null;
+  // [event type, signal kind, extra payload?]; the token defaults to the fresh one.
+  emit: [string, string, Record<string, unknown>?];
+}
+
+// Declarative driver for the dominant shape: seed task/round, stub the
+// findings/response read, emit one server event. Stubs only when provided
+// (null is meaningful: a missing/crash-replay artifact), so leaving a field
+// out keeps the fixture's default mock.
+async function runScenario(s: Scenario): Promise<Fixture> {
+  const fx = makeFixture(s.task, s.config);
+  if (s.seed) await putRound(fx.store, s.seed.phase, s.seed.round, s.seed.extra);
+  if (s.findings !== undefined) fx.transport.readFindings.mockResolvedValue(s.findings);
+  if (s.response !== undefined) fx.transport.readResponse.mockResolvedValue(s.response);
+  const [type, kind, extra] = s.emit;
+  await fx.emit(type, { token: 'tok123', kind, ...extra });
+  return fx;
+}
+
+function bigFile(path: string): string {
+  return `diff --git a/${path} b/${path}\n${Array.from({ length: 1500 }, (_, i) => `+l${i}`).join('\n')}`;
+}
+
+// Two-file diff where the first file overflows the per-batch budget, forcing a 2-batch split.
+const TWO_BATCH_DIFF = [
+  `diff --git a/src/a.ts b/src/a.ts\n${Array.from({ length: 2100 }, () => '+x').join('\n')}`,
+  'diff --git a/lib/b.ts b/lib/b.ts\n+y',
+].join('\n');
+
 describe('server.code.ready', () => {
   it('reads diff, persists round with baseSha, dispatches review', async () => {
     const fx = makeFixture();
@@ -197,8 +246,6 @@ describe('server.code.ready', () => {
 
   it('large diff → first batch dispatched with batch meta', async () => {
     const fx = makeFixture();
-    const bigFile = (path: string) =>
-      `diff --git a/${path} b/${path}\n${Array.from({ length: 1500 }, (_, i) => `+l${i}`).join('\n')}`;
     fx.transport.readContent.mockResolvedValue({
       content: [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n'),
       diffstat: 'stat',
@@ -271,8 +318,8 @@ describe('no-QA auto-approve', () => {
 describe('server.code.review.submitted', () => {
   it('approve + afterDone null → ready', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
-    fx.transport.readFindings.mockResolvedValue({ round: 1, verdict: 'approve', findings: [] });
+    await putRound(fx.store, 'code', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
     expect(fx.transport.deleteFindings).toHaveBeenCalled();
@@ -283,8 +330,8 @@ describe('server.code.review.submitted', () => {
 
   it('approve + afterDone pr → approved + dispatchServerAfterDone', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 }, { afterDone: 'pr' });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
-    fx.transport.readFindings.mockResolvedValue({ round: 1, verdict: 'approve', findings: [] });
+    await putRound(fx.store, 'code', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'approved']);
     expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'pr']);
@@ -292,7 +339,7 @@ describe('server.code.review.submitted', () => {
 
   it('request-changes → dispatchServerFixToDev with findings json', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(FINDINGS_RC);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(1);
@@ -302,13 +349,7 @@ describe('server.code.review.submitted', () => {
 
   it('batched: stashes slice, dispatches next batch as continuation with diffstat', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, batchIndex: 0, batchTotal: 2 });
-    const content = [
-      `diff --git a/src/a.ts b/src/a.ts\n${Array.from({ length: 2100 }, () => '+x').join('\n')}`,
-      `diff --git a/lib/b.ts b/lib/b.ts\n+y`,
-    ].join('\n');
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content, diffstat: 'FULL-SCOPE-STAT', startedAt: 'now', batchFindings: [],
-    });
+    await putRound(fx.store, 'code', 1, { content: TWO_BATCH_DIFF, diffstat: 'FULL-SCOPE-STAT', batchFindings: [] });
     fx.transport.readFindings.mockResolvedValue(FINDINGS_RC);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     const round = await fx.store.getRound('t1', 'code', 1);
@@ -322,8 +363,7 @@ describe('server.code.review.submitted', () => {
 
   it('last batch aggregates with namespaced ids and routes verdict', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, batchIndex: 1, batchTotal: 2 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now',
+    await putRound(fx.store, 'code', 1, {
       batchFindings: [{ round: 1, verdict: 'approve', findings: [{ id: 'f-1', severity: 'minor', message: 'nit' }] }],
     });
     fx.transport.readFindings.mockResolvedValue(FINDINGS_RC);
@@ -339,9 +379,7 @@ describe('server.code.review.submitted', () => {
 describe('server.code.fix.submitted', () => {
   it('coverage gap → intervention, no recheck dispatch', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now', findings: FINDINGS_RC,
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({ round: 1, responses: [] });
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(fx.emitted.some(e => e.type === 'human.intervention'
@@ -353,9 +391,7 @@ describe('server.code.fix.submitted', () => {
 
   it('unknown findingId → intervention with unknownFindingIds, response not stored, re-armed', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now', findings: FINDINGS_RC,
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     // Covers the real finding f-1 but invents f99 — must fail closed (would otherwise persist).
     fx.transport.readResponse.mockResolvedValue({
       round: 1,
@@ -378,9 +414,7 @@ describe('server.code.fix.submitted', () => {
 
   it('full coverage → response stored, recheck dispatched with priors', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now', findings: FINDINGS_RC,
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
       round: 1,
       responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
@@ -421,16 +455,15 @@ describe('server.spec flow', () => {
 
   it('spec-reviewed approve → transitionToCodePhase', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
-    await fx.store.putRound('t1', 'spec', { round: 1, phase: 'spec', content: 's', startedAt: 'now' });
-    fx.transport.readFindings.mockResolvedValue({ round: 1, verdict: 'approve', findings: [] });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
   });
 
   it('spec-fixed with full coverage → new spec review round dispatched', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
-    await fx.store.putRound('t1', 'spec', {
-      round: 1, phase: 'spec', content: 's', startedAt: 'now',
+    await putRound(fx.store, 'spec', 1, {
       findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'gap', location: 'S1' }] },
     });
     fx.transport.readResponse.mockResolvedValue({
@@ -446,8 +479,7 @@ describe('server.spec flow', () => {
 
   it('spec-fixed unknown findingId → intervention with unknownFindingIds, response not stored, re-armed', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
-    await fx.store.putRound('t1', 'spec', {
-      round: 1, phase: 'spec', content: 's', startedAt: 'now',
+    await putRound(fx.store, 'spec', 1, {
       findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'gap', location: 'S1' }] },
     });
     fx.transport.readResponse.mockResolvedValue({
@@ -473,10 +505,7 @@ describe('server.spec flow', () => {
 describe('crash-replay recovery from stored exchange artifacts', () => {
   it('code-reviewed replay with stored findings resumes verdict routing', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now',
-      findings: FINDINGS_RC, completedAt: 'now',
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC, completedAt: 'now' });
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(1);
@@ -484,14 +513,7 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
 
   it('code-reviewed replay mid-batch resumes next batch dispatch', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, batchIndex: 0, batchTotal: 2 });
-    const content = [
-      `diff --git a/src/a.ts b/src/a.ts\n${Array.from({ length: 2100 }, () => '+x').join('\n')}`,
-      'diff --git a/lib/b.ts b/lib/b.ts\n+y',
-    ].join('\n');
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content, startedAt: 'now',
-      batchFindings: [FINDINGS_RC],
-    });
+    await putRound(fx.store, 'code', 1, { content: TWO_BATCH_DIFF, batchFindings: [FINDINGS_RC] });
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
@@ -502,8 +524,7 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
 
   it('code-fixed replay with stored response resumes recheck dispatch', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now',
+    await putRound(fx.store, 'code', 1, {
       findings: FINDINGS_RC,
       response: { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'ok' }] },
     });
@@ -517,9 +538,8 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
 
   it('spec-reviewed replay with stored approve resumes code-phase transition', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
-    await fx.store.putRound('t1', 'spec', {
-      round: 1, phase: 'spec', content: 's', startedAt: 'now',
-      findings: { round: 1, verdict: 'approve', findings: [] }, completedAt: 'now',
+    await putRound(fx.store, 'spec', 1, {
+      findings: APPROVE_R1, completedAt: 'now',
     });
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
@@ -528,8 +548,7 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
 
   it('spec-fixed replay with stored response resumes spec recheck', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
-    await fx.store.putRound('t1', 'spec', {
-      round: 1, phase: 'spec', content: 's', startedAt: 'now',
+    await putRound(fx.store, 'spec', 1, {
       findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'g', location: 'S1' }] },
       response: { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] },
     });
@@ -541,13 +560,7 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
 
   it('batch continuation derives recheck from round number', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 0, batchTotal: 2 });
-    const content = [
-      `diff --git a/src/a.ts b/src/a.ts\n${Array.from({ length: 2100 }, () => '+x').join('\n')}`,
-      'diff --git a/lib/b.ts b/lib/b.ts\n+y',
-    ].join('\n');
-    await fx.store.putRound('t1', 'code', {
-      round: 2, phase: 'code', content, startedAt: 'now', batchFindings: [],
-    });
+    await putRound(fx.store, 'code', 2, { content: TWO_BATCH_DIFF, batchFindings: [] });
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 2 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck?: boolean }];
@@ -558,8 +571,7 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
 describe('batched recheck id stability', () => {
   it('aggregation keeps already-namespaced ids unprefixed', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 1, batchTotal: 2 });
-    await fx.store.putRound('t1', 'code', {
-      round: 2, phase: 'code', content: 'd', startedAt: 'now',
+    await putRound(fx.store, 'code', 2, {
       batchFindings: [{
         round: 2, verdict: 'request-changes',
         findings: [{ id: 'b0-f-1', severity: 'major', message: 'still open' }],
@@ -578,7 +590,7 @@ describe('batched recheck id stability', () => {
 describe('invalid exchange file re-arms the watcher', () => {
   it('malformed findings.json → intervention + same-token code-reviewed re-arm', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockRejectedValue(new Error('schema violation'));
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
@@ -587,9 +599,7 @@ describe('invalid exchange file re-arms the watcher', () => {
 
   it('malformed response.json → same-token code-fixed re-arm', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now', findings: FINDINGS_RC,
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockRejectedValue(new Error('schema violation'));
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
@@ -599,7 +609,7 @@ describe('invalid exchange file re-arms the watcher', () => {
 describe('Codex resilience', () => {
   it('findings missing (not stored) → intervention + re-arm code-reviewed', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
@@ -608,7 +618,7 @@ describe('Codex resilience', () => {
 
   it('stale round payload → deleted + re-arm, never routed', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2 });
-    await fx.store.putRound('t1', 'code', { round: 2, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 2);
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 1 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.transport.deleteFindings).toHaveBeenCalled();
@@ -644,9 +654,7 @@ describe('content read failure re-arms the entry signal', () => {
 
   it('code-fixed recheck entry → re-arm code-fixed', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now', findings: FINDINGS_RC,
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
       round: 1,
       responses: [{ findingId: 'f-1', action: 'fix', rationale: 'ok' }],
@@ -660,8 +668,8 @@ describe('content read failure re-arms the entry signal', () => {
 describe('afterDone snapshot', () => {
   it('approve verdict snapshots afterDone onto the task', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 }, { afterDone: 'pr' });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
-    fx.transport.readFindings.mockResolvedValue({ round: 1, verdict: 'approve', findings: [] });
+    await putRound(fx.store, 'code', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.updateTask).toContainEqual(['t1', { afterDone: 'pr' }]);
   });
@@ -695,8 +703,6 @@ describe('Codex: reviewed-head anchor', () => {
 
   it('batched dispatch pins the anchor on the round-opening slice', async () => {
     const fx = makeFixture();
-    const bigFile = (path: string) =>
-      `diff --git a/${path} b/${path}\n${Array.from({ length: 1500 }, (_, i) => `+l${i}`).join('\n')}`;
     fx.transport.readContent.mockResolvedValue({
       content: [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n'),
       diffstat: 'stat',
@@ -736,12 +742,40 @@ describe('Codex: reviewed-head anchor', () => {
 });
 
 describe('guard exits re-arm the consumed signal', () => {
-  it('code review dispatch with missing dev config re-arms code-done and holds on arm failure', async () => {
-    const fx = makeFixture({ agentId: 'ghost' });
-    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'ghost', 'code-done']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(['t1', 'ghost', 'code-done']);
-    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  // [name, task, emit type, signal kind, armed agent, holds-on-arm-failure, seed?]
+  type ReArmRow = [string, Partial<TaskState>, string, string, string, boolean, SeedRound?];
+
+  const reArmCases: ReArmRow[] = [
+    ['code review dispatch with missing dev config re-arms code-done and holds on arm failure',
+      { agentId: 'ghost' }, 'server.code.ready', 'code-done', 'ghost', true],
+    ['code recheck entry (fixing) with missing dev config re-arms code-fixed and holds on arm failure',
+      { status: 'fixing', agentId: 'ghost', reviewRound: 1 }, 'server.code.fix.submitted', 'code-fixed', 'ghost', true],
+    ['code verdict with missing qa config re-arms code-reviewed and holds on arm failure',
+      { status: 'review', reviewRound: 1, qaAgentId: 'ghost' }, 'server.code.review.submitted', 'code-reviewed', 'ghost', true],
+    ['code verdict with missing round data re-arms code-reviewed without holding (arm succeeds)',
+      { status: 'review', reviewRound: 1 }, 'server.code.review.submitted', 'code-reviewed', 'qa-1', false],
+    ['code fix-submitted with missing stored findings re-arms code-fixed without holding (arm succeeds)',
+      { status: 'fixing', reviewRound: 1 }, 'server.code.fix.submitted', 'code-fixed', 'dev-1', false, { phase: 'code', round: 1 }],
+    ['spec review dispatch with missing dev config re-arms spec-done and holds on arm failure',
+      { phase: 'spec', status: 'in_progress', agentId: 'ghost' }, 'server.spec.ready', 'spec-done', 'ghost', true],
+    ['spec verdict with missing qa config re-arms spec-reviewed and holds on arm failure',
+      { phase: 'spec', status: 'review', specReviewRound: 1, qaAgentId: 'ghost' }, 'server.spec.review.submitted', 'spec-reviewed', 'ghost', true],
+    ['spec verdict with missing round data re-arms spec-reviewed without holding (arm succeeds)',
+      { phase: 'spec', status: 'review', specReviewRound: 1 }, 'server.spec.review.submitted', 'spec-reviewed', 'qa-1', false],
+    ['spec fix-submitted with missing dev config re-arms spec-fixed and holds on arm failure',
+      { phase: 'spec', status: 'fixing', specReviewRound: 1, agentId: 'ghost' }, 'server.spec.fix.submitted', 'spec-fixed', 'ghost', true],
+    ['spec fix-submitted with missing stored findings re-arms spec-fixed without holding (arm succeeds)',
+      { phase: 'spec', status: 'fixing', specReviewRound: 1 }, 'server.spec.fix.submitted', 'spec-fixed', 'dev-1', false, { phase: 'spec', round: 1 }],
+  ];
+
+  it.each(reArmCases)('%s', async (_name, task, type, kind, agent, holds, seed) => {
+    const fx = await runScenario({ task, seed, emit: [type, kind] });
+    const armed = ['t1', agent, kind];
+    expect(fx.calls.setupPhaseSignal).toContainEqual(armed);
+    if (holds) expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(armed);
+    else expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
+    // dispatch-entry guards (code-done / spec-done) must not dispatch a review
+    if (type.endsWith('.ready')) expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
   it('code review dispatch with a legacy undefined agentId intervenes without arming an undefined watcher', async () => {
@@ -754,79 +788,12 @@ describe('guard exits re-arm the consumed signal', () => {
         && (e.data as { phase?: string }).phase === 'server-code-review-no-dev-agent',
     )).toBe(true);
   });
-
-  it('code recheck entry (fixing) with missing dev config re-arms code-fixed and holds on arm failure', async () => {
-    const fx = makeFixture({ status: 'fixing', agentId: 'ghost', reviewRound: 1 });
-    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'ghost', 'code-fixed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(['t1', 'ghost', 'code-fixed']);
-  });
-
-  it('code verdict with missing qa config re-arms code-reviewed and holds on arm failure', async () => {
-    const fx = makeFixture({ status: 'review', reviewRound: 1, qaAgentId: 'ghost' });
-    await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'ghost', 'code-reviewed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(['t1', 'ghost', 'code-reviewed']);
-  });
-
-  it('code verdict with missing round data re-arms code-reviewed without holding (arm succeeds)', async () => {
-    const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
-  });
-
-  it('code fix-submitted with missing stored findings re-arms code-fixed without holding (arm succeeds)', async () => {
-    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
-    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
-  });
-
-  it('spec review dispatch with missing dev config re-arms spec-done and holds on arm failure', async () => {
-    const fx = makeFixture({ phase: 'spec', status: 'in_progress', agentId: 'ghost' });
-    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'ghost', 'spec-done']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(['t1', 'ghost', 'spec-done']);
-    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
-  });
-
-  it('spec verdict with missing qa config re-arms spec-reviewed and holds on arm failure', async () => {
-    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1, qaAgentId: 'ghost' });
-    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'ghost', 'spec-reviewed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(['t1', 'ghost', 'spec-reviewed']);
-  });
-
-  it('spec verdict with missing round data re-arms spec-reviewed without holding (arm succeeds)', async () => {
-    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
-    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
-  });
-
-  it('spec fix-submitted with missing dev config re-arms spec-fixed and holds on arm failure', async () => {
-    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1, agentId: 'ghost' });
-    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'ghost', 'spec-fixed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(['t1', 'ghost', 'spec-fixed']);
-  });
-
-  it('spec fix-submitted with missing stored findings re-arms spec-fixed without holding (arm succeeds)', async () => {
-    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
-    await fx.store.putRound('t1', 'spec', { round: 1, phase: 'spec', content: 's', startedAt: 'now' });
-    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
-    expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
-  });
 });
 
 describe('aggregation id disambiguation', () => {
   it('a restated namespaced id and a colliding new id stay one-to-one', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 1, batchTotal: 2 });
-    await fx.store.putRound('t1', 'code', {
-      round: 2, phase: 'code', content: 'd', startedAt: 'now',
+    await putRound(fx.store, 'code', 2, {
       batchFindings: [{
         round: 2, verdict: 'request-changes',
         // Restated unresolved finding keeps its round-1 namespaced id…
@@ -874,7 +841,7 @@ describe('publish robustness: unverified PR number and putRound failure re-arm t
 describe('verdict-save failure re-arm', () => {
   it('findings save failure re-arms code-reviewed; file is NOT deleted', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(FINDINGS_RC);
     const failing = fx.store as unknown as { putRound: (...a: unknown[]) => Promise<void> };
     const original = failing.putRound.bind(fx.store);
@@ -892,9 +859,7 @@ describe('verdict-save failure re-arm', () => {
 
   it('response save failure re-arms code-fixed; file is NOT deleted', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
-    await fx.store.putRound('t1', 'code', {
-      round: 1, phase: 'code', content: 'd', startedAt: 'now', findings: FINDINGS_RC,
-    });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
       round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'ok' }],
     });
@@ -910,7 +875,7 @@ describe('verdict-save failure re-arm', () => {
 describe('Codex: cap at verdict', () => {
   it('request-changes at the cap pauses at max_rounds without dispatching a fix', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 3 }, { rounds: 3 });
-    await fx.store.putRound('t1', 'code', { round: 3, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 3);
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 3 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'max_rounds']);
@@ -919,8 +884,8 @@ describe('Codex: cap at verdict', () => {
 
   it('replayed approve keeps the snapshotted afterDone over hot config', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, afterDone: 'pr' }, { afterDone: null });
-    await fx.store.putRound('t1', 'code', { round: 1, phase: 'code', content: 'd', startedAt: 'now' });
-    fx.transport.readFindings.mockResolvedValue({ round: 1, verdict: 'approve', findings: [] });
+    await putRound(fx.store, 'code', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     // Snapshot 'pr' wins: dispatches publish instead of landing at ready (null path).
     expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'pr']);
@@ -955,7 +920,7 @@ describe('max_rounds releases agents and clears references', () => {
 
   it('code verdict cap releases QA with allowAwaitingHuman and retains dev', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 3 }, { rounds: 3 });
-    await fx.store.putRound('t1', 'code', { round: 3, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 3);
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 3 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.releaseAgentForTask).toContainEqual(['qa-1', 't1', 'idle', { allowAwaitingHuman: true }]);
@@ -965,7 +930,7 @@ describe('max_rounds releases agents and clears references', () => {
 
   it('code verdict cap keeps the reference and raises intervention when QA is still bound after a refused release', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 3 }, { rounds: 3 });
-    await fx.store.putRound('t1', 'code', { round: 3, phase: 'code', content: 'd', startedAt: 'now' });
+    await putRound(fx.store, 'code', 3);
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 3 });
     fx.releaseAgentForTask.mockResolvedValue(false);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
@@ -988,7 +953,7 @@ describe('max_rounds releases agents and clears references', () => {
 
   it('spec verdict cap on request-changes releases and clears BOTH dev and QA references', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 3 }, { rounds: 3 });
-    await fx.store.putRound('t1', 'spec', { round: 3, phase: 'spec', content: 's', startedAt: 'now' });
+    await putRound(fx.store, 'spec', 3);
     fx.transport.readFindings.mockResolvedValue(SPEC_FINDINGS_RC);
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'max_rounds']);
@@ -1016,16 +981,16 @@ describe('gate relaxation: github tasks through server spec chain', () => {
 
   it('server.spec.review.submitted routes approve verdict for a github task', async () => {
     const f = makeFixture({ reviewMode: 'github', phase: 'spec', status: 'review', specReviewRound: 1 });
-    await f.store.putRound('t1', 'spec', { round: 1, phase: 'spec', content: 'spec text', startedAt: 'now' });
-    f.transport.readFindings.mockResolvedValueOnce({ round: 1, verdict: 'approve', findings: [] });
+    await putRound(f.store, 'spec', 1, { content: 'spec text' });
+    f.transport.readFindings.mockResolvedValueOnce(APPROVE_R1);
     await f.emit('server.spec.review.submitted', { token: 'tok123' });
     expect(f.calls.transitionToCodePhase).toHaveLength(1);
   });
 
   it('server.spec.fix.submitted processes a github task response', async () => {
     const f = makeFixture({ reviewMode: 'github', phase: 'spec', status: 'fixing', specReviewRound: 1 });
-    await f.store.putRound('t1', 'spec', {
-      round: 1, phase: 'spec', content: 'spec text', startedAt: 'now',
+    await putRound(f.store, 'spec', 1, {
+      content: 'spec text',
       findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'm' }] },
     });
     f.transport.readResponse.mockResolvedValueOnce({
@@ -1040,7 +1005,7 @@ describe('gate relaxation: github tasks through server spec chain', () => {
       { reviewMode: 'github', phase: 'spec', status: 'review', specReviewRound: 1 },
       { rounds: 1 },
     );
-    await f.store.putRound('t1', 'spec', { round: 1, phase: 'spec', content: 'spec text', startedAt: 'now' });
+    await putRound(f.store, 'spec', 1, { content: 'spec text' });
     f.transport.readFindings.mockResolvedValueOnce({
       round: 1, verdict: 'request-changes',
       findings: [{ id: 'f-1', severity: 'major', message: 'm' }],

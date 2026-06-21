@@ -10,20 +10,59 @@ const wrapper = ({ children }: { children: ReactNode }) => (
   <PendingRestartProvider>{children}</PendingRestartProvider>
 );
 
+function healthResponse(startedAt: string): Response {
+  return new Response(JSON.stringify({ status: 'ok', startedAt }), { status: 200 });
+}
+
 function installDefaultFetchMock(startedAt = 'STABLE') {
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
     const u = String(url);
-    if (u === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', startedAt }), { status: 200 });
+    if (u === '/health') return healthResponse(startedAt);
+    throw new Error(`unexpected url ${u}`);
+  });
+}
+
+// /health reports a mutable startedAt; /api/restart returns `restart`. onRestart can advance startedAt.
+function installRestartFetchMock(opts: {
+  startedAt: string;
+  restart: { status: number; body: unknown };
+  onRestart?: (advance: (next: string) => void) => void;
+}) {
+  let current = opts.startedAt;
+  const advance = (next: string): void => { current = next; };
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+    const u = String(url);
+    if (u === '/health') return healthResponse(current);
+    if (u.endsWith('/api/restart')) {
+      opts.onRestart?.(advance);
+      return new Response(JSON.stringify(opts.restart.body), { status: opts.restart.status });
     }
     throw new Error(`unexpected url ${u}`);
   });
+  return { advance };
 }
 
 async function flushMicrotasks() {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
+}
+
+const STORAGE_KEY = 'baxian.pendingRestart';
+
+function seedPersisted(count: number, baselineStartedAt: string): void {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ count, baselineStartedAt }));
+}
+
+function readPersisted() {
+  return JSON.parse(localStorage.getItem(STORAGE_KEY)!);
+}
+
+// Simulate another same-origin tab writing storage: persist newValue then fire the cross-tab event.
+function fireCrossTabStorage(oldValue: string | null, newValue: string | null): void {
+  if (newValue === null) localStorage.removeItem(STORAGE_KEY);
+  else localStorage.setItem(STORAGE_KEY, newValue);
+  window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, oldValue, newValue }));
 }
 
 beforeEach(() => {
@@ -63,10 +102,7 @@ describe('usePendingRestart', () => {
   });
 
   it('mount-time reconcile clears stale state when /health.startedAt has already advanced past the persisted baseline (server restarted via CLI / other tab / page reload)', async () => {
-    localStorage.setItem(
-      'baxian.pendingRestart',
-      JSON.stringify({ count: 5, baselineStartedAt: 'OLD' }),
-    );
+    seedPersisted(5, 'OLD');
     installDefaultFetchMock('NEW');
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -80,10 +116,7 @@ describe('usePendingRestart', () => {
   });
 
   it('mount-time reconcile leaves persisted state alone when /health.startedAt still matches the baseline', async () => {
-    localStorage.setItem(
-      'baxian.pendingRestart',
-      JSON.stringify({ count: 3, baselineStartedAt: 'STABLE' }),
-    );
+    seedPersisted(3, 'STABLE');
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
     expect(result.current.count).toBe(3);
@@ -95,20 +128,10 @@ describe('usePendingRestart', () => {
   });
 
   it('triggerRestart success: polls until startedAt changes, clears count', async () => {
-    let currentStartedAt = 'OLD';
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-      const u = String(url);
-      if (u === '/health') {
-        return new Response(
-          JSON.stringify({ status: 'ok', startedAt: currentStartedAt }),
-          { status: 200 },
-        );
-      }
-      if (u.endsWith('/api/restart')) {
-        currentStartedAt = 'NEW';
-        return new Response(JSON.stringify({ acceptedAt: '2026' }), { status: 202 });
-      }
-      throw new Error(`unexpected url ${u}`);
+    installRestartFetchMock({
+      startedAt: 'OLD',
+      restart: { status: 202, body: { acceptedAt: '2026' } },
+      onRestart: (advance) => advance('NEW'),
     });
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -123,20 +146,10 @@ describe('usePendingRestart', () => {
   });
 
   it('triggerRestart 409 stays in restarting and resolves on startedAt change', async () => {
-    let currentStartedAt = 'A';
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-      const u = String(url);
-      if (u === '/health') {
-        return new Response(
-          JSON.stringify({ status: 'ok', startedAt: currentStartedAt }),
-          { status: 200 },
-        );
-      }
-      if (u.endsWith('/api/restart')) {
-        currentStartedAt = 'B';
-        return new Response(JSON.stringify({ error: 'already' }), { status: 409 });
-      }
-      throw new Error(`unexpected url ${u}`);
+    installRestartFetchMock({
+      startedAt: 'A',
+      restart: { status: 409, body: { error: 'already' } },
+      onRestart: (advance) => advance('B'),
     });
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -147,19 +160,9 @@ describe('usePendingRestart', () => {
 
   it('triggerRestart preserves same-tab dirty changes made while polling for the new startedAt', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
-    let currentStartedAt = 'OLD';
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-      const u = String(url);
-      if (u === '/health') {
-        return new Response(
-          JSON.stringify({ status: 'ok', startedAt: currentStartedAt }),
-          { status: 200 },
-        );
-      }
-      if (u.endsWith('/api/restart')) {
-        return new Response(JSON.stringify({ acceptedAt: '2026' }), { status: 202 });
-      }
-      throw new Error(`unexpected url ${u}`);
+    const { advance } = installRestartFetchMock({
+      startedAt: 'OLD',
+      restart: { status: 202, body: { acceptedAt: '2026' } },
     });
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -175,7 +178,7 @@ describe('usePendingRestart', () => {
     act(() => { result.current.flagDirty(); });
     expect(result.current.count).toBe(2);
 
-    currentStartedAt = 'NEW';
+    advance('NEW');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500);
       await triggerPromise;
@@ -183,26 +186,15 @@ describe('usePendingRestart', () => {
 
     expect(result.current.phase).toBe('pending');
     expect(result.current.count).toBe(1);
-    const persisted = JSON.parse(localStorage.getItem('baxian.pendingRestart')!);
-    expect(persisted).toEqual({ count: 1, baselineStartedAt: 'NEW' });
+    expect(readPersisted()).toEqual({ count: 1, baselineStartedAt: 'NEW' });
     vi.useRealTimers();
   });
 
   it('triggerRestart preserves cross-tab dirty changes made while polling for the new startedAt', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
-    let currentStartedAt = 'OLD';
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-      const u = String(url);
-      if (u === '/health') {
-        return new Response(
-          JSON.stringify({ status: 'ok', startedAt: currentStartedAt }),
-          { status: 200 },
-        );
-      }
-      if (u.endsWith('/api/restart')) {
-        return new Response(JSON.stringify({ acceptedAt: '2026' }), { status: 202 });
-      }
-      throw new Error(`unexpected url ${u}`);
+    const { advance } = installRestartFetchMock({
+      startedAt: 'OLD',
+      restart: { status: 202, body: { acceptedAt: '2026' } },
     });
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -216,21 +208,14 @@ describe('usePendingRestart', () => {
     expect(result.current.phase).toBe('restarting');
 
     act(() => {
-      localStorage.setItem(
-        'baxian.pendingRestart',
+      fireCrossTabStorage(
+        JSON.stringify({ count: 1, baselineStartedAt: 'OLD' }),
         JSON.stringify({ count: 2, baselineStartedAt: 'OLD' }),
-      );
-      window.dispatchEvent(
-        new StorageEvent('storage', {
-          key: 'baxian.pendingRestart',
-          oldValue: JSON.stringify({ count: 1, baselineStartedAt: 'OLD' }),
-          newValue: JSON.stringify({ count: 2, baselineStartedAt: 'OLD' }),
-        }),
       );
     });
     expect(result.current.count).toBe(2);
 
-    currentStartedAt = 'NEW';
+    advance('NEW');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500);
       await triggerPromise;
@@ -238,21 +223,14 @@ describe('usePendingRestart', () => {
 
     expect(result.current.phase).toBe('pending');
     expect(result.current.count).toBe(1);
-    const persisted = JSON.parse(localStorage.getItem('baxian.pendingRestart')!);
-    expect(persisted).toEqual({ count: 1, baselineStartedAt: 'NEW' });
+    expect(readPersisted()).toEqual({ count: 1, baselineStartedAt: 'NEW' });
     vi.useRealTimers();
   });
 
   it('triggerRestart 401 switches to failed', async () => {
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-      const u = String(url);
-      if (u === '/health') {
-        return new Response(JSON.stringify({ status: 'ok', startedAt: 'X' }), { status: 200 });
-      }
-      if (u.endsWith('/api/restart')) {
-        return new Response(JSON.stringify({ error: 'unauth' }), { status: 401 });
-      }
-      throw new Error(`unexpected ${u}`);
+    installRestartFetchMock({
+      startedAt: 'X',
+      restart: { status: 401, body: { error: 'unauth' } },
     });
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -263,10 +241,7 @@ describe('usePendingRestart', () => {
   });
 
   it('cross-tab sync: when another same-origin tab clears the storage (restart succeeded there), this tab transitions to idle without remount', async () => {
-    localStorage.setItem(
-      'baxian.pendingRestart',
-      JSON.stringify({ count: 5, baselineStartedAt: 'STABLE' }),
-    );
+    seedPersisted(5, 'STABLE');
     installDefaultFetchMock('STABLE');
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });
@@ -277,14 +252,7 @@ describe('usePendingRestart', () => {
     expect(result.current.count).toBe(5);
 
     act(() => {
-      localStorage.removeItem('baxian.pendingRestart');
-      window.dispatchEvent(
-        new StorageEvent('storage', {
-          key: 'baxian.pendingRestart',
-          oldValue: JSON.stringify({ count: 5, baselineStartedAt: 'STABLE' }),
-          newValue: null,
-        }),
-      );
+      fireCrossTabStorage(JSON.stringify({ count: 5, baselineStartedAt: 'STABLE' }), null);
     });
 
     expect(result.current.count).toBe(0);
@@ -311,22 +279,16 @@ describe('usePendingRestart', () => {
       await new Promise(r => setTimeout(r, 0));
     });
 
-    const persisted = JSON.parse(localStorage.getItem('baxian.pendingRestart')!);
+    const persisted = readPersisted();
     expect(persisted.count).toBe(3);
     expect(persisted.baselineStartedAt).toBe('STABLE');
   });
 
   it('triggerRestart 30s timeout switches to failed', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-      const u = String(url);
-      if (u === '/health') {
-        return new Response(JSON.stringify({ status: 'ok', startedAt: 'STUCK' }), { status: 200 });
-      }
-      if (u.endsWith('/api/restart')) {
-        return new Response(JSON.stringify({ acceptedAt: '2026' }), { status: 202 });
-      }
-      throw new Error(`unexpected ${u}`);
+    installRestartFetchMock({
+      startedAt: 'STUCK',
+      restart: { status: 202, body: { acceptedAt: '2026' } },
     });
 
     const { result } = renderHook(() => usePendingRestart(), { wrapper });

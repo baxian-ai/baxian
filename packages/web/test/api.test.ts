@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, ApiError, UNAUTHORIZED_EVENT, setAuthToken, clearAuthToken } from '../src/api.ts';
 
+function jsonResponse(json: unknown, status = 200): Response {
+  return new Response(JSON.stringify(json), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
 function mockFetchOk(json: unknown = {}) {
-  return vi.fn(async () =>
-    new Response(JSON.stringify(json), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    }),
-  );
+  return vi.fn(async () => jsonResponse(json));
 }
 
 function lastCall(spy: ReturnType<typeof mockFetchOk>): { url: string; init: RequestInit } {
@@ -38,12 +40,7 @@ describe('post helper', () => {
   });
 
   it('dispatches a window unauthorized event when a request returns 401', async () => {
-    fetchSpy.mockImplementationOnce(async () =>
-      new Response(JSON.stringify({ error: 'Unauthorized' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({ error: 'Unauthorized' }, 401));
     const listener = vi.fn();
     window.addEventListener(UNAUTHORIZED_EVENT, listener);
 
@@ -56,12 +53,7 @@ describe('post helper', () => {
   });
 
   it('does not dispatch unauthorized event for non-401 errors', async () => {
-    fetchSpy.mockImplementationOnce(async () =>
-      new Response(JSON.stringify({ error: 'boom' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({ error: 'boom' }, 500));
     const listener = vi.fn();
     window.addEventListener(UNAUTHORIZED_EVENT, listener);
 
@@ -104,12 +96,7 @@ describe('post helper', () => {
   });
 
   it('sets Content-Type and serializes body for POSTs with payload', async () => {
-    fetchSpy.mockImplementationOnce(async () =>
-      new Response(JSON.stringify({ id: 'task-1' }), {
-        status: 201,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({ id: 'task-1' }, 201));
     await api.tasks.create({
       projectId: 'p1',
       title: 't',
@@ -133,7 +120,7 @@ describe('tasks query', () => {
       const body = url.includes('category=active')
         ? { tasks: [{ id: 'a-1' }], hasMore: false, nextOffset: 1 }
         : { tasks: [{ id: 'p-1' }], hasMore: false, nextOffset: 1 };
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse(body);
     });
     const tasks = await api.tasks.list('proj-1');
     expect(tasks.map((t) => (t as { id: string }).id).sort()).toEqual(['a-1', 'p-1']);
@@ -152,7 +139,7 @@ describe('tasks query', () => {
       } else {
         body = { tasks: Array.from({ length: 20 }, (_, i) => ({ id: `p-${i + 1}` })), hasMore: true, nextOffset: 20 };
       }
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse(body);
     });
 
     const tasks = await api.tasks.list('proj-1');
@@ -170,7 +157,7 @@ describe('tasks query', () => {
           ? { tasks: [{ id: 'dup' }], hasMore: false, nextOffset: 21 }
           : { tasks: Array.from({ length: 19 }, (_, i) => ({ id: `a-${i}` })).concat([{ id: 'dup' }]), hasMore: true, nextOffset: 20 })
         : { tasks: [], hasMore: false, nextOffset: 0 };
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      return jsonResponse(body);
     });
     const tasks = await api.tasks.list('proj-1');
     const ids = tasks.map((t) => (t as { id: string }).id);
@@ -178,36 +165,21 @@ describe('tasks query', () => {
   });
 
   it('tasks.page requests a category with offset', async () => {
-    fetchSpy.mockImplementationOnce(async () =>
-      new Response(JSON.stringify({ tasks: [], hasMore: false, nextOffset: 0 }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({ tasks: [], hasMore: false, nextOffset: 0 }));
     await api.tasks.page('proj-1', { category: 'done', offset: 20 });
     const { url } = lastCall(fetchSpy);
     expect(url).toBe('/api/tasks?projectId=proj-1&category=done&offset=20');
   });
 
   it('tasks.page defaults offset to 0 and omits category when not given', async () => {
-    fetchSpy.mockImplementationOnce(async () =>
-      new Response(JSON.stringify({ tasks: [], hasMore: false, nextOffset: 0 }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({ tasks: [], hasMore: false, nextOffset: 0 }));
     await api.tasks.page('proj-1');
     const { url } = lastCall(fetchSpy);
     expect(url).toBe('/api/tasks?projectId=proj-1&offset=0');
   });
 
   it('tasks.page builds active/pending category URLs', async () => {
-    fetchSpy.mockImplementation(async () =>
-      new Response(JSON.stringify({ tasks: [], hasMore: false, nextOffset: 0 }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      }),
-    );
+    fetchSpy.mockImplementation(async () => jsonResponse({ tasks: [], hasMore: false, nextOffset: 0 }));
     await api.tasks.page('p', { category: 'active' });
     expect(lastCall(fetchSpy).url).toBe('/api/tasks?projectId=p&category=active&offset=0');
     await api.tasks.page('p', { category: 'pending', offset: 40 });

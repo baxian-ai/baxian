@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import type { AgentRuntime, AgentSnapshot } from '../../src/shared/index.js';
+import type { AgentBindingFacts, AgentRole, AgentRuntime, AgentSnapshot } from '../../src/shared/index.js';
 
 const showMock = vi.hoisted(() => vi.fn());
 vi.mock('../../src/components/toast.tsx', () => ({
@@ -44,25 +44,78 @@ vi.mock('../../src/components/pane-terminal.tsx', () => ({
   ),
 }));
 
-import { AgentCard } from '../../src/components/agent-card.tsx';
+import { AgentCard, type TerminalMode } from '../../src/components/agent-card.tsx';
 
-function renderCard(agent: AgentSnapshot, runtime?: AgentRuntime): void {
+type RenderCardOptions = {
+  runtime?: AgentRuntime;
+  role?: AgentRole;
+  terminalMode?: TerminalMode;
+  terminalLoading?: boolean;
+  active?: boolean;
+  onActivate?: () => void;
+};
+
+function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void {
+  const { runtime, role = 'dev', terminalMode, terminalLoading, active, onActivate } = options;
   render(
     <MemoryRouter>
-      <AgentCard agent={agent} projectId="proj" role="dev" runtime={runtime} />
+      <AgentCard
+        agent={agent}
+        projectId="proj"
+        role={role}
+        runtime={runtime}
+        terminalMode={terminalMode}
+        terminalLoading={terminalLoading}
+        active={active}
+        onActivate={onActivate}
+      />
     </MemoryRouter>,
   );
 }
 
+function makeSnapshot(overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
+  return {
+    id: 'dev-1',
+    projectId: 'proj',
+    runtimeStatus: 'idle',
+    tmuxSessionStatus: 'present',
+    stale: false,
+    ...overrides,
+  };
+}
+
+function makeBinding(id: string, overrides: Partial<AgentBindingFacts> = {}): AgentBindingFacts {
+  return {
+    id,
+    projectId: 'proj',
+    updatedAt: '2026-05-16T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
+function kebab(): HTMLElement {
+  return screen.getByRole('button', { name: /操作菜单/ });
+}
+
+function openMenu(): void {
+  fireEvent.click(kebab());
+}
+
+function terminalHrefs(): (string | null)[] {
+  return screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href'));
+}
+
 describe('AgentCard', () => {
+  beforeEach(() => {
+    deleteAgentMock.mockReset();
+    compactMock.mockReset();
+    clearMock.mockReset();
+    reviewMock.mockReset();
+    showMock.mockReset();
+  });
+
   it('shows the configured runtime as muted text after the agent name with hover text', () => {
-    renderCard({
-      id: 'dev-codex',
-      projectId: 'proj',
-      runtimeStatus: 'idle',
-      tmuxSessionStatus: 'present',
-      stale: false,
-    }, 'codex');
+    renderCard(makeSnapshot({ id: 'dev-codex' }), { runtime: 'codex' });
 
     const name = screen.getByText('dev-codex');
     const runtime = screen.getByText('(Codex)');
@@ -73,19 +126,12 @@ describe('AgentCard', () => {
   });
 
   it('shows bootstrap as starting and keeps Terminal disabled until pane exists', () => {
-    renderCard({
+    renderCard(makeSnapshot({
       id: 'dev-new',
-      projectId: 'proj',
       runtimeStatus: 'pending',
       tmuxSessionStatus: 'absent',
-      stale: false,
-      binding: {
-        id: 'dev-new',
-        projectId: 'proj',
-        creationToken: 'create-1',
-        updatedAt: '2026-05-16T00:00:00.000Z',
-      },
-    });
+      binding: makeBinding('dev-new', { creationToken: 'create-1' }),
+    }));
 
     expect(screen.getByText('Starting')).toBeTruthy();
     expect(screen.getByRole('img', { name: 'Starting session' })).toBeTruthy();
@@ -96,96 +142,59 @@ describe('AgentCard', () => {
   });
 
   it('keeps startup-dialog pending agents attachable once paneId is known', () => {
-    renderCard({
+    renderCard(makeSnapshot({
       id: 'dev-pending',
-      projectId: 'proj',
       runtimeStatus: 'pending',
-      tmuxSessionStatus: 'present',
-      stale: false,
-      binding: {
-        id: 'dev-pending',
-        projectId: 'proj',
-        creationToken: 'create-1',
-        paneId: '%1',
-        updatedAt: '2026-05-16T00:00:00.000Z',
-      },
-    });
+      binding: makeBinding('dev-pending', { creationToken: 'create-1', paneId: '%1' }),
+    }));
 
     expect(screen.getByText('Pending user')).toBeTruthy();
     expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(screen.getByText('等待人工介入')).toBeTruthy();
-    const terminalLinks = screen.getAllByRole('link', { name: 'Terminal' });
-    expect(terminalLinks.map(link => link.getAttribute('href')))
-      .toEqual(['/terminal/dev-pending', '/terminal/dev-pending']);
+    expect(terminalHrefs()).toEqual(['/terminal/dev-pending', '/terminal/dev-pending']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
   });
 
   it('allows attaching once the probe confirms PENDING_HUMAN even if paneId is still missing', () => {
-    renderCard({
+    renderCard(makeSnapshot({
       id: 'dev-pending-no-pane',
-      projectId: 'proj',
       runtimeStatus: 'pending',
-      tmuxSessionStatus: 'present',
-      stale: false,
       reason: 'PENDING_HUMAN',
       message: 'Agent runtime is waiting on a startup dialog.',
-      binding: {
-        id: 'dev-pending-no-pane',
-        projectId: 'proj',
-        creationToken: 'create-1',
-        updatedAt: '2026-05-16T00:00:00.000Z',
-      },
-    });
+      binding: makeBinding('dev-pending-no-pane', { creationToken: 'create-1' }),
+    }));
 
     expect(screen.getByText('Pending user')).toBeTruthy();
     expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(screen.getByText('等待人工介入')).toBeTruthy();
-    const terminalLinks = screen.getAllByRole('link', { name: 'Terminal' });
-    expect(terminalLinks.map(link => link.getAttribute('href')))
-      .toEqual(['/terminal/dev-pending-no-pane', '/terminal/dev-pending-no-pane']);
+    expect(terminalHrefs()).toEqual(['/terminal/dev-pending-no-pane', '/terminal/dev-pending-no-pane']);
     expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
   });
 
   it('allows attaching when binding.status flips to awaiting_human even if paneId is still missing', () => {
-    renderCard({
+    renderCard(makeSnapshot({
       id: 'dev-held',
-      projectId: 'proj',
       runtimeStatus: 'pending',
-      tmuxSessionStatus: 'present',
-      stale: false,
-      binding: {
-        id: 'dev-held',
-        projectId: 'proj',
+      binding: makeBinding('dev-held', {
         creationToken: 'create-1',
-        updatedAt: '2026-05-16T00:00:00.000Z',
         status: 'awaiting_human',
         awaitingPhase: 'agent_dialog_pending',
         awaitingReason: 'startup dialog blocking REPL',
-      },
-    });
+      }),
+    }));
 
     expect(screen.getByText('Held')).toBeTruthy();
     expect(screen.getByText('agent_dialog_pending')).toBeTruthy();
-    const terminalLinks = screen.getAllByRole('link', { name: 'Terminal' });
-    expect(terminalLinks.map(link => link.getAttribute('href')))
-      .toEqual(['/terminal/dev-held', '/terminal/dev-held']);
+    expect(terminalHrefs()).toEqual(['/terminal/dev-held', '/terminal/dev-held']);
     expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
   });
 
   it('keeps in-flight bootstrap as Starting when tmux is present but neither awaiting_human nor PENDING_HUMAN is set', () => {
-    renderCard({
+    renderCard(makeSnapshot({
       id: 'dev-launching',
-      projectId: 'proj',
       runtimeStatus: 'pending',
-      tmuxSessionStatus: 'present',
-      stale: false,
-      binding: {
-        id: 'dev-launching',
-        projectId: 'proj',
-        creationToken: 'create-1',
-        updatedAt: '2026-05-16T00:00:00.000Z',
-      },
-    });
+      binding: makeBinding('dev-launching', { creationToken: 'create-1' }),
+    }));
 
     expect(screen.getByText('Starting')).toBeTruthy();
     expect(screen.getByRole('img', { name: 'Starting session' })).toBeTruthy();
@@ -196,22 +205,7 @@ describe('AgentCard', () => {
   });
 
   it('embedded terminal mode renders an interactive full terminal even when idle', () => {
-    render(
-      <MemoryRouter>
-        <AgentCard
-          agent={{
-            id: 'dev-idle',
-            projectId: 'proj',
-            runtimeStatus: 'idle',
-            tmuxSessionStatus: 'present',
-            stale: false,
-          }}
-          projectId="proj"
-          role="dev"
-          terminalMode="embedded-full"
-        />
-      </MemoryRouter>,
-    );
+    renderCard(makeSnapshot({ id: 'dev-idle' }), { terminalMode: 'embedded-full' });
 
     const terminal = screen.getByTestId('pane-terminal');
     expect(terminal.getAttribute('data-mode')).toBe('full');
@@ -222,13 +216,7 @@ describe('AgentCard', () => {
   });
 
   it('activity preview terminal frame is square-cornered', () => {
-    renderCard({
-      id: 'dev-working',
-      projectId: 'proj',
-      runtimeStatus: 'working',
-      tmuxSessionStatus: 'present',
-      stale: false,
-    });
+    renderCard(makeSnapshot({ id: 'dev-working', runtimeStatus: 'working' }));
 
     const terminal = screen.getByTestId('pane-terminal');
     const terminalFrame = terminal.parentElement as HTMLElement;
@@ -238,24 +226,7 @@ describe('AgentCard', () => {
 
   describe('selectable embedded terminals', () => {
     function renderSelectable(active: boolean, onActivate = vi.fn()) {
-      render(
-        <MemoryRouter>
-          <AgentCard
-            agent={{
-              id: 'dev-sel',
-              projectId: 'proj',
-              runtimeStatus: 'idle',
-              tmuxSessionStatus: 'present',
-              stale: false,
-            }}
-            projectId="proj"
-            role="dev"
-            terminalMode="embedded-full"
-            active={active}
-            onActivate={onActivate}
-          />
-        </MemoryRouter>,
-      );
+      renderCard(makeSnapshot({ id: 'dev-sel' }), { terminalMode: 'embedded-full', active, onActivate });
       return { onActivate };
     }
 
@@ -334,13 +305,7 @@ describe('AgentCard', () => {
   });
 
   it('hides the session-present status dot in the normal path', () => {
-    renderCard({
-      id: 'dev-present',
-      projectId: 'proj',
-      runtimeStatus: 'idle',
-      tmuxSessionStatus: 'present',
-      stale: false,
-    });
+    renderCard(makeSnapshot({ id: 'dev-present' }));
 
     expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(document.querySelector('.status-dot')).toBeNull();
@@ -351,38 +316,25 @@ describe('AgentCard', () => {
     ['unreachable', 'Host unreachable', 'status-dot--danger'],
     ['unknown', 'Session unknown', 'status-dot--warn'],
   ] as const)('renders a non-normal %s tmux status as the %s dot (modifier %s)', (status, label, modifier) => {
-    renderCard({
-      id: `dev-${status}`,
-      projectId: 'proj',
-      runtimeStatus: 'idle',
-      tmuxSessionStatus: status,
-      stale: false,
-    });
+    renderCard(makeSnapshot({ id: `dev-${status}`, tmuxSessionStatus: status }));
     const dot = screen.getByRole('img', { name: label });
     expect(dot.className).toContain(modifier);
   });
 
   it('non-normal status dots use the warning or danger treatment', () => {
-    renderCard({
-      id: 'dev-no-session',
-      projectId: 'proj',
-      runtimeStatus: 'idle',
-      tmuxSessionStatus: 'absent',
-      stale: false,
-    });
+    renderCard(makeSnapshot({ id: 'dev-no-session', tmuxSessionStatus: 'absent' }));
     const dot = screen.getByRole('img', { name: 'No session' });
     expect(dot.className).toContain('status-dot--warn');
     expect(dot.className).not.toContain('status-dot--danger');
   });
 
   it('abnormal status dot sits to the right of the runtime pill in the top-right group', () => {
-    renderCard({
+    renderCard(makeSnapshot({
       id: 'dev-position',
-      projectId: 'proj',
       runtimeStatus: 'working',
       tmuxSessionStatus: 'unreachable',
       stale: true,
-    });
+    }));
     const dot = screen.getByRole('img', { name: 'Host unreachable' });
     const runtimePill = screen.getByText('Working');
     const stalePill = screen.getByText('Stale');
@@ -394,40 +346,27 @@ describe('AgentCard', () => {
   });
 
   it('abnormal status dot carries an explicit extra left margin so it breathes away from the pill cluster', () => {
-    renderCard({
-      id: 'dev-spacing',
-      projectId: 'proj',
-      runtimeStatus: 'idle',
-      tmuxSessionStatus: 'absent',
-      stale: false,
-    });
+    renderCard(makeSnapshot({ id: 'dev-spacing', tmuxSessionStatus: 'absent' }));
     const dot = screen.getByRole('img', { name: 'No session' });
     expect(dot.className).toContain('ml-2');
   });
 
   describe('actions menu', () => {
-    beforeEach(() => {
-      deleteAgentMock.mockReset();
-      compactMock.mockReset();
-      clearMock.mockReset();
-      reviewMock.mockReset();
-      showMock.mockReset();
-    });
-
     function renderIdleCard(): void {
-      renderCard({
-        id: 'dev-actions',
-        projectId: 'proj',
-        runtimeStatus: 'idle',
-        tmuxSessionStatus: 'present',
-        stale: false,
+      renderCard(makeSnapshot({ id: 'dev-actions' }));
+    }
+
+    async function clickMenuItem(name: string): Promise<void> {
+      openMenu();
+      await act(async () => {
+        fireEvent.click(screen.getByRole('menuitem', { name }));
       });
     }
 
     it('replaces the trash button with a vertical-ellipsis trigger and hides the menu by default', () => {
       renderIdleCard();
 
-      const trigger = screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ });
+      const trigger = kebab();
       expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
       expect(trigger.getAttribute('aria-expanded')).toBe('false');
       expect(trigger.querySelector('svg')).toBeTruthy();
@@ -437,7 +376,7 @@ describe('AgentCard', () => {
 
     it('opens the menu with Compact, Clear, and Delete', () => {
       renderIdleCard();
-      const trigger = screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ });
+      const trigger = kebab();
 
       fireEvent.click(trigger);
 
@@ -453,7 +392,7 @@ describe('AgentCard', () => {
 
     it('labels the menu via the trigger so screen readers know which agent owns it', () => {
       renderIdleCard();
-      const trigger = screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ });
+      const trigger = kebab();
 
       fireEvent.click(trigger);
 
@@ -467,10 +406,7 @@ describe('AgentCard', () => {
       compactMock.mockResolvedValue({ compacted: true });
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Compact' }));
-      });
+      await clickMenuItem('Compact');
 
       expect(compactMock).toHaveBeenCalledWith('dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
@@ -482,10 +418,7 @@ describe('AgentCard', () => {
       clearMock.mockResolvedValue({ cleared: true });
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Clear' }));
-      });
+      await clickMenuItem('Clear');
 
       expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('dev-actions'));
       expect(clearMock).toHaveBeenCalledWith('dev-actions');
@@ -498,10 +431,7 @@ describe('AgentCard', () => {
       const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Clear' }));
-      });
+      await clickMenuItem('Clear');
 
       expect(confirmSpy).toHaveBeenCalled();
       expect(clearMock).not.toHaveBeenCalled();
@@ -513,10 +443,7 @@ describe('AgentCard', () => {
       clearMock.mockRejectedValue(new Error('Agent dev-actions has no live session'));
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Clear' }));
-      });
+      await clickMenuItem('Clear');
 
       expect(showMock).toHaveBeenCalledWith(expect.objectContaining({
         kind: 'error',
@@ -529,10 +456,7 @@ describe('AgentCard', () => {
       compactMock.mockRejectedValue(new Error('Agent dev-actions runtime is not at an idle REPL prompt'));
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Compact' }));
-      });
+      await clickMenuItem('Compact');
 
       expect(showMock).toHaveBeenCalledWith(expect.objectContaining({
         kind: 'error',
@@ -545,13 +469,9 @@ describe('AgentCard', () => {
       let resolveCompact: ((value: { compacted: boolean }) => void) | undefined;
       compactMock.mockReturnValue(new Promise(resolve => { resolveCompact = resolve; }));
       renderIdleCard();
-      const trigger = screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ });
 
-      fireEvent.click(trigger);
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Compact' }));
-      });
-      fireEvent.click(trigger);
+      await clickMenuItem('Compact');
+      openMenu();
 
       const items = screen.getAllByRole('menuitem') as HTMLButtonElement[];
       expect(items[0].textContent).toBe('Compacting…');
@@ -567,10 +487,7 @@ describe('AgentCard', () => {
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions'], restartRequired: false });
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
-      });
+      await clickMenuItem('Delete');
 
       expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('dev-actions'));
       expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-actions');
@@ -583,10 +500,7 @@ describe('AgentCard', () => {
       deleteAgentMock.mockRejectedValue(new Error('boom-delete-failed'));
       renderIdleCard();
 
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
-      });
+      await clickMenuItem('Delete');
 
       const errorEl = await screen.findByText('boom-delete-failed');
       expect(errorEl.tagName).toBe('DIV');
@@ -599,7 +513,7 @@ describe('AgentCard', () => {
 
     it('closes the menu when clicking outside', () => {
       renderIdleCard();
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
+      openMenu();
       expect(screen.getByRole('menu')).toBeTruthy();
 
       fireEvent.mouseDown(document.body);
@@ -609,7 +523,7 @@ describe('AgentCard', () => {
 
     it('closes the menu when pressing Escape', () => {
       renderIdleCard();
-      fireEvent.click(screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ }));
+      openMenu();
       expect(screen.getByRole('menu')).toBeTruthy();
 
       fireEvent.keyDown(document, { key: 'Escape' });
@@ -619,9 +533,8 @@ describe('AgentCard', () => {
 
     it('moves focus to the first menuitem when the menu opens', () => {
       renderIdleCard();
-      const trigger = screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ });
 
-      fireEvent.click(trigger);
+      openMenu();
 
       const firstItem = screen.getByRole('menuitem', { name: 'Compact' });
       expect(document.activeElement).toBe(firstItem);
@@ -632,12 +545,9 @@ describe('AgentCard', () => {
       let resolveDelete: ((value: { removed: string[]; restartRequired: boolean }) => void) | undefined;
       deleteAgentMock.mockReturnValue(new Promise(resolve => { resolveDelete = resolve; }));
       renderIdleCard();
-      const trigger = screen.getByRole('button', { name: /Agent dev-actions 操作菜单/ });
+      const trigger = kebab();
 
-      fireEvent.click(trigger);
-      await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
-      });
+      await clickMenuItem('Delete');
 
       expect((trigger as HTMLButtonElement).disabled).toBe(true);
       expect(trigger.className).toContain('disabled:opacity-50');
@@ -651,58 +561,27 @@ describe('AgentCard', () => {
   });
 
   describe('footer actions', () => {
-    beforeEach(() => {
-      reviewMock.mockReset();
-      showMock.mockReset();
-    });
-
     function renderDevWithTask(): void {
-      renderCard({
+      renderCard(makeSnapshot({
         id: 'dev-footer',
-        projectId: 'proj',
-        runtimeStatus: 'idle',
-        tmuxSessionStatus: 'present',
-        stale: false,
-        binding: {
-          id: 'dev-footer',
-          projectId: 'proj',
-          taskId: 'task-1',
-          updatedAt: '2026-05-16T00:00:00.000Z',
-        },
-      });
+        binding: makeBinding('dev-footer', { taskId: 'task-1' }),
+      }));
     }
 
     it('shows "Call review" as a menuitem inside the kebab menu for dev agents with a task', () => {
       renderDevWithTask();
       expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
 
-      fireEvent.click(screen.getByRole('button', { name: /操作菜单/ }));
+      openMenu();
       expect(screen.getByRole('menuitem', { name: 'Call review' })).toBeTruthy();
     });
 
     it('hides "Call review" from the kebab menu for QA agents', () => {
-      render(
-        <MemoryRouter>
-          <AgentCard
-            agent={{
-              id: 'qa-footer',
-              projectId: 'proj',
-              runtimeStatus: 'idle',
-              tmuxSessionStatus: 'present',
-              stale: false,
-              binding: {
-                id: 'qa-footer',
-                projectId: 'proj',
-                taskId: 'task-1',
-                updatedAt: '2026-05-16T00:00:00.000Z',
-              },
-            }}
-            projectId="proj"
-            role="qa"
-          />
-        </MemoryRouter>,
-      );
-      fireEvent.click(screen.getByRole('button', { name: /操作菜单/ }));
+      renderCard(makeSnapshot({
+        id: 'qa-footer',
+        binding: makeBinding('qa-footer', { taskId: 'task-1' }),
+      }), { role: 'qa' });
+      openMenu();
       expect(screen.queryByRole('menuitem', { name: 'Call review' })).toBeNull();
     });
 
@@ -719,29 +598,17 @@ describe('AgentCard', () => {
     it('keeps the kebab menu outside the scroll area so its dropdown is never clipped', () => {
       renderDevWithTask();
       const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
-      const kebab = screen.getByRole('button', { name: /操作菜单/ });
-      expect(actionRow.contains(kebab)).toBe(false);
+      expect(actionRow.contains(kebab())).toBe(false);
     });
   });
 
   it('does not mount an embedded terminal while agent state is loading', () => {
-    render(
-      <MemoryRouter>
-        <AgentCard
-          agent={{
-            id: 'dev-loading',
-            projectId: 'proj',
-            runtimeStatus: 'unknown',
-            tmuxSessionStatus: 'unknown',
-            stale: true,
-          }}
-          projectId="proj"
-          role="dev"
-          terminalMode="embedded-full"
-          terminalLoading
-        />
-      </MemoryRouter>,
-    );
+    renderCard(makeSnapshot({
+      id: 'dev-loading',
+      runtimeStatus: 'unknown',
+      tmuxSessionStatus: 'unknown',
+      stale: true,
+    }), { terminalMode: 'embedded-full', terminalLoading: true });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
     expect(screen.getByText('Agent 状态加载中')).toBeTruthy();
