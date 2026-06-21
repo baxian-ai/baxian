@@ -81,21 +81,21 @@ export type DispatchPhase =
 
 export const AGENT_PHASES: Record<AgentRole, Record<string, { skills: string[] }>> = {
   dev: {
-    develop: { skills: ['baxian-rules', 'task-check', 'spells'] },
-    fix: { skills: ['baxian-rules', 'pr-feedback', 'spells'] },
-    'post-approve': { skills: ['baxian-rules', 'pr-feedback', 'spells'] },
-    merge: { skills: ['baxian-rules', 'spells'] },
-    code: { skills: ['baxian-rules', 'task-check', 'spells'] },
-    'server-feedback': { skills: ['baxian-rules', 'server-feedback', 'spells'] },
-    'server-after-done': { skills: ['baxian-rules', 'spells'] },
+    develop: { skills: ['baxian-rules', 'baxian-task-check'] },
+    fix: { skills: ['baxian-rules', 'baxian-pr-feedback'] },
+    'post-approve': { skills: ['baxian-rules', 'baxian-pr-feedback'] },
+    merge: { skills: ['baxian-rules'] },
+    code: { skills: ['baxian-rules', 'baxian-task-check'] },
+    'server-feedback': { skills: ['baxian-rules'] },
+    'server-after-done': { skills: ['baxian-rules'] },
   },
   qa: {
-    review: { skills: ['baxian-rules', 'pr-review', 'spells'] },
-    recheck: { skills: ['baxian-rules', 'pr-recheck', 'spells'] },
-    merge: { skills: ['baxian-rules', 'spells'] },
-    'server-review': { skills: ['baxian-rules', 'server-review', 'spells'] },
-    'server-recheck': { skills: ['baxian-rules', 'server-recheck', 'spells'] },
-    'server-spec-review': { skills: ['baxian-rules', 'server-spec-review', 'spells'] },
+    review: { skills: ['baxian-rules', 'baxian-pr-review'] },
+    recheck: { skills: ['baxian-rules', 'baxian-pr-recheck'] },
+    merge: { skills: ['baxian-rules'] },
+    'server-review': { skills: ['baxian-rules'] },
+    'server-recheck': { skills: ['baxian-rules'] },
+    'server-spec-review': { skills: ['baxian-rules'] },
   },
 };
 

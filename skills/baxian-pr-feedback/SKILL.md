@@ -1,6 +1,7 @@
 ---
-name: pr-feedback
+name: baxian-pr-feedback
 description: Process review feedback on a PR — Fixed/Won't fix each finding, create issues for out-of-scope items
+disable-model-invocation: true
 ---
 
 ## Fetch Feedback

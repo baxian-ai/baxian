@@ -396,10 +396,12 @@ export class SshRunner implements CommandRunner {
     const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
     const b64 = buf.toString('base64');
     const eof = `BAXIAN_EOF_${randomBytes(4).toString('hex')}`;
-    const cmd =
+    // Run the heredoc under POSIX `sh`: wrapRemoteCommand hands this to the user's login shell
+    // ($SHELL -l -c), and fish has no `<<EOF` heredocs — a fish login host would fail every write.
+    const inner =
       `mkdir -p ${shellQuote(dirname(filePath))} && ` +
       `openssl base64 -d -A > ${shellQuote(filePath)} <<'${eof}'\n${b64}\n${eof}`;
-    const r = await this.exec(cmd);
+    const r = await this.exec(`sh -c ${shellQuote(inner)}`);
     if (r.exitCode !== 0) {
       throw new Error(`writeFile remote failed (${filePath}): ${r.stderr}`);
     }

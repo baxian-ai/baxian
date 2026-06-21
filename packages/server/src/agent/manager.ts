@@ -34,7 +34,7 @@ import type { EventBus } from '../event/bus.js';
 import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-store.js';
 import { SkillRegistry } from '../skill/registry.js';
 import type { CommandRunner } from './runner.js';
-import { createRunner, LocalRunner, shellQuote, resolveAgentHost } from './runner.js';
+import { createRunner, LocalRunner, shellQuote, resolveAgentHost, hostGroupKey } from './runner.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
   TmuxManager,
@@ -499,6 +499,19 @@ export class AgentManager {
       );
     }
 
+    // Skills must be on disk at the repo root before the REPL launches OR is reused,
+    // so native discovery sees them and the dispatch's /skill / $skill resolves. Runs
+    // on every path — fresh launch, adopt of a live runtime, and shell/REPL restart —
+    // not just buildFreshSession; the version marker keeps the steady state a single cat.
+    try {
+      await this.provisionRepoSkills(runner, agent, workdir);
+    } catch (err) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `skill provisioning failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     let alive: boolean;
     try {
       alive = await tmux.hasSession(agentId);
@@ -524,6 +537,159 @@ export class AgentManager {
     return this.buildFreshSession(tmux, agent, agentId, workdir);
   }
 
+  // Materialize baxian skills into the repo root the REPL launches in (cwd at
+  // launch), so the agent's `claude`/`codex` discovers them as native skills and
+  // the dispatch can force-load one with `/skill` / `$skill`. Each file is written
+  // atomically (stage + rename) and a current skill's dir is never removed, so a
+  // concurrent agent's lazy SKILL.md read never observes an absent/partial file.
+  private async provisionRepoSkills(
+    runner: CommandRunner,
+    agent: AgentConfig,
+    workdir: string,
+  ): Promise<void> {
+    if (this.skillRegistry.names().length === 0) return;
+    const subdir = agent.runtime === 'codex' ? '.agents/skills' : '.claude/skills';
+    const destRoot = `${workdir}/${subdir}`;
+    // Re-run on EVERY dispatch — do NOT cache the result. Config hot-reload
+    // (replaceConfig, no restart) can repoint this agent's workdir/runtime to another
+    // repo / skills dir, and repo code or a prior agent turn can tamper the on-disk
+    // skill tree between dispatches; a skip cache (in-memory or on-disk) would then
+    // serve a missing or repo-controlled tree. The files are tiny, so materialize
+    // unconditionally. The cleanup + git-exclude are idempotent + best-effort.
+    await this.excludeInjectedSkills(runner, workdir, subdir);
+    // Serialize the cleanup+materialize per target skills dir (shared with the launch-time
+    // scan in buildFreshSession): two same-runtime agents on one repo would otherwise let
+    // one's `rm` blank the tree while the other materializes or its REPL scans for skills.
+    await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
+      await this.ensureSkillDirSafe(runner, workdir, subdir);
+      await this.skillRegistry.materialize(
+        (path, content) => this.atomicWriteFile(runner, path, content),
+        destRoot,
+      );
+    });
+  }
+
+  // Per (host, workdir, runtime-subdir) in-process lock. Both the cleanup+materialize
+  // and the fresh REPL launch (which scans the skills dir at startup) run under it, so a
+  // concurrent same-dir agent never observes a transiently-empty skills tree.
+  private skillDirChain = new Map<string, Promise<unknown>>();
+  private skillDirLockKey(agent: AgentConfig, workdir: string): string {
+    // Canonicalize the host (a registry id and an equivalent inline host, or a blank vs default
+    // port, must collapse to one key) and the workdir (a trailing slash must not fork the lock),
+    // so two agents truly pointing at the same physical dir serialize instead of racing.
+    const host = hostGroupKey(agent.mode, resolveAgentHost(this.config.host, agent.host));
+    const subdir = agent.runtime === 'codex' ? '.agents/skills' : '.claude/skills';
+    const dir = workdir.replace(/\/+$/, '');
+    return `${host}:${dir}:${subdir}`;
+  }
+  private runUnderSkillDirLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.skillDirChain.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    this.skillDirChain.set(key, run.then(() => undefined, () => undefined));
+    return run;
+  }
+
+  // Atomic per-file replace. materialize() hands us each skill file's FINAL path; we stage it as a
+  // sibling `.baxian-tmp` and `mv -f` it into place. POSIX rename is atomic, so a claude/codex lazy
+  // SKILL.md body read — which happens at `/baxian-*` / `$baxian-*` INVOKE time, after this dir's
+  // provisioning lock has already been released — sees either the complete old file or the complete
+  // new one, never the truncate-in-place window of a bare writeFile or the blank window of a
+  // delete-then-rewrite. The tmp lives inside the `baxian-*` leaf, so the git-exclude rule covers it.
+  private async atomicWriteFile(
+    runner: CommandRunner,
+    finalPath: string,
+    content: Buffer,
+  ): Promise<void> {
+    const tmp = `${finalPath}.baxian-tmp`;
+    await runner.writeFile(tmp, content);
+    const mv = `mv -f ${shellQuote(tmp)} ${shellQuote(finalPath)}`;
+    const res = await runner.exec(`sh -c ${shellQuote(mv)}`);
+    if (res.exitCode !== 0) {
+      throw new Error(`atomic skill write failed (${finalPath}): ${res.stderr || 'unknown error'}`);
+    }
+  }
+
+  // Make the skills subtree symlink-safe before writing into it, WITHOUT blanking a live skill. A
+  // current skill's dir is left in place (its files are swapped atomically by atomicWriteFile); we
+  // prune `baxian-*` dirs no longer in the registry, strip EVERY symlink anywhere under a `baxian-*`
+  // tree (leaf OR a nested component like `baxian-pr-review/agents`) so the atomic write can't be
+  // redirected out of the workdir, and drop stale helper files left by a past skill version (a
+  // removed/renamed file) — SKILL.md is kept so a concurrent lazy read is never blanked, and
+  // materialize re-writes every current file atomically. The PARENT components (`.claude`/`.agents`
+  // + their `skills` subdir) fail fast when they are symlinks: following one could write OUTSIDE the
+  // workdir, and silently rm-ing it would destroy a user's legitimate symlinked skills dir (codex
+  // documents symlinked skill folders as supported). `find -name`/`-path` (not a bare glob) avoids
+  // zsh NOMATCH; the whole thing runs under POSIX `sh -c` since wrapRemoteCommand otherwise uses the
+  // login shell (maybe fish). `top`/`subdir` are fixed constants; names are baxian-owned slugs.
+  private async ensureSkillDirSafe(
+    runner: CommandRunner,
+    workdir: string,
+    subdir: string,
+  ): Promise<void> {
+    const top = subdir.split('/')[0];
+    const keep = this.skillRegistry.names().map((n) => `! -name ${shellQuote(n)}`).join(' ');
+    const inner =
+      `cd ${shellQuote(workdir)} && ` +
+      `for d in ${top} ${subdir}; do if [ -L "$d" ]; then ` +
+      `printf 'baxian: %s is a symlink -> %s; replace it with a real directory\\n' "$d" "$(readlink "$d")" >&2; ` +
+      `exit 3; fi; done && ` +
+      `mkdir -p ${subdir} && ` +
+      `find ${subdir} -maxdepth 1 -name 'baxian-*' ${keep} -exec rm -rf {} + && ` +
+      `find ${subdir} -path '${subdir}/baxian-*' -type l -exec rm -f {} + && ` +
+      `find ${subdir} -path '${subdir}/baxian-*/*' -type f ! -name 'SKILL.md' -exec rm -f {} +`;
+    const res = await runner.exec(`sh -c ${shellQuote(inner)}`);
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `failed to prepare a symlink-safe ${subdir} in ${workdir}: ${res.stderr || 'unknown error'}`,
+      );
+    }
+  }
+
+  // Tag a freshly-launched session with the skills version it discovered at launch, so
+  // adoptOrRestartSession can tell when a live REPL predates the current skills.
+  private async tagSessionSkillsVersion(tmux: TmuxManager, agentId: string): Promise<void> {
+    if (this.skillRegistry.names().length === 0) return;
+    await tmux.setOption(agentId, '@baxian-skills-version', this.skillRegistry.contentHash());
+  }
+
+  // True when a live REPL's launch-time skills version differs from the current one
+  // (or is absent — a pre-skills session): it cannot resolve a dispatched /baxian-*.
+  private async replSkillsStale(tmux: TmuxManager, agentId: string): Promise<boolean> {
+    if (this.skillRegistry.names().length === 0) return false;
+    // getOption already maps a MISSING tag to null (→ stale). Do NOT swallow other
+    // errors: a thrown tmux probe failure must propagate so the caller surfaces it as an
+    // EnsureSessionError, instead of being read as stale and needlessly killing the REPL.
+    const tagged = await tmux.getOption(agentId, '@baxian-skills-version');
+    return tagged !== this.skillRegistry.contentHash();
+  }
+
+  // Hide ONLY what baxian writes — the `baxian-*` skill dirs — from the agent's
+  // `git status` / PRs. Excluding the whole skills dir would also hide a user repo's own
+  // untracked native skills there, defeating the `baxian-` prefix's coexistence intent.
+  // The `if git rev-parse` guard skips a non-git workdir, and failure only warns: skills
+  // are already on disk, so a git hiccup must not block the session.
+  private async excludeInjectedSkills(
+    runner: CommandRunner,
+    workdir: string,
+    subdir: string,
+  ): Promise<void> {
+    // info/exclude patterns anchor at the REPO ROOT, but the skills dir lives at the
+    // workdir; when workdir is a SUBDIR of the repo, prefix the rule with the workdir's
+    // path relative to the repo root (git rev-parse --show-prefix) so the pattern matches.
+    const inner =
+      `cd ${shellQuote(workdir)} && if p="$(git rev-parse --git-path info/exclude 2>/dev/null)"; then ` +
+      `pre="$(git rev-parse --show-prefix 2>/dev/null)"; rule="\${pre}${subdir}/baxian-*"; ` +
+      `mkdir -p "$(dirname "$p")" && { grep -qxF "$rule" "$p" 2>/dev/null || printf '%s\\n' "$rule" >> "$p"; }; fi`;
+    // Run under POSIX sh (if/then/fi + $() are not fish syntax; wrapRemoteCommand uses $SHELL).
+    const res = await runner.exec(`sh -c ${shellQuote(inner)}`);
+    if (res.exitCode !== 0) {
+      console.warn(
+        `[AgentManager] skill info/exclude best-effort failed in ${workdir} ` +
+          `(skills still materialized): ${res.stderr || 'unknown error'}`,
+      );
+    }
+  }
+
   private async pinRuntimeSessionOptions(tmux: TmuxManager, agentId: string): Promise<void> {
     await tmux.setOption(agentId, 'prefix', 'C-b');
     await tmux.setOption(agentId, 'prefix2', 'None');
@@ -537,6 +703,20 @@ export class AgentManager {
   }
 
   private async buildFreshSession(
+    tmux: TmuxManager,
+    agent: AgentConfig & { projectId: string },
+    agentId: string,
+    workdir: string,
+  ): Promise<EnsureSessionResult> {
+    // Hold the per-skills-dir lock across the launch so the REPL's startup skill scan
+    // can't overlap a concurrent same-dir agent's provisioning rm (see provisionRepoSkills).
+    return this.runUnderSkillDirLock(
+      this.skillDirLockKey(agent, workdir),
+      () => this.buildFreshSessionLocked(tmux, agent, agentId, workdir),
+    );
+  }
+
+  private async buildFreshSessionLocked(
     tmux: TmuxManager,
     agent: AgentConfig & { projectId: string },
     agentId: string,
@@ -565,6 +745,7 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
+      await this.tagSessionSkillsVersion(tmux, agentId);
       return { ok: true, createdSession: true, freshRuntime: true, paneId, workdir };
     } catch (err) {
       const partial: {
@@ -1160,9 +1341,27 @@ export class AgentManager {
       );
     }
     switch (state.kind) {
-      case 'live-runtime':
+      case 'live-runtime': {
+        let stale: boolean;
+        try {
+          stale = await this.replSkillsStale(tmux, agentId);
+        } catch (err) {
+          // A tmux probe failure here is transient — surface it, do NOT kill the REPL.
+          throw new EnsureSessionError(
+            { createdSession: false, agentId },
+            `skills-version probe failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (stale) {
+          // This REPL launched before the current skills were on disk; claude/codex only
+          // discover a freshly-created top-level skills dir at launch, so a dispatched
+          // /baxian-* / $baxian-* would not resolve. Rebuild so the command works.
+          await tmux.killSession(agentId).catch(() => {});
+          return this.buildFreshSession(tmux, agent, agentId, workdir);
+        }
         // 复用既有 REPL，上下文未中断——dedup 仍可沿用。
         return { ok: true, createdSession: false, freshRuntime: false, paneId, workdir };
+      }
       case 'startup-dialog':
         throw new EnsureSessionError(
           {
@@ -1192,6 +1391,7 @@ export class AgentManager {
             scrollback: 0,
           });
           // 信任弹窗刚被答完，REPL 从启动态进入可用——上下文是新的。
+          await this.tagSessionSkillsVersion(tmux, agentId);
           return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir };
         } catch (trustErr) {
           if (trustErr instanceof ReplNotReadyError && detectStartupDialog(trustErr.lastScreen, runtime)) {
@@ -1224,6 +1424,7 @@ export class AgentManager {
         scrollback: 0,
       });
       // shell 路径：在原 pane 里重新启动了 REPL，新进程没有旧 prompt 上下文。
+      await this.tagSessionSkillsVersion(tmux, agentId);
       return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir };
     } catch (relErr) {
       if (relErr instanceof ReplNotReadyError && detectStartupDialog(relErr.lastScreen, runtime)) {

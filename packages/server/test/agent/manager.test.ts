@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
+import type { AgentConfig, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager, DispatchTerminalError, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
 import { prepareConfig } from '../../src/config/loader.js';
@@ -133,7 +133,7 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
 }
 
 async function seedPhaseSkillsAtDir(skillsDir: string): Promise<void> {
-  for (const name of ['baxian-rules', 'task-check', 'pr-feedback', 'pr-review', 'pr-recheck', 'spells']) {
+  for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
     await mkdir(join(skillsDir, name), { recursive: true });
     await writeFile(
       join(skillsDir, name, 'SKILL.md'),
@@ -1410,14 +1410,13 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>task-check</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
+    expect(prompts[0]).toContain('<!-- baxian:managed -->');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
 
     vi.restoreAllMocks();
   });
@@ -1551,7 +1550,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'pr-feedback', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1568,13 +1567,13 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts.length).toBe(1);
     expect(prompts[0]).not.toContain('<skills>');
     expect(prompts[0]).not.toContain('</skills>');
-    expect(prompts[0]).not.toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).not.toContain('<name>pr-feedback</name>');
-    expect(prompts[0]).not.toContain('<name>spells</name>');
+    // primary already resident → no leading command, prompt opens on the task header.
+    expect(prompts[0].startsWith('Phase:')).toBe(true);
+    expect(prompts[0]).not.toMatch(/^[/$]baxian-/);
     expect(prompts[0]).toContain('Post-approve PR feedback check');
 
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'pr-feedback', 'spells']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
 
     vi.restoreAllMocks();
   });
@@ -1585,7 +1584,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%9', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'pr-feedback', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1599,13 +1598,11 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
 
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>pr-feedback</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-pr-feedback\n')).toBe(true);
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.paneId).toBe('%9');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'pr-feedback', 'spells']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
 
     vi.restoreAllMocks();
   });
@@ -1617,7 +1614,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await taskStore.set(t);
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'task-check', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
@@ -1631,15 +1628,13 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>task-check</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
     expect(prompts[0]).not.toContain('<skills></skills>');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
 
     vi.restoreAllMocks();
   });
@@ -1650,7 +1645,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'pr-feedback', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1665,13 +1660,11 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>pr-feedback</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-pr-feedback\n')).toBe(true);
     expect(prompts[0]).not.toContain('<skills></skills>');
 
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'pr-feedback', 'spells']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
 
     vi.restoreAllMocks();
   });
@@ -1718,7 +1711,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'pr-feedback', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, {
@@ -1747,12 +1740,12 @@ describe('injectedSkills dedup across phase dispatches', () => {
   it('persistInjectedSkills skips agentStore write when phase brings no new skill', async () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: 't-no-write', paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 't-no-write', paneId: '%0', skills: ['baxian-rules', 'task-check', 'spells'] },
+      injectedSkills: { taskId: 't-no-write', paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     const setSpy = vi.spyOn(agentStore, 'set');
     await (manager as unknown as {
       persistInjectedSkills: (agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuseInjectedSkills: string[] | null) => Promise<void>;
-    }).persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-rules', 'task-check', 'spells']);
+    }).persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-rules', 'baxian-task-check']);
     expect(setSpy).not.toHaveBeenCalled();
     vi.restoreAllMocks();
   });
@@ -1764,19 +1757,19 @@ describe('injectedSkills dedup across phase dispatches', () => {
     }).persistInjectedSkills('dev-1', 't-fresh-base', '%0', 'dev', 'develop', null);
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe('t-fresh-base');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
   });
 
   it('persistInjectedSkills writes when phase introduces a skill not yet in baseList', async () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: 't-add', paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 't-add', paneId: '%0', skills: ['baxian-rules', 'spells'] },
+      injectedSkills: { taskId: 't-add', paneId: '%0', skills: ['baxian-rules'] },
     });
     await (manager as unknown as {
       persistInjectedSkills: (agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuseInjectedSkills: string[] | null) => Promise<void>;
-    }).persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-rules', 'spells']);
+    }).persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-rules']);
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
   });
 
   it('startSession resets dedup when adoptOrRestartSession relaunches REPL inside an existing pane (createdSession=false, freshRuntime=true)', async () => {
@@ -1788,7 +1781,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await taskStore.set(t);
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'task-check', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
@@ -1802,15 +1795,13 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>task-check</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
     expect(prompts[0]).not.toContain('<skills></skills>');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
 
     vi.restoreAllMocks();
   });
@@ -1821,7 +1812,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'pr-feedback', 'spells'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1835,13 +1826,11 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
 
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>pr-feedback</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-pr-feedback\n')).toBe(true);
     expect(prompts[0]).not.toContain('<skills></skills>');
 
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'pr-feedback', 'spells']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
 
     vi.restoreAllMocks();
   });
@@ -1866,7 +1855,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
 
     vi.restoreAllMocks();
   });
@@ -1891,9 +1880,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
 
-    // post-approve phase skills = baxian-rules / pr-feedback / spells；paste 后即合并落盘，与 ack 无关。
+    // post-approve phase skills = baxian-rules / baxian-pr-feedback；paste 后即合并落盘，与 ack 无关。
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'pr-feedback', 'spells']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
 
     vi.restoreAllMocks();
   });
@@ -1927,7 +1916,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // Agent currently bound to t but carries a STALE injectedSkills record from a prior task.
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 'task-OLD', paneId: '%0', skills: ['baxian-rules', 'task-check', 'spells'] },
+      injectedSkills: { taskId: 'task-OLD', paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
@@ -1940,15 +1929,166 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
 
-    expect(prompts[0]).toContain('<name>baxian-rules</name>');
-    expect(prompts[0]).toContain('<name>task-check</name>');
-    expect(prompts[0]).toContain('<name>spells</name>');
+    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'spells', 'task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
 
     vi.restoreAllMocks();
+  });
+
+  it('provisionRepoSkills materializes skills under .claude/skills for claude-code and .agents/skills for codex', async () => {
+    // provisionRepoSkills runs inside ensureSession (fresh launch, adopt, and restart
+    // all funnel through it). Its writeFile transport records every materialized path.
+    function capturingRunner(): { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn> } {
+      return {
+        exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+        writeFile: vi.fn(async (): Promise<void> => undefined),
+      };
+    }
+    type ProvisionFn = (runner: CommandRunner, agent: AgentConfig, workdir: string) => Promise<void>;
+    const provision = (mgr: AgentManager) => (mgr as unknown as { provisionRepoSkills: ProvisionFn }).provisionRepoSkills.bind(mgr);
+
+    const devAgent = { id: 'dev-1', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    const devRunner = capturingRunner();
+    await provision(manager)(devRunner as unknown as CommandRunner, devAgent, '/tmp/repo');
+    // Atomic per-file replace: every skill file is staged as a sibling `.baxian-tmp` (writeFile never
+    // targets the live final path) then `mv -f`'d into place, so a concurrent lazy SKILL.md read is
+    // never blanked or half-written.
+    const devStaged = devRunner.writeFile.mock.calls.map(c => c[0] as string);
+    expect(devStaged).toContain('/tmp/repo/.claude/skills/baxian-rules/SKILL.md.baxian-tmp');
+    expect(devStaged).toContain('/tmp/repo/.claude/skills/baxian-task-check/SKILL.md.baxian-tmp');
+    expect(devStaged.every(p => p.endsWith('.baxian-tmp'))).toBe(true);
+    expect(devStaged.every(p => !p.includes('/.agents/skills/'))).toBe(true);
+    const devMv = devRunner.exec.mock.calls.map(c => c[0] as string).filter(c => c.includes('mv -f'));
+    expect(devMv.some(c => c.includes('.claude/skills/baxian-rules/SKILL.md.baxian-tmp'))).toBe(true);
+    expect(devMv.length).toBe(devStaged.length); // one atomic rename per staged file
+    // Excludes ONLY the baxian-* dirs baxian writes, NOT the whole skills dir — a user
+    // repo's own untracked native skills there must stay visible.
+    const excludeCmd = devRunner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('info/exclude'));
+    expect(excludeCmd).toBeDefined();
+    expect(excludeCmd).toContain('.claude/skills/baxian-*');
+    expect(excludeCmd).not.toContain("'.claude/skills/'");
+    expect(excludeCmd).toContain('sh -c'); // POSIX sh, not the user's (maybe fish) login shell
+    expect(excludeCmd).toContain('show-prefix'); // workdir-relative prefix when workdir is a repo subdir
+    // Symlink-safe, non-blanking cleanup: prune only baxian-* dirs NOT in the registry (allowlist,
+    // not delete-all), fail fast (readlink) on a symlinked parent, all under `sh -c` (POSIX, not fish).
+    const guardCmd = devRunner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('[ -L'));
+    expect(guardCmd).toBeDefined();
+    expect(guardCmd).toContain('sh -c');
+    expect(guardCmd).toContain('find .claude/skills -maxdepth 1 -name');
+    expect(guardCmd).toContain('baxian-*');
+    expect(guardCmd).toContain('! -name'); // allowlist prune keeps current skills in place
+    expect(guardCmd).toContain('readlink'); // parent symlink → actionable fail-fast, not silent rm
+    expect(guardCmd).toContain('-type l -exec rm -f'); // strip leaf AND nested symlinks (write can't escape workdir)
+    expect(guardCmd).toContain('-type f ! -name'); // drop stale helper files...
+    expect(guardCmd).toContain('SKILL.md'); // ...but keep SKILL.md so a concurrent live read is never blanked
+
+    const qaAgent = { id: 'qa-1', projectId: 'proj', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    const qaRunner = capturingRunner();
+    await provision(manager)(qaRunner as unknown as CommandRunner, qaAgent, '/tmp/repo');
+    const qaStaged = qaRunner.writeFile.mock.calls.map(c => c[0] as string);
+    expect(qaStaged).toContain('/tmp/repo/.agents/skills/baxian-rules/SKILL.md.baxian-tmp');
+    expect(qaStaged).toContain('/tmp/repo/.agents/skills/baxian-pr-review/SKILL.md.baxian-tmp');
+    expect(qaStaged.every(p => !p.includes('/.claude/skills/'))).toBe(true);
+  });
+
+  it('provisionRepoSkills treats info/exclude failure as best-effort (does not block the session)', async () => {
+    const runner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> =>
+        cmd.includes('info/exclude')
+          ? { stdout: '', stderr: 'fatal: not a git repository', exitCode: 1 }
+          : { stdout: '', stderr: '', exitCode: 0 }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+    const provision = (mgr: AgentManager) =>
+      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
+    const agent = { id: 'dev-1', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    // Skills are already materialized, so a non-git workdir / git hiccup must not throw.
+    await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).resolves.toBeUndefined();
+    expect(runner.writeFile.mock.calls.some(c => (c[0] as string).includes('/.claude/skills/baxian-rules/SKILL.md'))).toBe(true);
+  });
+
+  it('provisionRepoSkills re-materializes on every call — no skip cache (hot-reload of workdir/runtime + tamper safe)', async () => {
+    const runner = {
+      exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+    const provision = (mgr: AgentManager) =>
+      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
+    const agent = { id: 'dev-nocache', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/repo-a' } as unknown as AgentConfig;
+    await provision(manager)(runner as unknown as CommandRunner, agent, '/repo-a');
+    expect(runner.writeFile.mock.calls.length).toBeGreaterThan(0);
+    runner.writeFile.mockClear();
+    // SAME agent id + same skills version, but config hot-reload repointed workdir → must
+    // re-materialize into the NEW dir (a skip cache keyed on agentId+version would not).
+    await provision(manager)(runner as unknown as CommandRunner, agent, '/repo-b');
+    const written = runner.writeFile.mock.calls.map(c => c[0] as string);
+    expect(written.some(p => p.includes('/repo-b/.claude/skills/baxian-rules/SKILL.md'))).toBe(true);
+  });
+
+  it('provisionRepoSkills serializes concurrent same-dir provisioning (no overlapping cleanup)', async () => {
+    let active = 0;
+    let maxActive = 0;
+    const runner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('[ -L')) { // the ensureSkillDirSafe cleanup section
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          await new Promise(r => setTimeout(r, 5));
+          active -= 1;
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+    const provision = (mgr: AgentManager) =>
+      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
+    const agent = { id: 'dev-race', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/repo' } as unknown as AgentConfig;
+    await Promise.all([
+      provision(manager)(runner as unknown as CommandRunner, agent, '/repo'),
+      provision(manager)(runner as unknown as CommandRunner, agent, '/repo'),
+    ]);
+    expect(maxActive).toBe(1); // the per-dir lock kept the two cleanup sections from overlapping
+  });
+
+  it('provisionRepoSkills fails fast on a symlinked parent skills dir (no silent rm of user config)', async () => {
+    // The cleanup section exits non-zero when a parent component is a symlink (codex supports
+    // symlinked skill folders — baxian must not follow it out of workdir nor silently delete it).
+    const runner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> =>
+        cmd.includes('[ -L')
+          ? { stdout: '', stderr: 'baxian: .claude/skills is a symlink -> /shared/skills; replace it with a real directory', exitCode: 3 }
+          : { stdout: '', stderr: '', exitCode: 0 }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+    const provision = (mgr: AgentManager) =>
+      (mgr as unknown as { provisionRepoSkills: (r: CommandRunner, a: AgentConfig, w: string) => Promise<void> }).provisionRepoSkills.bind(mgr);
+    const agent = { id: 'dev-sym', projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' } as unknown as AgentConfig;
+    await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).rejects.toThrow(/symlink-safe/);
+    // Fail-fast precedes materialize: nothing is written THROUGH the symlinked parent.
+    expect(runner.writeFile.mock.calls.length).toBe(0);
+  });
+
+  it('skillDirLockKey canonicalizes host + workdir so equivalent agents serialize', async () => {
+    // A registry host id and the equivalent inline host must collapse to one key, and a trailing
+    // slash on the workdir must not fork the lock — else two agents on the same physical dir race.
+    const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
+    await skillRegistry.scan();
+    const cfg: BaxianConfig = { ...CONFIG, host: [{ id: 'box', hostname: 'h', user: 'u', port: 22 }] };
+    const m = new AgentManager({
+      config: cfg, agentStore, taskStore, lockManager, eventBus, skillRegistry,
+      runnerFactory: () => readyRunner(),
+    });
+    const key = (a: object, w: string) =>
+      (m as unknown as { skillDirLockKey: (a: AgentConfig, w: string) => string }).skillDirLockKey(a as AgentConfig, w);
+    const byId = { runtime: 'claude-code', mode: 'remote', host: 'box' };
+    const byInline = { runtime: 'claude-code', mode: 'remote', host: { hostname: 'h', user: 'u', port: 22 } };
+    expect(key(byId, '/repo')).toBe(key(byInline, '/repo')); // id vs inline → same host group
+    expect(key(byId, '/repo/')).toBe(key(byId, '/repo')); // trailing slash normalized away
+    expect(key(byId, '/other')).not.toBe(key(byId, '/repo')); // genuinely different dir → distinct
+    expect(key({ ...byId, runtime: 'codex' }, '/repo')).not.toBe(key(byId, '/repo')); // runtime subdir differs
   });
 });
 

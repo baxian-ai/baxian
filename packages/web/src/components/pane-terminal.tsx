@@ -110,6 +110,7 @@ export function PaneTerminal({
   const liveQueuedCharsRef = useRef(0);
   const liveRafRef = useRef<number | null>(null);
   const liveFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewScrollRafRef = useRef<number | null>(null);
   const writeChainRef = useRef<Promise<void>>(Promise.resolve());
   const writeGenerationRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
@@ -143,9 +144,20 @@ export function PaneTerminal({
     const el = containerRef.current;
     const t = termRef.current;
     if (!el || !t) return;
+    if (el.clientHeight <= 0) return;
     const cursorY = t.buffer.active.cursorY;
     const cursorBottomPx = (cursorY + 1) * TERMINAL_LINE_HEIGHT_PX;
     el.scrollTop = Math.max(0, cursorBottomPx - el.clientHeight);
+  };
+  const schedulePreviewScrollToCursor = (): void => {
+    if (!isStaticPreview || previewScrollRafRef.current !== null) return;
+    let ran = false;
+    const frameId = requestAnimationFrame(() => {
+      ran = true;
+      previewScrollRafRef.current = null;
+      scrollPreviewToCursor();
+    });
+    if (!ran) previewScrollRafRef.current = frameId;
   };
 
   const enqueueTerminalTask = (task: TerminalTask, generation: number): void => {
@@ -156,7 +168,7 @@ export function PaneTerminal({
         try {
           await task(t);
           if (canResize) t.scrollToBottom();
-          scrollPreviewToCursor();
+          schedulePreviewScrollToCursor();
         } catch (err) {
           console.warn('[pane-terminal] terminal task failed:', err);
         }
@@ -300,6 +312,9 @@ export function PaneTerminal({
     term.open(container);
     termRef.current = term;
     fitRef.current = fit;
+    const renderDisposable = isStaticPreview
+      ? term.onRender(() => schedulePreviewScrollToCursor())
+      : null;
     if (interactive && (autoFocus || focusAfterActivationRef.current)) {
       focusAfterActivationRef.current = false;
       try { term.focus(); } catch {}
@@ -347,7 +362,11 @@ export function PaneTerminal({
         if (resizeTimer) clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
           resizeTimer = null;
-          fitAndResize();
+          if (canResize) {
+            fitAndResize();
+          } else if (isStaticPreview) {
+            schedulePreviewScrollToCursor();
+          }
         }, 100);
       });
       observer.observe(container);
@@ -357,7 +376,14 @@ export function PaneTerminal({
     const scheduleFit = () => {
       raf = requestAnimationFrame(() => {
         raf = null;
-        if (disposed || !canResize) return;
+        if (disposed) return;
+        if (!canResize) {
+          if (isStaticPreview) {
+            installObserver();
+            schedulePreviewScrollToCursor();
+          }
+          return;
+        }
         if (fitAndResize(true)) {
           installObserver();
           return;
@@ -383,12 +409,17 @@ export function PaneTerminal({
         clearTimeout(liveFlushTimerRef.current);
         liveFlushTimerRef.current = null;
       }
+      if (previewScrollRafRef.current !== null) {
+        cancelAnimationFrame(previewScrollRafRef.current);
+        previewScrollRafRef.current = null;
+      }
       writeGenerationRef.current++;
       liveQueueRef.current = [];
       liveQueuedCharsRef.current = 0;
       writeChainRef.current = Promise.resolve();
       if (resizeTimer) clearTimeout(resizeTimer);
       observer?.disconnect();
+      renderDisposable?.dispose();
       termRef.current = null;
       fitRef.current = null;
       refitToContainerRef.current = null;

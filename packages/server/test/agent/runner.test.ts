@@ -404,8 +404,11 @@ describe('SshRunner.writeFile', () => {
     expect(cmd).toContain('openssl base64 -d -A > ');
     expect(cmd).not.toContain('base64 --decode');
     expect(cmd).not.toContain('base64 -d > ');
-    expect(cmd).toContain(shellQuote('/tmp/baxian/foo.txt'));
-    expect(cmd).toContain(shellQuote('/tmp/baxian'));
+    // The heredoc is wrapped in `sh -c` so a fish login shell can't break it (fish has no heredocs);
+    // the path is inner-quoted by that wrap, so assert presence rather than exact outer quoting.
+    expect(cmd).toContain('sh -c');
+    expect(cmd).toContain('/tmp/baxian/foo.txt');
+    expect(cmd).toContain('/tmp/baxian');
   });
 
   it('uses a heredoc marker with BAXIAN_EOF_ prefix and random suffix', async () => {

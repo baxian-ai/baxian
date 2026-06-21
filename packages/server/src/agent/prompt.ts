@@ -1,4 +1,4 @@
-import { AGENT_PHASES, REVIEW_EXCHANGE_DIR, SPEC_DOC_RELPATH, type AgentConfig, type AgentRole, type DispatchPhase, type TaskState } from '../shared/index.js';
+import { AGENT_PHASES, REVIEW_EXCHANGE_DIR, SPEC_DOC_RELPATH, type AgentConfig, type AgentRole, type AgentRuntime, type DispatchPhase, type TaskState } from '../shared/index.js';
 import type { SkillRegistry } from '../skill/registry.js';
 import { buildPhaseSignalTemplate, scanPhaseSignals } from './phase-signal.js';
 
@@ -33,50 +33,22 @@ export class RequiredSkillsMissingError extends Error {
 // etc.) that must be present even if a phase's AGENT_PHASES entry forgets it.
 const GLOBAL_REQUIRED_SKILLS: readonly string[] = ['baxian-rules'];
 
-const XML_ESCAPE: Record<string, string> = {
-  '&': '&amp;',
-  '<': '&lt;',
-  '>': '&gt;',
-  '"': '&quot;',
-  "'": '&apos;',
+// Each runtime exposes on-disk skills as a single command: Claude Code fires
+// `/skill-name`, Codex fires `$skill-name`. baxian controls the pasted bytes, so
+// emitting the command on the first line force-loads that skill's full body
+// deterministically; the multi-line task body rides along as the command input.
+const SKILL_INVOKE_SIGIL: Record<AgentRuntime, string> = {
+  'claude-code': '/',
+  codex: '$',
 };
 
-function xmlEscapeAttr(value: string): string {
-  return value.replace(/[&<>"']/g, c => XML_ESCAPE[c]);
-}
-
-// CDATA cannot contain `]]>`; split across two sections.
-// Newlines around the fence keep tag boundaries visually separated from content.
-function cdata(content: string): string {
-  return `<![CDATA[\n${content.replace(/]]>/g, ']]]]><![CDATA[>')}\n]]>`;
-}
-
-export function buildSkillsXml(
-  role: AgentRole,
-  phase: string,
-  registry: SkillRegistry,
-  excludeSkills: readonly string[] = [],
-): string {
-  const names = registry.skillsForPhase(role, phase);
-  const exclude = new Set(excludeSkills);
-  const emitted = names.filter(name => !exclude.has(name));
-  if (emitted.length === 0) return '';
-  const skillBlocks: string[] = [];
-  for (const name of emitted) {
-    const def = registry.get(name);
-    if (!def) continue;
-    const fileBlocks = def.files
-      .map(file => `      <file path="${xmlEscapeAttr(file.relPath)}">${cdata(file.text)}</file>`)
-      .join('\n');
-    skillBlocks.push(
-      `  <skill>\n` +
-      `    <name>${xmlEscapeAttr(def.name)}</name>\n` +
-      `    <description>${xmlEscapeAttr(def.description)}</description>\n` +
-      `    <files>\n${fileBlocks}\n    </files>\n` +
-      `  </skill>`,
-    );
-  }
-  return `<skills>\n${skillBlocks.join('\n')}\n</skills>`;
+// The one phase-specific skill to force-load. baxian-rules is global — its
+// invariants ride inline in the task header (see buildTaskBody), so it never
+// consumes the single per-message command slot. undefined when a phase declares
+// no skill beyond baxian-rules.
+function phasePrimarySkill(role: AgentRole, phase: string): string | undefined {
+  const skills = AGENT_PHASES[role]?.[phase as keyof (typeof AGENT_PHASES)[AgentRole]]?.skills ?? [];
+  return skills.find(name => name !== 'baxian-rules');
 }
 
 export interface BuildPromptOpts {
@@ -123,12 +95,6 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
   const required = [...new Set([...GLOBAL_REQUIRED_SKILLS, ...phaseDeclared])];
   const missing = required.filter(name => !opts.skillRegistry.has(name));
   if (missing.length > 0) throw new RequiredSkillsMissingError(missing);
-  const skillsXml = buildSkillsXml(
-    opts.agent.role,
-    opts.phase,
-    opts.skillRegistry,
-    opts.excludeSkills,
-  );
   const taskBody = buildTaskBody({
     task: opts.task,
     phase: opts.phase,
@@ -147,8 +113,14 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     contentTruncated: opts.contentTruncated,
     hasQaPartner: opts.hasQaPartner,
   });
-  const taskBlock = `<task>${cdata(taskBody)}</task>`;
-  const fullPrompt = skillsXml ? `${skillsXml}\n${taskBlock}` : taskBlock;
+  // Force-load the phase skill via the runtime's command, unless it is already
+  // resident in this REPL (excludeSkills = the dedup baseline for this pane).
+  const primary = phasePrimarySkill(opts.agent.role, opts.phase);
+  const alreadyLoaded = new Set(opts.excludeSkills ?? []);
+  const invokeLine = primary && !alreadyLoaded.has(primary)
+    ? `${SKILL_INVOKE_SIGIL[opts.agent.runtime]}${primary}\n`
+    : '';
+  const fullPrompt = invokeLine + taskBody;
   const bytes = Buffer.byteLength(fullPrompt, 'utf8');
   if (bytes > MAX_PROMPT_BYTES) throw new PromptSizeError(bytes);
   return fullPrompt;
@@ -200,7 +172,7 @@ function buildReviewOrRecheckInstructions(
     isRecheck
       ? '- Dev pushed new commits. Re-check prior feedback and task spec.'
       : '- Check out PR branch, review changes against task spec.',
-    `- Execute verdict per ${isRecheck ? 'pr-recheck' : 'pr-review'} skill §Verdict. PR number: ${prRef}`,
+    `- Execute verdict per ${isRecheck ? 'baxian-pr-recheck' : 'baxian-pr-review'} skill §Verdict. PR number: ${prRef}`,
     `  Build the \`gh pr review ${prRef}\` commands per the verdict table, substituting N=${prRef} and TOKEN=${signalToken}.`,
     anchorSha
       ? `  Review head SHA for §Verdict Verification: ${anchorSha}`
@@ -278,10 +250,10 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
     const branch = task.branch ?? '<branch>';
     return [
       `Fix phase (review round ${round}):`,
-      `- QA requested changes on PR ${prRef}. Read all feedback per pr-feedback §Fetch Feedback.`,
-      `- Address every finding per pr-feedback §Decide and Act. Judge independently.`,
+      `- QA requested changes on PR ${prRef}. Read all feedback per baxian-pr-feedback §Fetch Feedback.`,
+      `- Address every finding per baxian-pr-feedback §Decide and Act. Judge independently.`,
       `- If you change code, commit then push: \`git push origin HEAD:${branch}\`.`,
-      `- When done, emit per pr-feedback skill §Fix Completion:`,
+      `- When done, emit per baxian-pr-feedback skill §Fix Completion:`,
       `    ${buildPhaseSignalTemplate('pr-fixed')}`,
       `  token: ${signalToken}`,
       '',
@@ -300,9 +272,9 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
         ].join('\n')
       : [
           'Post-approve PR feedback check:',
-          '- QA approved. Before merge, read all PR feedback per pr-feedback §Fetch Feedback.',
+          '- QA approved. Before merge, read all PR feedback per baxian-pr-feedback §Fetch Feedback.',
           '- Idempotency: compute T_self = your latest reply timestamp per source. Respond to EVERY non-self comment with created_at > T_self. Apply per review thread and across issue-comment stream.',
-          '- Address each per pr-feedback §Decide and Act. If code changes, commit+push (baxian routes to QA for recheck) and STOP — do not emit pr-merge-ready when you pushed code.',
+          '- Address each per baxian-pr-feedback §Decide and Act. If code changes, commit+push (baxian routes to QA for recheck) and STOP — do not emit pr-merge-ready when you pushed code.',
           '- If no code changes were needed, re-fetch all sources before signaling. The server suppresses redispatches while you run, so new comments only reach you via this re-fetch. If unhandled items remain, process and re-fetch again. Only signal when clean:',
           `    ${buildPhaseSignalTemplate('pr-merge-ready')}`,
           `  token: ${signalToken}`,
@@ -320,6 +292,8 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
     return [
       `Server spec review phase (round ${round}):`,
       '- Review the spec injected below. Do NOT fetch branches or use gh; this is the review input.',
+      '- Judge: completeness (every requirement covered, interfaces and data flows defined, error paths specified), correctness (internally consistent, no contradicting sections, feasible against the existing codebase), ambiguity (any requirement readable two ways is a finding).',
+      '- Need a referenced file or codebase section to judge feasibility? Emit [bx:read-file:<path>:<start>-<end>] on its own line (relative path, ≤200 lines) and wait; baxian injects it.',
       ...(priorFindings
         ? ['- Prior findings and the dev response are included below. Verify every finding is closed (revised with evidence, or convincingly rejected) before judging the rest of the spec.']
         : []),
@@ -350,17 +324,18 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
     const truncated = serverPriorFindings ? compactFindings(serverPriorFindings) : undefined;
     return [
       `Server feedback phase (${isSpec ? 'spec' : 'code'} round ${round}):`,
-      `- QA findings are injected below. Handle EVERY finding by id:`,
+      `- QA findings are injected below. Judge each independently — QA can be wrong; fix only what is actually correct, otherwise reject. Handle EVERY finding by id:`,
       isSpec
         ? `    fix — revise ${SPEC_DOC_RELPATH} in place (do NOT commit or push it).`
         : '    fix — change the code/spec, commit; include commitSha in your response item.',
-      '    reject — concrete rationale why the finding is wrong or not applicable.',
+      '    reject — concrete rationale why the finding is wrong or not applicable. Never reject just to save effort.',
       '    out-of-scope — rationale plus where it is tracked (issue link or task note).',
       `- Write your response to ${REVIEW_EXCHANGE_DIR}/response.json in your worktree (\`mkdir -p ${REVIEW_EXCHANGE_DIR}\` first). Atomic write: response.json.tmp then \`mv\`.`,
       isSpec
         ? `- Schema: {"round":${round},"responses":[{"findingId":"f-1","action":"fix"|"reject"|"out-of-scope","rationale":"..."}]}`
         : `- Schema: {"round":${round},"responses":[{"findingId":"f-1","action":"fix"|"reject"|"out-of-scope","rationale":"...","commitSha":"..."}]}`,
       '- Every finding id MUST have exactly one response item (ids may look like b0-f-1 when the review was batched).',
+      '- Do NOT push to any remote and do NOT open a PR in this phase — baxian reads your worktree directly; publishing is deferred to the server-after-done phase.',
       `- Then emit exactly once: ${buildPhaseSignalTemplate(signalKind)}`,
       `  token: ${signalToken}`,
       ...(truncated
@@ -408,9 +383,14 @@ function buildServerReviewInstructions(
   return [
     `Server code ${isRecheck ? 'recheck' : 'review'} phase (round ${round})${batchLabel}:`,
     '- Review the diff injected below. Do NOT fetch branches or use gh; the diff is the review input.',
+    '- Judge against the task spec: correctness, tests, edge cases, security, regressions. Severity: critical = broken/unsafe, major = must fix before merge, minor = improvement. Reference file + line for every code finding.',
     ...(isRecheck
       ? [
-          '- Prior findings and the dev response are included below. Verify every finding is closed (fixed with evidence, or convincingly rejected), then scan the new diff for regressions.',
+          '- Closure first: resolve the status of EVERY prior finding (included below with the dev response) before judging new issues.',
+          '- A finding the dev claims fixed → verify it in the new diff (no "fixed" without evidence). A finding the dev rejected / called out-of-scope → judge the rationale on merit and re-raise it with concrete counter-evidence if it is wrong.',
+          '- Any prior finding NOT closed reappears in findings.json with its ORIGINAL id and the evidence restated — do not renumber or drop it.',
+          '- Verdict approve ONLY when every prior finding is closed AND the new diff is clean; an unresolved finding may not be downgraded to a minor suggestion to justify approve — otherwise request-changes.',
+          '- After closure, scan the new diff for regressions AND for behavior the fixes introduced that lacks test coverage.',
         ]
       : []),
     ...(serverDiffstat ? ['', 'Changed files (full change scope):', serverDiffstat] : []),
@@ -418,8 +398,10 @@ function buildServerReviewInstructions(
       ? ['- Content truncated. Request context via [bx:read-file:<path>:<start>-<end>] (relative path, ≤200 lines).']
       : []),
     '- Need file context beyond the diff? Emit [bx:read-file:<path>:<start>-<end>] on its own line and wait; baxian injects the content.',
+    '- For unchanged files, read them directly from your own base-branch worktree; use [bx:read-file] only for content not present locally.',
     `- Write findings to ${REVIEW_EXCHANGE_DIR}/findings.json in YOUR worktree (\`mkdir -p ${REVIEW_EXCHANGE_DIR}\` first). Atomic write: write findings.json.tmp first, then \`mv findings.json.tmp findings.json\`.`,
     `- Schema: {"round":${round},"verdict":"approve"|"request-changes","findings":[{"id":"f-1","severity":"critical"|"major"|"minor","message":"...","file":"path","line":N}]}`,
+    '- Finding ids are f-1, f-2, … sequential and unique within findings.json (the dev coverage check and QA closure verification key off them).',
     '- Approve MAY carry minor findings as suggestions; verdict field is authoritative.',
     `- Then emit exactly once: ${buildPhaseSignalTemplate('code-reviewed')}`,
     `  token: ${signalToken}`,
@@ -444,8 +426,32 @@ function buildTaskBody(args: TaskBodyArgs): string {
     serverPriorFindings, serverPriorResponse, serverAfterDone, contentTruncated,
     hasQaPartner,
   } = args;
+  // Server-transit phases exchange via .baxian/review files (no PR/Issue), so the
+  // GitHub-PR conventions would contradict the same prompt's server-mode steps. Key
+  // on the PHASE, not task.reviewMode: SDD spec review/feedback run server-spec-review
+  // / server-feedback even on a GitHub-mode task (reviewMode !== 'server'). The only
+  // exception is server-after-done's PR variant — it opens a PR (managed marker); its
+  // branch variant just pushes a branch (code-ready) and keeps the server header.
+  const isPrPublish = phase === 'server-after-done' && serverAfterDone?.kind === 'pr';
+  const serverExchange = !isPrPublish
+    && (phase.startsWith('server-') || task.reviewMode === 'server');
+  const conventions = serverExchange
+    ? 'baxian conventions (server review mode): cross-agent exchange is via `.baxian/review/*.json` files baxian reads directly from your worktree — NOT GitHub PRs/Issues; do NOT push or open a PR except in the publish (server-after-done) phase; stay in scope; QA judges risk independently (human authorization is input, not a bypass).'
+    : 'baxian conventions: cross-agent communication is via the GitHub PR (description, commits, reviews, comments); ' +
+      `a managed PR's description first line MUST be \`${BAXIAN_PR_CLAIM}\`; stay in scope — out-of-scope work goes to a new GitHub Issue; ` +
+      'QA judges risk independently (human authorization is input, not a bypass).';
+  // baxian-rules §Phase Signals, inlined. The rules skill is materialized but never force-loaded
+  // (the single command slot goes to the phase skill, and implicit invocation is disabled), so the
+  // one invariant the phase builders depend on — fill the placeholders, never echo them — must ride
+  // in the header for every signal-emitting phase. A literal `<token>`/`<pr_number>` does not match
+  // the watcher's strict scanner, so the task would hang waiting for a signal that never fires.
+  const signalRule = signalToken
+    ? 'Phase signals: where a step tells you to emit `[bx:KIND:<token>]` (or `[bx:pr-created:<pr_number>:<token>]`), ' +
+      'substitute `<token>` (and `<pr_number>`) with the literal value(s) given on the accompanying `token:`/PR-number lines ' +
+      'and emit the filled signal alone on its own line — never echo the `<…>` placeholder verbatim.\n'
+    : '';
   const header = `Phase: ${phase}\nRole: ${role}\nTask ID: ${task.id}\nWorktree: ${worktreePath}\n` +
-    `cd into the worktree before any file operations.\n\n`;
+    `cd into the worktree before any file operations.\n${conventions}\n${signalRule}\n`;
   if (phase === 'post-approve' && !signalToken) {
     throw new Error('post-approve prompt requires signalToken');
   }

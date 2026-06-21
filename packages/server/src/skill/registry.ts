@@ -1,4 +1,5 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { AGENT_PHASES } from '../shared/index.js';
@@ -98,10 +99,12 @@ async function walk(dir: string, base: string = dir): Promise<SkillFile[]> {
     const entryPath = join(dir, entry);
     let s;
     try {
-      s = await stat(entryPath);
+      s = await lstat(entryPath);
     } catch {
-      continue; // broken symlink / race; skip
+      continue; // race: entry removed between readdir and lstat
     }
+    // lstat, not stat: our skills are regular files only — a symlink/special
+    // file isn't ours, so skip it rather than follow it out of the tree.
     if (s.isDirectory()) {
       out.push(...(await walk(entryPath, base)));
     } else if (s.isFile()) {
@@ -135,12 +138,23 @@ export class SkillRegistry {
       const entryPath = join(this.skillsDir, entry);
       let s;
       try {
-        s = await stat(entryPath);
+        s = await lstat(entryPath);
       } catch {
-        continue; // broken symlink / race
+        continue; // race: entry removed between readdir and lstat
       }
+      // lstat skips a symlinked dir too: a skill dir must be a real directory we own.
       if (!s.isDirectory()) continue;
       const skillFile = join(entryPath, 'SKILL.md');
+      let skillStat;
+      try {
+        skillStat = await lstat(skillFile);
+      } catch {
+        continue; // no SKILL.md, or race
+      }
+      // SKILL.md must be a real file we own. A symlink would register the skill
+      // (readFile follows it) while walk() skips it, so materialize() never writes
+      // it out — a registered-but-unmaterialized skill the agent can't discover.
+      if (!skillStat.isFile()) continue;
       let skillBuf: Buffer;
       try {
         skillBuf = await readFile(skillFile);
@@ -179,4 +193,36 @@ export class SkillRegistry {
     if (!phaseConfig) return [];
     return phaseConfig.skills.filter((name) => this.skills.has(name));
   }
+
+  // Write every scanned skill (SKILL.md + helper files) under destRoot/<name>/<relPath>
+  // so the agent host's `claude`/`codex` REPL discovers them as native skills. `write`
+  // abstracts the transport (CommandRunner.writeFile for SSH/local) so this stays
+  // decoupled from the agent layer. Returns the absolute file paths written.
+  async materialize(write: SkillFileWriter, destRoot: string): Promise<string[]> {
+    const written: string[] = [];
+    for (const def of this.skills.values()) {
+      for (const file of def.files) {
+        const path = join(destRoot, def.name, file.relPath);
+        await write(path, file.content);
+        written.push(path);
+      }
+    }
+    return written;
+  }
+
+  // Stable digest of all scanned skill content. The on-host version marker compares
+  // against it so a redeploy with edited skills re-materializes, an unchanged one skips.
+  contentHash(): string {
+    const h = createHash('sha256');
+    for (const name of [...this.skills.keys()].sort()) {
+      const def = this.skills.get(name)!;
+      h.update(name).update('\0');
+      for (const file of [...def.files].sort((a, b) => a.relPath.localeCompare(b.relPath))) {
+        h.update(file.relPath).update('\0').update(file.content).update('\0');
+      }
+    }
+    return h.digest('hex').slice(0, 16);
+  }
 }
+
+export type SkillFileWriter = (path: string, content: Buffer) => Promise<void>;

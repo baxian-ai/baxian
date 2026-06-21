@@ -15,6 +15,7 @@ class FakeTerminal {
   scrollToBottomCount = 0;
   disposed = false;
   opts: Record<string, unknown>;
+  renderCallbacks: Array<() => void> = [];
   buffer = { active: { cursorY: 0 } };
   modes = { applicationCursorKeysMode: false };
   oscHandlers = new Map<number, (data: string) => boolean | Promise<boolean>>();
@@ -33,6 +34,17 @@ class FakeTerminal {
   open(): void { /* no-op */ }
   onData(cb: (data: string) => void): void {
     this.onDataCallback = cb;
+  }
+  onRender(cb: () => void): { dispose(): void } {
+    this.renderCallbacks.push(cb);
+    return {
+      dispose: () => {
+        this.renderCallbacks = this.renderCallbacks.filter(item => item !== cb);
+      },
+    };
+  }
+  emitRender(): void {
+    for (const cb of this.renderCallbacks) cb();
   }
   write(data: string, cb?: () => void): void {
     this.writes.push(data);
@@ -939,6 +951,123 @@ describe('PaneTerminal', () => {
     }
   });
 
+  it('preview re-anchors when its card becomes measurable after the first snapshot', async () => {
+    const { _resetPaneStreamClientForTest, PaneStreamClient } =
+      await import('../../src/stores/pane-stream-store.ts');
+    _resetPaneStreamClientForTest(
+      new PaneStreamClient({
+        wsUrl: 'ws://test.local/api/stream',
+        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
+        tokenProvider: () => null,
+      }),
+    );
+
+    const scrollState = { value: 0 };
+    let visibleHeight = 0;
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get() { return scrollState.value; },
+      set(v: number) { scrollState.value = v; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => visibleHeight,
+    });
+
+    try {
+      const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
+      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+      const term = fakeTerminals[fakeTerminals.length - 1];
+      term.buffer.active.cursorY = 42;
+      await new Promise((r) => setTimeout(r, 0));
+      const ws = lastMockWs()!;
+      const sid = ws.sent
+        .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
+        .find((m) => m.op === 'subscribe')!.subscriberId!;
+      ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 200, rows: 50, data: 'AAA', snapshotSeq: 1 });
+      ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 200, rows: 50, snapshotSeq: 1 });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(scrollState.value).toBe(0);
+      expect(MockResizeObserver.lastCallback).not.toBeNull();
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        visibleHeight = 300;
+        MockResizeObserver.lastCallback!([], {} as ResizeObserver);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+          await Promise.resolve();
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(scrollState.value).toBe(474);
+    } finally {
+      // @ts-expect-error remove scrollTop shim
+      delete HTMLElement.prototype.scrollTop;
+      // @ts-expect-error remove clientHeight shim — beforeEach re-installs the default 480 for the next case
+      delete HTMLElement.prototype.clientHeight;
+      _resetPaneStreamClientForTest(null);
+    }
+  });
+
+  it('preview re-anchors after xterm renders rows for already-written data', async () => {
+    const { _resetPaneStreamClientForTest, PaneStreamClient } =
+      await import('../../src/stores/pane-stream-store.ts');
+    _resetPaneStreamClientForTest(
+      new PaneStreamClient({
+        wsUrl: 'ws://test.local/api/stream',
+        wsFactory: (url) => new MockWebSocket(url) as unknown as WebSocket,
+        tokenProvider: () => null,
+      }),
+    );
+
+    const scrollState = { value: 0 };
+    Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+      configurable: true,
+      get() { return scrollState.value; },
+      set(v: number) { scrollState.value = v; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => 300,
+    });
+
+    try {
+      const { PaneTerminal } = await import('../../src/components/pane-terminal.tsx');
+      render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+      const term = fakeTerminals[fakeTerminals.length - 1];
+      term.buffer.active.cursorY = 10;
+      await new Promise((r) => setTimeout(r, 0));
+      const ws = lastMockWs()!;
+      const sid = ws.sent
+        .map((s) => JSON.parse(s) as { op?: string; subscriberId?: string })
+        .find((m) => m.op === 'subscribe')!.subscriberId!;
+      ws.deliver({ type: 'snapshot', subscriberId: sid, cols: 200, rows: 50, data: 'AAA', snapshotSeq: 1 });
+      ws.deliver({ type: 'subscribed', subscriberId: sid, agentId: 'dev-1', cols: 200, rows: 50, snapshotSeq: 1 });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(scrollState.value).toBe(0);
+
+      term.buffer.active.cursorY = 42;
+      act(() => {
+        term.emitRender();
+      });
+
+      expect(scrollState.value).toBe(474);
+    } finally {
+      // @ts-expect-error remove scrollTop shim
+      delete HTMLElement.prototype.scrollTop;
+      // @ts-expect-error remove clientHeight shim — beforeEach re-installs the default 480 for the next case
+      delete HTMLElement.prototype.clientHeight;
+      _resetPaneStreamClientForTest(null);
+    }
+  });
+
   it('non-preview (no maxLines) leaves container scrollTop alone — no clipping to compensate for', async () => {
     const { _resetPaneStreamClientForTest, PaneStreamClient } =
       await import('../../src/stores/pane-stream-store.ts');
@@ -975,6 +1104,7 @@ describe('PaneTerminal', () => {
       });
 
       expect(scrollState.writes).toBe(0);
+      expect(MockResizeObserver.lastCallback).toBeNull();
     } finally {
       // @ts-expect-error restore default
       delete HTMLElement.prototype.scrollTop;

@@ -47,15 +47,15 @@ describe('SkillRegistry', () => {
   });
 
   it('returns skills for a given role and phase', async () => {
-    await createSkill('task-check', 'content');
+    await createSkill('baxian-task-check', 'content');
     await createSkill('baxian-rules', 'content');
-    await createSkill('pr-review', 'content');
+    await createSkill('baxian-pr-review', 'content');
     const registry = new SkillRegistry(tempDir);
     await registry.scan();
     const devSkills = registry.skillsForPhase('dev', 'develop');
-    expect(devSkills).toContain('task-check');
+    expect(devSkills).toContain('baxian-task-check');
     expect(devSkills).toContain('baxian-rules');
-    expect(devSkills).not.toContain('pr-review');
+    expect(devSkills).not.toContain('baxian-pr-review');
   });
 
   it('handles empty skills directory', async () => {
@@ -79,6 +79,39 @@ describe('SkillRegistry', () => {
     await registry.scan();
     expect(registry.has('real-skill')).toBe(true);
   });
+
+  it('does not follow a symlinked directory at the top level into a skill', async () => {
+    await createSkill('real-skill', 'content');
+    await symlink(join(tempDir, 'real-skill'), join(tempDir, 'linked-skill'));
+    const registry = new SkillRegistry(tempDir);
+    await registry.scan();
+    expect(registry.names()).toEqual(['real-skill']);
+  });
+
+  it('skips a skill whose SKILL.md is a symlink (not registered)', async () => {
+    const foreignMd = join(tempDir, 'foreign.md');
+    await writeFile(foreignMd, '# Foreign');
+    await mkdir(join(tempDir, 'symlinked-md-skill'), { recursive: true });
+    await symlink(foreignMd, join(tempDir, 'symlinked-md-skill', 'SKILL.md'));
+    await createSkill('real-skill', 'content');
+    const registry = new SkillRegistry(tempDir);
+    await registry.scan();
+    expect(registry.names()).toEqual(['real-skill']);
+  });
+
+  it('ignores a symlinked helper file inside a skill (does not inject it)', async () => {
+    const secret = join(tempDir, 'outside.txt');
+    await writeFile(secret, 'host secret');
+    await createSkill('alpha', '# Alpha');
+    await symlink(secret, join(tempDir, 'alpha', 'leak.txt'));
+    const registry = new SkillRegistry(tempDir);
+    await registry.scan();
+    const recorded = new Map<string, Buffer>();
+    await registry.materialize(async (path, content) => {
+      recorded.set(path, content);
+    }, '/dest');
+    expect([...recorded.keys()]).toEqual(['/dest/alpha/SKILL.md']);
+  });
 });
 
 describe('SkillRegistry edge cases', () => {
@@ -92,5 +125,60 @@ describe('SkillRegistry edge cases', () => {
     const registry = new SkillRegistry();
     await registry.scan();
     expect(registry.names()).toEqual([]);
+  });
+});
+
+describe('SkillRegistry.materialize', () => {
+  it('writes SKILL.md and helper files under destRoot/<name>/<relPath> with exact Buffer contents', async () => {
+    await createSkill('alpha', '# Alpha skill');
+    await mkdir(join(tempDir, 'beta', 'helpers'), { recursive: true });
+    await writeFile(join(tempDir, 'beta', 'SKILL.md'), '# Beta skill');
+    await writeFile(join(tempDir, 'beta', 'helpers', 'x.sh'), '#!/bin/sh\necho hi');
+
+    const registry = new SkillRegistry(tempDir);
+    await registry.scan();
+
+    const recorded = new Map<string, Buffer>();
+    const recorder = async (path: string, content: Buffer): Promise<void> => {
+      recorded.set(path, content);
+    };
+    const written = await registry.materialize(recorder, '/dest');
+
+    expect(written).toContain('/dest/alpha/SKILL.md');
+    expect(written).toContain('/dest/beta/SKILL.md');
+    expect(written).toContain('/dest/beta/helpers/x.sh');
+
+    expect(recorded.get('/dest/alpha/SKILL.md')).toEqual(Buffer.from('# Alpha skill'));
+    expect(recorded.get('/dest/beta/SKILL.md')).toEqual(Buffer.from('# Beta skill'));
+    expect(recorded.get('/dest/beta/helpers/x.sh')).toEqual(Buffer.from('#!/bin/sh\necho hi'));
+  });
+});
+
+describe('SkillRegistry.contentHash', () => {
+  it('returns a non-empty stable digest, identical across scans of identical content', async () => {
+    await createSkill('alpha', '# Alpha');
+    await createSkill('beta', '# Beta');
+
+    const registry = new SkillRegistry(tempDir);
+    await registry.scan();
+    const first = registry.contentHash();
+    expect(first).toBeTruthy();
+    expect(first.length).toBeGreaterThan(0);
+
+    await registry.scan();
+    expect(registry.contentHash()).toBe(first);
+  });
+
+  it('changes when a skill content changes', async () => {
+    await createSkill('alpha', '# Alpha');
+    const registry = new SkillRegistry(tempDir);
+    await registry.scan();
+    const before = registry.contentHash();
+
+    await writeFile(join(tempDir, 'alpha', 'SKILL.md'), '# Alpha edited');
+    await registry.scan();
+    const after = registry.contentHash();
+
+    expect(after).not.toBe(before);
   });
 });

@@ -1,31 +1,27 @@
 ---
-name: pr-review
-description: QA performs a full independent pull request review — findings, verdict, approval
+name: baxian-pr-recheck
+description: QA re-evaluates a PR after dev responded to prior findings — verify closure, check new risks, verdict
+disable-model-invocation: true
 ---
-
-Source of truth: PR, commits, comments, checks, issues.
 
 ## Gather Context
 
 ```bash
-gh pr view N --json title,body,headRefName,headRefOid,baseRefName,reviewDecision,url,files
+gh pr view N --json headRefOid,reviewDecision,comments,reviews,files
 gh pr diff N
 gh api --paginate repos/OWNER/REPO/pulls/N/reviews
 gh api --paginate repos/OWNER/REPO/pulls/N/comments
 gh api --paginate repos/OWNER/REPO/issues/N/comments
 ```
 
-## Scope
+`gh pr view --json reviews` silently truncates; always use paginated `gh api` above for closure decisions.
 
-Prioritize:
-- Bugs, regressions, security, lifecycle, concurrency.
-- Missing/weak/non-assertive tests.
-- Coverage gaps for branches, errors, edge cases.
-- PR vs issue vs repo rules mismatches.
+## Decision Path
 
-## Findings
-
-Inline comments on smallest relevant range. Concrete evidence + expected fix. Don't restate diff.
+- Head changed → review increment, verify all prior findings closed, new behavior has tests.
+- Head unchanged + dev replied → judge reply against code. No "fixed" without evidence.
+- Neither changed → report unchanged, keep prior findings.
+- Post to PR with concrete evidence for unresolved issues.
 
 ## Verdict
 

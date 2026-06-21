@@ -1,12 +1,13 @@
 ---
-name: task-check
+name: baxian-task-check
 description: How to analyze a baxian-managed task before starting development
+disable-model-invocation: true
 ---
 
-Before writing any code, read the `<task>` block in your prompt.
+Before writing any code, read the task in your prompt — the `Phase:` / `Role:` header followed by the `Title:` line and its description.
 
 ## Steps
-1. Read `<task>` block — authoritative task source (no `.baxian/task.md` file).
+1. Read the prompt's `Title:` line and description — the authoritative task source (no `.baxian/task.md` file).
 2. Identify acceptance criteria.
 3. Plan: files to modify, tests to write.
 

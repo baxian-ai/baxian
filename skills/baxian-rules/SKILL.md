@@ -1,6 +1,7 @@
 ---
 name: baxian-rules
 description: General rules and conventions for baxian-managed agents
+disable-model-invocation: true
 ---
 
 ## General

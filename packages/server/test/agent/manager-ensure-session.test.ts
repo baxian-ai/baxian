@@ -33,9 +33,10 @@ const CONFIG: BaxianConfig = {
 describe('AgentManager.ensureSession', () => {
   let tempDir: string;
   let manager: AgentManager;
-  let runner: { exec: ReturnType<typeof vi.fn> };
+  let runner: { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn> };
 
   let tmuxSessions: Map<string, { claim: string; readyOnce: boolean }>;
+  let currentSkillsVersion = '';
 
   function makeMockExec(
     overrides: { trustDialogReady?: boolean } = {},
@@ -77,6 +78,9 @@ describe('AgentManager.ensureSession', () => {
         if (!sess) return { stdout: '', stderr: '', exitCode: 1 };
         if (cmd.includes('@baxian-agent-id')) {
           return { stdout: `${sess.claim}\n`, stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('@baxian-skills-version')) {
+          return { stdout: `${currentSkillsVersion}\n`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
@@ -121,7 +125,7 @@ describe('AgentManager.ensureSession', () => {
     await initStateDir(tempDir);
     tmuxSessions = new Map<string, { claim: string; readyOnce: boolean }>();
 
-    runner = { exec: vi.fn() };
+    runner = { exec: vi.fn(), writeFile: vi.fn().mockResolvedValue(undefined) };
     runner.exec.mockImplementation(makeMockExec({ trustDialogReady: true }));
 
     const agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
@@ -132,7 +136,7 @@ describe('AgentManager.ensureSession', () => {
     const skillsDir = join(tempDir, 'skills');
     // Seed every skill declared by AGENT_PHASES so previewPromptBytesForTaskInput
     // and any startSession-path test using dev.develop passes fail-fast validation.
-    for (const name of ['baxian-rules', 'task-check', 'pr-feedback', 'pr-review', 'pr-recheck', 'spells']) {
+    for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
       await mkdir(join(skillsDir, name), { recursive: true });
       await writeFile(
         join(skillsDir, name, 'SKILL.md'),
@@ -141,6 +145,7 @@ describe('AgentManager.ensureSession', () => {
     }
     const skillRegistry = new SkillRegistry(skillsDir);
     await skillRegistry.scan();
+    currentSkillsVersion = skillRegistry.contentHash();
 
     manager = new AgentManager({
       config: CONFIG,
@@ -212,6 +217,45 @@ describe('AgentManager.ensureSession', () => {
     const result = await manager.ensureSession('dev-1', 'runtime');
     expect(result.createdSession).toBe(false);
     expect(result.paneId).toBe('%0');
+  });
+
+  it('runtime mode, shell relaunch path tags the session with the skills version (so the next adopt is not seen stale)', async () => {
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> =>
+      // classifyPaneForAdopt sees a shell foreground → relaunch path (not live-runtime).
+      cmd.includes('display-message') && cmd.includes('capture-pane')
+        ? { stdout: 'zsh\n___bx-classify-sep___\n', stderr: '', exitCode: 0 }
+        : makeMockExec({ trustDialogReady: true })(cmd));
+    await manager.ensureSession('dev-1', 'runtime');
+    const calls = runner.exec.mock.calls.map(c => c[0] as string);
+    expect(calls.some(c => c.includes('set-option') && c.includes('@baxian-skills-version'))).toBe(true);
+  });
+
+  it('runtime mode, live REPL with a stale skills version → kills + rebuilds so /baxian-* resolves', async () => {
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    // The live REPL reports an OLD skills version (it launched before the current skills),
+    // so it cannot resolve a dispatched /baxian-* — adopt must rebuild instead of reusing.
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> =>
+      cmd.includes('show-option') && cmd.includes('@baxian-skills-version')
+        ? { stdout: 'stale-version\n', stderr: '', exitCode: 0 }
+        : makeMockExec({ trustDialogReady: true })(cmd));
+    const result = await manager.ensureSession('dev-1', 'runtime');
+    expect(result.createdSession).toBe(true);
+    const calls = runner.exec.mock.calls.map(c => c[0] as string);
+    expect(calls.some(c => c.includes('kill-session'))).toBe(true);
+    expect(calls.some(c => c.includes('new-session'))).toBe(true);
+  });
+
+  it('runtime mode, a tmux probe failure during the skills-version check surfaces as EnsureSessionError (does NOT kill the live REPL)', async () => {
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> =>
+      // Unexpected exit (not 0/1) → getOption throws a real probe error (not a missing tag).
+      cmd.includes('show-option') && cmd.includes('@baxian-skills-version')
+        ? { stdout: '', stderr: 'tmux probe boom', exitCode: 2 }
+        : makeMockExec({ trustDialogReady: true })(cmd));
+    await expect(manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/skills-version probe failed/);
+    const calls = runner.exec.mock.calls.map(c => c[0] as string);
+    expect(calls.some(c => c.includes('kill-session'))).toBe(false);
   });
 
   it('create path pins window-size=latest so plain tmux attach follows the current terminal size', async () => {

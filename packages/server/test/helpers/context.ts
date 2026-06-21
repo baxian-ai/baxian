@@ -17,11 +17,10 @@ import type { AppContext } from '../../src/app.js';
 
 const SKILL_NAMES = [
   'baxian-rules',
-  'task-check',
-  'pr-review',
-  'pr-feedback',
-  'pr-recheck',
-  'spells',
+  'baxian-task-check',
+  'baxian-pr-review',
+  'baxian-pr-feedback',
+  'baxian-pr-recheck',
 ];
 
 export async function createTestContext(tempDir: string): Promise<AppContext> {
