@@ -215,14 +215,14 @@ describe('Dashboard layout', () => {
     expect(groupWrapper.className).not.toContain('space-y-3');
   });
 
-  it('promotes "新建 Task" to the primary CTA and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
+  it('renders "新建 Task" as a low-key text-style button and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
     seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
     renderDashboard();
 
     const topbarActions = screen.getByTestId('topbar-actions');
     const taskBtn = screen.getByRole('button', { name: '+ 新建 Task' });
-    expect(taskBtn.className).toContain('btn-primary');
-    expect(taskBtn.className).not.toContain('btn-secondary');
+    expect(taskBtn.className).toContain('btn-ghost');
+    expect(taskBtn.className).not.toContain('btn-primary');
     expect(topbarActions.contains(taskBtn)).toBe(true);
 
     expect(screen.queryByRole('button', { name: '新建项目' })).toBeNull();

@@ -146,7 +146,7 @@ export function Project() {
   return (
     <div>
       <TopbarActions>
-        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-primary">+ 新建 Task</button>
+        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-ghost">+ 新建 Task</button>
         <div className="relative">
           <button
             ref={menuButtonRef}

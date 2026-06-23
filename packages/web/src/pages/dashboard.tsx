@@ -67,7 +67,7 @@ export function Dashboard() {
       onClick={() => setCreateTaskOpen(true)}
       disabled={createTaskDisabled}
       aria-describedby={createTaskDisabled ? 'create-task-hint' : undefined}
-      className="btn-primary"
+      className="btn-ghost"
     >
       + 新建 Task
     </button>

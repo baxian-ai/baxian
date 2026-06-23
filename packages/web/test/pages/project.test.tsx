@@ -158,7 +158,7 @@ describe('Project header actions', () => {
 
     const topbarActions = screen.getByTestId('topbar-actions');
     const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建 Task' });
-    expect(taskBtn.className).toContain('btn-primary');
+    expect(taskBtn.className).toContain('btn-ghost');
     expect(screen.getAllByRole('button', { name: '+ 新建 Task' })).toHaveLength(1);
     expect(screen.queryByTestId('create-task-modal')).toBeNull();
     fireEvent.click(taskBtn);
