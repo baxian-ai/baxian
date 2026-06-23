@@ -8,6 +8,7 @@ import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { Modal } from '../components/modal.tsx';
 import { useTaskDetail } from '../components/task-detail-modal.tsx';
 import { useToast } from '../components/toast.tsx';
+import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import type { ProjectConfig, TaskState } from '../shared/index.js';
@@ -144,87 +145,87 @@ export function Project() {
 
   return (
     <div>
+      <TopbarActions>
+        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-primary">+ 新建 Task</button>
+        <div className="relative">
+          <button
+            ref={menuButtonRef}
+            id={menuTriggerId}
+            type="button"
+            onClick={() => setMenuOpen(open => !open)}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            aria-controls={menuId}
+            aria-label={`项目 ${project.id} 操作菜单`}
+            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="12" r="1" />
+              <circle cx="12" cy="5" r="1" />
+              <circle cx="12" cy="19" r="1" />
+            </svg>
+          </button>
+          {menuOpen && (
+            <div
+              ref={menuRef}
+              id={menuId}
+              role="menu"
+              aria-labelledby={menuTriggerId}
+              className="absolute right-0 top-full z-10 mt-1 min-w-[180px] rounded-md border border-hairline bg-surface py-1 shadow-md"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { setMenuOpen(false); setCreateAgentOpen(true); }}
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-100 hover:text-og-1000"
+              >
+                添加 Agent
+              </button>
+              <div role="none" className="my-1 border-t border-hairline" />
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { setMenuOpen(false); setDeleteOpen(true); }}
+                disabled={!canDelete}
+                title={canDelete ? undefined : `请先删除项目下的 ${agentCount} 个 Agent`}
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-danger hover:bg-[#fef2f2] disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
+              >
+                删除项目…
+              </button>
+            </div>
+          )}
+        </div>
+      </TopbarActions>
       {error && <div className="mb-4 text-[13px] text-danger">Error: {error}</div>}
       <div className="mb-6 flex items-baseline gap-x-3">
         <h1 className="min-w-0 truncate font-display text-[17px] font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
         <span className="hidden min-w-0 truncate font-mono text-[12px] text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
-        <div className="ml-auto flex items-center gap-1 self-center">
-          {!taskPanelOpen && (
-            <button
-              type="button"
-              onClick={() => setTaskPanelOpen(true)}
-              aria-label="打开 Task 面板"
-              className="btn-ghost"
-            >
-              Tasks
-            </button>
-          )}
-          <div className="relative">
-            <button
-              ref={menuButtonRef}
-              id={menuTriggerId}
-              type="button"
-              onClick={() => setMenuOpen(open => !open)}
-              aria-haspopup="menu"
-              aria-expanded={menuOpen}
-              aria-controls={menuId}
-              aria-label={`项目 ${project.id} 操作菜单`}
-              className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="1" />
-                <circle cx="12" cy="5" r="1" />
-                <circle cx="12" cy="19" r="1" />
-              </svg>
-            </button>
-            {menuOpen && (
-              <div
-                ref={menuRef}
-                id={menuId}
-                role="menu"
-                aria-labelledby={menuTriggerId}
-                className="absolute right-0 top-full z-10 mt-1 min-w-[180px] rounded-md border border-hairline bg-surface py-1 shadow-md"
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { setMenuOpen(false); setCreateAgentOpen(true); }}
-                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-100 hover:text-og-1000"
-                >
-                  添加 Agent
-                </button>
-                <div role="none" className="my-1 border-t border-hairline" />
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { setMenuOpen(false); setDeleteOpen(true); }}
-                  disabled={!canDelete}
-                  title={canDelete ? undefined : `请先删除项目下的 ${agentCount} 个 Agent`}
-                  className="block w-full px-3 py-1.5 text-left text-[13px] text-danger hover:bg-[#fef2f2] disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
-                >
-                  删除项目…
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
+        {!taskPanelOpen && (
+          <button
+            type="button"
+            onClick={() => setTaskPanelOpen(true)}
+            aria-label="打开 Task 面板"
+            className="btn-ghost ml-auto self-center"
+          >
+            Tasks
+          </button>
+        )}
       </div>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <div className="min-w-0 flex-1">
-          <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+          <div className="mb-3 flex flex-wrap items-baseline gap-2">
             <h2 className="font-display text-[12px] font-semibold uppercase tracking-[0.06em] text-og-500">Agents</h2>
-            <button onClick={() => setCreateTaskOpen(true)} className="btn-ghost">+ 新建 Task</button>
           </div>
           {project.agent.flat().length === 0 ? (
             <div className="mb-8 rounded-lg border border-hairline bg-surface py-6 text-center text-[13px] text-og-500">

@@ -66,6 +66,7 @@ vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => 
 });
 
 import { Dashboard } from '../../src/pages/dashboard.tsx';
+import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
 function seed(projects: ProjectConfig[], agents: AgentSnapshot[] = []): void {
   projectsHookState.projects = projects;
@@ -76,6 +77,7 @@ function seed(projects: ProjectConfig[], agents: AgentSnapshot[] = []): void {
 function renderDashboard() {
   return render(
     <MemoryRouter>
+      <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
       <Dashboard />
     </MemoryRouter>,
   );
@@ -217,9 +219,11 @@ describe('Dashboard layout', () => {
     seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
     renderDashboard();
 
+    const topbarActions = screen.getByTestId('topbar-actions');
     const taskBtn = screen.getByRole('button', { name: '+ 新建 Task' });
     expect(taskBtn.className).toContain('btn-primary');
     expect(taskBtn.className).not.toContain('btn-secondary');
+    expect(topbarActions.contains(taskBtn)).toBe(true);
 
     expect(screen.queryByRole('button', { name: '新建项目' })).toBeNull();
     expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
@@ -230,10 +234,26 @@ describe('Dashboard layout', () => {
 
     const toolbar = taskBtn.parentElement!;
     const triggerWrapper = moreTrigger.parentElement!;
+    expect(toolbar).toBe(topbarActions);
     expect(
       toolbar.compareDocumentPosition(triggerWrapper) & Node.DOCUMENT_POSITION_CONTAINED_BY,
     ).toBeTruthy();
     expect(toolbar.lastElementChild).toBe(triggerWrapper);
+  });
+
+  it('keeps the disabled Dashboard "新建 Task" action in the topbar when there is no project yet', () => {
+    seed([]);
+    renderDashboard();
+
+    const topbarActions = screen.getByTestId('topbar-actions');
+    const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建 Task' }) as HTMLButtonElement;
+    expect(taskBtn.disabled).toBe(true);
+    expect(taskBtn.getAttribute('title')).toBeNull();
+    expect(taskBtn.parentElement?.getAttribute('title')).toBe('请先创建项目');
+    expect(taskBtn.parentElement?.className).toContain('inline-flex');
+
+    const hint = within(topbarActions).getByText('请先创建项目');
+    expect(hint.className).toContain('sr-only');
   });
 
   it('opens the kebab menu on click and exposes a "新建项目" menuitem that opens the CreateProject modal', () => {

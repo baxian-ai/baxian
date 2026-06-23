@@ -32,17 +32,14 @@ const TASK: TaskState = {
   updatedAt: '2026-04-28T10:00:00Z',
 };
 
-// Server-phase compaction tests only need baxian-rules in the registry; this wires up the
-// shared per-test temp-registry lifecycle so each block doesn't re-declare beforeEach/afterEach.
-function useRulesOnlyRegistry(prefix: string): () => SkillRegistry {
+// Server phases force-load no skill (AGENT_PHASES declares skills: [] for them), so these
+// blocks just need an empty registry with the shared per-test temp-dir lifecycle.
+function useServerPhaseRegistry(prefix: string): () => SkillRegistry {
   let tempDir: string;
   let registry: SkillRegistry;
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), prefix));
     registry = new SkillRegistry(tempDir);
-    const dir = join(tempDir, 'baxian-rules');
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, 'SKILL.md'), 'baxian-rules stub');
     await registry.scan();
   });
   afterEach(async () => {
@@ -80,7 +77,6 @@ describe('buildPromptInline', () => {
   // not reject. Individual tests can overwrite a specific skill with custom
   // content (writeFile is destructive) before scanning.
   async function seedAllPhaseSkills(): Promise<void> {
-    await makeSkill('baxian-rules', 'rules stub');
     await makeSkill('baxian-task-check', 'task-check stub');
     await makeSkill('baxian-pr-feedback', 'pr-feedback stub');
     await makeSkill('baxian-pr-review', 'pr-review stub');
@@ -196,12 +192,11 @@ describe('buildPromptInline', () => {
     })).toThrow(/fix prompt requires signalToken/);
   });
 
-  it('inlines the baxian-rules phase-signal substitution rule for signal-emitting phases only', async () => {
+  it('inlines the phase-signal substitution rule for signal-emitting phases only', async () => {
     await seedAndScan();
-    // baxian-rules is materialized but never force-loaded (single command slot + implicit
-    // invocation disabled), so its §Phase Signals "substitute the placeholders, never echo them"
-    // invariant must ride inline in the header — else the agent emits a literal [bx:KIND:<token>]
-    // the watcher's strict scanner can't match and the task hangs waiting on a signal.
+    // The "substitute the placeholders, never echo them" invariant must ride inline in the header —
+    // else the agent emits a literal [bx:KIND:<token>] the watcher's strict scanner can't match and
+    // the task hangs waiting on a signal.
     const withSignal = build({
       task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
       phase: 'fix',
@@ -263,7 +258,7 @@ describe('buildPromptInline', () => {
   // excluding any other skill keeps the leading command intact.
   it.each<[string, string[], string, string[], string[]]>([
     ['containing the primary drops the leading command, body unchanged', ['baxian-task-check'], 'Phase: develop', ['Title: Fix login redirect'], ['/baxian-task-check']],
-    ['not naming the primary keeps the leading command', ['baxian-rules'], '/baxian-task-check\n', [], []],
+    ['not naming the primary keeps the leading command', ['baxian-pr-review'], '/baxian-task-check\n', [], []],
   ])('excludeSkills %s', async (_label, excludeSkills, prefix, contains, notContains) => {
     await seedAndScan();
     const prompt = build({ worktreePath: '/tmp/repo/.baxian-worktrees/task-001_abc', excludeSkills });
@@ -272,12 +267,12 @@ describe('buildPromptInline', () => {
     for (const f of notContains) expect(prompt).not.toContain(f);
   });
 
-  // Each row seeds a partial (or empty) registry, then asserts the registry-wide required-skill
-  // check still rejects. excludeSkills must NOT bypass it — the check is registry-wide, not emit-wide.
+  // Each row leaves the phase-declared skill (baxian-task-check) out of the registry, then asserts
+  // the required-skill check rejects. excludeSkills must NOT bypass it — the check is registry-wide,
+  // not emit-wide.
   it.each<[string, string[], string[]]>([
-    ['excludeSkills names a skill missing from registry', ['baxian-rules'], ['baxian-task-check']],
-    ['baxian-rules is absent from registry', ['baxian-task-check'], []],
-    ['the registry is empty (no baxian-rules) regardless of phase', [], []],
+    ['excludeSkills naming the required skill does not bypass the check', [], ['baxian-task-check']],
+    ['the registry is empty', [], []],
   ])('buildPromptInline throws RequiredSkillsMissingError when %s', async (_label, seed, excludeSkills) => {
     for (const name of seed) await makeSkill(name, name);
     await registry.scan();
@@ -290,24 +285,7 @@ describe('buildPromptInline', () => {
     expect(() => build({ task: huge })).toThrow(PromptSizeError);
   });
 
-  it('error message lists every missing required skill (global + phase-declared)', async () => {
-    // baxian-rules (global required) AND baxian-task-check (phase-declared by dev.develop) both absent.
-    await registry.scan();
-    try {
-      build();
-      throw new Error('expected RequiredSkillsMissingError');
-    } catch (err) {
-      expect(err).toBeInstanceOf(RequiredSkillsMissingError);
-      const missing = (err as RequiredSkillsMissingError).missing;
-      expect(missing).toContain('baxian-rules');
-      expect(missing).toContain('baxian-task-check');
-      expect((err as Error).message).toContain('baxian-rules');
-      expect((err as Error).message).toContain('baxian-task-check');
-    }
-  });
-
-  it('throws when a phase-declared skill is missing even if baxian-rules is present', async () => {
-    await makeSkill('baxian-rules', 'rules');
+  it('error message lists the missing phase-declared skill', async () => {
     // 'baxian-task-check' is declared by AGENT_PHASES.dev.develop but intentionally not seeded.
     await registry.scan();
     try {
@@ -316,6 +294,7 @@ describe('buildPromptInline', () => {
     } catch (err) {
       expect(err).toBeInstanceOf(RequiredSkillsMissingError);
       expect((err as RequiredSkillsMissingError).missing).toEqual(['baxian-task-check']);
+      expect((err as Error).message).toContain('baxian-task-check');
     }
   });
 
@@ -408,7 +387,7 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain(`TOKEN=review-token-N`);
     expect(prompt).toContain(buildPhaseSignalTemplate('pr-approved'));
     expect(prompt).toContain(buildPhaseSignalTemplate('pr-changes-requested'));
-    // Stamps no longer inlined — agent builds them from baxian-rules template + token.
+    // Stamps no longer inlined — agent builds them from the phase template + token.
     expect(prompt).not.toContain('<!-- baxian:pr-approved:review-token-N -->');
     expect(prompt).not.toContain('Output exactly one filled signal');
   });
@@ -423,7 +402,7 @@ describe('buildPromptInline', () => {
       ['skip the commit_id check'],
       ['Review head SHA for §Verdict Verification']],
   ])('review prompt force-loads baxian-pr-review and handles verdict verification (%s)', async (_label, reviewHeadAnchorSha, contains, notContains) => {
-    await seedRealSkillsAndScan(['baxian-rules', 'baxian-pr-review']);
+    await seedRealSkillsAndScan(['baxian-pr-review']);
     const prompt = build({
       task: { ...TASK, status: 'review', prNumber: 42, reviewHeadAnchorSha },
       phase: 'review',
@@ -436,7 +415,7 @@ describe('buildPromptInline', () => {
   });
 
   it('recheck phase carries verdict verification section', async () => {
-    await seedRealSkillsAndScan(['baxian-rules', 'baxian-pr-recheck']);
+    await seedRealSkillsAndScan(['baxian-pr-recheck']);
     const prompt = build({
       task: { ...TASK, status: 'review', prNumber: 42, reviewRound: 2, reviewHeadAnchorSha: 'sha-recheck-789' },
       phase: 'recheck',
@@ -528,7 +507,7 @@ describe('buildPromptInline', () => {
 });
 
 describe('server review mode prompt builders', () => {
-  const getRegistry = useRulesOnlyRegistry('baxian-server-prompt-');
+  const getRegistry = useServerPhaseRegistry('baxian-server-prompt-');
 
   const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' };
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
@@ -665,7 +644,7 @@ describe('server review mode prompt builders', () => {
 
   it('every baxian skill disables implicit model-invocation (Claude frontmatter + Codex policy) so only baxian explicitly invokes the per-phase skill', async () => {
     const skillsRoot = fileURLToPath(new URL('../../../../skills', import.meta.url));
-    for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
+    for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
       const md = await readFile(join(skillsRoot, name, 'SKILL.md'), 'utf-8');
       expect(md).toContain('disable-model-invocation: true');
       const policy = await readFile(join(skillsRoot, name, 'agents', 'openai.yaml'), 'utf-8');
@@ -686,7 +665,7 @@ describe('server review mode prompt builders', () => {
 });
 
 describe('server-phase prompt builders (managed-PR marker, findings compaction)', () => {
-  const getRegistry = useRulesOnlyRegistry('baxian-r8-');
+  const getRegistry = useServerPhaseRegistry('baxian-r8-');
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
 
   it('server-after-done pr prompt demands the managed-PR marker', async () => {
@@ -733,7 +712,7 @@ describe('server-phase prompt builders (managed-PR marker, findings compaction)'
 });
 
 describe('compactFindings ids-only tier', () => {
-  const getRegistry = useRulesOnlyRegistry('baxian-r9-');
+  const getRegistry = useServerPhaseRegistry('baxian-r9-');
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
 
   it('pathological finding counts keep the full id set via the ids-only tier', async () => {
@@ -764,7 +743,7 @@ describe('compactFindings ids-only tier', () => {
 });
 
 describe('response compaction', () => {
-  const getRegistry = useRulesOnlyRegistry('baxian-r14-');
+  const getRegistry = useServerPhaseRegistry('baxian-r14-');
   const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' };
 
   it('oversized prior responses keep every findingId/action (rationales compacted)', async () => {

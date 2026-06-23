@@ -7,6 +7,7 @@ import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { HostManagementModal } from '../components/host-management-modal.tsx';
 import { Modal } from '../components/modal.tsx';
 import { useTaskDetail } from '../components/task-detail-modal.tsx';
+import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import type { AgentSnapshot, ProjectConfig } from '../shared/index.js';
@@ -59,20 +60,29 @@ export function Dashboard() {
     };
   }, [moreMenuOpen]);
 
+  const createTaskDisabled = projects.length === 0;
+  const createTaskButton = (
+    <button
+      type="button"
+      onClick={() => setCreateTaskOpen(true)}
+      disabled={createTaskDisabled}
+      aria-describedby={createTaskDisabled ? 'create-task-hint' : undefined}
+      className="btn-primary"
+    >
+      + 新建 Task
+    </button>
+  );
+
   return (
     <div>
-      <h1 className="sr-only">Dashboard</h1>
-      <div className="mb-6 flex flex-wrap items-center justify-end gap-2">
-        <button
-          onClick={() => setCreateTaskOpen(true)}
-          disabled={projects.length === 0}
-          aria-describedby={projects.length === 0 ? 'create-task-hint' : undefined}
-          className="btn-primary"
-        >
-          + 新建 Task
-        </button>
-        {projects.length === 0 && (
-          <span id="create-task-hint" className="self-center text-[12px] text-og-500">请先创建项目</span>
+      <TopbarActions>
+        {createTaskDisabled ? (
+          <span className="inline-flex" title="请先创建项目">
+            {createTaskButton}
+          </span>
+        ) : createTaskButton}
+        {createTaskDisabled && (
+          <span id="create-task-hint" className="sr-only">请先创建项目</span>
         )}
         <div className="relative">
           <button
@@ -130,7 +140,8 @@ export function Dashboard() {
             </div>
           )}
         </div>
-      </div>
+      </TopbarActions>
+      <h1 className="sr-only">Dashboard</h1>
       {error && <div className="mb-4 text-[13px] text-danger">Error: {error}</div>}
       {projectsLoaded && projects.length === 0 && !projectsError && (
         <div className="rounded-lg border border-hairline bg-surface py-12 text-center text-[13px] text-og-500">

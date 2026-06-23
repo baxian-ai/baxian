@@ -4,6 +4,7 @@ import { Project } from './pages/project.tsx';
 import { Terminal } from './pages/terminal.tsx';
 import { BrandToggle } from './components/brand-toggle.tsx';
 import { PendingRestartBanner } from './components/pending-restart-banner.tsx';
+import { TOPBAR_ACTIONS_ID } from './components/topbar-actions.tsx';
 
 function AppShell() {
   const location = useLocation();
@@ -19,6 +20,10 @@ function AppShell() {
           <span aria-hidden className="block h-2.5 w-2.5 rounded-full bg-accent" />
           baxian
         </Link>
+        <div
+          id={TOPBAR_ACTIONS_ID}
+          className="ml-auto flex min-w-0 items-center justify-end gap-2"
+        />
       </nav>
       <PendingRestartBanner />
       <main className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-6 sm:px-6">

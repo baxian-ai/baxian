@@ -51,12 +51,10 @@ describe('SkillRegistry', () => {
 
   it('returns skills for a given role and phase', async () => {
     await createSkill('baxian-task-check', 'content');
-    await createSkill('baxian-rules', 'content');
     await createSkill('baxian-pr-review', 'content');
     const registry = await scanned();
     const devSkills = registry.skillsForPhase('dev', 'develop');
     expect(devSkills).toContain('baxian-task-check');
-    expect(devSkills).toContain('baxian-rules');
     expect(devSkills).not.toContain('baxian-pr-review');
   });
 

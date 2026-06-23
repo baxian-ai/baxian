@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { useLayoutEffect } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 
@@ -18,6 +19,7 @@ vi.mock('../src/components/pending-restart-banner.tsx', () => ({
 }));
 
 import { App } from '../src/app.tsx';
+import { TOPBAR_ACTIONS_ID, TopbarActions } from '../src/components/topbar-actions.tsx';
 
 beforeEach(() => {
   window.history.pushState({}, '', '/');
@@ -25,6 +27,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  document.body.innerHTML = '';
 });
 
 describe('App shell layout', () => {
@@ -49,6 +52,11 @@ describe('App shell layout', () => {
     expect(screen.queryByRole('link', { name: 'Tasks' })).toBeNull();
     expect(container.querySelector('a[href="/tasks"]')).toBeNull();
     expect(nav.querySelector('button[aria-label^="切换为 Logo"]')).toBeNull();
+
+    const actions = nav.querySelector(`#${TOPBAR_ACTIONS_ID}`);
+    expect(actions).toBeTruthy();
+    expect(actions!.className).toContain('ml-auto');
+    expect(actions!.className).toContain('justify-end');
 
     const navLinks = nav.querySelectorAll('a');
     expect(navLinks.length).toBe(1);
@@ -121,6 +129,41 @@ describe('App shell layout', () => {
 
     expect(container.querySelector('footer')).toBeNull();
     expect(screen.getByTestId('page-terminal')).toBeTruthy();
+  });
+});
+
+describe('TopbarActions', () => {
+  it('portals into an existing topbar container before layout effects run', () => {
+    document.body.innerHTML = `<div id="${TOPBAR_ACTIONS_ID}"></div>`;
+    const layoutSnapshots: string[] = [];
+
+    function LayoutProbe() {
+      useLayoutEffect(() => {
+        layoutSnapshots.push(document.getElementById(TOPBAR_ACTIONS_ID)?.textContent ?? '');
+      }, []);
+      return null;
+    }
+
+    render(
+      <>
+        <TopbarActions><button type="button">first-pass action</button></TopbarActions>
+        <LayoutProbe />
+      </>,
+    );
+
+    expect(layoutSnapshots).toEqual(['first-pass action']);
+    expect(screen.getByRole('button', { name: 'first-pass action' })).toBeTruthy();
+  });
+
+  it('falls back after mount when the topbar container is created in the same React commit', async () => {
+    render(
+      <>
+        <div id={TOPBAR_ACTIONS_ID} />
+        <TopbarActions><button type="button">same-commit action</button></TopbarActions>
+      </>,
+    );
+
+    expect(await screen.findByRole('button', { name: 'same-commit action' })).toBeTruthy();
   });
 });
 

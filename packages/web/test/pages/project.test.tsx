@@ -71,6 +71,7 @@ vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => 
 });
 
 import { Project } from '../../src/pages/project.tsx';
+import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -80,6 +81,7 @@ function LocationProbe() {
 function renderProjectPage() {
   return render(
     <MemoryRouter initialEntries={['/project/demo']}>
+      <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
       <Routes>
         <Route path="/project/:id" element={<Project />} />
         <Route path="/" element={<LocationProbe />} />
@@ -150,20 +152,26 @@ describe('Project page header', () => {
 });
 
 describe('Project header actions', () => {
-  it('exposes a top-level "新建 Task" button that opens the create-task modal', async () => {
+  it('moves the top-level "新建 Task" button into the topbar and opens the create-task modal', async () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
+    const topbarActions = screen.getByTestId('topbar-actions');
+    const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建 Task' });
+    expect(taskBtn.className).toContain('btn-primary');
+    expect(screen.getAllByRole('button', { name: '+ 新建 Task' })).toHaveLength(1);
     expect(screen.queryByTestId('create-task-modal')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '+ 新建 Task' }));
+    fireEvent.click(taskBtn);
     expect(await screen.findByTestId('create-task-modal')).toBeTruthy();
   });
 
-  it('moves "添加 Agent" into the three-dot menu — no top-level add-agent button by default', async () => {
+  it('moves the project three-dot menu into the topbar and keeps "添加 Agent" inside it', async () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
     expect(screen.queryByRole('button', { name: /添加 Agent/ })).toBeNull();
+    const topbarActions = screen.getByTestId('topbar-actions');
+    expect(within(topbarActions).getByRole('button', { name: /项目 demo 操作菜单/ })).toBeTruthy();
 
     await openProjectMenu();
     const item = await screen.findByRole('menuitem', { name: '添加 Agent' });
@@ -176,12 +184,14 @@ describe('Project header actions', () => {
 });
 
 describe('Project Task panel', () => {
-  it('toggles the Task panel from the header and keeps the trigger before the project menu', async () => {
+  it('toggles the Task panel from the project header while project actions live in the topbar', async () => {
     renderProjectPage();
     const openBtn = await waitFor(() => screen.getByRole('button', { name: '打开 Task 面板' }));
+    const topbarActions = screen.getByTestId('topbar-actions');
     const menu = screen.getByRole('button', { name: /项目 demo 操作菜单/ });
     expect(screen.queryByRole('complementary', { name: 'Task 面板' })).toBeNull();
-    expect(openBtn.compareDocumentPosition(menu) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(topbarActions.contains(openBtn)).toBe(false);
+    expect(topbarActions.contains(menu)).toBe(true);
 
     fireEvent.click(openBtn);
 
@@ -268,6 +278,7 @@ describe('Project delete entry', () => {
     }
     render(
       <MemoryRouter initialEntries={['/project/demo']}>
+        <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
         <Routes>
           <Route path="/project/:id" element={<Project />} />
           <Route path="/" element={<><LocationProbe /><ProjectIdsProbe /></>} />

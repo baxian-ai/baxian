@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os';
 import type { AgentBindingFacts, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
+import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
+import { buildPhaseSignal } from '../../src/agent/phase-signal.js';
+import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
+import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
 import { WorktreeManager } from '../../src/agent/worktree.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
@@ -12,6 +16,7 @@ import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
+import { registerEventHandlers } from '../../src/event/handlers.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
 import { PostApproveStore } from '../../src/state/post-approve-store.js';
 import { initStateDir } from '../../src/state/init.js';
@@ -436,6 +441,24 @@ describe('recover()', () => {
 });
 
 describe('setupRecoveredPostApproveSignals()', () => {
+  function snapshotPaneStreamerManager(snapshot: string): PaneStreamerManager {
+    const streamer = {
+      subscribeAtomic: vi.fn(async (_cbs: SubscriberCallbacks) => ({
+        snapshot: { data: snapshot },
+        unsubscribe: vi.fn(),
+      })),
+    };
+    return { ensure: vi.fn(() => streamer) } as unknown as PaneStreamerManager;
+  }
+
+  async function waitForTaskStatus(taskId: string, status: TaskState['status']): Promise<void> {
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline) {
+      if ((await taskStore.get(taskId))?.status === status) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+
   it('sets up approved tasks with stored completion records', async () => {
     await seedTask({ id: 'task-approved', reviewRound: 1, status: 'approved' });
     await manager.setPostApproveCompletion('task-approved', {
@@ -469,6 +492,76 @@ describe('setupRecoveredPostApproveSignals()', () => {
       skipSnapshot: false,
       recovered: true,
     });
+  });
+
+  it('does not re-arm already merge-ready tasks with stale completion records', async () => {
+    await seedTask({ id: 'task-merge-ready', reviewRound: 1, status: 'merge-ready' });
+    await manager.setPostApproveCompletion('task-merge-ready', {
+      token: 'tok',
+      approvedHeadSha: 'a'.repeat(40),
+    });
+    const watcher = {
+      start: vi.fn(async () => true),
+      stop: vi.fn(),
+    };
+    manager = new AgentManager({
+      config: CONFIG,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: new EventBus(new EventLog(join(tempDir, 'events-merge-ready'))),
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => noopRunner(),
+      postApproveStore: manager['postApproveStore'],
+      phaseSignalWatcher: watcher as never,
+    });
+
+    await manager.setupRecoveredPostApproveSignals();
+
+    expect(watcher.start).not.toHaveBeenCalled();
+  });
+
+  it('replays a recovered pr-merge-ready snapshot for manual-merge projects', async () => {
+    const token = 'posttok12345';
+    await seedTask({ id: 'task-approved-manual', reviewRound: 1, status: 'approved' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-approved-manual', paneId: '%1' });
+    await manager.setPostApproveCompletion('task-approved-manual', {
+      token,
+      approvedHeadSha: 'b'.repeat(40),
+    });
+
+    const manualConfig: BaxianConfig = {
+      ...CONFIG,
+      project: CONFIG.project.map(p => ({ ...p, merge: null })),
+    };
+    const eventsDir = join(tempDir, 'events-post-approve-manual');
+    await mkdir(eventsDir, { recursive: true });
+    const localBus = new EventBus(new EventLog(eventsDir));
+    const watcher = new PhaseSignalWatcher({
+      paneStreamerManager: snapshotPaneStreamerManager(`done\n${buildPhaseSignal('pr-merge-ready', token)}\n`),
+      eventBus: localBus,
+      resolveAgent: (id) => (
+        id === 'dev-1' ? { ...CONFIG.project[0]!.agent[0]![0]!, projectId: 'proj' } : undefined
+      ),
+    });
+    manager = new AgentManager({
+      config: manualConfig,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: localBus,
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => noopRunner(),
+      postApproveStore: manager['postApproveStore'],
+      phaseSignalWatcher: watcher,
+    });
+    registerEventHandlers(localBus, manager);
+
+    await manager.setupRecoveredPostApproveSignals();
+    await waitForTaskStatus('task-approved-manual', 'merge-ready');
+
+    expect((await taskStore.get('task-approved-manual'))?.status).toBe('merge-ready');
+    await expect(manager.getPostApproveCompletion('task-approved-manual')).resolves.toBeNull();
   });
 });
 

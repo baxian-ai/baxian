@@ -80,11 +80,13 @@ async function makeFixture(
     platformRunner: runner,
     ...(reviewStore ? { reviewStore } : {}),
   });
+  // Shrink the cancel /clear busy→idle poll so cancelTask tests don't wait real seconds.
+  Object.assign(manager, { compactIdlePollMs: 5, compactIdleWaitMs: 200, clearContextWaitMs: 200 });
   return { manager, taskStore, agentStore, execCalls, events };
 }
 
 // Pane responses that satisfy interruptPaneAndWaitReady for a claude-code dev:
-// C-c lands, then capture-pane shows an idle REPL.
+// ESC lands, then capture-pane shows an idle REPL.
 function readyPaneExec(cmd: string): Partial<ExecResult> {
   if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
     return { stdout: 'claude\n' };
@@ -321,7 +323,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     await taskStore.set(approvedPrMarkerFixture());
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
-    const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
+    const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes("'Escape'"));
     const closeAt = execCalls.findIndex(c => c.includes('gh pr close 31') && c.includes('--delete-branch'));
     expect(interruptAt).toBeGreaterThanOrEqual(0);
     expect(closeAt).toBeGreaterThan(interruptAt);
@@ -335,7 +337,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
       publishDispatchedAt: '2026-06-10T01:00:00.000Z',
     }));
     await manager.cancelTask('task-1');
-    const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
+    const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes("'Escape'"));
     const deleteAt = execCalls.findIndex(c => c.includes('git push origin --delete') && c.includes('bx/task-1'));
     expect(interruptAt).toBeGreaterThanOrEqual(0);
     expect(deleteAt).toBeGreaterThan(interruptAt);

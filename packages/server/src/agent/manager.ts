@@ -248,11 +248,29 @@ export function canDispatchWithBinding(binding: AgentBindingFacts | null | undef
 // allowAwaitingHuman:true release，gate 单点放行。
 const TURN_COMPLETED_AWAITING_PHASES = new Set<string>();
 
+// Pane is stopped (interrupt landed) but its session was not cleared: cancel is mid /clear
+// (`cancel-clearing`) or /clear was unconfirmed (`cancel-clear-failed`). Resume can't fix it (it doesn't
+// /clear), so these are DELETE-only: shouldReleaseHeldBinding returns false → recover()/escape/Resume all
+// refuse. Persisted, so the protection survives a restart mid-cleanup.
+const UNCLEARED_PANE_PHASES = new Set<string>(['cancel-clearing', 'cancel-clear-failed']);
+
+// All cancel-cleanup holds (the un-cleared ones plus `cancel-interrupt-failed`, where the interrupt failed
+// so the pane may still be running the cancelled task). None may be AUTO-released — not by recover(), not by
+// a terminal-task escape, not even by an allowAwaitingHuman caller — because that would reuse the cancelled
+// session. Only cancel's own confirmed-/clear release (fromCancelCleanup) frees one automatically; the
+// operator recovers via Resume (cancel-interrupt-failed only, after verifying) or DELETE (any).
+const CANCEL_CLEANUP_HOLD_PHASES = new Set<string>([...UNCLEARED_PANE_PHASES, 'cancel-interrupt-failed']);
+
+// A prompt line still holding the typed `/clear` (e.g. `❯ /clear`, `› /clear`) = the Enter was swallowed,
+// so /clear was never submitted. After a real submission /clear wipes the screen and the composer is empty.
+const CLEAR_PENDING_IN_COMPOSER_RE = /(?:^|\n)[ \t]*[❯>›→][ \t]*\/clear\b/;
+
 // Resume / recover 共用：决定 Held agent 的 binding 是否随状态恢复一起清掉。
 export function shouldReleaseHeldBinding(
   state: AgentBindingFacts,
   boundTask: TaskState | null | undefined,
 ): boolean {
+  if (state.awaitingPhase != null && UNCLEARED_PANE_PHASES.has(state.awaitingPhase)) return false;
   const taskIsTerminal = !!boundTask && TERMINAL_STATUSES.includes(boundTask.status);
   const turnCompleted = state.awaitingPhase != null && TURN_COMPLETED_AWAITING_PHASES.has(state.awaitingPhase);
   return !boundTask || taskIsTerminal || turnCompleted;
@@ -303,6 +321,7 @@ export class AgentManager {
   protected compactIdleWaitMs = 5 * 60_000;
   protected compactIdlePollMs = 2_000;
   protected manualCompactWaitMs = 5_000;
+  protected clearContextWaitMs = 30_000;
   protected postMergeFetchTimeoutMs = 60_000;
   protected postMergeBranchTimeoutMs = 10_000;
   // taskIds with in-flight manual review — second concurrent POST gets 409.
@@ -1491,7 +1510,7 @@ export class AgentManager {
     agentId: string,
     expectedTaskId: string,
     mode: 'waiting' | 'idle',
-    opts: { allowAwaitingHuman?: boolean; clearAwaitingHuman?: boolean } = {},
+    opts: { allowAwaitingHuman?: boolean; clearAwaitingHuman?: boolean; fromCancelCleanup?: boolean } = {},
   ): Promise<boolean> {
     return this.withTaskLock(async () => {
       const state = await this.agentStore.get(agentId);
@@ -1500,6 +1519,21 @@ export class AgentManager {
         console.warn(
           `[AgentManager] releaseAgentForTask: agent ${agentId} taskId mismatch ` +
           `(expected ${expectedTaskId}, got ${state.taskId}); skipping`,
+        );
+        return false;
+      }
+      // Cancel-cleanup hold: only cancel's own release may free it. Checked BEFORE the allowAwaitingHuman
+      // gate below, because that gate skips shouldReleaseHeldBinding entirely — so without this an
+      // allowAwaitingHuman caller (startup false-start, review/max-rounds handlers, a terminal-task escape)
+      // could reassign the un-cleared/maybe-running pane before cancel confirms /clear. (Operator recovery
+      // via resumeAgent / DELETE doesn't go through this path.)
+      if (
+        state.awaitingPhase != null
+        && CANCEL_CLEANUP_HOLD_PHASES.has(state.awaitingPhase)
+        && !opts.fromCancelCleanup
+      ) {
+        console.warn(
+          `[AgentManager] releaseAgentForTask: agent ${agentId} ${state.awaitingPhase} (cancel-cleanup hold); refusing auto-release`,
         );
         return false;
       }
@@ -1771,6 +1805,15 @@ export class AgentManager {
         );
         return { resumed: false, releasedBinding: false };
       }
+      // Un-cleared pane (cancel mid-clear or /clear unconfirmed): Resume would free + reuse it (terminal
+      // task → shouldReleaseHeldBinding) and leak the cancelled task's context. Refuse; only DELETE (which
+      // destroys the pane) is a safe recovery.
+      if (state.awaitingPhase != null && UNCLEARED_PANE_PHASES.has(state.awaitingPhase)) {
+        console.warn(
+          `[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — pane holds un-cleared context; refusing Resume. DELETE the agent to discard it.`,
+        );
+        return { resumed: false, releasedBinding: false };
+      }
       const now = new Date().toISOString();
       const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask);
       const cfg = this.getAgentConfig(agentId);
@@ -1852,30 +1895,33 @@ export class AgentManager {
     return { resumed: result.resumed, releasedBinding: result.releasedBinding };
   }
 
+  private async resolvePaneId(
+    state: AgentBindingFacts,
+    cfg: AgentConfig & { projectId: string },
+  ): Promise<string | null> {
+    if (state.paneId) return state.paneId;
+    try {
+      return await new TmuxManager(this.createRunnerFor(cfg)).getSinglePaneId(cfg.id);
+    } catch (err) {
+      console.warn(`[AgentManager] resolvePaneId: getSinglePaneId failed for ${cfg.id}:`, err);
+      return null;
+    }
+  }
+
+  // ESC (not Ctrl-C) is the interrupt key both runtimes advertise; returns whether the pane reached idle.
   private async interruptPaneAndWaitReady(
     state: AgentBindingFacts,
     cfg: AgentConfig & { projectId: string },
   ): Promise<boolean> {
-    const runner = this.createRunnerFor(cfg);
-    const tmux = new TmuxManager(runner);
-    let paneId = state.paneId;
-    if (!paneId) {
-      try {
-        paneId = await tmux.getSinglePaneId(cfg.id);
-      } catch (err) {
-        console.warn(
-          `[AgentManager] interruptPaneAndWaitReady: getSinglePaneId failed for ${cfg.id}:`,
-          err,
-        );
-        return false;
-      }
-    }
+    const paneId = await this.resolvePaneId(state, cfg);
+    if (!paneId) return false;
+    const tmux = new TmuxManager(this.createRunnerFor(cfg));
     try {
-      await tmux.sendKeysToPane(paneId, 'C-c');
+      await tmux.sendKeysToPane(paneId, 'Escape');
       await new Promise(r => setTimeout(r, 200));
     } catch (err) {
       console.warn(
-        `[AgentManager] interruptPaneAndWaitReady: send C-c failed for pane ${paneId}:`,
+        `[AgentManager] interruptPaneAndWaitReady: send Escape failed for pane ${paneId}:`,
         err,
       );
       return false;
@@ -1892,6 +1938,73 @@ export class AgentManager {
         err,
       );
       return false;
+    }
+  }
+
+  // Persist a "cancel is interrupting + /clearing this pane" hold BEFORE the ESC→/clear window so the
+  // protection survives a restart (recover() holds UNCLEARED_PANE_PHASES) and the escape can't reassign the
+  // un-cleared pane. Direct update (no intervention event): a normal cancel clears it on release; only a
+  // crash/failure leaves it. Conditional on the binding so a stale cancel can't mark an agent rebound away.
+  private async markPaneCancelClearing(agentId: string, taskId: string): Promise<void> {
+    const now = new Date().toISOString();
+    await this.agentStore.update(agentId, (latest) => {
+      if (!latest || latest.taskId !== taskId) return AGENT_STORE_NOOP;
+      return {
+        ...latest,
+        status: 'awaiting_human',
+        awaitingPhase: 'cancel-clearing',
+        awaitingReason: 'Cancelling: interrupting and clearing the runtime session; not reusable until /clear is confirmed or the agent is deleted.',
+        awaitingSince: now,
+        updatedAt: now,
+      };
+    });
+  }
+
+  // Returns whether /clear was confirmed (a real busy→idle, not the stale pre-/clear idle frame); the
+  // caller must hold the agent, not release it, on false or the un-cleared context leaks to the next dispatch.
+  private async clearPaneContext(
+    state: AgentBindingFacts,
+    cfg: AgentConfig & { projectId: string },
+  ): Promise<boolean> {
+    const paneId = await this.resolvePaneId(state, cfg);
+    if (!paneId) return false;
+    if (!this.tryAcquireCompactGuard(cfg.id)) {
+      console.warn(`[AgentManager] clearPaneContext: ${cfg.id} compact/upload in progress; cannot /clear`);
+      return false;
+    }
+    try {
+      const tmux = new TmuxManager(this.createRunnerFor(cfg));
+      const runtime = agentRuntimeKindFor(cfg);
+      // C-c clears any prompt an ack-timeout left in the composer, so /clear isn't appended to it and submitted.
+      await tmux.sendKeysToPane(paneId, 'C-c');
+      await this.waitForReplPromptReady(tmux, paneId, runtime, this.clearContextWaitMs);
+      await tmux.sendKeysLiteral(paneId, '/clear');
+      // Snapshot the composer holding the typed /clear; require submission proof so a swallowed Enter
+      // (which would leave /clear idle in the composer and let waitForReplPromptReady pass on the stale
+      // frame) is resent rather than treated as cleared.
+      const beforeSubmit = await tmux.capturePaneSnapshot(paneId);
+      await tmux.sendEnter(paneId);
+      await tmux.waitSubmitAck(paneId, beforeSubmit, runtime, {
+        timeoutMs: this.clearContextWaitMs,
+        acceptComposerChange: true,
+        resend: () => tmux.sendEnter(paneId),
+        resendIntervalMs: this.compactIdlePollMs,
+      });
+      await this.waitForReplPromptReady(tmux, paneId, runtime, this.clearContextWaitMs);
+      // Positively confirm the composer is empty: a ready anchor alone can sit above a composer that still
+      // holds the typed /clear (e.g. acceptComposerChange returned on an unrelated redraw). If /clear is
+      // still parked there, it was never submitted — treat as unconfirmed so the caller holds the pane.
+      const afterClear = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+      if (CLEAR_PENDING_IN_COMPOSER_RE.test(afterClear)) {
+        console.warn(`[AgentManager] clearPaneContext: /clear still in composer for ${cfg.id}; unconfirmed`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn(`[AgentManager] clearPaneContext: /clear failed for ${cfg.id}:`, err);
+      return false;
+    } finally {
+      this.compactInFlight.delete(cfg.id);
     }
   }
 
@@ -2332,15 +2445,13 @@ export class AgentManager {
     });
   }
 
-  // manual-merge skips snapshot — a stale scrollback signal would re-fire every restart.
+  // Recovery snapshot replay is safe because the completion token is cleared after merge-ready.
   async setupRecoveredPostApproveSignals(): Promise<void> {
     if (!this.phaseSignalWatcher) return;
     const tasks = await this.taskStore.list({ status: 'approved' });
     for (const task of tasks) {
       const completion = await this.postApproveStore.get(task.id);
       if (!completion) continue;
-      const project = this.getProjectConfig(task.projectId);
-      const skipSnapshot = project?.merge !== 'auto';
       try {
         await this.phaseSignalWatcher.start({
           taskId: task.id,
@@ -2348,7 +2459,7 @@ export class AgentManager {
           agentId: task.agentId,
           expectedKinds: 'pr-merge-ready',
           token: completion.token,
-          skipSnapshot,
+          skipSnapshot: false,
           recovered: true,
         });
       } catch (err) {
@@ -2991,16 +3102,36 @@ export class AgentManager {
       if (!fresh || TERMINAL_STATUSES.includes(fresh.status)) {
         const cfg = this.getAgentConfig(agentId);
         const state = await this.agentStore.get(agentId);
-        if (cfg && state && state.taskId === taskId && !(await this.interruptPaneAndWaitReady(state, cfg))) {
-          await this.markAwaitingHuman(
-            agentId,
-            'cancel-interrupt-failed',
-            'Task was cancelled during startup but C-c / REPL ready check failed; the agent may still be ' +
-              'running the cancelled prompt. Attach via web terminal to verify, then Resume or Delete.',
-            { expectedTaskId: taskId },
-          );
+        if (cfg && state && state.taskId === taskId) {
+          // Persist the un-cleared hold before the ESC→/clear window so a restart mid-cleanup recovers it
+          // held instead of releasing the still-dirty pane (mirrors cancelTask).
+          await this.markPaneCancelClearing(agentId, taskId);
+          if (!(await this.interruptPaneAndWaitReady(state, cfg))) {
+            await this.markAwaitingHuman(
+              agentId,
+              'cancel-interrupt-failed',
+              'Task was cancelled during startup but ESC / REPL ready check failed; the agent may still be ' +
+                'running the cancelled prompt. Attach via web terminal to verify, then Resume or Delete.',
+              { expectedTaskId: taskId },
+            );
+            return null;
+          }
+          if (!(await this.clearPaneContext(state, cfg))) {
+            await this.markAwaitingHuman(
+              agentId,
+              'cancel-clear-failed',
+              'Task was cancelled during startup and the session interrupted, but /clear was not confirmed; ' +
+                'the pane holds un-cleared context. DELETE the agent to discard it (Resume will not reuse an un-cleared pane).',
+              { expectedTaskId: taskId },
+            );
+            return null;
+          }
+          // /clear confirmed → cancel cleanup is done; free the cancel-clearing hold (only path allowed to).
+          await this.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
           return null;
         }
+        // No live pane to clean (agent gone / rebound): release without the cancel-cleanup bypass — if it
+        // somehow holds an un-cleared phase, refusing here keeps the dirty pane for the owning cancel.
         await this.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true });
         return null;
       }
@@ -4121,7 +4252,11 @@ export class AgentManager {
             );
           }
         }
-        const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask);
+        // A cancel-cleanup hold must NOT be auto-released on restart (it would reuse the cancelled,
+        // un-cleared/maybe-running pane). cancel-interrupt-failed has shouldReleaseHeldBinding=true (it's
+        // operator-Resume recoverable), so exclude the whole cancel-cleanup set here explicitly.
+        const cancelHold = state.awaitingPhase != null && CANCEL_CLEANUP_HOLD_PHASES.has(state.awaitingPhase);
+        const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask) && !cancelHold;
         // 释放 binding 时同步清 worktree（与 resumeAgent 一致）——否则跨重启恢复后
         // worktreePath 在下面 update 中被丢弃，磁盘上的 worktree 永远无人回收。
         if (shouldReleaseBinding && state.worktreePath) {
@@ -4180,7 +4315,9 @@ export class AgentManager {
         if (shouldReleaseBinding) {
           await this.lockManager.release(state.id);
         }
-        if (state.taskId && !shouldReleaseBinding) {
+        // Skip the menu-watch for cancel-cleanup holds: they await operator Resume/DELETE, and their taskId
+        // won't clear on its own, so the watcher would poll forever.
+        if (state.taskId && !shouldReleaseBinding && !cancelHold) {
           this.startRuntimeMenuWatch(state.id);
         }
       } catch (err) {
@@ -4382,6 +4519,13 @@ export class AgentManager {
         };
       }
 
+      // Mark the panes cancel-clearing BEFORE flipping the task terminal (still under the lock), so any
+      // window — a concurrent escape, or a restart — sees a persisted hold instead of a plain binding to a
+      // terminal task that recover()/the escape would release with the session still un-cleared.
+      for (const id of [devToRelease, qaToRelease]) {
+        if (id) await this.markPaneCancelClearing(id, taskId);
+      }
+
       const now = new Date().toISOString();
       task.status = 'cancelled';
       task.updatedAt = now;
@@ -4406,39 +4550,58 @@ export class AgentManager {
     // (config hot-removed: the pane outlives the config; state gone; rebound)
     // leave an in-flight publish possible.
     let devStopConfirmed = false;
+    // Phase 1 — interrupt every still-bound pane first, so a slow /clear on one agent can't keep another
+    // running the cancelled task. The persisted cancel-clearing hold (set under the lock) blocks any
+    // concurrent escape from releasing these panes until they are /cleared.
+    const stopped: string[] = [];
     for (const id of [devToRelease, qaToRelease]) {
       if (!id) continue;
       const cfg = this.getAgentConfig(id);
       const state = await this.agentStore.get(id);
-      if (!cfg || !state) continue;
-      // 重校验绑定：lock 释放后另一路 release+acquire 可能已把 agent 绑给新任务，
-      // 此时不能 C-c 打到新会话上、也不能继续 idle release。
-      if (state.taskId !== taskId) {
+      if (!cfg || !state || state.taskId !== taskId) {
         console.warn(
-          `[AgentManager] cancelTask: ${id} no longer bound to ${taskId} (got ${state.taskId}); skipping`,
+          `[AgentManager] cancelTask: ${id} no longer bound to ${taskId} (got ${state?.taskId}); skipping`,
         );
         continue;
       }
-      const ok = await this.interruptPaneAndWaitReady(state, cfg);
-      if (!ok) {
+      if (!(await this.interruptPaneAndWaitReady(state, cfg))) {
         await this.markAwaitingHuman(
           id,
           'cancel-interrupt-failed',
-          'Task marked cancelled but C-c / REPL ready check failed; agent may still be running. Attach via web terminal to verify, then Resume or Delete.',
+          'Task marked cancelled but ESC / REPL ready check failed; agent may still be running the cancelled prompt. Attach via web terminal to verify, then Resume or Delete.',
+          { expectedTaskId: taskId },
         );
         continue;
       }
+      // devStopConfirmed reflects only "the pane stopped" — set before /clear so published-artifact
+      // retirement still proceeds even when /clear can't be confirmed.
       if (id === publishedCleanup?.devAgentId) devStopConfirmed = true;
-      try {
-        // allowAwaitingHuman: cancelTask 是显式回收入口，agent 之前可能因 ack_unknown 等被标 Held，
-        // 用户主动 Cancel 应允许跨过 awaiting_human gate 清理 binding；release 默认 gate 是为了
-        // 拦住非显式路径（如 generic catch）的意外清理，cancelTask 不属于那类。
-        await this.releaseAgentForTask(id, taskId, 'idle', { allowAwaitingHuman: true });
-      } catch (err) {
-        console.error(
-          `[AgentManager] cancelTask releaseAgentForTask(${id}) failed:`,
-          err,
+      stopped.push(id);
+    }
+    // Phase 2 — every pane is stopped; /clear + release each.
+    for (const id of stopped) {
+      const cfg = this.getAgentConfig(id);
+      const state = await this.agentStore.get(id);
+      if (!cfg || !state || state.taskId !== taskId) {
+        console.warn(`[AgentManager] cancelTask: ${id} rebound before /clear (got ${state?.taskId}); skipping`);
+        continue;
+      }
+      if (!(await this.clearPaneContext(state, cfg))) {
+        // /clear unconfirmed → hold; the un-cleared pane stays bound (UNCLEARED_PANE_PHASES) until DELETE.
+        await this.markAwaitingHuman(
+          id,
+          'cancel-clear-failed',
+          'Task marked cancelled and the session interrupted, but /clear was not confirmed; the pane holds un-cleared context. DELETE the agent to discard it (Resume will not reuse an un-cleared pane).',
+          { expectedTaskId: taskId },
         );
+        continue;
+      }
+      try {
+        // fromCancelCleanup: this IS the owning cancel, having confirmed /clear — the only release allowed
+        // to free the cancel-clearing hold. allowAwaitingHuman: cross the awaiting_human gate too.
+        await this.releaseAgentForTask(id, taskId, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
+      } catch (err) {
+        console.error(`[AgentManager] cancelTask releaseAgentForTask(${id}) failed:`, err);
       }
     }
 
@@ -5575,10 +5738,10 @@ export class AgentManager {
         await new Promise(r => setTimeout(r, this.compactIdlePollMs));
         await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
         if (!await bindingStillOurs()) return;
-        await tmux.sendKeysLiteral(paneId, cleanSlate ? '/clear' : '/compact');
-        await tmux.sendEnter(paneId);
-        await new Promise(r => setTimeout(r, this.compactIdlePollMs));
-        await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
+        const command = cleanSlate ? '/clear' : '/compact';
+        if (!await this.sendPostMergeSlashCommand(tmux, paneId, agentId, runtime, command, bindingStillOurs)) {
+          return;
+        }
         break;
       } catch (err) {
         const label = attempts < 2 ? 'retrying' : 'giving up';
@@ -5589,6 +5752,47 @@ export class AgentManager {
       }
     }
     await this.releasePostMergeAgent(agentId, originalTaskId);
+  }
+
+  private async sendPostMergeSlashCommand(
+    tmux: TmuxManager,
+    paneId: string,
+    agentId: string,
+    runtime: AgentRuntimeKind,
+    command: '/compact' | '/clear',
+    bindingStillOurs: () => Promise<boolean>,
+  ): Promise<boolean> {
+    let rejection: Error | undefined;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await tmux.sendKeysLiteral(paneId, command);
+      await tmux.sendEnter(paneId);
+      await new Promise(r => setTimeout(r, this.compactIdlePollMs));
+      await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
+      if (!await bindingStillOurs()) return false;
+
+      if (!await this.hasRuntimeSlashCommandRejection(tmux, paneId, command)) return true;
+
+      rejection = new Error(`runtime rejected ${command} because a task is still in progress`);
+      if (attempt < 2) {
+        console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) ${command} rejected; retrying`);
+        await new Promise(r => setTimeout(r, this.compactIdlePollMs));
+        if (!await bindingStillOurs()) return false;
+      }
+    }
+    throw rejection ?? new Error(`runtime rejected ${command}`);
+  }
+
+  private async hasRuntimeSlashCommandRejection(
+    tmux: TmuxManager,
+    paneId: string,
+    command: '/compact' | '/clear',
+  ): Promise<boolean> {
+    const cap = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+    return this.runtimeSlashCommandRejectedPattern(command).test(cap);
+  }
+
+  private runtimeSlashCommandRejectedPattern(command: '/compact' | '/clear'): RegExp {
+    return new RegExp(`["'“”‘’]?${command}["'“”‘’]?\\s+is disabled while a task is in progress\\.`, 'gi');
   }
 
   // pane_current_command 是 runtime 是否仍活的权威信号（不被 viewport stale frame 骗）。

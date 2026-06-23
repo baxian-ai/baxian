@@ -91,7 +91,13 @@ function mockFn(): ReturnType<typeof vi.fn> {
 }
 
 function fakeCompactionTmux(): Record<string, ReturnType<typeof vi.fn>> {
-  return { injectPrompt: mockFn(), sendEnter: mockFn(), sendKeysLiteral: mockFn(), sendKeysToPane: mockFn() };
+  return {
+    injectPrompt: mockFn(),
+    sendEnter: mockFn(),
+    sendKeysLiteral: mockFn(),
+    sendKeysToPane: mockFn(),
+    capturePaneById: vi.fn().mockResolvedValue(''),
+  };
 }
 
 function fakeDispatchTmux(): Record<string, ReturnType<typeof vi.fn>> {
@@ -517,6 +523,65 @@ describe('compactAgent', () => {
     gates[2]();
     await run;
 
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('retries post-merge /clear when Codex rejects it while the task is still in progress', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    let lastLiteral = '';
+    let clearSubmits = 0;
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      sendKeysLiteral: vi.fn(async (_paneId: string, text: string) => { lastLiteral = text; }),
+      sendEnter: vi.fn(async () => {
+        if (lastLiteral === '/clear') clearSubmits++;
+      }),
+      capturePaneById: vi.fn(async () => (
+        clearSubmits === 1
+          ? "■ '/clear' is disabled while a task is in progress.\n› \n\n  repo · 100% context left"
+          : '› \n\n  repo · 100% context left'
+      )),
+    };
+
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
+
+    const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
+    expect(slashCalls).toHaveLength(2);
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('does not treat a reused Codex rejection toast as post-merge /clear success', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    let lastLiteral = '';
+    let clearSubmits = 0;
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      sendKeysLiteral: vi.fn(async (_paneId: string, text: string) => { lastLiteral = text; }),
+      sendEnter: vi.fn(async () => {
+        if (lastLiteral === '/clear') clearSubmits++;
+      }),
+      capturePaneById: vi.fn(async () => (
+        clearSubmits > 0
+          ? "■ '/clear' is disabled while a task is in progress.\n› \n\n  repo · 100% context left"
+          : '› \n\n  repo · 100% context left'
+      )),
+    };
+
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
+
+    const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
+    expect(slashCalls).toHaveLength(4);
+    expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });

@@ -28,11 +28,6 @@ export class RequiredSkillsMissingError extends Error {
   }
 }
 
-// Global invariants every dispatch carries, independent of phase. baxian-rules
-// holds backend-state-machine constraints (verdict marker grammar, PR signal,
-// etc.) that must be present even if a phase's AGENT_PHASES entry forgets it.
-const GLOBAL_REQUIRED_SKILLS: readonly string[] = ['baxian-rules'];
-
 // Each runtime exposes on-disk skills as a single command: Claude Code fires
 // `/skill-name`, Codex fires `$skill-name`. baxian controls the pasted bytes, so
 // emitting the command on the first line force-loads that skill's full body
@@ -42,13 +37,12 @@ const SKILL_INVOKE_SIGIL: Record<AgentRuntime, string> = {
   codex: '$',
 };
 
-// The one phase-specific skill to force-load. baxian-rules is global — its
-// invariants ride inline in the task header (see buildTaskBody), so it never
-// consumes the single per-message command slot. undefined when a phase declares
-// no skill beyond baxian-rules.
+// The one phase-specific skill to force-load via the single per-message command
+// slot. undefined when a phase declares no skill (merge / server-* run on inline
+// instructions only).
 function phasePrimarySkill(role: AgentRole, phase: string): string | undefined {
   const skills = AGENT_PHASES[role]?.[phase as keyof (typeof AGENT_PHASES)[AgentRole]]?.skills ?? [];
-  return skills.find(name => name !== 'baxian-rules');
+  return skills[0];
 }
 
 export interface BuildPromptOpts {
@@ -86,13 +80,12 @@ export interface BuildPromptOpts {
 export const MAX_INLINE_FINDINGS_BYTES = 10 * 1024;
 
 // Throws PromptSizeError when fullPrompt > MAX_PROMPT_BYTES, or
-// RequiredSkillsMissingError when a global or phase-declared skill cannot be
-// resolved. The phase-declared check exists because skillsForPhase() silently
-// filters missing names — without this fail-fast the prompt would build with
-// silently-degraded behavior and no operator-visible signal.
+// RequiredSkillsMissingError when a phase-declared skill cannot be resolved.
+// The check exists because skillsForPhase() silently filters missing names —
+// without this fail-fast the prompt would build with silently-degraded behavior
+// and no operator-visible signal.
 export function buildPromptInline(opts: BuildPromptOpts): string {
-  const phaseDeclared = AGENT_PHASES[opts.agent.role]?.[opts.phase]?.skills ?? [];
-  const required = [...new Set([...GLOBAL_REQUIRED_SKILLS, ...phaseDeclared])];
+  const required = AGENT_PHASES[opts.agent.role]?.[opts.phase]?.skills ?? [];
   const missing = required.filter(name => !opts.skillRegistry.has(name));
   if (missing.length > 0) throw new RequiredSkillsMissingError(missing);
   const taskBody = buildTaskBody({
@@ -440,11 +433,9 @@ function buildTaskBody(args: TaskBodyArgs): string {
     : 'baxian conventions: cross-agent communication is via the GitHub PR (description, commits, reviews, comments); ' +
       `a managed PR's description first line MUST be \`${BAXIAN_PR_CLAIM}\`; stay in scope — out-of-scope work goes to a new GitHub Issue; ` +
       'QA judges risk independently (human authorization is input, not a bypass).';
-  // baxian-rules §Phase Signals, inlined. The rules skill is materialized but never force-loaded
-  // (the single command slot goes to the phase skill, and implicit invocation is disabled), so the
-  // one invariant the phase builders depend on — fill the placeholders, never echo them — must ride
-  // in the header for every signal-emitting phase. A literal `<token>`/`<pr_number>` does not match
-  // the watcher's strict scanner, so the task would hang waiting for a signal that never fires.
+  // The phase-signal substitution invariant — fill the placeholders, never echo them — must ride in
+  // the header for every signal-emitting phase: a literal `<token>`/`<pr_number>` does not match the
+  // watcher's strict scanner, so the task would hang waiting for a signal that never fires.
   const signalRule = signalToken
     ? 'Phase signals: where a step tells you to emit `[bx:KIND:<token>]` (or `[bx:pr-created:<pr_number>:<token>]`), ' +
       'substitute `<token>` (and `<pr_number>`) with the literal value(s) given on the accompanying `token:`/PR-number lines ' +

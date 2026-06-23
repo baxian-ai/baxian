@@ -58,6 +58,57 @@ function readyRunner(): CommandRunner {
   };
 }
 
+// Runner for cancelTask's real /clear path: answers pane_current_command (runtime) + plain capture-pane
+// (idle), and models capturePaneSnapshot so it changes once the pane's /clear Enter lands — the evidence
+// clearPaneContext's waitSubmitAck requires (a swallowed Enter would leave the snapshot unchanged).
+// Records every send-keys into `sentKeys`. `failClear(pane)` makes that pane's /clear injection fail.
+function clearAwareRunner(
+  sentKeys: string[],
+  paneInfo: (pane: string) => { proc: string; idle: string },
+  opts: { failClear?: (pane: string) => boolean; swallowClearEnters?: number } = {},
+): CommandRunner {
+  const clearTyped = new Set<string>();
+  const swallowed = new Map<string, number>();
+  const paneOf = (cmd: string): string => cmd.match(/%\d+/)?.[0] ?? '';
+  return {
+    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('send-keys')) {
+        sentKeys.push(cmd);
+        const pane = paneOf(cmd);
+        if (cmd.includes('send-keys -l') && cmd.includes('/clear')) {
+          if (opts.failClear?.(pane)) return { stdout: '', stderr: 'tmux send failed', exitCode: 1 };
+          clearTyped.add(pane);
+        } else if (cmd.includes("'Enter'") && clearTyped.has(pane)) {
+          const n = swallowed.get(pane) ?? 0;
+          // Simulate a swallowed Enter: the composer keeps /clear until a resend lands.
+          if (n < (opts.swallowClearEnters ?? 0)) swallowed.set(pane, n + 1);
+          else clearTyped.delete(pane);
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      const pane = paneOf(cmd);
+      const info = paneInfo(pane);
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
+        return { stdout: `${info.proc}\n`, stderr: '', exitCode: 0 };
+      }
+      // info.idle ends at the prompt marker; a typed-but-unsubmitted /clear renders on that prompt line.
+      const frame = clearTyped.has(pane) ? `${info.idle} /clear` : info.idle;
+      // capturePaneSnapshot: `capture-pane -e -p && printf SEP && display-message history_size`.
+      if (cmd.includes('capture-pane') && cmd.includes('history_size')) {
+        return { stdout: `${frame}\n___bx-snap-sep___\n0\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: frame, stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }),
+    writeFile: vi.fn(async (): Promise<void> => undefined),
+  } as unknown as CommandRunner;
+}
+
+const CLAUDE_PANE = { proc: 'claude', idle: '⏵⏵ bypass permissions on /tmp/repo\n\n>' };
+const CODEX_PANE = { proc: 'codex', idle: 'permissions: YOLO mode\n\n>' };
+
 // Runner for the post-merge happy path: idle at rest, then BUSY for a few captures right after EACH
 // submitted Enter (the cleanup prompt's Enter and the /clear's Enter), then idle again — so the
 // background flow sees, for both submissions, a real idle → submit → busy → idle cycle and releases
@@ -164,7 +215,7 @@ function recordingRunner(
 }
 
 function setCompactTiming(mgr: AgentManager, waitMs = 100, pollMs = 10): void {
-  Object.assign(mgr, { compactIdleWaitMs: waitMs, compactIdlePollMs: pollMs });
+  Object.assign(mgr, { compactIdleWaitMs: waitMs, compactIdlePollMs: pollMs, clearContextWaitMs: waitMs });
 }
 
 // Spy the private interruptPaneAndWaitReady (a 10s real wait) to a fixed outcome; returns the spy so
@@ -172,6 +223,13 @@ function setCompactTiming(mgr: AgentManager, waitMs = 100, pollMs = 10): void {
 function mockInterruptPane(mgr: AgentManager, ok: boolean): ReturnType<typeof vi.spyOn> {
   return vi.spyOn(mgr as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
     .mockResolvedValue(ok) as ReturnType<typeof vi.spyOn>;
+}
+
+// clearPaneContext runs a real /clear + busy→idle wait; stub it (confirmed=true) for cancel tests that
+// mock the interrupt and only assert release/binding, so a runtime-mismatched runner can't hang the test.
+function stubClearPane(mgr: AgentManager, confirmed = true): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(mgr as unknown as { clearPaneContext: () => Promise<boolean> }, 'clearPaneContext')
+    .mockResolvedValue(confirmed) as ReturnType<typeof vi.spyOn>;
 }
 
 function freshRegistry(): SkillRegistry {
@@ -248,7 +306,7 @@ function captureInjection(into: string[]): (cmd: string) => void {
 }
 
 async function seedPhaseSkillsAtDir(skillsDir: string): Promise<void> {
-  for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
+  for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
     await mkdir(join(skillsDir, name), { recursive: true });
     await writeFile(
       join(skillsDir, name, 'SKILL.md'),
@@ -435,16 +493,19 @@ describe('AgentManager task binding flow', () => {
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     mockInterruptPane(manager, true);
+    stubClearPane(manager);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await manager.cancelTask(t.id);
 
     expect(cancelled.status).toBe('cancelled');
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', t.id, 'idle', { allowAwaitingHuman: true });
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', t.id, 'idle', { allowAwaitingHuman: true });
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
   });
 
   it('cancelTask releases a bound dev through the real release path without task-lock deadlock', async () => {
+    const localManager = makeManager({ runnerFactory: () => clearAwareRunner([], () => CLAUDE_PANE) });
+    setCompactTiming(localManager);
     const t = await seedTask();
     await seedAgent({
       id: 'dev-1',
@@ -456,7 +517,7 @@ describe('AgentManager task binding flow', () => {
     const timeout = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error('cancelTask timed out')), 1_500);
     });
-    const cancelled = await Promise.race([manager.cancelTask(t.id), timeout]);
+    const cancelled = await Promise.race([localManager.cancelTask(t.id), timeout]);
 
     expect(cancelled.status).toBe('cancelled');
     const state = await agentStore.get('dev-1');
@@ -552,6 +613,7 @@ describe('AgentManager task binding flow', () => {
   it('createAndStartTask({ background: true }): cancel mid-bootstrap interrupts the pane, then idle-releases', async () => {
     mockStartSessionThatCancels();
     const interruptSpy = mockInterruptPane(manager, true);
+    stubClearPane(manager);
     let released!: () => void;
     const releaseDone = new Promise<void>((resolve) => { released = resolve; });
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async () => { released(); return true; });
@@ -567,9 +629,9 @@ describe('AgentManager task binding flow', () => {
     );
 
     await releaseDone;
-    // C-c the (possibly prompt-running) pane BEFORE handing it back, so the next dispatch isn't polluted.
+    // ESC + /clear the (possibly prompt-running) pane BEFORE handing it back, so the next dispatch isn't polluted.
     expect(interruptSpy).toHaveBeenCalledTimes(1);
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', created.id, 'idle', { allowAwaitingHuman: true });
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', created.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
     expect(armSpy).not.toHaveBeenCalled();
   });
 
@@ -589,6 +651,26 @@ describe('AgentManager task binding flow', () => {
 
     await holdDone;
     expect(holdSpy).toHaveBeenCalledWith('dev-1', 'cancel-interrupt-failed', expect.any(String), { expectedTaskId: created.id });
+    expect(releaseSpy).not.toHaveBeenCalled();
+  });
+
+  it('createAndStartTask({ background: true }): cancel mid-bootstrap holds the agent when /clear is not confirmed', async () => {
+    mockStartSessionThatCancels();
+    mockInterruptPane(manager, true);
+    stubClearPane(manager, false);
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    let held!: () => void;
+    const holdDone = new Promise<void>((resolve) => { held = resolve; });
+    const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockImplementation(async () => { held(); });
+
+    const created = await manager.createAndStartTask(
+      'proj',
+      { title: 'T', description: 'D', preferredAgentId: 'dev-1' },
+      { background: true },
+    );
+
+    await holdDone;
+    expect(holdSpy).toHaveBeenCalledWith('dev-1', 'cancel-clear-failed', expect.any(String), { expectedTaskId: created.id });
     expect(releaseSpy).not.toHaveBeenCalled();
   });
 
@@ -613,10 +695,10 @@ describe('AgentManager task binding flow', () => {
     expect(holdSpy).toHaveBeenCalledWith(created.id, 'dev-1', ['spec-done', 'pr-created']);
   });
 
-  it('createAndStartTask: a cancel before delivery releases the agent from the now-terminal task', async () => {
-    // startSession returns false because the user cancelled mid-bootstrap; cancelTask couldn't C-c a pane
-    // that didn't exist yet, so it left the agent held. rollbackFailedDispatch only acts on in_progress
-    // tasks, so the !started path must release the agent from the cancelled task (else manual Resume).
+  it('createAndStartTask: a cancel-cleanup hold from a cancel-before-delivery is NOT auto-released by the !started path', async () => {
+    // User cancelled mid-bootstrap; cancelTask marked the agent cancel-interrupt-failed (pane may still be
+    // running). The !started path must NOT auto-release that cancel-cleanup hold (it would hand the cancelled
+    // session to the next dispatch) — it stays held for operator Resume (after verifying) or Delete.
     vi.spyOn(manager, 'startSession').mockImplementation(async (cancelledTaskId: string) => {
       const t = await taskStore.get(cancelledTaskId);
       if (t) await taskStore.set({ ...t, status: 'cancelled', updatedAt: NOW });
@@ -625,13 +707,13 @@ describe('AgentManager task binding flow', () => {
         : s));
       return false;
     });
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
 
     const created = await manager.createAndStartTask('proj', { title: 'T', description: 'D', preferredAgentId: 'dev-1' });
 
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', created.id, 'idle', { allowAwaitingHuman: true });
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe(created.id);
+    expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
   it('develop dispatch holds the dev when the spec/pr-created watcher fails to arm', async () => {
@@ -765,7 +847,7 @@ describe('AgentManager task binding flow', () => {
       t.id,
       'develop',
       'dev-1',
-      new DispatchTerminalError('required_skills_missing', 'missing baxian-rules'),
+      new DispatchTerminalError('required_skills_missing', 'missing baxian-task-check'),
     );
 
     expect((await taskStore.get(t.id))?.status).toBe('failed');
@@ -1436,7 +1518,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('startSession develop prompt drops the spec route when the dev has no QA partner', async () => {
@@ -1537,7 +1619,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1558,7 +1640,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts[0]).toContain('Post-approve PR feedback check');
 
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
   });
 
   it('continueSession with a different paneId resets dedup — full skills re-injected', async () => {
@@ -1566,7 +1648,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%9', updatedAt: NOW,
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1582,7 +1664,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.paneId).toBe('%9');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
   });
 
   it('startSession on a freshly-created tmux session re-injects full skills even when paneId string matches', async () => {
@@ -1591,7 +1673,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const t = await seedTask({ id: 'task-fresh-pane', branch: 'bx/task-fresh-pane' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
@@ -1609,7 +1691,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('continueSession on a freshly-created tmux session re-injects full skills even when paneId string matches', async () => {
@@ -1617,7 +1699,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1634,7 +1716,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts[0]).not.toContain('<skills></skills>');
 
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
   });
 
   it('continueSession post-approve: freshRuntime suppresses incremental nudge — full preamble always sent', async () => {
@@ -1673,7 +1755,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, {
@@ -1698,10 +1780,10 @@ describe('injectedSkills dedup across phase dispatches', () => {
   it('persistInjectedSkills skips agentStore write when phase brings no new skill', async () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: 't-no-write', paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 't-no-write', paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
+      injectedSkills: { taskId: 't-no-write', paneId: '%0', skills: ['baxian-task-check'] },
     });
     const setSpy = vi.spyOn(agentStore, 'set');
-    await persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-rules', 'baxian-task-check']);
+    await persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-task-check']);
     expect(setSpy).not.toHaveBeenCalled();
   });
 
@@ -1710,17 +1792,17 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await persistInjectedSkills('dev-1', 't-fresh-base', '%0', 'dev', 'develop', null);
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe('t-fresh-base');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('persistInjectedSkills writes when phase introduces a skill not yet in baseList', async () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: 't-add', paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 't-add', paneId: '%0', skills: ['baxian-rules'] },
+      injectedSkills: { taskId: 't-add', paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
-    await persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-rules']);
+    await persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-pr-feedback']);
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-task-check']);
   });
 
   it('startSession resets dedup when adoptOrRestartSession relaunches REPL inside an existing pane (createdSession=false, freshRuntime=true)', async () => {
@@ -1731,7 +1813,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const t = await seedTask({ id: 'task-pane-relaunch', branch: 'bx/task-pane-relaunch' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
@@ -1749,7 +1831,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('continueSession resets dedup when adoptOrRestartSession relaunches REPL inside an existing pane', async () => {
@@ -1757,7 +1839,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules', 'baxian-pr-feedback'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1773,7 +1855,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts[0]).not.toContain('<skills></skills>');
 
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
   });
 
   it('startSession records injectedSkills even when injectAndAwaitAck returns acked=false — paste delivered the skills', async () => {
@@ -1793,7 +1875,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
     expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('continueSession expands injectedSkills even when injectAndAwaitAck returns acked=false', async () => {
@@ -1801,7 +1883,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-rules'] },
+      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
@@ -1813,9 +1895,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
     expect(ok).toBe(true);
 
-    // post-approve phase skills = baxian-rules / baxian-pr-feedback；paste 后即合并落盘，与 ack 无关。
+    // post-approve phase skill = baxian-pr-feedback；paste 后即合并落盘，与 ack 无关。
     const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-rules']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-task-check']);
   });
 
   it('does NOT record injectedSkills when paste landed on a busy baseline', async () => {
@@ -1841,7 +1923,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // Agent currently bound to t but carries a STALE injectedSkills record from a prior task.
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      injectedSkills: { taskId: 'task-OLD', paneId: '%0', skills: ['baxian-rules', 'baxian-task-check'] },
+      injectedSkills: { taskId: 'task-OLD', paneId: '%0', skills: ['baxian-task-check'] },
     });
     await lockManager.acquire('dev-1');
 
@@ -1856,7 +1938,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-rules', 'baxian-task-check']);
+    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('provisionRepoSkills materializes skills under .claude/skills for claude-code and .agents/skills for codex', async () => {
@@ -1875,12 +1957,11 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // targets the live final path) then `mv -f`'d into place, so a concurrent lazy SKILL.md read is
     // never blanked or half-written.
     const devStaged = devRunner.writeFile.mock.calls.map(c => c[0] as string);
-    expect(devStaged).toContain('/tmp/repo/.claude/skills/baxian-rules/SKILL.md.baxian-tmp');
     expect(devStaged).toContain('/tmp/repo/.claude/skills/baxian-task-check/SKILL.md.baxian-tmp');
     expect(devStaged.every(p => p.endsWith('.baxian-tmp'))).toBe(true);
     expect(devStaged.every(p => !p.includes('/.agents/skills/'))).toBe(true);
     const devMv = devRunner.exec.mock.calls.map(c => c[0] as string).filter(c => c.includes('mv -f'));
-    expect(devMv.some(c => c.includes('.claude/skills/baxian-rules/SKILL.md.baxian-tmp'))).toBe(true);
+    expect(devMv.some(c => c.includes('.claude/skills/baxian-task-check/SKILL.md.baxian-tmp'))).toBe(true);
     expect(devMv.length).toBe(devStaged.length); // one atomic rename per staged file
     // Excludes ONLY the baxian-* dirs baxian writes, NOT the whole skills dir — a user
     // repo's own untracked native skills there must stay visible.
@@ -1907,7 +1988,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const qaRunner = capturingRunner();
     await provision(manager)(qaRunner as unknown as CommandRunner, qaAgent, '/tmp/repo');
     const qaStaged = qaRunner.writeFile.mock.calls.map(c => c[0] as string);
-    expect(qaStaged).toContain('/tmp/repo/.agents/skills/baxian-rules/SKILL.md.baxian-tmp');
     expect(qaStaged).toContain('/tmp/repo/.agents/skills/baxian-pr-review/SKILL.md.baxian-tmp');
     expect(qaStaged.every(p => !p.includes('/.claude/skills/'))).toBe(true);
   });
@@ -1923,7 +2003,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     const agent = agentConfig({ id: 'dev-1' });
     // Skills are already materialized, so a non-git workdir / git hiccup must not throw.
     await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).resolves.toBeUndefined();
-    expect(runner.writeFile.mock.calls.some(c => (c[0] as string).includes('/.claude/skills/baxian-rules/SKILL.md'))).toBe(true);
+    expect(runner.writeFile.mock.calls.some(c => (c[0] as string).includes('/.claude/skills/baxian-task-check/SKILL.md'))).toBe(true);
   });
 
   it('provisionRepoSkills re-materializes on every call — no skip cache (hot-reload of workdir/runtime + tamper safe)', async () => {
@@ -1939,7 +2019,7 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // re-materialize into the NEW dir (a skip cache keyed on agentId+version would not).
     await provision(manager)(runner as unknown as CommandRunner, agent, '/repo-b');
     const written = runner.writeFile.mock.calls.map(c => c[0] as string);
-    expect(written.some(p => p.includes('/repo-b/.claude/skills/baxian-rules/SKILL.md'))).toBe(true);
+    expect(written.some(p => p.includes('/repo-b/.claude/skills/baxian-task-check/SKILL.md'))).toBe(true);
   });
 
   it('provisionRepoSkills serializes concurrent same-dir provisioning (no overlapping cleanup)', async () => {
@@ -2038,30 +2118,14 @@ describe('AgentManager runtime menu marker', () => {
   });
 });
 
-describe('cancelTask still sends C-c to dev and qa panes', () => {
-  it('captures C-c on both dev and qa, then clears both bindings', async () => {
+describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
+  it('sends ESC then /clear on both dev and qa, then clears both bindings', async () => {
     const sentKeys: string[] = [];
-    const capturingRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys')) {
-          sentKeys.push(cmd);
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-          if (cmd.includes('%1')) return { stdout: 'codex\n', stderr: '', exitCode: 0 };
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          if (cmd.includes('%1')) {
-            return { stdout: 'permissions: YOLO mode\n\n>', stderr: '', exitCode: 0 };
-          }
-          return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => capturingRunner });
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      runnerFactory: () => clearAwareRunner(sentKeys, pane => (pane === '%1' ? CODEX_PANE : CLAUDE_PANE)),
+    });
+    setCompactTiming(localManager);
 
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({
@@ -2080,14 +2144,52 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
     const cancelled = await localManager.cancelTask(t.id);
 
     expect(cancelled.status).toBe('cancelled');
-    expect(sentKeys.filter(k => k.includes('C-c')).length).toBeGreaterThanOrEqual(2);
+    const escKeys = sentKeys.filter(k => k.includes("'Escape'"));
+    const clearKeys = sentKeys.filter(k => k.includes('send-keys -l') && k.includes('/clear'));
+    expect(escKeys.length).toBeGreaterThanOrEqual(2);
+    expect(clearKeys.length).toBeGreaterThanOrEqual(2);
+    // dev pane sequence: ESC (interrupt the turn) → C-c (clear any leftover composer) → /clear (wipe context).
+    const escAt = sentKeys.findIndex(k => k.includes('%0') && k.includes("'Escape'"));
+    const ccAt = sentKeys.findIndex(k => k.includes('%0') && k.includes('C-c'));
+    const clearAt = sentKeys.findIndex(k => k.includes('%0') && k.includes('send-keys -l') && k.includes('/clear'));
+    expect(escAt).toBeGreaterThanOrEqual(0);
+    expect(ccAt).toBeGreaterThan(escAt);
+    expect(clearAt).toBeGreaterThan(ccAt);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
     expect(await lockManager.isLocked('qa-1')).toBe(false);
   });
 
-  it('skips C-c and release when agent has been rebound to a new task (race protection)', async () => {
+  it('clears the composer (C-c) before /clear so an ack-timeout-left prompt is not submitted with /clear', async () => {
+    const sentKeys: string[] = [];
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      runnerFactory: () => clearAwareRunner(sentKeys, () => CLAUDE_PANE),
+    });
+    setCompactTiming(localManager);
+
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    const cancelled = await localManager.cancelTask(t.id);
+    expect(cancelled.status).toBe('cancelled');
+
+    const ccAt = sentKeys.findIndex(k => k.includes('C-c'));
+    const clearAt = sentKeys.findIndex(k => k.includes('send-keys -l') && k.includes('/clear'));
+    const enterAfterClear = sentKeys.findIndex((k, i) => i > clearAt && k.includes("'Enter'"));
+    // composer cleared (C-c) strictly before /clear is typed; the submitting Enter comes after /clear —
+    // so /clear lands on an empty line and the cancelled prompt is never co-submitted.
+    expect(ccAt).toBeGreaterThanOrEqual(0);
+    expect(clearAt).toBeGreaterThan(ccAt);
+    expect(enterAfterClear).toBeGreaterThan(clearAt);
+    // confirmed clear → agent released.
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('skips interrupt/clear and release when agent has been rebound to a new task (race protection)', async () => {
     const sentKeys: string[] = [];
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
@@ -2136,15 +2238,18 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
     const cancelled = await localManager.cancelTask(oldTask.id);
 
     expect(cancelled.status).toBe('cancelled');
-    // race 触发后 cancelTask 必须 skip C-c——否则会打到 task-new 会话上。
-    expect(sentKeys.filter(k => k.includes('C-c'))).toHaveLength(0);
+    // race 触发后 cancelTask 必须 skip 中断/清理——否则 ESC + /clear 会打到 task-new 会话上。
+    expect(sentKeys.filter(k => k.includes("'Escape'"))).toHaveLength(0);
+    expect(sentKeys.filter(k => k.includes('/clear'))).toHaveLength(0);
     // 不能解绑 dev-1：它现在归属 task-new。
     expect((await agentStore.get('dev-1'))?.taskId).toBe(newTask.id);
   });
 
-  it('preserves binding and emits intervention when interrupt fails', async () => {
+  it('preserves binding and emits intervention when interrupt fails (no /clear)', async () => {
+    const sentKeys: string[] = [];
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('send-keys')) sentKeys.push(cmd);
         if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
           return { stdout: 'claude\n', stderr: '', exitCode: 0 };
         }
@@ -2172,6 +2277,8 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
     const cancelled = await localManager.cancelTask(t.id);
 
     expect(cancelled.status).toBe('cancelled');
+    // 中断失败时不得 /clear：会话仍可能在运行，清理会打断/污染待人工处理的 pane。
+    expect(sentKeys.filter(k => k.includes('/clear'))).toHaveLength(0);
     // 中断失败：绑定保留、lock 保留、status='awaiting_human'——下次 cancel/operator Resume 才能彻底清理
     const stateAfter = await agentStore.get('dev-1');
     expect(stateAfter?.taskId).toBe(t.id);
@@ -2188,6 +2295,351 @@ describe('cancelTask still sends C-c to dev and qa panes', () => {
       agentId: 'dev-1',
       taskId: t.id,
     });
+  });
+
+  // interrupt 成功但 /clear 注入失败：必须保留绑定并标记 cancel-clear-failed，绝不能 release——否则
+  // 会把未确认清空的 pane 交给下一次 dispatch，复现 task-139 要修的脏上下文。
+  it('holds the agent (no release) when /clear injection fails', async () => {
+    const sentKeys: string[] = [];
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('send-keys')) {
+          sentKeys.push(cmd);
+          // /clear 注入失败 → clearPaneContext 抛错并返回未确认
+          if (cmd.includes('send-keys -l') && cmd.includes('/clear')) {
+            return { stdout: '', stderr: 'tmux send failed', exitCode: 1 };
+          }
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
+          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
+    setCompactTiming(localManager);
+    mockInterruptPane(localManager, true);
+
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    const cancelled = await localManager.cancelTask(t.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    expect(sentKeys.some(k => k.includes('send-keys -l') && k.includes('/clear'))).toBe(true);
+    const stateAfter = await agentStore.get('dev-1');
+    expect(stateAfter?.taskId).toBe(t.id);
+    expect(stateAfter?.status).toBe('awaiting_human');
+    expect(stateAfter?.awaitingPhase).toBe('cancel-clear-failed');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+    expect(events.some(
+      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'cancel-clear-failed',
+    )).toBe(true);
+  });
+
+  // compact/upload guard 被占用时无法安全注入 /clear：跳过注入但同样必须 hold，不能 release。
+  it('holds the agent (no release) when the compact guard blocks /clear', async () => {
+    const sentKeys: string[] = [];
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('send-keys')) sentKeys.push(cmd);
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
+    mockInterruptPane(localManager, true);
+    // 预占 compact guard，模拟并发 compact/upload。
+    (localManager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('dev-1');
+
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    const cancelled = await localManager.cancelTask(t.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    // guard 占用 → 不注入 /clear
+    expect(sentKeys.some(k => k.includes('/clear'))).toBe(false);
+    const stateAfter = await agentStore.get('dev-1');
+    expect(stateAfter?.taskId).toBe(t.id);
+    expect(stateAfter?.status).toBe('awaiting_human');
+    expect(stateAfter?.awaitingPhase).toBe('cancel-clear-failed');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  // Cancel interrupts EVERY bound pane before clearing any: even when dev's /clear fails, qa must have been
+  // interrupted (ESC) before dev's /clear and still get cleared + released.
+  it('interrupts both panes before clearing either, so a failed dev /clear does not strand qa', async () => {
+    const sentKeys: string[] = [];
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      // dev (%0) /clear injection fails → dev held; qa (%1) succeeds.
+      runnerFactory: () => clearAwareRunner(
+        sentKeys,
+        pane => (pane === '%1' ? CODEX_PANE : CLAUDE_PANE),
+        { failClear: pane => pane === '%0' },
+      ),
+    });
+    setCompactTiming(localManager);
+
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    await lockManager.acquire('dev-1');
+    await lockManager.acquire('qa-1');
+
+    await localManager.cancelTask(t.id);
+
+    // qa was interrupted (phase 1) BEFORE dev's /clear was even attempted (phase 2).
+    const qaEsc = sentKeys.findIndex(k => k.includes('%1') && k.includes("'Escape'"));
+    const devClear = sentKeys.findIndex(k => k.includes('%0') && k.includes('send-keys -l') && k.includes('/clear'));
+    expect(qaEsc).toBeGreaterThanOrEqual(0);
+    expect(devClear).toBeGreaterThanOrEqual(0);
+    expect(qaEsc).toBeLessThan(devClear);
+    // dev held on its failed clear; qa still cleared + released — not stranded by dev.
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.status).toBe('awaiting_human');
+    expect(dev?.awaitingPhase).toBe('cancel-clear-failed');
+    expect(dev?.taskId).toBe(t.id);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  // If a late release+reassign rebinds the agent during clearPaneContext, the cancel-clear-failed mark
+  // (expectedTaskId-guarded) must no-op instead of stamping the unrelated new binding as awaiting_human.
+  it('does not stale-mark a rebound agent as cancel-clear-failed (release+reassign race)', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+    mockInterruptPane(localManager, true);
+
+    const t = await seedTask();
+    await taskStore.set(task({ id: 'task-new' }));
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    // Simulate the race: clearPaneContext can't confirm, and meanwhile the agent got released+rebound.
+    vi.spyOn(localManager as unknown as { clearPaneContext: () => Promise<boolean> }, 'clearPaneContext')
+      .mockImplementation(async () => {
+        // A real release+reassign yields a fresh binding (no Held fields) — model that clean rebind.
+        await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-new', paneId: '%0', updatedAt: new Date().toISOString() });
+        return false;
+      });
+
+    await localManager.cancelTask(t.id);
+
+    // expectedTaskId guard → the late mark no-ops; the new binding is not stamped awaiting_human.
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe('task-new');
+    expect(dev?.status).not.toBe('awaiting_human');
+    expect(dev?.awaitingPhase).toBeUndefined();
+  });
+
+  // A cancel-clearing pane is un-cleared: NO release frees it except cancel's own (fromCancelCleanup) — not
+  // a bare escape, and crucially not even an allowAwaitingHuman caller (review/max-rounds handlers etc.).
+  it('refuses release of a cancel-clearing pane unless it is cancel\'s own (fromCancelCleanup)', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await lockManager.acquire('dev-1');
+
+    // bare escape-style release is refused → binding + lock intact.
+    expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle')).toBe(false);
+    // allowAwaitingHuman alone (handler/escape path) must ALSO be refused — it must not bypass the hold.
+    expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true })).toBe(false);
+    expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+
+    // cancel's own release (fromCancelCleanup) clears the hold.
+    expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true })).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+  });
+
+  // A real terminal-task escape racing in during cancel's interrupt is refused (the cancel-clearing hold is
+  // persisted under the lock before the status flip), while cancel still cleans + releases both agents.
+  it('blocks a concurrent terminal-task escape release while cancel is mid-cleanup', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+    stubClearPane(localManager);
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    await lockManager.acquire('dev-1');
+    await lockManager.acquire('qa-1');
+
+    let escapeReleaseResult: boolean | undefined;
+    // During cancel's phase-1 interrupt, fire the review.submitted-style escape release on qa once.
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
+      .mockImplementation(async () => {
+        if (escapeReleaseResult === undefined) {
+          escapeReleaseResult = await localManager.releaseAgentForTask('qa-1', t.id, 'idle');
+        }
+        return true;
+      });
+
+    const cancelled = await localManager.cancelTask(t.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    expect(escapeReleaseResult).toBe(false); // escape refused while cancel owned the cleanup
+    // cancel itself still released both (allowAwaitingHuman clears the cancel-clearing hold).
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+  });
+
+  // The cancel-clearing hold is per-agent and only marked for agents actually bound to the cancelling task,
+  // so a stale dev (already rebound to task-new) is never marked and task-new's own release isn't blocked.
+  it('cancel of one task does not block a rebound agent release by its new task', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+    await taskStore.set(task({ id: 'task-old', agentId: 'dev-1', qaAgentId: 'qa-1' }));
+    await taskStore.set(task({ id: 'task-new', agentId: 'dev-1' }));
+    // dev-1 already rebound to task-new; qa-1 still on the to-be-cancelled old task.
+    await seedAgent({ id: 'dev-1', taskId: 'task-new', paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-old', paneId: '%1' });
+    await lockManager.acquire('dev-1');
+    await lockManager.acquire('qa-1');
+
+    // dev-1 is rebound → cancel skips its interrupt; qa-1 interrupt succeeds.
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
+      .mockResolvedValue(true);
+    let devReleaseByNewTask: boolean | undefined;
+    // While the old task's qa is mid /clear, task-new releases dev-1; the old cancel's guard must not block it.
+    vi.spyOn(localManager as unknown as { clearPaneContext: () => Promise<boolean> }, 'clearPaneContext')
+      .mockImplementation(async () => {
+        if (devReleaseByNewTask === undefined) {
+          devReleaseByNewTask = await localManager.releaseAgentForTask('dev-1', 'task-new', 'idle');
+        }
+        return true;
+      });
+
+    await localManager.cancelTask('task-old');
+
+    expect(devReleaseByNewTask).toBe(true); // task-new's release NOT blocked by task-old's cancel guard
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined(); // released by task-new
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined(); // cleaned + released by cancel
+  });
+
+  // A stale cancel (its task field still points at an agent now bound elsewhere) must not stamp/clear the
+  // cancel-clearing hold of the agent's real owner, or the owner's dirty pane loses its protection.
+  it('a stale cancel does not disturb the cancel-clearing hold of the agent\'s real owner', async () => {
+    // dev-1 is actually bound to task-a (cleanup in-flight, marked cancel-clearing); task-b is stale.
+    await taskStore.set(task({ id: 'task-a', agentId: 'dev-1' }));
+    await taskStore.set(task({ id: 'task-b', agentId: 'dev-1' }));
+    await seedAgent({ id: 'dev-1', taskId: 'task-a', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+
+    // cancelling the stale task-b must not touch dev-1 (it isn't actually bound to task-b).
+    await manager.cancelTask('task-b');
+
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe('task-a');
+    expect(dev?.awaitingPhase).toBe('cancel-clearing');
+    // task-a's terminal-task escape release of the still-dirty pane is therefore still refused.
+    expect(await manager.releaseAgentForTask('dev-1', 'task-a', 'idle')).toBe(false);
+    expect((await agentStore.get('dev-1'))?.taskId).toBe('task-a');
+  });
+
+  // A cancel-clear-failed hold's pane is un-cleared: neither the terminal-task escape (releaseAgentForTask)
+  // nor Resume may free + reuse it; only DELETE (destroys the pane) is safe.
+  it('does not release a cancel-clear-failed hold via the escape or Resume', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
+    await lockManager.acquire('dev-1');
+
+    // terminal-task escape style release is refused (shouldReleaseHeldBinding=false for cancel-clear-failed).
+    expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle')).toBe(false);
+    expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+
+    // Resume refuses too — no auto-reuse of an un-cleared pane.
+    const res = await manager.resumeAgent('dev-1');
+    expect(res.resumed).toBe(false);
+    const after = await agentStore.get('dev-1');
+    expect(after?.taskId).toBe(t.id);
+    expect(after?.awaitingPhase).toBe('cancel-clear-failed');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  // A swallowed /clear Enter would leave /clear idle in the composer; clearPaneContext must resend until
+  // the submission is confirmed (the composer redraws) rather than release the pane still un-cleared.
+  it('resends the /clear Enter when the first is swallowed, then confirms and releases', async () => {
+    const sentKeys: string[] = [];
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      runnerFactory: () => clearAwareRunner(sentKeys, () => CLAUDE_PANE, { swallowClearEnters: 1 }),
+    });
+    setCompactTiming(localManager);
+    (localManager as unknown as { clearContextWaitMs: number }).clearContextWaitMs = 2_000;
+
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    const cancelled = await localManager.cancelTask(t.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    // The /clear Enter was resent after the first was swallowed (≥2 Enters after the typed /clear).
+    const clearAt = sentKeys.findIndex(k => k.includes('send-keys -l') && k.includes('/clear'));
+    const entersAfterClear = sentKeys.filter((k, i) => i > clearAt && k.includes("'Enter'"));
+    expect(entersAfterClear.length).toBeGreaterThanOrEqual(2);
+    // confirmed → agent released.
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  // Cancel persists a cancel-clearing hold before the ESC→/clear window. If the process restarts mid-window,
+  // recover() must keep the un-cleared pane held (not release it for reuse with the cancelled context).
+  it('recover() holds a cancel-clearing agent bound to a cancelled task (restart mid-cleanup)', async () => {
+    await taskStore.set(task({ id: 'task-x', status: 'cancelled', agentId: 'dev-1' }));
+    await seedAgent({ id: 'dev-1', taskId: 'task-x', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await lockManager.acquire('dev-1');
+    // ensureSession (recover) returns the live pane.
+    vi.spyOn(manager as unknown as { ensureSession: () => Promise<{ paneId: string }> }, 'ensureSession')
+      .mockResolvedValue({ paneId: '%0' });
+
+    await manager.recover();
+
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe('task-x'); // binding preserved (not released for reuse)
+    expect(dev?.status).toBe('awaiting_human');
+    expect(dev?.awaitingPhase).toBe('cancel-clearing');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  // cancel-interrupt-failed (pane may still be running the cancelled task) must not be AUTO-released by an
+  // escape/handler (allowAwaitingHuman) or by recover(); only the operator's Resume (after verifying) may.
+  it('does not auto-release a cancel-interrupt-failed pane (escape/handler), but Resume can', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
+    await lockManager.acquire('dev-1');
+
+    // allowAwaitingHuman (review/max-rounds handler / terminal-task escape) must NOT free it.
+    expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true })).toBe(false);
+    expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+
+    // operator Resume (human-confirmed) releases it.
+    const res = await manager.resumeAgent('dev-1');
+    expect(res.resumed).toBe(true);
+    expect(res.releasedBinding).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+  });
+
+  it('recover() holds a cancel-interrupt-failed agent (restart) instead of auto-releasing it', async () => {
+    await taskStore.set(task({ id: 'task-y', status: 'cancelled', agentId: 'dev-1' }));
+    await seedAgent({ id: 'dev-1', taskId: 'task-y', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
+    await lockManager.acquire('dev-1');
+    vi.spyOn(manager as unknown as { ensureSession: () => Promise<{ paneId: string }> }, 'ensureSession')
+      .mockResolvedValue({ paneId: '%0' });
+
+    await manager.recover();
+
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe('task-y'); // not auto-released despite the terminal task
+    expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 });
 
@@ -2647,7 +3099,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     const t = await seedTask();
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
+      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
     });
     await lockManager.acquire('dev-1');
 
@@ -2688,7 +3140,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   // The release gate refuses to free a Held agent while its prompt may still be running, unless the
   // task is terminal (cleanup must not leak the binding) or the caller explicitly opts in.
   it.each([
-    { name: 'task terminal → bypass even without opt', agentId: 'dev-1', paneId: '%0', taskStatus: 'merged' as const, phase: 'cancel-interrupt-failed', opt: undefined, expectedOk: true },
+    { name: 'task terminal → bypass even without opt', agentId: 'dev-1', paneId: '%0', taskStatus: 'merged' as const, phase: 'dispatch-failed:ack_unknown', opt: undefined, expectedOk: true },
     { name: 'dev-wait-gate-failed + active task refuses', agentId: 'qa-1', paneId: '%1', taskStatus: 'fixing' as const, phase: 'dev-wait-gate-failed-after-qa-started', opt: undefined, expectedOk: false },
     { name: 'dev-wait-gate-failed WITH allowAwaitingHuman releases', agentId: 'qa-1', paneId: '%1', taskStatus: 'approved' as const, phase: 'dev-wait-gate-failed-after-qa-started', opt: { allowAwaitingHuman: true }, expectedOk: true },
     { name: 'dispatch-failed:ack_unknown without opt refuses', agentId: 'qa-1', paneId: '%1', taskStatus: 'review' as const, phase: 'dispatch-failed:ack_unknown', opt: undefined, expectedOk: false },
@@ -4056,12 +4508,13 @@ describe('AgentManager max_rounds manual actions', () => {
       taskId: 'task-mr', paneId: '%1',
     });
     mockInterruptPane(manager, true);
+    stubClearPane(manager);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await manager.cancelTask('task-mr');
 
     expect(cancelled.status).toBe('cancelled');
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-mr', 'idle', { allowAwaitingHuman: true });
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-mr', 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
   });
 });
 

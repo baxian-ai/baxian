@@ -34,6 +34,10 @@ export interface WaitReplReadyOpts extends WaitOpts {
 export interface WaitSubmitAckOpts extends WaitOpts {
   resend?: () => Promise<void>;
   resendIntervalMs?: number;
+  // Treat any change away from the pre-Enter composer as proof of submission (not only a busy frame).
+  // For meta-commands like /clear that redraw the screen instead of going busy, the cleared composer is
+  // the submission evidence; a swallowed Enter leaves the composer unchanged and still triggers resend.
+  acceptComposerChange?: boolean;
 }
 
 // claude shows semver on linux / `claude.exe` on macOS; `node` is codex-only.
@@ -584,6 +588,9 @@ export class TmuxManager {
     while (Date.now() < deadline) {
       const visible = stripHistorySuffix(await this.capturePaneSnapshot(paneId));
       if (submitAckBusy(visible, runtime)) return;
+      // For meta-commands (acceptComposerChange) a cleared/redrawn composer is itself the submission
+      // proof — they may never show a busy frame.
+      if (opts.acceptComposerChange && visible !== composerBaseline) return;
       // Any deviation from the pre-Enter composer (submit cleared it, or the runtime parked on a
       // menu/dialog/other UI) means a swallowed Enter is NOT the cause — and pressing Enter there
       // would answer whatever is on screen, exactly what the detect-only dialog policy forbids
