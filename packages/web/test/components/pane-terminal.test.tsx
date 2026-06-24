@@ -14,6 +14,7 @@ class FakeTerminal {
   resetCount = 0;
   scrollToBottomCount = 0;
   disposed = false;
+  element?: HTMLElement;
   opts: Record<string, unknown>;
   renderCallbacks: Array<() => void> = [];
   buffer = { active: { cursorY: 0 } };
@@ -267,6 +268,26 @@ describe('parseOsc52Clipboard wired to the real xterm OSC parser (chunk reassemb
   });
 });
 
+describe('computePreviewScale (fit the read-only preview width into its card)', () => {
+  it.each([
+    [800, 1600, 0.5],   // pane wider than card → scale down so the full width fits
+    [400, 1600, 0.25],  // much narrower card → scale further
+    [800, 800, 1],      // exact fit → no scale
+    [800, 400, 1],      // card wider than pane → never upscale (clamped to 1)
+  ])('container=%i content=%i → scale %f', async (container, content, expected) => {
+    const { computePreviewScale } = await importPane();
+    expect(computePreviewScale(container, content)).toBeCloseTo(expected, 10);
+  });
+
+  it('returns 1 for unmeasured / invalid dimensions (no transform until the card is laid out)', async () => {
+    const { computePreviewScale } = await importPane();
+    expect(computePreviewScale(0, 1600)).toBe(1);
+    expect(computePreviewScale(800, 0)).toBe(1);
+    expect(computePreviewScale(-10, 1600)).toBe(1);
+    expect(computePreviewScale(800, NaN)).toBe(1);
+  });
+});
+
 describe('PaneTerminal', () => {
   it('applies Zed light theme to the xterm instance', async () => {
     const { PaneTerminal, ZED_LIGHT_THEME, TERMINAL_BG } = await importPane();
@@ -425,6 +446,35 @@ describe('PaneTerminal', () => {
     expect(term.cols).toBe(200);
     expect(term.rows).toBe(50);
     expect(term.scrollToBottomCount).toBe(0);
+  });
+
+  it('preview scales the xterm host down when the pane is wider than the card (no right-edge clip)', async () => {
+    // Card content width 800 (clientWidth shim); pane renders 1600px → scale 0.5 so the full width fits.
+    const { term } = await renderPane({ mode: 'preview', interactive: false });
+    const host = document.createElement('div');
+    Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 1600 });
+    term.element = host;
+    act(() => { term.emitRender(); });
+    expect(host.style.transform).toBe('scale(0.5)');
+    expect(host.style.transformOrigin).toBe('top left');
+  });
+
+  it('preview does not upscale when the card is at least as wide as the pane', async () => {
+    const { term } = await renderPane({ mode: 'preview', interactive: false });
+    const host = document.createElement('div');
+    Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 400 });
+    term.element = host;
+    act(() => { term.emitRender(); });
+    expect(host.style.transform).toBe('');
+  });
+
+  it('full+interactive mode never scales the host (it owns tmux sizing via fit/resize, not CSS scale)', async () => {
+    const { term } = await renderPane({ mode: 'full', interactive: true });
+    const host = document.createElement('div');
+    Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 1600 });
+    term.element = host;
+    act(() => { term.emitRender(); });
+    expect(host.style.transform).toBe('');
   });
 
   it('batches live data into one xterm write per animation frame and keeps the resizable pane pinned to bottom', async () => {

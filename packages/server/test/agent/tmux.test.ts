@@ -45,10 +45,10 @@ describe('TmuxManager', () => {
       expect(cmd).toContain("-c '/home/user/code'");
     });
 
-    it('sets default pane size 200x50 via -x/-y', async () => {
+    it('sets default pane size 80x50 via -x/-y', async () => {
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('-x 200');
+      expect(cmd).toContain('-x 80');
       expect(cmd).toContain('-y 50');
     });
 

@@ -276,9 +276,10 @@ export class TmuxManager {
     const PATH = '/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
     const result = await run(
       this.runner,
+      // -x 80: stays in sync with PaneStreamer.DEFAULT_COLS (the headless buffer) — see note there.
       `tmux new-session -d -s ${shellQuote(name)} ` +
         `-e ${shellQuote(`PATH=${PATH}`)} ` +
-        `-x 200 -y 50 -c ${shellQuote(workdir)}`,
+        `-x 80 -y 50 -c ${shellQuote(workdir)}`,
     );
     if (result.exitCode !== 0) {
       throw new Error(`Failed to create tmux session ${name}: ${result.stderr}`);
