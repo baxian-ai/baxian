@@ -15,6 +15,7 @@ import { TaskStore } from './state/task-store.js';
 import { ErrorRecordStore } from './state/error-record-store.js';
 import { PostApproveStore } from './state/post-approve-store.js';
 import { ReviewStore } from './state/review-store.js';
+import { PetStore } from './state/pet-store.js';
 import { LockManager } from './state/lock.js';
 import { ProcessLock, ProcessLockError } from './state/process-lock.js';
 import { EventBus } from './event/bus.js';
@@ -163,6 +164,7 @@ export async function startServer(configPath?: string): Promise<void> {
     const taskStore = new TaskStore(`${stateDir}/state/tasks`);
     const errorRecordStore = new ErrorRecordStore(`${stateDir}/state/errors`);
     const postApproveStore = new PostApproveStore(`${stateDir}/state/post-approve`);
+    const petStore = new PetStore(`${stateDir}/state/pets`);
     const lockManager = new LockManager(`${stateDir}/locks`);
     const eventLog = new EventLog(`${stateDir}/events`);
     const eventBus = new EventBus(eventLog);
@@ -211,11 +213,13 @@ export async function startServer(configPath?: string): Promise<void> {
     await agentManager.setupRecoveredPostApproveSignals();
     await agentManager.setupRecoveredSpecSignals();
 
-    const snapshotCtx = { agentManager, agentStore, taskStore, tmuxSessionStatusStore, errorRecordStore };
+    const snapshotCtx = { agentManager, agentStore, taskStore, tmuxSessionStatusStore, errorRecordStore, petStore };
     const eventPublisher = new EventPublisher(eventBroker, snapshotCtx, taskStore);
     agentStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     tmuxSessionStatusStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     taskStore.onChange((kind, id) => eventPublisher.publishTaskChange(kind, id));
+    // Pet assignment changes (set/clear, and delete cascade) re-broadcast affected agent snapshots.
+    petStore.onChange((id) => eventPublisher.publishAgentChange('set', id));
 
     // Notify subscribers when bootstrap touches an agent's error state; agentStore alone misses
     // failure paths since those don't mutate any binding. Must be wired AFTER publisher exists.
@@ -330,6 +334,7 @@ export async function startServer(configPath?: string): Promise<void> {
         paneStreamerManager,
         eventBroker,
         errorRecordStore,
+        petStore,
       },
       {
         ...(httpsOpts ? { https: httpsOpts } : {}),

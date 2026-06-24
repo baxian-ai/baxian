@@ -9,6 +9,7 @@ import type {
   MergeStrategy,
   ProjectReviewConfig,
   ReviewRound,
+  PetMeta,
 } from './shared/index.js';
 
 const BASE = '/api';
@@ -124,6 +125,19 @@ async function patch<T>(path: string, body?: unknown, options?: { signal?: Abort
   return JSON.parse(text) as T;
 }
 
+async function put<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body ?? null),
+  });
+  if (!res.ok) await throwApiError(res);
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
+}
+
 async function del<T = void>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE', headers: authHeaders() });
   if (!res.ok) await throwApiError(res);
@@ -196,6 +210,19 @@ export const api = {
       post<ProbeResponse>('/agents/probe', { mode, host: target.host, hostId: target.hostId }, options),
     uploadImage: async (id: string, file: File) =>
       post<{ path: string }>(`/agents/${enc(id)}/images`, { dataBase64: await fileToBase64(file) }),
+    setPet: (id: string, petId: string | null) =>
+      put<{ petId: string | null }>(`/agents/${enc(id)}/pet`, { petId }),
+  },
+  pets: {
+    list: () => get<PetMeta[]>('/pets'),
+    create: async (petJson: unknown, spritesheet: File) =>
+      post<PetMeta>('/pets', { petJson, spritesheetBase64: await fileToBase64(spritesheet) }),
+    remove: (id: string) => del(`/pets/${enc(id)}`),
+    fetchSpritesheet: async (id: string): Promise<Blob> => {
+      const res = await fetch(`${BASE}/pets/${enc(id)}/spritesheet`, { headers: authHeaders() });
+      if (!res.ok) await throwApiError(res);
+      return res.blob();
+    },
   },
   tasks: {
     // Realtime fallback only: the full open working set, mirroring the project-tasks

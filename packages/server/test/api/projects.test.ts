@@ -11,7 +11,7 @@ import { requesters } from './helpers.js';
 let tempDir: string;
 let app: FastifyInstance;
 let configPath: string;
-const { post, del } = requesters(() => app);
+const { post, put, del } = requesters(() => app);
 
 // Standard agent-create bodies; spread + override per case.
 function devAgent(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -320,6 +320,16 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(purgeAgent).toHaveBeenCalledWith('purge1-dev');
   });
 
+  it('clears the deleted agent\'s pet assignment (so a recreate with same id starts clean)', async () => {
+    await projectWithDev('petdel', 'petdel-dev');
+    const pet = await app.ctx.petStore!.create({
+      displayName: 'P', description: '', spritesheet: { bytes: Buffer.from('x'), ext: 'webp' },
+    });
+    await app.ctx.petStore!.setAssignment('petdel-dev', pet.id);
+    await del('/api/projects/petdel/agents/petdel-dev');
+    expect(await app.ctx.petStore!.getAssignment('petdel-dev')).toBeNull();
+  });
+
   it('removes paired dev together with its qa', async () => {
     await projectWithDev('da2', 'da2-dev');
     await addAgent('da2', qaAgent('da2-qa', 'da2-dev'));
@@ -431,6 +441,31 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     const firstResp = await first;
     expect(firstResp.statusCode).toBe(200);
     expect(cleanupSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('concurrent DELETE + PUT pet: PUT is 409 while deletion is in flight, no stale assignment', async () => {
+    await projectWithDev('da-petrace', 'da-petrace-dev');
+    await seedAgent('da-petrace-dev', 'da-petrace', {
+      paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
+    });
+    await app.ctx.lockManager.acquire('da-petrace-dev');
+    const pet = await app.ctx.petStore!.create({
+      displayName: 'P', description: '', spritesheet: { bytes: Buffer.from('x'), ext: 'webp' },
+    });
+
+    // Block DELETE in phase2 (deletion claim held, config lock free) so PUT runs concurrently.
+    let resolveCleanup: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { resolveCleanup = resolve; });
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => { await gate; });
+
+    const deleting = del('/api/projects/da-petrace/agents/da-petrace-dev');
+    await new Promise((r) => setTimeout(r, 20));
+    const putResp = await put('/api/agents/da-petrace-dev/pet', { petId: pet.id });
+    expect(putResp.statusCode).toBe(409);
+
+    resolveCleanup();
+    expect((await deleting).statusCode).toBe(200);
+    expect(await app.ctx.petStore!.getAssignment('da-petrace-dev')).toBeNull();
   });
 
   it('awaiting_human with stale lock: DELETE takes over (does not 409 on acquire failure)', async () => {

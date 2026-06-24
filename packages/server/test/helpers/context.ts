@@ -7,6 +7,7 @@ import { initStateDir } from '../../src/state/init.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { ReviewStore } from '../../src/state/review-store.js';
+import { PetStore } from '../../src/state/pet-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
@@ -54,6 +55,7 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
   const eventLog = new EventLog(join(tempDir, 'events'));
   const eventBus = new EventBus(eventLog);
   const tmuxSessionStatusStore = new TmuxSessionStatusStore();
+  const petStore = new PetStore(join(tempDir, 'state', 'pets'));
   const registry = new SkillRegistry(skillsDir);
   await registry.scan();
 
@@ -86,5 +88,6 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
     eventBus,
     eventLog,
     tmuxSessionStatusStore,
+    petStore,
   };
 }

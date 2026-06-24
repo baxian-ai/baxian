@@ -506,6 +506,16 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
                 'DELETE /agents errorRecordStore.purgeAgent failed');
             }
           }
+          // Same reason as the error-record purge: drop the pet assignment so reusing the
+          // agent id (delete + recreate) doesn't inherit the previous incarnation's pet.
+          if (app.ctx.petStore) {
+            try {
+              await app.ctx.petStore.setAssignment(id, null);
+            } catch (petErr) {
+              app.log.warn({ err: petErr, agentId: id },
+                'DELETE /agents petStore.setAssignment(null) failed');
+            }
+          }
           await app.ctx.lockManager.release(id);
         }
         return reply.send({ removed: targets, restartRequired: false });

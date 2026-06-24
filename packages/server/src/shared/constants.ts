@@ -46,6 +46,19 @@ export const IMAGE_UPLOAD_ROUTE_BODY_LIMIT = 8 * 1024 * 1024;
 export const TASK_CREATE_ROUTE_BODY_LIMIT = 32 * 1024 * 1024;
 export const MAX_CONFIG_BACKUPS = 7;
 
+// Agent Pet (Codex Pet format). Atlas grid is fixed by the hatch-pet contract:
+// 1536×1872, 8 cols × 9 rows, 192×208 cells. Single source of truth for validation + UI.
+export const PET_ATLAS_WIDTH = 1536;
+export const PET_ATLAS_HEIGHT = 1872;
+export const PET_GRID_COLS = 8;
+export const PET_GRID_ROWS = 9;
+export const PET_CELL_WIDTH = 192;
+export const PET_CELL_HEIGHT = 208;
+export const PET_DISPLAY_NAME_MAX = 80;
+export const PET_DESCRIPTION_MAX = 500;
+export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
+export const PET_UPLOAD_ROUTE_BODY_LIMIT = 12 * 1024 * 1024;
+
 // Server review mode: injected content sizing (spec §7) and exchange paths (spec §4).
 export const DIFF_INLINE_THRESHOLD = 800;
 export const DIFF_LARGE_THRESHOLD = 2000;

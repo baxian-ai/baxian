@@ -5,6 +5,8 @@ import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
 import { PaneTerminal } from './pane-terminal.tsx';
+import { AgentPet } from './agent-pet.tsx';
+import { AgentPetConfigModal } from './agent-pet-config-modal.tsx';
 import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
 
 export type TerminalMode = 'activity-preview' | 'embedded-full';
@@ -81,6 +83,7 @@ export function AgentCard({
   const [resuming, setResuming] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [petModalOpen, setPetModalOpen] = useState(false);
   const menuButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const menuId = useId();
@@ -310,7 +313,16 @@ export function AgentCard({
           {isAwaitingHuman && (
             <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? '需人工处理'}>Held</span>
           )}
-          <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
+          {agent.petId ? (
+            <AgentPet
+              petId={agent.petId}
+              status={agent.runtimeStatus}
+              bootstrapping={isBootstrapping}
+              label={runtimeBadge.label}
+            />
+          ) : (
+            <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
+          )}
           {agent.stale && (
             <span className="pill pill-warn" title={agent.observedAt ? `Last observed at ${agent.observedAt}` : undefined}>
               Stale
@@ -493,6 +505,16 @@ export function AgentCard({
               >
                 {clearing ? 'Clearing…' : 'Clear'}
               </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { setMenuOpen(false); setPetModalOpen(true); }}
+                disabled={compacting || clearing || deleting}
+                title="配置 Agent Pet（在状态位置显示动画宠物）"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-100 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Agent Pet
+              </button>
               {!pendingRestart && taskId && role === 'dev' && (
                 <button
                   type="button"
@@ -520,6 +542,13 @@ export function AgentCard({
       </div>
       {stopError && <div className="mt-1.5 break-words text-[12px] text-danger">{stopError}</div>}
       {deleteError && <div className="mt-1.5 break-words text-[12px] text-danger">{deleteError}</div>}
+      {petModalOpen && (
+        <AgentPetConfigModal
+          agentId={agent.id}
+          currentPetId={agent.petId ?? null}
+          onClose={() => setPetModalOpen(false)}
+        />
+      )}
     </div>
   );
 }

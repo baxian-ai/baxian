@@ -171,6 +171,18 @@ export interface AgentSnapshot {
   latestBootstrapError?: AgentErrorSummary;
   reason?: string;
   message?: string;
+  /** Agent Pet assignment; the web animates this pet in place of the status pill. */
+  petId?: string;
+}
+
+export type PetSpritesheetExt = 'png' | 'webp';
+
+export interface PetMeta {
+  id: string;
+  displayName: string;
+  description: string;
+  ext: PetSpritesheetExt;
+  createdAt: string;
 }
 
 export interface TaskState {

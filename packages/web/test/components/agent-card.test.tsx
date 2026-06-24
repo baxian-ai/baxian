@@ -31,6 +31,11 @@ vi.mock('../../src/api.ts', () => ({
   },
 }));
 
+vi.mock('../../src/hooks/use-pets.ts', () => ({
+  usePets: () => ({ pets: [], loading: false, error: null, refresh: vi.fn() }),
+  usePetSpritesheet: (petId?: string) => (petId ? 'blob:mock-sprite' : null),
+}));
+
 vi.mock('../../src/components/pane-terminal.tsx', () => ({
   TERMINAL_BG: '#fdfdfd',
   PaneTerminal: (props: { mode: string; interactive?: boolean; autoFocus?: boolean; deferFullUntilFocus?: boolean }) => (
@@ -374,7 +379,7 @@ describe('AgentCard', () => {
       expect(screen.queryByRole('menu')).toBeNull();
     });
 
-    it('opens the menu with Compact, Clear, and Delete', () => {
+    it('opens the menu with Compact, Clear, Agent Pet, and Delete', () => {
       renderIdleCard();
       const trigger = kebab();
 
@@ -384,10 +389,11 @@ describe('AgentCard', () => {
       const menu = screen.getByRole('menu');
       expect(trigger.getAttribute('aria-controls')).toBe(menu.id);
       const items = screen.getAllByRole('menuitem');
-      expect(items).toHaveLength(3);
+      expect(items).toHaveLength(4);
       expect(items[0].textContent).toBe('Compact');
       expect(items[1].textContent).toBe('Clear');
-      expect(items[2].textContent).toBe('Delete');
+      expect(items[2].textContent).toBe('Agent Pet');
+      expect(items[3].textContent).toBe('Delete');
     });
 
     it('labels the menu via the trigger so screen readers know which agent owns it', () => {
@@ -599,6 +605,29 @@ describe('AgentCard', () => {
       renderDevWithTask();
       const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
       expect(actionRow.contains(kebab())).toBe(false);
+    });
+  });
+
+  describe('Agent Pet', () => {
+    it('renders the animated pet in place of the status pill when petId is set', () => {
+      renderCard(makeSnapshot({ id: 'dev-pet', runtimeStatus: 'working', petId: 'pet-1' }));
+      // The "Working" pill text is gone; the pet exposes the status via aria-label.
+      expect(screen.queryByText('Working')).toBeNull();
+      const pet = screen.getByRole('img', { name: 'Working' });
+      expect(pet.getAttribute('data-pet-row')).toBe('7'); // working → running row
+    });
+
+    it('keeps the status pill when no pet is assigned', () => {
+      renderCard(makeSnapshot({ id: 'dev-nopet', runtimeStatus: 'working' }));
+      expect(screen.getByText('Working').className).toContain('pill');
+      expect(screen.queryByRole('img', { name: 'Working' })).toBeNull();
+    });
+
+    it('opens the Agent Pet config modal from the kebab menu', () => {
+      renderCard(makeSnapshot({ id: 'dev-petcfg' }));
+      openMenu();
+      fireEvent.click(screen.getByRole('menuitem', { name: 'Agent Pet' }));
+      expect(screen.getByRole('dialog', { name: 'Agent Pet' })).toBeTruthy();
     });
   });
 

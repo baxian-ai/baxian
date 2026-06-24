@@ -32,6 +32,7 @@ type Inject = FastifyInstance['inject'];
 export interface RequestHelpers {
   get(url: string, opts?: InjectOptions): ReturnType<Inject>;
   post(url: string, payload?: unknown, opts?: InjectOptions): ReturnType<Inject>;
+  put(url: string, payload?: unknown, opts?: InjectOptions): ReturnType<Inject>;
   patch(url: string, payload?: unknown, opts?: InjectOptions): ReturnType<Inject>;
   del(url: string, opts?: InjectOptions): ReturnType<Inject>;
 }
@@ -40,6 +41,7 @@ export function requesters(getApp: () => FastifyInstance): RequestHelpers {
   return {
     get: (url, opts) => getApp().inject({ method: 'GET', url, ...opts }),
     post: (url, payload, opts) => getApp().inject({ method: 'POST', url, payload, ...opts }),
+    put: (url, payload, opts) => getApp().inject({ method: 'PUT', url, payload, ...opts }),
     patch: (url, payload, opts) => getApp().inject({ method: 'PATCH', url, payload, ...opts }),
     del: (url, opts) => getApp().inject({ method: 'DELETE', url, ...opts }),
   };

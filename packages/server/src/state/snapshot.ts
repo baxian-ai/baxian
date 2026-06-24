@@ -24,6 +24,11 @@ export interface AgentSnapshotCtx {
     latestBootstrapByAgent: () => Promise<Map<string, ErrorRecord>>;
     toSummary: (record: ErrorRecord) => AgentErrorSummary;
   };
+  // Optional: when present, snapshot carries each agent's Agent Pet assignment.
+  petStore?: {
+    listAssignments: () => Promise<Record<string, string>>;
+    getAssignment: (agentId: string) => Promise<string | null>;
+  };
 }
 
 const WORKING_TASK_STATUSES = new Set<TaskState['status']>(['in_progress', 'fixing']);
@@ -38,6 +43,7 @@ export function agentSnapshot(
   tmuxObservation: TmuxSessionObservation,
   task: TaskState | undefined,
   latestBootstrapError?: AgentErrorSummary,
+  petId?: string,
 ): AgentSnapshot {
   const runtimeStatus = deriveRuntimeStatus(binding, tmuxObservation, task);
   // When PENDING_IDLE is gated by task status, also hide the matching error card / reason /
@@ -64,6 +70,7 @@ export function agentSnapshot(
     ...(showBootstrapError ? { latestBootstrapError } : {}),
     ...(!suppressPendingIdle && tmuxObservation.reason ? { reason: tmuxObservation.reason } : {}),
     ...(!suppressPendingIdle && tmuxObservation.message ? { message: tmuxObservation.message } : {}),
+    ...(petId ? { petId } : {}),
   };
 }
 
@@ -155,10 +162,34 @@ async function loadLatestBootstrapByAgent(
   }
 }
 
+// Pet assignment is a cosmetic display concern; a corrupt assignments file (which the
+// PetStore write path refuses to overwrite by throwing) must not take down the agent
+// dashboard. Degrade to "no pet" with a warning, mirroring loadLatestBootstrap* above.
+async function loadPetAssignments(ctx: AgentSnapshotCtx): Promise<Record<string, string>> {
+  if (!ctx.petStore) return {};
+  try {
+    return await ctx.petStore.listAssignments();
+  } catch (err) {
+    console.warn('[snapshot] failed to load pet assignments:', err);
+    return {};
+  }
+}
+
+async function loadPetAssignment(ctx: AgentSnapshotCtx, agentId: string): Promise<string | undefined> {
+  if (!ctx.petStore) return undefined;
+  try {
+    return (await ctx.petStore.getAssignment(agentId)) ?? undefined;
+  } catch (err) {
+    console.warn(`[snapshot] failed to load pet assignment for ${agentId}:`, err);
+    return undefined;
+  }
+}
+
 export async function buildAllAgentSnapshots(ctx: AgentSnapshotCtx): Promise<AgentSnapshot[]> {
-  const [bindings, bootstrapErrorsByAgent] = await Promise.all([
+  const [bindings, bootstrapErrorsByAgent, petAssignments] = await Promise.all([
     ctx.agentStore.list(),
     loadLatestBootstrapByAgent(ctx),
+    loadPetAssignments(ctx),
   ]);
   const bindingByAgentId = new Map(bindings.map((s) => [s.id, s]));
   return Promise.all(ctx.agentManager.listAgents().map(async (configured) => {
@@ -170,6 +201,7 @@ export async function buildAllAgentSnapshots(ctx: AgentSnapshotCtx): Promise<Age
       ctx.tmuxSessionStatusStore.get(configured.id),
       task ?? undefined,
       bootstrapErrorsByAgent.get(configured.id),
+      petAssignments[configured.id],
     );
   }));
 }
@@ -183,12 +215,14 @@ export async function buildAgentSnapshotById(
   const binding = await ctx.agentStore.get(id);
   const task = binding?.taskId ? await ctx.taskStore.get(binding.taskId) : null;
   const latestBootstrapError = await loadLatestBootstrapError(ctx, id);
+  const petId = await loadPetAssignment(ctx, id);
   return agentSnapshot(
     configured,
     binding ?? undefined,
     ctx.tmuxSessionStatusStore.get(id),
     task ?? undefined,
     latestBootstrapError,
+    petId,
   );
 }
 

@@ -46,3 +46,14 @@ export const IMAGE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
 export const TASK_IMAGE_MAX_COUNT = 4;
 
 export const REVIEW_VERDICT_TIMEOUT_MS = 10 * 60 * 1000;
+
+// Agent Pet (Codex Pet) atlas grid — fixed by the hatch-pet contract. Mirrors the
+// server constants of the same name; drives the sprite renderer's cell math.
+export const PET_ATLAS_WIDTH = 1536;
+export const PET_ATLAS_HEIGHT = 1872;
+export const PET_GRID_COLS = 8;
+export const PET_GRID_ROWS = 9;
+export const PET_CELL_WIDTH = 192;
+export const PET_CELL_HEIGHT = 208;
+// Client-side soft check only — the server's magic-byte + dimension validation is authoritative.
+export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
