@@ -356,18 +356,35 @@ describe('POST /api/tasks', () => {
     }, { background: true });
   });
 
+  it.each([
+    ['omitted', { description: undefined }, 'task-no-desc'],
+    ['all-whitespace', { description: '   ' }, 'task-ws-desc'],
+  ] as const)('description %s → 201 + manager 收到空描述', async (_label, overrides, id) => {
+    const spy = vi
+      .spyOn(app.ctx.agentManager, 'createAndStartTask')
+      .mockResolvedValue(makeTask({ id }));
+
+    const response = await post('/api/tasks', createPayload(overrides));
+
+    expect(response.statusCode).toBe(201);
+    expect(spy).toHaveBeenCalledWith(
+      'proj',
+      expect.objectContaining({ description: '' }),
+      { background: true },
+    );
+  });
+
   // Payload validation that rejects before reaching the manager. Each row: [label, body, status, errorMatch].
   it.each([
     ['title + issueNumber → 400 mutually exclusive', createPayload({ title: 'x', description: 'y', issueNumber: 5 }), 400, /mutually exclusive/],
     ['only issueNumber → 400 (issue-bound unsupported)', { projectId: 'proj', issueNumber: 5 }, 400, undefined],
     ['missing title → 400', { projectId: 'proj', description: 'y', preferredAgentId: 'dev-1' }, 400, undefined],
-    ['missing description → 400', { projectId: 'proj', title: 't', preferredAgentId: 'dev-1' }, 400, undefined],
     ['missing projectId → 400', { title: 't', description: 'd', preferredAgentId: 'dev-1' }, 400, undefined],
     ['projectId not found → 404', createPayload({ projectId: 'no-such' }), 404, undefined],
     ['title all-whitespace → 400 1-200', createPayload({ title: '   ' }), 400, /1-200/],
     ['title over 200 → 400 1-200', createPayload({ title: 'x'.repeat(201) }), 400, /1-200/],
-    ['description all-whitespace → 400 1-16000', createPayload({ description: '   ' }), 400, /1-16000/],
-    ['description over 16000 → 400 1-16000', createPayload({ description: 'x'.repeat(16001) }), 400, /1-16000/],
+    ['description non-string → 400', createPayload({ description: 42 }), 400, /description must be a string/],
+    ['description over 16000 → 400 at most', createPayload({ description: 'x'.repeat(16001) }), 400, /at most 16000/],
     ['projectId all-whitespace → 400', createPayload({ projectId: '   ' }), 400, /projectId is required/],
     ['title with newline → 400 single line', createPayload({ title: 'line1\nline2' }), 400, /single line/],
     ['preferredAgentId null → 400', createPayload({ preferredAgentId: null }), 400, undefined],
@@ -589,6 +606,16 @@ describe('PATCH /api/tasks/:id', () => {
     expect(spy).toHaveBeenCalledWith('task-001', { description: 'new desc' });
   });
 
+  it('清空 description → 200 + editTask 收到空串', async () => {
+    const updated = makeTask({ status: 'pending', description: '' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(updated);
+
+    const response = await patch('/api/tasks/task-001', { description: '   ' });
+
+    expect(response.statusCode).toBe(200);
+    expect(spy).toHaveBeenCalledWith('task-001', { description: '' });
+  });
+
   it('改 preferredAgentId 立即重派 → 响应反映 manager refresh 后 in_progress + 新 dev', async () => {
     const refreshed = makeTask({
       status: 'in_progress',
@@ -610,7 +637,8 @@ describe('PATCH /api/tasks/:id', () => {
   it.each([
     ['title all-whitespace → 400 1-200', { title: '   ' }, /1-200/],
     ['title over 200 → 400', { title: 'x'.repeat(201) }, undefined],
-    ['description all-whitespace → 400 1-16000', { description: '   ' }, /1-16000/],
+    ['description non-string → 400', { description: 42 }, /description must be a string/],
+    ['description over 16000 → 400 at most', { description: 'x'.repeat(16001) }, /at most 16000/],
     ['preferredAgentId null → 400', { preferredAgentId: null }, undefined],
     ["status 'failed' → 400 only cancelled accepted", { status: 'failed' }, /Only 'cancelled'/],
     ["title + status='cancelled' → 400 cannot combine", { title: 't', status: 'cancelled' }, /Cannot combine cancellation with edits/],

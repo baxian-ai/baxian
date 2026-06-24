@@ -102,6 +102,7 @@ async function openDeleteDialog(): Promise<HTMLElement> {
 
 beforeEach(() => {
   cleanup();
+  localStorage.clear();
   __resetProjectsCacheForTests();
   toastShow.mockClear();
   projectsGet.mockClear();
@@ -184,39 +185,55 @@ describe('Project header actions', () => {
 });
 
 describe('Project Task panel', () => {
-  it('toggles the Task panel from the project header while project actions live in the topbar', async () => {
+  it('opens the Task panel by default and renders its title/close control outside the panel', async () => {
     renderProjectPage();
-    const openBtn = await waitFor(() => screen.getByRole('button', { name: '打开 Task 面板' }));
-    const topbarActions = screen.getByTestId('topbar-actions');
-    const menu = screen.getByRole('button', { name: /项目 demo 操作菜单/ });
-    expect(screen.queryByRole('complementary', { name: 'Task 面板' })).toBeNull();
-    expect(topbarActions.contains(openBtn)).toBe(false);
-    expect(topbarActions.contains(menu)).toBe(true);
-
-    fireEvent.click(openBtn);
-
     const panel = await waitFor(() => screen.getByRole('complementary', { name: 'Task 面板' }));
-    expect(panel).toBeTruthy();
-    expect(screen.queryByRole('button', { name: '打开 Task 面板' })).toBeNull();
-
-    fireEvent.click(within(panel).getByRole('button', { name: '关闭 Task 面板' }));
-    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'Task 面板' })).toBeNull());
-    expect(screen.getByRole('button', { name: '打开 Task 面板' })).toBeTruthy();
+    const heading = screen.getByRole('heading', { name: 'Tasks' });
+    const agentsHeading = screen.getByRole('heading', { name: 'Agents' });
+    const closeBtn = screen.getByRole('button', { name: '关闭 Task 面板' });
+    // 标题与关闭按钮在面板外，标题样式与左侧「Agents」标题一致。
+    expect(panel.contains(heading)).toBe(false);
+    expect(panel.contains(closeBtn)).toBe(false);
+    expect(heading.className).toBe(agentsHeading.className);
+    expect(screen.queryByRole('menuitem', { name: '显示 Task 面板' })).toBeNull();
   });
 
-  it('persists and restores the Task panel open state', async () => {
+  it('closes via the header button and reopens from the three-dot menu', async () => {
     renderProjectPage();
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: '打开 Task 面板' })));
-    await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('1'));
+    await waitFor(() => screen.getByRole('complementary', { name: 'Task 面板' }));
+    const menuBtn = screen.getByRole('button', { name: /项目 demo 操作菜单/ });
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭 Task 面板' }));
+    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'Task 面板' })).toBeNull());
+    // 关闭按钮卸载后焦点回到三点菜单触发按钮，而非丢回 body（WCAG 2.4.3）。
+    expect(document.activeElement).toBe(menuBtn);
+
+    await openProjectMenu();
+    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: '显示 Task 面板' }));
+    fireEvent.click(reopen);
+
+    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task 面板' }))).toBeTruthy();
+    // 菜单项卸载后焦点同样回到触发按钮。
+    expect(document.activeElement).toBe(menuBtn);
+    // 面板打开后菜单里不再有「显示 Task 面板」入口。
+    await openProjectMenu();
+    expect(screen.queryByRole('menuitem', { name: '显示 Task 面板' })).toBeNull();
+  });
+
+  it('persists and restores the Task panel closed state', async () => {
+    renderProjectPage();
+    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: '关闭 Task 面板' })));
+    await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('0'));
 
     cleanup();
     renderProjectPage();
-    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task 面板' }))).toBeTruthy();
-    expect(screen.queryByRole('button', { name: '打开 Task 面板' })).toBeNull();
+    await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
+    expect(screen.queryByRole('complementary', { name: 'Task 面板' })).toBeNull();
 
-    const panel = screen.getByRole('complementary', { name: 'Task 面板' });
-    fireEvent.click(within(panel).getByRole('button', { name: '关闭 Task 面板' }));
-    await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('0'));
+    await openProjectMenu();
+    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '显示 Task 面板' })));
+    await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('1'));
+    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task 面板' }))).toBeTruthy();
   });
 });
 

@@ -95,6 +95,31 @@ describe('AgentManager.startBootstrapAsync', () => {
     expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
   });
 
+  it('success clears stale dialog Held fields from an earlier pending bootstrap', async () => {
+    await agentStore.update('dev-1', (state) => state ? {
+      ...state,
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      awaitingReason: 'startup dialog',
+      awaitingSince: NOW,
+    } : null);
+    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true,
+      createdSession: true,
+      paneId: '%0',
+      workdir: '/tmp/repo',
+    });
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.status).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(state?.awaitingReason).toBeUndefined();
+    expect(state?.awaitingSince).toBeUndefined();
+  });
+
   it('hard failure clears the creation token and emits bootstrap_failed', async () => {
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
       new EnsureSessionError(

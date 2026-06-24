@@ -469,7 +469,9 @@ function buildTaskBody(args: TaskBodyArgs): string {
     hasQaPartner,
   });
 
-  const titleAndBody = `Title: ${task.title}\n\n${task.description}`;
+  const titleAndBody = task.description
+    ? `Title: ${task.title}\n\n${task.description}`
+    : `Title: ${task.title}`;
   const imagesBlock = imagePaths && imagePaths.length > 0
     ? '\n\n附图（baxian 已将用户上传的图片下载到 agent host，以下为绝对路径，请读取并结合任务分析）:\n' +
       imagePaths.map(p => `- ${p}`).join('\n')

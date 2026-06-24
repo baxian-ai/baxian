@@ -814,8 +814,15 @@ export class AgentManager {
       await this.agentStore.update(agentId, (existing) => {
         if (!existing || existing.creationToken !== creationToken) return AGENT_STORE_NOOP;
         resolvedExisting = existing;
+        const {
+          status: _status,
+          awaitingPhase: _awaitingPhase,
+          awaitingReason: _awaitingReason,
+          awaitingSince: _awaitingSince,
+          ...readyState
+        } = existing;
         return {
-          ...existing,
+          ...readyState,
           paneId: result.paneId,
           creationToken: undefined,
           updatedAt: now,
@@ -1617,6 +1624,27 @@ export class AgentManager {
       await this.lockManager.release(agentId);
       return true;
     });
+  }
+
+  async clearAwaitingHuman(agentId: string): Promise<boolean> {
+    const now = new Date().toISOString();
+    let cleared = false;
+    await this.agentStore.update(agentId, (latest) => {
+      if (!latest || latest.status !== 'awaiting_human') return AGENT_STORE_NOOP;
+      cleared = true;
+      const {
+        status: _status,
+        awaitingPhase: _awaitingPhase,
+        awaitingReason: _awaitingReason,
+        awaitingSince: _awaitingSince,
+        ...readyState
+      } = latest;
+      return {
+        ...readyState,
+        updatedAt: now,
+      };
+    });
+    return cleared;
   }
 
   // baxian 把 agent 标为"自动调度走不通，等 operator 显式 resume"。
@@ -5764,6 +5792,12 @@ export class AgentManager {
   ): Promise<boolean> {
     let rejection: Error | undefined;
     for (let attempt = 1; attempt <= 2; attempt++) {
+      // The runtime rejects /clear|/compact while a turn is in progress, and the post-merge
+      // notification turn can still be running when our idle scrape passes. Esc interrupts it (the
+      // same stop the cancel flow runs before /clear); a genuinely idle pane absorbs it harmlessly.
+      await tmux.sendKeysToPane(paneId, 'Escape');
+      await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
+      if (!await bindingStillOurs()) return false;
       await tmux.sendKeysLiteral(paneId, command);
       await tmux.sendEnter(paneId);
       await new Promise(r => setTimeout(r, this.compactIdlePollMs));

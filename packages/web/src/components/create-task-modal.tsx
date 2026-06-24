@@ -241,8 +241,7 @@ export function CreateTaskModal(props: Props) {
   const descriptionTrimmed = description.trim();
   const formReady =
     !!selectedProjectId &&
-    titleTrimmed.length > 0 &&
-    descriptionTrimmed.length > 0;
+    titleTrimmed.length > 0;
   const canSubmit = formReady && !submitting;
 
   const handleDismiss = () => {
@@ -423,7 +422,7 @@ export function CreateTaskModal(props: Props) {
         </div>
 
         <div>
-          <label className={labelCls} htmlFor="task-description">Description</label>
+          <label className={labelCls} htmlFor="task-description">Description（可选）</label>
           <textarea
             id="task-description"
             value={description}
@@ -431,9 +430,8 @@ export function CreateTaskModal(props: Props) {
             maxLength={DESCRIPTION_MAX}
             rows={8}
             className={`${inputCls} font-mono text-[12px]`}
-            placeholder="详细描述任务，支持 markdown"
+            placeholder="详细描述任务，支持 markdown；简单任务可不填"
             disabled={submitting}
-            required
           />
           <div className={counterCls}>{description.length} / {DESCRIPTION_MAX}</div>
         </div>

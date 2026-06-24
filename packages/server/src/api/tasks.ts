@@ -157,14 +157,14 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'title must be a single line (no \\r or \\n)' });
     }
 
-    if (body.description === undefined) {
-      return reply.status(400).send({ error: 'description is required' });
+    if (body.description !== undefined && typeof body.description !== 'string') {
+      return reply.status(400).send({ error: 'description must be a string when provided' });
     }
-    const descriptionTrimmed = typeof body.description === 'string' ? body.description.trim() : '';
-    if (descriptionTrimmed.length < 1 || descriptionTrimmed.length > DESCRIPTION_MAX_LEN) {
+    const descriptionTrimmed = body.description?.trim() ?? '';
+    if (descriptionTrimmed.length > DESCRIPTION_MAX_LEN) {
       return reply
         .status(400)
-        .send({ error: `description must be 1-${DESCRIPTION_MAX_LEN} characters` });
+        .send({ error: `description must be at most ${DESCRIPTION_MAX_LEN} characters` });
     }
 
     if (body.preferredAgentId !== undefined && typeof body.preferredAgentId !== 'string') {
@@ -330,11 +330,14 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (body.description !== undefined) {
-        const trimmed = typeof body.description === 'string' ? body.description.trim() : '';
-        if (trimmed.length < 1 || trimmed.length > DESCRIPTION_MAX_LEN) {
+        if (typeof body.description !== 'string') {
+          return reply.status(400).send({ error: 'description must be a string when provided' });
+        }
+        const trimmed = body.description.trim();
+        if (trimmed.length > DESCRIPTION_MAX_LEN) {
           return reply
             .status(400)
-            .send({ error: `description must be 1-${DESCRIPTION_MAX_LEN} characters` });
+            .send({ error: `description must be at most ${DESCRIPTION_MAX_LEN} characters` });
         }
         patch.description = trimmed;
       }

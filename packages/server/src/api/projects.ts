@@ -708,6 +708,7 @@ async function pendingCleanupAfterReplReady(
   const state = await app.ctx.agentStore.get(agentId);
   const taskId = state?.taskId;
   if (!taskId) {
+    await app.ctx.agentManager.clearAwaitingHuman(agentId);
     if (!takeover) await app.ctx.lockManager.release(agentId);
     return;
   }

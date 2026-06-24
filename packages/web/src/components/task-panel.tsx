@@ -8,7 +8,6 @@ interface TaskPanelProps {
   // Live open working set (active + pending) from the project-tasks WS frame; the
   // panel reuses it so 状态 / Round N update without a manual refresh.
   openTasks: TaskState[];
-  onClose: () => void;
   className?: string;
 }
 
@@ -102,7 +101,7 @@ function useDoneSection(projectId: string): DoneState {
   return { items, hasMore, loading, loaded, error, load };
 }
 
-export function TaskPanel({ projectId, openTasks, onClose, className = '' }: TaskPanelProps) {
+export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelProps) {
   const activeAll = useMemo(
     () => openTasks.filter((t) => TASK_ACTIVE_STATUS_SET.has(t.status)).sort(byUpdatedDesc),
     [openTasks],
@@ -134,23 +133,6 @@ export function TaskPanel({ projectId, openTasks, onClose, className = '' }: Tas
       aria-label="Task 面板"
       className={`flex flex-col rounded-lg border border-hairline bg-surface ${className}`}
     >
-      <div className="flex items-center justify-between border-b border-hairline px-3 py-2">
-        <h2 className="font-display text-[12px] font-semibold uppercase tracking-[0.06em] text-og-500">
-          Tasks
-        </h2>
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="关闭 Task 面板"
-          className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <line x1="18" y1="6" x2="6" y2="18" />
-            <line x1="6" y1="6" x2="18" y2="18" />
-          </svg>
-        </button>
-      </div>
-
       <div>
         <LiveSection title="IN PROGRESS" section={active} emptyHint="暂无正在处理的任务" />
         <LiveSection title="PENDING" section={pending} emptyHint="暂无待处理的任务" />
@@ -160,7 +142,7 @@ export function TaskPanel({ projectId, openTasks, onClose, className = '' }: Tas
             type="button"
             onClick={toggleDone}
             aria-expanded={doneExpanded}
-            className="flex w-full items-center justify-between px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
+            className="flex w-full items-center justify-between px-3 py-2 text-left text-[11px] font-normal uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
           >
             <span>DONE</span>
             <span className="font-normal normal-case text-accent">{doneExpanded ? '收起' : '查看'}</span>
@@ -183,7 +165,7 @@ function LiveSection({
 }) {
   return (
     <section aria-label={title} className="border-b border-hairline">
-      <div className="px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.05em] text-og-500">
+      <div className="px-3 py-2 text-[11px] font-normal uppercase tracking-[0.05em] text-og-500">
         {title} <span className="text-og-400">({section.total})</span>
       </div>
       {section.items.length === 0 ? (

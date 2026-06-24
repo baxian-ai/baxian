@@ -129,6 +129,27 @@ describe('CLI task subcommands', () => {
     }
   });
 
+  it('task create without --description sends empty description', async () => {
+    const { fn, calls } = mockFetch([
+      { status: 201, body: { id: 't-nodesc', status: 'pending' } },
+    ]);
+    globalThis.fetch = fn as unknown as typeof globalThis.fetch;
+
+    const cli = buildCli();
+    await cli.parseAsync([
+      'node',
+      'cli',
+      '--api-url', 'http://srv:9000',
+      'task', 'create',
+      '--project', 'proj',
+      '--title', 'No desc',
+      '--agent', 'dev-1',
+    ]);
+
+    const body = JSON.parse(String(calls[0].init.body));
+    expect(body.description).toBe('');
+  });
+
   it('task create errors when both --description and --description-file given', async () => {
     const cli = buildCli();
     await expect(

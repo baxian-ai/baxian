@@ -306,16 +306,12 @@ export function buildCli(): Command {
             description = await readFile(opts.descriptionFile, 'utf-8');
           }
         }
-        if (description === undefined || description === '') {
-          fail('--description or --description-file is required');
-        }
-
         const result = await apiPost<{ id: string; status: string }>(
           '/tasks',
           {
             projectId: opts.project,
             title: opts.title,
-            description,
+            description: description ?? '',
             preferredAgentId: opts.agent,
           },
           ctxOf(opts),

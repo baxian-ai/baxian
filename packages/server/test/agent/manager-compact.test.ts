@@ -331,6 +331,7 @@ describe('compactAgent', () => {
     await waitGates(gates, 3);
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
     gates[2]();
+    // post-merge runs 4 prompt-ready waits: pre-notification, post-notification, post-Esc, post-slash.
     await waitGates(gates, 4);
     gates[3]();
     await vi.waitFor(() => expect(fakeTmux.injectPrompt).toHaveBeenCalled());
@@ -338,6 +339,8 @@ describe('compactAgent', () => {
     gates[4]();
     await waitGates(gates, 6);
     gates[5]();
+    await waitGates(gates, 7);
+    gates[6]();
     await postMerge;
 
     expect(guardSet().has('dev-1')).toBe(false);
@@ -516,11 +519,14 @@ describe('compactAgent', () => {
       message: expect.stringContaining('already in progress'),
     });
 
+    // 4 prompt-ready waits: pre-notification, post-notification, post-Esc interrupt, post-slash.
     gates[0]();
     await waitGates(gates, 2);
     gates[1]();
     await waitGates(gates, 3);
     gates[2]();
+    await waitGates(gates, 4);
+    gates[3]();
     await run;
 
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
@@ -552,6 +558,28 @@ describe('compactAgent', () => {
 
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
     expect(slashCalls).toHaveLength(2);
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('interrupts with Esc before submitting the post-merge slash command', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    const fakeTmux = fakeCompactionTmux();
+
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
+
+    const escIdx = fakeTmux.sendKeysToPane.mock.calls.findIndex(([, key]) => key === 'Escape');
+    const clearIdx = fakeTmux.sendKeysLiteral.mock.calls.findIndex(([, text]) => text === '/clear');
+    expect(escIdx).toBeGreaterThanOrEqual(0);
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'Escape');
+    // Esc must precede /clear so a still-running turn can't reject the slash command.
+    expect(fakeTmux.sendKeysToPane.mock.invocationCallOrder[escIdx])
+      .toBeLessThan(fakeTmux.sendKeysLiteral.mock.invocationCallOrder[clearIdx]);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });

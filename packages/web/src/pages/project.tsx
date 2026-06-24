@@ -19,13 +19,14 @@ const NO_TASKS: TaskState[] = [];
 
 // Persist the panel-visible preference so it survives a refresh (a global UI choice,
 // not per-project — the user either wants the task list alongside agents or not).
+// Default-open: only an explicit '0' (the user closed it) hides the panel.
 const TASK_PANEL_OPEN_KEY = 'baxian.taskPanel.open';
 
 function readTaskPanelOpen(): boolean {
   try {
-    return localStorage.getItem(TASK_PANEL_OPEN_KEY) === '1';
+    return localStorage.getItem(TASK_PANEL_OPEN_KEY) !== '0';
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -184,6 +185,16 @@ export function Project() {
               aria-labelledby={menuTriggerId}
               className="absolute right-0 top-full z-10 mt-1 min-w-[180px] rounded-md border border-hairline bg-surface py-1 shadow-md"
             >
+              {!taskPanelOpen && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => { setMenuOpen(false); setTaskPanelOpen(true); menuButtonRef.current?.focus(); }}
+                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-100 hover:text-og-1000"
+                >
+                  显示 Task 面板
+                </button>
+              )}
               <button
                 type="button"
                 role="menuitem"
@@ -211,20 +222,10 @@ export function Project() {
       <div className="mb-6 flex items-baseline gap-x-3">
         <h1 className="min-w-0 truncate font-display text-[17px] font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
         <span className="hidden min-w-0 truncate font-mono text-[12px] text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
-        {!taskPanelOpen && (
-          <button
-            type="button"
-            onClick={() => setTaskPanelOpen(true)}
-            aria-label="打开 Task 面板"
-            className="btn-ghost ml-auto self-center"
-          >
-            Tasks
-          </button>
-        )}
       </div>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <div className="min-w-0 flex-1">
-          <div className="mb-3 flex flex-wrap items-baseline gap-2">
+          <div className="mb-3 flex h-8 items-center gap-2">
             <h2 className="font-display text-[12px] font-semibold uppercase tracking-[0.06em] text-og-500">Agents</h2>
           </div>
           {project.agent.flat().length === 0 ? (
@@ -251,12 +252,23 @@ export function Project() {
         </div>
 
         {taskPanelOpen && (
-          <TaskPanel
-            projectId={project.id}
-            openTasks={tasks}
-            onClose={() => setTaskPanelOpen(false)}
-            className="w-full lg:w-[340px] lg:shrink-0 xl:w-[380px]"
-          />
+          <div className="w-full lg:w-[340px] lg:shrink-0 xl:w-[380px]">
+            <div className="mb-3 flex h-8 items-center justify-between gap-2">
+              <h2 className="font-display text-[12px] font-semibold uppercase tracking-[0.06em] text-og-500">Tasks</h2>
+              <button
+                type="button"
+                onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
+                aria-label="关闭 Task 面板"
+                className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+            <TaskPanel projectId={project.id} openTasks={tasks} />
+          </div>
         )}
       </div>
 

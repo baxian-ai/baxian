@@ -695,6 +695,28 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     expect(state?.taskId).toBe('task-clear-held'); // binding 保留
   });
 
+  it('restart-repl clears awaiting_human Held state when no task is bound', async () => {
+    await seedAgent('dev-1', 'proj', {
+      paneId: '%0',
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      awaitingReason: 'startup dialog',
+      awaitingSince: now(),
+    });
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+    expect(state?.awaitingReason).toBeUndefined();
+    expect(state?.awaitingSince).toBeUndefined();
+    expect(state?.paneId).toBe('%0');
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
+
   it('returns 404 when agent is not in the project', async () => {
     const response = await post('/api/projects/no-such/agents/dev-1/restart-repl');
     expect(response.statusCode).toBe(404);
@@ -722,6 +744,27 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(response.statusCode).toBe(200);
     const stateAfter = await app.ctx.agentStore.get('dev-1');
     expect(stateAfter?.paneId).toBe('%0');
+  });
+
+  it('retry clears stale awaiting_human Held state after ensureSession confirms REPL ready', async () => {
+    await seedAgent('dev-1', 'proj', {
+      paneId: '%old',
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      awaitingReason: 'startup dialog',
+      awaitingSince: now(),
+    });
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(200);
+    const stateAfter = await app.ctx.agentStore.get('dev-1');
+    expect(stateAfter?.paneId).toBe('%0');
+    expect(stateAfter?.status).toBeUndefined();
+    expect(stateAfter?.awaitingPhase).toBeUndefined();
+    expect(stateAfter?.awaitingReason).toBeUndefined();
+    expect(stateAfter?.awaitingSince).toBeUndefined();
   });
 
   it('unknown tmux probe status still lets retry attempt recovery', async () => {

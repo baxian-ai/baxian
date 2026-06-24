@@ -437,7 +437,7 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
         )}
 
         <pre className="card mb-4 whitespace-pre-wrap p-4 text-[13px] text-og-800">
-          {task.description}
+          {task.description || <span className="text-og-400">（无描述）</span>}
         </pre>
 
         <div className="card space-y-2 p-4 text-[13px]">

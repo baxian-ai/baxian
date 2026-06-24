@@ -109,7 +109,7 @@ function titleInput(): HTMLInputElement {
 }
 
 function descriptionInput(): HTMLTextAreaElement {
-  return screen.getByLabelText('Description') as HTMLTextAreaElement;
+  return screen.getByLabelText('Description（可选）') as HTMLTextAreaElement;
 }
 
 function devSelect(): HTMLSelectElement {
@@ -495,6 +495,22 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       preferredAgentId: 'bx-dev',
+      projectId: 'baxian',
+    }));
+  });
+
+  it('submits with an empty description (description optional)', async () => {
+    tasksCreateMock.mockResolvedValue(makeTask({ id: 'task-nodesc', description: '' }));
+    await mountModal({ projectId: 'baxian' });
+
+    fireEvent.change(titleInput(), { target: { value: '只填标题' } });
+    expect((screen.getByRole('button', { name: '创建' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    await flushApi();
+
+    expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
+      title: '只填标题',
+      description: '',
       projectId: 'baxian',
     }));
   });

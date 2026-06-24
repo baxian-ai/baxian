@@ -300,11 +300,18 @@ describe('buildPromptInline', () => {
 
   it('boundary: accepts a prompt at exactly the cap', async () => {
     await seedAndScan();
-    const empty = build({ task: { ...TASK, description: '' } });
-    const overhead = Buffer.byteLength(empty, 'utf8');
-    const pad = 'x'.repeat(MAX_PROMPT_BYTES - overhead);
+    const base = build({ task: { ...TASK, description: 'x' } });
+    const overhead = Buffer.byteLength(base, 'utf8');
+    const pad = 'x'.repeat(MAX_PROMPT_BYTES - overhead + 1);
     const prompt = build({ task: { ...TASK, description: pad } });
     expect(Buffer.byteLength(prompt, 'utf8')).toBe(MAX_PROMPT_BYTES);
+  });
+
+  it('empty description → prompt ends at the title, no dangling body', async () => {
+    await seedAndScan();
+    const prompt = build({ task: { ...TASK, description: '' } });
+    expect(prompt).toContain(`Title: ${TASK.title}`);
+    expect(prompt.endsWith(`Title: ${TASK.title}`)).toBe(true);
   });
 
   it('develop phase with signalToken includes spec-done signal and opt-in copy (server chain)', async () => {

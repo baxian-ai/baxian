@@ -60,18 +60,10 @@ function doneCalls() {
   return pageMock.mock.calls.filter((c) => c[1]?.category === 'done');
 }
 
-function renderPanel(
-  openTasks: TaskState[],
-  handlers: { onClose?: () => void } = {},
-  projectId = 'proj',
-) {
+function renderPanel(openTasks: TaskState[], projectId = 'proj') {
   return render(
     <MemoryRouter>
-      <TaskPanel
-        projectId={projectId}
-        openTasks={openTasks}
-        onClose={handlers.onClose ?? vi.fn()}
-      />
+      <TaskPanel projectId={projectId} openTasks={openTasks} />
     </MemoryRouter>,
   );
 }
@@ -134,7 +126,6 @@ describe('TaskPanel', () => {
         <TaskPanel
           projectId="proj"
           openTasks={[task({ id: 'task-007', status: 'review', reviewRound: 1, title: 'evolving' })]}
-          onClose={vi.fn()}
         />
       </MemoryRouter>,
     );
@@ -148,7 +139,7 @@ describe('TaskPanel', () => {
 
     rerender(
       <MemoryRouter>
-        <TaskPanel projectId="proj" openTasks={[]} onClose={vi.fn()} />
+        <TaskPanel projectId="proj" openTasks={[]} />
       </MemoryRouter>,
     );
     expect(screen.queryByText('evolving')).toBeNull();
@@ -239,8 +230,7 @@ describe('TaskPanel', () => {
     expect(await screen.findByText(/加载失败：boom/)).toBeTruthy();
   });
 
-  it('uses the compact panel chrome and wires the close control', () => {
-    const onClose = vi.fn();
+  it('uses the compact panel chrome and keeps the header/close control outside the panel', () => {
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
     expect(screen.getByRole('region', { name: 'IN PROGRESS' })).toBeTruthy();
     expect(screen.getByRole('region', { name: 'PENDING' })).toBeTruthy();
@@ -249,11 +239,22 @@ describe('TaskPanel', () => {
     expect(screen.queryByRole('region', { name: '待处理' })).toBeNull();
     expect(screen.queryByRole('button', { name: '刷新 Task 列表' })).toBeNull();
     expect(screen.queryByRole('button', { name: '+ 新建 Task' })).toBeNull();
+    // 标题与关闭按钮已移出面板，由 Project 页面在面板外渲染。
+    expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '关闭 Task 面板' })).toBeNull();
+  });
 
-    cleanup();
-    renderPanel([], { onClose });
-    fireEvent.click(screen.getByRole('button', { name: '关闭 Task 面板' }));
-    expect(onClose).toHaveBeenCalledTimes(1);
+  it('renders the section titles in normal weight, not bold', () => {
+    renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
+    for (const name of ['IN PROGRESS', 'PENDING']) {
+      const title = screen.getByRole('region', { name }).firstElementChild as HTMLElement;
+      expect(title.textContent).toContain(name);
+      expect(title.className).toContain('font-normal');
+      expect(title.className).not.toContain('font-semibold');
+    }
+    const done = screen.getByRole('button', { name: /DONE/ });
+    expect(done.className).toContain('font-normal');
+    expect(done.className).not.toContain('font-semibold');
   });
 
   it('renders each live status as a colored dot whose label is the status (hover text)', () => {
