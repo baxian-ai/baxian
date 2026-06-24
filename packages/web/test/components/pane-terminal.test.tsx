@@ -448,9 +448,9 @@ describe('PaneTerminal', () => {
     expect(term.scrollToBottomCount).toBe(0);
   });
 
-  it('preview scales the xterm host down when the pane is wider than the card (no right-edge clip)', async () => {
+  it('compact preview scales the xterm host down when the pane is wider than the card (no right-edge clip)', async () => {
     // Card content width 800 (clientWidth shim); pane renders 1600px → scale 0.5 so the full width fits.
-    const { term } = await renderPane({ mode: 'preview', interactive: false });
+    const { term } = await renderPane({ mode: 'preview', interactive: false, maxLines: 6 });
     const host = document.createElement('div');
     Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 1600 });
     term.element = host;
@@ -459,13 +459,43 @@ describe('PaneTerminal', () => {
     expect(host.style.transformOrigin).toBe('top left');
   });
 
-  it('preview does not upscale when the card is at least as wide as the pane', async () => {
-    const { term } = await renderPane({ mode: 'preview', interactive: false });
+  it('compact preview does not upscale when the card is at least as wide as the pane', async () => {
+    const { term } = await renderPane({ mode: 'preview', interactive: false, maxLines: 6 });
     const host = document.createElement('div');
     Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 400 });
     term.element = host;
     act(() => { term.emitRender(); });
     expect(host.style.transform).toBe('');
+  });
+
+  it('embedded preview keeps normal font scale even when the pane is wider than the card', async () => {
+    const { term } = await renderPane({ mode: 'preview', interactive: false });
+    const host = document.createElement('div');
+    Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 2400 });
+    host.style.transformOrigin = 'top left';
+    host.style.transform = 'scale(0.25)';
+    term.element = host;
+    act(() => { term.emitRender(); });
+    expect(host.style.transform).toBe('');
+    expect(host.style.transformOrigin).toBe('');
+  });
+
+  it('embedded preview clears compact preview scale after maxLines is removed without remounting xterm', async () => {
+    const { PaneTerminal } = await importPane();
+    const { rerender } = render(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} maxLines={6} />);
+    const term = lastTerminal();
+    const terminalCount = fakeTerminals.length;
+    const host = document.createElement('div');
+    Object.defineProperty(host, 'scrollWidth', { configurable: true, value: 1600 });
+    term.element = host;
+    act(() => { term.emitRender(); });
+    expect(host.style.transform).toBe('scale(0.5)');
+
+    rerender(<PaneTerminal agentId="dev-1" mode="preview" interactive={false} />);
+    act(() => { term.emitRender(); });
+    expect(fakeTerminals).toHaveLength(terminalCount);
+    expect(host.style.transform).toBe('');
+    expect(host.style.transformOrigin).toBe('');
   });
 
   it('full+interactive mode never scales the host (it owns tmux sizing via fit/resize, not CSS scale)', async () => {
