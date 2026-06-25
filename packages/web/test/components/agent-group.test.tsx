@@ -11,6 +11,11 @@ vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
   usePendingRestart: () => ({ flagDirty: vi.fn() }),
 }));
 
+vi.mock('../../src/hooks/use-pets.ts', () => ({
+  usePets: () => ({ pets: [], loading: false, error: null, refresh: vi.fn() }),
+  usePetSpritesheet: (petId?: string) => (petId ? 'blob:mock-sprite' : null),
+}));
+
 const tasksDispatchMock = vi.fn();
 vi.mock('../../src/api.ts', () => ({
   UNAUTHORIZED_EVENT: 'baxian:unauthorized',
@@ -86,6 +91,15 @@ function activate(cardOrId: HTMLElement | string): void {
     : cardOrId;
   const trigger = within(card).getByRole('button', { name: /激活 .* 终端/ });
   fireEvent.click(trigger);
+}
+
+function classToken(el: HTMLElement, prefix: string): string {
+  return el.className.split(/\s+/).find(token => token.startsWith(prefix)) ?? '';
+}
+
+function tailwindSpacingPx(token: string): number {
+  const value = token.split('-').at(-1);
+  return Number.parseFloat(value ?? '') * 4;
 }
 
 type RenderGroupOptions = {
@@ -191,6 +205,35 @@ describe('AgentGroup', () => {
     expect(within(region).queryByText('001')).toBeNull();
     expect(within(region).queryByText('梳理绑定逻辑')).toBeNull();
     expect(within(region).getByText('暂无任务')).toBeTruthy();
+  });
+
+  it('reserves top grid space for card pets that escape upward', () => {
+    renderGroup([task()], {
+      agentsById: new Map([
+        ['dev-1', { ...agent('dev-1'), petId: 'pet-1' }],
+        ['qa-1', agent('qa-1')],
+      ]),
+    });
+
+    const pet = screen.getByRole('img');
+    const petFrame = pet.parentElement as HTMLElement;
+    const card = pet.closest('.card') as HTMLElement;
+    const grid = card.parentElement as HTMLElement;
+    const gridPaddingClass = classToken(grid, 'pt-');
+    const petTopClass = classToken(petFrame, '-top-');
+    expect(gridPaddingClass.length).toBeGreaterThan(0);
+    expect(petTopClass.length).toBeGreaterThan(0);
+    expect(tailwindSpacingPx(gridPaddingClass)).toBeGreaterThanOrEqual(tailwindSpacingPx(petTopClass));
+  });
+
+  it('does not add pet escape spacing when no card pet is rendered', () => {
+    renderGroup([task()]);
+
+    const card = within(screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' }))
+      .getByText('dev-1')
+      .closest('.card') as HTMLElement;
+    const grid = card.parentElement as HTMLElement;
+    expect(classToken(grid, 'pt-')).toBe('');
   });
 
   it('embedded mode defaults to non-interactive previews so scroll stays smooth', () => {

@@ -93,7 +93,9 @@ function mockFn(): ReturnType<typeof vi.fn> {
 function fakeCompactionTmux(): Record<string, ReturnType<typeof vi.fn>> {
   return {
     injectPrompt: mockFn(),
+    captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
     sendEnter: mockFn(),
+    waitSubmitAck: mockFn(),
     sendKeysLiteral: mockFn(),
     sendKeysToPane: mockFn(),
     capturePaneById: vi.fn().mockResolvedValue(''),
@@ -611,6 +613,91 @@ describe('compactAgent', () => {
     expect(slashCalls).toHaveLength(4);
     expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('submits the post-merge notification via waitSubmitAck with a swallowed-Enter resend guard', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    const fakeTmux = fakeCompactionTmux();
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
+
+    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'PR merged notice', 'dev-1');
+    expect(fakeTmux.captureSettledSnapshot).toHaveBeenCalledWith('%7', expect.any(Object));
+    expect(fakeTmux.waitSubmitAck).toHaveBeenCalledTimes(1);
+    // Settle (baseline w/ pasted text) → ack must run after the paste so a swallowed Enter is detected
+    // on the unchanged composer.
+    expect(fakeTmux.captureSettledSnapshot.mock.invocationCallOrder[0])
+      .toBeLessThan(fakeTmux.waitSubmitAck.mock.invocationCallOrder[0]);
+    expect(fakeTmux.injectPrompt.mock.invocationCallOrder[0])
+      .toBeLessThan(fakeTmux.captureSettledSnapshot.mock.invocationCallOrder[0]);
+
+    // The resend callback re-sends Enter — recovering the first Enter the TUI swallows after a paste.
+    const ackOpts = fakeTmux.waitSubmitAck.mock.calls[0][3] as { resend: () => Promise<void> };
+    expect(typeof ackOpts.resend).toBe('function');
+    const before = fakeTmux.sendEnter.mock.calls.length;
+    await ackOpts.resend();
+    expect(fakeTmux.sendEnter.mock.calls.length).toBe(before + 1);
+  });
+
+  it('treats a post-merge notification ack timeout as best-effort: still /clears, no C-c retry', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      waitSubmitAck: vi.fn().mockRejectedValue(new Error('runtime ack timeout')),
+    };
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
+
+    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith('%7', '/clear');
+    expect(fakeTmux.sendKeysToPane).not.toHaveBeenCalledWith('%7', 'C-c');
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('propagates a NON-timeout notification ack error to the retry (not best-effort swallow)', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      waitSubmitAck: vi.fn()
+        .mockRejectedValueOnce(new Error('capturePaneSnapshot failed')) // infra error, not an ack timeout
+        .mockResolvedValue(undefined),
+    };
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
+
+    // Attempt 1's infra error aborted the attempt (not swallowed) → attempt 2 re-injected + C-c'd.
+    expect(fakeTmux.injectPrompt.mock.calls.filter(([, p]) => p === 'PR merged notice')).toHaveLength(2);
+    expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
+    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith('%7', '/clear');
+  });
+
+  it('holds the agent (no release) when give-up cannot clear an unsubmitted notification', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    // Pre-Enter settle fails on every attempt → give up before submit; C-c also fails and the session
+    // is still up → composer can't be confirmed clear, so the dirty pane must NOT be released for reuse.
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      captureSettledSnapshot: vi.fn().mockRejectedValue(new Error('capture failed')),
+      sendKeysToPane: vi.fn().mockRejectedValue(new Error('C-c failed')),
+      hasSession: vi.fn().mockResolvedValue(true),
+    };
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
+
+    expect(releaseSpy).not.toHaveBeenCalled();
     expect(guardSet().has('dev-1')).toBe(false);
   });
 });

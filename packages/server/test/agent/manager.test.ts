@@ -131,11 +131,11 @@ function compactRunner(
         return { stdout: 'claude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        if (busyLeft > 0) {
-          busyLeft--;
-          return { stdout: BUSY, stderr: '', exitCode: 0 };
-        }
-        return { stdout: IDLE, stderr: '', exitCode: 0 };
+        let frame = IDLE;
+        if (busyLeft > 0) { busyLeft--; frame = BUSY; }
+        // capturePaneSnapshot bundles capture-pane + separator + history_size into one exec.
+        if (cmd.includes('history_size')) return { stdout: `${frame}\n___bx-snap-sep___\n0`, stderr: '', exitCode: 0 };
+        return { stdout: frame, stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
@@ -155,11 +155,11 @@ function smallPaneClaudeCompactRunner(execs: string[]): CommandRunner {
         return { stdout: 'claude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        if (busyLeft > 0) {
-          busyLeft--;
-          return { stdout: BUSY, stderr: '', exitCode: 0 };
-        }
-        return { stdout: IDLE, stderr: '', exitCode: 0 };
+        let frame = IDLE;
+        if (busyLeft > 0) { busyLeft--; frame = BUSY; }
+        // capturePaneSnapshot bundles capture-pane + separator + history_size into one exec.
+        if (cmd.includes('history_size')) return { stdout: `${frame}\n___bx-snap-sep___\n0`, stderr: '', exitCode: 0 };
+        return { stdout: frame, stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
@@ -2826,8 +2826,10 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
             return { stdout: 'claude\n', stderr: '', exitCode: 0 };
           }
           if (cmd.includes('capture-pane')) {
-            if (busyLeft > 0) { busyLeft--; return { stdout: BUSY, stderr: '', exitCode: 0 }; }
-            return { stdout: IDLE, stderr: '', exitCode: 0 };
+            let frame = IDLE;
+            if (busyLeft > 0) { busyLeft--; frame = BUSY; }
+            if (cmd.includes('history_size')) return { stdout: `${frame}\n___bx-snap-sep___\n0`, stderr: '', exitCode: 0 };
+            return { stdout: frame, stderr: '', exitCode: 0 };
           }
           return { stdout: '', stderr: '', exitCode: 0 };
         }),

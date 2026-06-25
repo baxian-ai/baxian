@@ -61,14 +61,18 @@ export interface AgentPetProps {
   bootstrapping?: boolean;
   /** Human-readable status text — used as the accessible label and the loading fallback. */
   label: string;
+  displayHeight?: number;
+  className?: string;
 }
 
-export function AgentPet({ petId, status, bootstrapping = false, label }: AgentPetProps) {
+export function AgentPet({ petId, status, bootstrapping = false, label, displayHeight = PET_DISPLAY_HEIGHT, className }: AgentPetProps) {
   const url = usePetSpritesheet(petId);
   const row = petRowForStatus(status, bootstrapping);
   const def = PET_ANIMATION_ROWS[row];
   const frames = def.durations.length;
   const [col, setCol] = useState(0);
+  const scale = displayHeight / PET_CELL_HEIGHT;
+  const displayWidth = PET_CELL_WIDTH * scale;
 
   useEffect(() => {
     setCol(0);
@@ -95,15 +99,15 @@ export function AgentPet({ petId, status, bootstrapping = false, label }: AgentP
       title={label}
       data-pet-row={row}
       data-pet-col={col}
-      className="inline-block shrink-0"
+      className={['inline-block shrink-0', className].filter(Boolean).join(' ')}
       style={{
-        width: `${PET_DISPLAY_WIDTH}px`,
-        height: `${PET_DISPLAY_HEIGHT}px`,
+        width: `${displayWidth}px`,
+        height: `${displayHeight}px`,
         backgroundImage: `url(${url})`,
         backgroundRepeat: 'no-repeat',
-        backgroundSize: `${PET_ATLAS_WIDTH * SCALE}px ${PET_ATLAS_HEIGHT * SCALE}px`,
-        backgroundPositionX: `${-(col * PET_DISPLAY_WIDTH)}px`,
-        backgroundPositionY: `${-(row * PET_DISPLAY_HEIGHT)}px`,
+        backgroundSize: `${PET_ATLAS_WIDTH * scale}px ${PET_ATLAS_HEIGHT * scale}px`,
+        backgroundPositionX: `${-(col * displayWidth)}px`,
+        backgroundPositionY: `${-(row * displayHeight)}px`,
         imageRendering: 'pixelated',
       }}
     />

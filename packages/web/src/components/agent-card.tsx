@@ -20,6 +20,8 @@ const RUNTIME_BADGES: Record<AgentSnapshot['runtimeStatus'], { label: string; cl
   error: { label: 'Error', cls: 'pill pill-warn' },
 };
 
+const AGENT_CARD_PET_HEIGHT = 72;
+
 type TmuxDotState = AgentSnapshot['tmuxSessionStatus'] | 'starting';
 
 const TMUX_DOTS: Record<Exclude<TmuxDotState, 'present'>, { label: string; modifier: string }> = {
@@ -270,8 +272,12 @@ export function AgentCard({
   // inner controls (Stop/Resume/Terminal link/kebab menu) from bubbling into onActivate.
   const allowSelection = isSelectableEmbedded && !terminalDisabled && !isActiveSelected;
   const cardClassName = [
-    'card flex h-full min-w-0 flex-col p-4',
+    'card relative flex h-full min-w-0 flex-col overflow-visible p-4',
     isActiveSelected ? 'ring-2 ring-accent' : '',
+  ].filter(Boolean).join(' ');
+  const headerClassName = [
+    'mb-3 flex items-start justify-between gap-2',
+    agent.petId ? 'pr-28' : '',
   ].filter(Boolean).join(' ');
   const terminalContainerClassName = [
     'mb-2 mt-3 h-80 min-h-0 overflow-hidden border border-hairline bg-surface',
@@ -291,7 +297,18 @@ export function AgentCard({
       className={cardClassName}
       data-agent-card={isSelectableEmbedded ? agent.id : undefined}
     >
-      <div className="mb-3 flex items-start justify-between gap-2">
+      {agent.petId && (
+        <div className="absolute -top-4 right-7 z-10">
+          <AgentPet
+            petId={agent.petId}
+            status={agent.runtimeStatus}
+            bootstrapping={isBootstrapping}
+            label={runtimeBadge.label}
+            displayHeight={AGENT_CARD_PET_HEIGHT}
+          />
+        </div>
+      )}
+      <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-[11px] font-medium uppercase tracking-[0.05em] text-og-500">{role}</span>
           <span
@@ -313,14 +330,7 @@ export function AgentCard({
           {isAwaitingHuman && (
             <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? '需人工处理'}>Held</span>
           )}
-          {agent.petId ? (
-            <AgentPet
-              petId={agent.petId}
-              status={agent.runtimeStatus}
-              bootstrapping={isBootstrapping}
-              label={runtimeBadge.label}
-            />
-          ) : (
+          {!agent.petId && (
             <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
           )}
           {agent.stale && (

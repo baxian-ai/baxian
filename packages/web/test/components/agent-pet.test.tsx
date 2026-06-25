@@ -66,6 +66,14 @@ describe('AgentPet rendering', () => {
     expect(el.style.backgroundPositionY).toBe('-252px'); // -(row 7 * 36px)
   });
 
+  it('scales sprite geometry from an explicit display height', () => {
+    render(<AgentPet petId="p1" status="working" label="Working" displayHeight={72} />);
+    const el = screen.getByRole('img', { name: 'Working' });
+    expect(el.style.height).toBe('72px');
+    expect(Number.parseFloat(el.style.width)).toBeCloseTo(66.46, 2);
+    expect(el.style.backgroundPositionY).toBe('-504px');
+  });
+
   it('falls back to the status pill while the spritesheet is unavailable', () => {
     sprite.url = null;
     render(<AgentPet petId="p1" status="working" label="Working" />);

@@ -108,6 +108,12 @@ export function AgentGroup({
 
   const showClaimable = !!dev && claimableTasks.length > 0;
   const showEmpty = activeTasks.length === 0 && !showClaimable;
+  const hasCardPet = group.some(cfg => !!agentsById.get(cfg.id)?.petId);
+  const gridClassName = [
+    'grid grid-cols-1 gap-4',
+    agentGridCols,
+    hasCardPet ? 'pt-4' : '',
+  ].filter(Boolean).join(' ');
   return (
     <div role="group" aria-label={label} className="min-w-0">
       {showClaimable && dev && (
@@ -150,7 +156,7 @@ export function AgentGroup({
           暂无任务
         </div>
       )}
-      <div className={`grid grid-cols-1 ${agentGridCols} gap-4`}>
+      <div className={gridClassName}>
         {group.map(cfg => {
           const snapshot = agentsById.get(cfg.id);
           const state: AgentSnapshot = snapshot ?? {

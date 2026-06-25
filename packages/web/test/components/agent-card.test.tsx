@@ -89,6 +89,15 @@ function makeSnapshot(overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
   };
 }
 
+function classToken(el: HTMLElement, prefix: string): string {
+  return el.className.split(' ').find(c => c.startsWith(prefix)) ?? '';
+}
+
+function tailwindSpacingPx(token: string): number {
+  const value = Number.parseFloat(token.split('-').at(-1) ?? '');
+  return Number.isFinite(value) ? value * 4 : 0;
+}
+
 function makeBinding(id: string, overrides: Partial<AgentBindingFacts> = {}): AgentBindingFacts {
   return {
     id,
@@ -615,6 +624,24 @@ describe('AgentCard', () => {
       expect(screen.queryByText('Working')).toBeNull();
       const pet = screen.getByRole('img', { name: 'Working' });
       expect(pet.getAttribute('data-pet-row')).toBe('7'); // working → running row
+    });
+
+    it('renders the card pet larger and lets it escape the card border', () => {
+      renderCard(makeSnapshot({ id: 'dev-pet-large', runtimeStatus: 'working', petId: 'pet-1' }));
+      const pet = screen.getByRole('img', { name: 'Working' });
+      expect(pet.style.height).toBe('72px');
+      const petFrame = pet.parentElement as HTMLElement;
+      expect(petFrame.className).toContain('absolute');
+      expect(petFrame.className).toContain('-top-4');
+      const card = pet.closest('.card') as HTMLElement;
+      expect(card.className).toContain('relative');
+      expect(card.className).toContain('overflow-visible');
+      const rightOffsetClass = classToken(petFrame, 'right-');
+      const headerPaddingClass = classToken(petFrame.nextElementSibling as HTMLElement, 'pr-');
+      expect(rightOffsetClass.length).toBeGreaterThan(0);
+      expect(headerPaddingClass.length).toBeGreaterThan(0);
+      expect(tailwindSpacingPx(headerPaddingClass))
+        .toBeGreaterThan(tailwindSpacingPx(rightOffsetClass) + Number.parseFloat(pet.style.width));
     });
 
     it('keeps the status pill when no pet is assigned', () => {

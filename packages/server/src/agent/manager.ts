@@ -5751,6 +5751,7 @@ export class AgentManager {
     };
 
     let attempts = 0;
+    let cleared = false;
     while (attempts < 2) {
       attempts++;
       try {
@@ -5762,14 +5763,27 @@ export class AgentManager {
         await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
         if (!await bindingStillOurs()) return;
         await tmux.injectPrompt(paneId, prompt, agentId);
+        // Resend a swallowed first Enter (bracketed-paste TUI quirk); settle so baseline holds the paste.
+        const baseline = await tmux.captureSettledSnapshot(paneId, { timeoutMs: this.dispatchSettleTimeoutMs });
         await tmux.sendEnter(paneId);
-        await new Promise(r => setTimeout(r, this.compactIdlePollMs));
+        try {
+          await tmux.waitSubmitAck(paneId, baseline, runtime, {
+            timeoutMs: this.dispatchAckTimeoutMs,
+            resend: () => tmux.sendEnter(paneId),
+            resendIntervalMs: this.dispatchAckResendIntervalMs,
+          });
+        } catch (ackErr) {
+          // Only a genuine ack timeout is best-effort; other (infra) errors must reach the outer retry.
+          if (!(ackErr instanceof Error && /runtime ack timeout/.test(ackErr.message))) throw ackErr;
+          console.warn(`[AgentManager] post-merge notification ack timeout (${agentId}, pane ${paneId}):`, ackErr);
+        }
         await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
         if (!await bindingStillOurs()) return;
         const command = cleanSlate ? '/clear' : '/compact';
         if (!await this.sendPostMergeSlashCommand(tmux, paneId, agentId, runtime, command, bindingStillOurs)) {
           return;
         }
+        cleared = true;
         break;
       } catch (err) {
         const label = attempts < 2 ? 'retrying' : 'giving up';
@@ -5779,6 +5793,8 @@ export class AgentManager {
         );
       }
     }
+    // Give-up: clear the injected-but-unsubmitted notification; hold (don't release) if it can't be cleared.
+    if (!cleared && !await this.clearComposerForReuse(tmux, paneId, agentId)) return;
     await this.releasePostMergeAgent(agentId, originalTaskId);
   }
 
