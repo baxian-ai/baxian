@@ -156,9 +156,9 @@ export function Project() {
             onClick={() => setMenuOpen(open => !open)}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
-            aria-controls={menuId}
+            aria-controls={menuOpen ? menuId : undefined}
             aria-label={`项目 ${project.id} 操作菜单`}
-            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
+            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -190,7 +190,7 @@ export function Project() {
                   type="button"
                   role="menuitem"
                   onClick={() => { setMenuOpen(false); setTaskPanelOpen(true); menuButtonRef.current?.focus(); }}
-                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-100 hover:text-og-1000"
+                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-50 hover:text-og-1000"
                 >
                   显示 Task 面板
                 </button>
@@ -199,7 +199,7 @@ export function Project() {
                 type="button"
                 role="menuitem"
                 onClick={() => { setMenuOpen(false); setCreateAgentOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-100 hover:text-og-1000"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-800 hover:bg-og-50 hover:text-og-1000"
               >
                 添加 Agent
               </button>
@@ -259,7 +259,7 @@ export function Project() {
                 type="button"
                 onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
                 aria-label="关闭 Task 面板"
-                className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
+                className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                   <line x1="18" y1="6" x2="6" y2="18" />

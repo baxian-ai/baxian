@@ -92,9 +92,9 @@ export function Dashboard() {
             onClick={() => setMoreMenuOpen(open => !open)}
             aria-haspopup="menu"
             aria-expanded={moreMenuOpen}
-            aria-controls={moreMenuId}
+            aria-controls={moreMenuOpen ? moreMenuId : undefined}
             aria-label="更多操作"
-            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000"
+            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"

@@ -466,9 +466,9 @@ export function AgentCard({
             disabled={deleting}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
-            aria-controls={menuId}
+            aria-controls={menuOpen ? menuId : undefined}
             aria-label={`Agent ${agent.id} 操作菜单`}
-            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-100 hover:text-og-1000 disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -498,10 +498,20 @@ export function AgentCard({
               <button
                 type="button"
                 role="menuitem"
+                onClick={() => { setMenuOpen(false); setPetModalOpen(true); }}
+                disabled={compacting || clearing || deleting}
+                title="配置 Agent Pet（在状态位置显示动画宠物）"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Agent Pet
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 onClick={() => { setMenuOpen(false); void handleCompact(); }}
                 disabled={compacting || clearing || deleting}
                 title="向 agent runtime 发送 /compact 压缩上下文"
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {compacting ? 'Compacting…' : 'Compact'}
               </button>
@@ -511,19 +521,9 @@ export function AgentCard({
                 onClick={() => { setMenuOpen(false); void handleClear(); }}
                 disabled={clearing || compacting || deleting}
                 title="向 agent runtime 发送 /clear 清空上下文"
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {clearing ? 'Clearing…' : 'Clear'}
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); setPetModalOpen(true); }}
-                disabled={compacting || clearing || deleting}
-                title="配置 Agent Pet（在状态位置显示动画宠物）"
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-100 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Agent Pet
               </button>
               {!pendingRestart && taskId && role === 'dev' && (
                 <button
@@ -532,7 +532,7 @@ export function AgentCard({
                   onClick={() => { setMenuOpen(false); void handleRequestReview(); }}
                   disabled={reviewing || deleting}
                   title={`让 QA 立即对 task ${taskId} 跑一轮 review（需要该 task 已有 PR）`}
-                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {reviewing ? 'Dispatching…' : 'Call review'}
                 </button>

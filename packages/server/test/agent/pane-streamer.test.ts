@@ -1,7 +1,11 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { AgentConfig, HostConfig } from '../../src/shared/index.js';
 import {
   PaneStreamer,
+  ensureSpawnHelperExecutable,
   type MinimalPty,
   type PtyFactory,
   type SubscriberCallbacks,
@@ -747,5 +751,122 @@ describe('PaneStreamer host re-resolution', () => {
     expect(captured[0].args).toContain('u@h');
 
     streamer.destroy();
+  });
+});
+
+describe('ensureSpawnHelperExecutable', () => {
+  let dir: string;
+  const activeDir = () => join(dir, 'prebuilds', `${process.platform}-${process.arch}`);
+  const helper = () => join(activeDir(), 'spawn-helper');
+  const buildHelper = () => join(dir, 'build', 'Release', 'spawn-helper');
+  // Fake node-pty loader: pty.node "loads" only under the given subpath, mirroring require() success.
+  const loadsUnder = (sub: string) => (modulePath: string) => {
+    if (!modulePath.includes(join(...sub.split('/')))) throw new Error(`cannot load ${modulePath}`);
+  };
+  const prebuildLoads = loadsUnder(`prebuilds/${process.platform}-${process.arch}`);
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pane-helper-'));
+    mkdirSync(activeDir(), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  // These two exercise the real chmodSync fs path, which is POSIX-only (Windows fs has no exec bit).
+  it.skipIf(process.platform === 'win32')('adds +x to a spawn-helper shipped as 0644 (node-pty#850)', () => {
+    writeFileSync(helper(), 'binary', { mode: 0o644 });
+    chmodSync(helper(), 0o644);
+    ensureSpawnHelperExecutable(dir, { load: prebuildLoads });
+    expect(statSync(helper()).mode & 0o111).toBe(0o111);
+  });
+
+  it.skipIf(process.platform === 'win32')('leaves an already-executable helper untouched', () => {
+    writeFileSync(helper(), 'binary', { mode: 0o755 });
+    chmodSync(helper(), 0o755);
+    ensureSpawnHelperExecutable(dir, { load: prebuildLoads });
+    expect(statSync(helper()).mode & 0o777).toBe(0o755);
+  });
+
+  it('targets only the helper beside the pty.node that loads, not an inactive candidate', () => {
+    mkdirSync(join(dir, 'build', 'Release'), { recursive: true });
+    writeFileSync(buildHelper(), 'binary', { mode: 0o644 });
+    chmodSync(buildHelper(), 0o644);
+    writeFileSync(helper(), 'binary', { mode: 0o644 });
+    chmodSync(helper(), 0o644);
+    const chmodded: string[] = [];
+    ensureSpawnHelperExecutable(dir, {
+      chmod: (p) => chmodded.push(p),
+      load: loadsUnder('build/Release'),
+      canExecute: () => false,
+    });
+    expect(chmodded).toEqual([buildHelper()]);
+  });
+
+  // build/Release/pty.node present but unloadable (ABI mismatch after a Node upgrade): node-pty falls
+  // back to the prebuild, so we must fix the prebuilt helper, not the inert build/Release one.
+  it('falls back to the prebuild when build/Release pty.node fails to load', () => {
+    mkdirSync(join(dir, 'build', 'Release'), { recursive: true });
+    writeFileSync(buildHelper(), 'binary', { mode: 0o644 });
+    chmodSync(buildHelper(), 0o644);
+    writeFileSync(helper(), 'binary', { mode: 0o644 });
+    chmodSync(helper(), 0o644);
+    const chmodded: string[] = [];
+    ensureSpawnHelperExecutable(dir, {
+      chmod: (p) => chmodded.push(p),
+      load: prebuildLoads,
+      canExecute: () => false,
+    });
+    expect(chmodded).toEqual([helper()]);
+  });
+
+  it('throws an actionable error when the active helper cannot be made executable', () => {
+    writeFileSync(helper(), 'binary', { mode: 0o644 });
+    chmodSync(helper(), 0o644);
+    const eperm = () => {
+      throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+    };
+    expect(() =>
+      ensureSpawnHelperExecutable(dir, { chmod: eperm, load: prebuildLoads, canExecute: () => false }),
+    ).toThrow(/chmod \+x/);
+  });
+
+  // root:group-owned 0550 + service user in that group: not world-exec and not chmod-able by us, but
+  // runnable. Must not chmod-EPERM-throw on an install that already works.
+  it('skips chmod (no throw) when the current process can already execute the helper', () => {
+    writeFileSync(helper(), 'binary', { mode: 0o550 });
+    chmodSync(helper(), 0o550);
+    const chmodCalls: string[] = [];
+    const wouldFail = (p: string) => {
+      chmodCalls.push(p);
+      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    };
+    expect(() =>
+      ensureSpawnHelperExecutable(dir, { chmod: wouldFail, load: prebuildLoads, canExecute: () => true }),
+    ).not.toThrow();
+    expect(chmodCalls).toEqual([]);
+  });
+
+  it('does not throw when no pty.node loads (source build elsewhere)', () => {
+    const loadsNothing = () => {
+      throw new Error('no loadable native module');
+    };
+    expect(() => ensureSpawnHelperExecutable(dir, { load: loadsNothing })).not.toThrow();
+  });
+
+  it('does not throw when the helper is missing though pty.node loads', () => {
+    expect(() => ensureSpawnHelperExecutable(dir, { load: prebuildLoads })).not.toThrow();
+  });
+
+  // Passing '' exercises the unresolved branch without triggering the resolveNodePtyDir() default
+  // (which would load/stat/chmod the real installed node-pty).
+  it('does not touch real node-pty when the package dir cannot be resolved', () => {
+    const mustNotRun = () => {
+      throw new Error('must not run when packageDir is unresolved');
+    };
+    expect(() =>
+      ensureSpawnHelperExecutable('', { chmod: mustNotRun, load: mustNotRun, canExecute: () => false }),
+    ).not.toThrow();
   });
 });

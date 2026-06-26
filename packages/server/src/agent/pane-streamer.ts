@@ -1,3 +1,6 @@
+import { accessSync, chmodSync, constants, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import type { AgentConfig, HostConfig } from '../shared/index.js';
 import xterm from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
@@ -70,9 +73,86 @@ const DEFAULT_ROWS = 50;
 
 let cachedPtyFactory: PtyFactory | null = null;
 
+const EXEC_BITS = 0o111;
+
+const moduleRequire = createRequire(import.meta.url);
+
+type ModuleLoader = (modulePath: string) => void;
+
+// node-pty 1.1.0 ships its prebuilt spawn-helper as 0644 (microsoft/node-pty#850); posix_spawnp then
+// fails with EACCES on the first attach. Restore +x on the helper node-pty will actually load. Gate on
+// whether *this* process can already exec it (a 0550 root:group helper is fine for a group member) so we
+// don't chmod-EPERM-throw on an install that would have worked; only a genuinely unrunnable helper that
+// we also can't fix is fatal — fail loudly there rather than leave the cryptic "posix_spawnp failed".
+export function ensureSpawnHelperExecutable(
+  packageDir = resolveNodePtyDir(),
+  deps: {
+    chmod?: (path: string, mode: number) => void;
+    load?: ModuleLoader;
+    canExecute?: (path: string) => boolean;
+  } = {},
+): void {
+  const chmod = deps.chmod ?? chmodSync;
+  const load = deps.load ?? moduleRequire;
+  const canExecute = deps.canExecute ?? defaultCanExecute;
+  const helper = packageDir ? resolveActiveSpawnHelper(packageDir, load) : undefined;
+  if (!helper) return;
+  let mode: number;
+  try {
+    mode = statSync(helper).mode;
+  } catch {
+    return; // helper absent (unexpected layout / Windows uses conpty) — let the real spawn surface it
+  }
+  if (canExecute(helper)) return;
+  try {
+    chmod(helper, mode | EXEC_BITS);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `node-pty spawn-helper is not executable and could not be fixed (${detail}): ${helper}. ` +
+        `A root-owned global install run as a non-root user hits this — fix with: chmod +x ${helper}`,
+    );
+  }
+}
+
+function defaultCanExecute(path: string): boolean {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The active helper sits beside the first pty.node that actually loads. We mirror node-pty
+// loadNativeModule by selecting on require() success, not mere existence: a stale/ABI-mismatched
+// build/Release/pty.node still exists but fails to load, and node-pty falls back to the prebuild —
+// existsSync would mis-pick build/Release and leave the prebuilt helper at 0644.
+function resolveActiveSpawnHelper(packageDir: string, load: ModuleLoader): string | undefined {
+  const dirs = ['build/Release', 'build/Debug', `prebuilds/${process.platform}-${process.arch}`];
+  for (const dir of dirs) {
+    try {
+      load(join(packageDir, dir, 'pty.node'));
+    } catch {
+      continue;
+    }
+    return join(packageDir, dir, 'spawn-helper');
+  }
+  return undefined;
+}
+
+function resolveNodePtyDir(): string | undefined {
+  try {
+    return dirname(moduleRequire.resolve('node-pty/package.json'));
+  } catch {
+    return undefined;
+  }
+}
+
 async function defaultPtyFactory(): Promise<PtyFactory> {
   if (cachedPtyFactory) return cachedPtyFactory;
   const nodePty = await import('node-pty');
+  ensureSpawnHelperExecutable();
   cachedPtyFactory = (cmd, cols, rows) =>
     nodePty.spawn(cmd.file, cmd.args, {
       name: 'xterm-256color',

@@ -166,6 +166,21 @@ describe('Project header actions', () => {
     expect(await screen.findByTestId('create-task-modal')).toBeTruthy();
   });
 
+  it('only sets aria-controls on the project three-dot menu while it is open', async () => {
+    renderProjectPage();
+    const trigger = await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
+    expect(trigger.getAttribute('aria-controls')).toBeNull();
+
+    fireEvent.click(trigger);
+    const menu = await waitFor(() => screen.getByRole('menu'));
+    expect(menu.id).toBeTruthy();
+    expect(trigger.getAttribute('aria-controls')).toBe(menu.id);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    expect(trigger.getAttribute('aria-controls')).toBeNull();
+  });
+
   it('moves the project three-dot menu into the topbar and keeps "添加 Agent" inside it', async () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));

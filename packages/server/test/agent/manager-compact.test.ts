@@ -661,6 +661,132 @@ describe('compactAgent', () => {
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
+  it('restarts and releases when Codex exits to shell after the post-merge notification', async () => {
+    await seedAgent({ taskId: 't1', injectedSkills: { taskId: 't1', paneId: '%7', skills: ['task-check'] } });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true,
+      createdSession: false,
+      freshRuntime: true,
+      paneId: '%9',
+      workdir: tempDir,
+    });
+    waitReadySpy
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('waitForReplPromptReady: pane %7 pane_current_command=zsh'))
+      .mockRejectedValueOnce(new Error('repl not ready'));
+
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      displayMessage: vi.fn().mockResolvedValue('zsh'),
+      waitSubmitAck: vi.fn().mockRejectedValue(new Error('runtime ack timeout')),
+    };
+
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'PR merged notice', true);
+
+    expect(ensureSpy).toHaveBeenCalledWith('dev-1', 'runtime');
+    expect(fakeTmux.sendKeysLiteral).not.toHaveBeenCalledWith('%7', '/clear');
+    const state = await agentStore.get('dev-1');
+    expect(state?.paneId).toBe('%9');
+    expect(state?.injectedSkills).toBeUndefined();
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('clears a dirty shell composer before restarting a post-merge runtime', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true,
+      createdSession: false,
+      freshRuntime: true,
+      paneId: '%9',
+      workdir: tempDir,
+    });
+    waitReadySpy
+      .mockRejectedValueOnce(new Error('first attempt failed before paste'))
+      .mockResolvedValueOnce(undefined);
+
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      displayMessage: vi.fn().mockResolvedValue('zsh'),
+      captureSettledSnapshot: vi.fn().mockRejectedValue(new Error('settle failed after paste')),
+    };
+
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'PR merged notice', true);
+
+    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'PR merged notice', 'dev-1');
+    const ccCallIndexes = fakeTmux.sendKeysToPane.mock.calls
+      .map(([, key], index) => ({ key, index }))
+      .filter(({ key }) => key === 'C-c')
+      .map(({ index }) => index);
+    expect(ccCallIndexes).toHaveLength(2);
+    const recoveryCcOrder = fakeTmux.sendKeysToPane.mock.invocationCallOrder[ccCallIndexes[1]];
+    expect(fakeTmux.injectPrompt.mock.invocationCallOrder[0]).toBeLessThan(recoveryCcOrder);
+    expect(recoveryCcOrder).toBeLessThan(ensureSpy.mock.invocationCallOrder[0]);
+    expect(fakeTmux.sendKeysLiteral).not.toHaveBeenCalledWith('%7', '/clear');
+    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+  });
+
+  it('recovers post-merge cleanup when the pane probe reports a missing pane', async () => {
+    await seedAgent({ taskId: 't1', injectedSkills: { taskId: 't1', paneId: '%7', skills: ['task-check'] } });
+    const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true,
+      createdSession: false,
+      freshRuntime: true,
+      paneId: '%9',
+      workdir: tempDir,
+    });
+    const fakeTmux = {
+      displayMessage: vi.fn().mockRejectedValue(new Error("tmux displayMessage %7 failed: can't find pane: %7")),
+    };
+
+    const recovered = await callPrivate<Promise<boolean>>(
+      'recoverPostMergeExitedRuntime',
+      fakeTmux,
+      '%7',
+      'dev-1',
+      't1',
+      'codex',
+    );
+
+    expect(recovered).toBe(true);
+    expect(ensureSpy).toHaveBeenCalledWith('dev-1', 'runtime');
+    const state = await agentStore.get('dev-1');
+    expect(state?.paneId).toBe('%9');
+    expect(state?.injectedSkills).toBeUndefined();
+  });
+
+  it('does not rewrite post-merge recovery state when the fresh runtime facts are already current', async () => {
+    const updatedAt = '2026-06-26T00:00:00.000Z';
+    await seedAgent({ taskId: 't1', repoPath: tempDir, updatedAt });
+    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true,
+      createdSession: false,
+      freshRuntime: true,
+      paneId: '%7',
+      workdir: tempDir,
+    });
+    const fakeTmux = {
+      displayMessage: vi.fn().mockResolvedValue('zsh'),
+      sendKeysToPane: mockFn(),
+    };
+
+    const recovered = await callPrivate<Promise<boolean>>(
+      'recoverPostMergeExitedRuntime',
+      fakeTmux,
+      '%7',
+      'dev-1',
+      't1',
+      'codex',
+    );
+
+    expect(recovered).toBe(true);
+    expect((await agentStore.get('dev-1'))?.updatedAt).toBe(updatedAt);
+  });
+
   it('propagates a NON-timeout notification ack error to the retry (not best-effort swallow)', async () => {
     await seedAgent({ taskId: 't1' });
     setPollMs(1);

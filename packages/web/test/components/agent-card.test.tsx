@@ -383,12 +383,14 @@ describe('AgentCard', () => {
       const trigger = kebab();
       expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
       expect(trigger.getAttribute('aria-expanded')).toBe('false');
+      // 菜单未渲染时不得保留指向不存在节点的 aria-controls（无效引用）。
+      expect(trigger.getAttribute('aria-controls')).toBeNull();
       expect(trigger.querySelector('svg')).toBeTruthy();
       expect(screen.queryByText('🗑')).toBeNull();
       expect(screen.queryByRole('menu')).toBeNull();
     });
 
-    it('opens the menu with Compact, Clear, Agent Pet, and Delete', () => {
+    it('opens the menu with Agent Pet, Compact, Clear, and Delete', () => {
       renderIdleCard();
       const trigger = kebab();
 
@@ -399,9 +401,9 @@ describe('AgentCard', () => {
       expect(trigger.getAttribute('aria-controls')).toBe(menu.id);
       const items = screen.getAllByRole('menuitem');
       expect(items).toHaveLength(4);
-      expect(items[0].textContent).toBe('Compact');
-      expect(items[1].textContent).toBe('Clear');
-      expect(items[2].textContent).toBe('Agent Pet');
+      expect(items[0].textContent).toBe('Agent Pet');
+      expect(items[1].textContent).toBe('Compact');
+      expect(items[2].textContent).toBe('Clear');
       expect(items[3].textContent).toBe('Delete');
     });
 
@@ -489,7 +491,7 @@ describe('AgentCard', () => {
       openMenu();
 
       const items = screen.getAllByRole('menuitem') as HTMLButtonElement[];
-      expect(items[0].textContent).toBe('Compacting…');
+      expect(items[1].textContent).toBe('Compacting…');
       expect(items.every(item => item.disabled)).toBe(true);
 
       await act(async () => {
@@ -551,7 +553,7 @@ describe('AgentCard', () => {
 
       openMenu();
 
-      const firstItem = screen.getByRole('menuitem', { name: 'Compact' });
+      const firstItem = screen.getByRole('menuitem', { name: 'Agent Pet' });
       expect(document.activeElement).toBe(firstItem);
     });
 

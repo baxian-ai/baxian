@@ -6015,9 +6015,61 @@ export class AgentManager {
         );
       }
     }
+    if (!cleared && await this.recoverPostMergeExitedRuntime(tmux, paneId, agentId, originalTaskId, runtime)) {
+      await this.releasePostMergeAgent(agentId, originalTaskId);
+      return;
+    }
     // Give-up: clear the injected-but-unsubmitted notification; hold (don't release) if it can't be cleared.
     if (!cleared && !await this.clearComposerForReuse(tmux, paneId, agentId)) return;
     await this.releasePostMergeAgent(agentId, originalTaskId);
+  }
+
+  private async recoverPostMergeExitedRuntime(
+    tmux: TmuxManager,
+    paneId: string,
+    agentId: string,
+    taskId: string,
+    runtime: AgentRuntimeKind,
+  ): Promise<boolean> {
+    let paneExists = true;
+    try {
+      if (hasReplProcTitle(await tmux.displayMessage(paneId, '#{pane_current_command}'), runtime)) return false;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      if (!/no server running|session not found|can't find (?:pane|session)|no such (?:pane|session)/i.test(detail)) {
+        return false;
+      }
+      paneExists = false;
+    }
+    const state = await this.agentStore.get(agentId);
+    if (!state || state.taskId !== taskId || state.paneId !== paneId) return false;
+    try {
+      if (paneExists) await tmux.sendKeysToPane(paneId, 'C-c');
+      const ensure = await this.ensureSession(agentId, 'runtime');
+      if (!ensure.freshRuntime) return false;
+      await this.agentStore.update(agentId, (existing) => {
+        if (!existing || existing.taskId !== taskId) return AGENT_STORE_NOOP;
+        if (
+          existing.paneId === ensure.paneId
+          && existing.repoPath === ensure.workdir
+          && existing.injectedSkills === undefined
+        ) {
+          return AGENT_STORE_NOOP;
+        }
+        return {
+          ...existing,
+          paneId: ensure.paneId,
+          repoPath: ensure.workdir,
+          injectedSkills: undefined,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      const current = await this.agentStore.get(agentId);
+      return current?.taskId === taskId && current.paneId === ensure.paneId;
+    } catch (err) {
+      console.warn(`[AgentManager] recoverPostMergeExitedRuntime(${agentId}, ${taskId}) failed:`, err);
+      return false;
+    }
   }
 
   private async sendPostMergeSlashCommand(

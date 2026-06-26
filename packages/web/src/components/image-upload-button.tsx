@@ -48,7 +48,7 @@ export function ImageUploadButton({ agentId, className }: ImageUploadButtonProps
         onClick={() => inputRef.current?.click()}
         className={
           className ??
-          'flex h-8 w-8 items-center justify-center rounded border border-hairline bg-surface text-og-700 transition-colors hover:bg-og-100 hover:text-og-1000 active:bg-og-200 disabled:cursor-not-allowed disabled:opacity-50'
+          'flex h-8 w-8 items-center justify-center rounded border border-hairline bg-surface text-og-700 transition-colors hover:bg-og-50 hover:text-og-1000 active:bg-og-200 disabled:cursor-not-allowed disabled:opacity-50'
         }
       >
         <svg

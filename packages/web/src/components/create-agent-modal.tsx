@@ -58,6 +58,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
   const [probeLoading, setProbeLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const probeAbortRef = useRef<AbortController | null>(null);
   const probeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRef = useRef(0);
@@ -75,6 +76,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     setProbe(null);
     setProbeLoading(false);
     setError(null);
+    setShowAdvanced(false);
 
     api.config.get().then(cfg => {
       if (session !== sessionRef.current) return;
@@ -351,33 +353,49 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
         </div>
 
         <div>
-          <label className={labelCls} htmlFor="workdir">Workdir（可选）</label>
-          <input id="workdir" type="text" value={form.workdir}
-            onChange={e => setForm({ ...form, workdir: e.target.value })}
-            className={inputCls}
-            placeholder="留空时自动 clone 到 ~/.baxian/repos/<owner>/<repo>"
-            disabled={submitting} />
-        </div>
+          <button
+            type="button"
+            onClick={() => setShowAdvanced(v => !v)}
+            aria-expanded={showAdvanced}
+            aria-controls={showAdvanced ? 'advanced-options' : undefined}
+            className="flex w-full items-center justify-between rounded-md px-1 py-1.5 text-left text-[12px] font-medium text-og-700 transition-colors hover:bg-og-50"
+          >
+            <span>高级选项</span>
+            <span className="text-og-400">{showAdvanced ? '收起' : '展开'}</span>
+          </button>
+          {showAdvanced && (
+            <div id="advanced-options" className="mt-3 space-y-3">
+              <div>
+                <label className={labelCls} htmlFor="workdir">Workdir（可选）</label>
+                <input id="workdir" type="text" value={form.workdir}
+                  onChange={e => setForm({ ...form, workdir: e.target.value })}
+                  className={inputCls}
+                  placeholder="留空时自动 clone 到 ~/.baxian/repos/<owner>/<repo>"
+                  disabled={submitting} />
+              </div>
 
-        <div>
-          <label className={labelCls} htmlFor="model">Model（可选）</label>
-          <input id="model" type="text" value={form.model}
-            onChange={e => setForm({ ...form, model: e.target.value })}
-            className={inputCls}
-            placeholder={form.runtime === 'codex' ? '例: o3 / gpt-4o（留空走 default）' : '例: sonnet / opus / claude-sonnet-4-6（留空走 default）'}
-            disabled={submitting} />
-          <div className={helpCls}>透传到 launch 命令的 --model 参数；留空跟随 CLI 默认。</div>
-        </div>
+              <div>
+                <label className={labelCls} htmlFor="model">Model（可选）</label>
+                <input id="model" type="text" value={form.model}
+                  onChange={e => setForm({ ...form, model: e.target.value })}
+                  className={inputCls}
+                  placeholder={form.runtime === 'codex' ? '例: o3 / gpt-4o（留空走 default）' : '例: sonnet / opus / claude-sonnet-4-6（留空走 default）'}
+                  disabled={submitting} />
+                <div className={helpCls}>透传到 launch 命令的 --model 参数；留空跟随 CLI 默认。</div>
+              </div>
 
-        <div>
-          <label className={labelCls} htmlFor="addDirs">Additional Dirs（可选）</label>
-          <textarea id="addDirs" value={form.addDirs}
-            onChange={e => setForm({ ...form, addDirs: e.target.value })}
-            className={`${inputCls} font-mono text-[12px]`}
-            rows={3}
-            placeholder={'每行一个绝对路径，例:\n/Users/me/shared-libs\n/Users/me/extra-repo'}
-            disabled={submitting} />
-          <div className={helpCls}>透传到 --add-dir。当前 YOLO 模式下不影响权限拦截，主要用于让 CLI 把额外目录纳入工作根。</div>
+              <div>
+                <label className={labelCls} htmlFor="addDirs">Additional Dirs（可选）</label>
+                <textarea id="addDirs" value={form.addDirs}
+                  onChange={e => setForm({ ...form, addDirs: e.target.value })}
+                  className={`${inputCls} font-mono text-[12px]`}
+                  rows={3}
+                  placeholder={'每行一个绝对路径，例:\n/Users/me/shared-libs\n/Users/me/extra-repo'}
+                  disabled={submitting} />
+                <div className={helpCls}>透传到 --add-dir。当前 YOLO 模式下不影响权限拦截，主要用于让 CLI 把额外目录纳入工作根。</div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5">

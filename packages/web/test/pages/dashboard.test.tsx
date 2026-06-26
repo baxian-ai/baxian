@@ -256,6 +256,22 @@ describe('Dashboard layout', () => {
     expect(hint.className).toContain('sr-only');
   });
 
+  it('only sets aria-controls on the 更多 kebab while its menu is open', () => {
+    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    renderDashboard();
+
+    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    expect(moreTrigger.getAttribute('aria-controls')).toBeNull();
+
+    fireEvent.click(moreTrigger);
+    const menu = screen.getByRole('menu');
+    expect(menu.id).toBeTruthy();
+    expect(moreTrigger.getAttribute('aria-controls')).toBe(menu.id);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(moreTrigger.getAttribute('aria-controls')).toBeNull();
+  });
+
   it('opens the kebab menu on click and exposes a "新建项目" menuitem that opens the CreateProject modal', () => {
     seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
     renderDashboard();

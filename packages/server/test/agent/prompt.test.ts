@@ -324,6 +324,9 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
     expect(prompt).toContain('token: spec-token-1');
     expect(prompt).toMatch(/proceed straight to implementing/);
+    expect(prompt).toContain('ready for review (not Draft)');
+    expect(prompt).toContain('gh pr ready');
+    expect(prompt).toContain('do NOT use `--draft`');
     expect(prompt).toContain('(do NOT commit or push it)');
     expect(prompt).not.toContain(buildPhaseSignal('spec-done', 'spec-token-1'));
     expect(scanPhaseSignals(prompt)).toEqual([]);
@@ -344,6 +347,8 @@ describe('buildPromptInline', () => {
     });
     expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
     expect(prompt).not.toMatch(/commit locally, then signal/);
+    expect(prompt).not.toContain('gh pr ready');
+    expect(prompt).not.toContain('ready for review (not Draft)');
     expect(prompt).toContain('(do NOT commit or push it)');
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
@@ -444,6 +449,8 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain('Code phase');
     expect(prompt).toContain('Spec is approved');
     expect(prompt).toContain('gh pr create');
+    expect(prompt).toContain('ready for review (not Draft)');
+    expect(prompt).toContain('gh pr ready');
     expect(prompt).toContain(buildPhaseSignalTemplate('pr-created'));
     expect(prompt).toContain('token: code-token-1');
     // Spec now lives at the server-chain path, not docs/spec/<task-id>.md.
@@ -580,10 +587,10 @@ describe('server review mode prompt builders', () => {
       { contains: ['Judge each independently', 'QA can be wrong', 'Never reject just to save effort'] }],
     ['server-after-done pr variant demands PR number in signal', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'pr', branch: 'bx/task-001' } },
-      { contains: ['gh pr create', '[bx:code-ready:<pr_number>:<token>]', 'git push'] }],
+      { contains: ['gh pr create', 'ready for review (not Draft)', 'gh pr ready', '[bx:code-ready:<pr_number>:<token>]', 'git push'] }],
     ['server-after-done branch variant uses plain code-ready', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } },
-      { contains: ['[bx:code-ready:<token>]'], notContains: ['gh pr create'] }],
+      { contains: ['[bx:code-ready:<token>]'], notContains: ['gh pr create', 'gh pr ready'] }],
     ['contentTruncated adds the truncation note', 'server-review', QA_AGENT,
       { serverContent: 'partial diff', contentTruncated: true },
       { contains: ['truncated'] }],

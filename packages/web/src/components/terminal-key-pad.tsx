@@ -30,7 +30,7 @@ function ArrowButton({ arrow, onPress }: ArrowButtonProps) {
       data-arrow={arrow.key}
       onMouseDown={(e) => e.preventDefault()}
       onClick={() => onPress(arrow.key)}
-      className="flex h-8 w-8 items-center justify-center rounded border border-hairline bg-surface text-og-700 transition-colors hover:bg-og-100 hover:text-og-1000 active:bg-og-200"
+      className="flex h-8 w-8 items-center justify-center rounded border border-hairline bg-surface text-og-700 transition-colors hover:bg-og-50 hover:text-og-1000 active:bg-og-200"
     >
       <svg
         xmlns="http://www.w3.org/2000/svg"

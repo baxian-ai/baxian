@@ -71,3 +71,32 @@ it('probes by host id (resolved server-side) once a host is selected', async () 
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledWith('remote', { hostId: 'box' }, expect.anything()));
 });
+
+it('hides Workdir/Model/Additional Dirs behind a collapsed 高级选项 toggle', async () => {
+  configGetMock.mockResolvedValue(cfg([]));
+  render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
+  await waitFor(() => expect(configGetMock).toHaveBeenCalled());
+
+  const toggle = screen.getByRole('button', { name: /高级选项/ });
+  expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  // 收起时不渲染 advanced-options，aria-controls 不得指向不存在的节点。
+  expect(toggle.getAttribute('aria-controls')).toBeNull();
+  expect(document.getElementById('advanced-options')).toBeNull();
+  expect(screen.queryByLabelText(/Workdir/)).toBeNull();
+  expect(screen.queryByLabelText(/Model/)).toBeNull();
+  expect(screen.queryByLabelText(/Additional Dirs/)).toBeNull();
+
+  fireEvent.click(toggle);
+
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  // 展开后才提供 aria-controls，并指向真实存在的区块。
+  expect(toggle.getAttribute('aria-controls')).toBe('advanced-options');
+  expect(document.getElementById('advanced-options')).toBeTruthy();
+  expect(screen.getByLabelText(/Workdir/)).toBeTruthy();
+  expect(screen.getByLabelText(/Model/)).toBeTruthy();
+  expect(screen.getByLabelText(/Additional Dirs/)).toBeTruthy();
+
+  fireEvent.click(toggle);
+  expect(toggle.getAttribute('aria-controls')).toBeNull();
+  expect(screen.queryByLabelText(/Workdir/)).toBeNull();
+});

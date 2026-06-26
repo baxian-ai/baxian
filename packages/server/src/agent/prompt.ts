@@ -3,6 +3,8 @@ import type { SkillRegistry } from '../skill/registry.js';
 import { buildPhaseSignalTemplate, scanPhaseSignals } from './phase-signal.js';
 
 export const BAXIAN_PR_CLAIM = '<!-- baxian:managed -->';
+const PR_READY_FOR_REVIEW_INSTRUCTION =
+  'The PR must be ready for review (not Draft): do NOT use `--draft`; if it is draft after creation, run `gh pr ready` before signaling.';
 
 export const MAX_PROMPT_BYTES = 80 * 1024;
 // 1KB margin: preview uses placeholders; real worktree path may be longer at inject.
@@ -211,9 +213,13 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
             `- To get QA spec review first, write the spec to ${SPEC_DOC_RELPATH} in your worktree (do NOT commit or push it), then signal:`,
             `    ${buildPhaseSignalTemplate('spec-done')}`,
             `  token: ${signalToken}`,
-            '- Otherwise proceed straight to implementing the change. After `gh pr create`, signal:',
+            '- Otherwise proceed straight to implementing the change. After `gh pr create`, ensure the PR is ready for review, then signal:',
+            `  ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
           ]
-        : ['Implement the change. After `gh pr create`, signal:']),
+        : [
+            'Implement the change. After `gh pr create`, ensure the PR is ready for review, then signal:',
+            `  ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
+          ]),
       `    ${buildPhaseSignalTemplate('pr-created')}`,
       `  token: ${signalToken}`,
       '',
@@ -232,7 +238,8 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
     : [
         'Code phase:',
         `- Spec is approved. Implement code per the spec at ${SPEC_DOC_RELPATH}.`,
-        '- Commit+push, open PR via `gh pr create`. After it returns, signal with PR number:',
+        '- Commit+push, open PR via `gh pr create`, and ensure it is ready for review before signaling:',
+        `  ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
         `    ${buildPhaseSignalTemplate('pr-created')}`,
         `  token: ${signalToken}`,
         '',
@@ -348,6 +355,7 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
         'Publish phase (push + PR):',
         `- Push the reviewed branch: \`git push -u origin ${branch}\`.`,
         '- Open a PR via `gh pr create` (title: task title; body: short summary of the server-side review outcome).',
+        `- ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
         `- The PR body MUST end with the marker line \`${BAXIAN_PR_CLAIM}\` — without it baxian's poller treats the PR as unmanaged and ignores its merge/comment events.`,
         '- Then emit exactly once, substituting the real PR number:',
         '    [bx:code-ready:<pr_number>:<token>]',
@@ -618,4 +626,3 @@ function renderCleanupStatus(branch: string, result: PostMergeBranchCleanupResul
       return `Local feature branch \`${branch}\` was not touched: ${result.detail || 'no repo path available'}.`;
   }
 }
-
