@@ -90,6 +90,13 @@ export function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind):
   return READY_ANCHORS[runtime].test(stripped);
 }
 
+// A turn can be working with a momentarily-static screen, signalled only by a braille spinner in the OSC pane
+// title. Same pattern both runtimes use in detect/manifests/*.json `osc_title_working`.
+const OSC_TITLE_WORKING_RE = /^[⠀-⣿] /;
+export function hasOscTitleWorking(paneTitle: string): boolean {
+  return OSC_TITLE_WORKING_RE.test(paneTitle);
+}
+
 export function hasReplProcTitle(current: string, runtime: AgentRuntimeKind): boolean {
   return REPL_PROC_TITLES[runtime].test(current);
 }
@@ -176,12 +183,16 @@ export function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeK
     || codexWorkingInTail(stripped, runtime);
 }
 
+// Empty Codex composer: bare `›` (may be indented) as the last non-blank line. Mirrors codex.json codex_idle_prompt.
+const CODEX_EMPTY_COMPOSER_RE = /(?:^|\n)[ \t]*›[ \t]*(?:\n[ \t]*)*$/;
+
 export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (runtime === 'claude-code') {
     return CLAUDE_IDLE_COMPOSER_LINE_RE.test(tail(stripped, CLAUDE_IDLE_COMPOSER_TAIL_LINES));
   }
   if (runtime === 'codex') {
-    return CODEX_IDLE_COMPOSER_LINE_RE.test(tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES));
+    const t = tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES);
+    return CODEX_IDLE_COMPOSER_LINE_RE.test(t) || CODEX_EMPTY_COMPOSER_RE.test(t);
   }
   return false;
 }
@@ -276,10 +287,9 @@ export class TmuxManager {
     const PATH = '/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
     const result = await run(
       this.runner,
-      // -x 80: stays in sync with PaneStreamer.DEFAULT_COLS (the headless buffer) — see note there.
       `tmux new-session -d -s ${shellQuote(name)} ` +
         `-e ${shellQuote(`PATH=${PATH}`)} ` +
-        `-x 80 -y 50 -c ${shellQuote(workdir)}`,
+        `-x 200 -y 50 -c ${shellQuote(workdir)}`,
     );
     if (result.exitCode !== 0) {
       throw new Error(`Failed to create tmux session ${name}: ${result.stderr}`);

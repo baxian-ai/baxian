@@ -44,6 +44,7 @@ import {
   runtimeBusyCheck,
   hasRuntimeReadyView,
   hasReplProcTitle,
+  hasOscTitleWorking,
   type AdoptPaneState,
   type AgentRuntimeKind,
 } from './tmux.js';
@@ -235,6 +236,9 @@ interface DispatchReviewSnapshot {
 // Dev-facing deliverable phases that weave the task's uploaded image paths into the prompt.
 const IMAGE_DISPATCH_PHASES = new Set<string>(['develop', 'code', 'fix', 'server-feedback']);
 
+// Pane grabs taken to decide live-turn vs static composer; (N-1) * runtimeLivenessProbeMs must exceed 1s.
+const RUNTIME_LIVENESS_SAMPLES = 3;
+
 export function canDispatchWithBinding(binding: AgentBindingFacts | null | undefined): boolean {
   return !binding?.taskId && !binding?.creationToken && binding?.status !== 'awaiting_human';
 }
@@ -260,6 +264,28 @@ const UNCLEARED_PANE_PHASES = new Set<string>(['cancel-clearing', 'cancel-clear-
 // session. Only cancel's own confirmed-/clear release (fromCancelCleanup) frees one automatically; the
 // operator recovers via Resume (cancel-interrupt-failed only, after verifying) or DELETE (any).
 const CANCEL_CLEANUP_HOLD_PHASES = new Set<string>([...UNCLEARED_PANE_PHASES, 'cancel-interrupt-failed']);
+
+// The cancel flow owns a binding in a cancel-cleanup hold: NO dispatch-failure cleanup may wipe it or
+// overwrite it (else cancel's Phase 2 /clear is skipped and an un-cleared pane is reused). Every binding-wipe
+// path must check this — releaseAgentForTask, rollbackFailedDispatch, startSession cleanup, markAwaitingHuman.
+function isCancelCleanupHold(binding: { awaitingPhase?: string } | null | undefined): boolean {
+  return binding?.awaitingPhase != null && CANCEL_CLEANUP_HOLD_PHASES.has(binding.awaitingPhase);
+}
+
+// Cancel-cleanup phases escalate monotonically — a more-locked phase must never be downgraded. cancel-clear-failed
+// (DELETE-only: /clear unconfirmed) outranks cancel-interrupt-failed (Resume-able) and the transient cancel-clearing,
+// so a re-entrant terminal cleanup can't soften "un-cleared, DELETE-only" into a hold Resume would reuse.
+const CANCEL_CLEANUP_PHASE_RANK: Record<string, number> = {
+  'cancel-clearing': 1,
+  'cancel-interrupt-failed': 2,
+  'cancel-clear-failed': 3,
+};
+function cancelPhaseRank(phase: string | undefined): number {
+  return phase ? (CANCEL_CLEANUP_PHASE_RANK[phase] ?? 0) : 0;
+}
+function cancelPhaseDowngrades(prev: string | undefined, next: string): boolean {
+  return cancelPhaseRank(next) < cancelPhaseRank(prev);
+}
 
 // A prompt line still holding the typed `/clear` (e.g. `❯ /clear`, `› /clear`) = the Enter was swallowed,
 // so /clear was never submitted. After a real submission /clear wipes the screen and the composer is empty.
@@ -322,6 +348,15 @@ export class AgentManager {
   protected compactIdlePollMs = 2_000;
   protected manualCompactWaitMs = 5_000;
   protected clearContextWaitMs = 30_000;
+  // Gap between liveness grabs in interruptPaneAndWaitReady; (SAMPLES-1)*this must exceed 1s + margin so a
+  // per-second elapsed-counter tick is always captured (700 * 2 = 1.4s).
+  protected runtimeLivenessProbeMs = 700;
+  // How long the post-C-c verify polls for the pane to reach a clean/empty composer before holding.
+  protected cleanComposerWaitMs = 5_000;
+  // How long cancel waits for an in-flight dispatch to release the pane mutex before holding (set in the
+  // constructor from the actual dispatchAckTimeoutMs). On timeout the pane is classified DELETE-only, not
+  // Resume-able, so a longer non-dispatch holder can't leave an un-cleared pane reusable.
+  protected cancelInterruptGuardWaitMs = DEFAULT_DISPATCH_ACK_TIMEOUT_MS + 5_000;
   protected postMergeFetchTimeoutMs = 60_000;
   protected postMergeBranchTimeoutMs = 10_000;
   // taskIds with in-flight manual review — second concurrent POST gets 409.
@@ -359,6 +394,9 @@ export class AgentManager {
     this.reviewStore = deps.reviewStore;
     this.dispatchAckTimeoutMs = deps.dispatchAckTimeoutMs ?? DEFAULT_DISPATCH_ACK_TIMEOUT_MS;
     this.dispatchSettleTimeoutMs = deps.dispatchSettleTimeoutMs ?? DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS;
+    // Track the ACTUAL ack timeout (a dispatch holds the pane mutex through waitSubmitAck), not a hardcoded
+    // default — else an overridden dispatchAckTimeoutMs would let cancel give up before the dispatch releases.
+    this.cancelInterruptGuardWaitMs = this.dispatchAckTimeoutMs + 5_000;
     this.agentIndex = buildAgentIndex(config);
     this.platformRunner = deps.platformRunner ?? new LocalRunner();
     this.imageStagingRoot = deps.imageStagingRoot ?? join(tmpdir(), 'baxian-task-images');
@@ -1534,11 +1572,7 @@ export class AgentManager {
       // allowAwaitingHuman caller (startup false-start, review/max-rounds handlers, a terminal-task escape)
       // could reassign the un-cleared/maybe-running pane before cancel confirms /clear. (Operator recovery
       // via resumeAgent / DELETE doesn't go through this path.)
-      if (
-        state.awaitingPhase != null
-        && CANCEL_CLEANUP_HOLD_PHASES.has(state.awaitingPhase)
-        && !opts.fromCancelCleanup
-      ) {
+      if (isCancelCleanupHold(state) && !opts.fromCancelCleanup) {
         console.warn(
           `[AgentManager] releaseAgentForTask: agent ${agentId} ${state.awaitingPhase} (cancel-cleanup hold); refusing auto-release`,
         );
@@ -1677,6 +1711,13 @@ export class AgentManager {
         const expectedTask = opts.expectedTaskId; // string | null
         const actualTask = existing.taskId ?? null;
         if (actualTask !== expectedTask) return AGENT_STORE_NOOP;
+      }
+      // A cancel-cleanup hold is owned by the cancel flow: a generic dispatch-failure hold must not overwrite
+      // it, and even a cancel-cleanup phase must not DOWNGRADE it (cancel-clear-failed is DELETE-only — softening
+      // it to cancel-clearing/cancel-interrupt-failed would let Resume reuse an un-cleared pane).
+      if (isCancelCleanupHold(existing)) {
+        if (!CANCEL_CLEANUP_HOLD_PHASES.has(phase)) return AGENT_STORE_NOOP;
+        if (cancelPhaseDowngrades(existing.awaitingPhase, phase)) return AGENT_STORE_NOOP;
       }
       projectId = existing.projectId;
       taskId = existing.taskId;
@@ -1936,7 +1977,8 @@ export class AgentManager {
     }
   }
 
-  // ESC (not Ctrl-C) is the interrupt key both runtimes advertise; returns whether the pane reached idle.
+  // ESC can't clear un-submitted composer text (pane never reaches ready); Ctrl-C does. Under the pane mutex
+  // (no key interleave with a concurrent dispatch), C-c'd only while still the runtime and not mid-turn.
   private async interruptPaneAndWaitReady(
     state: AgentBindingFacts,
     cfg: AgentConfig & { projectId: string },
@@ -1944,21 +1986,110 @@ export class AgentManager {
     const paneId = await this.resolvePaneId(state, cfg);
     if (!paneId) return false;
     const tmux = new TmuxManager(this.createRunnerFor(cfg));
-    try {
-      await tmux.sendKeysToPane(paneId, 'Escape');
-      await new Promise(r => setTimeout(r, 200));
-    } catch (err) {
-      console.warn(
-        `[AgentManager] interruptPaneAndWaitReady: send Escape failed for pane ${paneId}:`,
-        err,
+    const runtime = agentRuntimeKindFor(cfg);
+    // An in-flight dispatch holds the mutex during its paste/ack; it releases once it sees the now-terminal task,
+    // so wait briefly rather than dropping a cancel-during-paste straight to manual hold.
+    if (!(await this.acquireCompactGuardWithin(cfg.id, this.cancelInterruptGuardWaitMs))) {
+      console.warn(`[AgentManager] interruptPaneAndWaitReady: ${cfg.id} pane mutex still busy after wait; holding (un-cleared)`);
+      // A longer-running holder (post-merge compaction, a slow image write) kept the mutex: cancel never
+      // verified the pane, so classify it un-cleared/DELETE-only. The monotonic phase guard then blocks the
+      // caller from softening it to a Resume-able cancel-interrupt-failed and reusing an un-cleared pane.
+      await this.markAwaitingHuman(
+        cfg.id,
+        'cancel-clear-failed',
+        'Cancel could not acquire the pane mutex to interrupt/clear (a dispatch/compact/upload held it); the ' +
+          'pane state is unverified and may still hold the cancelled session. DELETE the agent to discard it.',
+        { expectedTaskId: state.taskId },
       );
       return false;
     }
     try {
-      await tmux.waitReplReady(paneId, agentRuntimeKindFor(cfg), {
-        timeoutMs: 10_000,
-        scrollback: 0,
-      });
+      try {
+        await tmux.sendKeysToPane(paneId, 'Escape');
+        await new Promise(r => setTimeout(r, 200));
+      } catch (err) {
+        console.warn(`[AgentManager] interruptPaneAndWaitReady: send Escape failed for pane ${paneId}:`, err);
+        return false;
+      }
+      if (await this.paneReachedReplReady(tmux, paneId, runtime, 10_000)) return true;
+      // Ctrl-C can only restore a runtime prompt: if the pane crashed back to a shell or a human took it
+      // over, it would hit their session instead — hold for a human.
+      if (!(await this.paneRunsRuntime(tmux, paneId, runtime))) return false;
+      if (await this.paneHasLiveTurn(tmux, paneId, runtime)) {
+        console.warn(`[AgentManager] interruptPaneAndWaitReady: pane ${paneId} still running a turn after ESC; holding`);
+        return false;
+      }
+      // Re-confirm: the runtime could have crashed to a shell during the ~1.4s liveness window; C-c must not
+      // land in a foreign session.
+      if (!(await this.paneRunsRuntime(tmux, paneId, runtime))) return false;
+      try {
+        await tmux.sendKeysToPane(paneId, 'C-c');
+        await new Promise(r => setTimeout(r, 200));
+      } catch (err) {
+        console.warn(`[AgentManager] interruptPaneAndWaitReady: send C-c (composer clear) failed for pane ${paneId}:`, err);
+        return false;
+      }
+      // Verify the OUTCOME via the canonical readiness check, not a guessed pre-state.
+      return this.paneReachedReplReady(tmux, paneId, runtime, this.cleanComposerWaitMs);
+    } finally {
+      this.compactInFlight.delete(cfg.id);
+    }
+  }
+
+  // Liveness = change across samples (pollution-immune): a static screen AND a static title are inert; only a
+  // repaint or an advancing OSC braille title is a live turn. (A stale working-shaped title doesn't change.)
+  private async paneHasLiveTurn(tmux: TmuxManager, paneId: string, runtime: AgentRuntimeKind): Promise<boolean> {
+    let first: string;
+    let firstTitle: string;
+    try {
+      first = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+      firstTitle = await tmux.readPaneTitle(paneId);
+    } catch (err) {
+      console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness capture failed for pane ${paneId}:`, err);
+      return true;
+    }
+    for (let i = 1; i < RUNTIME_LIVENESS_SAMPLES; i++) {
+      await new Promise(r => setTimeout(r, this.runtimeLivenessProbeMs));
+      let frame: string;
+      let title: string;
+      try {
+        frame = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+        title = await tmux.readPaneTitle(paneId);
+      } catch (err) {
+        console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness re-capture failed for pane ${paneId}:`, err);
+        return true;
+      }
+      if (title !== firstTitle && hasOscTitleWorking(title)) return true; // advancing spinner → live, even over a ready-looking frame
+      if (hasRuntimeReadyView(frame, runtime)) return false; // visible idle overrides only a STATIC (stale) working title
+      if (frame !== first) return true;
+    }
+    return false;
+  }
+
+  // Ctrl-C must only hit the runtime: confirm the pane's process is still codex/claude, else hold for a human.
+  private async paneRunsRuntime(tmux: TmuxManager, paneId: string, runtime: AgentRuntimeKind): Promise<boolean> {
+    let proc: string;
+    try {
+      proc = await tmux.displayMessage(paneId, '#{pane_current_command}');
+    } catch (err) {
+      console.warn(`[AgentManager] interruptPaneAndWaitReady: proc-title read failed for pane ${paneId}:`, err);
+      return false;
+    }
+    if (!hasReplProcTitle(proc, runtime)) {
+      console.warn(`[AgentManager] interruptPaneAndWaitReady: pane ${paneId} not running ${runtime} (got ${proc.trim()}); holding`);
+      return false;
+    }
+    return true;
+  }
+
+  private async paneReachedReplReady(
+    tmux: TmuxManager,
+    paneId: string,
+    runtime: AgentRuntimeKind,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    try {
+      await tmux.waitReplReady(paneId, runtime, { timeoutMs, scrollback: 0 });
       return true;
     } catch (err) {
       console.warn(
@@ -1977,6 +2108,9 @@ export class AgentManager {
     const now = new Date().toISOString();
     await this.agentStore.update(agentId, (latest) => {
       if (!latest || latest.taskId !== taskId) return AGENT_STORE_NOOP;
+      // Don't downgrade a more-locked hold (e.g. cancel-clear-failed, DELETE-only) back to the transient
+      // cancel-clearing: a re-entrant terminal cleanup must not soften the un-cleared protection.
+      if (cancelPhaseDowngrades(latest.awaitingPhase, 'cancel-clearing')) return AGENT_STORE_NOOP;
       return {
         ...latest,
         status: 'awaiting_human',
@@ -2019,9 +2153,13 @@ export class AgentManager {
         resendIntervalMs: this.compactIdlePollMs,
       });
       await this.waitForReplPromptReady(tmux, paneId, runtime, this.clearContextWaitMs);
-      // Positively confirm the composer is empty: a ready anchor alone can sit above a composer that still
-      // holds the typed /clear (e.g. acceptComposerChange returned on an unrelated redraw). If /clear is
-      // still parked there, it was never submitted — treat as unconfirmed so the caller holds the pane.
+      // A rejected /clear ("…is disabled while a task is in progress.") returns to a bare prompt that now reads
+      // ready — but the context was NOT cleared, so hold the pane instead of releasing it.
+      if (await this.hasRuntimeSlashCommandRejection(tmux, paneId, '/clear')) {
+        console.warn(`[AgentManager] clearPaneContext: /clear rejected (task still in progress) for ${cfg.id}; unconfirmed`);
+        return false;
+      }
+      // /clear still parked in the composer → its Enter was swallowed, never submitted → unconfirmed.
       const afterClear = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
       if (CLEAR_PENDING_IN_COMPOSER_RE.test(afterClear)) {
         console.warn(`[AgentManager] clearPaneContext: /clear still in composer for ${cfg.id}; unconfirmed`);
@@ -2850,6 +2988,16 @@ export class AgentManager {
       );
       return;
     }
+    // Cancel may have taken over (markPaneCancelClearing keeps taskId, flips to a cancel-cleanup hold). This
+    // rollback would clear taskId + release the lock, making cancel's Phase 1 skip interrupt + /clear and leave
+    // an un-cleared pane bound to nothing — leave the binding/lock to the cancel owner.
+    if (isCancelCleanupHold(existing)) {
+      console.warn(
+        `[AgentManager] rollback: agent ${agentId} held by cancel cleanup (${existing?.awaitingPhase}); ` +
+        `leaving binding to the owner`,
+      );
+      return;
+    }
 
     const projectId = existing?.projectId ?? this.getAgentConfig(agentId)?.projectId;
     if (!projectId) {
@@ -3220,9 +3368,29 @@ export class AgentManager {
       throw new ApiError(409, `Agent ${agentId} compact or upload in progress; retry shortly`);
     }
     try {
+      // Refuse to paste into a pane cancel is tearing down. Re-check BOTH before and after the (slow) host
+      // write: cancel keeps taskId while flipping the hold, and it can land during writeImageToHost.
+      const assertUploadStillValid = async (): Promise<void> => {
+        const held = await this.agentStore.get(agentId);
+        if (!held || held.paneId !== paneId) {
+          throw new ApiError(409, `Agent ${agentId} session changed while uploading; image paste aborted`);
+        }
+        const boundTask = held.taskId ? await this.taskStore.get(held.taskId) : null;
+        if (boundTask && TERMINAL_STATUSES.includes(boundTask.status)) {
+          throw new ApiError(409, `Agent ${agentId} task ${held.taskId} is terminal; image upload refused`);
+        }
+        // taskStore.get yielded the loop — re-read the cancel hold LAST so a hold that landed during that await
+        // (e.g. while the slow host write was running) is caught before the paste.
+        const fresh = await this.agentStore.get(agentId);
+        if (!fresh || fresh.paneId !== paneId || isCancelCleanupHold(fresh)) {
+          throw new ApiError(409, `Agent ${agentId} is being cancelled (${fresh?.awaitingPhase}); image upload refused`);
+        }
+      };
+      await assertUploadStillValid();
       const runner = this.createRunnerFor(cfg);
       const path = agentHostPath(agentId, imageFilename(ext));
       await writeImageToHost(runner, path, bytes);
+      await assertUploadStillValid();
       const tmux = new TmuxManager(runner);
       await tmux.injectPrompt(paneId, `${path} `, agentId);
       return { path };
@@ -3706,23 +3874,36 @@ export class AgentManager {
     const now = new Date().toISOString();
     let agentMarkedRunning = false;
     try {
-      await this.agentStore.update(agentId, (existing) => ({
-        id: agentId,
-        projectId: agent.projectId,
-        paneId,
-        taskId,
-        worktreePath,
-        repoPath: workdir,
-        startedAt: now,
-        // Mark this dispatch as mid-bootstrap until the prompt is ack'd — recover() rolls back only a task
-        // it can positively see was never delivered, so a crash here doesn't leave it silently stuck.
-        bootstrappingTaskId: taskId,
-        updatedAt: now,
-        ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
-        ...(reuseInjectedSkills
-          ? { injectedSkills: { taskId, paneId, skills: reuseInjectedSkills } }
-          : {}),
-      }));
+      let cancelHoldWon = false;
+      await this.agentStore.update(agentId, (existing) => {
+        // This fresh rebuild would drop awaitingPhase: if cancel raced a hold in, overwriting it skips /clear.
+        if (isCancelCleanupHold(existing)) { cancelHoldWon = true; return AGENT_STORE_NOOP; }
+        return {
+          id: agentId,
+          projectId: agent.projectId,
+          paneId,
+          taskId,
+          worktreePath,
+          repoPath: workdir,
+          startedAt: now,
+          // Mark this dispatch as mid-bootstrap until the prompt is ack'd — recover() rolls back only a task
+          // it can positively see was never delivered, so a crash here doesn't leave it silently stuck.
+          bootstrappingTaskId: taskId,
+          updatedAt: now,
+          ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
+          ...(reuseInjectedSkills
+            ? { injectedSkills: { taskId, paneId, skills: reuseInjectedSkills } }
+            : {}),
+        };
+      });
+      if (cancelHoldWon) {
+        console.warn(
+          `[AgentManager] startSession[${phase}]: agent ${agentId} entered a cancel-cleanup hold during dispatch; ` +
+          `aborting so cancel can finish interrupt + /clear`,
+        );
+        try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
+        return false;
+      }
       agentMarkedRunning = true;
 
       const ack = await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
@@ -3783,6 +3964,16 @@ export class AgentManager {
                 );
                 return AGENT_STORE_NOOP;
               }
+              // Cancel may have taken over the binding while we waited for the pane mutex: markPaneCancelClearing
+              // keeps taskId but flips it to a cancel-cleanup hold. Tearing it down here would drop that hold and
+              // make cancel's Phase 2 skip /clear, reusing an un-cleared pane — leave it to the cancel owner.
+              if (isCancelCleanupHold(agentNow)) {
+                console.warn(
+                  `[AgentManager] startSession cleanup agentStore: agent ${agentId} held by cancel cleanup ` +
+                  `(${agentNow.awaitingPhase}); leaving binding to the owner`,
+                );
+                return AGENT_STORE_NOOP;
+              }
               released = true;
               void err;
               return {
@@ -3826,6 +4017,28 @@ export class AgentManager {
           throw new Error(
             `dispatch aborted: agent ${agentId} binding changed while waiting for pane mutex`,
           );
+        }
+        // Refuse to inject a cancelled task's prompt into a pane cancel is about to /clear — else this
+        // dispatch wins the mutex in cancel's interrupt→/clear gap and clearPaneContext fails to re-acquire
+        // it, stranding the agent at cancel-clear-failed. Cancel persists the agent hold
+        // (markPaneCancelClearing, keeps taskId) BEFORE flipping the task terminal, so check the hold too —
+        // a task-status-only check would slip through the window between the two writes.
+        if (isCancelCleanupHold(now)) {
+          throw new Error(
+            `dispatch aborted: agent ${agentId} taken over by cancel (${now.awaitingPhase}) while waiting for pane mutex`,
+          );
+        }
+        const boundTask = now.taskId ? await this.taskStore.get(now.taskId) : null;
+        if (boundTask && TERMINAL_STATUSES.includes(boundTask.status)) {
+          throw new Error(
+            `dispatch aborted: task ${now.taskId} for agent ${agentId} went terminal while waiting for pane mutex`,
+          );
+        }
+        // taskStore.get yielded the loop — re-read right before the paste so a cancel hold that landed during
+        // that await can't slip an injection into a pane cancel has taken over.
+        const fresh = await this.agentStore.get(agentId);
+        if (!fresh || fresh.paneId !== before.paneId || fresh.taskId !== before.taskId || isCancelCleanupHold(fresh)) {
+          throw new Error(`dispatch aborted: agent ${agentId} taken over by cancel before paste`);
         }
       }
       return await this.injectAndAwaitAckSteps(tmux, paneId, prompt, agentId, runtime);
@@ -4283,7 +4496,7 @@ export class AgentManager {
         // A cancel-cleanup hold must NOT be auto-released on restart (it would reuse the cancelled,
         // un-cleared/maybe-running pane). cancel-interrupt-failed has shouldReleaseHeldBinding=true (it's
         // operator-Resume recoverable), so exclude the whole cancel-cleanup set here explicitly.
-        const cancelHold = state.awaitingPhase != null && CANCEL_CLEANUP_HOLD_PHASES.has(state.awaitingPhase);
+        const cancelHold = isCancelCleanupHold(state);
         const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask) && !cancelHold;
         // 释放 binding 时同步清 worktree（与 resumeAgent 一致）——否则跨重启恢复后
         // worktreePath 在下面 update 中被丢弃，磁盘上的 worktree 永远无人回收。
@@ -5730,6 +5943,15 @@ export class AgentManager {
     }
   }
 
+  private async acquireCompactGuardWithin(agentId: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.tryAcquireCompactGuard(agentId)) {
+      if (Date.now() >= deadline) return false;
+      await new Promise(r => setTimeout(r, this.compactIdlePollMs));
+    }
+    return true;
+  }
+
   private tryAcquireCompactGuard(agentId: string): boolean {
     if (this.compactInFlight.has(agentId)) return false;
     this.compactInFlight.add(agentId);
@@ -6646,8 +6868,26 @@ export class AgentManager {
           `injectTextToAgent: agent ${agentId} no longer bound to ${opts.expectedTaskId}`,
         );
       }
+      // Same cancel race as the prompt dispatch: cancel persists the agent hold (keeps taskId) before the
+      // task flips terminal, and this responder can win the mutex in cancel's interrupt→/clear gap. Refuse to
+      // inject into a pane cancel is tearing down — by the hold AND by terminal task status.
+      if (isCancelCleanupHold(state)) {
+        throw new Error(`injectTextToAgent: agent ${agentId} taken over by cancel (${state?.awaitingPhase}); refusing injection`);
+      }
+      const boundTask = state?.taskId ? await this.taskStore.get(state.taskId) : null;
+      if (boundTask && TERMINAL_STATUSES.includes(boundTask.status)) {
+        throw new Error(`injectTextToAgent: task ${state?.taskId} for agent ${agentId} is terminal; refusing injection`);
+      }
       const paneId = state?.paneId;
       if (!paneId) throw new Error(`injectTextToAgent: agent ${agentId} has no live pane`);
+      // taskStore.get yielded the loop — re-read right before the paste so a cancel hold that landed during
+      // that await can't slip text into a pane cancel has taken over.
+      const fresh = await this.agentStore.get(agentId);
+      if (!fresh || fresh.paneId !== paneId
+        || (opts.expectedTaskId !== undefined && fresh.taskId !== opts.expectedTaskId)
+        || isCancelCleanupHold(fresh)) {
+        throw new Error(`injectTextToAgent: agent ${agentId} taken over by cancel before paste`);
+      }
       const tmux = new TmuxManager(this.createRunnerFor(cfg));
       await tmux.injectPrompt(paneId, text, agentId);
       await tmux.sendEnter(paneId);

@@ -221,7 +221,7 @@ describe('PaneStreamer', () => {
     it('returns initial empty snapshot + snapshotSeq=-1 when no prior data', async () => {
       const { streamer } = makeStreamer();
       const result = await streamer.subscribeAtomic(cbs);
-      expect(result.snapshot.cols).toBe(80);
+      expect(result.snapshot.cols).toBe(200);
       expect(result.snapshot.rows).toBe(50);
       expect(result.snapshot.data).toBe('');
       expect(result.snapshotSeq).toBe(-1);
@@ -639,14 +639,14 @@ describe('PaneStreamer', () => {
     it('still resizes tmux when requested dimensions match headless so web can reclaim latest sizing', async () => {
       const { streamer, runner, fakePty } = await subscribed();
       const beforeExecs = runner.exec.mock.calls.length;
-      await streamer.resize(80, 50);
+      await streamer.resize(200, 50);
       expect(runner.exec.mock.calls.length).toBeGreaterThan(beforeExecs);
       const resizeCmd = findCmd(runner, c =>
-        c.includes('tmux resize-window') && c.includes('-x 80') && c.includes('-y 50'),
+        c.includes('tmux resize-window') && c.includes('-x 200') && c.includes('-y 50'),
       );
       expect(resizeCmd).toBeDefined();
-      expect(fakePty.resizeCalls).toEqual([{ cols: 80, rows: 50 }]);
-      await expectDims(streamer, 80, 50);
+      expect(fakePty.resizeCalls).toEqual([{ cols: 200, rows: 50 }]);
+      await expectDims(streamer, 200, 50);
       streamer.destroy();
     });
 

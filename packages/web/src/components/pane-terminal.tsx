@@ -56,13 +56,6 @@ export function stripTerminalAutoReplies(data: string): string {
   return data.replace(TERMINAL_REPLY_PATTERN, '');
 }
 
-// Compact preview renders at the server pane geometry; when that's wider than the card, scale the
-// xterm host to fit so nothing is clipped on the right. Clamp to 1 (never upscale); 0/invalid → 1.
-export function computePreviewScale(containerWidth: number, contentWidth: number): number {
-  if (!(containerWidth > 0) || !(contentWidth > 0)) return 1;
-  return Math.min(1, containerWidth / contentWidth);
-}
-
 const OSC52_MAX_B64 = 1024 * 1024;
 
 // OSC 52 payload is `<selector>;<base64>`; tmux emits an empty selector (`;<b64>`). Returns the text
@@ -118,8 +111,6 @@ export function PaneTerminal({
   const liveRafRef = useRef<number | null>(null);
   const liveFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previewScrollRafRef = useRef<number | null>(null);
-  const previewScaleRef = useRef(1);
-  const shouldScaleStaticPreviewRef = useRef(false);
   const writeChainRef = useRef<Promise<void>>(Promise.resolve());
   const writeGenerationRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
@@ -143,32 +134,19 @@ export function PaneTerminal({
     });
   };
 
+  // Preview keeps the server's full-screen geometry, which is taller than the card; the default
+  // browser behavior reveals the TOP rows (oldest). Anchor the cursor row to the bottom of the
+  // visible slice so the latest output is always in view — for every preview render, whether it is
+  // maxLines-clipped (activity preview) or just overflow-clipped by its container (embedded card).
   const isStaticPreview = streamMode === 'preview';
-  const shouldScaleStaticPreview = isStaticPreview && !!(maxLines && maxLines > 0);
-  shouldScaleStaticPreviewRef.current = shouldScaleStaticPreview;
-  const applyPreviewScale = (el: HTMLDivElement, t: XTerm): void => {
-    const host = t.element;
-    if (!host) return;
-    if (!shouldScaleStaticPreviewRef.current) {
-      previewScaleRef.current = 1;
-      host.style.transformOrigin = '';
-      host.style.transform = '';
-      return;
-    }
-    const scale = computePreviewScale(el.clientWidth, host.scrollWidth);
-    previewScaleRef.current = scale;
-    host.style.transformOrigin = 'top left';
-    host.style.transform = scale < 1 ? `scale(${scale})` : '';
-  };
   const scrollPreviewToCursor = (): void => {
     if (!isStaticPreview) return;
     const el = containerRef.current;
     const t = termRef.current;
     if (!el || !t) return;
-    applyPreviewScale(el, t);
     if (el.clientHeight <= 0) return;
     const cursorY = t.buffer.active.cursorY;
-    const cursorBottomPx = (cursorY + 1) * TERMINAL_LINE_HEIGHT_PX * previewScaleRef.current;
+    const cursorBottomPx = (cursorY + 1) * TERMINAL_LINE_HEIGHT_PX;
     el.scrollTop = Math.max(0, cursorBottomPx - el.clientHeight);
   };
   const schedulePreviewScrollToCursor = (): void => {

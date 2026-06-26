@@ -65,9 +65,7 @@ const DEFAULT_REATTACH_JITTER = 0.2;
 // bytes (SSH banner, "Connection closed" stderr) before dying, which must NOT reset backoff.
 const DEFAULT_REATTACH_STABLE_AFTER_MS = 5000;
 const DEFAULT_SESSION_PROBE_TIMEOUT_MS = 3000;
-// 80 = standard terminal width: keeps an unattended agent's pane no wider than the read-only preview
-// card (else it's right-clipped). Must stay in sync with TmuxManager.createSession's `-x 80`.
-const DEFAULT_COLS = 80;
+const DEFAULT_COLS = 200;
 const DEFAULT_ROWS = 50;
 
 let cachedPtyFactory: PtyFactory | null = null;

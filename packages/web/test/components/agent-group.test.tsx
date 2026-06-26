@@ -97,11 +97,6 @@ function classToken(el: HTMLElement, prefix: string): string {
   return el.className.split(/\s+/).find(token => token.startsWith(prefix)) ?? '';
 }
 
-function tailwindSpacingPx(token: string): number {
-  const value = token.split('-').at(-1);
-  return Number.parseFloat(value ?? '') * 4;
-}
-
 type RenderGroupOptions = {
   group?: AgentConfig[];
   agentsById?: Map<string, AgentSnapshot>;
@@ -207,7 +202,7 @@ describe('AgentGroup', () => {
     expect(within(region).getByText('暂无任务')).toBeTruthy();
   });
 
-  it('reserves top grid space for card pets that escape upward', () => {
+  it('keeps the grid flush below the task bar even with a card pet — the pet may overlap it (no extra top gap)', () => {
     renderGroup([task()], {
       agentsById: new Map([
         ['dev-1', { ...agent('dev-1'), petId: 'pet-1' }],
@@ -219,14 +214,13 @@ describe('AgentGroup', () => {
     const petFrame = pet.parentElement as HTMLElement;
     const card = pet.closest('.card') as HTMLElement;
     const grid = card.parentElement as HTMLElement;
-    const gridPaddingClass = classToken(grid, 'pt-');
-    const petTopClass = classToken(petFrame, '-top-');
-    expect(gridPaddingClass.length).toBeGreaterThan(0);
-    expect(petTopClass.length).toBeGreaterThan(0);
-    expect(tailwindSpacingPx(gridPaddingClass)).toBeGreaterThanOrEqual(tailwindSpacingPx(petTopClass));
+    // No reserved top padding — the task bar stays close to the card; the pet is allowed to overlap it.
+    expect(classToken(grid, 'pt-')).toBe('');
+    // The pet still escapes the card border upward (so it overlaps the task bar rather than being clipped).
+    expect(classToken(petFrame, '-top-').length).toBeGreaterThan(0);
   });
 
-  it('does not add pet escape spacing when no card pet is rendered', () => {
+  it('does not add grid top spacing when no card pet is rendered', () => {
     renderGroup([task()]);
 
     const card = within(screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' }))

@@ -65,9 +65,10 @@ function readyRunner(): CommandRunner {
 function clearAwareRunner(
   sentKeys: string[],
   paneInfo: (pane: string) => { proc: string; idle: string },
-  opts: { failClear?: (pane: string) => boolean; swallowClearEnters?: number } = {},
+  opts: { failClear?: (pane: string) => boolean; swallowClearEnters?: number; rejectClear?: (pane: string) => boolean } = {},
 ): CommandRunner {
   const clearTyped = new Set<string>();
+  const rejected = new Set<string>();
   const swallowed = new Map<string, number>();
   const paneOf = (cmd: string): string => cmd.match(/%\d+/)?.[0] ?? '';
   return {
@@ -82,7 +83,7 @@ function clearAwareRunner(
           const n = swallowed.get(pane) ?? 0;
           // Simulate a swallowed Enter: the composer keeps /clear until a resend lands.
           if (n < (opts.swallowClearEnters ?? 0)) swallowed.set(pane, n + 1);
-          else clearTyped.delete(pane);
+          else { clearTyped.delete(pane); if (opts.rejectClear?.(pane)) rejected.add(pane); }
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
@@ -91,8 +92,11 @@ function clearAwareRunner(
       if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
         return { stdout: `${info.proc}\n`, stderr: '', exitCode: 0 };
       }
-      // info.idle ends at the prompt marker; a typed-but-unsubmitted /clear renders on that prompt line.
-      const frame = clearTyped.has(pane) ? `${info.idle} /clear` : info.idle;
+      // info.idle ends at the prompt marker; a typed-but-unsubmitted /clear renders on that prompt line; a
+      // submitted-but-rejected /clear shows the runtime's "disabled while a task is in progress" toast above it.
+      const frame = rejected.has(pane)
+        ? `■ '/clear' is disabled while a task is in progress.\n${info.idle}`
+        : clearTyped.has(pane) ? `${info.idle} /clear` : info.idle;
       // capturePaneSnapshot: `capture-pane -e -p && printf SEP && display-message history_size`.
       if (cmd.includes('capture-pane') && cmd.includes('history_size')) {
         return { stdout: `${frame}\n___bx-snap-sep___\n0\n`, stderr: '', exitCode: 0 };
@@ -888,6 +892,89 @@ describe('AgentManager task binding flow', () => {
     expect(stateAfter?.taskId).toBe(t.id);
     expect(stateAfter?.worktreePath).toBeTruthy();
     expect(stateAfter?.updatedAt).not.toBe(beforeUpdatedAt); // agentStore 第一次 set 过 startedAt
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  it('startSession cleanup leaves the binding when cancel took it over (cancel-clearing) during the mutex wait', async () => {
+    const t = await seedTask({ id: 'task-ss-cancel-clearing', branch: 'bx/task-ss-cancel-clearing' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
+    });
+    // Dispatch wins the pane mutex after cancel released Phase 1; injectAndAwaitAck's task-terminal guard
+    // aborts, but cancel has already marked the agent cancel-clearing (keeps taskId) — the cleanup must not
+    // wipe that hold (else Phase 2 skips /clear and reuses an un-cleared pane).
+    vi.spyOn(manager as unknown as { injectAndAwaitAck: () => Promise<unknown> }, 'injectAndAwaitAck')
+      .mockImplementation(async () => {
+        await (manager as unknown as { markPaneCancelClearing: (a: string, tid: string) => Promise<void> })
+          .markPaneCancelClearing('dev-1', t.id);
+        throw new Error('dispatch aborted: task went terminal while waiting for pane mutex');
+      });
+    const minimalRunner: CommandRunner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('git worktree add')) return { stdout: '', stderr: '', exitCode: 0 };
+        if (cmd.includes('git rev-parse')) return { stdout: 'abc123\n', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async () => undefined),
+    };
+    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow(/went terminal/);
+
+    const stateAfter = await agentStore.get('dev-1');
+    expect(stateAfter?.taskId).toBe(t.id);                 // binding preserved for cancel's Phase 2
+    expect(stateAfter?.awaitingPhase).toBe('cancel-clearing');
+    expect(await lockManager.isLocked('dev-1')).toBe(true); // lock not released
+  });
+
+  it('startSession set-running write preserves a cancel-clearing hold present at write time (does NOT wipe it)', async () => {
+    // Dangerous ordering: cancel installs the hold BEFORE startSession's set-running write (vs test above, where
+    // it lands during injectAndAwaitAck). The fresh-rebuild write must not overwrite the hold — else cancel's
+    // Phase 2 skips /clear and the next dispatch reuses an un-cleared pane.
+    const t = await seedTask({ id: 'task-ss-cancel-clearing-prewrite', branch: 'bx/task-ss-cancel-clearing-prewrite' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await lockManager.acquire('dev-1');
+
+    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
+    });
+    const injectSpy = vi.spyOn(manager as unknown as { injectAndAwaitAck: () => Promise<unknown> }, 'injectAndAwaitAck')
+      .mockRejectedValue(new Error('injectAndAwaitAck must not run when a cancel hold owns the binding'));
+    const minimalRunner: CommandRunner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('git worktree add')) return { stdout: '', stderr: '', exitCode: 0 };
+        if (cmd.includes('git rev-parse')) return { stdout: 'abc123\n', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async () => undefined),
+    };
+    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
+
+    const result = await manager.startSession(t.id, 'dev-1', 'develop');
+
+    expect(result).toBe(false);                              // dispatch aborted, not run onto a held pane
+    expect(injectSpy).not.toHaveBeenCalled();                // never injected the prompt
+    const stateAfter = await agentStore.get('dev-1');
+    expect(stateAfter?.taskId).toBe(t.id);                   // binding preserved for cancel's Phase 2
+    expect(stateAfter?.awaitingPhase).toBe('cancel-clearing');
+    expect(stateAfter?.bootstrappingTaskId).toBeUndefined(); // never marked mid-bootstrap
+    expect(await lockManager.isLocked('dev-1')).toBe(true);  // lock not released
+  });
+
+  it('rollbackFailedDispatch leaves the binding/lock when the agent is held by cancel cleanup', async () => {
+    const t = await seedTask({ id: 'task-rollback-cancel', status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await lockManager.acquire('dev-1');
+
+    await (manager as unknown as { rollbackFailedDispatch: (tid: string, aid: string) => Promise<void> })
+      .rollbackFailedDispatch(t.id, 'dev-1');
+
+    const st = await agentStore.get('dev-1');
+    expect(st?.taskId).toBe(t.id);                  // binding left for cancel's Phase 1
+    expect(st?.awaitingPhase).toBe('cancel-clearing');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
@@ -2589,6 +2676,31 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
+  // A /clear rejected as "disabled while a task is in progress" returns to a bare prompt that now reads ready;
+  // clearPaneContext must detect the rejection toast and hold (un-cleared), not release the pane.
+  it('cancel holds the pane (cancel-clear-failed) when /clear is rejected as disabled-while-task-in-progress', async () => {
+    const sentKeys: string[] = [];
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      runnerFactory: () => clearAwareRunner(sentKeys, () => CLAUDE_PANE, { rejectClear: () => true }),
+    });
+    setCompactTiming(localManager);
+    (localManager as unknown as { clearContextWaitMs: number }).clearContextWaitMs = 2_000;
+
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    const cancelled = await localManager.cancelTask(t.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    // rejection detected → /clear unconfirmed → pane held, NOT released for reuse.
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe(t.id);
+    expect(dev?.awaitingPhase).toBe('cancel-clear-failed');
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
   // Cancel persists a cancel-clearing hold before the ESC→/clear window. If the process restarts mid-window,
   // recover() must keep the un-cleared pane held (not release it for reuse with the cancelled context).
   it('recover() holds a cancel-clearing agent bound to a cancelled task (restart mid-cleanup)', async () => {
@@ -2640,6 +2752,507 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     expect(dev?.taskId).toBe('task-y'); // not auto-released despite the terminal task
     expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+});
+
+describe('interruptPaneAndWaitReady composer recovery', () => {
+  // The method is private and does real multi-second waits; drive its control flow by spying the
+  // TmuxManager methods (the instance is built inside the method, so prototype spies apply).
+  function callInterrupt(
+    mgr: AgentManager,
+    state: AgentBindingFacts,
+    cfg: AgentConfig & { projectId: string },
+  ): Promise<boolean> {
+    return (mgr as unknown as {
+      interruptPaneAndWaitReady: (s: AgentBindingFacts, c: AgentConfig & { projectId: string }) => Promise<boolean>;
+    }).interruptPaneAndWaitReady(state, cfg);
+  }
+  function cfgOf(mgr: AgentManager, id: string): AgentConfig & { projectId: string } {
+    return (mgr as unknown as {
+      getAgentConfig: (id: string) => AgentConfig & { projectId: string };
+    }).getAgentConfig(id);
+  }
+  // Record sent keys + answer the proc-title probe with the runtime (codex → `node`) by default. Used by the
+  // hold cases that never reach C-c (they set their own waitReplReady / capturePaneById).
+  function spyKeys(proc = 'node'): string[] {
+    const keys: string[] = [];
+    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue(proc);
+    return keys;
+  }
+  // Simulate cancel cleanup. ESC's waitReplReady rejects (still dirty); capturePaneById returns the dirty
+  // screen until a C-c is sent, then `afterCtrlC` (drives the liveness sampling). The post-C-c verify is
+  // waitReplReady again — it resolves ONLY if the clear reached a ready prompt (opts.cleanAfterCtrlC, default
+  // true); foreign-node / undismissed-blocker cases pass cleanAfterCtrlC:false so the verify holds.
+  function spyClearFlow(dirty: string, afterCtrlC: string, opts: { proc?: string; cleanAfterCtrlC?: boolean } = {}): string[] {
+    const proc = opts.proc ?? 'node';
+    const cleanAfterCtrlC = opts.cleanAfterCtrlC ?? true;
+    const keys: string[] = [];
+    let cleared = false;
+    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => {
+      keys.push(k);
+      if (k === 'C-c') cleared = true;
+    });
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue(proc);
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockImplementation(async () => {
+      if (cleared && cleanAfterCtrlC) return; // C-c reached a clean/ready prompt
+      throw new Error('repl not ready');
+    });
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockImplementation(async () => (cleared ? afterCtrlC : dirty));
+    return keys;
+  }
+
+  // A cancelled Codex prompt left un-submitted in the composer (no busy markers). Cleared by C-c.
+  const STUCK_COMPOSER =
+    '› Title: 优化 Agent Pet 样式\n  1. Agent Pet 再放大一点点\n  2. ...\n  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
+  // A dirty composer whose pasted text ITSELF contains "Working (…)" / "esc to interrupt" (Issue A).
+  const BUSY_LOOKING_COMPOSER =
+    '› 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
+  // A LONG pasted prompt whose `›` first line has scrolled off the visible pane — no composer glyph visible.
+  const LONG_COMPOSER_NO_GLYPH =
+    'pasted diagnostics line\n'.repeat(14) + '  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
+  // After C-c: a cleared Codex composer shown as a bare `›` (banner/footer/placeholder scrolled off).
+  const CLEARED_BARE_PROMPT = '› \n  gpt-5.5 xhigh · ~/.baxian/repos/example-owner/example-repo\n';
+  // A human running `node` in a crashed Codex pane: node's `>` prompt (U+003E), never becomes a Codex `›`.
+  const NODE_HUMAN_SESSION = 'running diagnostics…\n> \n';
+  // A Claude dirty composer (❯ with text) → after C-c a clean empty `❯` (a ready view for Claude).
+  const CLAUDE_DIRTY = '❯ 修复 web terminal 乱码\n';
+  const CLAUDE_CLEARED = '❯ \n';
+  // A genuinely running turn whose elapsed seconds advance across grabs (repaints → live).
+  const RUNNING_TURN_A = '• Working (12s)\n  esc to interrupt\n';
+  const RUNNING_TURN_B = '• Working (13s)\n  esc to interrupt\n';
+  // A real running Claude turn whose spinner sits high in a tall pane and advances across grabs.
+  const CLAUDE_RUN_A = '✶ Grooving… (12s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
+  const CLAUDE_RUN_B = '✶ Grooving… (13s)\n' + 'tool output\n'.repeat(12) + '❯ \n';
+  // A static (non-live) runtime menu — C-c that doesn't dismiss it leaves no clean composer → hold.
+  const RUNTIME_MENU = 'Select a model\n  Enter to confirm · Esc to cancel\n';
+  // A live turn with NO busy marker visible (long tool output pushed Working/spinner off-screen), advancing.
+  const GROWING_OUTPUT_A = 'building project…\n  compiled module 1\n';
+  const GROWING_OUTPUT_B = 'building project…\n  compiled module 2\n';
+  // A permission/confirm blocker sitting above a bare `›` — C-c that doesn't dismiss it is NOT a clean composer.
+  const BLOCKER_OVER_PROMPT = 'Allow command `rm -rf`?\n  Press Enter to confirm or Esc to cancel\n› \n';
+
+  it('C-c clears an un-submitted composer and verifies it reached a clean composer (qa-1: codex)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(STUCK_COMPOSER, CLEARED_BARE_PROMPT);
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']); // C-c left a bare `›` empty composer → verified clean
+  });
+
+  it('C-c clears a dirty composer whose text contains "Working"/"esc to interrupt" (Issue A)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(BUSY_LOOKING_COMPOSER, CLEARED_BARE_PROMPT);
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']); // busy-looking but static → cleared → verified clean
+  });
+
+  it('C-c clears a LONG composer whose `›` scrolled off — verified by the OUTCOME, not a visible glyph', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(LONG_COMPOSER_NO_GLYPH, CLEARED_BARE_PROMPT);
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']); // no visible `›` before C-c, but the cleared composer verifies
+  });
+
+  it('C-c clears a Claude dirty composer and verifies the empty ❯ prompt (dev-1: claude-code)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(CLAUDE_DIRTY, CLAUDE_CLEARED, { proc: 'claude' });
+
+    await seedAgent({ id: 'dev-1', paneId: '%3' });
+    const ok = await callInterrupt(manager, (await agentStore.get('dev-1'))!, cfgOf(manager, 'dev-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']);
+  });
+
+  it('holds (no C-c) when a turn is genuinely still running after ESC (screen changes between grabs)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    const keys = spyKeys();
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockResolvedValueOnce(RUNNING_TURN_A)
+      .mockResolvedValueOnce(RUNNING_TURN_B);
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']); // live turn caught before C-c → never C-c'd
+  });
+
+  it('holds (no C-c) on a real running Claude turn whose high spinner advances between grabs (dev-1)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    const keys = spyKeys('claude');
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockResolvedValueOnce(CLAUDE_RUN_A)
+      .mockResolvedValueOnce(CLAUDE_RUN_B);
+
+    await seedAgent({ id: 'dev-1', paneId: '%3' });
+    const ok = await callInterrupt(manager, (await agentStore.get('dev-1'))!, cfgOf(manager, 'dev-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']); // repaints → live → hold
+  });
+
+  it('holds (no C-c) when the pane is no longer running the runtime (crashed to shell)', async () => {
+    const keys = spyKeys('zsh'); // proc title is not the runtime
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById');
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']); // no C-c into a shell
+    expect(captureSpy).not.toHaveBeenCalled(); // proc-title gate fails before any liveness probe
+  });
+
+  it('re-checks proc title right before C-c: holds (no C-c) if the runtime crashed to a shell during the liveness window', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys: string[] = [];
+    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
+    // runtime at the first gate, then a shell by the time we're about to send C-c
+    vi.spyOn(TmuxManager.prototype, 'displayMessage')
+      .mockResolvedValueOnce('node')
+      .mockResolvedValue('zsh');
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    // static (non-live) screen so paneHasLiveTurn returns false and we reach the pre-C-c re-check
+    const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockResolvedValue('idle diagnostics output\n  gpt-5.5 xhigh · ~/repo\n');
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']);     // NO C-c — the re-check caught the shell after liveness sampling
+    expect(captureSpy).toHaveBeenCalled(); // first gate passed; liveness ran before the second gate held
+  });
+
+  it('holds (no C-c) when the screen is static but the OSC braille title ADVANCES across samples (live turn)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    const keys: string[] = [];
+    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node'); // proc-title gate: still the runtime
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle')
+      .mockResolvedValueOnce('⠋ Working') // first sample
+      .mockResolvedValue('⠙ Working');    // advanced spinner → live
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue('quiet build output\n  no spinner here\n');
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']); // advancing title → live → hold (no C-c into a running turn)
+  });
+
+  it('does NOT treat a STALE static working-shaped OSC title as live — C-c proceeds (else cancel-interrupt-failed)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(STUCK_COMPOSER, CLEARED_BARE_PROMPT); // dirty composer cleared by C-c
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('⠹ Working'); // leftover, NEVER changes
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape', 'C-c']); // static stale title is not evidence of life → clear proceeds
+  });
+
+  it('an ADVANCING OSC title is live even when the screen momentarily shows a ready-looking prompt', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    const keys: string[] = [];
+    vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle')
+      .mockResolvedValueOnce('⠋ Working')
+      .mockResolvedValue('⠙ Working'); // spinner advances → live, despite the ready-looking screen
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue('› \n'); // momentarily ready-looking
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']); // advancing title checked BEFORE visible-idle → live → hold (no C-c)
+  });
+
+  it('holds AFTER one C-c when a human `node` session never becomes a Codex composer (`>` ≠ `›`)', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(NODE_HUMAN_SESSION, NODE_HUMAN_SESSION, { cleanAfterCtrlC: false }); // `>` never becomes a ready Codex prompt
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape', 'C-c']); // verify finds no clean Codex composer → hold (no auto-release)
+  });
+
+  it('holds AFTER C-c when a runtime menu does not dismiss to a clean composer', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(RUNTIME_MENU, RUNTIME_MENU, { cleanAfterCtrlC: false }); // menu not dismissed → not ready
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape', 'C-c']);
+  });
+
+  it('holds (no C-c) on a live turn with NO busy marker — sampled for change, not gated on busy markers', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    const keys = spyKeys();
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockRejectedValue(new Error('repl not ready'));
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById')
+      .mockResolvedValueOnce(GROWING_OUTPUT_A)
+      .mockResolvedValueOnce(GROWING_OUTPUT_B); // output grows → live, even with no Working/spinner/esc marker
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape']); // changed across grabs → live → hold (no C-c)
+  });
+
+  it('holds AFTER C-c when a bare `›` still sits under a permission/confirm blocker', async () => {
+    Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    const keys = spyClearFlow(BLOCKER_OVER_PROMPT, BLOCKER_OVER_PROMPT, { cleanAfterCtrlC: false }); // blocker not dismissed → not ready
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual(['Escape', 'C-c']); // bare `›` + blocker ≠ clean composer → hold
+  });
+
+  it('holds DELETE-only (cancel-clear-failed) without sending keys when the pane mutex stays busy past the wait window', async () => {
+    Object.assign(manager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
+    const keys = spyKeys();
+    (manager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('qa-1'); // never released
+    // mirror the cancel flow: the agent is already cancel-clearing when Phase 1 runs
+    await seedAgent({ id: 'qa-1', taskId: 'tBusy', paneId: '%7', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(false);
+    expect(keys).toEqual([]); // never races a dispatch's keystrokes on the same pane
+    // pane unverified → classified un-cleared/DELETE-only, NOT Resume-able cancel-interrupt-failed
+    expect((await agentStore.get('qa-1'))?.awaitingPhase).toBe('cancel-clear-failed');
+  });
+
+  it('waits for a busy pane mutex and proceeds once the in-flight dispatch releases it (no instant hold)', async () => {
+    Object.assign(manager, { cancelInterruptGuardWaitMs: 2_000, compactIdlePollMs: 5 });
+    const keys = spyKeys();
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined); // idle reached on ESC
+    const inFlight = (manager as unknown as { compactInFlight: Set<string> }).compactInFlight;
+    inFlight.add('qa-1');
+    setTimeout(() => inFlight.delete('qa-1'), 25); // dispatch releases the mutex shortly after
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const ok = await callInterrupt(manager, (await agentStore.get('qa-1'))!, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape']); // acquired the mutex after release, then interrupted (not cancel-interrupt-failed)
+  });
+
+  it('returns ready on ESC alone, without capturing or escalating, when the pane is already idle', async () => {
+    const keys = spyKeys();
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
+    const captureSpy = vi.spyOn(TmuxManager.prototype, 'capturePaneById');
+
+    await seedAgent({ id: 'qa-1', paneId: '%7' });
+    const state = (await agentStore.get('qa-1'))!;
+    const ok = await callInterrupt(manager, state, cfgOf(manager, 'qa-1'));
+
+    expect(ok).toBe(true);
+    expect(keys).toEqual(['Escape']);
+    expect(captureSpy).not.toHaveBeenCalled();
+  });
+
+  // Closes the interrupt→/clear mutex gap: a dispatch that wins the pane mutex after cancel released Phase 1
+  // must not inject a cancelled task's prompt (cancel keeps taskId, so the paneId/taskId check alone misses it).
+  it('injectAndAwaitAck aborts a dispatch whose bound task went terminal while waiting for the pane mutex', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const tmux = new TmuxManager(readyRunner());
+    await expect(
+      callInjectAndAwaitAck(manager, tmux, '%0', 'prompt', 'dev-1', 'claude-code'),
+    ).rejects.toThrow(/went terminal/);
+  });
+
+  it('injectAndAwaitAck aborts when cancel marked the agent cancel-clearing before the task flips terminal', async () => {
+    const t = await seedTask({ status: 'in_progress' }); // task NOT terminal yet — cancel writes the hold first
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    const tmux = new TmuxManager(readyRunner());
+    await expect(
+      callInjectAndAwaitAck(manager, tmux, '%0', 'prompt', 'dev-1', 'claude-code'),
+    ).rejects.toThrow(/taken over by cancel/);
+  });
+
+  it('injectAndAwaitAck re-checks after the task read: aborts before paste if cancel lands during taskStore.get', async () => {
+    const t = await seedTask({ status: 'in_progress' }); // not terminal — the hold lands DURING the bound-task read
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' }); // no hold at the first check
+    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    const realGet = taskStore.get.bind(taskStore);
+    vi.spyOn(taskStore, 'get').mockImplementation(async (id: string) => {
+      await agentStore.update('dev-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
+      return realGet(id);
+    });
+    const tmux = new TmuxManager(readyRunner());
+    await expect(
+      callInjectAndAwaitAck(manager, tmux, '%0', 'prompt', 'dev-1', 'claude-code'),
+    ).rejects.toThrow(/taken over by cancel before paste/);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('injectTextToAgent re-checks after the task read: aborts before paste if cancel lands during taskStore.get', async () => {
+    const t = await seedTask({ status: 'in_progress' }); // not terminal — hold lands DURING the bound-task read
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' }); // no hold at the first check
+    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    const realGet = taskStore.get.bind(taskStore);
+    vi.spyOn(taskStore, 'get').mockImplementation(async (id: string) => {
+      await agentStore.update('qa-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
+      return realGet(id);
+    });
+    await expect(
+      manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
+    ).rejects.toThrow(/taken over by cancel before paste/);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('injectTextToAgent (read-file responder) refuses to inject into a pane held by cancel cleanup', async () => {
+    await seedTask({ id: 'task-rf-hold', status: 'in_progress' }); // task not yet terminal — cancel wrote the hold first
+    await seedAgent({ id: 'qa-1', taskId: 'task-rf-hold', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await expect(
+      manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: 'task-rf-hold' }),
+    ).rejects.toThrow(/taken over by cancel/);
+  });
+
+  it('injectTextToAgent refuses to inject when the bound task is already terminal', async () => {
+    const t = await seedTask({ id: 'task-rf-terminal', status: 'cancelled' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await expect(
+      manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
+    ).rejects.toThrow(/terminal/);
+  });
+
+  it('attachImageToRunningAgent refuses to paste into a pane held by cancel cleanup', async () => {
+    await seedTask({ id: 'task-img-hold', status: 'in_progress' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-img-hold', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await expect(
+      manager.attachImageToRunningAgent('qa-1', Buffer.from('img'), 'png'),
+    ).rejects.toThrow(/being cancelled/);
+  });
+
+  it('attachImageToRunningAgent refuses when the bound task is already terminal', async () => {
+    const t = await seedTask({ id: 'task-img-terminal', status: 'cancelled' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await expect(
+      manager.attachImageToRunningAgent('qa-1', Buffer.from('img'), 'png'),
+    ).rejects.toThrow(/terminal/);
+  });
+
+  it('attachImageToRunningAgent re-checks cancel state AFTER the slow host write — refuses the paste if cancel landed', async () => {
+    await seedTask({ id: 'task-img-toctou', status: 'in_progress' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-img-toctou', paneId: '%0' });
+    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    // Cancel lands DURING writeImageToHost: the (non-ssh) host write installs the cancel-clearing hold.
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      runnerFactory: () => ({
+        exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+        writeFile: vi.fn(async () => {
+          await agentStore.update('dev-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
+        }),
+      } as unknown as CommandRunner),
+    });
+
+    await expect(
+      localManager.attachImageToRunningAgent('dev-1', Buffer.from('img'), 'png'),
+    ).rejects.toThrow(/being cancelled/);
+    expect(injectSpy).not.toHaveBeenCalled(); // never pasted into the pane cancel is tearing down
+  });
+
+  it('attachImageToRunningAgent re-checks the cancel hold AFTER its task read (closes the assertUploadStillValid gap)', async () => {
+    await seedTask({ id: 'task-img-taskgap', status: 'in_progress' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-img-taskgap', paneId: '%0' });
+    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    const realGet = taskStore.get.bind(taskStore);
+    vi.spyOn(taskStore, 'get').mockImplementation(async (id: string) => {
+      await agentStore.update('dev-1', (s) => (s ? { ...s, status: 'awaiting_human', awaitingPhase: 'cancel-clearing' } : AGENT_STORE_NOOP));
+      return realGet(id);
+    });
+    const localManager = makeManager({
+      skillRegistry: freshRegistry(),
+      runnerFactory: () => ({
+        exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+        writeFile: vi.fn(async () => undefined),
+      } as unknown as CommandRunner),
+    });
+    await expect(
+      localManager.attachImageToRunningAgent('dev-1', Buffer.from('img'), 'png'),
+    ).rejects.toThrow(/being cancelled/);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('cancel-interrupt guard wait is derived from the configured dispatch ack timeout (not the default)', () => {
+    const m = makeManager({ skillRegistry: freshRegistry(), dispatchAckTimeoutMs: 60_000 }) as unknown as {
+      cancelInterruptGuardWaitMs: number; dispatchAckTimeoutMs: number;
+    };
+    expect(m.dispatchAckTimeoutMs).toBe(60_000);
+    expect(m.cancelInterruptGuardWaitMs).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('markAwaitingHuman does not let a generic hold overwrite a cancel-cleanup hold (but cancel transitions do)', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+
+    await manager.markAwaitingHuman('dev-1', 'code-dispatch-failed', 'generic dispatch failure');
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing'); // preserved
+
+    await manager.markAwaitingHuman('dev-1', 'cancel-clear-failed', 'cancel /clear unconfirmed');
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clear-failed'); // in-set transition allowed
+  });
+
+  it('markAwaitingHuman does NOT downgrade cancel-clear-failed (DELETE-only) to cancel-interrupt-failed', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
+    await manager.markAwaitingHuman('dev-1', 'cancel-interrupt-failed', 'late interrupt failure');
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clear-failed'); // monotonic: no downgrade
+  });
+
+  it('markAwaitingHuman still allows the escalation cancel-clearing → cancel-interrupt-failed', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
+    await manager.markAwaitingHuman('dev-1', 'cancel-interrupt-failed', 'interrupt failed');
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
+  });
+
+  it('markPaneCancelClearing does NOT downgrade an existing cancel-clear-failed back to cancel-clearing', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
+    await (manager as unknown as { markPaneCancelClearing: (a: string, t: string) => Promise<void> })
+      .markPaneCancelClearing('dev-1', 'tX');
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clear-failed'); // re-entrant cleanup can't soften it
+  });
+
+  it('markPaneCancelClearing still sets cancel-clearing from a non-hold binding (initial cancel)', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'tX', paneId: '%0' });
+    await (manager as unknown as { markPaneCancelClearing: (a: string, t: string) => Promise<void> })
+      .markPaneCancelClearing('dev-1', 'tX');
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
+  });
+
+  it('cancel-interrupt guard wait covers the dispatch ack window (so cancel-during-ack is not dropped to hold)', () => {
+    const m = manager as unknown as { cancelInterruptGuardWaitMs: number; dispatchAckTimeoutMs: number };
+    expect(m.cancelInterruptGuardWaitMs).toBeGreaterThanOrEqual(m.dispatchAckTimeoutMs);
   });
 });
 

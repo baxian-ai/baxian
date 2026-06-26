@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, runtimeBusyCheck } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
@@ -45,10 +45,10 @@ describe('TmuxManager', () => {
       expect(cmd).toContain("-c '/home/user/code'");
     });
 
-    it('sets default pane size 80x50 via -x/-y', async () => {
+    it('sets default pane size 200x50 via -x/-y', async () => {
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('-x 80');
+      expect(cmd).toContain('-x 200');
       expect(cmd).toContain('-y 50');
     });
 
@@ -549,6 +549,24 @@ describe('TmuxManager', () => {
       let submitted = false;
       runner.exec.mockImplementation(async () => ({
         stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : 'idle composer\n', 0),
+        stderr: '',
+        exitCode: 0,
+      }));
+      const resend = vi.fn(async () => { submitted = true; });
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).resolves.toBeUndefined();
+      expect(resend).toHaveBeenCalled();
+    });
+
+    // A long injected prompt wraps the composer across many rows — the case a narrow pane made worse.
+    // The swallowed-Enter recovery must still fire (it keys off "composer byte-identical to baseline").
+    it('re-sends Enter for a long multi-line pasted prompt held in the composer (no message left unsent)', async () => {
+      const longComposer = Array.from({ length: 40 }, (_, i) => `wrapped prompt line ${i} ......................`).join('\n') + '\n';
+      const baseline = buildBaseline(longComposer, 0);
+      let submitted = false;
+      runner.exec.mockImplementation(async () => ({
+        stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : longComposer, 0),
         stderr: '',
         exitCode: 0,
       }));
@@ -1158,8 +1176,8 @@ describe('hasRuntimeReadyView', () => {
     expect(hasRuntimeReadyView('→ baxian git:(main)\n', 'codex')).toBe(true);
   });
 
-  it('does not accept bare › as codex idle via composer fallback (handled by READY_ANCHORS)', () => {
-    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(false);
+  it('accepts a bare › as codex idle (a cleared empty composer; busy/menu gating still applies)', () => {
+    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
   });
 
   it('rejects codex → prompt when busy spinner is active', () => {
@@ -1227,6 +1245,57 @@ describe('runtimeBusyCheck', () => {
   });
 });
 
+describe('hasRuntimeReadyView accepts a cleared bare Codex › only when nothing runtime-owned is on screen', () => {
+  // Cleared composer = a bare › as the last non-blank line, only blanks below (detect/manifests codex_idle_prompt).
+  it('treats a bare › (only blank lines below) as a ready idle composer', () => {
+    expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
+    expect(hasRuntimeReadyView('output scrolled up\n›\n\n', 'codex')).toBe(true);
+  });
+  it('accepts an INDENTED bare › — Codex indents the empty prompt marker', () => {
+    expect(hasRuntimeReadyView('  › \n', 'codex')).toBe(true);
+    expect(hasRuntimeReadyView('prior output\n  ›\n', 'codex')).toBe(true);
+  });
+  it('does NOT treat a bare › as ready when a busy turn marker is still on screen', () => {
+    expect(hasRuntimeReadyView('· Working… (12s)\n  esc to interrupt\n› \n', 'codex')).toBe(false);
+  });
+  it('does NOT treat a bare › as ready under a permission/confirm blocker', () => {
+    expect(hasRuntimeReadyView('Allow command `rm`?\n  Press Enter to confirm or Esc to cancel\n› \n', 'codex')).toBe(false);
+  });
+  it('does NOT treat a node/shell > as a Codex composer', () => {
+    expect(hasRuntimeReadyView('> require("fs")\n> \n', 'codex')).toBe(false);
+  });
+
+  // A `›` with ANY non-blank line below it (ordinary text OR a status footer) is NOT empty — that is the
+  // with-text idle form (handled by the ready-anchor), not a cleared composer. No footer-below special case.
+  it('does NOT treat a bare › as ready when ordinary user text follows it (pasted/leftover transcript)', () => {
+    expect(hasRuntimeReadyView('›\nplease finish the refactor\n', 'codex')).toBe(false);
+    expect(hasRuntimeReadyView('some output\n›\nleftover line\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
+  });
+  it('does NOT treat a bare › with a status footer DIRECTLY below it as empty (that shape is the with-text form)', () => {
+    expect(hasRuntimeReadyView('› \n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
+    expect(hasRuntimeReadyView('› \n  gpt-5.5 xhigh · /Users/x/repo\n', 'codex')).toBe(false);
+  });
+  it('does NOT treat a › followed by a dirty/non-blank line then a footer as ready', () => {
+    expect(hasRuntimeReadyView('›\nold output\n› new dirty prompt text\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
+    expect(hasRuntimeReadyView('›\n  see logs · /tmp/out and fix it\n', 'codex')).toBe(false);
+    expect(hasRuntimeReadyView('›\n  - refactor auth · update tests · ship\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
+  });
+});
+
+describe('hasOscTitleWorking', () => {
+  it('matches a braille-spinner OSC pane title (same pattern both runtime manifests use)', () => {
+    expect(hasOscTitleWorking('⠁ Reading file')).toBe(true);
+    expect(hasOscTitleWorking('⣿ Working')).toBe(true);
+  });
+  it('does NOT match an idle/non-spinner title or a bare proc name', () => {
+    expect(hasOscTitleWorking('baxian · main')).toBe(false);
+    expect(hasOscTitleWorking('✳ idle')).toBe(false);
+    expect(hasOscTitleWorking('node')).toBe(false);
+    expect(hasOscTitleWorking('')).toBe(false);
+    expect(hasOscTitleWorking('⠁no-space-after-spinner')).toBe(false);
+  });
+});
+
 describe('hasRuntimeIdleComposerPrompt', () => {
   it('detects codex → prompt in tail', () => {
     const screen = 'some output\n→ baxian git:(main)\n';
@@ -1237,8 +1306,19 @@ describe('hasRuntimeIdleComposerPrompt', () => {
     expect(hasRuntimeIdleComposerPrompt('→ myproject\n', 'codex')).toBe(true);
   });
 
-  it('does not match bare › as codex composer prompt (handled by READY_ANCHORS)', () => {
-    expect(hasRuntimeIdleComposerPrompt('› \n', 'codex')).toBe(false);
+  it('matches a bare › empty composer — only blank lines may follow (col-0 OR indented marker)', () => {
+    expect(hasRuntimeIdleComposerPrompt('› \n', 'codex')).toBe(true);
+    expect(hasRuntimeIdleComposerPrompt('  ›\n', 'codex')).toBe(true);                              // Codex indents the marker
+    expect(hasRuntimeIdleComposerPrompt('old output\n  ›\n\n', 'codex')).toBe(true);               // bottom bare › + blanks
+    expect(hasRuntimeIdleComposerPrompt('› with text\n', 'codex')).toBe(false);                    // not empty → not idle
+    expect(hasRuntimeIdleComposerPrompt('› \n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);   // footer below bare › → not the empty form
+  });
+
+  it('a bare › is empty only when ONLY blank lines follow — any non-blank line below means dirty', () => {
+    expect(hasRuntimeIdleComposerPrompt('›\nleftover user text\n', 'codex')).toBe(false);
+    expect(hasRuntimeIdleComposerPrompt('›\nold output\n› still typing\n', 'codex')).toBe(false);  // bottom prompt not bare
+    // bottom line is a bare (indented) › with nothing below → the cleared composer; older content scrolled up
+    expect(hasRuntimeIdleComposerPrompt('› old typing\n  wrapped\n  ›\n', 'codex')).toBe(true);
   });
 
   it('does not match → followed by multi-word content (output, not prompt)', () => {
