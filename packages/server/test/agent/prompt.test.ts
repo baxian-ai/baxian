@@ -314,20 +314,25 @@ describe('buildPromptInline', () => {
     expect(prompt.endsWith(`Title: ${TASK.title}`)).toBe(true);
   });
 
-  it('develop phase with signalToken includes spec-done signal and opt-in copy (server chain)', async () => {
+  it('develop phase with signalToken references the SDD skill section and keeps the variable spec-done signal', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress' },
       signalToken: 'spec-token-1',
     });
     expect(prompt).toContain('Specification-Driven Development (SDD)');
+    // SDD mechanics moved into the force-loaded baxian-task-check skill; the prompt only points at it.
+    expect(prompt).toContain('follow baxian-task-check §Specification-Driven Development');
+    // Both options render as a parallel bullet list (SDD vs Otherwise).
+    expect(prompt).toContain('- Specification-Driven Development (SDD)');
+    expect(prompt).toMatch(/- Otherwise proceed straight to implementing/);
+    expect(prompt).not.toContain('(do NOT commit or push it)');
     expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
     expect(prompt).toContain('token: spec-token-1');
     expect(prompt).toMatch(/proceed straight to implementing/);
     expect(prompt).toContain('ready for review (not Draft)');
     expect(prompt).toContain('gh pr ready');
     expect(prompt).toContain('do NOT use `--draft`');
-    expect(prompt).toContain('(do NOT commit or push it)');
     expect(prompt).not.toContain(buildPhaseSignal('spec-done', 'spec-token-1'));
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
@@ -339,18 +344,29 @@ describe('buildPromptInline', () => {
     expect(prompt).not.toContain('[bx:spec-done:');
   });
 
-  it('server develop prompt spec line does not ask to commit the spec', async () => {
+  it('server develop prompt points at the SDD skill section and never inlines the spec-commit copy', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress', reviewMode: 'server' },
       signalToken: 'spec-token-srv',
     });
     expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
+    expect(prompt).toContain('follow baxian-task-check §Specification-Driven Development');
     expect(prompt).not.toMatch(/commit locally, then signal/);
     expect(prompt).not.toContain('gh pr ready');
     expect(prompt).not.toContain('ready for review (not Draft)');
-    expect(prompt).toContain('(do NOT commit or push it)');
+    expect(prompt).not.toContain('(do NOT commit or push it)');
     expect(scanPhaseSignals(prompt)).toEqual([]);
+  });
+
+  it('baxian-task-check skill carries the migrated SDD mechanics (write .baxian/spec.md, do NOT commit)', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('## Specification-Driven Development (SDD)');
+    expect(body).toContain('.baxian/spec.md');
+    expect(body).toContain('Do NOT commit or push it');
   });
 
   it.each([

@@ -23,3 +23,13 @@ Before writing any code, read the task in your prompt — the `Phase:` / `Role:`
 - Missing info + no PR → pick reasonable interpretation, write assumption after `<!-- baxian:managed -->` marker (marker MUST be line 1), or create task if blocked.
 - Minor ambiguity → proceed, note in PR.
 - Always record assumptions (PR, task, or commit message).
+
+## Specification-Driven Development (SDD)
+
+Optional, and offered only when the dispatch prompt gives you a `spec-done` signal (a QA partner exists). Use it to have QA review your design before you write code.
+
+- Write the spec to `.baxian/spec.md` in your worktree. Do NOT commit or push it — baxian reads the file directly for QA review.
+- Then emit the `spec-done` signal the prompt gives you (with its token).
+- Skip it and implement directly when the change is small or the design is unambiguous.
+
+After QA approves the spec, baxian dispatches the code phase to implement it.

@@ -189,37 +189,33 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
     if (!signalToken) return '';
     // spec review 由 QA 执行；没有 QA 时不提供该路线，spec-done 会派不出去。
     const offerSpec = hasQaPartner !== false;
+    // SDD 机制（写 .baxian/spec.md、不要 commit/push）已收进 baxian-task-check
+    // §Specification-Driven Development（develop force-load 该 skill）；prompt 只留可变 signal。
+    const specLines = offerSpec
+      ? [
+          '- Specification-Driven Development (SDD) — optional. To get QA spec review first, follow baxian-task-check §Specification-Driven Development, then signal:',
+          `    ${buildPhaseSignalTemplate('spec-done')}`,
+          `  token: ${signalToken}`,
+        ]
+      : [];
     if (task.reviewMode === 'server') {
       return [
         'Server review mode — no PRs, no branch pushes during review.',
-        ...(offerSpec
-          ? [
-              'Specification-Driven Development (SDD) — optional:',
-              `- To get QA spec review first, write the spec to ${SPEC_DOC_RELPATH} in your worktree (do NOT commit or push it), then signal:`,
-              `    ${buildPhaseSignalTemplate('spec-done')}`,
-              `  token: ${signalToken}`,
-              '- Otherwise implement the change, commit locally (do NOT push), then signal:',
-            ]
-          : ['- Implement the change, commit locally (do NOT push), then signal:']),
+        ...specLines,
+        offerSpec
+          ? '- Otherwise implement the change, commit locally (do NOT push), then signal:'
+          : '- Implement the change, commit locally (do NOT push), then signal:',
         `    ${buildPhaseSignalTemplate('code-done')}`,
         `  token: ${signalToken}`,
         '',
       ].join('\n');
     }
     return [
-      ...(offerSpec
-        ? [
-            'Specification-Driven Development (SDD) — optional:',
-            `- To get QA spec review first, write the spec to ${SPEC_DOC_RELPATH} in your worktree (do NOT commit or push it), then signal:`,
-            `    ${buildPhaseSignalTemplate('spec-done')}`,
-            `  token: ${signalToken}`,
-            '- Otherwise proceed straight to implementing the change. After `gh pr create`, ensure the PR is ready for review, then signal:',
-            `  ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
-          ]
-        : [
-            'Implement the change. After `gh pr create`, ensure the PR is ready for review, then signal:',
-            `  ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
-          ]),
+      ...specLines,
+      offerSpec
+        ? '- Otherwise proceed straight to implementing the change. After `gh pr create`, ensure the PR is ready for review, then signal:'
+        : 'Implement the change. After `gh pr create`, ensure the PR is ready for review, then signal:',
+      `  ${PR_READY_FOR_REVIEW_INSTRUCTION}`,
       `    ${buildPhaseSignalTemplate('pr-created')}`,
       `  token: ${signalToken}`,
       '',
