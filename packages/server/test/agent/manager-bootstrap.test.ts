@@ -315,6 +315,94 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
     }
   });
 
+  it('recovers a runtime dialog after the tmux pane was recreated (stale stored paneId)', async () => {
+    // Held on agent_dialog_pending (runtime path: no creationToken, no taskId) with a paneId that
+    // points at a pane the session no longer owns — the runtime relaunched into a fresh pane that is
+    // already at a ready REPL. slowPoll must follow the session's live pane, not the dead snapshot.
+    await agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      awaitingReason: 'startup dialog',
+      awaitingSince: NOW,
+      paneId: '%old',
+      updatedAt: NOW,
+    });
+
+    const READY_CODEX = [
+      '>_ OpenAI Codex (v0.142.3)',
+      'model:       gpt-5.5 xhigh',
+      'directory:   ~/repo',
+      'permissions: YOLO mode',
+      '',
+      '› ',
+    ].join('\n');
+
+    const dispatchRunner: CommandRunner = {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('list-panes')) {
+          return { stdout: '%new node\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('%old')) {
+          return { stdout: '', stderr: "can't find pane: %old", exitCode: 1 };
+        }
+        if (cmd.includes('display-message') && cmd.includes('%new')) {
+          return { stdout: 'node\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane') && cmd.includes('%new')) {
+          return { stdout: READY_CODEX, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    };
+
+    vi.spyOn(manager as unknown as {
+      createRunnerFor: (agent: unknown) => CommandRunner;
+    }, 'createRunnerFor').mockReturnValue(dispatchRunner);
+    vi.spyOn(manager, 'getAgentConfig').mockReturnValue({
+      id: 'dev-1',
+      projectId: 'proj',
+      runtime: 'codex',
+      role: 'dev',
+      mode: 'local',
+      workdir: '/tmp/repo',
+      yolo: true,
+    });
+
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
+    // Force-exit guard: the buggy code polls the dead %old forever, so cap the loop instead of hanging.
+    const realGet = agentStore.get.bind(agentStore);
+    let polls = 0;
+    const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+      polls++;
+      if (polls > 12) await agentStore.delete(id);
+      return realGet(id);
+    });
+    try {
+      await (manager as unknown as {
+        slowPollDialogPending: (
+          id: string,
+          token: string | undefined,
+          opts: { expectedPaneId?: string; expectedTaskId?: string },
+        ) => Promise<void>;
+      }).slowPollDialogPending('dev-1', undefined, { expectedPaneId: '%old', expectedTaskId: undefined });
+
+      const state = await realGet('dev-1');
+      expect(state?.awaitingPhase).toBe('agent_dialog_resolved_runtime');
+      expect(state?.paneId).toBe('%new');
+      expect(events.some(e =>
+        e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',
+      )).toBe(true);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      getSpy.mockRestore();
+    }
+  });
+
   it('exits when agentStore record is deleted (DELETE path collapses the loop)', async () => {
     await agentStore.update('dev-1', (s) => s ? {
       ...s, creationToken: TOKEN, updatedAt: NOW,

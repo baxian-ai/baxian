@@ -1171,23 +1171,14 @@ export class AgentManager {
       const state = await this.agentStore.get(agentId);
       if (!state) return;
       if (generationMismatch(state)) return;
-      let paneId = state.paneId;
-      if (!paneId) {
-        try {
-          paneId = await tmux.getSinglePaneId(agentId);
-          const discoveredPaneId = paneId;
-          await this.agentStore.update(agentId, (s) => {
-            if (!s) return AGENT_STORE_NOOP;
-            if (generationMismatch(s)) return AGENT_STORE_NOOP;
-            return {
-              ...s,
-              paneId: discoveredPaneId,
-              updatedAt: new Date().toISOString(),
-            };
-          });
-        } catch {
-          continue;
-        }
+      // The session's live pane is authoritative — never the stored snapshot. A runtime relaunch
+      // (skills-stale rebuild, crash / Ctrl-C recovery) gives the session a fresh pane id; trusting
+      // a stale state.paneId would poll a dead pane forever and the Held would never clear.
+      let paneId: string;
+      try {
+        paneId = await tmux.getSinglePaneId(agentId);
+      } catch {
+        continue;
       }
 
       try {
@@ -1219,6 +1210,7 @@ export class AgentManager {
         if (isBootstrapPath) {
           return {
             ...fresh,
+            paneId,
             creationToken: undefined,
             status: 'ok',
             awaitingPhase: undefined,
@@ -1229,6 +1221,7 @@ export class AgentManager {
         }
         return {
           ...fresh,
+          paneId,
           awaitingPhase: 'agent_dialog_resolved_runtime',
           awaitingReason: 'Runtime dialog resolved; agent REPL ready. Click Resume to release the binding and let baxian pick the next task.',
           updatedAt: now,
