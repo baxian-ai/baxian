@@ -34,7 +34,7 @@ Via `gh pr review` with per-pass stamp:
 
 Multi-line: `--body-file -`, stamp at end.
 
-No pane signal on success. **422 fallback** (same identity):
+No pane signal on success. **422 fallback** (same identity) — for signal wire format and emit rules, see the baxian-signals skill:
 - request-changes: `gh pr review N --comment --body 'FINDINGS'`, then emit `pr-changes-requested` signal.
 - approve: emit `pr-approved` signal.
 

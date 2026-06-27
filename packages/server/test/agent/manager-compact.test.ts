@@ -212,7 +212,7 @@ afterEach(async () => {
 });
 
 describe('compactAgent', () => {
-  it('waits for an idle prompt, clears the composer with C-c, then sends /compact + Enter', async () => {
+  it('waits for an idle prompt, clears the composer with C-c (claude), then sends /compact + Enter', async () => {
     await seedAgent();
     waitReadySpy.mockResolvedValue(undefined);
 
@@ -226,6 +226,7 @@ describe('compactAgent', () => {
     expect(timeoutMs).toBe(5_000);
 
     const calls = execCalls();
+    // Claude needs a double Ctrl-C to exit, so a single C-c safely clears a leftover composer draft.
     const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/compact'));
     expect(ccIdx).toBeGreaterThanOrEqual(0);
@@ -844,6 +845,25 @@ describe('clearAgent', () => {
     expect(calls.some(c => c.includes('/compact'))).toBe(false);
     const enterIdx = calls.findIndex((c, i) => i > literalIdx && c.includes('send-keys') && c.includes('Enter'));
     expect(enterIdx).toBeGreaterThan(literalIdx);
+  });
+
+  // Regression: a single Ctrl-C on an empty Codex composer quits Codex (openai/codex#14708). The
+  // three-dot-menu /clear must interrupt with Escape so a codex runtime survives the clear.
+  it('interrupts with Escape and never C-c for a codex agent so Codex is not killed', async () => {
+    await seedAgent({ id: 'qa-1', paneId: '%3' });
+    waitReadySpy.mockResolvedValue(undefined);
+
+    await manager.clearAgent('qa-1');
+    await expectGuardReleased('qa-1');
+
+    expect(waitReadySpy.mock.calls[0][2]).toBe('codex');
+    const calls = execCalls();
+    expect(calls.some(c => c.includes('send-keys') && c.includes('C-c'))).toBe(false);
+    const escIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('Escape'));
+    const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/clear'));
+    expect(escIdx).toBeGreaterThanOrEqual(0);
+    expect(literalIdx).toBeGreaterThan(escIdx);
+    expect(calls[escIdx]).toContain("'%3'");
   });
 
   it('clears injectedSkills from the agent store after sending /clear', async () => {

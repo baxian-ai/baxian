@@ -27,4 +27,4 @@ Reply to every item, including duplicates (reference primary). Thread inline com
 
 ## Fix Completion
 
-Emit `pr-fixed` when done — even without code push. baxian verifies work exists before routing to QA.
+Emit `pr-fixed` when done — even without code push. baxian verifies work exists before routing to QA. Signal wire format and emit rules: see the baxian-signals skill.

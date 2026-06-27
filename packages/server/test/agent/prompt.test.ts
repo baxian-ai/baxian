@@ -205,8 +205,14 @@ describe('buildPromptInline', () => {
     expect(withSignal).toContain('Phase signals:');
     expect(withSignal).toContain('substitute');
     expect(withSignal).toContain('never echo the `<…>` placeholder');
+    // The header points at the canonical protocol skill while keeping the load-bearing rule inline.
+    expect(withSignal).toContain('baxian-signals');
+    // pr_number is sourced from the PR the agent just created/opened — there is no PR-number line.
+    expect(withSignal).toContain('PR you just created');
     // A phase with no pending signal (develop without a token) carries no signal rule.
-    expect(build()).not.toContain('Phase signals:');
+    const noSignal = build();
+    expect(noSignal).not.toContain('Phase signals:');
+    expect(noSignal).not.toContain('baxian-signals');
   });
 
   it('post-approve prompt tells dev to re-read PR feedback before merge', async () => {

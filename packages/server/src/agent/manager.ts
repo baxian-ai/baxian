@@ -3413,7 +3413,7 @@ export class AgentManager {
       const taskIdAtStart = state.taskId;
       const updatedAtAtStart = state.updatedAt;
       // updatedAt 拦同任务 phase 派发（paneId/taskId 均不变，派发 paste 前必写 state）；
-      // 快照变了决不注入——C-c 会打断刚注入的 prompt。
+      // 快照变了决不注入——中断键（C-c/Escape）会打断刚注入的 prompt。
       const assertSessionUnchanged = async (): Promise<void> => {
         const now = await this.agentStore.get(agentId);
         if (
@@ -3436,7 +3436,8 @@ export class AgentManager {
       };
       await waitReady();
       await assertSessionUnchanged();
-      await tmux.sendKeysToPane(paneId, 'C-c');
+      // Codex quits on Ctrl-C at an empty composer (openai/codex#14708); interrupt it with Escape instead.
+      await tmux.sendKeysToPane(paneId, cfg.runtime === 'codex' ? 'Escape' : 'C-c');
       await waitReady();
       await assertSessionUnchanged();
       await tmux.sendKeysLiteral(paneId, command);

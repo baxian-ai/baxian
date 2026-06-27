@@ -29,7 +29,7 @@ Before writing any code, read the task in your prompt — the `Phase:` / `Role:`
 Optional, and offered only when the dispatch prompt gives you a `spec-done` signal (a QA partner exists). Use it to have QA review your design before you write code.
 
 - Write the spec to `.baxian/spec.md` in your worktree. Do NOT commit or push it — baxian reads the file directly for QA review.
-- Then emit the `spec-done` signal the prompt gives you (with its token).
+- Then emit the `spec-done` signal the prompt gives you (with its token). Signal wire format and emit rules: see the baxian-signals skill.
 - Skip it and implement directly when the change is small or the design is unambiguous.
 
 After QA approves the spec, baxian dispatches the code phase to implement it.

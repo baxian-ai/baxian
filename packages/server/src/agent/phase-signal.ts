@@ -1,14 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
-// Phase signal format for agent → server signalling, emitted in the agent's
-// assistant reply text (Bash tool stdout is captured by Claude Code's TUI and
-// never reaches the pane pty, so printf-based signals don't work).
-//
-// Wire format:
-//   Two-segment: `[bx:KIND:TOKEN]`              — for kinds without payload
-//   Three-segment: `[bx:pr-created:<num>:TOKEN]` — pr-created carries PR number
-//
-// Server scans pane bytes fuzzily so TUI soft-wrap still matches.
+// Server-side scanner/builder for baxian's agent→server signals, which ride in
+// the agent's pane text. Wire format and the full signalling protocol — the
+// single source of truth — live in skills/baxian-signals/SKILL.md.
 
 export type PhaseSignalKind =
   | 'spec-fixed'

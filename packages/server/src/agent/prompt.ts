@@ -442,8 +442,9 @@ function buildTaskBody(args: TaskBodyArgs): string {
   // watcher's strict scanner, so the task would hang waiting for a signal that never fires.
   const signalRule = signalToken
     ? 'Phase signals: where a step tells you to emit `[bx:KIND:<token>]` (or `[bx:pr-created:<pr_number>:<token>]`), ' +
-      'substitute `<token>` (and `<pr_number>`) with the literal value(s) given on the accompanying `token:`/PR-number lines ' +
-      'and emit the filled signal alone on its own line — never echo the `<…>` placeholder verbatim.\n'
+      'substitute `<token>` with the value on the accompanying `token:` line and `<pr_number>` (when present) with the number of the PR you just created/opened ' +
+      'and emit the filled signal alone on its own line — never echo the `<…>` placeholder verbatim. ' +
+      'See the baxian-signals skill for the full signal protocol.\n'
     : '';
   const header = `Phase: ${phase}\nRole: ${role}\nTask ID: ${task.id}\nWorktree: ${worktreePath}\n` +
     `cd into the worktree before any file operations.\n${conventions}\n${signalRule}\n`;
