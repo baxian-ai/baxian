@@ -130,16 +130,5 @@ function normalizeBinding(raw: Record<string, unknown>, fallbackId: string): Age
   if (typeof raw.awaitingPhase === 'string') binding.awaitingPhase = raw.awaitingPhase;
   if (typeof raw.awaitingReason === 'string') binding.awaitingReason = raw.awaitingReason;
   if (typeof raw.awaitingSince === 'string') binding.awaitingSince = raw.awaitingSince;
-  const injected = normalizeInjectedSkills(raw.injectedSkills);
-  if (injected) binding.injectedSkills = injected;
   return binding;
-}
-
-function normalizeInjectedSkills(raw: unknown): AgentBindingFacts['injectedSkills'] {
-  if (!raw || typeof raw !== 'object') return undefined;
-  const obj = raw as Record<string, unknown>;
-  if (typeof obj.taskId !== 'string' || typeof obj.paneId !== 'string') return undefined;
-  if (!Array.isArray(obj.skills)) return undefined;
-  const skills = obj.skills.filter((s): s is string => typeof s === 'string');
-  return { taskId: obj.taskId, paneId: obj.paneId, skills };
 }

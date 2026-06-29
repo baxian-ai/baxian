@@ -1165,7 +1165,6 @@ export function registerEventHandlers(
       // dispatchPostMergeCleanup owns the worktree removal → branch delete → /clear → release.
       if (transitioned.prNumber && transitioned.branch) {
         await manager.dispatchPostMergeCleanup(transitioned.qaAgentId, {
-          prNumber: transitioned.prNumber,
           taskId: transitioned.id,
           branch: transitioned.branch,
         }).catch(err => console.warn(

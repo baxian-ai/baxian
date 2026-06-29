@@ -58,10 +58,6 @@ export interface BuildPromptOpts {
   postApproveRedispatchCount?: number;
   /** Caller-transmitted round — task field is stale during dispatch. */
   currentSpecRound?: number;
-  // Skills already in the REPL's context for the current (task, pane); omit
-  // from the <skills> payload to avoid re-inlining content the model still
-  // remembers. Registry-required check still runs over the full set.
-  excludeSkills?: readonly string[];
   /** Absolute agent-host image paths to weave into the task body. */
   imagePaths?: string[];
   /** Server mode: injected review input (diff or spec doc), pre-sized by the caller. */
@@ -112,8 +108,10 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     contentTruncated: opts.contentTruncated,
     hasQaPartner: opts.hasQaPartner,
   });
-  // Force-load the phase skill via the runtime's command, unless it is already
-  // resident in this REPL (excludeSkills = the dedup baseline for this pane).
+  // Force-load the phase skill via the runtime's command on the first line. EVERY dispatch
+  // re-emits it: a dispatch is one slash-command invocation, and re-firing re-injects the
+  // (small) skill body deterministically, so the procedure is guaranteed resident regardless
+  // of prior /compact or context drift — never assume the model still remembers an earlier load.
   const primary = phasePrimarySkill(opts.agent.role, opts.phase);
   // A signal-emitting phase with NO primary skill (the server-* phases) would otherwise leave the
   // command slot empty and rely on the model to implicitly load baxian-signals — but the emit rules
@@ -121,8 +119,7 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
   // into the free slot so the protocol is deterministically in context (GitHub phases keep their
   // primary skill, whose own body points at baxian-signals).
   const slotSkill = primary ?? (opts.signalToken ? 'baxian-signals' : undefined);
-  const alreadyLoaded = new Set(opts.excludeSkills ?? []);
-  const invokeLine = slotSkill && !alreadyLoaded.has(slotSkill)
+  const invokeLine = slotSkill
     ? `${SKILL_INVOKE_SIGIL[opts.agent.runtime]}${slotSkill}\n`
     : '';
   const fullPrompt = invokeLine + taskBody;
@@ -464,38 +461,9 @@ function truncateFindings(text: string): { text: string; truncated: boolean } {
 }
 
 
+// Post-merge cleanup is silent toward the agent (no notification): baxian removes the worktree,
+// deletes the local branch, then /clears the idle pane. This carries just the ids that cleanup needs.
 export interface PostMergeCleanupContext {
-  prNumber: number;
   taskId: string;
   branch: string;
-}
-
-export interface PostMergeBranchCleanupResult {
-  outcome: 'deleted' | 'absent' | 'failed' | 'skipped';
-  detail: string;
-}
-
-export function buildPostMergeCleanupPrompt(
-  ctx: PostMergeCleanupContext,
-  result: PostMergeBranchCleanupResult,
-): string {
-  // Self-contained, NO skill force-load: dispatchPostMergeCleanup injects this straight into an
-  // existing pane without re-provisioning skills (unlike ensureSession), so a hot-upgraded session
-  // may not have a freshly-added skill on the host. The failed-case manual-cleanup warning must
-  // never depend on skill availability — keep it inline. `next` is the compaction step baxian runs
-  // once the REPL is idle (clean slate → /clear, otherwise → /compact, which preserves the warning).
-  const cleanSlate = result.outcome === 'deleted' || result.outcome === 'absent';
-  return [
-    'event: pr-merged',
-    `task: ${ctx.taskId}`,
-    `pr: ${ctx.prNumber}`,
-    `branch: ${ctx.branch}`,
-    `branch-cleanup: ${result.outcome}`,
-    ...(result.detail ? [`detail: ${result.detail.replace(/\n+/g, ' ').trim()}`] : []),
-    `next: ${cleanSlate ? 'clear' : 'compact'}`,
-    ...(result.outcome === 'failed'
-      ? ['', `WARNING: baxian could not delete the merged branch — clean it up manually before the next task: \`git worktree prune && git branch -D ${ctx.branch}\`.`]
-      : []),
-    '',
-  ].join('\n');
 }

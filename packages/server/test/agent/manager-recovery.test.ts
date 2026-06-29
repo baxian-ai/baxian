@@ -180,7 +180,6 @@ describe('recover()', () => {
     await manager.recover();
 
     expect(cleanupSpy).toHaveBeenCalledWith('dev-1', {
-      prNumber: 42,
       taskId: 'task-merged',
       branch: 'bx/task-merged',
     });

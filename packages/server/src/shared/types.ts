@@ -138,17 +138,6 @@ export interface AgentBindingFacts {
   awaitingPhase?: string;
   awaitingReason?: string;
   awaitingSince?: string;
-  // Skills already inlined into the REPL session's context, scoped to
-  // (taskId, paneId). When either changes we treat the agent's context as
-  // fresh and re-inject — this is the "across task cycles re-inject, within
-  // a cycle dedup" boundary.
-  injectedSkills?: InjectedSkillsRecord;
-}
-
-export interface InjectedSkillsRecord {
-  taskId: string;
-  paneId: string;
-  skills: string[];
 }
 
 export interface AgentErrorSummary {

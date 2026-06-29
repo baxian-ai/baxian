@@ -117,6 +117,19 @@ function waitGates(gates: Array<() => void>, n: number): Promise<void> {
   return vi.waitFor(() => expect(gates.length).toBe(n));
 }
 
+// Release every prompt-ready gate as it appears until `p` settles. Resilient to the exact
+// number of waits a flow performs (the post-merge wrap-up is just Esc → /clear, no notification).
+async function drainUntil(gates: Array<() => void>, p: Promise<unknown>): Promise<void> {
+  let settled = false;
+  const done = p.then(() => { settled = true; }, () => { settled = true; });
+  let i = 0;
+  while (!settled) {
+    while (i < gates.length) gates[i++]();
+    await Promise.race([done, new Promise(r => setTimeout(r, 2))]);
+  }
+  await p;
+}
+
 // Drain the 3 prompt-ready gates a single compact/clear awaits, settling the
 // holder promise mid-way (the third gate is opened last, releasing the guard).
 async function drainHolderGates(gates: Array<() => void>, holder: Promise<unknown>): Promise<void> {
@@ -321,31 +334,18 @@ describe('compactAgent', () => {
     const manual = manager.compactAgent('dev-1');
     await waitGates(gates, 1);
 
-    const postMerge = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'cleanup prompt');
+    const postMerge = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
     await new Promise(r => setTimeout(r, 20));
-    expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
+    // post-merge is blocked on the shared compact guard → it has NOT created any new prompt-ready wait.
     expect(gates.length).toBe(1);
 
-    gates[0]();
-    await waitGates(gates, 2);
-    gates[1]();
+    // Drain gates until both finish: the manual compact releases the guard, then post-merge runs its
+    // Esc → /clear wrap-up (no notification to inject).
+    await drainUntil(gates, postMerge);
     await manual;
 
-    await waitGates(gates, 3);
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
-    gates[2]();
-    // post-merge runs 4 prompt-ready waits: pre-notification, post-notification, post-Esc, post-slash.
-    await waitGates(gates, 4);
-    gates[3]();
-    await vi.waitFor(() => expect(fakeTmux.injectPrompt).toHaveBeenCalled());
-    await waitGates(gates, 5);
-    gates[4]();
-    await waitGates(gates, 6);
-    gates[5]();
-    await waitGates(gates, 7);
-    gates[6]();
-    await postMerge;
-
+    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith('%7', '/clear');
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
@@ -514,24 +514,16 @@ describe('compactAgent', () => {
     const gates = installGates();
     const fakeTmux = fakeCompactionTmux();
 
-    const run = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'cleanup prompt');
+    const run = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
     await waitGates(gates, 1);
 
+    // post-merge holds the shared compact guard → a concurrent manual compact is refused.
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
     });
 
-    // 4 prompt-ready waits: pre-notification, post-notification, post-Esc interrupt, post-slash.
-    gates[0]();
-    await waitGates(gates, 2);
-    gates[1]();
-    await waitGates(gates, 3);
-    gates[2]();
-    await waitGates(gates, 4);
-    gates[3]();
-    await run;
-
+    await drainUntil(gates, run);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });
@@ -608,62 +600,19 @@ describe('compactAgent', () => {
       )),
     };
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
 
+    // sendPostMergeSlashCommand retries /clear once on a rejection toast, then gives up — 2 attempts,
+    // NOT treated as success. Give-up C-c's the composer clean and releases (stuck pane must not strand).
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
-    expect(slashCalls).toHaveLength(4);
+    expect(slashCalls).toHaveLength(2);
     expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
-  it('submits the post-merge notification via waitSubmitAck with a swallowed-Enter resend guard', async () => {
+  it('restarts and releases when Codex exits to shell before /clear lands', async () => {
     await seedAgent({ taskId: 't1' });
-    setPollMs(1);
-    stubReleasePostMergeAgent();
-    waitReadySpy.mockResolvedValue(undefined);
-
-    const fakeTmux = fakeCompactionTmux();
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
-
-    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'PR merged notice', 'dev-1');
-    expect(fakeTmux.captureSettledSnapshot).toHaveBeenCalledWith('%7', expect.any(Object));
-    expect(fakeTmux.waitSubmitAck).toHaveBeenCalledTimes(1);
-    // Settle (baseline w/ pasted text) → ack must run after the paste so a swallowed Enter is detected
-    // on the unchanged composer.
-    expect(fakeTmux.captureSettledSnapshot.mock.invocationCallOrder[0])
-      .toBeLessThan(fakeTmux.waitSubmitAck.mock.invocationCallOrder[0]);
-    expect(fakeTmux.injectPrompt.mock.invocationCallOrder[0])
-      .toBeLessThan(fakeTmux.captureSettledSnapshot.mock.invocationCallOrder[0]);
-
-    // The resend callback re-sends Enter — recovering the first Enter the TUI swallows after a paste.
-    const ackOpts = fakeTmux.waitSubmitAck.mock.calls[0][3] as { resend: () => Promise<void> };
-    expect(typeof ackOpts.resend).toBe('function');
-    const before = fakeTmux.sendEnter.mock.calls.length;
-    await ackOpts.resend();
-    expect(fakeTmux.sendEnter.mock.calls.length).toBe(before + 1);
-  });
-
-  it('treats a post-merge notification ack timeout as best-effort: still /clears, no C-c retry', async () => {
-    await seedAgent({ taskId: 't1' });
-    setPollMs(1);
-    const releaseSpy = stubReleasePostMergeAgent();
-    waitReadySpy.mockResolvedValue(undefined);
-
-    const fakeTmux = {
-      ...fakeCompactionTmux(),
-      waitSubmitAck: vi.fn().mockRejectedValue(new Error('runtime ack timeout')),
-    };
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
-
-    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith('%7', '/clear');
-    expect(fakeTmux.sendKeysToPane).not.toHaveBeenCalledWith('%7', 'C-c');
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
-    expect(guardSet().has('dev-1')).toBe(false);
-  });
-
-  it('restarts and releases when Codex exits to shell after the post-merge notification', async () => {
-    await seedAgent({ taskId: 't1', injectedSkills: { taskId: 't1', paneId: '%7', skills: ['task-check'] } });
     setPollMs(1);
     const releaseSpy = stubReleasePostMergeAgent();
     const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
@@ -673,66 +622,28 @@ describe('compactAgent', () => {
       paneId: '%9',
       workdir: tempDir,
     });
+    // The post-Esc readiness wait fails (runtime dropped to a shell) → /clear never lands → recover.
     waitReadySpy
-      .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error('waitForReplPromptReady: pane %7 pane_current_command=zsh'))
-      .mockRejectedValueOnce(new Error('repl not ready'));
+      .mockRejectedValue(new Error('repl not ready'));
 
     const fakeTmux = {
       ...fakeCompactionTmux(),
       displayMessage: vi.fn().mockResolvedValue('zsh'),
-      waitSubmitAck: vi.fn().mockRejectedValue(new Error('runtime ack timeout')),
     };
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'PR merged notice', true);
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
 
     expect(ensureSpy).toHaveBeenCalledWith('dev-1', 'runtime');
     expect(fakeTmux.sendKeysLiteral).not.toHaveBeenCalledWith('%7', '/clear');
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBe('%9');
-    expect(state?.injectedSkills).toBeUndefined();
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
-  it('clears a dirty shell composer before restarting a post-merge runtime', async () => {
-    await seedAgent({ taskId: 't1' });
-    setPollMs(1);
-    const releaseSpy = stubReleasePostMergeAgent();
-    const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true,
-      createdSession: false,
-      freshRuntime: true,
-      paneId: '%9',
-      workdir: tempDir,
-    });
-    waitReadySpy
-      .mockRejectedValueOnce(new Error('first attempt failed before paste'))
-      .mockResolvedValueOnce(undefined);
-
-    const fakeTmux = {
-      ...fakeCompactionTmux(),
-      displayMessage: vi.fn().mockResolvedValue('zsh'),
-      captureSettledSnapshot: vi.fn().mockRejectedValue(new Error('settle failed after paste')),
-    };
-
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'PR merged notice', true);
-
-    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'PR merged notice', 'dev-1');
-    const ccCallIndexes = fakeTmux.sendKeysToPane.mock.calls
-      .map(([, key], index) => ({ key, index }))
-      .filter(({ key }) => key === 'C-c')
-      .map(({ index }) => index);
-    expect(ccCallIndexes).toHaveLength(2);
-    const recoveryCcOrder = fakeTmux.sendKeysToPane.mock.invocationCallOrder[ccCallIndexes[1]];
-    expect(fakeTmux.injectPrompt.mock.invocationCallOrder[0]).toBeLessThan(recoveryCcOrder);
-    expect(recoveryCcOrder).toBeLessThan(ensureSpy.mock.invocationCallOrder[0]);
-    expect(fakeTmux.sendKeysLiteral).not.toHaveBeenCalledWith('%7', '/clear');
-    expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
-  });
-
   it('recovers post-merge cleanup when the pane probe reports a missing pane', async () => {
-    await seedAgent({ taskId: 't1', injectedSkills: { taskId: 't1', paneId: '%7', skills: ['task-check'] } });
+    await seedAgent({ taskId: 't1' });
     const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true,
       createdSession: false,
@@ -756,9 +667,7 @@ describe('compactAgent', () => {
     expect(recovered).toBe(true);
     expect(ensureSpy).toHaveBeenCalledWith('dev-1', 'runtime');
     const state = await agentStore.get('dev-1');
-    expect(state?.paneId).toBe('%9');
-    expect(state?.injectedSkills).toBeUndefined();
-  });
+    expect(state?.paneId).toBe('%9');  });
 
   it('does not rewrite post-merge recovery state when the fresh runtime facts are already current', async () => {
     const updatedAt = '2026-06-26T00:00:00.000Z';
@@ -788,41 +697,20 @@ describe('compactAgent', () => {
     expect((await agentStore.get('dev-1'))?.updatedAt).toBe(updatedAt);
   });
 
-  it('propagates a NON-timeout notification ack error to the retry (not best-effort swallow)', async () => {
-    await seedAgent({ taskId: 't1' });
-    setPollMs(1);
-    stubReleasePostMergeAgent();
-    waitReadySpy.mockResolvedValue(undefined);
-
-    const fakeTmux = {
-      ...fakeCompactionTmux(),
-      waitSubmitAck: vi.fn()
-        .mockRejectedValueOnce(new Error('capturePaneSnapshot failed')) // infra error, not an ack timeout
-        .mockResolvedValue(undefined),
-    };
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
-
-    // Attempt 1's infra error aborted the attempt (not swallowed) → attempt 2 re-injected + C-c'd.
-    expect(fakeTmux.injectPrompt.mock.calls.filter(([, p]) => p === 'PR merged notice')).toHaveLength(2);
-    expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
-    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith('%7', '/clear');
-  });
-
-  it('holds the agent (no release) when give-up cannot clear an unsubmitted notification', async () => {
+  it('holds the agent (no release) when give-up cannot reach a clean composer', async () => {
     await seedAgent({ taskId: 't1' });
     setPollMs(1);
     const releaseSpy = stubReleasePostMergeAgent();
     waitReadySpy.mockResolvedValue(undefined);
 
-    // Pre-Enter settle fails on every attempt → give up before submit; C-c also fails and the session
-    // is still up → composer can't be confirmed clear, so the dirty pane must NOT be released for reuse.
+    // Every keystroke fails (Esc, then the give-up C-c) and the session is still up → the composer
+    // can't be confirmed clear, so the pane must NOT be released for reuse (held for a human instead).
     const fakeTmux = {
       ...fakeCompactionTmux(),
-      captureSettledSnapshot: vi.fn().mockRejectedValue(new Error('capture failed')),
-      sendKeysToPane: vi.fn().mockRejectedValue(new Error('C-c failed')),
+      sendKeysToPane: vi.fn().mockRejectedValue(new Error('keystroke failed')),
       hasSession: vi.fn().mockResolvedValue(true),
     };
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code', 'PR merged notice', true);
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
 
     expect(releaseSpy).not.toHaveBeenCalled();
     expect(guardSet().has('dev-1')).toBe(false);
@@ -864,28 +752,6 @@ describe('clearAgent', () => {
     expect(escIdx).toBeGreaterThanOrEqual(0);
     expect(literalIdx).toBeGreaterThan(escIdx);
     expect(calls[escIdx]).toContain("'%3'");
-  });
-
-  it('clears injectedSkills from the agent store after sending /clear', async () => {
-    await seedAgent({ injectedSkills: { taskId: 't1', paneId: '%7', skills: ['baxian-rules', 'task-check'] } });
-    waitReadySpy.mockResolvedValue(undefined);
-
-    await manager.clearAgent('dev-1');
-    await expectGuardReleased('dev-1');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills).toBeUndefined();
-  });
-
-  it('does not clear injectedSkills when sending /compact', async () => {
-    await seedAgent({ injectedSkills: { taskId: 't1', paneId: '%7', skills: ['baxian-rules'] } });
-    waitReadySpy.mockResolvedValue(undefined);
-
-    await manager.compactAgent('dev-1');
-    await expectGuardReleased('dev-1');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills).toEqual({ taskId: 't1', paneId: '%7', skills: ['baxian-rules'] });
   });
 
   it('rejects 404 for an unknown agent', async () => {

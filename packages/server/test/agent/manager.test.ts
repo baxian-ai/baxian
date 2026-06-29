@@ -1560,7 +1560,7 @@ describe('AgentManager.startSession status gate', () => {
   });
 });
 
-describe('injectedSkills dedup across phase dispatches', () => {
+describe('AgentManager dispatch & skill provisioning', () => {
   function workdirRunner(): CommandRunner {
     return {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
@@ -1599,12 +1599,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => workdirRunner();
   }
 
-  const persistInjectedSkills = (
-    agentId: string, taskId: string, paneId: string, role: 'dev' | 'qa', phase: string, reuse: string[] | null,
-  ): Promise<void> => (manager as unknown as {
-    persistInjectedSkills: (a: string, t: string, p: string, r: 'dev' | 'qa', ph: string, reuse: string[] | null) => Promise<void>;
-  }).persistInjectedSkills(agentId, taskId, paneId, role, phase, reuse);
-
   type ProvisionFn = (runner: CommandRunner, agent: AgentConfig, workdir: string) => Promise<void>;
   const provision = (mgr: AgentManager): ProvisionFn =>
     (mgr as unknown as { provisionRepoSkills: ProvisionFn }).provisionRepoSkills.bind(mgr);
@@ -1612,29 +1606,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
   function agentConfig(over: Partial<AgentConfig> & { id: string }): AgentConfig {
     return { projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', ...over } as unknown as AgentConfig;
   }
-
-  it('startSession on a fresh agent inlines full phase skills and records the set', async () => {
-    const t = await seedTask({ id: 'task-dedup-1', branch: 'bx/task-dedup-1' });
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
-
-    mockEnsureSession();
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
-    expect(ok).toBe(true);
-
-    expect(prompts.length).toBe(1);
-    expect(prompts[0].startsWith('/baxian-task-check\nphase: develop\n')).toBe(true);
-    expect(prompts[0]).not.toContain('[baxian]');
-    expect(prompts[0]).toContain('phase: develop');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
-  });
 
   it('startSession develop prompt drops the spec route when the dev has no QA partner', async () => {
     const t = await seedTask({ id: 'task-noqa-1', branch: 'bx/task-noqa-1', signalToken: 'devtok1234ab' });
@@ -1728,113 +1699,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     );
   });
 
-  it('continueSession with matching (taskId, paneId) omits the <skills> tag entirely when phase skills are all already injected', async () => {
-    const t = await seedTask({ id: 'task-dedup-2', branch: 'bx/task-dedup-2', status: 'approved' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
-    });
-    await lockManager.acquire('dev-1');
-    await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
-
-    mockEnsureSession();
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
-    expect(ok).toBe(true);
-
-    expect(prompts.length).toBe(1);
-    expect(prompts[0]).not.toContain('<skills>');
-    expect(prompts[0]).not.toContain('</skills>');
-    // primary already resident → no leading command, prompt opens on the first dispatch field.
-    expect(prompts[0].startsWith('phase: post-approve')).toBe(true);
-    expect(prompts[0]).not.toMatch(/^[/$]baxian-/);
-    expect(prompts[0]).not.toContain('[baxian]');
-    expect(prompts[0]).toContain('phase: post-approve');
-    expect(prompts[0]).toContain('signal: pr-merge-ready');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
-  });
-
-  it('continueSession with a different paneId resets dedup — full skills re-injected', async () => {
-    const t = await seedTask({ id: 'task-dedup-3', branch: 'bx/task-dedup-3', status: 'approved' });
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: t.id, paneId: '%9', updatedAt: NOW,
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
-    });
-    await lockManager.acquire('dev-1');
-    await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
-
-    mockEnsureSession({ paneId: '%9' });
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
-    expect(ok).toBe(true);
-
-    expect(prompts[0].startsWith('/baxian-pr-feedback\n')).toBe(true);
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.paneId).toBe('%9');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
-  });
-
-  it('startSession on a freshly-created tmux session re-injects full skills even when paneId string matches', async () => {
-    // tmux server / session 重启后 buildFreshSession 跑过，paneId 字符串可能与旧记录恰好相同
-    // （fresh server 第一个 pane 通常就是 %0）。此时 REPL 是全新的，绝不能让 dedup 沿用旧 skill 集。
-    const t = await seedTask({ id: 'task-fresh-pane', branch: 'bx/task-fresh-pane' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-task-check'] },
-    });
-    await lockManager.acquire('dev-1');
-
-    mockEnsureSession({ createdSession: true, freshRuntime: true });
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
-    expect(ok).toBe(true);
-
-    expect(prompts.length).toBe(1);
-    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
-    expect(prompts[0]).not.toContain('<skills></skills>');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
-  });
-
-  it('continueSession on a freshly-created tmux session re-injects full skills even when paneId string matches', async () => {
-    const t = await seedTask({ id: 'task-fresh-pane-cont', branch: 'bx/task-fresh-pane-cont', status: 'approved' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
-    });
-    await lockManager.acquire('dev-1');
-    await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
-
-    mockEnsureSession({ createdSession: true, freshRuntime: true });
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
-    expect(ok).toBe(true);
-
-    expect(prompts.length).toBe(1);
-    expect(prompts[0].startsWith('/baxian-pr-feedback\n')).toBe(true);
-    expect(prompts[0]).not.toContain('<skills></skills>');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
-  });
-
   it('continueSession post-approve: freshRuntime suppresses incremental nudge — full preamble always sent', async () => {
     const t = await seedTask({ id: 'task-fresh-redispatch', branch: 'bx/task-fresh-redispatch', status: 'approved' });
     await seedAgent({
@@ -1870,7 +1734,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
     });
     await lockManager.acquire('dev-1');
     await manager['postApproveStore'].set(t.id, {
@@ -1891,87 +1754,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
     // reused runtime + count>0 → manager passes the count, descriptor carries the redispatch field.
     expect(prompts[0]).toContain('redispatch: 2');
     expect(prompts[0]).toContain('signal: pr-merge-ready');
-  });
-
-  it('persistInjectedSkills skips agentStore write when phase brings no new skill', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 't-no-write', paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 't-no-write', paneId: '%0', skills: ['baxian-task-check'] },
-    });
-    const setSpy = vi.spyOn(agentStore, 'set');
-    await persistInjectedSkills('dev-1', 't-no-write', '%0', 'dev', 'develop', ['baxian-task-check']);
-    expect(setSpy).not.toHaveBeenCalled();
-  });
-
-  it('persistInjectedSkills writes baseline when reuseInjectedSkills is null (fresh REPL)', async () => {
-    await seedAgent({ id: 'dev-1', taskId: 't-fresh-base', paneId: '%0' });
-    await persistInjectedSkills('dev-1', 't-fresh-base', '%0', 'dev', 'develop', null);
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.taskId).toBe('t-fresh-base');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
-  });
-
-  it('persistInjectedSkills writes when phase introduces a skill not yet in baseList', async () => {
-    await agentStore.set({
-      id: 'dev-1', projectId: 'proj', taskId: 't-add', paneId: '%0', updatedAt: NOW,
-      injectedSkills: { taskId: 't-add', paneId: '%0', skills: ['baxian-pr-feedback'] },
-    });
-    await persistInjectedSkills('dev-1', 't-add', '%0', 'dev', 'develop', ['baxian-pr-feedback']);
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-task-check']);
-  });
-
-  it('startSession resets dedup when adoptOrRestartSession relaunches REPL inside an existing pane (createdSession=false, freshRuntime=true)', async () => {
-    // adoptOrRestartSession 的 shell 重启 / trust-dialog 分支会在同一 paneId 上重新启动 REPL，
-    // 仍返回 createdSession=false——只看 createdSession 会误判上下文未变，进而沿用旧 skill 集
-    // 让下一轮派发空 <skills/>。这里专测：paneId 字符串相同 + 旧 injectedSkills 完备 + freshRuntime=true
-    // → 必须全量重注入 + 落盘新 baseline。
-    const t = await seedTask({ id: 'task-pane-relaunch', branch: 'bx/task-pane-relaunch' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-task-check'] },
-    });
-    await lockManager.acquire('dev-1');
-
-    mockEnsureSession({ freshRuntime: true });
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
-    expect(ok).toBe(true);
-
-    expect(prompts.length).toBe(1);
-    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
-    expect(prompts[0]).not.toContain('<skills></skills>');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
-  });
-
-  it('continueSession resets dedup when adoptOrRestartSession relaunches REPL inside an existing pane', async () => {
-    const t = await seedTask({ id: 'task-pane-relaunch-cont', branch: 'bx/task-pane-relaunch-cont', status: 'approved' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-pr-feedback'] },
-    });
-    await lockManager.acquire('dev-1');
-    await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
-
-    mockEnsureSession({ freshRuntime: true });
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
-    expect(ok).toBe(true);
-
-    expect(prompts[0].startsWith('/baxian-pr-feedback\n')).toBe(true);
-    expect(prompts[0]).not.toContain('<skills></skills>');
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
   });
 
   it('startSession runs armBeforeInject before pasting the prompt', async () => {
@@ -2029,89 +1811,6 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     expect(ok).toBe(false);
     expect(prompts.length).toBe(0);
-  });
-
-  it('startSession records injectedSkills even when injectAndAwaitAck returns acked=false — paste delivered the skills', async () => {
-    const t = await seedTask({ id: 'task-ack-false', branch: 'bx/task-ack-false' });
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
-
-    mockEnsureSession();
-    capturePrompts(manager, { acked: false });
-    useWorkdirRunner();
-
-    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
-    expect(ok).toBe(true);
-
-    // 即便首个 Enter 被吞（ack 超时），skill 文本已 paste 进 pane → 落 dedup baseline，
-    // 避免下一轮派发整组重注入（SKILLS 重复注入根因）。
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.paneId).toBe('%0');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
-  });
-
-  it('continueSession expands injectedSkills even when injectAndAwaitAck returns acked=false', async () => {
-    const t = await seedTask({ id: 'task-ack-false-cont', branch: 'bx/task-ack-false-cont', status: 'approved' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-      injectedSkills: { taskId: t.id, paneId: '%0', skills: ['baxian-task-check'] },
-    });
-    await lockManager.acquire('dev-1');
-    await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
-
-    mockEnsureSession();
-    capturePrompts(manager, { acked: false });
-    useWorkdirRunner();
-
-    const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', { signalToken: 'tok' });
-    expect(ok).toBe(true);
-
-    // post-approve phase skill = baxian-pr-feedback；paste 后即合并落盘，与 ack 无关。
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback', 'baxian-task-check']);
-  });
-
-  it('does NOT record injectedSkills when paste landed on a busy baseline', async () => {
-    const t = await seedTask({ id: 'task-busy-baseline', branch: 'bx/task-busy-baseline' });
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
-
-    mockEnsureSession();
-    // Busy-baseline race: ack timed out AND the prompt was pasted into a running input stream, not an
-    // idle composer → skills never entered context → baseline must stay empty (else recovery loses skills).
-    capturePrompts(manager, { acked: false, composerDelivered: false });
-    useWorkdirRunner();
-
-    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
-    expect(ok).toBe(true);
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills).toBeUndefined();
-  });
-
-  it('startSession on a different taskId resets a stale injectedSkills record', async () => {
-    const t = await seedTask({ id: 'task-dedup-4', branch: 'bx/task-dedup-4' });
-    // Agent currently bound to t but carries a STALE injectedSkills record from a prior task.
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      injectedSkills: { taskId: 'task-OLD', paneId: '%0', skills: ['baxian-task-check'] },
-    });
-    await lockManager.acquire('dev-1');
-
-    mockEnsureSession();
-    const prompts = capturePrompts(manager);
-    useWorkdirRunner();
-
-    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
-    expect(ok).toBe(true);
-
-    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
-
-    const state = await agentStore.get('dev-1');
-    expect(state?.injectedSkills?.taskId).toBe(t.id);
-    expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-task-check']);
   });
 
   it('provisionRepoSkills materializes skills under .claude/skills for claude-code and .agents/skills for codex', async () => {
@@ -3411,29 +3110,27 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     manager = makeManager({ runnerFactory: () => recordingRunner(execs) });
     await seedAgent({ id: 'dev-1', taskId: 'task-x' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 1, taskId: 'task-x', branch: 'bx/task-x' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'task-x', branch: 'bx/task-x' });
 
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('runs the full cycle: idle → cleanup prompt (busy→idle) → /clear (busy→idle) → release', async () => {
+  it('runs the full cycle: idle → /clear → release, with NO agent dialogue', async () => {
     const execs: string[] = [];
     const promptInjections: string[] = [];
     manager = makeManager({ runnerFactory: () => compactRunner(execs, captureInjection(promptInjections)) });
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 99, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const joined = execs.join('\n');
-    expect(joined).toMatch(/tmux load-buffer/);
-    expect(joined).toMatch(/tmux paste-buffer/);
+    // Nothing is pasted into the pane — no notification, no conversation. baxian just resets context.
+    expect(promptInjections).toEqual([]);
+    expect(joined).not.toMatch(/tmux (load|paste)-buffer/);
     expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
-    expect(promptInjections.join('\n')).toContain('event: pr-merged');
-    // cleanup prompt injected BEFORE /clear in the command stream
-    expect(execs.findIndex(c => c.includes('load-buffer')))
-      .toBeLessThan(execs.findIndex(c => c.includes("send-keys -l -t '%5' '/clear'")));
+    expect(joined).not.toMatch(/\/compact/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
@@ -3443,21 +3140,20 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 99, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('runs server-side fetch+prune + branch -D in repoPath, and surfaces the "deleted" outcome in the prompt', async () => {
+  it('runs server-side fetch+prune + branch -D in repoPath, then /clear', async () => {
     const execs: string[] = [];
-    const promptInjections: string[] = [];
-    manager = makeManager({ runnerFactory: () => compactRunner(execs, captureInjection(promptInjections)) });
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main-clone', taskId: 'merged-task' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 17, taskId: 'merged-task', branch: 'bx/task-merge' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/task-merge' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const fetchCmd = execs.find(c => c.includes('git fetch --prune origin'));
@@ -3465,8 +3161,6 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect(fetchCmd).toContain('git worktree prune');
     const delCmd = execs.find(c => c.includes('git branch -D'));
     expect(delCmd).toContain("git branch -D 'bx/task-merge'");
-    expect(promptInjections.join('\n')).toContain('branch-cleanup: deleted');
-    expect(promptInjections.join('\n')).toContain('branch: bx/task-merge');
     expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
   });
 
@@ -3476,7 +3170,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', worktreePath: '/wt/merged-task' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 9, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const removeIdx = execs.findIndex(c => c.includes('git worktree remove'));
@@ -3498,7 +3192,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 5, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     expect(taskIdDuringBranchDelete).toBe('merged-task');
@@ -3506,18 +3200,15 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('sends /compact instead of /clear when branch delete fails, preserving the cleanup warning', async () => {
+  it('a failed branch delete is logged server-side but does not change the wrap-up — still /clear, never /compact', async () => {
     const BUSY = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
     const IDLE = '⏵⏵ bypass permissions on /tmp/repo\n\n>';
     let busyLeft = 0;
     const execs: string[] = [];
-    const promptInjections: string[] = [];
-    const record = captureInjection(promptInjections);
     manager = makeManager({
       runnerFactory: () => ({
         exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
           execs.push(cmd);
-          record(cmd);
           if (cmd.includes('git branch -D')) {
             return { stdout: '', stderr: "error: Cannot delete branch 'bx/merged-task' checked out at '/tmp/wt'", exitCode: 1 };
           }
@@ -3539,15 +3230,33 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main', taskId: 'merged-task' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 99, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const joined = execs.join('\n');
-    expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/compact'/);
-    expect(joined).not.toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
-    expect(promptInjections.join('\n')).toContain('branch-cleanup: failed');
-    expect(promptInjections.join('\n')).toContain('next: compact');
+    expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(joined).not.toMatch(/\/compact/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+  });
+
+  it('warns (does not silently skip) when the binding has no repoPath to delete the branch from', async () => {
+    const execs: string[] = [];
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
+    setCompactTiming(manager);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task' }); // no repoPath on the binding
+
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+    await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
+
+    // Missing repoPath → branch delete can't run, but the skip is surfaced server-side, not dropped.
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/no repoPath on binding; skipping local branch delete/));
+    const joined = execs.join('\n');
+    expect(joined).not.toContain('git branch -D');
+    // The pane is still reset and the agent released — cleanup proceeds despite the skip.
+    expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    warnSpy.mockRestore();
   });
 
   it('treats a fast /clear (busy seen only briefly) as success, not a failed start', async () => {
@@ -3556,7 +3265,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager);
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 9, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const binding = await agentStore.get('dev-1');
@@ -3571,7 +3280,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager, 50, 5);
     await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main', taskId: 'next-task' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 17, taskId: 'merged-task', branch: 'bx/task-merge' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/task-merge' });
     await new Promise(r => setTimeout(r, 60));
 
     const joined = execs.join('\n');
@@ -3598,7 +3307,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager, 50, 5);
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 3, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId, 5000);
 
     const binding = await agentStore.get('dev-1');
@@ -3619,7 +3328,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
       return origUpdate(id, cb);
     });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 1, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await new Promise(r => setTimeout(r, 60));
 
     const binding = await agentStore.get('dev-1');
@@ -3646,7 +3355,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     setCompactTiming(manager, 50, 5);
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
 
-    await manager.dispatchPostMergeCleanup('dev-1', { prNumber: 1, taskId: 'merged-task', branch: 'bx/merged-task' });
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await new Promise(r => setTimeout(r, 500));
 
     expect(execs.filter(c => c.includes('send-keys') && c.includes('C-c'))).toHaveLength(0);

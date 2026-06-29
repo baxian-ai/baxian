@@ -1788,7 +1788,7 @@ describe('pr.merged handler', () => {
 
     await emitPrMerged(id, { prNumber });
 
-    expect(dispatchSpy).toHaveBeenCalledWith('qa-1', { prNumber, taskId: id, branch: `bx/${id}` });
+    expect(dispatchSpy).toHaveBeenCalledWith('qa-1', { taskId: id, branch: `bx/${id}` });
     expect(stopSpy).not.toHaveBeenCalledWith('qa-1', id, 'idle');
   });
 
@@ -1799,7 +1799,6 @@ describe('pr.merged handler', () => {
     await emitPrMerged('task-m4', { prNumber: 13 });
 
     expect(dispatchSpy).toHaveBeenCalledWith('qa-1', {
-      prNumber: 13,
       taskId: 'task-m4',
       branch: 'bx/task-m4',
     });
@@ -1818,7 +1817,6 @@ describe('pr.merged handler', () => {
     const task = await taskStore.get('task-m4-post-approve');
     expect(task!.status).toBe('merged');
     expect(dispatchSpy).toHaveBeenCalledWith('dev-1', {
-      prNumber: 130,
       taskId: 'task-m4-post-approve',
       branch: 'bx/task-m4-post-approve',
     });

@@ -58,12 +58,10 @@ import type { ReviewStore } from '../state/review-store.js';
 import {
   buildPromptInline,
   buildGreetingPrompt,
-  buildPostMergeCleanupPrompt,
   PromptSizeError,
   RequiredSkillsMissingError,
   MAX_PROMPT_BYTES_ROUTE_LIMIT,
   type PostMergeCleanupContext,
-  type PostMergeBranchCleanupResult,
 } from './prompt.js';
 import { ApiError } from '../errors.js';
 import { prepareConfig } from '../config/loader.js';
@@ -74,7 +72,7 @@ export interface EnsureSessionResult {
   // True when the REPL inside the pane was launched (or relaunched) in this
   // call: buildFreshSession 路径，以及 adoptOrRestartSession 的 shell 重启 /
   // trust-dialog 完成两个分支。这些场景下旧 REPL 上下文（如果存在）已经丢失，
-  // 调用方应据此重置 skill dedup baseline——adopted live-runtime 则保持 false。
+  // 调用方据此放弃 post-approve 增量 nudge、改发完整 preamble——adopted live-runtime 则保持 false。
   freshRuntime: boolean;
   paneId: string;
   workdir: string;
@@ -311,19 +309,6 @@ export function shouldReleaseHeldBinding(
   const taskIsTerminal = !!boundTask && TERMINAL_STATUSES.includes(boundTask.status);
   const turnCompleted = state.awaitingPhase != null && TURN_COMPLETED_AWAITING_PHASES.has(state.awaitingPhase);
   return !boundTask || taskIsTerminal || turnCompleted;
-}
-
-// null 表示 context 已无效（换 task / 换 pane），调用方应回退到完整注入。
-// 返回数组（含空数组）则代表当前 REPL session 已有的 skill 名集合，可作 excludeSkills 入参。
-function reuseSkillsIfContextValid(
-  state: AgentBindingFacts | null,
-  taskId: string,
-  paneId: string,
-): string[] | null {
-  const rec = state?.injectedSkills;
-  if (!rec) return null;
-  if (rec.taskId !== taskId || rec.paneId !== paneId) return null;
-  return rec.skills;
 }
 
 export class AgentManager {
@@ -1600,7 +1585,7 @@ export class AgentManager {
           await tmux.killSession(agentId).catch(() => {});
           return this.buildFreshSession(tmux, agent, agentId, workdir);
         }
-        // 复用既有 REPL，上下文未中断——dedup 仍可沿用。
+        // 复用既有 REPL，上下文未中断——freshRuntime=false，post-approve 可走增量 nudge。
         return { ok: true, createdSession: false, freshRuntime: false, paneId, workdir };
       }
       case 'startup-dialog':
@@ -3665,12 +3650,6 @@ export class AgentManager {
       await assertSessionUnchanged();
       await tmux.sendKeysLiteral(paneId, command);
       await tmux.sendEnter(paneId);
-      if (command === '/clear') {
-        await this.agentStore.update(agentId, (s) => {
-          if (!s) return AGENT_STORE_NOOP;
-          return { ...s, injectedSkills: undefined };
-        });
-      }
       guardHandedOff = true;
       void this.waitForReplPromptReady(tmux, paneId, cfg.runtime, this.compactIdleWaitMs)
         .catch(err => {
@@ -4010,14 +3989,6 @@ export class AgentManager {
     // Caller-transmitted token/round take precedence — task fields are stale during dispatch.
     const promptSignalToken = opts.signalToken ?? task.signalToken;
     const promptSpecRound = opts.currentSpecRound ?? task.specReviewRound;
-    const beforeInjectAgent = await this.agentStore.get(agentId);
-    // freshRuntime=true 覆盖两种场景：(a) buildFreshSession 全新 tmux session；
-    // (b) adoptOrRestartSession 的 shell 重启 / trust-dialog 答完——pane 仍在但 REPL
-    // 是新进程。两种情况下旧上下文都没了，必须重置 dedup baseline，决不能因为
-    // paneId 字符串恰好相同就沿用旧 skill 集。
-    const reuseInjectedSkills = ensure.freshRuntime
-      ? null
-      : reuseSkillsIfContextValid(beforeInjectAgent, taskId, paneId);
     // develop prompt 按 QA 有无裁剪 spec 路线（qaAgentId 快照优先，与 review 派发同一解析）。
     const hasQaPartner = !!(task.qaAgentId ?? this.findQaPartner(agentId)?.id);
     let prompt: string;
@@ -4032,7 +4003,6 @@ export class AgentManager {
         hasQaPartner,
         ...(promptSignalToken ? { signalToken: promptSignalToken } : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
-        ...(reuseInjectedSkills ? { excludeSkills: reuseInjectedSkills } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
         ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
         ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
@@ -4125,9 +4095,6 @@ export class AgentManager {
           bootstrappingTaskId: taskId,
           updatedAt: now,
           ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
-          ...(reuseInjectedSkills
-            ? { injectedSkills: { taskId, paneId, skills: reuseInjectedSkills } }
-            : {}),
         };
       });
       if (cancelHoldWon) {
@@ -4140,7 +4107,7 @@ export class AgentManager {
       }
       agentMarkedRunning = true;
 
-      const ack = await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
+      await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
       // Prompt delivered → clear the mid-bootstrap marker IMMEDIATELY, before the slower persist/emit/watch
       // steps: a crash between ack and the clear would otherwise leave recover() seeing a stale marker on
       // an already-running prompt and re-dispatching it. The clear is best-effort and NON-destructive — its
@@ -4159,14 +4126,6 @@ export class AgentManager {
         ).catch((holdErr) => {
           console.warn(`[AgentManager] startSession: hold after marker-clear failure for task=${taskId} failed:`, holdErr);
         });
-      }
-      // dedup baseline 记录的是「已 paste 进 idle composer 的 skill 文本」：paste 落入 composer 即进
-      // REPL 上下文，与 submit-ack 无关。ack 超时（首个 Enter 被吞）下 skill 仍在 composer，跳过落盘会让
-      // 下一轮整组重注入——即 SKILLS 重复注入。但 composerDelivered=false（paste 时 pane
-      // 已 busy，文本进了运行中输入流而非 composer）则不能落盘，否则恢复提示会缺必需 skill。freshRuntime
-      // 负责 REPL 真正重启时作废 baseline。
-      if (ack.composerDelivered) {
-        await this.persistInjectedSkills(agentId, taskId, paneId, agent.role, phase, reuseInjectedSkills);
       }
 
       await this.eventBus.emit({
@@ -4365,35 +4324,6 @@ export class AgentManager {
     }
   }
 
-  // Snapshot which skills are now resident in the REPL's context, union of
-  // the pre-dispatch baseline (when context was still valid) and the phase's
-  // declared skills. Guarded by (taskId, paneId) so a concurrent rebind never
-  // overwrites a freshly-bound agent.
-  private async persistInjectedSkills(
-    agentId: string,
-    taskId: string,
-    paneId: string,
-    role: AgentConfig['role'],
-    phase: string,
-    reuseInjectedSkills: string[] | null,
-  ): Promise<void> {
-    const phaseSkills = this.skillRegistry.skillsForPhase(role, phase);
-    const baseList = reuseInjectedSkills ?? [];
-    // 已有有效 context 记录，且本 phase 没有引入新 skill → 写盘无信息增益，short-circuit。
-    // reuseInjectedSkills === null 时缺基线记录，仍需建一份初始档。
-    if (reuseInjectedSkills !== null && phaseSkills.every(s => baseList.includes(s))) return;
-    const merged = Array.from(new Set([...baseList, ...phaseSkills]));
-    const now = new Date().toISOString();
-    await this.agentStore.update(agentId, (latest) => {
-      if (!latest || latest.taskId !== taskId || latest.paneId !== paneId) return AGENT_STORE_NOOP;
-      return {
-        ...latest,
-        injectedSkills: { taskId, paneId, skills: merged },
-        updatedAt: now,
-      };
-    });
-  }
-
   // Ready gate prevents mid-paste webhook from flipping to 'waiting' on a busy REPL.
   async markAgentWaiting(
     agentId: string,
@@ -4476,17 +4406,10 @@ export class AgentManager {
     const tmux = new TmuxManager(runner);
 
     const promptSpecRound = opts.currentSpecRound ?? task.specReviewRound;
-    // 与 startSession 同步：任何 REPL 启动 / 重启路径（freshRuntime=true）都视为新上下文，
-    // 强制重新注入完整 skill 集——既覆盖 fresh tmux session，也覆盖同 pane 里的 shell 重启
-    // 与 trust-dialog 完成两种 adopt 场景。
-    const reuseInjectedSkills = ensure.freshRuntime
-      ? null
-      : reuseSkillsIfContextValid(agentState, taskId, paneId);
     let prompt: string;
     try {
-      // freshRuntime=true 表示 tmux/REPL 刚新建或重启，旧 post-approve prompt 上下文已丢失
-      // (同步：reuseInjectedSkills 在 freshRuntime 时也强制 null 重发 skill 集)。此时即使
-      // redispatchCount>0 也必须发完整长段，否则 dev 拿不到 T_self / idempotency / final
+      // freshRuntime=true 表示 tmux/REPL 刚新建或重启，旧 post-approve prompt 上下文已丢失。
+      // 此时即使 redispatchCount>0 也必须发完整长段，否则 dev 拿不到 T_self / idempotency / final
       // re-fetch / 禁止 merge 等首轮规则。
       const useIncrementalNudge =
         typeof opts.postApproveRedispatchCount === 'number'
@@ -4506,7 +4429,6 @@ export class AgentManager {
           ? { postApproveRedispatchCount: opts.postApproveRedispatchCount }
           : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
-        ...(reuseInjectedSkills ? { excludeSkills: reuseInjectedSkills } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
         ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
         ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
@@ -4583,17 +4505,10 @@ export class AgentManager {
         paneId,
         worktreePath,
         updatedAt: now,
-        ...(reuseInjectedSkills
-          ? { injectedSkills: { taskId, paneId, skills: reuseInjectedSkills } }
-          : { injectedSkills: undefined }),
       };
     });
 
-    const ack = await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
-    // 仅 composer 投递成功才落 dedup baseline（理由见 startSession）；freshRuntime 负责 REPL 重启时作废。
-    if (ack.composerDelivered) {
-      await this.persistInjectedSkills(agentId, taskId, paneId, agent.role, phase, reuseInjectedSkills);
-    }
+    await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
     return true;
   }
 
@@ -4747,7 +4662,6 @@ export class AgentManager {
               continue;
             }
             await this.dispatchPostMergeCleanup(state.id, {
-              prNumber: boundTask.prNumber,
               taskId: boundTask.id,
               branch: boundTask.branch,
             });
@@ -6024,10 +5938,9 @@ export class AgentManager {
     this.phaseSignalWatcher?.stop(taskId);
     // Keep the agent BOUND (non-dispatchable) until branch cleanup + context reset finish, then
     // release. dispatchPostMergeCleanup owns the whole lifecycle: worktree removal → branch
-    // delete → /clear (or /compact if cleanup failed) → release.
+    // delete → /clear → release (no agent notification).
     if (task.prNumber && task.branch) {
       const ctx: PostMergeCleanupContext = {
-        prNumber: task.prNumber,
         taskId: task.id,
         branch: task.branch,
       };
@@ -6080,15 +5993,24 @@ export class AgentManager {
     await this.removeMergedWorktree(agent, agentId, ctx.taskId);
 
     const runner = this.createRunnerFor(agent);
-    const cleanupResult: PostMergeBranchCleanupResult = state.repoPath
-      ? await this.deleteLocalBranchInRepo(runner, state.repoPath, ctx.branch, agentId)
-      : { outcome: 'skipped', detail: 'agent has no repoPath in binding' };
+    if (state.repoPath) {
+      await this.deleteLocalBranchInRepo(runner, state.repoPath, ctx.branch, agentId);
+    } else {
+      // No repoPath on the binding → can't run `git branch -D`. Keep the "can't clean → warn
+      // server-side" contract: surface the skip (the merged branch may linger locally) rather than
+      // dropping it silently now that there is no agent notification carrying `branch-cleanup: skipped`.
+      console.warn(
+        `[AgentManager] dispatchPostMergeCleanup(${agentId}): no repoPath on binding; skipping local ` +
+        `branch delete for ${ctx.branch} (it may linger locally)`,
+      );
+    }
 
+    // No agent dialogue: the merged task is already done and the agent is idle, so baxian just resets
+    // its context with /clear and releases it. Worktree + local branch were cleaned above; a failed
+    // branch delete is logged server-side (deleteLocalBranchInRepo), not surfaced into the pane.
     const tmux = new TmuxManager(runner);
-    const prompt = buildPostMergeCleanupPrompt(ctx, cleanupResult);
     const runtime = agentRuntimeKindFor(agent);
-    const cleanSlate = cleanupResult.outcome === 'deleted' || cleanupResult.outcome === 'absent';
-    void this.runPostMergeCompaction(tmux, state.paneId, agentId, ctx.taskId, runtime, prompt, cleanSlate).catch(err =>
+    void this.runPostMergeCompaction(tmux, state.paneId, agentId, ctx.taskId, runtime).catch(err =>
       console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) failed:`, err),
     );
   }
@@ -6142,17 +6064,15 @@ export class AgentManager {
     });
   }
 
-  // shellQuote prevents injection. Three outcomes the caller must distinguish so the
-  // notification prompt to the agent doesn't lie about a deletion that actually failed:
-  //   - deleted: branch ref was removed (or no longer exists at the end of the call).
-  //   - absent:  branch wasn't there at all (auto-delete-head-branches, never landed locally).
-  //   - failed:  worktree still occupies the ref, permissions, etc. — agent must NOT be told "cleaned".
+  // Best-effort local cleanup after merge: prune the remote-tracking ref + worktree admin entry, then
+  // delete the local branch. shellQuote prevents injection. Failures are logged server-side only — the
+  // wrap-up resets the pane with /clear regardless, and there is no agent notification to keep honest.
   private async deleteLocalBranchInRepo(
     runner: CommandRunner,
     repoPath: string,
     branch: string,
     agentId: string,
-  ): Promise<PostMergeBranchCleanupResult> {
+  ): Promise<void> {
     // --expire=now: bare `git worktree prune` honors gc.worktreePruneExpire (default 3 months),
     // so a worktree that the release just removed could still be tracked as occupying the ref.
     const fetchCmd =
@@ -6172,21 +6092,15 @@ export class AgentManager {
     const delCmd = `cd ${shellQuote(repoPath)} && git branch -D ${shellQuote(branch)}`;
     try {
       const delResult = await runner.exec(delCmd, { timeout: this.postMergeBranchTimeoutMs });
-      if (delResult.exitCode === 0) {
-        return { outcome: 'deleted', detail: delResult.stdout.trim() };
+      // exit 0 → deleted; "not found"/"no such branch" → already absent (auto-delete-head-branches). Both fine.
+      if (delResult.exitCode !== 0 && !/not found|not a valid|no such branch/i.test(delResult.stderr)) {
+        console.warn(
+          `[AgentManager] deleteLocalBranchInRepo(${agentId}, ${branch}): branch -D exit=${delResult.exitCode} ` +
+          `stderr=${delResult.stderr.trim()}`,
+        );
       }
-      if (/not found|not a valid|no such branch/i.test(delResult.stderr)) {
-        return { outcome: 'absent', detail: delResult.stderr.trim() };
-      }
-      console.warn(
-        `[AgentManager] deleteLocalBranchInRepo(${agentId}, ${branch}): branch -D exit=${delResult.exitCode} ` +
-        `stderr=${delResult.stderr.trim()}`,
-      );
-      return { outcome: 'failed', detail: delResult.stderr.trim() || `exit ${delResult.exitCode}` };
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
       console.warn(`[AgentManager] deleteLocalBranchInRepo(${agentId}, ${branch}) branch -D threw:`, err);
-      return { outcome: 'failed', detail };
     }
   }
 
@@ -6196,14 +6110,12 @@ export class AgentManager {
     agentId: string,
     originalTaskId: string,
     runtime: AgentRuntimeKind,
-    prompt: string,
-    cleanSlate: boolean,
   ): Promise<void> {
-    // 等待获取（而非无条件 add）：手动 compact 持锁时直接进入会并发注入，
+    // 等待获取（而非无条件 add）：手动 compact 持锁时直接进入会并发，
     // 且 finally 会误删对方的 guard 放穿后续请求。
     await this.acquireCompactGuard(agentId);
     try {
-      await this.runPostMergeCompactionSteps(tmux, paneId, agentId, originalTaskId, runtime, prompt, cleanSlate);
+      await this.runPostMergeCompactionSteps(tmux, paneId, agentId, originalTaskId, runtime);
     } finally {
       this.compactInFlight.delete(agentId);
     }
@@ -6236,63 +6148,33 @@ export class AgentManager {
     agentId: string,
     originalTaskId: string,
     runtime: AgentRuntimeKind,
-    prompt: string,
-    cleanSlate: boolean,
   ): Promise<void> {
     const bindingStillOurs = async (): Promise<boolean> => {
       const s = await this.agentStore.get(agentId);
       return !!s && s.taskId === originalTaskId && s.paneId === paneId;
     };
+    if (!await bindingStillOurs()) return;
 
-    let attempts = 0;
+    // No notification, no dialogue: the merged task is done and the agent is idle, so just reset its
+    // context. sendPostMergeSlashCommand interrupts any lingering turn (Esc), waits for idle, sends
+    // /clear, verifies it wasn't rejected, and retries. Returns false if the binding moved mid-way.
     let cleared = false;
-    while (attempts < 2) {
-      attempts++;
-      try {
-        if (attempts > 1) {
-          if (!await bindingStillOurs()) return;
-          await tmux.sendKeysToPane(paneId, 'C-c');
-          await new Promise(r => setTimeout(r, 1000));
-        }
-        await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
-        if (!await bindingStillOurs()) return;
-        await tmux.injectPrompt(paneId, prompt, agentId);
-        // Resend a swallowed first Enter (bracketed-paste TUI quirk); settle so baseline holds the paste.
-        const baseline = await tmux.captureSettledSnapshot(paneId, { timeoutMs: this.dispatchSettleTimeoutMs });
-        await tmux.sendEnter(paneId);
-        try {
-          await tmux.waitSubmitAck(paneId, baseline, runtime, {
-            timeoutMs: this.dispatchAckTimeoutMs,
-            resend: () => tmux.sendEnter(paneId),
-            resendIntervalMs: this.dispatchAckResendIntervalMs,
-          });
-        } catch (ackErr) {
-          // Only a genuine ack timeout is best-effort; other (infra) errors must reach the outer retry.
-          if (!(ackErr instanceof Error && /runtime ack timeout/.test(ackErr.message))) throw ackErr;
-          console.warn(`[AgentManager] post-merge notification ack timeout (${agentId}, pane ${paneId}):`, ackErr);
-        }
-        await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
-        if (!await bindingStillOurs()) return;
-        const command = cleanSlate ? '/clear' : '/compact';
-        if (!await this.sendPostMergeSlashCommand(tmux, paneId, agentId, runtime, command, bindingStillOurs)) {
-          return;
-        }
+    try {
+      cleared = await this.sendPostMergeSlashCommand(tmux, paneId, agentId, runtime, bindingStillOurs);
+    } catch (err) {
+      console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) /clear failed:`, err);
+    }
+    if (!cleared) {
+      // A runtime that exited to a shell can't take /clear; restarting it yields the same clean slate.
+      if (await this.recoverPostMergeExitedRuntime(tmux, paneId, agentId, originalTaskId, runtime)) {
         cleared = true;
-        break;
-      } catch (err) {
-        const label = attempts < 2 ? 'retrying' : 'giving up';
-        console.warn(
-          `[AgentManager] runPostMergeCompaction(${agentId}) attempt ${attempts} failed (${label}):`,
-          err,
-        );
+      } else if (!await bindingStillOurs()) {
+        return; // binding moved to another flow mid-cleanup → leave its pane alone (no C-c, no release)
+      } else if (!await this.clearComposerForReuse(tmux, paneId, agentId)) {
+        return; // can't even reach a clean composer → hold (don't release) for a human
       }
+      // else: composer cleaned → a stuck pane must not strand the agent bound to a merged task; release.
     }
-    if (!cleared && await this.recoverPostMergeExitedRuntime(tmux, paneId, agentId, originalTaskId, runtime)) {
-      await this.releasePostMergeAgent(agentId, originalTaskId);
-      return;
-    }
-    // Give-up: clear the injected-but-unsubmitted notification; hold (don't release) if it can't be cleared.
-    if (!cleared && !await this.clearComposerForReuse(tmux, paneId, agentId)) return;
     await this.releasePostMergeAgent(agentId, originalTaskId);
   }
 
@@ -6321,18 +6203,13 @@ export class AgentManager {
       if (!ensure.freshRuntime) return false;
       await this.agentStore.update(agentId, (existing) => {
         if (!existing || existing.taskId !== taskId) return AGENT_STORE_NOOP;
-        if (
-          existing.paneId === ensure.paneId
-          && existing.repoPath === ensure.workdir
-          && existing.injectedSkills === undefined
-        ) {
+        if (existing.paneId === ensure.paneId && existing.repoPath === ensure.workdir) {
           return AGENT_STORE_NOOP;
         }
         return {
           ...existing,
           paneId: ensure.paneId,
           repoPath: ensure.workdir,
-          injectedSkills: undefined,
           updatedAt: new Date().toISOString(),
         };
       });
@@ -6349,33 +6226,32 @@ export class AgentManager {
     paneId: string,
     agentId: string,
     runtime: AgentRuntimeKind,
-    command: '/compact' | '/clear',
     bindingStillOurs: () => Promise<boolean>,
   ): Promise<boolean> {
     let rejection: Error | undefined;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      // The runtime rejects /clear|/compact while a turn is in progress, and the post-merge
-      // notification turn can still be running when our idle scrape passes. Esc interrupts it (the
-      // same stop the cancel flow runs before /clear); a genuinely idle pane absorbs it harmlessly.
+      // The runtime rejects /clear while a turn is in progress, and the agent's last task turn can
+      // still be settling when our idle scrape passes. Esc interrupts it (the same stop the cancel
+      // flow runs before /clear); a genuinely idle pane absorbs it harmlessly.
       await tmux.sendKeysToPane(paneId, 'Escape');
       await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
       if (!await bindingStillOurs()) return false;
-      await tmux.sendKeysLiteral(paneId, command);
+      await tmux.sendKeysLiteral(paneId, '/clear');
       await tmux.sendEnter(paneId);
       await new Promise(r => setTimeout(r, this.compactIdlePollMs));
       await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
       if (!await bindingStillOurs()) return false;
 
-      if (!await this.hasRuntimeSlashCommandRejection(tmux, paneId, command)) return true;
+      if (!await this.hasRuntimeSlashCommandRejection(tmux, paneId, '/clear')) return true;
 
-      rejection = new Error(`runtime rejected ${command} because a task is still in progress`);
+      rejection = new Error('runtime rejected /clear because a task is still in progress');
       if (attempt < 2) {
-        console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) ${command} rejected; retrying`);
+        console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) /clear rejected; retrying`);
         await new Promise(r => setTimeout(r, this.compactIdlePollMs));
         if (!await bindingStillOurs()) return false;
       }
     }
-    throw rejection ?? new Error(`runtime rejected ${command}`);
+    throw rejection ?? new Error('runtime rejected /clear');
   }
 
   private async hasRuntimeSlashCommandRejection(

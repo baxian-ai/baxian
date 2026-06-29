@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 import {
   buildPromptInline,
   buildGreetingPrompt,
-  buildPostMergeCleanupPrompt,
   MAX_PROMPT_BYTES,
   MAX_INLINE_FINDINGS_BYTES,
   PromptSizeError,
@@ -278,29 +277,24 @@ describe('buildPromptInline', () => {
     for (const f of notContains) expect(prompt).not.toContain(f);
   });
 
-  // Excluding the primary (already-resident) skill drops its leading /command but leaves the body;
-  // excluding any other skill keeps the leading command intact.
-  it.each<[string, string[], string, string[], string[]]>([
-    ['containing the primary drops the leading command, body unchanged', ['baxian-task-check'], 'phase: develop', ['title: Fix login redirect'], ['/baxian-task-check']],
-    ['not naming the primary keeps the leading command', ['baxian-pr-review'], '/baxian-task-check\n', [], []],
-  ])('excludeSkills %s', async (_label, excludeSkills, prefix, contains, notContains) => {
+  // Every dispatch is one slash-command invocation: buildPromptInline ALWAYS force-loads the
+  // phase's primary skill on the first line. `code` (post spec-approval) shares baxian-task-check
+  // with `develop` in the same REPL and used to drop the command once the skill was resident — it
+  // must not. No bare-descriptor dispatch ever ships.
+  it('every phase force-loads its /command — code reuses baxian-task-check yet still emits it', async () => {
     await seedAndScan();
-    const prompt = build({ worktreePath: '/tmp/repo/.baxian-worktrees/task-001_abc', excludeSkills });
-    expect(prompt.startsWith(prefix)).toBe(true);
-    for (const f of contains) expect(prompt).toContain(f);
-    for (const f of notContains) expect(prompt).not.toContain(f);
+    const codePrompt = build({ phase: 'code', signalToken: 'code-token-1' });
+    expect(codePrompt.startsWith('/baxian-task-check\nphase: code\n')).toBe(true);
+    expect(codePrompt).toContain('signal: pr-created');
+    const codexCode = build({ phase: 'code', signalToken: 'code-token-1', agent: { ...DEV_AGENT, runtime: 'codex' } });
+    expect(codexCode.startsWith('$baxian-task-check\n')).toBe(true);
   });
 
-  // Each row leaves the phase-declared skill (baxian-task-check) out of the registry, then asserts
-  // the required-skill check rejects. excludeSkills must NOT bypass it — the check is registry-wide,
-  // not emit-wide.
-  it.each<[string, string[], string[]]>([
-    ['excludeSkills naming the required skill does not bypass the check', [], ['baxian-task-check']],
-    ['the registry is empty', [], []],
-  ])('buildPromptInline throws RequiredSkillsMissingError when %s', async (_label, seed, excludeSkills) => {
-    for (const name of seed) await makeSkill(name, name);
+  // The required-skill check is registry-wide: a phase-declared skill missing from the registry
+  // fails the build loud, rather than shipping a prompt whose force-load silently no-ops.
+  it('buildPromptInline throws RequiredSkillsMissingError when the phase skill is absent from the registry', async () => {
     await registry.scan();
-    expect(() => build({ excludeSkills })).toThrow(RequiredSkillsMissingError);
+    expect(() => build()).toThrow(RequiredSkillsMissingError);
   });
 
   it('requires baxian-signals only when a signalToken is present (rules moved into that skill)', async () => {
@@ -517,66 +511,6 @@ describe('buildPromptInline', () => {
     expect(scanPhaseSignals(buildPhaseSignal('spec-done', 'abc123def456'))).toEqual([
       { kind: 'spec-done', token: 'abc123def456' },
     ]);
-  });
-
-  const CLEANUP_META = { prNumber: 42, taskId: 'task-007', branch: 'bx/task-007' } as const;
-
-  type CleanupResult = Parameters<typeof buildPostMergeCleanupPrompt>[1];
-  it.each<[string, CleanupResult, string[], string[]]>([
-    [
-      'deleted → branch-cleanup: deleted + next: clear',
-      { outcome: 'deleted', detail: '' },
-      ['event: pr-merged', 'pr: 42', 'task: task-007', 'branch: bx/task-007', 'branch-cleanup: deleted', 'next: clear'],
-      ['next: compact', 'WARNING'],
-    ],
-    [
-      'failed → branch-cleanup: failed + detail + next: compact',
-      { outcome: 'failed', detail: "error: Cannot delete branch 'bx/task-007' checked out at '/tmp/wt'" },
-      ['branch-cleanup: failed', "detail: error: Cannot delete branch 'bx/task-007' checked out at '/tmp/wt'", 'next: compact'],
-      ['next: clear'],
-    ],
-    [
-      'absent → branch-cleanup: absent + next: clear',
-      { outcome: 'absent', detail: 'branch not found' },
-      ['branch-cleanup: absent', 'next: clear'],
-      ['next: compact'],
-    ],
-    [
-      'skipped → branch-cleanup: skipped + next: compact',
-      { outcome: 'skipped', detail: 'no repo path available' },
-      ['branch-cleanup: skipped', 'next: compact'],
-      ['next: clear'],
-    ],
-  ])('buildPostMergeCleanupPrompt %s', (_label, result, contains, notContains) => {
-    const prompt = buildPostMergeCleanupPrompt(CLEANUP_META, result);
-    for (const fragment of contains) expect(prompt).toContain(fragment);
-    for (const fragment of notContains) expect(prompt).not.toContain(fragment);
-  });
-
-  it('buildPostMergeCleanupPrompt: self-contained, force-loads no skill (post-merge path does not re-provision)', () => {
-    // dispatchPostMergeCleanup injects directly without re-provisioning skills, so this prompt must
-    // NOT depend on a force-loaded skill — a hot-upgraded session might not have it materialized yet.
-    const prompt = buildPostMergeCleanupPrompt(CLEANUP_META, { outcome: 'failed', detail: 'x' });
-    expect(prompt.startsWith('event: pr-merged')).toBe(true);
-    expect(prompt).not.toContain('baxian-merge-cleanup');
-    expect(prompt).not.toContain('[baxian]');
-    // failed → the manual-cleanup warning rides inline so it survives even without the skill.
-    expect(prompt).toContain('WARNING');
-    expect(prompt).toContain('git branch -D bx/task-007');
-  });
-
-  it('buildPostMergeCleanupPrompt: never leaks agent-side git commands regardless of outcome', () => {
-    const prompts = (['deleted', 'absent', 'failed', 'skipped'] as const).map(outcome =>
-      buildPostMergeCleanupPrompt(
-        { prNumber: 1, taskId: 't', branch: 'b' },
-        { outcome, detail: 'x' },
-      ),
-    );
-    for (const prompt of prompts) {
-      expect(prompt).not.toMatch(/git fetch --prune origin/);
-      expect(prompt).not.toMatch(/git symbolic-ref/);
-      expect(prompt).not.toMatch(/git checkout/);
-    }
   });
 
   afterEach(async () => {
