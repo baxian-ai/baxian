@@ -45,6 +45,11 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean } = {}) {
   const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   const events: BaxianEvent[] = [];
   eventBus.on('*', (e) => { events.push(e); });
+  const watcher = {
+    start: vi.fn(async () => true),
+    stop: vi.fn(),
+    has: vi.fn(() => false),
+  };
   const manager = new AgentManager({
     config: makeConfig(mode, opts),
     agentStore,
@@ -53,8 +58,9 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean } = {}) {
     eventBus,
     runnerFactory: () => runner,
     platformRunner: runner,
+    phaseSignalWatcher: watcher as never,
   });
-  return { manager, taskStore, agentStore, events };
+  return { manager, taskStore, agentStore, events, watcher };
 }
 
 function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
@@ -91,6 +97,51 @@ describe('server dispatch guards (spec unification)', () => {
     await expect(
       f.manager.dispatchServerFixToDev('task-1', '{}'),
     ).rejects.toThrow(/not in server review mode/);
+  });
+});
+
+describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s pre-inject hook', () => {
+  it('defers the spec-reviewed read-file watcher arm into startSession (not eagerly before the session exists)', async () => {
+    // Regression: arming the watcher BEFORE startSession attaches PaneStreamer to a QA tmux session
+    // that does not exist yet on a cold first dispatch → handleAttachExit sees hasSession=false →
+    // onSessionGone deletes the just-armed entry, and the first server-spec-review loses its
+    // read-file/verdict watcher. The arm must ride startSession's pre-inject hook (pane created by
+    // ensureSession), so the dispatcher hands over armBeforeInject instead of arming directly.
+    const f = await makeFixture('github');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'github', phase: undefined, status: 'in_progress',
+      signalToken: 'orig-token', specReviewRound: 0,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW,
+    }));
+
+    const armedSpecReviewed = () => f.watcher.start.mock.calls.some(
+      (c) => (c[0] as { expectedKinds?: unknown }).expectedKinds === 'spec-reviewed',
+    );
+    let capturedOpts: { armBeforeInject?: () => Promise<boolean> } | undefined;
+    let armedBeforeStart = false;
+    const startSpy = vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      capturedOpts = opts as { armBeforeInject?: () => Promise<boolean> };
+      armedBeforeStart = armedSpecReviewed();
+      return false;
+    });
+
+    await f.manager.dispatchServerReviewToQa('task-1', { phase: 'spec', content: 'spec text', contentTruncated: true })
+      .catch(() => undefined);
+
+    expect(startSpy).toHaveBeenCalled();
+    // The QA pane may not exist before startSession runs ensureSession, so the arm must be deferred.
+    expect(armedBeforeStart).toBe(false);
+    // The dispatcher hands startSession a pre-inject hook that arms the spec-reviewed read-file watcher.
+    expect(capturedOpts?.armBeforeInject).toBeTypeOf('function');
+    await capturedOpts!.armBeforeInject!();
+    expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      expectedKinds: 'spec-reviewed',
+      onReadFile: expect.any(Function),
+      skipSnapshot: false,
+    }));
   });
 });
 

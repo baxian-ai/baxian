@@ -15,15 +15,22 @@ function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 describe('buildLaunchCommand', () => {
   it('claude-code: bypass mode by default', () => {
     expect(buildLaunchCommand(agent({ runtime: 'claude-code' }))).toBe(
-      'env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions',
+      'env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions',
     );
   });
 
   it('claude-code uses env instead of POSIX assignment syntax for shell compatibility', () => {
     const cmd = buildLaunchCommand(agent({ runtime: 'claude-code' }));
 
-    expect(cmd).toMatch(/^env CLAUDE_CODE_NO_FLICKER=1 claude\b/);
+    expect(cmd).toMatch(/^env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude\b/);
     expect(cmd).not.toMatch(/^CLAUDE_CODE_NO_FLICKER=1\b/);
+  });
+
+  // Disables Claude Code's "How is Claude doing this session?" survey: its overlay masks the REPL ready
+  // anchor, and on macOS Escape/Ctrl-C can't dismiss it, so a cancel's interrupt would stall (task-167).
+  it('claude-code disables the session feedback survey; codex carries no such env', () => {
+    expect(buildLaunchCommand(agent({ runtime: 'claude-code' }))).toContain('CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1');
+    expect(buildLaunchCommand(agent({ runtime: 'codex' }))).not.toContain('CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY');
   });
 
   it('codex: bypass approvals by default', () => {
@@ -34,7 +41,7 @@ describe('buildLaunchCommand', () => {
 
   it('claude-code with --model', () => {
     expect(buildLaunchCommand(agent({ runtime: 'claude-code', model: 'sonnet' }))).toBe(
-      "env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions --model 'sonnet'",
+      "env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions --model 'sonnet'",
     );
   });
 
@@ -46,7 +53,7 @@ describe('buildLaunchCommand', () => {
 
   it('claude-code with single --add-dir', () => {
     expect(buildLaunchCommand(agent({ runtime: 'claude-code', addDirs: ['/usr/local/lib'] }))).toBe(
-      "env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions --add-dir '/usr/local/lib'",
+      "env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions --add-dir '/usr/local/lib'",
     );
   });
 
@@ -61,12 +68,12 @@ describe('buildLaunchCommand', () => {
   it('claude-code with both --model and --add-dir', () => {
     expect(
       buildLaunchCommand(agent({ runtime: 'claude-code', model: 'opus', addDirs: ['/x'] })),
-    ).toBe("env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions --model 'opus' --add-dir '/x'");
+    ).toBe("env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions --model 'opus' --add-dir '/x'");
   });
 
   it('empty addDirs array is a no-op', () => {
     expect(buildLaunchCommand(agent({ runtime: 'claude-code', addDirs: [] }))).toBe(
-      'env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions',
+      'env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions',
     );
   });
 
@@ -91,7 +98,7 @@ describe('buildLaunchCommand', () => {
       agent({ runtime: 'claude-code', addDirs: ['/path with space/$(whoami)'] }),
     );
     expect(cmd).toBe(
-      "env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions --add-dir '/path with space/$(whoami)'",
+      "env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions --add-dir '/path with space/$(whoami)'",
     );
   });
 });

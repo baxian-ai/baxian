@@ -86,6 +86,25 @@ export function detectRuntimeMenu(stripped: string): boolean {
   return RUNTIME_MENU_SIGNALS.some(re => re.test(stripped));
 }
 
+// Codex completion popup: its footer means Enter *inserts* the choice, not submit, so a resubmit must
+// refuse while it shows. The overlay replaces the status line as the bottom UI — scan up from the
+// bottom but stop at the status line (`·`), so a body merely quoting the footer (status line still
+// below it) isn't read as a popup; the joined lines also recover a footer a narrow pane wrapped.
+const RUNTIME_COMPLETION_POPUP_RE = /\benter to insert\b[^\n]{0,40}\besc to close\b/i;
+const COMPLETION_POPUP_FOOTER_LINES = 3;
+export function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKind): boolean {
+  if (runtime !== 'codex') return false;
+  const lines = stripped.split('\n');
+  const footer: string[] = [];
+  for (let i = lines.length - 1; i >= 0 && footer.length < COMPLETION_POPUP_FOOTER_LINES; i--) {
+    const line = lines[i].trim();
+    if (line === '') continue;
+    if (line.includes('·')) break;
+    footer.unshift(line);
+  }
+  return RUNTIME_COMPLETION_POPUP_RE.test(footer.join(' '));
+}
+
 export function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolean {
   return READY_ANCHORS[runtime].test(stripped);
 }
@@ -137,6 +156,14 @@ export function hasActiveSpinnerInTail(stripped: string): boolean {
 function tail(stripped: string, count: number): string {
   const paneLines = stripped.split('\n');
   return paneLines.slice(Math.max(0, paneLines.length - count)).join('\n');
+}
+
+function bottomNonBlankLine(stripped: string): string {
+  const lines = stripped.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== '') return lines[i];
+  }
+  return '';
 }
 
 function escToInterruptInTail(stripped: string): boolean {
@@ -577,11 +604,9 @@ export class TmuxManager {
     return prev;
   }
 
-  // Ack only on a fresh idle→busy transition (a swallowed Enter can't fake it); an already-busy baseline is non-ackable.
-  // The first Enter after a bracketed paste is occasionally swallowed by the TUI's paste-end handling,
-  // leaving injected text in the box needing a manual Enter. When a resend callback is given,
-  // re-send Enter — but ONLY while the pane is still byte-identical to the pre-Enter composer, which is
-  // the only proof the prompt is genuinely unsent.
+  // Ack on a fresh idle→busy transition (a swallowed Enter can't fake it); an already-busy baseline is non-ackable.
+  // A first Enter swallowed by paste-end handling or eaten by a $skill popup leaves the prompt unsent;
+  // resend (if given) while the pane still reads as an Enter-would-submit composer.
   async waitSubmitAck(
     paneId: string,
     baseline: string,
@@ -602,13 +627,19 @@ export class TmuxManager {
       // For meta-commands (acceptComposerChange) a cleared/redrawn composer is itself the submission
       // proof — they may never show a busy frame.
       if (opts.acceptComposerChange && visible !== composerBaseline) return;
-      // Any deviation from the pre-Enter composer (submit cleared it, or the runtime parked on a
-      // menu/dialog/other UI) means a swallowed Enter is NOT the cause — and pressing Enter there
-      // would answer whatever is on screen, exactly what the detect-only dialog policy forbids
-      // Resend only on an unchanged composer.
+      // Key resend on "an Enter here would submit", not byte-identity to baseline — a popup/redraw breaks
+      // that permanently and would strand the prompt. The menu/startup footer a resend must avoid is the
+      // bottom-most UI line; scoping there (not whole-screen) stops task-body text that merely quotes such
+      // a footer from blocking recovery. (Popup detector scans the bottom itself.)
+      const bottomLine = bottomNonBlankLine(visible);
+      const enterWouldSubmit =
+        !detectRuntimeMenu(bottomLine)
+        && !detectStartupDialog(bottomLine, runtime)
+        && !TRUST_DIALOGS[runtime].test(visible)
+        && !detectRuntimeCompletionPopup(visible, runtime);
       if (
         opts.resend
-        && visible === composerBaseline
+        && enterWouldSubmit
         && Date.now() - lastResend >= resendIntervalMs
       ) {
         await opts.resend();

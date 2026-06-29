@@ -295,8 +295,16 @@ export const api = {
         `/projects/${enc(projectId)}/agents/${enc(agentId)}`,
       ),
     resumeAgent: (projectId: string, agentId: string) =>
-      post<{ agentId: string; resumed: boolean; releasedBinding: boolean }>(
+      post<{ agentId: string; resumed: boolean; releasedBinding: boolean; reason?: string }>(
         `/projects/${enc(projectId)}/agents/${enc(agentId)}/resume`,
+      ),
+    restartRepl: (projectId: string, agentId: string) =>
+      post<{ ok: boolean; agentId: string; runtimeStatus?: string; message?: string }>(
+        `/projects/${enc(projectId)}/agents/${enc(agentId)}/restart-repl`,
+      ),
+    retryAgent: (projectId: string, agentId: string) =>
+      post<{ ok: boolean; agentId: string; runtimeStatus?: string; message?: string }>(
+        `/projects/${enc(projectId)}/agents/${enc(agentId)}/retry`,
       ),
     bootstrap: (projectId: string) =>
       post<{ ok: boolean; ran: number; message?: string }>(

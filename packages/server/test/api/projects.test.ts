@@ -627,6 +627,23 @@ describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
     expect(body.resumed).toBe(false);
   });
 
+  it('resume surfaces the manager reason instead of the generic fallback (e.g. greeting_failed)', async () => {
+    await seedAgent('dev-1', 'proj', { status: 'awaiting_human', awaitingPhase: 'greeting_failed' });
+    vi.spyOn(app.ctx.agentManager, 'resumeAgent').mockResolvedValue({
+      resumed: false,
+      releasedBinding: false,
+      reason: 'Greeting capability check failed; use Restart REPL to re-run the greeting check.',
+    });
+
+    const response = await post('/api/projects/proj/agents/dev-1/resume');
+
+    expect(response.statusCode).toBe(409);
+    const body = JSON.parse(response.body);
+    expect(body.error).toMatch(/Restart REPL/);
+    expect(body.error).not.toMatch(/not in a state that can be resumed/);
+    expect(body.resumed).toBe(false);
+  });
+
   it('agent not awaiting_human: 409', async () => {
     await seedAgent('dev-1', 'proj');
 

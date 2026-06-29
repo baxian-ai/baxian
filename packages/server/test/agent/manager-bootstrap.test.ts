@@ -436,6 +436,8 @@ describe('AgentManager greeting capability gate', () => {
     const res = await mgr.resumeAgent('dev-1');
 
     expect(res.resumed).toBe(false);
+    // The refusal must carry an actionable reason, not be swallowed into a generic API fallback.
+    expect(res.reason).toMatch(/Restart REPL/);
     const state = await agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');

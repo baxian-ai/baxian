@@ -1974,6 +1974,63 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
   });
 
+  it('startSession runs armBeforeInject before pasting the prompt', async () => {
+    const t = await seedTask({ id: 'task-arm-before', branch: 'bx/task-arm-before' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    mockEnsureSession();
+    const prompts = capturePrompts(manager);
+    useWorkdirRunner();
+
+    let promptsAtArm = -1;
+    const ok = await manager.startSession(t.id, 'dev-1', 'develop', {
+      armBeforeInject: async () => { promptsAtArm = prompts.length; return true; },
+    });
+
+    expect(ok).toBe(true);
+    expect(promptsAtArm).toBe(0);   // hook ran before any paste
+    expect(prompts.length).toBe(1); // paste happened after the hook
+  });
+
+  it('startSession aborts without pasting when armBeforeInject returns false', async () => {
+    const t = await seedTask({ id: 'task-arm-abort', branch: 'bx/task-arm-abort' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    mockEnsureSession();
+    const prompts = capturePrompts(manager);
+    useWorkdirRunner();
+
+    const ok = await manager.startSession(t.id, 'dev-1', 'develop', {
+      armBeforeInject: async () => false,
+    });
+
+    expect(ok).toBe(false);
+    expect(prompts.length).toBe(0); // arm failure → nothing injected
+  });
+
+  it('continueSession aborts without pasting when armBeforeInject returns false', async () => {
+    const t = await seedTask({ id: 'task-arm-abort-cont', branch: 'bx/task-arm-abort-cont', status: 'approved' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+    });
+    await lockManager.acquire('dev-1');
+    await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
+
+    mockEnsureSession();
+    const prompts = capturePrompts(manager);
+    useWorkdirRunner();
+
+    const ok = await manager.continueSession(t.id, 'dev-1', 'post-approve', {
+      signalToken: 'tok', armBeforeInject: async () => false,
+    });
+
+    expect(ok).toBe(false);
+    expect(prompts.length).toBe(0);
+  });
+
   it('startSession records injectedSkills even when injectAndAwaitAck returns acked=false — paste delivered the skills', async () => {
     const t = await seedTask({ id: 'task-ack-false', branch: 'bx/task-ack-false' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -3658,7 +3715,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const result = await manager.resumeAgent('dev-1');
 
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
+    expect(result).toMatchObject({ resumed: false, releasedBinding: false });
+    expect(result.reason).toBeTruthy();
     expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
     expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
     expect(await lockManager.isLocked('dev-1')).toBe(true);
@@ -3692,7 +3750,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const result = await manager.resumeAgent('dev-1');
 
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
+    expect(result).toMatchObject({ resumed: false, releasedBinding: false });
+    expect(result.reason).toBeTruthy();
     expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
     expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('agent_dialog_pending');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
@@ -3703,7 +3762,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const result = await manager.resumeAgent('dev-1');
 
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
+    expect(result).toMatchObject({ resumed: false, releasedBinding: false });
   });
 
   it('resumeAgent refuses when creationToken still set (bootstrap dialog unresolved)', async () => {
@@ -3716,7 +3775,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const result = await manager.resumeAgent('dev-1');
 
-    expect(result).toEqual({ resumed: false, releasedBinding: false });
+    expect(result).toMatchObject({ resumed: false, releasedBinding: false });
+    expect(result.reason).toBeTruthy();
     // 状态保持 awaiting_human，DELETE 路径仍可用
     expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
     expect((await agentStore.get('dev-1'))?.creationToken).toBe('tok-still-pending');
@@ -3734,7 +3794,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const result = await manager.resumeAgent('qa-1');
 
-    expect(result).toEqual({ resumed: expectRelease, releasedBinding: expectRelease });
+    expect(result).toMatchObject({ resumed: expectRelease, releasedBinding: expectRelease });
+    if (!expectRelease) expect(result.reason).toBeTruthy();
     expect((await agentStore.get('qa-1'))?.taskId).toBe(expectRelease ? undefined : t.id);
     if (!expectRelease) expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
     expect(await lockManager.isLocked('qa-1')).toBe(!expectRelease);
@@ -3819,7 +3880,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const result = await manager.resumeAgent('qa-1');
 
-    expect(result).toEqual({ resumed: expectRelease, releasedBinding: expectRelease });
+    expect(result).toMatchObject({ resumed: expectRelease, releasedBinding: expectRelease });
+    if (!expectRelease) expect(result.reason).toBeTruthy();
     const after = await agentStore.get('qa-1');
     if (expectRelease) {
       expect(after?.taskId).toBeUndefined();

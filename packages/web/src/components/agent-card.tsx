@@ -121,6 +121,8 @@ export function AgentCard({
   }, [menuOpen]);
   const taskId = agent.binding?.taskId;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
+  // greeting_failed 不能靠 Resume 清除（能力必须重新验证）——同一个 Resume 按钮改走 restart-repl 重跑握手。
+  const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
   // Without these exemptions, an in-flight waitReplReady looks identical to a needs-human pane.
   const isBootstrapping = !!agent.binding?.creationToken
     && !agent.binding?.paneId
@@ -189,11 +191,27 @@ export function AgentCard({
   };
 
   const handleResume = async () => {
-    if (!window.confirm(`确认 Resume Agent ${agent.id}？baxian 会清除 awaiting_human 状态，agent 重新可派遣。`)) {
-      return;
-    }
+    const confirmMsg = needsRegreet
+      ? `确认 Resume Agent ${agent.id}？greeting 能力未通过，baxian 会重跑能力握手（会话存活则重启 REPL，已丢失则重建）；握手通过才解除 Held。`
+      : `确认 Resume Agent ${agent.id}？baxian 会清除 awaiting_human 状态，agent 重新可派遣。`;
+    if (!window.confirm(confirmMsg)) return;
     setResuming(true);
     try {
+      if (needsRegreet) {
+        // restart-repl 复用存活会话；会话已丢失（absent/unreachable/unknown）时它会报 "use retry to rebuild"，
+        // 走 retry 重建会话——两条路都接 regreetHeldAgent 重跑握手。
+        if (agent.tmuxSessionStatus === 'present') {
+          await api.projects.restartRepl(projectId, agent.id);
+        } else {
+          await api.projects.retryAgent(projectId, agent.id);
+        }
+        show({
+          kind: 'success',
+          title: `Agent ${agent.id} 正在重跑能力握手`,
+          body: '握手通过后 Held 会在下一次刷新自动解除，仍失败则按提示修复 runtime 后再试。',
+        });
+        return;
+      }
       const result = await api.projects.resumeAgent(projectId, agent.id);
       show({
         kind: 'success',
@@ -450,7 +468,9 @@ export function AgentCard({
               type="button"
               onClick={handleResume}
               disabled={resuming}
-              title="清除 awaiting_human 状态，让 agent 重新可派遣"
+              title={needsRegreet
+                ? '重跑 greeting 能力握手以恢复（会话存活则重启 REPL，已丢失则重建；greeting_failed 无法靠清状态解除）'
+                : '清除 awaiting_human 状态，让 agent 重新可派遣'}
               className="btn-ghost shrink-0 !text-warn hover:!bg-[#fef3c7]/60"
             >
               {resuming ? 'Resuming…' : 'Resume'}

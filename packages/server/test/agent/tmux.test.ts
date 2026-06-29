@@ -560,7 +560,7 @@ describe('TmuxManager', () => {
     });
 
     // A long injected prompt wraps the composer across many rows — the case a narrow pane made worse.
-    // The swallowed-Enter recovery must still fire (it keys off "composer byte-identical to baseline").
+    // The swallowed-Enter recovery must still fire (it keys off "an Enter here would submit").
     it('re-sends Enter for a long multi-line pasted prompt held in the composer (no message left unsent)', async () => {
       const longComposer = Array.from({ length: 40 }, (_, i) => `wrapped prompt line ${i} ......................`).join('\n') + '\n';
       const baseline = buildBaseline(longComposer, 0);
@@ -575,6 +575,98 @@ describe('TmuxManager', () => {
         tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
+    });
+
+    // Codex $skill dispatch repro: the first Enter was eaten by the $skill completion popup
+    // ("Enter to insert"), which redrew the composer so it no longer matched the pre-Enter
+    // baseline — yet the prompt is still unsent. Recovery must key off "Enter here submits"
+    // (idle, non-busy, no menu/popup), NOT byte-identity to baseline, or the prompt sticks forever.
+    it('re-sends Enter after the composer diverged from baseline but is still an idle composer', async () => {
+      const baseline = buildBaseline('idle composer\n', 0);
+      let submitted = false;
+      // visible differs from baseline (the eaten Enter left an extra blank line) yet is still idle.
+      runner.exec.mockImplementation(async () => ({
+        stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : 'idle composer\n\n', 0),
+        stderr: '',
+        exitCode: 0,
+      }));
+      const resend = vi.fn(async () => { submitted = true; });
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).resolves.toBeUndefined();
+      expect(resend).toHaveBeenCalled();
+    });
+
+    it('does NOT re-send Enter while a Codex completion popup is open (Enter would insert, not submit)', async () => {
+      // $skill / @file / /command popup: footer says Enter inserts the highlighted item. Resending
+      // here corrupts the composer instead of submitting — wait for it to close.
+      const baseline = buildBaseline('› $baxian-pr-review\n  phase: review\n', 0);
+      runner.exec.mockResolvedValue({
+        stdout: composeSnapStdout('› $baxian-pr-review\n  phase: review\n\n  Press enter to insert or esc to close\n', 0),
+        stderr: '',
+        exitCode: 0,
+      });
+      const resend = vi.fn(async () => undefined);
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).rejects.toThrow(/runtime ack timeout/);
+      expect(resend).not.toHaveBeenCalled();
+    });
+
+    // The popup footer is detected ONLY as the bottom-most UI line. A task body that merely quotes
+    // "Press enter to insert or esc to close" (e.g. a prompt describing this very bug) keeps the model
+    // status line below it — it is NOT an open popup, so a swallowed first Enter must still recover.
+    it('re-sends Enter when the prompt body quotes the popup footer but the status line is still below it', async () => {
+      const held = '› $baxian-pr-review\n  note: Press enter to insert or esc to close\n\n  gpt-5.5 xhigh · ~/repo\n';
+      const baseline = buildBaseline(held, 0);
+      let submitted = false;
+      runner.exec.mockImplementation(async () => ({
+        stdout: composeSnapStdout(submitted ? '· Thinking… (2s)\n' : held, 0),
+        stderr: '',
+        exitCode: 0,
+      }));
+      const resend = vi.fn(async () => { submitted = true; });
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).resolves.toBeUndefined();
+      expect(resend).toHaveBeenCalled();
+    });
+
+    // Menu/startup footers a resend must avoid are detected only as the bottom-most line. A task body
+    // that quotes "Enter to select · Esc to cancel" higher up keeps the composer + status line below it,
+    // so a swallowed first Enter must still recover (the quoted footer is not the active UI).
+    it('re-sends Enter when the prompt body quotes a menu footer but the composer is held below it', async () => {
+      const held = '› $baxian-task\n  describe a menu: Enter to select · Esc to cancel\n'
+        + Array.from({ length: 20 }, (_, i) => `  detail line ${i}`).join('\n')
+        + '\n\n  gpt-5.5 xhigh · ~/repo\n';
+      const baseline = buildBaseline(held, 0);
+      let submitted = false;
+      runner.exec.mockImplementation(async () => ({
+        stdout: composeSnapStdout(submitted ? '· Thinking… (2s)\n' : held, 0),
+        stderr: '',
+        exitCode: 0,
+      }));
+      const resend = vi.fn(async () => { submitted = true; });
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).resolves.toBeUndefined();
+      expect(resend).toHaveBeenCalled();
+    });
+
+    it('detects a Codex completion popup whose footer a narrow pane wrapped across two rows', async () => {
+      // PaneStreamer.resize can narrow the pane until "Press enter to insert or esc to close" wraps;
+      // the footer is still the bottom-most overlay, so the wrapped rows must join into one match.
+      const baseline = buildBaseline('› $baxian-pr-review\n  phase: review\n', 0);
+      runner.exec.mockResolvedValue({
+        stdout: composeSnapStdout('› $baxian-pr-review\n  Build Web Apps [Plugin]\n\n  Press enter to insert or esc\n  to close\n', 0),
+        stderr: '',
+        exitCode: 0,
+      });
+      const resend = vi.fn(async () => undefined);
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).rejects.toThrow(/runtime ack timeout/);
+      expect(resend).not.toHaveBeenCalled();
     });
 
     it('does NOT re-send Enter once the pane leaves the composer for a menu — detect-only policy', async () => {

@@ -559,7 +559,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           const refreshed = await app.ctx.agentStore.get(agentId);
           const reason = refreshed?.creationToken
             ? 'Bootstrap dialog still unresolved; resolve via web terminal or DELETE the agent.'
-            : 'Resume rejected; agent not in a state that can be resumed.';
+            : result.reason ?? 'Resume rejected; agent not in a state that can be resumed.';
           return reply.status(409).send({ error: reason, ...result, agentId });
         }
         return reply.send({ agentId, ...result });

@@ -16,6 +16,9 @@ const deleteAgentMock = vi.fn();
 const compactMock = vi.fn();
 const clearMock = vi.fn();
 const reviewMock = vi.fn();
+const resumeAgentMock = vi.fn();
+const restartReplMock = vi.fn();
+const retryAgentMock = vi.fn();
 vi.mock('../../src/api.ts', () => ({
   api: {
     agents: {
@@ -24,6 +27,9 @@ vi.mock('../../src/api.ts', () => ({
     },
     projects: {
       deleteAgent: (...args: unknown[]) => deleteAgentMock(...args),
+      resumeAgent: (...args: unknown[]) => resumeAgentMock(...args),
+      restartRepl: (...args: unknown[]) => restartReplMock(...args),
+      retryAgent: (...args: unknown[]) => retryAgentMock(...args),
     },
     tasks: {
       review: (...args: unknown[]) => reviewMock(...args),
@@ -125,7 +131,72 @@ describe('AgentCard', () => {
     compactMock.mockReset();
     clearMock.mockReset();
     reviewMock.mockReset();
+    resumeAgentMock.mockReset();
+    restartReplMock.mockReset();
+    retryAgentMock.mockReset();
     showMock.mockReset();
+  });
+
+  describe('Held recovery via Resume button', () => {
+    function heldCard(id: string, awaitingPhase: string, tmuxSessionStatus: AgentSnapshot['tmuxSessionStatus'] = 'present'): void {
+      renderCard(makeSnapshot({
+        id,
+        runtimeStatus: 'pending',
+        tmuxSessionStatus,
+        binding: makeBinding(id, {
+          status: 'awaiting_human',
+          awaitingPhase,
+          awaitingReason: `${awaitingPhase} reason`,
+        }),
+      }));
+    }
+
+    function resumeButton(): HTMLElement {
+      return screen.getByRole('button', { name: /^Resume$/ });
+    }
+
+    it('routes Resume to restart-repl (re-greet) for a greeting_failed hold with a live session', async () => {
+      restartReplMock.mockResolvedValue({ ok: true, agentId: 'dev-greet' });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      heldCard('dev-greet', 'greeting_failed', 'present');
+
+      await act(async () => { fireEvent.click(resumeButton()); });
+
+      expect(restartReplMock).toHaveBeenCalledWith('proj', 'dev-greet');
+      expect(retryAgentMock).not.toHaveBeenCalled();
+      expect(resumeAgentMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['absent', 'unreachable', 'unknown'] as const)(
+      'routes Resume to retry (rebuild) for a greeting_failed hold when the session is %s',
+      async (sessionStatus) => {
+        retryAgentMock.mockResolvedValue({ ok: true, agentId: 'dev-gone' });
+        vi.spyOn(window, 'confirm').mockReturnValue(true);
+        heldCard('dev-gone', 'greeting_failed', sessionStatus);
+
+        await act(async () => { fireEvent.click(resumeButton()); });
+
+        expect(retryAgentMock).toHaveBeenCalledWith('proj', 'dev-gone');
+        expect(restartReplMock).not.toHaveBeenCalled();
+        expect(resumeAgentMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it('routes Resume to the resume endpoint for a non-greeting hold', async () => {
+      resumeAgentMock.mockResolvedValue({ agentId: 'dev-hold', resumed: true, releasedBinding: true });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      heldCard('dev-hold', 'cancel-interrupt-failed');
+
+      await act(async () => { fireEvent.click(resumeButton()); });
+
+      expect(resumeAgentMock).toHaveBeenCalledWith('proj', 'dev-hold');
+      expect(restartReplMock).not.toHaveBeenCalled();
+    });
+
+    it('gives the greeting_failed Resume button a distinct tooltip from the plain hold', () => {
+      heldCard('dev-greet', 'greeting_failed');
+      expect(resumeButton().getAttribute('title')).toMatch(/握手|greeting|Restart REPL/i);
+    });
   });
 
   it('shows the configured runtime as muted text after the agent name with hover text', () => {

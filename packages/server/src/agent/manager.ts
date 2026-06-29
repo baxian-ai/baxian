@@ -143,7 +143,7 @@ export function buildLaunchCommand(agent: AgentConfig): string {
   const segments: string[] = [];
   switch (agent.runtime) {
     case 'claude-code':
-      segments.push('env CLAUDE_CODE_NO_FLICKER=1 claude --permission-mode bypassPermissions');
+      segments.push('env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions');
       break;
     case 'codex':
       segments.push('codex --dangerously-bypass-approvals-and-sandbox');
@@ -220,6 +220,9 @@ export interface ContinueSessionOpts {
   serverPriorResponse?: string;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   contentTruncated?: boolean;
+  // Pre-inject hook: armed once the pane exists but before the prompt is pasted. Returns false to
+  // abort the dispatch (e.g. the signal watcher could not arm).
+  armBeforeInject?: () => Promise<boolean>;
 }
 
 export interface MergePrOpts {
@@ -1945,25 +1948,25 @@ export class AgentManager {
   // operator 显式恢复 awaiting_human 的 agent。
   // 如果 taskId 指向已 terminal 的 task，连带清掉绑定 + 锁——回归 idle 可派遣。
   // 如果 taskId 指向仍 active 的 task（罕见，比如 dialog_pending 期间 task 没 fail），保留绑定。
-  async resumeAgent(agentId: string): Promise<{ resumed: boolean; releasedBinding: boolean }> {
+  async resumeAgent(agentId: string): Promise<{ resumed: boolean; releasedBinding: boolean; reason?: string }> {
     const result = await this.withTaskLock(async (): Promise<{
       resumed: boolean;
       releasedBinding: boolean;
       redispatchCodeTaskId?: string;
+      reason?: string;
     }> => {
       const state = await this.agentStore.get(agentId);
-      if (!state) return { resumed: false, releasedBinding: false };
+      if (!state) return { resumed: false, releasedBinding: false, reason: 'Agent state not found.' };
       if (state.status !== 'awaiting_human') {
-        return { resumed: false, releasedBinding: false };
+        return { resumed: false, releasedBinding: false, reason: 'Agent is not awaiting human; nothing to resume.' };
       }
       // creationToken 仍 set = bootstrap dialog 仍未解决。Resume 不能让它"继续"——
       // dialog 在 pane 里需要 operator 通过 web terminal 处理，slowPoll 解决后自动清状态。
       // 如果 operator 想放弃这个 agent，应该走 DELETE 路径。
       if (state.creationToken) {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} still has creationToken (bootstrap dialog unresolved); refusing Resume — operator should resolve dialog via web terminal or DELETE the agent.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = 'Bootstrap dialog still unresolved; resolve it via the web terminal or DELETE the agent.';
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} still has creationToken — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       const boundTask = state.taskId ? await this.taskStore.get(state.taskId) : null;
       // "prompt 可能仍在 pane 中跑"类 phase + bound task 仍 active 时 refuse：Resume 让
@@ -1981,10 +1984,9 @@ export class AgentManager {
         && PROMPT_MAYBE_RUNNING_PHASES.has(state.awaitingPhase)
         && boundTask && ACTIVE_TASK_STATUSES.has(boundTask.status)
       ) {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} with active task ${state.taskId} — prompt may still be running; refusing Resume until outcome arrives or operator cancels the task / deletes the agent.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = `Prompt may still be running (${state.awaitingPhase}); Resume is blocked until the task outcome arrives. Cancel task ${state.taskId} or DELETE the agent to recover.`;
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       // agent_dialog_pending: pane 仍卡 startup dialog，REPL 未 ready。Resume 让
       // shouldReleaseHeldBinding 看 task terminal/missing 放行后会清 binding/lock，下一次
@@ -1993,10 +1995,9 @@ export class AgentManager {
       // agent_dialog_resolved_runtime（Resume 放行）或 bootstrap path 直接清 Held → status='ok'，
       // 或 DELETE agent。
       if (state.awaitingPhase === 'agent_dialog_pending') {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} dialog still pending; refusing Resume — operator should dismiss dialog via web terminal (slowPoll will mark agent_dialog_resolved_runtime, then Resume) or DELETE the agent.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = 'Startup dialog still pending; Resume cannot dismiss it. Dismiss the dialog via the web terminal (baxian will auto-resume) or DELETE the agent.';
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       // agent_dialog_resolved_runtime + active task：正常路径下 handleDialogPendingFromRuntime
       // 已 fail task → boundTask 应 terminal。bound task 仍 active 表示 crash window
@@ -2007,10 +2008,9 @@ export class AgentManager {
         state.awaitingPhase === 'agent_dialog_resolved_runtime'
         && boundTask && ACTIVE_TASK_STATUSES.has(boundTask.status)
       ) {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} dialog resolved but bound task ${state.taskId} still active (crash window) — prompt was never injected; refusing Resume. Operator should cancel the task or DELETE the agent.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = `Dialog resolved but task ${state.taskId} is still active and its prompt was never injected; Resume would strand it. Cancel the task or DELETE the agent.`;
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       // code-dispatch-failed: the code-phase prompt never reached the pane (spec
       // approval already transitioned the task). Resume = clear the hold AND
@@ -2043,29 +2043,25 @@ export class AgentManager {
         state.awaitingPhase?.startsWith('signal-arm-failed')
         && boundTask && ACTIVE_TASK_STATUSES.has(boundTask.status)
       ) {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} with active task ${state.taskId} — the dispatched prompt's pane signal has no consumer and Resume cannot rebuild the watcher; refusing Resume. Operator should cancel the task or DELETE the agent.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = `The dispatched prompt's pane signal has no consumer and Resume cannot rebuild the watcher; cancel task ${state.taskId} or DELETE the agent to retry.`;
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       // Un-cleared pane (cancel mid-clear or /clear unconfirmed): Resume would free + reuse it (terminal
       // task → shouldReleaseHeldBinding) and leak the cancelled task's context. Refuse; only DELETE (which
       // destroys the pane) is a safe recovery.
       if (state.awaitingPhase != null && UNCLEARED_PANE_PHASES.has(state.awaitingPhase)) {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — pane holds un-cleared context; refusing Resume. DELETE the agent to discard it.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = 'The pane holds un-cleared context from a cancelled task; Resume would leak it into the next task. DELETE the agent to discard it.';
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       // A greeting capability failure must be RE-PROVEN, not Resumed away: the default path below
       // flips status→'ok' regardless of shouldReleaseHeldBinding, which would put an unverified
       // agent back in the dispatch pool. The recovery path is restart-repl / retry (re-greets).
       if (state.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(state.awaitingPhase)) {
-        console.warn(
-          `[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — capability must be re-proven; ` +
-          `refusing Resume. Use restart-repl / retry to re-run the greeting check.`,
-        );
-        return { resumed: false, releasedBinding: false };
+        const reason = 'Greeting capability check failed; the runtime must re-prove it. Resume cannot clear this hold — use Restart REPL to re-run the greeting check.';
+        console.warn(`[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — ${reason}`);
+        return { resumed: false, releasedBinding: false, reason };
       }
       const now = new Date().toISOString();
       const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask);
@@ -2145,7 +2141,11 @@ export class AgentManager {
         ).catch(() => undefined);
       }
     }
-    return { resumed: result.resumed, releasedBinding: result.releasedBinding };
+    return {
+      resumed: result.resumed,
+      releasedBinding: result.releasedBinding,
+      ...(result.reason ? { reason: result.reason } : {}),
+    };
   }
 
   private async resolvePaneId(
@@ -3903,6 +3903,9 @@ export class AgentManager {
       serverPriorFindings?: string;
       serverPriorResponse?: string;
       contentTruncated?: boolean;
+      // Pre-inject hook: armed once the pane exists but before the prompt is pasted. Returns false
+      // to abort the dispatch (e.g. the signal watcher could not arm).
+      armBeforeInject?: () => Promise<boolean>;
     } = {},
   ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
@@ -4091,6 +4094,13 @@ export class AgentManager {
         `[AgentManager] startSession[${phase}]: agent ${agentId} reassigned to ${agentFresh.taskId} ` +
         `(was ${taskId}); cleaning up worktree before paste`,
       );
+      try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
+      return false;
+    }
+
+    // Pane exists now but the prompt is not out — arm here so a request it triggers is a live chunk,
+    // not snapshot-suppressed scrollback. Abort cleanly (no binding written yet) if it cannot arm.
+    if (opts.armBeforeInject && !(await opts.armBeforeInject())) {
       try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       return false;
     }
@@ -4558,6 +4568,11 @@ export class AgentManager {
         );
         return false;
       }
+    }
+
+    // Arm before paste (same reasoning as startSession): pane exists, prompt not out yet.
+    if (opts.armBeforeInject && !(await opts.armBeforeInject())) {
+      return false;
     }
 
     const now = new Date().toISOString();
@@ -6843,6 +6858,12 @@ export class AgentManager {
       ...(opts.priorFindingsJson ? { serverPriorFindings: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { serverPriorResponse: opts.priorResponseJson } : {}),
       ...(opts.phase === 'spec' ? { currentSpecRound: newRound } : {}),
+      // Arm the verdict + read-file watcher in the pane-exists / pre-paste window so a QA
+      // [bx:read-file:...] emitted during the dispatch is a live chunk, not snapshot-suppressed.
+      armBeforeInject: () => this.setupPhaseSignalWatcher(
+        taskId, qaId, expectedKind, newToken, false,
+        (req) => { void this.handleReadFileRequest(taskId, qaId, req); },
+      ),
     };
     // A continuation consumed the QA's reviewed signal (not the dev's entry
     // signal): rollback restores the prior slice's review/token, so re-arm the
@@ -6855,12 +6876,16 @@ export class AgentManager {
         await rearmEntrySignal();
       }
     };
+
     let started = false;
     try {
       started = opts.continuation
         ? await this.continueSession(taskId, qaId, dispatchPhase, sessionOpts)
         : await this.startSession(taskId, qaId, dispatchPhase, sessionOpts);
     } catch (err) {
+      // armBeforeInject may have armed the watcher before the failing paste — drop it so a stale
+      // entry can't fire on a rolled-back / failed task (no-op if it never armed).
+      this.stopPhaseSignalWatcher(taskId);
       if (err instanceof DispatchTerminalError) {
         await this.failTaskForDispatchError(taskId, dispatchPhase, qaId, err);
       } else if (err instanceof EnsureSessionError && err.partial.handled) {
@@ -6875,6 +6900,9 @@ export class AgentManager {
       throw err;
     }
     if (!started) {
+      // Covers armBeforeInject returning false (watcher couldn't arm) as well as any other
+      // pre-paste abort; stop is a no-op when nothing armed.
+      this.stopPhaseSignalWatcher(taskId);
       await rollback();
       if (!opts.continuation) {
         await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
@@ -6892,15 +6920,6 @@ export class AgentManager {
       return null;
     }
 
-    this.stopPhaseSignalWatcher(taskId);
-    await this.armPostDispatchSignalOrHold(
-      taskId,
-      qaId,
-      expectedKind,
-      newToken,
-      false,
-      (req) => { void this.handleReadFileRequest(taskId, qaId, req); },
-    );
     return await this.taskStore.get(taskId);
   }
 
