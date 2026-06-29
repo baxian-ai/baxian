@@ -1,10 +1,14 @@
 ---
 name: baxian-pr-feedback
-description: Process review feedback on a PR — Fixed/Won't fix each finding, create issues for out-of-scope items
+description: Dev processes PR review feedback (fix phase) and the pre-merge feedback pass (post-approve) — fetch, judge, act, signal back.
 disable-model-invocation: true
 ---
 
+baxian dispatches you with a block of `key: value` dispatch fields. Work in `worktree:`; the PR is in `pr:`. Communicate via the GitHub PR; stay in scope (out-of-scope → new Issue). Route on `phase:`: `fix` → §Fix, `post-approve` → §Post-Approve.
+
 ## Fetch Feedback
+
+Substitute `N` with your `pr:` field:
 
 ```bash
 gh api --paginate repos/OWNER/REPO/pulls/N/reviews
@@ -25,6 +29,19 @@ For each actionable item:
 
 Reply to every item, including duplicates (reference primary). Thread inline comments.
 
-## Fix Completion
+## Fix
 
-Emit `pr-fixed` when done — even without code push. baxian verifies work exists before routing to QA. Signal wire format and emit rules: see the baxian-signals skill.
+QA requested changes on the PR in `pr:` (review round `round:`). Read all feedback (§Fetch Feedback), then handle every finding (§Decide and Act). If you change code, commit then push to your `branch:`: `git push origin HEAD:<branch>`. Emit your `signal:` (`pr-fixed`) with `token:` when done — even without a code push; baxian verifies work exists before routing to QA.
+
+## Post-Approve
+
+QA already approved. Before merge, re-process PR feedback idempotently — handle every item per §Fetch Feedback and §Decide and Act, plus:
+
+- Idempotency: compute `T_self` = your latest reply timestamp per source. Respond to EVERY non-self comment with `created_at` > `T_self`, applied per review thread AND across the issue-comment stream.
+- If you change code: commit + push (baxian routes to QA for recheck) and STOP — do NOT emit `pr-merge-ready` when you pushed code.
+- If no code change is needed: re-fetch all sources before signaling. The server suppresses redispatches while you run, so new comments only reach you via this re-fetch. If unhandled items remain, process and re-fetch again. Emit your `signal:` (`pr-merge-ready`) with `token:` only when clean.
+- Do not merge the PR yourself from this phase.
+
+When a `redispatch:` field is present, new feedback arrived while you were running: re-read the three sources, handle any non-self item with `created_at` > `T_self`, re-fetch once more, and emit only when no unhandled items remain.
+
+Signal wire format and emit rules: see the baxian-signals skill.

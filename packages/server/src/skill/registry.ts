@@ -226,3 +226,23 @@ export class SkillRegistry {
 }
 
 export type SkillFileWriter = (path: string, content: Buffer) => Promise<void>;
+
+// Skills the greeting gate + signal dispatch hard-depend on. The gate is unconditional, so
+// their absence is never a valid "skill-less" deployment — it is a packaging/scan error.
+export const CORE_SKILLS = ['baxian-greeting', 'baxian-signals'] as const;
+
+// Throw at startup when a core skill is missing. An EMPTY registry (dropped skills/ dir or a
+// bad skillsDir) is the worst case and must be fatal too: otherwise the server boots, the gate
+// injects /baxian-greeting that resolves to nothing, and every agent burns the full greeting
+// timeout into greeting_failed instead of the error surfacing loudly at boot.
+export function assertCoreSkillsPresent(registry: SkillRegistry, skillsDir?: string): void {
+  const missing = CORE_SKILLS.filter((name) => !registry.has(name));
+  if (missing.length === 0) return;
+  const detail =
+    registry.names().length === 0
+      ? `skill registry is EMPTY (skillsDir=${skillsDir ?? 'unset'}) — skills/ was dropped from the bundle or the path is wrong`
+      : `skill registry is missing core skill(s): ${missing.join(', ')}`;
+  throw new Error(
+    `${detail} — the greeting gate and signal dispatch require ${CORE_SKILLS.join(' + ')}`,
+  );
+}

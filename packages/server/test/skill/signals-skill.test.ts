@@ -28,6 +28,16 @@ describe('baxian-signals skill', () => {
     expect(body).toContain('PR you just created');
   });
 
+  // baxian-greeting is force-loaded explicitly by the server (/baxian-greeting), like the phase
+  // skills — so it must disable implicit model invocation, else the model could mis-select it
+  // mid-task. (signals is the deliberate exception that stays implicitly loadable.)
+  it('baxian-greeting disables implicit model invocation (explicitly force-loaded)', async () => {
+    const body = await skillBody('baxian-greeting');
+    expect(body).toContain('disable-model-invocation: true');
+    const policy = await skillFile('baxian-greeting/agents/openai.yaml');
+    expect(policy).toMatch(/allow_implicit_invocation:\s*false/);
+  });
+
   // Both runtimes must keep the skill implicitly loadable, else the prompt/skill pointers
   // point at a skill no runtime ever loads (the unreachable-reference regression).
   it('keeps the skill implicitly loadable for Codex', async () => {
@@ -42,6 +52,9 @@ describe('baxian-signals skill', () => {
     'baxian-pr-review',
     'baxian-pr-recheck',
     'baxian-pr-feedback',
+    'baxian-greeting',
+    'baxian-server-review',
+    'baxian-server-feedback',
   ])('%s points at baxian-signals', async (name) => {
     const body = await skillBody(name);
     expect(body).toContain('baxian-signals');

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { SkillRegistry } from '../../src/skill/registry.js';
+import { SkillRegistry, assertCoreSkillsPresent } from '../../src/skill/registry.js';
 
 let tempDir: string;
 
@@ -170,5 +170,27 @@ describe('SkillRegistry.contentHash', () => {
     const after = registry.contentHash();
 
     expect(after).not.toBe(before);
+  });
+});
+
+describe('assertCoreSkillsPresent', () => {
+  it('passes when both core skills are present', async () => {
+    await createSkill('baxian-greeting', '# Greeting');
+    await createSkill('baxian-signals', '# Signals');
+    const registry = await scanned();
+    expect(() => assertCoreSkillsPresent(registry, tempDir)).not.toThrow();
+  });
+
+  it('throws an EMPTY-registry error when no skills were scanned (dropped dir / bad path)', async () => {
+    const registry = await scanned('/nonexistent/skills/path');
+    expect(() => assertCoreSkillsPresent(registry, '/nonexistent/skills/path'))
+      .toThrow(/EMPTY.*\/nonexistent\/skills\/path/s);
+  });
+
+  it('throws naming the missing core skill when only one is present', async () => {
+    await createSkill('baxian-greeting', '# Greeting');
+    const registry = await scanned();
+    expect(() => assertCoreSkillsPresent(registry, tempDir))
+      .toThrow(/missing core skill\(s\): baxian-signals/);
   });
 });

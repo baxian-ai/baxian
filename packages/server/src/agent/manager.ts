@@ -57,6 +57,7 @@ import { ReviewTransport } from './review-transport.js';
 import type { ReviewStore } from '../state/review-store.js';
 import {
   buildPromptInline,
+  buildGreetingPrompt,
   buildPostMergeCleanupPrompt,
   PromptSizeError,
   RequiredSkillsMissingError,
@@ -189,6 +190,7 @@ export interface AgentManagerDeps {
   bootstrapTimeoutsMs?: {
     trustDialog?: number;
     waitReplReady?: number;
+    greeting?: number;
   };
   dispatchAckTimeoutMs?: number;
   dispatchSettleTimeoutMs?: number;
@@ -291,12 +293,18 @@ function cancelPhaseDowngrades(prev: string | undefined, next: string): boolean 
 // so /clear was never submitted. After a real submission /clear wipes the screen and the composer is empty.
 const CLEAR_PENDING_IN_COMPOSER_RE = /(?:^|\n)[ \t]*[❯>›→][ \t]*\/clear\b/;
 
+// A greeting capability failure is NOT cleared by a plain Resume or by recover()'s auto-release:
+// the agent must re-prove it can signal (restart/retry re-runs the handshake). Auto-releasing it
+// would slip an unverified agent back to dispatchable, defeating the whole bootstrap gate.
+const REGREET_REQUIRED_HOLD_PHASES = new Set<string>(['greeting_failed']);
+
 // Resume / recover 共用：决定 Held agent 的 binding 是否随状态恢复一起清掉。
 export function shouldReleaseHeldBinding(
   state: AgentBindingFacts,
   boundTask: TaskState | null | undefined,
 ): boolean {
   if (state.awaitingPhase != null && UNCLEARED_PANE_PHASES.has(state.awaitingPhase)) return false;
+  if (state.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(state.awaitingPhase)) return false;
   const taskIsTerminal = !!boundTask && TERMINAL_STATUSES.includes(boundTask.status);
   const turnCompleted = state.awaitingPhase != null && TURN_COMPLETED_AWAITING_PHASES.has(state.awaitingPhase);
   return !boundTask || taskIsTerminal || turnCompleted;
@@ -341,7 +349,10 @@ export class AgentManager {
   private agentIndex: Map<string, AgentConfig & { projectId: string }>;
   private platformRunner: CommandRunner;
   private imageStagingRoot: string;
-  private bootstrapTimeoutsMs: { trustDialog: number; waitReplReady: number };
+  private bootstrapTimeoutsMs: { trustDialog: number; waitReplReady: number; greeting: number };
+  // Bootstrap greeting handshake: total attempts before holding the agent, to absorb a
+  // single transient slow/garbled reply without failing a genuinely capable agent.
+  protected greetingMaxAttempts = 2;
   private runtimeMenuWatchers = new Map<string, AbortController>();
   protected runtimeMenuPollIntervalMs = 10_000;
   protected compactIdleWaitMs = 5 * 60_000;
@@ -404,6 +415,7 @@ export class AgentManager {
     this.bootstrapTimeoutsMs = {
       trustDialog: deps.bootstrapTimeoutsMs?.trustDialog ?? 10_000,
       waitReplReady: deps.bootstrapTimeoutsMs?.waitReplReady ?? 30_000,
+      greeting: deps.bootstrapTimeoutsMs?.greeting ?? 120_000,
     };
   }
 
@@ -847,6 +859,24 @@ export class AgentManager {
 
     try {
       const result = await this.ensureSession(agentId, 'create');
+      // Capability gate: hold the agent until it proves (via the baxian-signals skill)
+      // that it can load skills and echo a valid greeting signal back through its pane.
+      // A non-greeting agent that reached 'ok' would silently hang on its first real signal.
+      if (!(await this.runGreetingHandshake(agentId, cfgAtStart, result.paneId))) {
+        // A newer create may have rotated creationToken during the (slow) greeting wait.
+        // Mirror the success token-mismatch path: kill the orphan session we created so the
+        // next generation's `create` doesn't trip on a pre-existing tmux session.
+        const current = await this.agentStore.get(agentId);
+        if (current && current.creationToken !== creationToken) {
+          console.warn(
+            `[bootstrap] ${agentId} creationToken changed during greeting — killing orphan session`,
+          );
+          await tryKillOrphanSession('greeting-failure token mismatch');
+          return;
+        }
+        await this.markGreetingFailed(agentId, creationToken);
+        return;
+      }
       let resolvedExisting: AgentBindingFacts | null = null;
       const now = new Date().toISOString();
       await this.agentStore.update(agentId, (existing) => {
@@ -908,6 +938,139 @@ export class AgentManager {
     }
   }
 
+  // Bootstrap capability handshake: inject the greeting prompt and wait for the agent to
+  // echo [bx:greeting:<token>] per the baxian-signals skill. Returns true on a verified
+  // echo, false on timeout / lost session across all attempts. No task binding exists yet,
+  // so this drives the low-level inject + the pane-scoped awaitOnce directly.
+  private async runGreetingHandshake(
+    agentId: string,
+    agent: AgentConfig & { projectId: string },
+    paneId: string,
+  ): Promise<boolean> {
+    const watcher = this.phaseSignalWatcher;
+    if (!watcher) return true; // no watcher wired (minimal harness) — nothing to gate on
+    const tmux = new TmuxManager(this.createRunnerFor(agent));
+    for (let attempt = 1; attempt <= this.greetingMaxAttempts; attempt++) {
+      const token = createSignalToken();
+      try {
+        // Inject FIRST, then arm the wait: if the paste fails the agent never sees the
+        // prompt and cannot echo, so skip the (default 120s) wait entirely and retry.
+        await this.injectAndAwaitAckSteps(
+          tmux, paneId, buildGreetingPrompt(token, agent.runtime), agentId, agent.runtime,
+        );
+      } catch (err) {
+        console.warn(`[bootstrap] greeting inject failed for ${agentId} (attempt ${attempt}):`, err);
+        // ack_unknown = injectAndAwaitAckSteps could NOT confirm the composer was cleared, so the
+        // next paste would land on a live/unconfirmed input stream. Hold rather than concatenate.
+        // A raw (non-ack_unknown) throw means the composer was already C-c'd → safe to retry.
+        if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') break;
+        continue;
+      }
+      const outcome = await watcher.awaitOnce({
+        agentId,
+        kind: 'greeting',
+        token,
+        timeoutMs: this.bootstrapTimeoutsMs.greeting,
+      });
+      if (outcome === 'matched') return true;
+      console.warn(
+        `[bootstrap] greeting attempt ${attempt}/${this.greetingMaxAttempts} for ${agentId}: ${outcome}`,
+      );
+      // 'no-agent' = config removed, unrecoverable. 'timeout'/'session-gone' (incl. a transient
+      // subscribe fault disguised as session-gone) keep the remaining retries — a one-off pane
+      // jitter must not fail a genuinely capable agent.
+      if (outcome === 'no-agent') break;
+      // An ack-timeout paste returns acked:false and leaves the unsubmitted greeting prompt in the
+      // composer; the next injectPrompt would concatenate onto it. Clear it before retrying — if the
+      // composer can't be confirmed clean, hold rather than paste onto a dirty/unsafe one.
+      if (attempt < this.greetingMaxAttempts && !(await this.clearComposerForReuse(tmux, paneId, agentId))) {
+        break;
+      }
+    }
+    return false;
+  }
+
+  // Greeting failed: hold the agent for a human (awaiting_human → not dispatchable) with a
+  // reason that names the capability gap. Clearing creationToken drops the "starting" pill;
+  // the operator fixes the runtime and restarts (re-greets) or Resumes to override.
+  private async markGreetingFailed(
+    agentId: string,
+    creationToken: string | undefined,
+  ): Promise<void> {
+    const existing = await this.agentStore.get(agentId);
+    if (!existing) return;
+    if (creationToken !== undefined && existing.creationToken !== creationToken) return;
+    const now = new Date().toISOString();
+    const reason =
+      'Greeting capability check failed: the agent did not echo a valid [bx:greeting] signal ' +
+      'per the baxian-signals skill within the timeout. Its runtime/model may not meet baxian ' +
+      'requirements (skill loading or pane signalling). Fix the runtime, then restart-repl or ' +
+      'retry the agent to re-run the check (Resume will not clear it — capability must be re-proven).';
+    let wrote = false;
+    await this.agentStore.update(agentId, (fresh) => {
+      if (!fresh) return AGENT_STORE_NOOP;
+      if (creationToken !== undefined && fresh.creationToken !== creationToken) return AGENT_STORE_NOOP;
+      wrote = true;
+      return {
+        ...fresh,
+        creationToken: undefined,
+        status: 'awaiting_human',
+        awaitingPhase: 'greeting_failed',
+        awaitingReason: reason,
+        awaitingSince: now,
+        updatedAt: now,
+      };
+    });
+    if (!wrote) return;
+    await this.safeEmit({
+      id: '',
+      type: 'human.intervention',
+      timestamp: now,
+      projectId: existing.projectId,
+      agentId,
+      data: { phase: 'greeting_failed', reason },
+    });
+  }
+
+  // Operator restart-repl/retry recovery for a greeting_failed agent: re-run the handshake on
+  // the freshly-restarted REPL. Only a passing greeting clears the hold; a failure re-holds it.
+  // Returns true when it took ownership of a greeting_failed agent (caller skips its normal clear).
+  async regreetHeldAgent(agentId: string): Promise<boolean> {
+    const agent = this.getAgentConfig(agentId);
+    if (!agent) return false;
+    const state = await this.agentStore.get(agentId);
+    if (state?.awaitingPhase !== 'greeting_failed') return false;
+    // Identity of THIS hold: a greeting_failed binding carries no creationToken, so a DELETE+recreate
+    // during the (slow, up to 2× timeout) handshake is detected via awaitingSince — a stale regreet
+    // must never write onto the recreated generation.
+    const guardSince = state.awaitingSince;
+    let paneId = state.paneId;
+    if (!paneId) {
+      try {
+        paneId = await new TmuxManager(this.createRunnerFor(agent)).getSinglePaneId(agentId);
+      } catch (err) {
+        console.warn(`[regreet] cannot resolve pane for ${agentId}:`, err);
+        return true; // leave it held; operator can restart/retry again
+      }
+    }
+    if (!(await this.runGreetingHandshake(agentId, agent, paneId))) {
+      // Failed → leave the existing hold untouched. Do NOT re-write it: an unguarded write could land
+      // on a DELETE+recreated generation that reused this id. Operator can restart/retry again.
+      return true;
+    }
+    // Passed → clear the hold, but only if this exact greeting_failed generation is still present.
+    await this.agentStore.update(agentId, (fresh) => {
+      if (!fresh || fresh.awaitingPhase !== 'greeting_failed' || fresh.awaitingSince !== guardSince) {
+        return AGENT_STORE_NOOP;
+      }
+      const {
+        status: _s, awaitingPhase: _ap, awaitingReason: _ar, awaitingSince: _as, ...ready
+      } = fresh;
+      return { ...ready, updatedAt: new Date().toISOString() };
+    });
+    return true;
+  }
+
   private async markDialogPending(
     agentId: string,
     creationToken: string | undefined,
@@ -919,6 +1082,10 @@ export class AgentManager {
   ): Promise<void> {
     const existing = await this.agentStore.get(agentId);
     if (!existing) return;
+    // A greeting capability failure must not be downgraded into a dialog-resolvable hold: doing so
+    // would let Resume release a never-re-greeted agent. Keep the greeting_failed hold; restart/retry
+    // re-runs the handshake.
+    if (existing.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(existing.awaitingPhase)) return;
     // runtime path snapshot 全空时直接拒绝——既无 paneId 也无 taskId 作 generation 证据，
     // 旧 callback 通过 guard 污染同样 idle 的新 agent 的风险无法排除。
     if (opts.runtimePath && opts.expectedPaneId === undefined && opts.expectedTaskId === undefined) {
@@ -952,6 +1119,7 @@ export class AgentManager {
     let taskIdForEmit: string | undefined;
     await this.agentStore.update(agentId, (fresh) => {
       if (!fresh) return AGENT_STORE_NOOP;
+      if (fresh.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(fresh.awaitingPhase)) return AGENT_STORE_NOOP;
       if (opts.runtimePath) {
         if (fresh.creationToken !== undefined) return AGENT_STORE_NOOP;
         if (opts.expectedPaneId !== undefined && fresh.paneId !== opts.expectedPaneId) return AGENT_STORE_NOOP;
@@ -1202,9 +1370,22 @@ export class AgentManager {
       // 推 failed）+ lock 在；ready 后切到 'agent_dialog_resolved_runtime' phase，让 resumeAgent 放行
       // 让 operator 显式确认。仍保留 awaiting_human + lock 防止"dialog ready 自动派下一 task 撞 pane"。
       const isBootstrapPath = creationToken !== undefined;
+      // A create bootstrap that was blocked on a startup dialog still owes the greeting gate:
+      // now that the dialog is dismissed and the REPL is ready, run it before clearing to 'ok',
+      // else a dialog-resolved agent would reach the dispatch pool without proving capability.
+      if (isBootstrapPath && !(await this.runGreetingHandshake(agentId, cfg, paneId))) {
+        await this.markGreetingFailed(agentId, creationToken);
+        return;
+      }
       await this.agentStore.update(agentId, (fresh) => {
         if (!fresh) return AGENT_STORE_NOOP;
         if (generationMismatch(fresh)) return AGENT_STORE_NOOP;
+        // A greeting capability hold must not be downgraded to a dialog-resolvable phase here (the
+        // runtime branch would otherwise rewrite it to agent_dialog_resolved_runtime, which Resume
+        // then releases un-regreeted). Preserve it; restart/retry's regreet is its recovery path.
+        if (fresh.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(fresh.awaitingPhase)) {
+          return AGENT_STORE_NOOP;
+        }
         projectIdForEmit = fresh.projectId;
         wrote = true;
         if (isBootstrapPath) {
@@ -1876,6 +2057,16 @@ export class AgentManager {
         );
         return { resumed: false, releasedBinding: false };
       }
+      // A greeting capability failure must be RE-PROVEN, not Resumed away: the default path below
+      // flips status→'ok' regardless of shouldReleaseHeldBinding, which would put an unverified
+      // agent back in the dispatch pool. The recovery path is restart-repl / retry (re-greets).
+      if (state.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(state.awaitingPhase)) {
+        console.warn(
+          `[AgentManager] resumeAgent: agent ${agentId} ${state.awaitingPhase} — capability must be re-proven; ` +
+          `refusing Resume. Use restart-repl / retry to re-run the greeting check.`,
+        );
+        return { resumed: false, releasedBinding: false };
+      }
       const now = new Date().toISOString();
       const shouldReleaseBinding = shouldReleaseHeldBinding(state, boundTask);
       const cfg = this.getAgentConfig(agentId);
@@ -2356,15 +2547,50 @@ export class AgentManager {
       throw new Error(`restart-repl precondition failed: unexpected pane state "${cmd}"`);
     }
 
+    // Re-materialize skills BEFORE the relaunch so the fresh REPL scans the current tree. restart-repl
+    // is the operator's recovery for a greeting_failed agent whose on-disk skill tree was stale/missing,
+    // and unlike retry it does not go through ensureSession's provisionRepoSkills. Best-effort: a
+    // provisioning blip must not block the REPL restart (a still-broken tree surfaces on the next regreet).
+    const project = this.getProjectConfig(cfg.projectId);
+    let workdir: string | undefined;
+    let provisioned = false;
+    if (project) {
+      try {
+        workdir = (await this.ensureWorkdir(cfg, project, runner)).workdir;
+        await this.provisionRepoSkills(runner, cfg, workdir);
+        provisioned = true;
+      } catch (err) {
+        console.warn(`[restart-repl] skill re-provision failed for ${agentId} (continuing):`, err);
+      }
+    }
+
     const runtime = agentRuntimeKindFor(cfg);
-    await tmux.sendKeysToPane(paneId, `${buildLaunchCommand(cfg)}\n`);
-    await tmux.handleTrustDialog(paneId, runtime, {
-      timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
-    });
-    await tmux.waitReplReady(paneId, runtime, {
-      timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
-      scrollback: 0,
-    });
+    const relaunch = async (): Promise<void> => {
+      await tmux.sendKeysToPane(paneId, `${buildLaunchCommand(cfg)}\n`);
+      await tmux.handleTrustDialog(paneId, runtime, {
+        timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
+      });
+      await tmux.waitReplReady(paneId, runtime, {
+        timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
+        scrollback: 0,
+      });
+      // Only re-tag when the tree was actually re-provisioned. Tagging after a FAILED provision
+      // would stamp the current version onto a REPL that scanned the stale/missing tree, so the
+      // next ensureSession reads it as fresh and reuses it instead of self-healing (rebuild). A
+      // successful provision DOES need the tag, else ensureSession needlessly kills this REPL and
+      // drops the agent onto a different, ungreeted one.
+      if (provisioned) {
+        await this.tagSessionSkillsVersion(tmux, agentId);
+      }
+    };
+    // Hold the per-skills-dir lock ACROSS the relaunch (like buildFreshSessionLocked) so a concurrent
+    // same-dir agent's provisioning — which transiently removes helper files (agents/openai.yaml) —
+    // can't make this fresh REPL scan an incomplete skill tree.
+    if (workdir !== undefined) {
+      await this.runUnderSkillDirLock(this.skillDirLockKey(cfg, workdir), relaunch);
+    } else {
+      await relaunch();
+    }
 
     await this.agentStore.update(agentId, (state) => {
       if (!state) return AGENT_STORE_NOOP;
@@ -2507,6 +2733,10 @@ export class AgentManager {
       agent: cfg,
       worktreePath: worktreePathBound,
       skillRegistry: this.skillRegistry,
+      // A representative token so the preview exercises the SAME required-skill set (baxian-signals)
+      // and worst-case byte size the real signal-emitting dispatch will build — else a missing
+      // baxian-signals only surfaces async after the task is already created (201).
+      signalToken: 'preview-signal-token',
     });
     return Buffer.byteLength(fullPrompt, 'utf8');
   }
@@ -4446,6 +4676,33 @@ export class AgentManager {
         // reboot) — only a positively-marked, never-ack'd dispatch is rolled back. (Same check runs in the
         // dialog-pending catch below, so a mid-bootstrap task blocked on a startup dialog isn't held forever.)
         if (await this.rollbackUndeliveredBootstrap(state, agentConfig)) continue;
+        // An incomplete create bootstrap (creationToken still set, no task) crashed before it
+        // proved signal capability. Re-run the greeting gate — but in the BACKGROUND: recover() is
+        // awaited before the server serves, and a synchronous handshake would block startup up to
+        // 2×greeting-timeout per such agent (serially). creationToken stays set meanwhile, so
+        // canDispatchWithBinding keeps the agent out of the pool until the handshake resolves.
+        if (state.creationToken && !state.taskId) {
+          const ct = state.creationToken;
+          const pane = result.paneId;
+          const cfg = agentConfig;
+          const agentId = state.id;
+          void (async () => {
+            if (await this.runGreetingHandshake(agentId, cfg, pane)) {
+              await this.agentStore.update(agentId, (latest) => {
+                if (!latest || latest.creationToken !== ct) return AGENT_STORE_NOOP;
+                const {
+                  creationToken: _ct, status: _s,
+                  awaitingPhase: _ap, awaitingReason: _ar, awaitingSince: _as,
+                  ...ready
+                } = latest;
+                return { ...ready, paneId: pane, updatedAt: new Date().toISOString() };
+              });
+            } else {
+              await this.markGreetingFailed(agentId, ct);
+            }
+          })().catch((err) => console.warn(`[recover] background re-greet for ${agentId} crashed:`, err));
+          continue;
+        }
         // recover 成功 = server 重启前 dialog_pending 的 agent 现在 REPL ready。
         // 处理 Held：与 resumeAgent 共用 shouldReleaseHeldBinding 规则（task terminal/无 task /
         // turn-completed phase → 同步清 binding；task active 且 phase 不在 completed 集合 → 保留 binding）。
@@ -4643,6 +4900,12 @@ export class AgentManager {
       await this.agentStore.update(agentId, (existing) => {
         if (!existing) return AGENT_STORE_NOOP;
         if (existing.creationToken) return AGENT_STORE_NOOP;
+        // A greeting capability hold must survive a transient/real tmux disappearance — wiping it
+        // (it carries a paneId on the dialog path) would slip an unverified agent back into the
+        // dispatch pool. Operator restart/retry re-greets; recover/Resume already preserve it.
+        if (existing.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(existing.awaitingPhase)) {
+          return AGENT_STORE_NOOP;
+        }
         timestamp = new Date().toISOString();
         projectId = existing.projectId;
         hadBinding = !!existing.taskId;

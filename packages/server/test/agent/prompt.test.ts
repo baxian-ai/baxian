@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildPromptInline,
+  buildGreetingPrompt,
   buildPostMergeCleanupPrompt,
   MAX_PROMPT_BYTES,
   MAX_INLINE_FINDINGS_BYTES,
@@ -32,13 +33,19 @@ const TASK: TaskState = {
   updatedAt: '2026-04-28T10:00:00Z',
 };
 
-// Server phases force-load no skill (AGENT_PHASES declares skills: [] for them), so these
-// blocks just need an empty registry with the shared per-test temp-dir lifecycle.
+// server-review/recheck/spec-review force-load baxian-server-review, server-feedback
+// force-loads baxian-server-feedback, server-after-done stays skill-less (force-loads
+// baxian-signals). All emit signals, so baxian-signals must resolve too. Seed every skill
+// these phases require so buildPromptInline's fail-fast does not reject.
 function useServerPhaseRegistry(prefix: string): () => SkillRegistry {
   let tempDir: string;
   let registry: SkillRegistry;
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), prefix));
+    for (const name of ['baxian-signals', 'baxian-server-review', 'baxian-server-feedback']) {
+      await mkdir(join(tempDir, name), { recursive: true });
+      await writeFile(join(tempDir, name, 'SKILL.md'), `${name} stub`);
+    }
     registry = new SkillRegistry(tempDir);
     await registry.scan();
   });
@@ -81,6 +88,9 @@ describe('buildPromptInline', () => {
     await makeSkill('baxian-pr-feedback', 'pr-feedback stub');
     await makeSkill('baxian-pr-review', 'pr-review stub');
     await makeSkill('baxian-pr-recheck', 'pr-recheck stub');
+    // Signal-emitting prompts point at baxian-signals for the emit rules, so it is a
+    // required skill whenever a signalToken is set (buildPromptInline fails fast otherwise).
+    await makeSkill('baxian-signals', 'signals stub');
   }
 
   // The dominant shape: seed every phase skill, scan, then build with DEV_AGENT defaults.
@@ -121,18 +131,21 @@ describe('buildPromptInline', () => {
     registry = new SkillRegistry(tempDir);
   });
 
-  it('dev develop force-loads the primary skill via /command, then the task body (claude-code sigil)', async () => {
+  it('dev develop force-loads the primary skill via /command, then structured key:value dispatch fields', async () => {
     await seedAndScan();
     const prompt = build({ worktreePath: '/tmp/repo/.baxian-worktrees/task-001_abc' });
-    expect(prompt.startsWith('/baxian-task-check\n')).toBe(true);
-    expect(prompt).toContain('Phase: develop');
-    expect(prompt).toContain('Role: dev');
-    expect(prompt).toContain('Task ID: task-001');
-    expect(prompt).toContain('/tmp/repo/.baxian-worktrees/task-001_abc');
-    expect(prompt).toContain('cd into the worktree before any file operations.');
-    expect(prompt).toContain('baxian conventions: cross-agent communication is via the GitHub PR');
-    expect(prompt).toContain('<!-- baxian:managed -->');
-    expect(prompt).toContain('Title: Fix login redirect');
+    // fields ride directly after the command — no [baxian] section marker.
+    expect(prompt.startsWith('/baxian-task-check\nphase: develop\n')).toBe(true);
+    expect(prompt).not.toContain('[baxian]');
+    expect(prompt).toContain('phase: develop');
+    expect(prompt).toContain('role: dev');
+    expect(prompt).toContain('task: task-001');
+    expect(prompt).toContain('exchange: github-pr');
+    expect(prompt).toContain('worktree: /tmp/repo/.baxian-worktrees/task-001_abc');
+    expect(prompt).toContain('title: Fix login redirect');
+    // Conventions + procedure now live in the force-loaded skill, not the prompt.
+    expect(prompt).not.toContain('cd into the worktree');
+    expect(prompt).not.toContain('baxian conventions:');
     // The XML skill-injection format is gone entirely.
     expect(prompt).not.toContain('<skills>');
     expect(prompt).not.toContain('<task>');
@@ -153,24 +166,23 @@ describe('buildPromptInline', () => {
     expect(reviewPrompt.startsWith('$baxian-pr-review\n')).toBe(true);
   });
 
-  it('imagePaths → appends a 附图 block listing every absolute path', async () => {
+  it('imagePaths → appends a structured images: list of every absolute path', async () => {
     await seedAndScan();
     const prompt = build({
       worktreePath: '/tmp/repo/.baxian-worktrees/task-001_abc',
       imagePaths: ['/tmp/baxian/upload/task-001/a.png', '/tmp/baxian/upload/task-001/b.webp'],
     });
-    expect(prompt).toContain('附图');
-    expect(prompt).toContain('请读取并结合任务分析');
+    expect(prompt).toContain('images:');
     expect(prompt).toContain('/tmp/baxian/upload/task-001/a.png');
     expect(prompt).toContain('/tmp/baxian/upload/task-001/b.webp');
   });
 
-  it('no imagePaths → no 附图 block', async () => {
+  it('no imagePaths → no images: block', async () => {
     await seedAndScan();
-    expect(build()).not.toContain('附图');
+    expect(build()).not.toContain('images:');
   });
 
-  it('fix phase prompt tells dev to address every finding and emit pr-fixed', async () => {
+  it('fix phase descriptor carries pr/branch/round and the pr-fixed signal field', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
@@ -178,10 +190,11 @@ describe('buildPromptInline', () => {
       signalToken: 'fix-token-42',
     });
     expect(prompt.startsWith('/baxian-pr-feedback\n')).toBe(true);
-    expect(prompt).toContain('Fix phase');
-    expect(prompt).toContain('baxian-pr-feedback');
-    expect(prompt).toContain('[bx:pr-fixed:<token>]');
-    expect(prompt).toContain('fix-token-42');
+    expect(prompt).toContain('phase: fix');
+    expect(prompt).toContain('pr: 42');
+    expect(prompt).toContain('round: 2');
+    expect(prompt).toContain('signal: pr-fixed');
+    expect(prompt).toContain('token: fix-token-42');
   });
 
   it('fix phase prompt requires a signalToken', async () => {
@@ -192,30 +205,27 @@ describe('buildPromptInline', () => {
     })).toThrow(/fix prompt requires signalToken/);
   });
 
-  it('inlines the phase-signal substitution rule for signal-emitting phases only', async () => {
+  it('represents the signal as structured signal/token fields, never a fireable literal', async () => {
     await seedAndScan();
-    // The "substitute the placeholders, never echo them" invariant must ride inline in the header —
-    // else the agent emits a literal [bx:KIND:<token>] the watcher's strict scanner can't match and
-    // the task hangs waiting on a signal.
+    // The wire protocol lives in the baxian-signals skill; the descriptor only names the kind
+    // (signal:) and the token (token:). The agent builds [bx:kind:token] from them.
     const withSignal = build({
       task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
       phase: 'fix',
       signalToken: 'fix-token-42',
     });
-    expect(withSignal).toContain('Phase signals:');
-    expect(withSignal).toContain('substitute');
-    expect(withSignal).toContain('never echo the `<…>` placeholder');
-    // The header points at the canonical protocol skill while keeping the load-bearing rule inline.
-    expect(withSignal).toContain('baxian-signals');
-    // pr_number is sourced from the PR the agent just created/opened — there is no PR-number line.
-    expect(withSignal).toContain('PR you just created');
-    // A phase with no pending signal (develop without a token) carries no signal rule.
+    expect(withSignal).toContain('signal: pr-fixed');
+    expect(withSignal).toContain('token: fix-token-42');
+    // No filled [bx:...] literal in the prompt → it can never self-fire the watcher.
+    expect(scanPhaseSignals(withSignal)).toEqual([]);
+    expect(withSignal).not.toContain('[bx:pr-fixed:');
+    // A phase with no pending signal (develop without a token) carries no signal/token field.
     const noSignal = build();
-    expect(noSignal).not.toContain('Phase signals:');
-    expect(noSignal).not.toContain('baxian-signals');
+    expect(noSignal).not.toContain('signal:');
+    expect(noSignal).not.toContain('token:');
   });
 
-  it('post-approve prompt tells dev to re-read PR feedback before merge', async () => {
+  it('post-approve descriptor carries pr + the pr-merge-ready signal field', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'approved', prNumber: 42 },
@@ -224,30 +234,38 @@ describe('buildPromptInline', () => {
     });
 
     expect(prompt.startsWith('/baxian-pr-feedback\n')).toBe(true);
-    expect(prompt).toContain('Post-approve PR feedback check');
-    expect(prompt).toContain('baxian-pr-feedback');
-    expect(prompt).not.toContain('post-approve-reply');
-    expect(prompt).toContain('T_self');
-    expect(prompt).toContain('EVERY non-self comment with created_at > T_self');
-    expect(prompt).toContain('Idempotency');
-    expect(prompt).toContain('re-fetch all sources before signaling');
-    expect(prompt).toContain('server suppresses redispatches while you run');
-    expect(prompt).toContain('do not emit pr-merge-ready when you pushed code');
-    expect(prompt).toContain(buildPhaseSignalTemplate('pr-merge-ready'));
+    expect(prompt).toContain('phase: post-approve');
+    expect(prompt).toContain('pr: 42');
+    expect(prompt).toContain('signal: pr-merge-ready');
     expect(prompt).toContain('token: post-token-42');
+    // Idempotency mechanics live in baxian-pr-feedback §Post-Approve, not the prompt.
+    expect(prompt).not.toContain('T_self');
+    expect(prompt).not.toContain('redispatch:');
     expect(prompt).not.toContain(buildPhaseSignal('pr-merge-ready', 'post-token-42'));
     expect(scanPhaseSignals(prompt)).toEqual([]);
-    expect(prompt).toContain('Do not merge the PR yourself from this phase');
   });
 
-  // redispatchCount>0 swaps the long preamble for an incremental nudge; count=0 keeps the full preamble.
+  it('baxian-pr-feedback skill carries the migrated post-approve idempotency rules', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-pr-feedback/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('## Post-Approve');
+    expect(body).toContain('T_self');
+    expect(body).toContain('EVERY non-self comment');
+    expect(body).toContain('do NOT emit `pr-merge-ready` when you pushed code');
+    expect(body).toContain('re-fetch all sources before signaling');
+    expect(body).toContain('Do not merge the PR yourself from this phase');
+  });
+
+  // redispatchCount>0 adds a `redispatch: N` field the skill §Post-Approve keys the nudge on; count=0 omits it.
   it.each<[string, number, string[], string[]]>([
-    ['redispatch #3 uses the incremental nudge instead of the long preamble', 3,
-      ['Post-approve recheck (redispatch #3)', 'New PR feedback arrived while you were running', 're-fetch one more time', buildPhaseSignalTemplate('pr-merge-ready'), 'token: post-token-42'],
-      ['Post-approve PR feedback check:', 'idempotency rule that prevents', 'Do not merge the PR yourself from this phase']],
-    ['redispatchCount=0 still emits the full preamble (first pass)', 0,
-      ['Post-approve PR feedback check:'],
-      ['Post-approve recheck (redispatch']],
+    ['redispatch #3 sets the redispatch field', 3,
+      ['redispatch: 3', 'signal: pr-merge-ready', 'token: post-token-42'],
+      []],
+    ['redispatchCount=0 omits the redispatch field', 0,
+      ['signal: pr-merge-ready'],
+      ['redispatch:']],
   ])('post-approve %s', async (_label, postApproveRedispatchCount, contains, notContains) => {
     await seedAndScan();
     const prompt = build({
@@ -263,7 +281,7 @@ describe('buildPromptInline', () => {
   // Excluding the primary (already-resident) skill drops its leading /command but leaves the body;
   // excluding any other skill keeps the leading command intact.
   it.each<[string, string[], string, string[], string[]]>([
-    ['containing the primary drops the leading command, body unchanged', ['baxian-task-check'], 'Phase: develop', ['Title: Fix login redirect'], ['/baxian-task-check']],
+    ['containing the primary drops the leading command, body unchanged', ['baxian-task-check'], 'phase: develop', ['title: Fix login redirect'], ['/baxian-task-check']],
     ['not naming the primary keeps the leading command', ['baxian-pr-review'], '/baxian-task-check\n', [], []],
   ])('excludeSkills %s', async (_label, excludeSkills, prefix, contains, notContains) => {
     await seedAndScan();
@@ -283,6 +301,26 @@ describe('buildPromptInline', () => {
     for (const name of seed) await makeSkill(name, name);
     await registry.scan();
     expect(() => build({ excludeSkills })).toThrow(RequiredSkillsMissingError);
+  });
+
+  it('requires baxian-signals only when a signalToken is present (rules moved into that skill)', async () => {
+    // Seed every phase skill EXCEPT baxian-signals.
+    await makeSkill('baxian-task-check', 'task-check stub');
+    await makeSkill('baxian-pr-feedback', 'pr-feedback stub');
+    await registry.scan();
+    // A signal-emitting prompt must fail fast — its emit rules would be unreachable.
+    expect(() => build({
+      task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
+      phase: 'fix',
+      signalToken: 'fix-token-42',
+    })).toThrow(RequiredSkillsMissingError);
+    try {
+      build({ phase: 'fix', signalToken: 'fix-token-42', task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 } });
+    } catch (err) {
+      expect((err as RequiredSkillsMissingError).missing).toContain('baxian-signals');
+    }
+    // A non-signalling prompt does NOT require baxian-signals.
+    expect(() => build({ phase: 'develop' })).not.toThrow();
   });
 
   it('throws PromptSizeError when prompt > 80KB', async () => {
@@ -313,55 +351,46 @@ describe('buildPromptInline', () => {
     expect(Buffer.byteLength(prompt, 'utf8')).toBe(MAX_PROMPT_BYTES);
   });
 
-  it('empty description → prompt ends at the title, no dangling body', async () => {
+  it('empty description → prompt ends at the title line, no dangling body', async () => {
     await seedAndScan();
     const prompt = build({ task: { ...TASK, description: '' } });
-    expect(prompt).toContain(`Title: ${TASK.title}`);
-    expect(prompt.endsWith(`Title: ${TASK.title}`)).toBe(true);
+    expect(prompt).toContain(`title: ${TASK.title}`);
+    expect(prompt.endsWith(`title: ${TASK.title}\n`)).toBe(true);
   });
 
-  it('develop phase with signalToken references the SDD skill section and keeps the variable spec-done signal', async () => {
+  it('develop descriptor with a QA partner carries spec-signal + the done signal', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress' },
       signalToken: 'spec-token-1',
     });
-    expect(prompt).toContain('Specification-Driven Development (SDD)');
-    // SDD mechanics moved into the force-loaded baxian-task-check skill; the prompt only points at it.
-    expect(prompt).toContain('follow baxian-task-check §Specification-Driven Development');
-    // Both options render as a parallel bullet list (SDD vs Otherwise).
-    expect(prompt).toContain('- Specification-Driven Development (SDD)');
-    expect(prompt).toMatch(/- Otherwise proceed straight to implementing/);
-    expect(prompt).not.toContain('(do NOT commit or push it)');
-    expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
+    expect(prompt).toContain('spec-signal: spec-done');
+    expect(prompt).toContain('signal: pr-created');
     expect(prompt).toContain('token: spec-token-1');
-    expect(prompt).toMatch(/proceed straight to implementing/);
-    expect(prompt).toContain('ready for review (not Draft)');
-    expect(prompt).toContain('gh pr ready');
-    expect(prompt).toContain('do NOT use `--draft`');
+    // SDD mechanics + PR-ready rules live in the force-loaded skill, not the prompt.
+    expect(prompt).not.toContain('Specification-Driven Development');
+    expect(prompt).not.toContain('gh pr ready');
     expect(prompt).not.toContain(buildPhaseSignal('spec-done', 'spec-token-1'));
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
-  it('develop phase without signalToken excludes the spec signal block', async () => {
+  it('develop without signalToken carries no signal fields', async () => {
     await seedAndScan();
     const prompt = build({ task: { ...TASK, status: 'in_progress' } });
-    expect(prompt).not.toContain('Specification-Driven Development (SDD)');
-    expect(prompt).not.toContain('[bx:spec-done:');
+    expect(prompt).not.toContain('spec-signal:');
+    expect(prompt).not.toContain('signal:');
   });
 
-  it('server develop prompt points at the SDD skill section and never inlines the spec-commit copy', async () => {
+  it('server develop descriptor uses server-files exchange and the code-done signal', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress', reviewMode: 'server' },
       signalToken: 'spec-token-srv',
     });
-    expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
-    expect(prompt).toContain('follow baxian-task-check §Specification-Driven Development');
-    expect(prompt).not.toMatch(/commit locally, then signal/);
+    expect(prompt).toContain('exchange: server-files');
+    expect(prompt).toContain('spec-signal: spec-done');
+    expect(prompt).toContain('signal: code-done');
     expect(prompt).not.toContain('gh pr ready');
-    expect(prompt).not.toContain('ready for review (not Draft)');
-    expect(prompt).not.toContain('(do NOT commit or push it)');
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
@@ -378,20 +407,19 @@ describe('buildPromptInline', () => {
   it.each([
     ['github chain', undefined, 'pr-created' as const],
     ['server chain', 'server' as const, 'code-done' as const],
-  ])('develop prompt drops the spec route when hasQaPartner is false (%s)', async (_label, reviewMode, replacementSignal) => {
+  ])('develop drops the spec-signal when hasQaPartner is false (%s)', async (_label, reviewMode, replacementSignal) => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress', reviewMode },
       signalToken: 'spec-token-1',
       hasQaPartner: false,
     });
-    expect(prompt).not.toContain('Specification-Driven Development (SDD)');
-    expect(prompt).not.toContain('[bx:spec-done:');
-    expect(prompt).toContain(buildPhaseSignalTemplate(replacementSignal));
+    expect(prompt).not.toContain('spec-signal:');
+    expect(prompt).toContain(`signal: ${replacementSignal}`);
     expect(prompt).toContain('token: spec-token-1');
   });
 
-  it('develop prompt keeps the spec route when hasQaPartner is true or omitted', async () => {
+  it('develop keeps the spec-signal when hasQaPartner is true or omitted', async () => {
     await seedAndScan();
     for (const extra of [{ hasQaPartner: true }, {}]) {
       const prompt = build({
@@ -399,12 +427,12 @@ describe('buildPromptInline', () => {
         signalToken: 'spec-token-1',
         ...extra,
       });
-      expect(prompt).toContain('Specification-Driven Development (SDD)');
-      expect(prompt).toContain(buildPhaseSignalTemplate('spec-done'));
+      expect(prompt).toContain('spec-signal: spec-done');
+      expect(prompt).toContain('signal: pr-created');
     }
   });
 
-  it('review prompt uses `gh pr review <N>` with explicit PR number (detached HEAD worktree)', async () => {
+  it('review descriptor carries pr + token; verdict procedure lives in the skill', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'review', prNumber: 42 },
@@ -413,29 +441,20 @@ describe('buildPromptInline', () => {
       signalToken: 'review-token-N',
     });
     expect(prompt.startsWith('/baxian-pr-review\n')).toBe(true);
-    expect(prompt).toContain('Code review phase');
-    expect(prompt).toContain('baxian-pr-review');
-    expect(prompt).toContain('PR number: 42');
-    expect(prompt).toContain('gh pr review 42');
-    expect(prompt).toContain(`N=42`);
-    expect(prompt).toContain(`TOKEN=review-token-N`);
-    expect(prompt).toContain(buildPhaseSignalTemplate('pr-approved'));
-    expect(prompt).toContain(buildPhaseSignalTemplate('pr-changes-requested'));
-    // Stamps no longer inlined — agent builds them from the phase template + token.
-    expect(prompt).not.toContain('<!-- baxian:pr-approved:review-token-N -->');
-    expect(prompt).not.toContain('Output exactly one filled signal');
+    expect(prompt).toContain('phase: review');
+    expect(prompt).toContain('pr: 42');
+    expect(prompt).toContain('token: review-token-N');
+    // review verdict is via native gh (no completion signal field); fallback kinds + commands live in the skill.
+    expect(prompt).not.toContain('signal:');
+    expect(prompt).not.toContain('gh pr review');
+    expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
-  // Skill body is force-loaded via /command (no inlined "emit a signal" mandate); the prompt
-  // carries the phase-builder verdict block. Anchor SHA present → pin the commit_id; absent → skip it.
+  // Anchor SHA present → the skill pins commit_id; absent → the field is omitted and the skill skips the check.
   it.each<[string, string | undefined, string[], string[]]>([
-    ['anchor SHA present', 'abc123def456',
-      ['Verdict Verification', 'Review head SHA for §Verdict Verification: abc123def456', '422 fallback'],
-      ['Output exactly one filled signal', 'skip the commit_id check']],
-    ['anchor SHA unavailable', undefined,
-      ['skip the commit_id check'],
-      ['Review head SHA for §Verdict Verification']],
-  ])('review prompt force-loads baxian-pr-review and handles verdict verification (%s)', async (_label, reviewHeadAnchorSha, contains, notContains) => {
+    ['anchor SHA present', 'abc123def456', ['anchor-sha: abc123def456'], []],
+    ['anchor SHA unavailable', undefined, [], ['anchor-sha:']],
+  ])('review descriptor carries anchor-sha only when present (%s)', async (_label, reviewHeadAnchorSha, contains, notContains) => {
     await seedRealSkillsAndScan(['baxian-pr-review']);
     const prompt = build({
       task: { ...TASK, status: 'review', prNumber: 42, reviewHeadAnchorSha },
@@ -448,7 +467,20 @@ describe('buildPromptInline', () => {
     for (const f of notContains) expect(prompt).not.toContain(f);
   });
 
-  it('recheck phase carries verdict verification section', async () => {
+  it('baxian-pr-review skill carries the verdict + verification procedure keyed on descriptor fields', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-pr-review/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('## Verdict');
+    expect(body).toContain('gh pr review N');
+    expect(body).toContain('## Verdict Verification');
+    expect(body).toContain('422 fallback');
+    expect(body).toContain('`anchor-sha:`');
+    expect(body).toContain('skip this check when `anchor-sha:` is absent');
+  });
+
+  it('recheck descriptor carries pr + anchor-sha; verdict procedure lives in the skill', async () => {
     await seedRealSkillsAndScan(['baxian-pr-recheck']);
     const prompt = build({
       task: { ...TASK, status: 'review', prNumber: 42, reviewRound: 2, reviewHeadAnchorSha: 'sha-recheck-789' },
@@ -457,26 +489,24 @@ describe('buildPromptInline', () => {
       signalToken: 'recheck-token-N',
     });
     expect(prompt.startsWith('/baxian-pr-recheck\n')).toBe(true);
-    expect(prompt).toContain('Verdict Verification');
-    expect(prompt).toContain('Review head SHA for §Verdict Verification: sha-recheck-789');
+    expect(prompt).toContain('phase: recheck');
+    expect(prompt).toContain('pr: 42');
+    expect(prompt).toContain('anchor-sha: sha-recheck-789');
+    expect(prompt).toContain('token: recheck-token-N');
   });
 
-  it('code prompt asks dev to open the PR and emit pr-created signal', async () => {
+  it('code descriptor carries the pr-created signal field', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress', phase: 'code' },
       phase: 'code',
       signalToken: 'code-token-1',
     });
-    expect(prompt).toContain('Code phase');
-    expect(prompt).toContain('Spec is approved');
-    expect(prompt).toContain('gh pr create');
-    expect(prompt).toContain('ready for review (not Draft)');
-    expect(prompt).toContain('gh pr ready');
-    expect(prompt).toContain(buildPhaseSignalTemplate('pr-created'));
+    expect(prompt).toContain('phase: code');
+    expect(prompt).toContain('signal: pr-created');
     expect(prompt).toContain('token: code-token-1');
-    // Spec now lives at the server-chain path, not docs/spec/<task-id>.md.
-    expect(prompt).toContain('.baxian/spec.md');
+    // procedure (spec path, gh pr create, ready-for-review) lives in baxian-task-check §Code, not the prompt
+    expect(prompt).not.toContain('gh pr create');
     expect(prompt).not.toContain('docs/spec/');
   });
 
@@ -494,33 +524,45 @@ describe('buildPromptInline', () => {
   type CleanupResult = Parameters<typeof buildPostMergeCleanupPrompt>[1];
   it.each<[string, CleanupResult, string[], string[]]>([
     [
-      'deleted: declares the deletion + /clear handoff',
+      'deleted → branch-cleanup: deleted + next: clear',
       { outcome: 'deleted', detail: '' },
-      ['PR #42', 'task task-007', 'branch bx/task-007', 'baxian deleted the merged local feature branch `bx/task-007`', '`/clear`'],
-      ['WARNING'],
+      ['event: pr-merged', 'pr: 42', 'task: task-007', 'branch: bx/task-007', 'branch-cleanup: deleted', 'next: clear'],
+      ['next: compact', 'WARNING'],
     ],
     [
-      'failed: WARNING + /compact handoff to preserve warning',
+      'failed → branch-cleanup: failed + detail + next: compact',
       { outcome: 'failed', detail: "error: Cannot delete branch 'bx/task-007' checked out at '/tmp/wt'" },
-      ['WARNING: baxian failed to delete the local feature branch `bx/task-007`', "checked out at '/tmp/wt'", 'clean it up manually', '`/compact`'],
-      ['`/clear`', 'baxian deleted the merged local feature branch'],
+      ['branch-cleanup: failed', "detail: error: Cannot delete branch 'bx/task-007' checked out at '/tmp/wt'", 'next: compact'],
+      ['next: clear'],
     ],
     [
-      'absent: states it without claiming deletion + /clear handoff',
+      'absent → branch-cleanup: absent + next: clear',
       { outcome: 'absent', detail: 'branch not found' },
-      ['Local feature branch `bx/task-007` was already absent', '`/clear`'],
-      ['baxian deleted the merged', 'WARNING'],
+      ['branch-cleanup: absent', 'next: clear'],
+      ['next: compact'],
     ],
     [
-      'skipped: uses /compact to preserve context',
+      'skipped → branch-cleanup: skipped + next: compact',
       { outcome: 'skipped', detail: 'no repo path available' },
-      ['`/compact`'],
-      ['`/clear`'],
+      ['branch-cleanup: skipped', 'next: compact'],
+      ['next: clear'],
     ],
   ])('buildPostMergeCleanupPrompt %s', (_label, result, contains, notContains) => {
     const prompt = buildPostMergeCleanupPrompt(CLEANUP_META, result);
     for (const fragment of contains) expect(prompt).toContain(fragment);
     for (const fragment of notContains) expect(prompt).not.toContain(fragment);
+  });
+
+  it('buildPostMergeCleanupPrompt: self-contained, force-loads no skill (post-merge path does not re-provision)', () => {
+    // dispatchPostMergeCleanup injects directly without re-provisioning skills, so this prompt must
+    // NOT depend on a force-loaded skill — a hot-upgraded session might not have it materialized yet.
+    const prompt = buildPostMergeCleanupPrompt(CLEANUP_META, { outcome: 'failed', detail: 'x' });
+    expect(prompt.startsWith('event: pr-merged')).toBe(true);
+    expect(prompt).not.toContain('baxian-merge-cleanup');
+    expect(prompt).not.toContain('[baxian]');
+    // failed → the manual-cleanup warning rides inline so it survives even without the skill.
+    expect(prompt).toContain('WARNING');
+    expect(prompt).toContain('git branch -D bx/task-007');
   });
 
   it('buildPostMergeCleanupPrompt: never leaks agent-side git commands regardless of outcome', () => {
@@ -571,80 +613,100 @@ describe('server review mode prompt builders', () => {
     for (const r of notMatches) expect(prompt).not.toMatch(r);
   }
 
+  it('every server phase force-loads its role skill (server-after-done now reads baxian-server-feedback §Publish)', () => {
+    const codexReview = build('server-review', QA_AGENT, { serverContent: 'diff x' });
+    expect(codexReview.startsWith('$baxian-server-review\n')).toBe(true); // codex sigil
+    const QA_CC: AgentConfig = { id: 'qa-cc', runtime: 'claude-code', role: 'qa', mode: 'local' };
+    const ccReview = build('server-review', QA_CC, { serverContent: 'diff x' });
+    expect(ccReview.startsWith('/baxian-server-review\n')).toBe(true); // claude-code sigil
+    const feedback = build('server-feedback', DEV_AGENT, { serverPriorFindings: CODE_FINDINGS });
+    expect(feedback.startsWith('/baxian-server-feedback\n')).toBe(true);
+    const afterDone = build('server-after-done', DEV_AGENT, { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } });
+    expect(afterDone.startsWith('/baxian-server-feedback\n')).toBe(true);
+  });
+
   // Declarative harness: build one server-phase prompt, assert its fragments. Each row is
   // [label, phase, agent, buildExtra, expectations].
   it.each<[string, string, AgentConfig, Record<string, unknown>, Expect]>([
-    ['server-review injects diff, diffstat, exchange path, signal template', 'server-review', QA_AGENT,
+    ['server-review injects diff + diffstat blocks, carries round + signal fields', 'server-review', QA_AGENT,
       { serverContent: 'diff --git a/a.ts b/a.ts\n+new line', serverDiffstat: ' a.ts | 1 +\n' },
-      { contains: ['diff --git a/a.ts', 'a.ts | 1 +', '.baxian/review/findings.json', '[bx:code-reviewed:<token>]', 'srvtok123456', 'read-file', 'mv'] }],
-    ['server-review labels batches', 'server-review', QA_AGENT,
+      { contains: ['phase: server-review', 'round: 1', 'signal: code-reviewed', 'srvtok123456', 'diffstat:', ' a.ts | 1 +', 'diff:', 'diff --git a/a.ts'] }],
+    ['server-review labels batches with a batch field', 'server-review', QA_AGENT,
       { serverContent: 'diff x', serverBatch: { index: 1, total: 3 } },
-      { contains: ['Batch 2/3'] }],
-    ['server-recheck includes prior findings and response blocks', 'server-recheck', QA_AGENT,
+      { contains: ['batch: 2/3'] }],
+    ['server-recheck carries prior-findings + prior-response blocks', 'server-recheck', QA_AGENT,
       { serverContent: 'diff y', serverPriorFindings: CODE_FINDINGS, serverPriorResponse: '{"round":1,"responses":[]}' },
-      { contains: ['request-changes', 'responses', '[bx:code-reviewed:<token>]'] }],
-    ['server-spec-review injects spec content and spec-reviewed signal', 'server-spec-review', QA_AGENT,
+      { contains: ['phase: server-recheck', 'prior-findings:', 'request-changes', 'prior-response:', 'responses', 'signal: code-reviewed'] }],
+    ['server-spec-review injects the spec block + spec-reviewed signal', 'server-spec-review', QA_AGENT,
       { serverContent: '# Spec doc' },
-      { contains: ['# Spec doc', '[bx:spec-reviewed:<token>]', 'location'] }],
-    ['server-feedback spec variant never asks to commit (spec doc is git-excluded)', 'server-feedback', DEV_AGENT,
+      { contains: ['spec:', '# Spec doc', 'round: 1', 'signal: spec-reviewed'] }],
+    ['server-feedback spec variant: feedback=spec + spec-fixed signal, no commit wording inline', 'server-feedback', DEV_AGENT,
       { ...SPEC_TASK, serverPriorFindings: CODE_FINDINGS },
-      { contains: ['(do NOT commit or push it)', '.baxian/spec.md', '[bx:spec-fixed:<token>]'], notContains: ['commitSha'], notMatches: [/commit;/, /, commit\b/] }],
-    ['server-feedback code variant keeps the commit + commitSha wording', 'server-feedback', DEV_AGENT,
+      { contains: ['feedback: spec', 'signal: spec-fixed'], notContains: ['commit'] }],
+    ['server-feedback code variant: feedback=code + code-fixed signal', 'server-feedback', DEV_AGENT,
       { serverPriorFindings: CODE_FINDINGS },
-      { contains: ['commit', 'commitSha', '[bx:code-fixed:<token>]'] }],
-    ['server-feedback keeps the server-mode "do NOT push / no PR" constraint', 'server-feedback', DEV_AGENT,
-      { serverPriorFindings: CODE_FINDINGS },
-      { contains: ['Do NOT push to any remote and do NOT open a PR in this phase', 'publishing is deferred to the server-after-done phase'] }],
-    ['server-recheck enforces the closure gate', 'server-recheck', QA_AGENT,
-      { serverContent: 'diff y', serverPriorFindings: CODE_FINDINGS, serverPriorResponse: '{"round":1,"responses":[]}' },
-      { contains: ['Verdict approve ONLY when every prior finding is closed AND the new diff is clean', 'reappears in findings.json with its ORIGINAL id', 're-raise it with concrete counter-evidence', 'behavior the fixes introduced that lacks test coverage'] }],
-    ['server-review keeps the local-worktree-read + finding-id invariants', 'server-review', QA_AGENT,
-      { serverContent: 'diff x' },
-      { contains: ['read them directly from your own base-branch worktree', 'sequential and unique within findings.json'] }],
-    ['server-spec-review offers read-file unconditionally', 'server-spec-review', QA_AGENT,
-      { serverContent: '# spec' },
-      { contains: ['Need a referenced file or codebase section to judge feasibility'] }],
-    ['server-feedback keeps judge-independently + no-lazy-reject guards', 'server-feedback', DEV_AGENT,
-      { serverPriorFindings: CODE_FINDINGS },
-      { contains: ['Judge each independently', 'QA can be wrong', 'Never reject just to save effort'] }],
-    ['server-after-done pr variant demands PR number in signal', 'server-after-done', DEV_AGENT,
+      { contains: ['feedback: code', 'signal: code-fixed'] }],
+    ['server-after-done pr variant: publish=pr + github-pr exchange + code-ready', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'pr', branch: 'bx/task-001' } },
-      { contains: ['gh pr create', 'ready for review (not Draft)', 'gh pr ready', '[bx:code-ready:<pr_number>:<token>]', 'git push'] }],
-    ['server-after-done branch variant uses plain code-ready', 'server-after-done', DEV_AGENT,
+      { contains: ['publish: pr', 'branch: bx/task-001', 'exchange: github-pr', 'signal: code-ready'], notContains: ['gh pr create'] }],
+    ['server-after-done branch variant: publish=branch + server-files exchange', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } },
-      { contains: ['[bx:code-ready:<token>]'], notContains: ['gh pr create', 'gh pr ready'] }],
-    ['contentTruncated adds the truncation note', 'server-review', QA_AGENT,
+      { contains: ['publish: branch', 'exchange: server-files', 'signal: code-ready'], notContains: ['publish: pr'] }],
+    ['contentTruncated adds the content: truncated field', 'server-review', QA_AGENT,
       { serverContent: 'partial diff', contentTruncated: true },
-      { contains: ['truncated'] }],
+      { contains: ['content: truncated'] }],
   ])('%s', (_label, phase, agent, extra, expectations) => {
     assertFragments(build(phase, agent, extra), expectations);
   });
 
-  it('server-feedback picks signal by task phase', () => {
+  it('server-feedback picks the signal + feedback fields by task phase', () => {
     const codePrompt = build('server-feedback', DEV_AGENT, { serverPriorFindings: CODE_FINDINGS });
-    expect(codePrompt).toContain('[bx:code-fixed:<token>]');
-    expect(codePrompt).toContain('.baxian/review/response.json');
+    expect(codePrompt).toContain('signal: code-fixed');
+    expect(codePrompt).toContain('feedback: code');
 
     const specPrompt = build('server-feedback', DEV_AGENT, { ...SPEC_TASK, serverPriorFindings: '{}' });
-    expect(specPrompt).toContain('[bx:spec-fixed:<token>]');
+    expect(specPrompt).toContain('signal: spec-fixed');
+    expect(specPrompt).toContain('feedback: spec');
   });
 
-  it('server review builders carry the judgment criteria (not just the I/O schema)', () => {
-    const codeReview = build('server-review', QA_AGENT, { serverContent: 'diff x' });
-    expect(codeReview).toContain('correctness, tests, edge cases, security, regressions');
-    expect(codeReview).toContain('critical = broken/unsafe');
-    const specReview = build('server-spec-review', QA_AGENT, { serverContent: '# spec' });
-    expect(specReview).toContain('completeness');
-    expect(specReview).toContain('ambiguity (any requirement readable two ways is a finding)');
+  it('baxian-server-review skill carries the migrated review criteria, closure rules, and findings schema', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-server-review/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('correctness, tests, edge cases, security, regressions');
+    expect(body).toContain('broken/unsafe');
+    expect(body).toContain('ONLY when every prior finding is closed');
+    expect(body).toContain('ORIGINAL id');
+    expect(body).toContain('base-branch worktree');
+    expect(body).toContain('sequential and unique within');
+    expect(body).toContain('completeness');
+    expect(body).toContain('ambiguity');
+    expect(body).toContain('findings.json.tmp');
+    expect(body).toContain('"location"');
   });
 
-  it('conventions header is reviewMode-aware: server mode points at .baxian/review, not GitHub PR/Issue', () => {
+  it('baxian-server-feedback skill carries the migrated fix/reject semantics, response schema, and publish constraint', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('Judge each finding independently');
+    expect(body).toContain('QA can be wrong');
+    expect(body).toContain('Never reject just to save effort');
+    expect(body).toContain('commitSha');
+    expect(body).toContain('Do NOT commit or push it');
+    expect(body).toContain('response.json.tmp');
+    expect(body).toContain('Do NOT push to any remote');
+    expect(body).toContain('publishing is deferred to the `server-after-done` phase');
+    expect(body).toContain('exactly one response item');
+  });
+
+  it('descriptor exchange field is mode-aware: server phases → server-files, github → github-pr', () => {
     const serverPrompt = build('server-review', QA_AGENT, { serverContent: 'diff x' });
-    expect(serverPrompt).toContain('server review mode');
-    expect(serverPrompt).toContain('.baxian/review/*.json');
+    expect(serverPrompt).toContain('exchange: server-files');
     expect(serverPrompt).not.toContain('cross-agent communication is via the GitHub PR');
-    // GitHub mode (no reviewMode) keeps the PR/Issue conventions. `merge` needs only
-    // baxian-rules, which this block seeds.
+    // GitHub mode (no reviewMode) → github-pr. `merge` needs no skill, which this block seeds.
     const githubPrompt = buildPromptInline({
       task: TASK,
       phase: 'merge',
@@ -652,12 +714,12 @@ describe('server review mode prompt builders', () => {
       worktreePath: '/wt/x',
       skillRegistry: getRegistry(),
     } as Parameters<typeof buildPromptInline>[0]);
-    expect(githubPrompt).toContain('cross-agent communication is via the GitHub PR');
+    expect(githubPrompt).toContain('exchange: github-pr');
   });
 
-  it('header keys on the phase, not reviewMode: SDD spec uses the server header on a GitHub-mode task; server-after-done keeps the GitHub header', () => {
+  it('exchange keys on the phase, not reviewMode: SDD spec → server-files on a GitHub task; publish-as-PR → github-pr', () => {
     // GitHub-mode task (no reviewMode), but the SDD spec review runs the server-transit
-    // phase → must use the .baxian/review header, not GitHub-PR.
+    // phase → server-files exchange, not github-pr.
     const sddSpec = buildPromptInline({
       task: TASK,
       phase: 'server-spec-review',
@@ -667,20 +729,18 @@ describe('server review mode prompt builders', () => {
       signalToken: 'srvtok123456',
       serverContent: '# spec',
     } as Parameters<typeof buildPromptInline>[0]);
-    expect(sddSpec).toContain('server review mode');
-    expect(sddSpec).not.toContain('cross-agent communication is via the GitHub PR');
-    // The publish phase's PR variant DOES open a PR → keeps the GitHub-PR header.
+    expect(sddSpec).toContain('exchange: server-files');
+    // The publish phase's PR variant DOES open a managed PR → github-pr exchange.
     const publish = build('server-after-done', DEV_AGENT, { serverAfterDone: { kind: 'pr', branch: 'bx/task-001' } });
-    expect(publish).toContain('cross-agent communication is via the GitHub PR');
-    // ...but the branch-only publish variant has no PR → server header (no managed marker).
+    expect(publish).toContain('exchange: github-pr');
+    // ...but the branch-only publish variant has no PR → server-files exchange.
     const branchPublish = build('server-after-done', DEV_AGENT, { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } });
-    expect(branchPublish).toContain('server review mode');
-    expect(branchPublish).not.toContain('cross-agent communication is via the GitHub PR');
+    expect(branchPublish).toContain('exchange: server-files');
   });
 
   it('every baxian skill disables implicit model-invocation (Claude frontmatter + Codex policy) so only baxian explicitly invokes the per-phase skill', async () => {
     const skillsRoot = fileURLToPath(new URL('../../../../skills', import.meta.url));
-    for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
+    for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-server-review', 'baxian-server-feedback']) {
       const md = await readFile(join(skillsRoot, name, 'SKILL.md'), 'utf-8');
       expect(md).toContain('disable-model-invocation: true');
       const policy = await readFile(join(skillsRoot, name, 'agents', 'openai.yaml'), 'utf-8');
@@ -704,17 +764,14 @@ describe('server-phase prompt builders (managed-PR marker, findings compaction)'
   const getRegistry = useServerPhaseRegistry('baxian-r8-');
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
 
-  it('server-after-done pr prompt demands the managed-PR marker', async () => {
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server' },
-      phase: 'server-after-done',
-      agent: DEV_AGENT,
-      worktreePath: '/wt/x',
-      skillRegistry: getRegistry(),
-      signalToken: 'srvtok123456',
-      serverAfterDone: { kind: 'pr', branch: 'bx/task-001' },
-    } as Parameters<typeof buildPromptInline>[0]);
-    expect(prompt).toContain('<!-- baxian:managed -->');
+  it('baxian-server-feedback §Publish demands the managed-PR marker and the PR-number signal', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('## Publish');
+    expect(body).toContain('<!-- baxian:managed -->');
+    expect(body).toContain('[bx:code-ready:<pr_number>:<token>]');
   });
 
   it('oversized findings injection keeps every finding id (messages compacted)', async () => {
@@ -806,5 +863,19 @@ describe('response compaction', () => {
       expect(prompt).toContain(`"findingId":"f-${i}"`);
     }
     expect(prompt).not.toContain('r'.repeat(600));
+  });
+});
+
+describe('buildGreetingPrompt', () => {
+  it('force-loads the baxian-greeting skill and carries the token (no fireable signal)', () => {
+    const cc = buildGreetingPrompt('greettok12345', 'claude-code');
+    // Force-load via the runtime command, exactly like a real phase dispatch — the skill body
+    // (not this prompt) chains to baxian-signals.
+    expect(cc.startsWith('/baxian-greeting\n')).toBe(true);
+    expect(cc).toContain('token: greettok12345');
+    // The prompt must not itself contain a filled greeting signal — that would self-fire awaitOnce.
+    expect(scanPhaseSignals(cc)).toEqual([]);
+    // codex uses the $ sigil for the same force-load.
+    expect(buildGreetingPrompt('greettok12345', 'codex').startsWith('$baxian-greeting\n')).toBe(true);
   });
 });

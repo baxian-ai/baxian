@@ -20,7 +20,7 @@ import { LockManager } from './state/lock.js';
 import { ProcessLock, ProcessLockError } from './state/process-lock.js';
 import { EventBus } from './event/bus.js';
 import { EventLog } from './event/log.js';
-import { SkillRegistry } from './skill/registry.js';
+import { SkillRegistry, assertCoreSkillsPresent } from './skill/registry.js';
 import { AgentManager } from './agent/manager.js';
 import { PaneStreamerManager } from './agent/pane-streamer-manager.js';
 import { EventBroker } from './event/broker.js';
@@ -173,6 +173,7 @@ export async function startServer(configPath?: string): Promise<void> {
 
     const registry = new SkillRegistry(skillsDir);
     await registry.scan();
+    assertCoreSkillsPresent(registry, skillsDir);
 
     // Resolve host refs against the LIVE config (hot-reload swaps it). Pointed at agentManager.getConfig
     // once that exists — using a holder avoids the use-before-declaration cycle (manager needs the streamer).

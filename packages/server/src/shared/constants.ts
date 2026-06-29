@@ -99,16 +99,16 @@ export const AGENT_PHASES: Record<AgentRole, Record<string, { skills: string[] }
     'post-approve': { skills: ['baxian-pr-feedback'] },
     merge: { skills: [] },
     code: { skills: ['baxian-task-check'] },
-    'server-feedback': { skills: [] },
-    'server-after-done': { skills: [] },
+    'server-feedback': { skills: ['baxian-server-feedback'] },
+    'server-after-done': { skills: ['baxian-server-feedback'] },
   },
   qa: {
     review: { skills: ['baxian-pr-review'] },
     recheck: { skills: ['baxian-pr-recheck'] },
     merge: { skills: [] },
-    'server-review': { skills: [] },
-    'server-recheck': { skills: [] },
-    'server-spec-review': { skills: [] },
+    'server-review': { skills: ['baxian-server-review'] },
+    'server-recheck': { skills: ['baxian-server-review'] },
+    'server-spec-review': { skills: ['baxian-server-review'] },
   },
 };
 

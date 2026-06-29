@@ -310,7 +310,9 @@ function captureInjection(into: string[]): (cmd: string) => void {
 }
 
 async function seedPhaseSkillsAtDir(skillsDir: string): Promise<void> {
-  for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
+  // baxian-signals is not a phase skill but is required whenever a prompt carries a signalToken
+  // (buildPromptInline fails fast otherwise), so seed it alongside the phase skills.
+  for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-signals']) {
     await mkdir(join(skillsDir, name), { recursive: true });
     await writeFile(
       join(skillsDir, name, 'SKILL.md'),
@@ -836,6 +838,31 @@ describe('AgentManager task binding flow', () => {
     expect(caught).toBeInstanceOf(ApiError);
     expect((caught as ApiError).status).toBe(500);
     expect((caught as Error).message).toMatch(/required skill/i);
+  });
+
+  it('validateTaskDispatch fails fast when baxian-signals is missing (preview carries a signal token)', async () => {
+    // Registry has the develop phase skill but NOT baxian-signals. Before the preview carried a
+    // signalToken it slipped through to 201 and failed async; now it is caught at create time.
+    const partialDir = join(tempDir, 'skills-no-signals');
+    await mkdir(join(partialDir, 'baxian-task-check'), { recursive: true });
+    await writeFile(
+      join(partialDir, 'baxian-task-check', 'SKILL.md'),
+      `---\nname: baxian-task-check\ndescription: stub\n---\nstub`,
+    );
+    const registry = new SkillRegistry(partialDir);
+    await registry.scan();
+    const mgr2 = makeManager({ skillRegistry: registry });
+    await seedAgent({ id: 'dev-1' });
+
+    let caught: unknown;
+    try {
+      await mgr2.validateTaskDispatch('proj', { title: 'x', description: 'y', preferredAgentId: 'dev-1' });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).status).toBe(500);
+    expect((caught as Error).message).toMatch(/baxian-signals/);
   });
 
   it('failTaskForDispatchError accepts required_skills_missing reason', async () => {
@@ -1599,8 +1626,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    expect(prompts[0].startsWith('/baxian-task-check\n')).toBe(true);
-    expect(prompts[0]).toContain('<!-- baxian:managed -->');
+    expect(prompts[0].startsWith('/baxian-task-check\nphase: develop\n')).toBe(true);
+    expect(prompts[0]).not.toContain('[baxian]');
+    expect(prompts[0]).toContain('phase: develop');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.taskId).toBe(t.id);
@@ -1620,9 +1648,8 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
-    expect(prompts[0]).toContain('[bx:pr-created:');
-    expect(prompts[0]).not.toContain('Specification-Driven Development (SDD)');
-    expect(prompts[0]).not.toContain('[bx:spec-done:');
+    expect(prompts[0]).toContain('signal: pr-created');
+    expect(prompts[0]).not.toContain('spec-signal:');
   });
 
   it('startSession develop prompt keeps the spec route when the config pair has a QA', async () => {
@@ -1636,8 +1663,8 @@ describe('injectedSkills dedup across phase dispatches', () => {
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
-    expect(prompts[0]).toContain('Specification-Driven Development (SDD)');
-    expect(prompts[0]).toContain('[bx:spec-done:');
+    expect(prompts[0]).toContain('spec-signal: spec-done');
+    expect(prompts[0]).toContain('signal: pr-created');
   });
 
   it('startSession marks bootstrappingTaskId during dispatch and clears it once the prompt is ack\'d', async () => {
@@ -1721,10 +1748,12 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(prompts.length).toBe(1);
     expect(prompts[0]).not.toContain('<skills>');
     expect(prompts[0]).not.toContain('</skills>');
-    // primary already resident → no leading command, prompt opens on the task header.
-    expect(prompts[0].startsWith('Phase:')).toBe(true);
+    // primary already resident → no leading command, prompt opens on the first dispatch field.
+    expect(prompts[0].startsWith('phase: post-approve')).toBe(true);
     expect(prompts[0]).not.toMatch(/^[/$]baxian-/);
-    expect(prompts[0]).toContain('Post-approve PR feedback check');
+    expect(prompts[0]).not.toContain('[baxian]');
+    expect(prompts[0]).toContain('phase: post-approve');
+    expect(prompts[0]).toContain('signal: pr-merge-ready');
 
     const state = await agentStore.get('dev-1');
     expect(state?.injectedSkills?.skills.sort()).toEqual(['baxian-pr-feedback']);
@@ -1829,12 +1858,11 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    // 完整 preamble，不是短 nudge。
-    expect(prompts[0]).toContain('Post-approve PR feedback check:');
-    expect(prompts[0]).toContain('T_self');
-    expect(prompts[0]).toContain('Idempotency');
-    expect(prompts[0]).toContain('Do not merge the PR yourself from this phase');
-    expect(prompts[0]).not.toContain('Post-approve recheck (redispatch');
+    // freshRuntime 丢了旧上下文 → manager 省略 redispatch 字段（完整规则由 force-load 的
+    // baxian-pr-feedback §Post-Approve 提供），而不是发短 nudge。
+    expect(prompts[0]).toContain('phase: post-approve');
+    expect(prompts[0]).toContain('signal: pr-merge-ready');
+    expect(prompts[0]).not.toContain('redispatch:');
   });
 
   it('continueSession post-approve: reused runtime + redispatchCount>0 uses incremental nudge', async () => {
@@ -1860,8 +1888,9 @@ describe('injectedSkills dedup across phase dispatches', () => {
     expect(ok).toBe(true);
 
     expect(prompts.length).toBe(1);
-    expect(prompts[0]).toContain('Post-approve recheck (redispatch #2)');
-    expect(prompts[0]).not.toContain('Post-approve PR feedback check:');
+    // reused runtime + count>0 → manager passes the count, descriptor carries the redispatch field.
+    expect(prompts[0]).toContain('redispatch: 2');
+    expect(prompts[0]).toContain('signal: pr-merge-ready');
   });
 
   it('persistInjectedSkills skips agentStore write when phase brings no new skill', async () => {
@@ -3344,7 +3373,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect(joined).toMatch(/tmux load-buffer/);
     expect(joined).toMatch(/tmux paste-buffer/);
     expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
-    expect(promptInjections.join('\n')).toContain('has merged');
+    expect(promptInjections.join('\n')).toContain('event: pr-merged');
     // cleanup prompt injected BEFORE /clear in the command stream
     expect(execs.findIndex(c => c.includes('load-buffer')))
       .toBeLessThan(execs.findIndex(c => c.includes("send-keys -l -t '%5' '/clear'")));
@@ -3379,7 +3408,8 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect(fetchCmd).toContain('git worktree prune');
     const delCmd = execs.find(c => c.includes('git branch -D'));
     expect(delCmd).toContain("git branch -D 'bx/task-merge'");
-    expect(promptInjections.join('\n')).toContain('baxian deleted the merged local feature branch `bx/task-merge`');
+    expect(promptInjections.join('\n')).toContain('branch-cleanup: deleted');
+    expect(promptInjections.join('\n')).toContain('branch: bx/task-merge');
     expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
   });
 
@@ -3458,8 +3488,8 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const joined = execs.join('\n');
     expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/compact'/);
     expect(joined).not.toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
-    expect(promptInjections.join('\n')).toContain('WARNING');
-    expect(promptInjections.join('\n')).toContain('clean it up manually');
+    expect(promptInjections.join('\n')).toContain('branch-cleanup: failed');
+    expect(promptInjections.join('\n')).toContain('next: compact');
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 

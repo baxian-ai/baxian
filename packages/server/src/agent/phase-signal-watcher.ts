@@ -15,7 +15,9 @@ const MATCH_BUFFER_CHARS = 1024;
 // data.source='pane-signal' tag tells the handler the trigger came from a
 // pane signal echo rather than a GitHub poll cycle, so idempotency dedup can
 // be applied if the same logical transition also gets reported by the poller).
-const KIND_TO_EVENT_TYPE: Record<PhaseSignalKind, EventType> = {
+// `greeting` is excluded: it is an agent-level bootstrap handshake consumed by
+// awaitOnce(), never a task transition routed through the EventBus.
+const KIND_TO_EVENT_TYPE: Record<Exclude<PhaseSignalKind, 'greeting'>, EventType> = {
   'spec-fixed': 'server.spec.fix.submitted',
   'pr-created': 'pr.created',
   'pr-approved': 'review.submitted',
@@ -167,6 +169,58 @@ export class PhaseSignalWatcher {
     return this.entries.get(taskId)?.recovered ?? false;
   }
 
+  // Agent-scoped one-shot wait used by the bootstrap greeting handshake: subscribe
+  // to the pane, resolve on the first matching (kind, token), and bound the wait by
+  // timeoutMs. Unlike start(), it is keyed by agentId (no task exists yet), resolves a
+  // value to the caller instead of emitting a bus event, and self-cleans on every exit.
+  async awaitOnce(args: {
+    agentId: string;
+    kind: PhaseSignalKind;
+    token: string;
+    timeoutMs: number;
+  }): Promise<'matched' | 'timeout' | 'session-gone' | 'no-agent'> {
+    const agent = this.deps.resolveAgent(args.agentId);
+    if (!agent) return 'no-agent';
+    const streamer = this.deps.paneStreamerManager.ensure(agent);
+    return new Promise((resolve) => {
+      let buffer = '';
+      let done = false;
+      let unsubscribe: () => void = () => undefined;
+      const finish = (outcome: 'matched' | 'timeout' | 'session-gone'): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { unsubscribe(); } catch {}
+        resolve(outcome);
+      };
+      const matches = (chunk: string): boolean => {
+        // Scan the FULL combined text BEFORE trimming (the initial snapshot can exceed the buffer
+        // cap; slicing first would drop a greeting that sits before >1KB of trailing text). Keep only
+        // the tail in `buffer` so a signal split across the next chunk boundary still rejoins.
+        const combined = buffer + chunk;
+        buffer = combined.slice(-MATCH_BUFFER_CHARS);
+        return scanPhaseSignals(combined).some(
+          (s) => s.kind === args.kind && s.token === args.token,
+        );
+      };
+      const timer = setTimeout(() => finish('timeout'), args.timeoutMs);
+      streamer
+        .subscribeAtomic({
+          onLive: (data) => { if (matches(data)) finish('matched'); },
+          onSessionGone: () => finish('session-gone'),
+        })
+        .then((sub) => {
+          unsubscribe = sub.unsubscribe;
+          // Race guard: if already resolved (timeout/gone) before subscribe settled,
+          // drop the subscription rather than leak it.
+          if (done) { try { sub.unsubscribe(); } catch {} return; }
+          // The fresh token is unique, so a snapshot match can only be this handshake's echo.
+          if (matches(sub.snapshot.data)) finish('matched');
+        })
+        .catch(() => finish('session-gone'));
+    });
+  }
+
   private onPaneData(entry: WatchEntry, chunk: string, isSnapshot = false): void {
     // Stale-entry guard: streamer may dispatch a queued chunk to the old
     // entry's onLive callback after the entry has been replaced by a re-establish.
@@ -193,6 +247,8 @@ export class PhaseSignalWatcher {
     );
     entry.buffer = rawCombined.slice(-MATCH_BUFFER_CHARS);
     if (!signal) return;
+    // greeting never arms the task-keyed watcher; guard keeps the event table exhaustive.
+    if (signal.kind === 'greeting') return;
     entry.fired = true;
     this.entries.delete(entry.taskId);
     try { entry.unsubscribe(); } catch {}

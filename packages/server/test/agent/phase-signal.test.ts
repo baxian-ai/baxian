@@ -29,6 +29,17 @@ describe('phase signal protocol', () => {
     expect(scanPhaseSignals(buildPhaseSignalTemplate('pr-fixed'))).toEqual([]);
   });
 
+  it('handles the greeting bootstrap handshake signal kind', () => {
+    expect(PHASE_SIGNAL_KINDS).toContain('greeting');
+    expect(buildPhaseSignal('greeting', 'tok456abc')).toBe('[bx:greeting:tok456abc]');
+    expect(buildPhaseSignalTemplate('greeting')).toBe('[bx:greeting:<token>]');
+    expect(scanPhaseSignals('hi\n[bx:greeting:abc123def456]')).toEqual([
+      { kind: 'greeting', token: 'abc123def456' },
+    ]);
+    // The angle-bracket template must not self-fire the scanner (would false-pass the handshake).
+    expect(scanPhaseSignals(buildPhaseSignalTemplate('greeting'))).toEqual([]);
+  });
+
   it('builds [bx:pr-created:<num>:<token>] three-segment for pr-created', () => {
     expect(buildPhaseSignal('pr-created', 'abc123def456', 42)).toBe('[bx:pr-created:42:abc123def456]');
     expect(buildPhaseSignal('pr-created', 'tok123def456', 999)).toBe('[bx:pr-created:999:tok123def456]');

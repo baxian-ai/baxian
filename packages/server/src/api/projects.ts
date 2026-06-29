@@ -718,7 +718,13 @@ async function pendingCleanupAfterReplReady(
   const state = await app.ctx.agentStore.get(agentId);
   const taskId = state?.taskId;
   if (!taskId) {
-    await app.ctx.agentManager.clearAwaitingHuman(agentId);
+    // A greeting_failed hold must re-prove signal capability, not be silently cleared:
+    // re-run the handshake on the restarted REPL; only a pass clears the hold.
+    if (state?.awaitingPhase === 'greeting_failed') {
+      await app.ctx.agentManager.regreetHeldAgent(agentId);
+    } else {
+      await app.ctx.agentManager.clearAwaitingHuman(agentId);
+    }
     if (!takeover) await app.ctx.lockManager.release(agentId);
     return;
   }

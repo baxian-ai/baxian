@@ -45,7 +45,7 @@ beforeEach(async () => {
   stagingRoot = join(tempDir, 'state', 'task-images');
 
   const skillsDir = join(tempDir, 'skills');
-  for (const s of ['baxian-rules', 'baxian-task-check']) {
+  for (const s of ['baxian-rules', 'baxian-task-check', 'baxian-signals']) {
     await mkdir(join(skillsDir, s), { recursive: true });
     await writeFile(join(skillsDir, s, 'SKILL.md'), `# ${s}`);
   }

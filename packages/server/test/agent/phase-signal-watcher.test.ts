@@ -418,3 +418,73 @@ describe('snapshot read-file suppression', () => {
     expect(seen).toEqual(['[bx:read-file:new/b.ts:5-9]']);
   });
 });
+
+describe('PhaseSignalWatcher.awaitOnce (bootstrap greeting)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('resolves "matched" when the pane echoes the greeting with the right token', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const token = 'greet12345678';
+    const p = watcher.awaitOnce({ agentId: DEV_AGENT.id, kind: 'greeting', token, timeoutMs: 1000 });
+    await flushMicrotasks();
+    streamer.triggerLive(`hi\n${buildPhaseSignal('greeting', token)}\n`);
+    expect(await p).toBe('matched');
+    expect(streamer.unsubscribed).toBe(true);
+  });
+
+  it('matches a greeting split across two pane chunks', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const token = 'splittok12345';
+    const full = buildPhaseSignal('greeting', token);
+    const cut = Math.floor(full.length / 2);
+    const p = watcher.awaitOnce({ agentId: DEV_AGENT.id, kind: 'greeting', token, timeoutMs: 1000 });
+    await flushMicrotasks();
+    streamer.triggerLive(full.slice(0, cut));
+    streamer.triggerLive(full.slice(cut));
+    expect(await p).toBe('matched');
+  });
+
+  it('matches a greeting in a large snapshot even when >1KB of text trails it', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const token = 'snaptok123456';
+    // Signal near the START of the snapshot, then a large trailing redraw — slicing to the 1KB tail
+    // BEFORE scanning would drop the signal; awaitOnce must scan the full snapshot first.
+    streamer.setSnapshot(`${buildPhaseSignal('greeting', token)}\n${'x'.repeat(4000)}`);
+    const p = watcher.awaitOnce({ agentId: DEV_AGENT.id, kind: 'greeting', token, timeoutMs: 1000 });
+    expect(await p).toBe('matched');
+  });
+
+  it('ignores a greeting echo carrying a different token (waits, then times out)', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const p = watcher.awaitOnce({ agentId: DEV_AGENT.id, kind: 'greeting', token: 'righttoken12', timeoutMs: 40 });
+    await flushMicrotasks();
+    streamer.triggerLive(buildPhaseSignal('greeting', 'wrongtoken99'));
+    expect(await p).toBe('timeout');
+  });
+
+  it('resolves "timeout" when no greeting arrives within timeoutMs', async () => {
+    const { watcher } = makeWatcher();
+    const outcome = await watcher.awaitOnce({
+      agentId: DEV_AGENT.id, kind: 'greeting', token: 'tok1234abcd', timeoutMs: 30,
+    });
+    expect(outcome).toBe('timeout');
+  });
+
+  it('resolves "session-gone" when the pane session ends before the greeting', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const p = watcher.awaitOnce({ agentId: DEV_AGENT.id, kind: 'greeting', token: 'tok1234abcd', timeoutMs: 1000 });
+    await flushMicrotasks();
+    streamer.triggerSessionGone();
+    expect(await p).toBe('session-gone');
+  });
+
+  it('resolves "no-agent" when the agent cannot be resolved', async () => {
+    const { watcher } = makeWatcher();
+    const outcome = await watcher.awaitOnce({
+      agentId: 'ghost', kind: 'greeting', token: 'tok1234abcd', timeoutMs: 1000,
+    });
+    expect(outcome).toBe('no-agent');
+  });
+});

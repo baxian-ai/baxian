@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentManager, EnsureSessionError } from '../../src/agent/manager.js';
+import { AgentManager, EnsureSessionError, DispatchTerminalError } from '../../src/agent/manager.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -13,6 +13,7 @@ import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
 import { initStateDir } from '../../src/state/init.js';
+import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 
@@ -40,6 +41,17 @@ function runner(): CommandRunner {
     exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     writeFile: vi.fn(async (): Promise<void> => undefined),
   };
+}
+
+// recover() now runs its re-greet in the background (so server startup is not blocked); poll for the
+// resulting state instead of asserting synchronously right after recover() returns.
+async function waitFor(check: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error('waitFor: condition not met within timeout');
 }
 
 beforeEach(async () => {
@@ -191,6 +203,276 @@ describe('AgentManager.startBootstrapAsync', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.creationToken).toBe('token-new');
     expect(state?.paneId).toBeUndefined();
+  });
+});
+
+describe('AgentManager greeting capability gate', () => {
+  // The base manager has no phaseSignalWatcher, so greeting is skipped there. These build a
+  // manager WITH a mock watcher to exercise the gate, stubbing the low-level pane inject.
+  function makeManagerWithWatcher(awaitOnce: ReturnType<typeof vi.fn>) {
+    const localEvents: BaxianEvent[] = [];
+    const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
+    const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
+    eventBus.on('*', (event) => { localEvents.push(event); });
+    const phaseSignalWatcher = { awaitOnce } as unknown as PhaseSignalWatcher;
+    const mgr = new AgentManager({
+      config: CONFIG,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus,
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => runner(),
+      phaseSignalWatcher,
+    });
+    vi.spyOn(mgr, 'ensureSession').mockResolvedValue({
+      ok: true, createdSession: true, paneId: '%0', workdir: '/tmp/repo',
+    });
+    const injectSpy = vi.spyOn(mgr as unknown as {
+      injectAndAwaitAckSteps: (...a: unknown[]) => Promise<unknown>;
+    }, 'injectAndAwaitAckSteps').mockResolvedValue({ acked: true, composerDelivered: true });
+    return { mgr, localEvents, injectSpy };
+  }
+
+  it('goes ready and clears the creation token when the agent echoes a valid greeting', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr, localEvents, injectSpy } = makeManagerWithWatcher(awaitOnce);
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.status).toBeUndefined();
+    expect(state?.paneId).toBe('%0');
+    expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
+    // One inject, awaiting a greeting-kind signal, via the skill (prose) path.
+    expect(injectSpy).toHaveBeenCalledTimes(1);
+    expect(awaitOnce).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'dev-1', kind: 'greeting' }));
+    expect(String(injectSpy.mock.calls[0][2])).toContain('baxian-greeting');
+  });
+
+  it('holds the agent as awaiting_human (greeting_failed) when greeting never verifies', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('timeout');
+    const { mgr, localEvents } = makeManagerWithWatcher(awaitOnce);
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('greeting_failed');
+    expect(localEvents.some(e =>
+      e.type === 'human.intervention' && e.data.phase === 'greeting_failed',
+    )).toBe(true);
+    expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
+    // Retries up to greetingMaxAttempts before giving up.
+    expect(awaitOnce).toHaveBeenCalledTimes(2);
+    // A held agent is not dispatchable.
+    expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
+  });
+
+  it('retries on session-gone (a transient subscribe fault must not fail a capable agent)', async () => {
+    // First attempt loses the subscription, second verifies — agent should end up ready.
+    const awaitOnce = vi.fn()
+      .mockResolvedValueOnce('session-gone')
+      .mockResolvedValueOnce('matched');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.status).toBeUndefined();
+    expect(awaitOnce).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not wait for the signal when the greeting paste fails — it retries the paste', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr, injectSpy } = makeManagerWithWatcher(awaitOnce);
+    // Inject fails every attempt → agent never echoes; awaitOnce must never be armed.
+    injectSpy.mockRejectedValue(new Error('pane busy'));
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
+    expect(injectSpy).toHaveBeenCalledTimes(2);
+    expect(awaitOnce).not.toHaveBeenCalled();
+  });
+
+  it('holds without retrying when the greeting paste fails ack_unknown (unconfirmed composer)', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr, injectSpy } = makeManagerWithWatcher(awaitOnce);
+    // ack_unknown = composer could not be confirmed clean; a second paste would land on unsafe input.
+    injectSpy.mockRejectedValue(new DispatchTerminalError('ack_unknown', 'pre-ack failure'));
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
+    expect(injectSpy).toHaveBeenCalledTimes(1); // NO second paste onto the unconfirmed composer
+    expect(awaitOnce).not.toHaveBeenCalled();
+  });
+
+  it('only kills the orphan session (no greeting_failed hold) when creationToken rotates mid-greeting', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('timeout');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    // A newer create rotates the token while greeting is still timing out.
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    const state = await agentStore.get('dev-1');
+    // The stale generation must NOT overwrite the newer one with a greeting_failed hold.
+    expect(state?.creationToken).toBe('token-newer');
+    expect(state?.awaitingPhase).not.toBe('greeting_failed');
+  });
+
+  it('recover() preserves a greeting_failed hold instead of releasing it to ok', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed',
+      awaitingReason: 'cap fail', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    await mgr.recover();
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('greeting_failed');
+    // A held, unverified agent must stay non-dispatchable after a restart.
+    expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
+  });
+
+  it('recover() re-greets an incomplete bootstrap (creationToken set, no task) → ready on pass', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
+
+    await mgr.recover();
+    // Re-greet runs in the background; wait for it to clear the token to 'ready'.
+    await waitFor(async () => (await agentStore.get('dev-1'))?.creationToken === undefined);
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBeUndefined();
+    expect(state?.status).toBeUndefined();
+    expect(awaitOnce).toHaveBeenCalledWith(expect.objectContaining({ kind: 'greeting' }));
+  });
+
+  it('recover() holds an incomplete bootstrap that fails its re-greet', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('timeout');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
+
+    await mgr.recover();
+    // Re-greet runs in the background; wait for the failure to land the greeting_failed hold.
+    await waitFor(async () => (await agentStore.get('dev-1'))?.awaitingPhase === 'greeting_failed');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('greeting_failed');
+  });
+
+  it('regreetHeldAgent clears the hold when the re-greet passes', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    expect(await mgr.regreetHeldAgent('dev-1')).toBe(true);
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.status).toBeUndefined();
+    expect(state?.awaitingPhase).toBeUndefined();
+  });
+
+  it('regreetHeldAgent keeps the hold when the re-greet fails', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('timeout');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    await mgr.regreetHeldAgent('dev-1');
+
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
+  });
+
+  it('regreetHeldAgent does not clear a binding that was recreated mid-handshake (generation guard)', async () => {
+    // A DELETE+recreate lands a new generation (creationToken set, no greeting_failed) while the
+    // handshake is still running; the stale regreet must NOT clear it.
+    const awaitOnce = vi.fn().mockImplementation(async () => {
+      await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-new', updatedAt: 'LATER' });
+      return 'matched';
+    });
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    await mgr.regreetHeldAgent('dev-1');
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBe('tok-new');
+    expect(state?.awaitingPhase).toBeUndefined();
+  });
+
+  // NOTE: slowPollDialogPending's bootstrap path also runs the greeting gate (manager.ts) — a direct
+  // mirror of startBootstrapAsync's gate covered above. It is not unit-tested here on purpose: driving
+  // the private while-loop needs a global setTimeout swap + a waitReplReady prototype spy, which races
+  // under CI coverage load (busy-spin → timeout). The mirrored logic is what the gate tests above pin.
+
+  it('Resume refuses a greeting_failed hold — capability must be re-proven, not overridden', async () => {
+    const { mgr } = makeManagerWithWatcher(vi.fn().mockResolvedValue('matched'));
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    const res = await mgr.resumeAgent('dev-1');
+
+    expect(res.resumed).toBe(false);
+    const state = await agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('greeting_failed');
+    // Still not dispatchable — Resume did not slip it into the pool.
+    expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
+  });
+
+  it('markDialogPending does not overwrite a greeting_failed hold (no downgrade to a dialog phase)', async () => {
+    const { mgr } = makeManagerWithWatcher(vi.fn());
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    await (mgr as unknown as {
+      markDialogPending: (id: string, tok: string | undefined) => Promise<void>;
+    }).markDialogPending('dev-1', undefined);
+
+    // The hold must stay greeting_failed — else a dialog-collision would let Resume release it.
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
+  });
+
+  it('reconcileFailedAgent preserves a greeting_failed hold on tmux-absent (does not wipe to idle)', async () => {
+    const { mgr } = makeManagerWithWatcher(vi.fn());
+    await agentStore.set({
+      id: 'dev-1', projectId: 'proj', paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
+    });
+
+    expect(await mgr.reconcileFailedAgent('dev-1')).toBe(false);
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('greeting_failed');
+    expect(state?.paneId).toBe('%0');
+    // A transient tmux absence must not turn an unverified agent back into a dispatch candidate.
+    expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 });
 

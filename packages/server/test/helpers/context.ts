@@ -22,6 +22,8 @@ const SKILL_NAMES = [
   'baxian-pr-review',
   'baxian-pr-feedback',
   'baxian-pr-recheck',
+  // Required whenever a prompt carries a signalToken — the dispatch preview now does.
+  'baxian-signals',
 ];
 
 export async function createTestContext(tempDir: string): Promise<AppContext> {

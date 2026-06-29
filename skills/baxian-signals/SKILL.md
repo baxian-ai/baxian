@@ -18,21 +18,27 @@ baxian scans the pane fuzzily (strips ANSI escapes and whitespace), so a TUI sof
 
 ## How to emit
 
-The dispatch prompt hands you a template with placeholders plus the literal values on companion lines:
+The dispatch descriptor names the signal kind in a signal field and the token in `token:`. The default completion is `signal:`; some phases also expose an alternate field for an optional branch (e.g. `spec-signal:` on develop's SDD route). Your phase skill's flow tells you which field applies — emit the one for the route you took, never both:
 
 ```
-[bx:pr-fixed:<token>]
+signal: pr-fixed
 token: a1b2c3d4e5f6
 ```
 
-1. Substitute `<token>` with the value on the `token:` line. `<pr_number>` (only `pr-created`, and `code-ready` when publishing as a PR) is the number of the PR you just created/opened with `gh pr create` — the dispatch prompt carries no PR-number line.
+1. Build the wire form `[bx:KIND:TOKEN]` from the field your skill's flow selects — KIND = that field's value (the `signal:` value by default, or an alternate like `spec-signal:`), TOKEN = the `token:` value — and emit it filled. `<pr_number>` (only `pr-created`, and `code-ready` when publishing as a PR) is the number of the PR you just created/opened with `gh pr create` — the descriptor carries no PR-number field.
 2. Emit the filled signal **alone on its own line**.
-3. **Never echo the `<…>` placeholder verbatim** — the scanner's strict regex cannot match angle-bracket placeholders, so a verbatim template echo fires nothing and the task hangs forever waiting on a signal.
-4. Emit the kind the prompt asks for, **exactly once**, only when its precondition holds. baxian consumes the first matching signal whose token matches the active dispatch; the token rotates every dispatch, so a stale or guessed token never fires.
+3. **Never emit an angle-bracket placeholder** like `[bx:pr-fixed:<token>]` verbatim — the scanner's strict regex cannot match placeholders, so it fires nothing and the task hangs forever waiting on a signal.
+4. Emit the single kind your phase skill's flow selects, **exactly once**, only when its precondition holds. baxian consumes the first matching signal whose token matches the active dispatch; the token rotates every dispatch, so a stale or guessed token never fires.
 
 ## Signal catalog
 
 Phase signals — the per-dispatch transition signals baxian consumes to advance a task. The dispatch prompt always names which one to emit and when.
+
+Bootstrap handshake (before any task):
+
+| Signal | Meaning |
+|---|---|
+| `greeting` | one-time capability check at agent startup; prove you can load this skill and signal back. baxian holds the agent until it sees a valid `greeting` echo |
 
 GitHub PR flow:
 

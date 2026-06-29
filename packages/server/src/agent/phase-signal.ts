@@ -16,7 +16,9 @@ export type PhaseSignalKind =
   | 'code-done'
   | 'code-reviewed'
   | 'code-fixed'
-  | 'code-ready';
+  | 'code-ready'
+  // Agent-level capability handshake at bootstrap, not a task transition.
+  | 'greeting';
 
 export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
   'spec-fixed',
@@ -31,6 +33,7 @@ export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
   'code-reviewed',
   'code-fixed',
   'code-ready',
+  'greeting',
 ] as const;
 
 // Discriminated union: kinds carry exactly the fields the protocol defines.
@@ -48,7 +51,8 @@ export type PhaseSignal =
   | { kind: 'code-done'; token: string }
   | { kind: 'code-reviewed'; token: string }
   | { kind: 'code-fixed'; token: string }
-  | { kind: 'code-ready'; token: string; prNumber?: number };
+  | { kind: 'code-ready'; token: string; prNumber?: number }
+  | { kind: 'greeting'; token: string };
 
 const VALID_KINDS = new Set<PhaseSignalKind>(PHASE_SIGNAL_KINDS);
 
@@ -63,7 +67,7 @@ const COMPACT_SIGNAL_RE_PR_CREATED = new RegExp(
   'g',
 );
 const COMPACT_SIGNAL_RE_PLAIN = new RegExp(
-  `\\[bx:(spec-fixed|pr-approved|pr-changes-requested|pr-fixed|pr-merge-ready|spec-done|spec-reviewed|code-done|code-reviewed|code-fixed):(${TOKEN_RANGE})\\]`,
+  `\\[bx:(spec-fixed|pr-approved|pr-changes-requested|pr-fixed|pr-merge-ready|spec-done|spec-reviewed|code-done|code-reviewed|code-fixed|greeting):(${TOKEN_RANGE})\\]`,
   'g',
 );
 // code-ready's PR-number segment is optional: afterDone:'pr' emits 3-segment, 'branch' 2-segment.

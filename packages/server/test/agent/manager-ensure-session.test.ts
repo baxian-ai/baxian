@@ -252,7 +252,7 @@ describe('AgentManager.ensureSession', () => {
     const skillsDir = join(tempDir, 'skills');
     // Seed every skill declared by AGENT_PHASES so previewPromptBytesForTaskInput
     // and any startSession-path test using dev.develop passes fail-fast validation.
-    for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck']) {
+    for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-signals']) {
       await mkdir(join(skillsDir, name), { recursive: true });
       await writeFile(
         join(skillsDir, name, 'SKILL.md'),
@@ -601,5 +601,46 @@ describe('AgentManager.ensureSession', () => {
     expect(manager.getAgentConfig('qa-1')).toBeUndefined();
     manager.replaceConfig(expandedConfig());
     expect(manager.getAgentConfig('qa-1')).toBeDefined();
+  });
+
+  // restartReplOnly re-provisions skills then relaunches the REPL. The skills-version tag must
+  // only be written when the provision SUCCEEDED: tagging after a failed provision would mark a
+  // REPL that scanned the stale tree as current, defeating ensureSession's rebuild self-heal.
+  type RestartReplPrivates = {
+    pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
+    ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }>;
+    provisionRepoSkills: (...a: unknown[]) => Promise<void>;
+    tagSessionSkillsVersion: (...a: unknown[]) => Promise<void>;
+  };
+  function stubRestartRepl(): RestartReplPrivates {
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    const m = manager as unknown as RestartReplPrivates;
+    vi.spyOn(m, 'pollPaneCommandStable').mockResolvedValue('zsh');
+    vi.spyOn(m, 'ensureWorkdir').mockResolvedValue({ workdir: '/tmp/repo' });
+    return m;
+  }
+
+  it('restartReplOnly tags @baxian-skills-version after a successful re-provision', async () => {
+    const m = stubRestartRepl();
+    vi.spyOn(m, 'provisionRepoSkills').mockResolvedValue(undefined);
+    const tagSpy = vi.spyOn(m, 'tagSessionSkillsVersion');
+
+    await manager.restartReplOnly('dev-1');
+
+    expect(tagSpy).toHaveBeenCalledTimes(1);
+    expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
+  });
+
+  it('restartReplOnly does NOT tag @baxian-skills-version when re-provision fails (keeps it stale for ensureSession self-heal)', async () => {
+    const m = stubRestartRepl();
+    vi.spyOn(m, 'provisionRepoSkills').mockRejectedValue(new Error('ssh write failed'));
+    const tagSpy = vi.spyOn(m, 'tagSessionSkillsVersion');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await manager.restartReplOnly('dev-1');
+
+    expect(tagSpy).not.toHaveBeenCalled();
+    expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
+    warnSpy.mockRestore();
   });
 });
