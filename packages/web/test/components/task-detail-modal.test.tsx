@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, act, within } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 import type { TaskState, TaskStatus } from '../../src/shared/index.js';
 
 const { useProjectsMock, useTaskMock } = vi.hoisted(() => ({
@@ -84,7 +85,11 @@ function setTasks(tasks: Record<string, TaskState>): void {
 
 function openDetail(overrides: Partial<TaskState> = {}): void {
   setTasks({ 'task-010': makeTask(overrides) });
-  render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
+  render(
+    <MemoryRouter>
+      <TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>
+    </MemoryRouter>,
+  );
   fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
 }
 
@@ -158,8 +163,9 @@ describe('TaskDetailProvider / useTaskDetail', () => {
     expect(screen.getByText('(Codex)').className).toContain('sm:inline');
   });
 
-  it('keeps Round and spec metadata visually consistent when specReviewRound is present', () => {
+  it('keeps Round and spec metadata visually consistent when specReviewRound is present', async () => {
     openDetail({ specReviewRound: 3 });
+    await act(async () => {});
 
     const dialog = screen.getByRole('dialog', { name: 'task-010 Clean tests' });
     const roundMeta = within(dialog).getByText((_, el) => el?.textContent === 'Round: 1 spec: 3');

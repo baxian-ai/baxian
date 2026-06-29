@@ -2,8 +2,10 @@ import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-do
 import { Dashboard } from './pages/dashboard.tsx';
 import { Project } from './pages/project.tsx';
 import { Terminal } from './pages/terminal.tsx';
+import { ReviewRoundPage } from './pages/review-round.tsx';
 import { BrandToggle } from './components/brand-toggle.tsx';
 import { PendingRestartBanner } from './components/pending-restart-banner.tsx';
+import { TaskDetailProvider } from './components/task-detail-modal.tsx';
 import { TOPBAR_ACTIONS_ID } from './components/topbar-actions.tsx';
 
 function AppShell() {
@@ -31,6 +33,7 @@ function AppShell() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/project/:id" element={<Project />} />
           <Route path="/terminal/:agentId" element={<Terminal />} />
+          <Route path="/tasks/:taskId/rounds/:phase/:round" element={<ReviewRoundPage />} />
         </Routes>
         {showBottomBrand && (
           <footer className="mt-auto flex justify-center pb-4 pt-24">
@@ -45,7 +48,9 @@ function AppShell() {
 export function App() {
   return (
     <BrowserRouter>
-      <AppShell />
+      <TaskDetailProvider>
+        <AppShell />
+      </TaskDetailProvider>
     </BrowserRouter>
   );
 }

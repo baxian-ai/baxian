@@ -210,7 +210,7 @@ describe('AgentCard', () => {
     expect(runtime.className).toContain('sm:inline');
   });
 
-  it('shows bootstrap as starting and keeps Terminal disabled until pane exists', () => {
+  it('shows bootstrap as starting and keeps the terminal gated until the tmux session appears', () => {
     renderCard(makeSnapshot({
       id: 'dev-new',
       runtimeStatus: 'pending',
@@ -224,6 +224,7 @@ describe('AgentCard', () => {
     expect(screen.queryByText('等待人工介入')).toBeNull();
     expect(screen.queryByRole('link', { name: 'Terminal' })).toBeNull();
     expect(screen.getByText('Terminal')).toBeTruthy();
+    expect(screen.queryByTestId('pane-terminal')).toBeNull();
   });
 
   it('keeps startup-dialog pending agents attachable once paneId is known', () => {
@@ -274,19 +275,48 @@ describe('AgentCard', () => {
     expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
   });
 
-  it('keeps in-flight bootstrap as Starting when tmux is present but neither awaiting_human nor PENDING_HUMAN is set', () => {
+  it('reveals the live terminal during in-flight bootstrap once the tmux session is present', () => {
     renderCard(makeSnapshot({
       id: 'dev-launching',
       runtimeStatus: 'pending',
+      tmuxSessionStatus: 'present',
       binding: makeBinding('dev-launching', { creationToken: 'create-1' }),
     }));
 
+    // Greeting handshake is still mid-flight, so the agent stays visibly "Starting"...
     expect(screen.getByText('Starting')).toBeTruthy();
     expect(screen.getByRole('img', { name: 'Starting session' })).toBeTruthy();
-    expect(screen.getByText(/Agent 正在启动/)).toBeTruthy();
     expect(screen.queryByText('等待人工介入')).toBeNull();
-    expect(screen.queryByRole('link', { name: 'Terminal' })).toBeNull();
-    expect(screen.getByText('Terminal')).toBeTruthy();
+    // ...but the live pane is now reachable so the operator can watch greeting progress and failures.
+    expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
+    expect(terminalHrefs()).toEqual(['/terminal/dev-launching']);
+    expect(screen.getByTestId('pane-terminal')).toBeTruthy();
+  });
+
+  it('embedded mode mounts the live terminal during bootstrap once the session is present', () => {
+    renderCard(makeSnapshot({
+      id: 'dev-emb-boot',
+      runtimeStatus: 'pending',
+      tmuxSessionStatus: 'present',
+      binding: makeBinding('dev-emb-boot', { creationToken: 'create-1' }),
+    }), { terminalMode: 'embedded-full' });
+
+    expect(screen.getByText('Starting')).toBeTruthy();
+    expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
+    expect(screen.getByTestId('pane-terminal').getAttribute('data-mode')).toBe('full');
+  });
+
+  it('embedded mode keeps the startup placeholder while bootstrapping before the session exists', () => {
+    renderCard(makeSnapshot({
+      id: 'dev-emb-wait',
+      runtimeStatus: 'pending',
+      tmuxSessionStatus: 'absent',
+      binding: makeBinding('dev-emb-wait', { creationToken: 'create-1' }),
+    }), { terminalMode: 'embedded-full' });
+
+    expect(screen.queryByTestId('pane-terminal')).toBeNull();
+    // Exact match targets the terminal placeholder, not the startup banner that also begins with this text.
+    expect(screen.getByText('Agent 正在启动')).toBeTruthy();
   });
 
   it('embedded terminal mode renders an interactive full terminal even when idle', () => {

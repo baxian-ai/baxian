@@ -128,17 +128,19 @@ export function AgentCard({
     && !agent.binding?.paneId
     && !isAwaitingHuman
     && agent.reason !== 'PENDING_HUMAN';
+  // 启动期 tmux session 一出现就放行终端：greeting 握手跑在这个活 pane 里，让操作者实时看到失败原因，而非干等 paneId 落库。
+  const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const runtimeBadge = isBootstrapping
     ? { label: 'Starting', cls: 'pill pill-review' }
     : RUNTIME_BADGES[agent.runtimeStatus];
   const tmuxDotState: TmuxDotState = isBootstrapping ? 'starting' : agent.tmuxSessionStatus;
   const showTerminalPreview = terminalMode === 'activity-preview' &&
-    !isBootstrapping && (agent.runtimeStatus === 'working' || agent.runtimeStatus === 'pending');
+    !bootstrapBlocksTerminal && (agent.runtimeStatus === 'working' || agent.runtimeStatus === 'pending');
   const showEmbeddedTerminal = terminalMode === 'embedded-full';
   // onActivate's presence opts into selectable mode; absence preserves the legacy "always full" path.
   const isSelectableEmbedded = showEmbeddedTerminal && typeof onActivate === 'function';
   const isActiveSelected = isSelectableEmbedded && active === true;
-  const terminalDisabled = terminalLoading || pendingRestart || isBootstrapping;
+  const terminalDisabled = terminalLoading || pendingRestart || bootstrapBlocksTerminal;
   const terminalDisabledMessage = terminalLoading
     ? 'Agent 状态加载中'
     : pendingRestart
@@ -359,7 +361,7 @@ export function AgentCard({
           <StatusDot state={tmuxDotState} />
         </div>
       </div>
-      {isBootstrapping && (
+      {bootstrapBlocksTerminal && (
         <div className="mb-2 rounded-md border border-accent-soft bg-accent-soft/40 px-2.5 py-2 text-[12px] text-accent">
           Agent 正在启动，终端可用后会自动刷新。
         </div>

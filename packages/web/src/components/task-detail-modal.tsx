@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { api } from '../api.ts';
 import { Modal } from './modal.tsx';
 import { CreateTaskModal } from './create-task-modal.tsx';
+import { ReviewConversation } from './review-conversation.tsx';
 import { useToast } from './toast.tsx';
 import { useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
@@ -468,6 +469,8 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
             <div className="text-og-500">Branch: <span className="font-mono text-og-800">{task.branch || '—'}</span></div>
           </div>
         </div>
+
+        <ReviewConversation task={task} onClose={onClose} />
       </div>
     );
   }
