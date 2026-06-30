@@ -10,7 +10,6 @@ import { withConfigLock } from '../config/mutex.js';
 import { applyConfigHotReload } from '../config/hot-reload.js';
 import { agentIsLive } from '../agent/liveness.js';
 
-// Stable identity of an agent's host reference (string id or inline object) for change detection.
 function hostRefKey(host: unknown): string {
   return JSON.stringify(host ?? null);
 }
@@ -29,8 +28,6 @@ function agentHostRefs(projects: ProjectConfig[] | undefined): Map<string, strin
 
 const REDACTED = '***';
 
-// Only host/port/https require a full server restart; everything else (project list,
-// agents, poller intervals, allowedHosts, token, review.rounds) is hot-reloadable.
 function requiresRestart(prev: BaxianConfig['server'], next: BaxianConfig['server']): boolean {
   return prev.host !== next.host
     || prev.port !== next.port
@@ -43,15 +40,12 @@ function sameHttps(a: HttpsConfig | undefined, b: HttpsConfig | undefined): bool
   return a.keyFile === b.keyFile && a.certFile === b.certFile;
 }
 
-// REDACTED and missing values both preserve the current secret.
 function resolveSensitive(incoming: string | undefined, current: string | undefined): string | undefined {
   if (incoming === REDACTED) return current;
   if (incoming === undefined) return current;
   return incoming;
 }
 
-// Strip a host's password. Used recursively so no config-returning endpoint ever leaks a secret —
-// whether the password sits in the top-level registry or a legacy inline agent.host.
 function redactHostSecret(host: HostConfig): HostConfig {
   return host.password !== undefined ? { ...host, password: REDACTED } : host;
 }
@@ -88,7 +82,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
     return redactConfig(app.ctx.config);
   });
 
-  // Top-level sections are shallow-merged; projects are replaced.
   app.patch<{ Body: Partial<BaxianConfig> }>('/config', async (request, reply) => {
     if (!app.ctx.configPath) {
       return reply.status(500).send({ error: 'No config path configured' });
@@ -96,7 +89,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
     return withConfigLock(async () => {
       const current = app.ctx.config;
       const rawBody = request.body;
-      // Object-only — `'codereview' in primitive` throws TypeError; arrays behave inconsistently.
       if (
         rawBody === null
         || rawBody === undefined
@@ -121,9 +113,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(400).send({ error: 'Invalid config', details: legacyErrors });
       }
 
-      // The host registry has a single guarded mutation path (/hosts/* — connectivity check +
-      // structural-change liveness guard + redaction). Reject host edits here so PATCH /config can
-      // never hot-swap a referenced host's endpoint/credentials behind those guards.
       if ('host' in incoming) {
         return reply.status(400).send({
           error: 'Invalid config',
@@ -145,7 +134,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       const merged: BaxianConfig = {
         review: { ...current.review, ...(incoming.review ?? {}) },
         server: mergedServer,
-        // Always preserved — host edits are rejected above and only go through /hosts/*.
         host: current.host,
         project: incoming.project ?? current.project,
       };
@@ -163,10 +151,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         throw err;
       }
 
-      // A project replace can repoint a remote agent at a different host id, bypassing the /hosts
-      // structural-change liveness guard. Block that for live agents (else their session is orphaned
-      // on the old host). Run AFTER prepareConfig so we scan the validated, well-formed project — a
-      // malformed project has already failed as a 400 above (never a TypeError/500 here).
       if (incoming.project !== undefined) {
         const currentRefs = agentHostRefs(current.project);
         const blocked: string[] = [];

@@ -11,7 +11,6 @@ import { TmuxManager } from './tmux.js';
 import { computeBackoffMs } from '../timing/backoff.js';
 
 export interface PaneStreamerOptions {
-  // Bounds the headless xterm buffer (in lines) that snapshots serialize from.
   scrollbackLines?: number;
   idleGraceMs?: number;
   reattachDelayMs?: number;
@@ -64,8 +63,6 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const DEFAULT_REATTACH_DELAY_MS = MIN_REATTACH_DELAY_MS;
 const DEFAULT_REATTACH_MAX_DELAY_MS = 15_000;
 const DEFAULT_REATTACH_JITTER = 0.2;
-// An attach must stay alive this long to count as recovered: a failing reattach often emits
-// bytes (SSH banner, "Connection closed" stderr) before dying, which must NOT reset backoff.
 const DEFAULT_REATTACH_STABLE_AFTER_MS = 5000;
 const DEFAULT_SESSION_PROBE_TIMEOUT_MS = 3000;
 const DEFAULT_COLS = 200;
@@ -79,11 +76,6 @@ const moduleRequire = createRequire(import.meta.url);
 
 type ModuleLoader = (modulePath: string) => void;
 
-// node-pty 1.1.0 ships its prebuilt spawn-helper as 0644 (microsoft/node-pty#850); posix_spawnp then
-// fails with EACCES on the first attach. Restore +x on the helper node-pty will actually load. Gate on
-// whether *this* process can already exec it (a 0550 root:group helper is fine for a group member) so we
-// don't chmod-EPERM-throw on an install that would have worked; only a genuinely unrunnable helper that
-// we also can't fix is fatal — fail loudly there rather than leave the cryptic "posix_spawnp failed".
 export function ensureSpawnHelperExecutable(
   packageDir = resolveNodePtyDir(),
   deps: {
@@ -101,7 +93,7 @@ export function ensureSpawnHelperExecutable(
   try {
     mode = statSync(helper).mode;
   } catch {
-    return; // helper absent (unexpected layout / Windows uses conpty) — let the real spawn surface it
+    return;
   }
   if (canExecute(helper)) return;
   try {
@@ -124,10 +116,6 @@ function defaultCanExecute(path: string): boolean {
   }
 }
 
-// The active helper sits beside the first pty.node that actually loads. We mirror node-pty
-// loadNativeModule by selecting on require() success, not mere existence: a stale/ABI-mismatched
-// build/Release/pty.node still exists but fails to load, and node-pty falls back to the prebuild —
-// existsSync would mis-pick build/Release and leave the prebuilt helper at 0644.
 function resolveActiveSpawnHelper(packageDir: string, load: ModuleLoader): string | undefined {
   const dirs = ['build/Release', 'build/Debug', `prebuilds/${process.platform}-${process.arch}`];
   for (const dir of dirs) {
@@ -209,8 +197,6 @@ export class PaneStreamer {
     private readonly agent: AgentConfig,
     private readonly tmux: TmuxManager,
     _runner: CommandRunner,
-    // Resolved per attach (not captured once) so a host credential/endpoint update via PATCH /hosts
-    // is picked up on the next reconnect instead of being stuck on the construction-time value.
     private readonly resolveHost: () => HostConfig | undefined,
     opts: PaneStreamerOptions = {},
   ) {
@@ -299,8 +285,6 @@ export class PaneStreamer {
     this.armStabilityTimer(generation);
   }
 
-  // Reset backoff only once an attach proves stable (survives the window), not on raw bytes:
-  // SSH banners / "Connection closed" stderr arrive as PTY data on a still-failing link.
   private armStabilityTimer(generation: number): void {
     this.clearStabilityTimer();
     this.stabilityTimer = setTimeout(() => {
@@ -379,7 +363,6 @@ export class PaneStreamer {
     });
   }
 
-  // tmux first: if it rejects, PTY/headless keep the last known pane size.
   async resize(cols: number, rows: number): Promise<void> {
     if (this.destroyed) throw new Error('PaneStreamer is destroyed');
     await this.tmux.resizeWindow(this.agent.id, cols, rows);
@@ -392,7 +375,6 @@ export class PaneStreamer {
     }
   }
 
-  // PTY stdin keeps bytes in tmux's keybind table; paste-buffer would bypass it.
   async sendInput(data: string): Promise<void> {
     if (this.destroyed) throw new Error('PaneStreamer is destroyed');
     if (data.length === 0) return;
@@ -405,9 +387,6 @@ export class PaneStreamer {
     return this.destroyed;
   }
 
-  // Fire sessionGoneCbs before kill — pty.onExit would otherwise see no subscribers.
-  // silent=true (planned shutdown): the pane signal isn't lost, we're tearing it down on purpose —
-  // skip the sessionGone callbacks so a watcher doesn't write a false signal-session-gone intervention.
   destroy(opts: { silent?: boolean } = {}): void {
     if (this.destroyed) return;
     this.destroyed = true;
@@ -469,8 +448,6 @@ export class PaneStreamer {
         this.scheduleReattach();
       });
     };
-    // Exponential backoff (reset by onPtyData on recovery) so a sustained SSH/tmux outage
-    // settles into infrequent retries instead of a fixed-rate reconnect storm.
     const delay = computeBackoffMs(++this.reattachAttempts, {
       baseMs: this.reattachDelayMs,
       maxMs: this.reattachMaxDelayMs,
@@ -483,8 +460,6 @@ export class PaneStreamer {
     }, delay);
   }
 
-  // One warn per outage, not per retry: repeated reattach failures during an SSH/tmux outage
-  // would otherwise flood logs with identical stack traces. Recovery is logged from onPtyData.
   private noteOutage(err: unknown): void {
     if (this.outageActive) return;
     this.outageActive = true;

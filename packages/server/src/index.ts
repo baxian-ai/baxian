@@ -39,7 +39,6 @@ import { buildApp } from './app.js';
 import { RestartCoordinator } from './lifecycle/restart.js';
 import { consumeRestartSentinel } from './lifecycle/restart-sentinel.js';
 
-// All-miss returns first candidate so caller surfaces ENOENT instead of silently using wrong path.
 export function pickExistingPath(base: string, candidates: readonly string[]): string {
   for (const rel of candidates) {
     const p = resolve(base, rel);
@@ -87,9 +86,6 @@ export function formatServerRunningMessage(host: string, port: number, https: bo
 }
 
 export async function startServer(configPath?: string): Promise<void> {
-  // Zero-config first run: auto-create a minimal user-level config at ~/.baxian/config.json
-  // so `baxian` works straight after `npm install -g baxian`. UI then populates project/agent
-  // via saveConfig writebacks. Explicit -c <path> doesn't auto-create — surface ENOENT instead.
   let cfgPath = await resolveConfigPath(configPath);
   if (!cfgPath) {
     cfgPath = userConfigPath();
@@ -118,12 +114,6 @@ export async function startServer(configPath?: string): Promise<void> {
       console.warn('[shutdown] processLock.release failed', e);
     }
   };
-  // SIGINT/SIGTERM and /api/restart share one graceful path: app.close() runs the onClose chain
-  // (stop pollers → destroy pane streamers/PTYs → converge SSH mux). The process lock is released
-  // LAST — AFTER app.close() — so a supervisor restart can't grab the lock while this process is
-  // still tearing down tmux/ssh sessions. (Fastify runs onClose hooks LIFO, so the lock release
-  // can't live in an onClose hook without racing ahead of the cleanup hook.) Grace-race so a hung
-  // PTY kill can't wedge exit.
   let appRef: Awaited<ReturnType<typeof buildApp>> | null = null;
   let shuttingDown = false;
   const SHUTDOWN_GRACE_MS = 8000;
@@ -175,8 +165,6 @@ export async function startServer(configPath?: string): Promise<void> {
     await registry.scan();
     assertCoreSkillsPresent(registry, skillsDir);
 
-    // Resolve host refs against the LIVE config (hot-reload swaps it). Pointed at agentManager.getConfig
-    // once that exists — using a holder avoids the use-before-declaration cycle (manager needs the streamer).
     let resolveHostRef: (agent: AgentConfig) => HostConfig | undefined = (agent) =>
       (typeof agent.host === 'object' ? agent.host : undefined);
     const paneStreamerManager = new PaneStreamerManager({
@@ -210,7 +198,6 @@ export async function startServer(configPath?: string): Promise<void> {
     await agentManager.recover();
     registerEventHandlers(eventBus, agentManager);
     registerServerEventHandlers(eventBus, agentManager);
-    // Set up signal watchers AFTER handlers register so emits land on live listeners.
     await agentManager.setupRecoveredPostApproveSignals();
     await agentManager.setupRecoveredSpecSignals();
 
@@ -219,11 +206,8 @@ export async function startServer(configPath?: string): Promise<void> {
     agentStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     tmuxSessionStatusStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     taskStore.onChange((kind, id) => eventPublisher.publishTaskChange(kind, id));
-    // Pet assignment changes (set/clear, and delete cascade) re-broadcast affected agent snapshots.
     petStore.onChange((id) => eventPublisher.publishAgentChange('set', id));
 
-    // Notify subscribers when bootstrap touches an agent's error state; agentStore alone misses
-    // failure paths since those don't mutate any binding. Must be wired AFTER publisher exists.
     const onBootstrapAgentAffected = (ids: string[]) => {
       for (const id of ids) eventPublisher.publishAgentChange('set', id);
     };
@@ -244,10 +228,6 @@ export async function startServer(configPath?: string): Promise<void> {
       );
     }
 
-    // Sweep stale bootstrap errors for agents no longer in the auto-bootstrap set. Covers:
-    // (a) agent deleted while server was down; (b) agent transitioned to explicit workdir
-    // mode (id stays, leaves bootstrap); (c) PATCH /config restartRequired window where the
-    // old poller appended a fresh stale record before the operator restarted.
     try {
       const result = await errorRecordStore.sweepStaleBootstrapErrors(autoBootstrapAgentIds(config));
       if (result.removed > 0) {
@@ -291,8 +271,6 @@ export async function startServer(configPath?: string): Promise<void> {
     });
     const seenRepos = new Set<string>();
     for (const project of config.project) {
-      // Non-GitHub repos never produce a pollable PR (forced server mode, no afterDone:'pr');
-      // polling would hammer `gh api` on a non-github URL forever. Skip — mirror replaceConfig.
       if (!isGitHubRepo(project.repo)) continue;
       const repoKey = repoSlug(project.repo).toLowerCase();
       if (seenRepos.has(repoKey)) continue;
@@ -343,10 +321,6 @@ export async function startServer(configPath?: string): Promise<void> {
       },
     );
 
-    // Lock release is NOT an onClose hook: Fastify runs onClose LIFO, so a hook registered here
-    // would fire BEFORE buildApp's cleanup hook (pollers/streamers/SSH mux). Instead the lock is
-    // released after app.close() — by gracefulShutdown (signals) and by RestartCoordinator's
-    // beforeExit (/api/restart) — guaranteeing cleanup completes first.
     appRef = app;
 
     const restartCoordinator = new RestartCoordinator({

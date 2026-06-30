@@ -52,7 +52,6 @@ async function flushMicrotasks(): Promise<void> {
 
 type StartArgs = Parameters<PhaseSignalWatcher['start']>[0];
 
-// start() with the common task/project/agent defaults; callers override per case.
 function startWatch(
   watcher: PhaseSignalWatcher,
   overrides: Partial<StartArgs> & Pick<StartArgs, 'expectedKinds' | 'token'>,
@@ -133,8 +132,6 @@ describe('PhaseSignalWatcher', () => {
       kind: 'pr-approved',
       token,
       source: 'pane-signal',
-      // The review.submitted handler dispatches on data.action — watcher must
-      // map pr-approved → APPROVE so the handler chain reaches the verdict branch.
       action: 'APPROVE',
     });
   });
@@ -249,7 +246,6 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'old1tok234ab' });
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'new1tok234ab' });
-    // Old token now stale; only new token should fire.
     streamer.triggerLive(`${buildPhaseSignal('spec-done', 'old1tok234ab')}\n`);
     expect(captured).toHaveLength(0);
     streamer.triggerLive(`${buildPhaseSignal('spec-done', 'new1tok234ab')}\n`);
@@ -330,7 +326,6 @@ describe('PhaseSignalWatcher', () => {
 });
 
 describe('kind → event type routing', () => {
-  // pr-approved / pr-changes-requested are tested separately (both emit review.submitted).
   const ROUTING: ReadonlyArray<[PhaseSignalKind, EventType]> = [
     ['spec-fixed', 'server.spec.fix.submitted'],
     ['spec-done', 'server.spec.ready'],
@@ -413,7 +408,6 @@ describe('snapshot read-file suppression', () => {
     expect(seen).toEqual([]);
     streamer.triggerLive('[bx:read-file:new/b.ts:5-9]');
     expect(seen).toEqual(['[bx:read-file:new/b.ts:5-9]']);
-    // The snapshot request stays suppressed even if its bytes re-enter the tail.
     streamer.triggerLive('[bx:read-file:old/a.ts:1-10]');
     expect(seen).toEqual(['[bx:read-file:new/b.ts:5-9]']);
   });
@@ -449,8 +443,6 @@ describe('PhaseSignalWatcher.awaitOnce (bootstrap greeting)', () => {
   it('matches a greeting in a large snapshot even when >1KB of text trails it', async () => {
     const { watcher, streamer } = makeWatcher();
     const token = 'snaptok123456';
-    // Signal near the START of the snapshot, then a large trailing redraw — slicing to the 1KB tail
-    // BEFORE scanning would drop the signal; awaitOnce must scan the full snapshot first.
     streamer.setSnapshot(`${buildPhaseSignal('greeting', token)}\n${'x'.repeat(4000)}`);
     const p = watcher.awaitOnce({ agentId: DEV_AGENT.id, kind: 'greeting', token, timeoutMs: 1000 });
     expect(await p).toBe('matched');

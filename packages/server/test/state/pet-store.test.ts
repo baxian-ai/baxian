@@ -86,7 +86,7 @@ describe.each([
     store.onChange((id) => fired.push(id));
 
     const pet = await store.create(petInput('alpha'));
-    expect(fired).toEqual([]); // create does not change any agent's petId
+    expect(fired).toEqual([]);
 
     await store.setAssignment('dev-1', pet.id);
     await store.setAssignment('qa-1', pet.id);
@@ -114,8 +114,6 @@ describe.each([
     expect(publishAgentChange).toHaveBeenCalledWith('set', 'dev-1');
   });
 
-  // Regression: concurrent delete(pet) + setAssignment(agent, samePet) must never leave a
-  // dangling assignment pointing at a deleted pet (TOCTOU between existence check and rm).
   it('never leaves a dangling assignment under concurrent delete/setAssignment', async () => {
     for (let i = 0; i < 40; i++) {
       const pet = await store.create(petInput(`p${i}`));
@@ -125,10 +123,9 @@ describe.each([
       ]);
       const assigned = await store.getAssignment('racer');
       if (assigned !== null) {
-        // If the assignment survived, the pet it points at MUST still exist.
         expect(await store.getMeta(assigned)).not.toBeNull();
       }
-      await store.setAssignment('racer', null); // reset for next round
+      await store.setAssignment('racer', null);
     }
   });
 });

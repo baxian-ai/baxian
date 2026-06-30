@@ -238,7 +238,6 @@ describe('TaskDetailProvider / useTaskDetail', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     expect(screen.getByTestId('edit-modal')).toBeTruthy();
-    // The detail dialog is unmounted while editing — only one focus trap at a time.
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 

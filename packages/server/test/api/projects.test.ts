@@ -13,7 +13,6 @@ let app: FastifyInstance;
 let configPath: string;
 const { post, put, del } = requesters(() => app);
 
-// Standard agent-create bodies; spread + override per case.
 function devAgent(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return { id, runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true, ...extra };
 }
@@ -34,7 +33,6 @@ function now(): string {
   return new Date().toISOString();
 }
 
-// Create a project and append a dev agent — the common DELETE/resume/retry precondition.
 async function projectWithDev(projectId: string, devId: string): Promise<void> {
   await createProject(projectId);
   await addAgent(projectId, devAgent(devId));
@@ -43,12 +41,10 @@ async function projectWithDev(projectId: string, devId: string): Promise<void> {
 type AgentFacts = Parameters<FastifyInstance['ctx']['agentStore']['set']>[0];
 type TaskFacts = Parameters<FastifyInstance['ctx']['taskStore']['set']>[0];
 
-// Seed agent binding facts; projectId + updatedAt default per the agent id / now().
 function seedAgent(id: string, projectId: string, extra: Partial<AgentFacts> = {}): Promise<void> {
   return app.ctx.agentStore.set({ id, projectId, updatedAt: now(), ...extra } as AgentFacts);
 }
 
-// Seed a task; the boilerplate title/description/reviewRound/timestamps default unless overridden.
 function seedTask(id: string, projectId: string, extra: Partial<TaskFacts> = {}): Promise<void> {
   return app.ctx.taskStore.set({
     id, projectId, title: 't', description: 'd', reviewRound: 0,
@@ -94,7 +90,6 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.restoreAllMocks();
   await app.close();
-  // maxRetries guards macOS APFS ENOTEMPTY from background fsync racing rm.
   await rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 });
 
@@ -168,7 +163,6 @@ describe('POST /api/projects', () => {
     expect(body.project.review).toEqual({ mode: 'server' });
   });
 
-  // Rejected create payloads. `proj` already exists in the default context → duplicate 409.
   it.each([
     ['non-github repo falling back to github review → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git' }, 400],
     ['duplicate project id → 409', { id: 'proj', repo: 'a/b' }, 409],
@@ -277,7 +271,6 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(response.statusCode).toBe(400);
   });
 
-  // Bad agent bodies against a fresh empty project → 400 (no extra agents needed in setup).
   it.each([
     ['mode=remote but host missing', 'pr', devAgent('pr-dev', { mode: 'remote' })],
     ['empty body / role missing', 'pe', {}],
@@ -311,8 +304,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
   });
 
   it('purges errorRecordStore entries for deleted agent (so a recreate with same id starts clean)', async () => {
-    // The bootstrap snapshot field is keyed by agentId only — without this purge, deleting
-    // an agent and recreating with the same id would inherit the old incarnation's red card.
     const purgeAgent = vi.fn().mockResolvedValue({ removed: 1 });
     app.ctx.errorRecordStore = { purgeAgent } as never;
     await projectWithDev('purge1', 'purge1-dev');
@@ -392,7 +383,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('awaiting_human agent with creationToken set is DELETable (dialog_pending exit)', async () => {
     await projectWithDev('da-dialog-tok', 'da-dialog-tok-dev');
-    // dialog_pending：markDialogPending 设的 status='awaiting_human' + creationToken 仍持有。
     await seedAgent('da-dialog-tok-dev', 'da-dialog-tok', {
       creationToken: 'tok-pending', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending',
@@ -416,21 +406,18 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
   });
 
   it('concurrent DELETEs on the same awaiting_human agent: second request gets 409 (deletionInFlight claim)', async () => {
-    // Without the claim, two cleanupRemovedAgentRuntime calls race on the same tmux/worktree via the stale-lock takeover path.
     await projectWithDev('da-dup', 'da-dup-dev');
     await seedAgent('da-dup-dev', 'da-dup', {
       paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
     await app.ctx.lockManager.acquire('da-dup-dev');
 
-    // 让 cleanupRemovedAgentRuntime 阻塞，使两个 DELETE phase2 必然重叠
     let resolveCleanup: () => void = () => undefined;
     const cleanupGate = new Promise<void>((resolve) => { resolveCleanup = resolve; });
     const cleanupSpy = vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime')
       .mockImplementation(async () => { await cleanupGate; });
 
     const first = del('/api/projects/da-dup/agents/da-dup-dev');
-    // 让 first 进入 phase2（cleanupRemovedAgentRuntime 等 cleanupGate）
     await new Promise((r) => setTimeout(r, 20));
     const second = await del('/api/projects/da-dup/agents/da-dup-dev');
 
@@ -453,7 +440,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       displayName: 'P', description: '', spritesheet: { bytes: Buffer.from('x'), ext: 'webp' },
     });
 
-    // Block DELETE in phase2 (deletion claim held, config lock free) so PUT runs concurrently.
     let resolveCleanup: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => { resolveCleanup = resolve; });
     vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => { await gate; });
@@ -473,12 +459,10 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     await seedAgent('da-stale-dev', 'da-stale', {
       paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    // 模拟 awaiting_human 状态：前任 op 留下 stale lock 没 release
     await app.ctx.lockManager.acquire('da-stale-dev');
 
     const response = await del('/api/projects/da-stale/agents/da-stale-dev');
     expect(response.statusCode).toBe(200);
-    // phase 3 应已清掉 stale lock
     expect(await app.ctx.lockManager.isLocked('da-stale-dev')).toBe(false);
   });
 
@@ -514,12 +498,10 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('refuses deleting an UNBOUND agent still referenced by an active task (spec max_rounds preferredAgentId)', async () => {
     await projectWithDev('da-mr-ref', 'da-mr-ref-dev');
-    // spec-phase max_rounds: dev released (agentId cleared) but preferredAgentId kept for Retry.
     await seedTask('task-spec-mr-ref', 'da-mr-ref', {
       preferredAgentId: 'da-mr-ref-dev', agentId: '', reviewRound: 5,
       status: 'max_rounds', phase: 'spec', prNumber: 8, branch: 'bx/task-spec-mr-ref',
     });
-    // agent is idle/unbound (no taskId) — the binding-based guard alone would allow deletion.
     await seedAgent('da-mr-ref-dev', 'da-mr-ref', { status: 'idle', paneId: '%0' });
 
     const response = await del('/api/projects/da-mr-ref/agents/da-mr-ref-dev');
@@ -659,9 +641,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
   });
 
   it('resume during DELETE cleanup (deletionInFlight): 409 (no resumeAgent invocation, prevents race with phase2 cleanup)', async () => {
-    // DELETE phase2 runs without withConfigLock; Resume must check deletionInFlight or it dispatches into a tmux/worktree being torn down.
     await seedAgent('dev-1', 'proj', { status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    // 模拟 DELETE phase1 已 claim deletion，phase2 cleanup 中
     app.ctx.agentManager.tryClaimDeletion(['dev-1']);
     const resumeSpy = vi.spyOn(app.ctx.agentManager, 'resumeAgent');
 
@@ -671,7 +651,6 @@ describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
     expect(JSON.parse(response.body).error).toMatch(/being deleted/);
     expect(resumeSpy).not.toHaveBeenCalled();
 
-    // 清理 claim 避免影响后续测试
     app.ctx.agentManager.releaseDeletionClaim(['dev-1']);
   });
 });
@@ -721,8 +700,6 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
   });
 
   it('restart-repl clears awaiting_human Held state on active task (markAgentWaiting allowAwaitingHuman+clearAwaitingHuman)', async () => {
-    // Explicit operator restart invalidates prior ack_unknown / dialog_pending Held; without clearing, Resume also refuses → stuck.
-    // Active task takes the takeover path (dev role + active task).
     await seedTask('task-clear-held', 'proj', {
       preferredAgentId: 'dev-1', agentId: 'dev-1', status: 'review', branch: 'bx/task-clear-held',
     });
@@ -744,7 +721,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     expect(state?.awaitingPhase).toBeUndefined();
     expect(state?.awaitingReason).toBeUndefined();
     expect(state?.awaitingSince).toBeUndefined();
-    expect(state?.taskId).toBe('task-clear-held'); // binding 保留
+    expect(state?.taskId).toBe('task-clear-held');
   });
 
   it('restart-repl clears awaiting_human Held state when no task is bound', async () => {
@@ -878,16 +855,11 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
 
 describe('POST /api/projects/:id/bootstrap', () => {
   it('returns 503 when bootstrapPoller is not initialised', async () => {
-    // Default test context omits bootstrapPoller (it's optional in AppContext); guard against
-    // the route 500-ing in that case — surface a clear "feature not available" instead.
     const response = await post('/api/projects/proj/bootstrap');
     expect(response.statusCode).toBe(503);
   });
 
   it('returns 404 when pollProject reports knownProject=false (e.g. PATCH-then-restart race)', async () => {
-    // Validation source of truth is the poller's view of config, not ctx.config — those can
-    // diverge during a PATCH /config window. Without this, the operator would see a misleading
-    // ok:true ran:0 success for a project the active poller never targets.
     app.ctx.bootstrapPoller = {
       pollProject: vi.fn().mockResolvedValue({ ok: false, ran: 0, knownProject: false }),
       stop: () => {},
@@ -907,8 +879,6 @@ describe('POST /api/projects/:id/bootstrap', () => {
   });
 
   it('surfaces ran=0 (no auto-mode agents) with an explanatory message instead of "failed"', async () => {
-    // Project exists but all its agents have explicit workdir → BootstrapPoller has nothing
-    // to do; success, not failure. Operators shouldn't see a warn toast for this case.
     app.ctx.bootstrapPoller = {
       pollProject: vi.fn().mockResolvedValue({ ok: true, ran: 0, knownProject: true }),
       stop: () => {},

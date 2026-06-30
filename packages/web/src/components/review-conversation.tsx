@@ -68,10 +68,6 @@ function responseSummary(response: ReviewResponse): string {
 }
 
 export function ReviewConversation({ task, onClose }: Props) {
-  // Spec review is server-mediated even in GitHub mode (server.spec.ready runs
-  // with requireServerMode:false), so an SDD GitHub task still has persisted spec
-  // rounds — surface those too, not just mode==='server' tasks. specReviewRound>0
-  // is the proxy for "spec review ran", keeping the fetch off plain GitHub tasks.
   const hasReviewRecords = task.reviewMode === 'server' || (task.specReviewRound ?? 0) > 0;
   if (!hasReviewRecords) return null;
   return <ReviewConversationBody task={task} onClose={onClose} />;

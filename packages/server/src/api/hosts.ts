@@ -21,7 +21,6 @@ const CHECK_TIMEOUT_MS = 5000;
 interface HostBody {
   id?: string;
   hostname?: string;
-  // null = explicit clear (drop the port so ssh honors ~/.ssh/config); undefined = keep current.
   port?: number | null;
   alias?: string;
   user?: string;
@@ -29,12 +28,9 @@ interface HostBody {
 }
 
 export interface HostRoutesOptions {
-  // Tests inject this to avoid spawning real ssh against the host machine.
   localRunnerFactory?: () => CommandRunner;
 }
 
-// SSH reachability, forced through a FRESH authenticated connection (noMux) so a lingering mux
-// can't make a wrong updated password pass — the bad password would then be saved.
 async function checkHostConnectivity(
   host: HostConfig,
   makeLocal: () => CommandRunner,
@@ -71,21 +67,17 @@ function generateHostId(base: string, existing: Set<string>): string {
   return `host-${existing.size + 1}`;
 }
 
-// REDACTED / missing password both mean "keep the stored one" (mirrors server.token handling).
 function resolvePassword(incoming: string | undefined, current: string | undefined): string | undefined {
   if (incoming === REDACTED || incoming === undefined) return current;
   return incoming;
 }
 
-// A missing port (honors ~/.ssh/config's Port) and an explicit 22 are DIFFERENT endpoints — collapsing
-// them with `?? 22` would let a port:22 edit slip past the password-exfiltration / live-agent guards.
 function structuralChange(prev: HostConfig, next: HostConfig): boolean {
   return prev.hostname !== next.hostname
     || (prev.user ?? '') !== (next.user ?? '')
     || prev.port !== next.port;
 }
 
-// Whether two hosts would dial the same SSH connection (so a re-probe is unnecessary).
 function sameConnection(a: HostConfig, b: HostConfig): boolean {
   return a.hostname === b.hostname
     && a.port === b.port
@@ -93,9 +85,6 @@ function sameConnection(a: HostConfig, b: HostConfig): boolean {
     && (a.password ?? '') === (b.password ?? '');
 }
 
-// Agents whose host reference resolves to this id AND that currently occupy the machine: bound to an
-// active task / mid-bootstrap (creationToken) / awaiting_human, or with a live pane / present tmux
-// session. Moving the host's endpoint under them would orphan those sessions.
 async function liveAgentsReferencingHost(app: FastifyInstance, hostId: string): Promise<string[]> {
   const live: string[] = [];
   for (const project of app.ctx.config.project) {
@@ -111,9 +100,6 @@ async function liveAgentsReferencingHost(app: FastifyInstance, hostId: string): 
   return live;
 }
 
-// These routes have no Fastify schema, so raw JSON reaches the handlers untyped: a truthy non-string
-// hostname (e.g. 123) would throw on .trim(), and a string/array port would inject into the ssh command.
-// Validate types here so malformed host-management requests return 400, never a 500.
 function hostBodyError(body: HostBody, hostnameRequired: boolean): string | null {
   if (hostnameRequired || body.hostname !== undefined) {
     if (typeof body.hostname !== 'string' || !body.hostname.trim()) return 'hostname is required';
@@ -130,9 +116,6 @@ function hostBodyError(body: HostBody, hostnameRequired: boolean): string | null
   return null;
 }
 
-// Apply a PATCH body onto a base host: provided fields win, omitted fields inherit base, an explicit
-// empty alias/user/password (or port: null) clears. Re-applied against the FRESH host inside the lock
-// so concurrent edits to other fields aren't clobbered by a stale full-host replacement.
 function applyHostPatch(base: HostConfig, body: HostBody): HostConfig {
   const password = resolvePassword(body.password, base.password);
   const alias = body.alias?.trim() ?? base.alias;
@@ -148,11 +131,6 @@ function applyHostPatch(base: HostConfig, body: HostBody): HostConfig {
   };
 }
 
-// Tear down live web terminal streamers of agents referencing this host so their cached host-derived
-// runner/tmux (attach PTY, resize, session probe) are rebuilt with the new credential on reconnect.
-// NOT silent: a silent destroy would skip onSessionGone, leaving open /api/stream sockets believing
-// they're still subscribed to a now-deleted streamer (input silently dropped). The normal teardown
-// fires session_gone so clients release and reconnect, which rebuilds the streamer with the new host.
 function invalidateStreamersForHost(app: FastifyInstance, hostId: string): void {
   const mgr = app.ctx.paneStreamerManager;
   if (!mgr) return;
@@ -242,9 +220,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       return reply.status(400).send({ error: bodyError });
     }
 
-    // SECURITY: changing the endpoint (hostname/user/port) of a password host requires an explicit
-    // password (a new one, or '' to clear). Otherwise the stored secret — which the caller can't read,
-    // it's redacted — would be sent to the newly supplied SSH target during the probe (exfiltration).
     const endpointChanged = structuralChange(current, applyHostPatch(current, { ...body, password: undefined }));
     if (endpointChanged && current.password !== undefined
       && (body.password === undefined || body.password === REDACTED)) {
@@ -253,7 +228,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       });
     }
 
-    // Probe the host the request describes (submitted fields over the current snapshot).
     const probeHost = applyHostPatch(current, body);
     if (structuralChange(current, probeHost)) {
       const live = await liveAgentsReferencingHost(app, id);
@@ -271,8 +245,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       return reply.status(400).send({ error: conn.message });
     }
 
-    // A request that sets or clears the password invalidates live streamers (below) so they rebuild
-    // with the new credential; '***' / omitted means "keep", so no invalidation.
     const passwordChanged = body.password !== undefined && body.password !== REDACTED;
 
     return withConfigLock(async () => {
@@ -280,11 +252,8 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       if (idx === -1) {
         return reply.status(404).send({ error: `Host "${id}" not found` });
       }
-      // Rebase the patch onto the FRESH host inside the lock so a concurrent edit to other fields
-      // (saved during our connectivity probe) isn't clobbered by a stale full-host replacement.
       const lockedCurrent = app.ctx.config.host[idx];
       const next = applyHostPatch(lockedCurrent, body);
-      // Re-check liveness: an agent may have gone live during the (lock-free) probe.
       if (structuralChange(lockedCurrent, next)) {
         const live = await liveAgentsReferencingHost(app, id);
         if (live.length > 0) {
@@ -295,8 +264,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
           });
         }
       }
-      // If a concurrent edit changed the connection fields, the rebased combination was never probed
-      // (e.g. A's new hostname + B's new password). Never save an unverified host — re-check it here.
       if (!sameConnection(next, probeHost)) {
         const reConn = await checkHostConnectivity(next, makeLocal);
         if (!reConn.ok) {
@@ -307,8 +274,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       hosts[idx] = next;
       try {
         const validated = await persistHosts(app, hosts);
-        // A live web terminal streamer caches its host-derived runner/tmux; tear down referencing
-        // streamers on a credential change so the next reconnect rebuilds with the new password.
         if (passwordChanged) invalidateStreamersForHost(app, id);
         const stored = validated.host.find(h => h.id === id)!;
         return reply.send({ host: redactHosts([stored])[0], restartRequired: false });
@@ -357,10 +322,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
     }
     const stored = body.id ? app.ctx.config.host.find(h => h.id === body.id) : undefined;
     const submitted = buildHostFromBody(body, body.id ?? 'check', undefined);
-    // SECURITY: the stored password may only be reused to probe the SAME endpoint it belongs to.
-    // Reusing it for a caller-chosen hostname/user/port would let an editor who can't read the
-    // redacted secret exfiltrate it to a controlled SSH server. A changed endpoint must carry an
-    // explicit password (else we probe key-auth only).
     const reuseStored = !!stored && !structuralChange(stored, submitted);
     const password = (body.password === undefined || body.password === REDACTED)
       ? (reuseStored ? stored!.password : undefined)

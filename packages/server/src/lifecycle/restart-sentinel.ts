@@ -40,7 +40,6 @@ export function clearRestartSentinelSync(stateDir: string): void {
   try {
     fs.unlinkSync(sentinelPath(stateDir));
   } catch {
-    /* best-effort */
   }
 }
 

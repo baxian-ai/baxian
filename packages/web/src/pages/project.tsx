@@ -13,13 +13,8 @@ import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import type { ProjectConfig, TaskState } from '../shared/index.js';
 
-// Stable empty ref: while tasks are unloaded the panel keys "fresh WS frame" off
-// openTasks identity, so a per-render `?? []` would masquerade as a new frame.
 const NO_TASKS: TaskState[] = [];
 
-// Persist the panel-visible preference so it survives a refresh (a global UI choice,
-// not per-project — the user either wants the task list alongside agents or not).
-// Default-open: only an explicit '0' (the user closed it) hides the panel.
 const TASK_PANEL_OPEN_KEY = 'baxian.taskPanel.open';
 
 function readTaskPanelOpen(): boolean {
@@ -113,7 +108,6 @@ export function Project() {
     try {
       localStorage.setItem(TASK_PANEL_OPEN_KEY, taskPanelOpen ? '1' : '0');
     } catch {
-      /* storage unavailable (private mode) — preference just won't persist */
     }
   }, [taskPanelOpen]);
 
@@ -127,7 +121,6 @@ export function Project() {
     setDeleteError(null);
     try {
       await api.projects.delete(project.id);
-      // Refresh the shared useProjects cache so Dashboard does not render the just-deleted project.
       await refreshProjectsList();
       show({ kind: 'success', title: `项目 ${project.id} 已删除` });
       setDeleteOpen(false);

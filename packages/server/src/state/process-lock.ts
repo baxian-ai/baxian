@@ -19,7 +19,6 @@ export class ProcessLockError extends Error {
   }
 }
 
-/** Single-instance guard. Stale locks require manual cleanup (auto-unlink races). */
 export class ProcessLock {
   private acquired = false;
   private ownerId: string | null = null;
@@ -29,7 +28,6 @@ export class ProcessLock {
     this.path = join(stateDir, fileName);
   }
 
-  /** Returns the lock info on success; throws {@link ProcessLockError} otherwise. */
   async acquire(): Promise<ProcessLockInfo> {
     const ownerId = randomUUID();
     const info: ProcessLockInfo = {
@@ -112,7 +110,6 @@ export class ProcessLock {
     }
   }
 
-  // Best-effort sync release for `process.once('exit', ...)` where async fs is dropped.
   releaseSync(): void {
     if (!this.acquired) return;
     let raw: string;
@@ -139,7 +136,6 @@ export class ProcessLock {
       this.acquired = false;
       this.ownerId = null;
     } catch {
-      // best-effort: process is exiting anyway
     }
   }
 
@@ -190,7 +186,6 @@ function isAlive(pid: number): boolean {
     process.kill(pid, STALE_PROBE_SIGNAL);
     return true;
   } catch (err: unknown) {
-    // EPERM: process exists, owned by another user.
     return (err as NodeJS.ErrnoException)?.code === 'EPERM';
   }
 }

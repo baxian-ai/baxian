@@ -81,7 +81,6 @@ describe('migrateLegacyPollerStateFile', () => {
 
     await migrateLegacyPollerStateFile(tempDir, ['proj-b'], target);
 
-    // Target unchanged; legacy NOT renamed away (so a manual cleanup path stays explicit).
     await expect(readFile(target, 'utf-8')).resolves.toContain('"current":true');
     await expect(readFile(legacy, 'utf-8')).resolves.toContain('"legacy":true');
   });
@@ -95,16 +94,10 @@ describe('migrateLegacyPollerStateFile', () => {
   });
 
   it('picks the first candidate that has a legacy file (shared-repo migration covers all duplicate projects)', async () => {
-    // Operator added project `x` ahead of original `a` between deploys.
-    // The legacy cursor lives under `poller-a.json`; dedupe now picks
-    // `x` as the attribution project, but the migration must still find
-    // and rename the file from `a`.
     const legacyForA = join(stateRoot, 'poller-a.json');
     await writeFile(legacyForA, JSON.stringify({ pullsByHead: { 'bx/old': 'sha-old' } }));
     const target = join(stateRoot, 'poller-shared%2Frepo.json');
 
-    // Candidate list mirrors `config.project` declaration order for that repo:
-    // newly-added `x` first, then `a`.
     await migrateLegacyPollerStateFile(tempDir, ['x', 'a'], target);
 
     await expect(readFile(target, 'utf-8')).resolves.toContain('sha-old');
@@ -112,9 +105,6 @@ describe('migrateLegacyPollerStateFile', () => {
   });
 
   it('first-found-wins: if multiple candidates have legacy files, only the first is migrated; the rest are left for manual cleanup', async () => {
-    // Defensive: in practice only one cursor file should exist at a time
-    // (the original "first match" project for that repo), but the helper
-    // shouldn't merge or shadow secondaries — explicit cleanup path.
     const legacyForX = join(stateRoot, 'poller-x.json');
     const legacyForA = join(stateRoot, 'poller-a.json');
     await writeFile(legacyForX, JSON.stringify({ from: 'x' }));
@@ -125,7 +115,6 @@ describe('migrateLegacyPollerStateFile', () => {
 
     await expect(readFile(target, 'utf-8')).resolves.toContain('"from":"x"');
     await expect(access(legacyForX)).rejects.toMatchObject({ code: 'ENOENT' });
-    // `a`'s legacy file is intentionally untouched — operator decides.
     await expect(readFile(legacyForA, 'utf-8')).resolves.toContain('"from":"a"');
   });
 });
@@ -153,7 +142,6 @@ describe('pickExistingPath', () => {
   });
 
   it('falls back to the first candidate when none exist (caller surfaces ENOENT explicitly)', () => {
-    // Resolver shouldn't silently guess a working alternative — bad path should reach the caller.
     expect(pickExistingPath(base, ['./nope-1', './nope-2'])).toBe(join(base, 'nope-1'));
   });
 

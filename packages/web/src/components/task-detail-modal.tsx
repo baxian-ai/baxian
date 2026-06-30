@@ -49,7 +49,6 @@ export function TaskDetailProvider({ children }: { children: ReactNode }) {
     <TaskDetailContext.Provider value={{ openTask }}>
       {children}
       {taskId !== null && (
-        // key remounts on task switch (e.g. Retry) so the override snapshot resets cleanly.
         <TaskDetailModal key={taskId} taskId={taskId} onClose={close} onOpenTask={setTaskId} />
       )}
     </TaskDetailContext.Provider>
@@ -79,8 +78,6 @@ export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {
   cancelled: 'pill',
 };
 
-// 列表里状态从胶囊压成圆点：颜色沿用 STATUS_BADGE_COLORS 的语义分组（多个状态共享一色），
-// 精确状态靠 hover tooltip 区分。
 const STATUS_DOT_COLORS: Record<TaskStatus, string> = {
   pending: 'bg-og-300',
   in_progress: 'bg-success',
@@ -150,7 +147,6 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
   const [reviewing, setReviewing] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [continuing, setContinuing] = useState(false);
-  // Local override after a PUT takes precedence until the broker push catches up.
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
@@ -213,8 +209,6 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
 
   const handleRetry = async () => {
     if (!task) return;
-    // Stronger gate for merged: retrying a merged task creates a duplicate run
-    // of work that landed on main, almost always a misclick — confirm twice.
     const prompt = task.status === 'merged'
       ? `task ${task.id} 已 merged。Retry 会用同样的标题/描述新建一个 task 从头跑，确定继续？`
       : `Retry task ${task.id}？这会新建一个 task 从头开始，旧 task 保留为历史。`;
@@ -277,7 +271,6 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
   };
 
   if (editOpen && task) {
-    // One modal at a time: swap to the edit form so the two focus traps never overlap.
     return (
       <CreateTaskModal
         mode="edit"
@@ -482,21 +475,14 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
     const isGate = task.status === 'ready' || task.status === 'merge-ready';
     const isServerApprovedGate = task.reviewMode === 'server' && task.status === 'approved';
     const editEnabled = task.status === 'pending';
-    // Server approved = publish gate (running or failed-retryable): Cancel is the
-    // documented escape when the backend refuses a retry as in-flight.
     const cancelEnabled = task.status === 'pending' || task.status === 'in_progress'
       || isMaxRounds || isGate || isServerApprovedGate;
-    // spec-phase max_rounds keeps Retry (its only escape); code-phase uses continue/complete.
     const retryEnabled =
       (RETRYABLE_STATUSES.has(task.status) || isSpecMaxRounds) && !!task.preferredAgentId;
-    // Call review uses the legacy GitHub protocol; server-mode tasks review via
-    // the exchange protocol and spec-phase max_rounds verdicts don't advance the spec loop.
     const reviewEnabled = !!task.prNumber && !isSpecMaxRounds && task.reviewMode !== 'server';
     const isServerMode = task.reviewMode === 'server';
     const completeEnabled = isCodeMaxRounds && (!!task.prNumber || isServerMode);
     const continueEnabled = isCodeMaxRounds && (!!task.prNumber || isServerMode) && !!task.agentId;
-    // Publish dispatch failure parks a server task at 'approved'; the backend
-    // retry entry is markTaskComplete — surface it here.
     const serverPublishRetry = isServerMode && task.status === 'approved';
     const isLegacy = task.preferredAgentId === '';
 
@@ -594,8 +580,6 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
   }
 }
 
-// Lazy review-round digest for the ready gate: rounds + latest verdict +
-// findings count. Renders nothing when the task has no recorded rounds.
 function ReviewSummary({ taskId }: { taskId: string }) {
   const [rounds, setRounds] = useState<ReviewRound[] | null>(null);
   useEffect(() => {

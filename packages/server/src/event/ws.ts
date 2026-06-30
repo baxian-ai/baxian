@@ -18,7 +18,6 @@ import { isTaskOpen } from '../shared/index.js';
 const TOPIC_PATTERN = /^(agents|agent:[A-Za-z0-9_-]+|task:[A-Za-z0-9_-]+|project-tasks:[A-Za-z0-9_-]+|pollers)$/;
 
 export async function eventsWsPlugin(app: FastifyInstance): Promise<void> {
-  // Path /api/realtime — /api/events is the audit-log REST endpoint.
   app.get(
     '/realtime',
     {
@@ -71,11 +70,9 @@ function handleConnection(
     }
 
     if (subs.has(topic)) {
-      // Dup subscribe is silent no-op — re-fetch could race live frames and roll client back.
       return;
     }
 
-    // Buffer publishes arriving during snapshot fetch so they flush AFTER the snapshot.
     let buffer: unknown[] | null = [];
     const unsub = broker.subscribe(topic, (data) => {
       if (buffer !== null) buffer.push(data);
@@ -85,7 +82,6 @@ function handleConnection(
 
     try {
       const snapshot = await fetchSnapshot(app, topic);
-      // Client may have unsubscribed during the await.
       if (!subs.has(topic)) {
         buffer = null;
         return;
@@ -162,7 +158,6 @@ function handleConnection(
       try {
         unsub();
       } catch {
-        // best-effort — connection dead, broker side cleanup best-effort
       }
     }
     subs.clear();

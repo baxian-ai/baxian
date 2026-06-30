@@ -40,7 +40,6 @@ function normalizeKeys(obj: Record<string, unknown>): Record<string, unknown> {
       continue;
     }
 
-    // Explicit singular wins over a previously-mapped plural, regardless of order.
     if (isExplicitSingular && !fromExplicitSingular[singular]) {
       result[singular] = value;
       fromExplicitSingular[singular] = true;

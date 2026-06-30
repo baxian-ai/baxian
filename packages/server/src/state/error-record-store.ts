@@ -63,8 +63,6 @@ export class ErrorRecordStore {
       .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))[0];
   }
 
-  // Batched variant for buildAllAgentSnapshots — one readAll() per snapshot pass instead of
-  // N (agent count) × full-history scan. Returns the most recent bootstrap record per agentId.
   async latestBootstrapByAgent(): Promise<Map<string, ErrorRecord>> {
     const records = await this.readAll();
     const latest = new Map<string, ErrorRecord>();
@@ -78,9 +76,6 @@ export class ErrorRecordStore {
     return latest;
   }
 
-  // Drops every record for an agentId by rewriting each affected jsonl. Called from
-  // agent-delete so an id reused later (delete + recreate) doesn't inherit stale bootstrap
-  // errors from the previous incarnation. Best-effort; partial failures are logged not thrown.
   async purgeAgent(agentId: string): Promise<{ removed: number }> {
     const idMarker = `"agentId":${JSON.stringify(agentId)}`;
     return this.rewriteFiltered({
@@ -89,9 +84,6 @@ export class ErrorRecordStore {
     });
   }
 
-  // Narrower variant: drops only bootstrap-operation records for one agent, called from
-  // runSingleTarget's success path on EVERY tick. Hot path — quickCheck must be cheap and
-  // truly short-circuit (read alone, no parse, no rewrite) in the common no-stale case.
   async purgeBootstrapForAgent(agentId: string): Promise<{ removed: number }> {
     const idMarker = `"agentId":${JSON.stringify(agentId)}`;
     const opMarker = '"operation":"bootstrap"';
@@ -101,14 +93,6 @@ export class ErrorRecordStore {
     });
   }
 
-  // One-shot sweep on startup / config-replace: drop bootstrap-operation records for every
-  // agent NOT currently in the auto-bootstrap set. Covers:
-  //   (a) agent transitioned from auto-mode to explicit workdir (id stays, leaves bootstrap)
-  //   (b) agent deleted while server was down
-  //   (c) PATCH /config saved then restartRequired — old poller appended a fresh stale record
-  //       in the window before restart; sweep on next startup clears it
-  // Done in a single rewriteFiltered pass — one full-history scan per startup rather than
-  // N (stale agents) × full scans.
   async sweepStaleBootstrapErrors(activeAgentIds: Set<string>): Promise<{ removed: number }> {
     return this.rewriteFiltered({
       mayMatch: content => content.includes('"operation":"bootstrap"'),
@@ -117,11 +101,6 @@ export class ErrorRecordStore {
     });
   }
 
-  // Shared rewrite-with-filter helper. shouldDrop returns true for records to remove.
-  // Uses tmp file + atomic rename per jsonl to survive crash/disk-full mid-rewrite
-  // (in-place writeFile would otherwise truncate the file and lose unrelated history).
-  // mayMatch lets callers short-circuit per file BEFORE the parse loop — without it, every
-  // call still parses the whole history even when nothing matches, defeating the rewrite skip.
   private rewriteFiltered(opts: {
     mayMatch: (content: string) => boolean;
     shouldDrop: (record: ErrorRecord) => boolean;
@@ -167,15 +146,10 @@ export class ErrorRecordStore {
         try {
           await writeFile(tmp, kept.length > 0 ? kept.join('\n') + '\n' : '');
           await rename(tmp, path);
-          // Only count records as removed after the atomic rename succeeds. If writeFile or
-          // rename fails the original file is untouched, and callers (bootstrap.ts uses
-          // removed > 0 as a state-change signal) must not be misled into publishing a
-          // "stale error cleared" event for a purge that didn't actually happen.
           removed += fileRemoved;
         } catch (err) {
           console.warn(`[ErrorRecordStore] rewriteFiltered: atomic rewrite failed for ${file}:`, err);
-          // Best-effort tmp cleanup so a partial write doesn't accumulate orphan .tmp files.
-          try { await unlink(tmp); } catch { /* ignore — tmp may not exist if writeFile failed early */ }
+          try { await unlink(tmp); } catch { }
         }
       }
       return { removed };

@@ -53,8 +53,6 @@ function seedAgent(overrides: Partial<AgentBindingFacts> = {}): Promise<void> {
   });
 }
 
-// Make waitForReplPromptReady block until the caller resolves the next queued gate.
-// Each call to compact/clear/dispatch awaits the prompt 3x, so draining gates step-steps it.
 function installGates(): Array<() => void> {
   const gates: Array<() => void> = [];
   waitReadySpy.mockImplementation(() => new Promise<void>(r => { gates.push(r); }));
@@ -65,8 +63,6 @@ function setPollMs(ms: number): void {
   (manager as never as { compactIdlePollMs: number }).compactIdlePollMs = ms;
 }
 
-// Call a private AgentManager method with `manager` as `this` (the method reads
-// this.agentStore etc., so it must not be detached from the instance).
 function callPrivate<T>(name: string, ...args: unknown[]): T {
   return (manager as never as Record<string, (...a: unknown[]) => T>)[name](...args);
 }
@@ -117,8 +113,6 @@ function waitGates(gates: Array<() => void>, n: number): Promise<void> {
   return vi.waitFor(() => expect(gates.length).toBe(n));
 }
 
-// Release every prompt-ready gate as it appears until `p` settles. Resilient to the exact
-// number of waits a flow performs (the post-merge wrap-up is just Esc → /clear, no notification).
 async function drainUntil(gates: Array<() => void>, p: Promise<unknown>): Promise<void> {
   let settled = false;
   const done = p.then(() => { settled = true; }, () => { settled = true; });
@@ -130,8 +124,6 @@ async function drainUntil(gates: Array<() => void>, p: Promise<unknown>): Promis
   await p;
 }
 
-// Drain the 3 prompt-ready gates a single compact/clear awaits, settling the
-// holder promise mid-way (the third gate is opened last, releasing the guard).
 async function drainHolderGates(gates: Array<() => void>, holder: Promise<unknown>): Promise<void> {
   gates[0]();
   await waitGates(gates, 2);
@@ -150,8 +142,6 @@ async function drainHolderAndRelease(
   await expectGuardReleased(id);
 }
 
-// Install the gates, kick off a guard-holding operation (compact by default),
-// and wait until it parks on its first prompt-ready gate.
 async function startGuarded(
   start: () => Promise<unknown> = () => manager.compactAgent('dev-1'),
 ): Promise<{ gates: Array<() => void>; holder: Promise<unknown> }> {
@@ -161,8 +151,6 @@ async function startGuarded(
   return { gates, holder };
 }
 
-// Start an image upload that blocks inside writeFile until releaseWrite() is
-// called, so the upload holds the shared guard for the duration.
 async function startBlockedUpload(id: string): Promise<{ upload: Promise<unknown>; releaseWrite: () => void }> {
   let releaseWrite: () => void = () => {};
   (mockRunner.writeFile as ReturnType<typeof vi.fn>).mockReturnValue(
@@ -239,7 +227,6 @@ describe('compactAgent', () => {
     expect(timeoutMs).toBe(5_000);
 
     const calls = execCalls();
-    // Claude needs a double Ctrl-C to exit, so a single C-c safely clears a leftover composer draft.
     const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/compact'));
     expect(ccIdx).toBeGreaterThanOrEqual(0);
@@ -264,8 +251,6 @@ describe('compactAgent', () => {
     await expect(manager.compactAgent('dev-1')).resolves.toBeUndefined();
   });
 
-  // A session change observed mid-wait (taskId flip, same-task updatedAt bump, or
-  // pane rebuild) must abort with 409 before any C-c / /compact reaches tmux.
   it.each([
     {
       label: 're-dispatched (taskId changes)',
@@ -275,7 +260,6 @@ describe('compactAgent', () => {
     {
       label: 'same-task re-dispatch bumps updatedAt',
       seed: () => seedAgent({ taskId: 'task-1', updatedAt: '2026-06-12T08:00:00.000Z' }),
-      // 同任务 phase 派发：paneId/taskId 均不变，仅 agent state 被重写。
       reseed: () => seedAgent({ taskId: 'task-1', updatedAt: '2026-06-12T08:00:01.000Z' }),
     },
     {
@@ -336,11 +320,8 @@ describe('compactAgent', () => {
 
     const postMerge = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
     await new Promise(r => setTimeout(r, 20));
-    // post-merge is blocked on the shared compact guard → it has NOT created any new prompt-ready wait.
     expect(gates.length).toBe(1);
 
-    // Drain gates until both finish: the manual compact releases the guard, then post-merge runs its
-    // Esc → /clear wrap-up (no notification to inject).
     await drainUntil(gates, postMerge);
     await manual;
 
@@ -517,7 +498,6 @@ describe('compactAgent', () => {
     const run = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
     await waitGates(gates, 1);
 
-    // post-merge holds the shared compact guard → a concurrent manual compact is refused.
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
       status: 409,
       message: expect.stringContaining('already in progress'),
@@ -572,7 +552,6 @@ describe('compactAgent', () => {
     expect(escIdx).toBeGreaterThanOrEqual(0);
     expect(clearIdx).toBeGreaterThanOrEqual(0);
     expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'Escape');
-    // Esc must precede /clear so a still-running turn can't reject the slash command.
     expect(fakeTmux.sendKeysToPane.mock.invocationCallOrder[escIdx])
       .toBeLessThan(fakeTmux.sendKeysLiteral.mock.invocationCallOrder[clearIdx]);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
@@ -602,8 +581,6 @@ describe('compactAgent', () => {
 
     await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
 
-    // sendPostMergeSlashCommand retries /clear once on a rejection toast, then gives up — 2 attempts,
-    // NOT treated as success. Give-up C-c's the composer clean and releases (stuck pane must not strand).
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
     expect(slashCalls).toHaveLength(2);
     expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
@@ -622,7 +599,6 @@ describe('compactAgent', () => {
       paneId: '%9',
       workdir: tempDir,
     });
-    // The post-Esc readiness wait fails (runtime dropped to a shell) → /clear never lands → recover.
     waitReadySpy
       .mockRejectedValueOnce(new Error('waitForReplPromptReady: pane %7 pane_current_command=zsh'))
       .mockRejectedValue(new Error('repl not ready'));
@@ -703,8 +679,6 @@ describe('compactAgent', () => {
     const releaseSpy = stubReleasePostMergeAgent();
     waitReadySpy.mockResolvedValue(undefined);
 
-    // Every keystroke fails (Esc, then the give-up C-c) and the session is still up → the composer
-    // can't be confirmed clear, so the pane must NOT be released for reuse (held for a human instead).
     const fakeTmux = {
       ...fakeCompactionTmux(),
       sendKeysToPane: vi.fn().mockRejectedValue(new Error('keystroke failed')),
@@ -735,8 +709,6 @@ describe('clearAgent', () => {
     expect(enterIdx).toBeGreaterThan(literalIdx);
   });
 
-  // Regression: a single Ctrl-C on an empty Codex composer quits Codex (openai/codex#14708). The
-  // three-dot-menu /clear must interrupt with Escape so a codex runtime survives the clear.
   it('interrupts with Escape and never C-c for a codex agent so Codex is not killed', async () => {
     await seedAgent({ id: 'qa-1', paneId: '%3' });
     waitReadySpy.mockResolvedValue(undefined);

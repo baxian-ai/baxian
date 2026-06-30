@@ -41,7 +41,6 @@ export function AuthGate({ children }: Props) {
 
   useEffect(() => {
     const onUnauthorized = () => {
-      // Ignore the 401 our own probe just dispatched while we're already probing.
       if (stateRef.current.kind === 'probing') return;
       setState({ kind: 'unauthorized', message: '登录已失效，请重新输入令牌' });
     };

@@ -5,7 +5,6 @@ import { api } from '../api.ts';
 
 export interface EventsResult<T> {
   data: T | null;
-  /** Distinguishes "still waiting" from "server said it's gone" — both have data === null. */
   loaded: boolean;
   error: { code: string; message: string } | null;
 }
@@ -89,7 +88,6 @@ export function useProjectTasks(projectId: string | undefined): EventsResult<Tas
     setError(null);
 
     let cancelled = false;
-    // Lets us drop a slow REST fallback when WS reconnects with a fresher frame.
     let wsLanded = false;
     let restAttempted = false;
 
@@ -105,8 +103,6 @@ export function useProjectTasks(projectId: string | undefined): EventsResult<Tas
       (err) => {
         if (cancelled) return;
         setError(err);
-        // Realtime is down — try one REST snapshot so the user sees their tasks
-        // instead of an empty page. Once WS lands, its frame supersedes REST.
         if (wsLanded || restAttempted) return;
         restAttempted = true;
         void api.tasks.list(projectId).then(
@@ -116,7 +112,6 @@ export function useProjectTasks(projectId: string | undefined): EventsResult<Tas
             setLoaded(true);
           },
           (restErr) => {
-            // Both channels down — keep the WS error visible; nothing more to do.
             console.warn(`[useProjectTasks] REST fallback failed for ${projectId}:`, restErr);
           },
         );

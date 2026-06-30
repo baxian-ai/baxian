@@ -75,7 +75,6 @@ function makePoller(runner: CommandRunner): GitHubPoller {
   return new GitHubPoller(opts);
 }
 
-// Silences console.error/console.warn for an entire describe block.
 function suppressConsole(): void {
   let errSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
@@ -164,8 +163,6 @@ describe('GitHubPoller.snapshots()', () => {
     expect(p.snapshots()[0].consecutiveFailures).toBe(3);
   });
 
-  // Each list-PR failure mode (non-zero exit / bad JSON / non-array) counts the cycle
-  // as a single failure and captures a matching lastErrorMessage.
   it.each([
     ['gh exit code != 0', nonZeroExitRunner('gh: not authenticated'), /pollPullRequests failed.*gh: not authenticated/],
     ['stdout JSON parse failure', badJsonRunner('not valid json {'), /JSON parse failed/],
@@ -268,8 +265,6 @@ describe('GitHubPoller.snapshots()', () => {
     const statePath = join(dir, 'cursor.json');
     try {
       const sha = 'a'.repeat(40);
-      // Seed cursor to hit the confirm branch: pullsByHead = legacy non-SHA,
-      // legacyAdoptionPending = current sha.
       await writeFile(statePath, JSON.stringify({
         pullsByHead: { 'bx/task-legacy': '2026-04-30T00:00:00Z' },
         legacyAdoptionPending: { 'bx/task-legacy': sha },
@@ -308,9 +303,6 @@ describe('GitHubPoller.snapshots()', () => {
   });
 
   it('sub-poll failure does not block sibling sub-polls for the same PR or other PRs', async () => {
-    // Two managed PRs; pollReviewsForPr fails for the first PR, comments succeed.
-    // The second PR's sub-polls all succeed. We verify both PRs reached emit by
-    // counting onEvent invocations.
     const prData = managedPrListJson(
       { number: 1, html_url: 'u1', ref: 'bx/a', sha: 'a'.repeat(40) },
       { number: 2, html_url: 'u2', ref: 'bx/b', sha: 'b'.repeat(40) },
@@ -334,11 +326,9 @@ describe('GitHubPoller.snapshots()', () => {
     });
     p.add({ projectId: PROJECT_ID, repo: REPO });
     await p.poll();
-    // The first PR's /reviews failed but its other sub-polls AND the second PR still ran.
     expect(reviewsForPr1Call).toBe(1);
     const created = events.filter(e => e.type === 'pr.created');
-    expect(created).toHaveLength(2); // both managed PRs created
-    // Cycle as a whole is still degraded due to the first PR's review fetch.
+    expect(created).toHaveLength(2);
     expect(p.snapshots()[0].health).toBe('degraded');
   });
 
@@ -349,20 +339,16 @@ describe('GitHubPoller.snapshots()', () => {
     expect(p.snapshots()[0].lastErrorMessage).toBe('rate limited');
     expect(p.snapshots()[0].consecutiveFailures).toBe(1);
 
-    // Swap to a working runner — poller exposes no setter so mutate the
-    // private field via a typed assertion.
     (p as unknown as { runner: CommandRunner }).runner = okRunner();
     await p.poll();
     const snap = p.snapshots()[0];
     expect(snap.health).toBe('healthy');
     expect(snap.consecutiveFailures).toBe(0);
-    // Historical error preserved — UI can show "last failed N min ago".
     expect(snap.lastErrorMessage).toBe('rate limited');
     expect(snap.lastErrorAt).toBeDefined();
   });
 
   it('one failing repo does not contaminate another entry status', async () => {
-    // Custom runner: succeeds for repo-good, throws for repo-bad.
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('repo-bad')) {
@@ -398,7 +384,6 @@ describe('GitHubPoller lifecycle hook', () => {
     const fn = vi.fn();
     p.setLifecycleHook(fn);
     await p.poll();
-    // 2 entries × 2 fires = 4
     expect(fn).toHaveBeenCalledTimes(4);
   });
 

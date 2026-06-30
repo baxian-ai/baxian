@@ -38,7 +38,6 @@ describe('useReviewRounds', () => {
     reviewsMock.mockReturnValueOnce(new Promise<ReviewRound[]>((r) => { resolve2 = r; }));
     rerender({ id: 'task-a', rev: '2' });
 
-    // No reset on revision-only change: old data stays until the refetch resolves.
     expect(result.current.loaded).toBe(true);
     expect(result.current.rounds).toHaveLength(1);
 

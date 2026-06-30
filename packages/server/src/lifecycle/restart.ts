@@ -11,7 +11,6 @@ export interface RestartCoordinatorOptions {
   app: Pick<FastifyInstance, 'close'>;
   configPath: string;
   stateDir: string;
-  /** Runs between app.close() and process.exit(); throws here abort restart. */
   beforeExit?: () => Promise<void>;
 }
 
@@ -60,9 +59,6 @@ export class RestartCoordinator {
       if (this.opts.beforeExit) {
         await this.opts.beforeExit();
       }
-      // Exit only; an external supervisor (systemd Restart=always in prod, or whoever ran
-      // `baxian start` in dev) is responsible for relaunching. Self-spawn would race with
-      // systemd and leave a stale detached process holding the lock.
       process.exit(0);
     } catch (err) {
       console.error(

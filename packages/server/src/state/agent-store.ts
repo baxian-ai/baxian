@@ -24,8 +24,6 @@ export class AgentStore {
     try {
       content = await readFile(this.path(id), 'utf-8');
     } catch (err) {
-      // ENOENT alone is "no binding"; corrupt/permission/IO errors must surface so a live
-      // binding is never misread as absent.
       if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null;
       throw err;
     }
@@ -41,7 +39,6 @@ export class AgentStore {
     this.fire('set', state.id);
   }
 
-  /** Per-agent serialized RMW. Updater returns: binding=write, null=delete, AGENT_STORE_NOOP=skip. Non-reentrant. */
   async update(
     id: string,
     updater: (existing: AgentBindingFacts | null) => AgentStoreUpdateResult,
@@ -57,7 +54,6 @@ export class AgentStore {
       }
       await this.set(result);
     });
-    // map 存 swallow-catch 版本以维持 mutex 链；删除前校验 still-current 防止误删后来者。
     const chain: Promise<unknown> = task.catch(() => undefined).finally(() => {
       if (this.mutex.get(id) === chain) this.mutex.delete(id);
     });
@@ -89,7 +85,6 @@ export class AgentStore {
     try {
       await unlink(this.path(id));
     } catch (err) {
-      // ENOENT is idempotent; other errors mean file still on disk → don't broadcast.
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code !== 'ENOENT') {
         console.error(`[AgentStore] delete ${id} failed; not broadcasting:`, err);

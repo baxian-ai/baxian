@@ -15,18 +15,11 @@ const VALID_MODES: AgentMode[] = ['local', 'remote'];
 const VALID_MERGE: MergeStrategy[] = ['auto', null];
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const REPO_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
-// One non-GitHub path segment: same char class as a GitHub slug segment, so a leading
-// '.' is impossible — rejecting "."/".."/empty/leading-dot/control chars (path traversal).
 const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 
-// GitHub: single "owner/repo" segment (unchanged). Non-GitHub: any-host git URL whose path
-// parses to non-empty, per-segment-safe components (multi-level subgroups allowed).
 function isValidRepo(repo: string): boolean {
   if (isGitHubRepo(repo)) return REPO_SLUG_PATTERN.test(repoSlug(repo));
   const parsed = parseGitRemote(repo);
-  // host is validated too: it becomes a directory component (repos-ext/<host>/…) and flows
-  // into unquoted preflight shell commands, so an unchecked host enables path traversal AND
-  // command injection (e.g. "gitlab.example.com;touch x", "https://../x.git").
   if (!parsed || parsed.path === '' || !isSafeGitHost(parsed.host)) return false;
   return parsed.path.split('/').every(seg => REPO_SEGMENT_PATTERN.test(seg));
 }
@@ -34,8 +27,6 @@ function isValidRepo(repo: string): boolean {
 export function validateConfig(config: BaxianConfig): ValidationError[] {
   const errors: ValidationError[] = [];
 
-  // Empty project list is valid — zero-config startup writes `project: []` and the
-  // web UI populates it. Validator only rejects malformed shapes, not "nothing to do".
   if (!Array.isArray(config.project)) {
     errors.push({ path: 'project', message: 'project must be an array' });
     return errors;
@@ -85,7 +76,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
     'server.tmuxProbeConcurrency',
     errors,
   );
-  // Bounds: 1000ms (CPU/rate-limit floor) to Node's setInterval ceiling (rolls to 1ms above).
   validateOptionalBoundedInteger(
     config.server.bootstrapRetryIntervalMs,
     'server.bootstrapRetryIntervalMs',
@@ -111,7 +101,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
     errors.push({ path: 'review.afterDone', message: "review.afterDone must be 'pr', 'branch', or null" });
   }
   if (config.server.https !== undefined) {
-    // Loader passes the raw value through, so shape-check at runtime.
     const https = config.server.https as unknown;
     if (typeof https !== 'object' || https === null || Array.isArray(https)) {
       errors.push({
@@ -128,7 +117,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
           });
           continue;
         }
-        // process.cwd() varies between systemd / manual launch — force absolute, fail at validate time.
         if (!isAbsolute(value as string)) {
           errors.push({
             path: `server.https.${field}`,
@@ -321,7 +309,6 @@ function validateAgentFields(config: BaxianConfig, errors: ValidationError[]): v
             message: 'agent.yolo must be a boolean if present',
           });
         } else if (agent.yolo === false) {
-          // REPL launch always passes bypass-permission flags — yolo=false would drift from runtime.
           errors.push({
             path: `${path}.yolo`,
             message:
@@ -435,16 +422,13 @@ function validateRemoteHosts(config: BaxianConfig, errors: ValidationError[]): v
           }
           continue;
         }
-        // Anything that isn't a string id or a plain object is malformed — fail cleanly, never deref.
         if (typeof agent.host !== 'object' || Array.isArray(agent.host)) {
           errors.push({ path: `${base}.host`, message: 'agent.host must be a host id (string) or an inline host object' });
           continue;
         }
-        // Legacy inline host object (back-compat). Passwords must live in the registry.
         if (!nonEmptyString(agent.host.hostname)) {
           errors.push({ path: `${base}.host.hostname`, message: 'host.hostname must be a non-empty string' });
         }
-        // port is interpolated into the ssh command — same integer/range guard as registry hosts.
         if (agent.host.port !== undefined
           && (!Number.isInteger(agent.host.port) || agent.host.port <= 0 || agent.host.port > 65535)) {
           errors.push({ path: `${base}.host.port`, message: 'host.port must be a positive integer ≤ 65535' });

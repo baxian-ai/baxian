@@ -13,13 +13,9 @@ describe('buildAttachInteractiveCommand', () => {
     expect(cmd.file).toBe('sh');
     expect(cmd.args[0]).toBe('-c');
     const script = cmd.args[1];
-    // exec hands the pty straight to the attach with the exact-match target.
     expect(script).toContain("exec tmux -u attach-session -t '=dev-1'");
-    // Each option is a separate, error-tolerant command (`;` + `|| true`, never `&&`): a bad value
-    // (e.g. a tmux too old for the `external` choice) cannot skip the attach that follows it.
     expect(script).not.toContain('&&');
     expect(script).toMatch(/set-clipboard external 2>\/dev\/null \|\| true;/);
-    // A read-only attach (-r) would silently drop input.
     expect(script).not.toContain(' -r ');
   });
 
@@ -31,10 +27,8 @@ describe('buildAttachInteractiveCommand', () => {
       mode: 'local',
     } as AgentConfig);
     const script = cmd.args[1];
-    // Server options must already be set when the client attaches (focus reporting; OSC 52 clipboard).
     expect(script.indexOf('focus-events')).toBeLessThan(script.indexOf('attach-session'));
     expect(script.indexOf('set-clipboard')).toBeLessThan(script.indexOf('attach-session'));
-    // external (not on): tmux's own copies set the clipboard; raw OSC 52 from pane apps is ignored.
     expect(script).toContain('set-clipboard external');
   });
 
@@ -46,12 +40,9 @@ describe('buildAttachInteractiveCommand', () => {
       mode: 'remote',
     } as AgentConfig, { hostname: 'hz1', user: 'baxian' });
     expect(cmd.file).toBe('ssh');
-    // `-e none` must be present: web users now write straight into ssh's PTY,
-    // so a line-anchored `~.` would otherwise tear the SSH down.
     const idxE = cmd.args.indexOf('-e');
     expect(idxE).toBeGreaterThanOrEqual(0);
     expect(cmd.args[idxE + 1]).toBe('none');
-    // Sanity: still requests a PTY and points at the right host/agent.
     expect(cmd.args).toContain('-t');
     expect(cmd.args).toContain('baxian@hz1');
     const remoteCmd = cmd.args[cmd.args.length - 1];

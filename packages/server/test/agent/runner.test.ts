@@ -181,7 +181,7 @@ function captureLocal(
       if (execImpl) return execImpl(cmd, options);
       return { stdout: '', stderr: '', exitCode: 0 };
     },
-    writeFile: async () => { /* unused in exec-only specs */ },
+    writeFile: async () => { },
     execWithStdin: async (cmd: string, stdin: Buffer, options?: ExecOptions): Promise<ExecResult> => {
       calls.push({ cmd, options, stdin });
       if (execImpl) return execImpl(cmd, options);
@@ -280,10 +280,7 @@ describe('SshRunner', () => {
 
   it('shell-quotes the ControlPath so a HOME with spaces stays one argv (not word-split into multiple ssh args)', () => {
     const opts = buildSshOptions(undefined);
-    // ControlPath value lives between single quotes — bash strips them, ssh receives the
-    // full path as a single argv even if HOME contained "/Users/Some User/...".
     expect(opts).toMatch(/-o ControlPath='[^']+\/cm-%C'/);
-    // No bare unquoted ControlPath would slip a space-containing path past bash unscathed.
     expect(opts).not.toMatch(/-o ControlPath=[^'][^ ]*\/cm-%C/);
   });
 
@@ -327,7 +324,6 @@ describe('closeSshMux (shutdown convergence)', () => {
     expect(exitCmds.some(c => c.cmd.includes("'other'"))).toBe(true);
     expect(exitCmds[0].cmd).toMatch(/-o ControlPath=\S+\/cm-%C/);
 
-    // Targets are cleared after convergence — a second close is a no-op.
     const { runner: closer2, calls: calls2 } = captureLocal();
     await runnerNs.closeSshMux(closer2);
     expect(calls2).toHaveLength(0);
@@ -404,8 +400,6 @@ describe('SshRunner.writeFile', () => {
     expect(cmd).toContain('openssl base64 -d -A > ');
     expect(cmd).not.toContain('base64 --decode');
     expect(cmd).not.toContain('base64 -d > ');
-    // The heredoc is wrapped in `sh -c` so a fish login shell can't break it (fish has no heredocs);
-    // the path is inner-quoted by that wrap, so assert presence rather than exact outer quoting.
     expect(cmd).toContain('sh -c');
     expect(cmd).toContain('/tmp/baxian/foo.txt');
     expect(cmd).toContain('/tmp/baxian');
@@ -486,8 +480,7 @@ describe('LocalRunner.execWithStdin (bypass ARG_MAX for tmux load-buffer)', () =
 
   it('passes large payloads (>1MB) through stdin without ARG_MAX failures', async () => {
     const local = new LocalRunner();
-    // 1.5MB payload (above macOS / Linux ARG_MAX of ~1MB for argv)
-    const big = Buffer.alloc(1.5 * 1024 * 1024, 65); // 'A' bytes
+    const big = Buffer.alloc(1.5 * 1024 * 1024, 65);
     const result = await local.execWithStdin('wc -c', big);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe(String(big.length));
@@ -495,7 +488,6 @@ describe('LocalRunner.execWithStdin (bypass ARG_MAX for tmux load-buffer)', () =
 
   it('handles arbitrary bytes including null and control characters via stdin', async () => {
     const local = new LocalRunner();
-    // \x00\x01\x02 ... 0xff
     const bytes = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
     const result = await local.execWithStdin('wc -c', bytes);
     expect(result.exitCode).toBe(0);
@@ -511,7 +503,6 @@ describe('SshRunner.execWithStdin (login shell + stdin pipe)', () => {
     await ssh.execWithStdin('tmux load-buffer -b X -', payload);
     expect(calls).toHaveLength(1);
     expect(calls[0].stdin).toEqual(payload);
-    // wrapped via login shell (matches existing exec() behavior)
     expect(calls[0].cmd).toContain('sh -c');
     expect(calls[0].cmd).toContain('tmux load-buffer');
   });
@@ -523,12 +514,9 @@ describe('SshRunner.execRawRemoteWithStdin (raw path, no login shell)', () => {
     const ssh = new SshRunner({ hostname: 'box' }, local);
     await ssh.execRawRemoteWithStdin('tmux load-buffer -b X -', Buffer.from('data'));
     expect(calls).toHaveLength(1);
-    // The local-side ssh command does not contain login-shell wrapping markers
-    // (no `sh -c '...exec "${SHELL...' wrapper inside the ssh args).
     expect(calls[0].cmd).not.toContain('exec "${SHELL');
     expect(calls[0].cmd).not.toContain('-l -c');
     expect(calls[0].cmd).not.toContain('-l -i -c');
-    // But still uses ssh + the raw remote command quoted
     expect(calls[0].cmd).toMatch(/^ssh /);
     expect(calls[0].cmd).toContain("'tmux load-buffer -b X -'");
   });

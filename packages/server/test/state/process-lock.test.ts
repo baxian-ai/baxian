@@ -4,8 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProcessLock, ProcessLockError } from '../../src/state/process-lock.js';
 
-// Probed: pick a high pid that ESRCH's right now. Avoids hard-coding "high"
-// numbers that are wrong relative to platform pid_max (Linux can hit 4M).
 function probeDeadPid(): number {
   for (let pid = 999_999; pid >= 100_000; pid--) {
     try {
@@ -59,20 +57,17 @@ describe('ProcessLock', () => {
 
   it('release on a never-acquired lock is a noop (does not delete other lock files)', async () => {
     const lock = new ProcessLock(stateDir);
-    // pre-create a lock file owned by another (real) process — ours
     await writeLockFile(
       lock.getPath(),
       { pid: process.pid, acquiredAt: new Date().toISOString() },
       { flag: 'wx' },
     );
     await lock.release();
-    // file should still be there because we never acquired this instance
     const raw = await readFile(lock.getPath(), 'utf-8');
     expect(raw).toContain(`"pid":${process.pid}`);
   });
 
   it('rejects when another live baxian process already holds the lock', async () => {
-    // Simulate another live process holding the lock by recording our own pid.
     await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
       { pid: process.pid, acquiredAt: new Date().toISOString() },
@@ -92,7 +87,6 @@ describe('ProcessLock', () => {
     const lock = new ProcessLock(stateDir);
     await expect(lock.acquire()).rejects.toBeInstanceOf(ProcessLockError);
 
-    // Stale file must remain — auto-unlink would race a concurrent reclaim.
     expect((await readLockInfo(lock.getPath())).pid).toBe(DEAD_PID);
   });
 
@@ -129,7 +123,6 @@ describe('ProcessLock', () => {
   });
 
   it('release rejects when ownerId mismatch and preserves the intruder file', async () => {
-    // throw is required so /api/restart aborts before spawning a child that can't acquire.
     const lock = new ProcessLock(stateDir);
     await lock.acquire();
     const intruderInfo = {
@@ -156,8 +149,6 @@ describe('ProcessLock', () => {
   });
 
   it('legacy lock file (no ownerId) with live pid is treated as held (acquire throws)', async () => {
-    // Same scenario but pid is alive — should throw "another server holds the lock"
-    // rather than the stale path.
     await writeLockFile(
       join(stateDir, '.baxian-server.lock'),
       { pid: process.pid, acquiredAt: '2025-12-31T23:59:00.000Z' },
@@ -168,23 +159,16 @@ describe('ProcessLock', () => {
   });
 
   it('release refuses to delete a malformed lock file (cannot prove ownership)', async () => {
-    // After acquire, an external actor / corruption replaces the file with
-    // unparseable content. release must not blindly unlink — owner-scoped
-    // release promises "only delete what is provably ours".
     const lock = new ProcessLock(stateDir);
     await lock.acquire();
     await writeFile(lock.getPath(), 'not-json{garbage');
     await expect(lock.release()).rejects.toBeInstanceOf(ProcessLockError);
-    // File must remain (refused-to-delete branch)
     const raw = await readFile(lock.getPath(), 'utf-8');
     expect(raw).toBe('not-json{garbage');
-    // acquired state is kept so the caller can retry / surface the failure
     expect(lock.isAcquired()).toBe(true);
   });
 
   it('release on an already-deleted lock file clears state and returns', async () => {
-    // External `rm` between acquire and release: missing branch should be
-    // a clean noop, not a throw — the desired end-state is achieved.
     const lock = new ProcessLock(stateDir);
     await lock.acquire();
     await rm(lock.getPath(), { force: true });
@@ -192,8 +176,6 @@ describe('ProcessLock', () => {
     expect(lock.isAcquired()).toBe(false);
   });
 
-  // releaseSync is the only path that runs from `process.once('exit', ...)`
-  // — Node drops queued microtasks at that point, so async release would no-op.
   describe('releaseSync', () => {
     it('deletes the lock file when ownerId matches', async () => {
       const lock = new ProcessLock(stateDir);

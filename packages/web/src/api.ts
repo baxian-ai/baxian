@@ -99,7 +99,6 @@ async function fetchHealth(): Promise<{ status: string; startedAt: string }> {
 }
 
 async function post<T>(path: string, body?: unknown, options?: { signal?: AbortSignal }): Promise<T> {
-  // Fastify rejects empty JSON bodies when Content-Type is set.
   const hasBody = body !== undefined;
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
@@ -170,7 +169,6 @@ export interface AddAgentBody extends AgentConfig {
 
 export interface HostInput {
   hostname: string;
-  // null = explicit clear on edit (drop the port so ssh honors ~/.ssh/config); omit to keep current.
   port?: number | null;
   alias?: string;
   user?: string;
@@ -187,7 +185,6 @@ export function fileToBase64(file: File): Promise<string> {
         reject(new Error('unexpected FileReader result'));
         return;
       }
-      // strip the "data:<mime>;base64," prefix
       const comma = result.indexOf(',');
       resolve(comma >= 0 ? result.slice(comma + 1) : result);
     };
@@ -225,11 +222,6 @@ export const api = {
     },
   },
   tasks: {
-    // Realtime fallback only: the full open working set, mirroring the project-tasks
-    // WS frame. Paged per category and de-duped by id so a WS-down snapshot never
-    // silently drops 待处理. 待处理 pages by ascending id (stable under concurrent
-    // mutation); 正在处理 is bounded by the agent count, so its updatedAt order
-    // effectively fits one page. No cross-project query.
     list: async (projectId: string): Promise<TaskState[]> => {
       const byId = new Map<string, TaskState>();
       for (const category of ['active', 'pending'] as const) {
@@ -243,7 +235,6 @@ export const api = {
       }
       return [...byId.values()];
     },
-    // One paginated page (≤20) of a single category, the unit the panel renders.
     page: (
       projectId: string,
       opts: { category?: 'active' | 'pending' | 'done'; offset?: number } = {},

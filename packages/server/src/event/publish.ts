@@ -10,7 +10,6 @@ import {
 import { DebouncedTask } from '../timing/debounced-task.js';
 
 export interface EventPublisherOptions {
-  // Coalesce 'agents' full-list rebuilds; per-id topics stay per-mutation.
   agentsDebounceMs?: number;
   pollersDebounceMs?: number;
   projectTasksDebounceMs?: number;
@@ -22,7 +21,6 @@ const DEFAULT_PROJECT_TASKS_DEBOUNCE_MS = 50;
 
 const PROJECT_TASKS_PREFIX = 'project-tasks:';
 
-// Serializes per-topic publishes so a slow snapshot read can't overtake a fast one.
 export class EventPublisher {
   private readonly chains = new Map<EventsTopic, Promise<void>>();
   private readonly broker: EventBroker;
@@ -91,7 +89,6 @@ export class EventPublisher {
             this.taskProjects.set(taskId, task.projectId);
             this.scheduleProjectTasksBroadcast(task.projectId);
           } else {
-            // 'set' raced a concurrent delete — file is gone by the time we read it.
             this.scheduleProjectTasksRefreshForVanishedTask(taskId);
           }
         }
@@ -175,10 +172,6 @@ export class EventPublisher {
     });
   }
 
-  // Vanished task = delete OR set that raced a concurrent delete. Cache hit
-  // (set in this session) targets one project; cache miss (cross-restart, or
-  // task created before this server came up) is rare and falls back to every
-  // subscribed project-tasks topic.
   private scheduleProjectTasksRefreshForVanishedTask(taskId: string): void {
     const cached = this.taskProjects.get(taskId);
     if (cached) {
@@ -192,8 +185,6 @@ export class EventPublisher {
   }
 
   private scheduleProjectTasksBroadcast(projectId: string): void {
-    // No subscribers → no DebouncedTask, no timer. Late subscribers see the
-    // current state via the WS plugin's fetchSnapshot at subscribe time.
     const topic: EventsTopic = `${PROJECT_TASKS_PREFIX}${projectId}`;
     if (!this.broker.hasSubscribers(topic)) return;
     let dt = this.projectTasksBroadcasts.get(projectId);

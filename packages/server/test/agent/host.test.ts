@@ -38,14 +38,12 @@ describe('hostGroupKey', () => {
 
   it('keys remote by user@hostname:port so the same machine de-dups', () => {
     expect(hostGroupKey('remote', KEY_HOST)).toBe('remote:agent@box.example.com:2222');
-    // Two different registry ids pointing at the same endpoint collapse to one key.
     const other: HostConfig = { id: 'box-alias', hostname: 'box.example.com', port: 2222, user: 'agent' };
     expect(hostGroupKey('remote', other)).toBe(hostGroupKey('remote', KEY_HOST));
   });
 
   it('keys a no-explicit-port host as :default (distinct from explicit :22, which honors ~/.ssh/config)', () => {
     expect(hostGroupKey('remote', { hostname: 'h', user: 'u' })).toBe('remote:u@h:default');
-    // An explicit 22 is a different key, so the two never share a repo cache / fetch throttle.
     expect(hostGroupKey('remote', { hostname: 'h', user: 'u', port: 22 })).toBe('remote:u@h:22');
   });
 });

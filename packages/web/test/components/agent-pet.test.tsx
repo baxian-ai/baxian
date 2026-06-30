@@ -26,7 +26,7 @@ function setMatchMedia(reduced: boolean): void {
 
 beforeEach(() => {
   sprite.url = 'blob:mock';
-  setMatchMedia(true); // static by default — deterministic frame 0
+  setMatchMedia(true);
 });
 
 describe('petRowForStatus', () => {
@@ -37,7 +37,7 @@ describe('petRowForStatus', () => {
     ['idle', false, 0],
     ['error', false, 5],
     ['unknown', false, 0],
-    ['idle', true, 3], // bootstrapping overrides → waving
+    ['idle', true, 3],
     ['working', true, 3],
   ] as const)('maps %s (bootstrapping=%s) → row %i', (status, boot, row) => {
     expect(petRowForStatus(status as AgentRuntimeStatus, boot)).toBe(row);
@@ -49,9 +49,9 @@ describe('PET_ANIMATION_ROWS (hatch-pet contract)', () => {
     expect(PET_ANIMATION_ROWS).toHaveLength(9);
     const frameCounts = PET_ANIMATION_ROWS.map((r) => r.durations.length);
     expect(frameCounts).toEqual([6, 8, 8, 4, 5, 8, 6, 6, 6]);
-    expect(PET_ANIMATION_ROWS[0].durations).toEqual([280, 110, 110, 140, 140, 320]); // idle
-    expect(PET_ANIMATION_ROWS[3].durations).toEqual([140, 140, 140, 280]); // waving
-    expect(PET_ANIMATION_ROWS[7].durations).toEqual([120, 120, 120, 120, 120, 220]); // running
+    expect(PET_ANIMATION_ROWS[0].durations).toEqual([280, 110, 110, 140, 140, 320]);
+    expect(PET_ANIMATION_ROWS[3].durations).toEqual([140, 140, 140, 280]);
+    expect(PET_ANIMATION_ROWS[7].durations).toEqual([120, 120, 120, 120, 120, 220]);
     PET_ANIMATION_ROWS.forEach((r, i) => expect(r.row).toBe(i));
   });
 });
@@ -60,10 +60,10 @@ describe('AgentPet rendering', () => {
   it('renders a sprite with role=img, the status label, and the right row offset', () => {
     render(<AgentPet petId="p1" status="working" label="Working" />);
     const el = screen.getByRole('img', { name: 'Working' });
-    expect(el.getAttribute('data-pet-row')).toBe('7'); // working → running
+    expect(el.getAttribute('data-pet-row')).toBe('7');
     expect(el.getAttribute('data-pet-col')).toBe('0');
     expect(el.style.backgroundImage).toContain('blob:mock');
-    expect(el.style.backgroundPositionY).toBe('-252px'); // -(row 7 * 36px)
+    expect(el.style.backgroundPositionY).toBe('-252px');
   });
 
   it('scales sprite geometry from an explicit display height', () => {

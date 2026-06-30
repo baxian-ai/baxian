@@ -18,8 +18,6 @@ const FETCH_THROTTLE_MS = 30_000;
 
 export class RepoStore {
   private readonly isGitHub: boolean;
-  // Full git URL (github or generic non-github), or legacy "owner/repo". Trimmed so a
-  // whitespace-padded config value clones/compares consistently (parseGitRemote also trims).
   private readonly repo: string;
 
   constructor(
@@ -52,19 +50,14 @@ export class RepoStore {
   private hostKey(): string {
     if (this.mode === 'local') return 'local';
     if (!this.host) throw new Error('Remote mode requires host config');
-    // Shared with bootstrap grouping: keyed by user@hostname:port so the same hostname/user on
-    // different ports never share a HOME cache / fetch throttle / mutex. "remote:" prefix prevents
-    // an SSH alias named "local" from colliding with local mode.
     return hostGroupKey(this.mode, this.host);
   }
 
   private async resolveAbsPath(): Promise<string> {
     const home = await this.resolveHome();
     if (this.isGitHub) {
-      // GitHub slugs are case-insensitive; case flips must not fork the store.
       return `${home}/.baxian/repos/${repoSlug(this.repo).toLowerCase()}`;
     }
-    // Non-GitHub: sibling root, root-level disjoint from repos/ (zero github collision).
     return `${home}/.baxian/${nonGitHubSubpath(this.repo)}`;
   }
 
@@ -103,18 +96,14 @@ export class RepoStore {
       const mk = await this.runner.exec(`mkdir -p ${shellQuote(parent)}`);
       if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent}: ${mk.stderr}`);
       const clone = this.isGitHub
-        // --no-upstream is a gh flag; do NOT prefix with `--` (that would forward to git clone).
         ? await this.runner.exec(
             `gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(absRepoPath)} --no-upstream`,
           )
-        // Non-GitHub: plain git, the only capability we assume of a generic remote.
         : await this.runner.exec(
             `git clone ${shellQuote(this.repo)} ${shellQuote(absRepoPath)}`,
           );
       if (clone.exitCode !== 0) {
         const cmd = this.isGitHub ? 'gh repo clone' : 'git clone';
-        // redact: a non-github HTTPS remote may carry an embedded token, and git's stderr
-        // echoes the URL — without this the token lands in error records / events / logs.
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
       if (this.isGitHub && parseGitRemote(this.repo) !== null) {
@@ -145,8 +134,6 @@ export class RepoStore {
   private async syncOriginUrl(absRepoPath: string, originUrl: string): Promise<boolean> {
     if (parseGitRemote(this.repo) === null) return false;
     if (!accessMethodDiffers(this.repo, originUrl)) return false;
-    // config --replace-all bypasses set-url's regex matching, which breaks with
-    // multi-URL origins and url.<base>.insteadOf shorthands.
     const result = await this.runner.exec(
       `git -C ${shellQuote(absRepoPath)} config --replace-all remote.origin.url ${shellQuote(this.repo)}`,
     );
@@ -163,10 +150,8 @@ export class RepoStore {
 
   private originMatches(originUrl: string): boolean {
     if (this.isGitHub) {
-      // GitHub treats owner/repo as case-insensitive.
       return normalizeRepoUrl(originUrl)?.toLowerCase() === repoSlug(this.repo).toLowerCase();
     }
-    // Generic remote: host case-insensitive (DNS), path case-sensitive (can differ per repo).
     const want = parseGitRemote(this.repo);
     const got = parseGitRemote(originUrl);
     return want !== null && got !== null && want.host === got.host && want.path === got.path;
@@ -175,7 +160,6 @@ export class RepoStore {
   private async fetchIfStale(cacheKey: string, absRepoPath: string): Promise<void> {
     const last = this.cache.lastFetchAt.get(cacheKey) ?? 0;
     if (Date.now() - last < FETCH_THROTTLE_MS) return;
-    // set-head is best-effort because empty repos have no default branch yet.
     const result = await this.runner.exec(
       `cd ${shellQuote(absRepoPath)} && git fetch --all --prune && (git remote set-head origin --auto || true)`,
     );
@@ -193,14 +177,9 @@ export class RepoStore {
   }
 }
 
-// repos-ext/<host>/<path>: host lowercased with ':'→'_' (port-distinct instances stay distinct
-// dirs); path case preserved (generic remotes can be case-sensitive). validator rejects unsafe
-// path segments at config time; assert again here so a bad value can never escape repos-ext/<host>.
 export function nonGitHubSubpath(repo: string): string {
   const parsed = parseGitRemote(repo);
   if (!parsed) throw new Error(`cannot derive local path for non-GitHub repo "${repo}"`);
-  // host becomes a directory component AND flows into unquoted preflight commands — reject any
-  // host that isn't DNS-safe labels (blocks "..", and shell metacharacters like ;/$/`/space).
   if (!isSafeGitHost(parsed.host)) {
     throw new Error(`refusing unsafe host in repo "${repo}"`);
   }

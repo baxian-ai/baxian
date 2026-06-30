@@ -24,7 +24,6 @@ function readFileText(file: File): Promise<string> {
   });
 }
 
-// Pull pet.json + its spritesheet out of an uploaded Codex Pet directory.
 export async function parsePetPackage(files: File[]): Promise<{ manifest: unknown; spritesheet: File }> {
   const petJsonFile = files.find(
     (f) => baseName(f.name) === 'pet.json' || baseName(f.webkitRelativePath || '') === 'pet.json',
@@ -48,9 +47,6 @@ export async function parsePetPackage(files: File[]): Promise<{ manifest: unknow
   return { manifest, spritesheet };
 }
 
-// Only mount children once scrolled into view, so opening the picker doesn't eagerly download
-// every saved pet's full spritesheet. Falls back to immediate mount where IntersectionObserver
-// is unavailable (e.g. jsdom / very old browsers).
 function LazyVisible({ children, style }: { children: ReactNode; style?: React.CSSProperties }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [visible, setVisible] = useState(typeof IntersectionObserver === 'undefined');
@@ -80,8 +76,6 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
   const { show } = useToast();
   const { pets, loading, refresh } = usePets();
   const [enabled, setEnabled] = useState(!!currentPetId);
-  // Local truth for the active assignment: updated optimistically on select/clear so the toggle
-  // reliably clears even before the realtime snapshot catches up; reconciled to currentPetId.
   const [assignedPetId, setAssignedPetId] = useState<string | null>(currentPetId);
   const [busy, setBusy] = useState(false);
   const dirInputRef = useRef<HTMLInputElement>(null);
@@ -103,8 +97,6 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
 
   const handleToggle = async (next: boolean) => {
     setEnabled(next);
-    // Clear based on local assignedPetId (not the prop) so a select made earlier in this same
-    // session is reliably removed even before its snapshot lands.
     if (!next && assignedPetId) {
       setBusy(true);
       try {

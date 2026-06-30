@@ -20,9 +20,6 @@ function isFileHeader(line: string): boolean {
   );
 }
 
-// Hunk state is load-bearing: inside a hunk a real changed line can start with
-// `---`/`+++` (deleting markdown frontmatter `---` shows as `----`), which must
-// render as del/add — only OUTSIDE a hunk are `--- `/`+++ ` file headers.
 export function parseUnifiedDiff(content: string): DiffLine[] {
   if (!content) return [];
   const out: DiffLine[] = [];

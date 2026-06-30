@@ -41,8 +41,8 @@ describe('usePetSpritesheet', () => {
     });
     await waitFor(() => expect(result.current).toBe('blob:created'));
 
-    rerender({ id: 'switch-B' }); // B's fetch is still pending
-    expect(result.current).toBeNull(); // must NOT keep showing A
+    rerender({ id: 'switch-B' });
+    expect(result.current).toBeNull();
 
     await act(async () => { resolveB?.(new Blob(['b'])); });
     await waitFor(() => expect(result.current).toBe('blob:created'));

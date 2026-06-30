@@ -15,9 +15,6 @@ export interface CreatePetInput {
   spritesheet: { bytes: Buffer; ext: PetSpritesheetExt };
 }
 
-// Persists the shared Pet library (state/pets/<id>/) and per-agent assignments
-// (state/pets/assignments.json). onChange fires for the agents whose petId changed
-// so the EventPublisher can re-broadcast their snapshots (wired in index.ts).
 export class PetStore {
   private readonly listeners = new Set<PetStoreListener>();
   private readonly memLibrary = new Map<string, { meta: PetMeta; bytes: Buffer }>();
@@ -101,9 +98,6 @@ export class PetStore {
 
   async delete(petId: string): Promise<void> {
     if (!SAFE_PET_ID.test(petId)) return;
-    // Library removal happens INSIDE the lock together with the assignment cascade so a
-    // concurrent setAssignment(samePetId) either runs before us (we then clear its entry)
-    // or after us (its in-lock getMeta sees the pet gone and rejects) — never dangling.
     const affected = await this.withLock(async () => {
       const map = await this.readAssignments();
       const ids = Object.keys(map).filter((agentId) => map[agentId] === petId);
@@ -128,8 +122,6 @@ export class PetStore {
   }
 
   async setAssignment(agentId: string, petId: string | null): Promise<void> {
-    // Existence check is INSIDE the lock so it can't pass against a pet that a concurrent
-    // delete() is removing under the same lock (TOCTOU → dangling assignment otherwise).
     await this.withLock(async () => {
       if (petId !== null) {
         const meta = await this.getMeta(petId);
@@ -162,8 +154,6 @@ export class PetStore {
       if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return {};
       throw err;
     }
-    // Only a missing file means "no assignments". Invalid JSON or a non-object payload is
-    // corruption — propagate so a later write can't silently overwrite tampered state.
     const parsed = JSON.parse(content) as unknown;
     if (!isRecord(parsed)) throw new Error(`corrupt ${ASSIGNMENTS_FILE}: expected a JSON object`);
     const out: Record<string, string> = {};

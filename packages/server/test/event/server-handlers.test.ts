@@ -134,8 +134,6 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
       calls.transitionToCodePhase.push([id]);
       return task;
     }),
-    // Mirrors the real arm path: the watcher's resolveAgent is the same
-    // getAgentConfig, so arming an unconfigured agent reports false.
     setupPhaseSignal: vi.fn(async (id: string, agentId: string, kinds: unknown) => {
       calls.setupPhaseSignal.push([id, agentId, kinds]);
       return agentId === DEV.id || agentId === QA.id;
@@ -190,14 +188,9 @@ interface Scenario {
   seed?: SeedRound;
   findings?: ReviewFindings | null;
   response?: ReviewResponse | null;
-  // [event type, signal kind, extra payload?]; the token defaults to the fresh one.
   emit: [string, string, Record<string, unknown>?];
 }
 
-// Declarative driver for the dominant shape: seed task/round, stub the
-// findings/response read, emit one server event. Stubs only when provided
-// (null is meaningful: a missing/crash-replay artifact), so leaving a field
-// out keeps the fixture's default mock.
 async function runScenario(s: Scenario): Promise<Fixture> {
   const fx = makeFixture(s.task, s.config);
   if (s.seed) await putRound(fx.store, s.seed.phase, s.seed.round, s.seed.extra);
@@ -212,7 +205,6 @@ function bigFile(path: string): string {
   return `diff --git a/${path} b/${path}\n${Array.from({ length: 1500 }, (_, i) => `+l${i}`).join('\n')}`;
 }
 
-// Two-file diff where the first file overflows the per-batch budget, forcing a 2-batch split.
 const TWO_BATCH_DIFF = [
   `diff --git a/src/a.ts b/src/a.ts\n${Array.from({ length: 2100 }, () => '+x').join('\n')}`,
   'diff --git a/lib/b.ts b/lib/b.ts\n+y',
@@ -385,14 +377,12 @@ describe('server.code.fix.submitted', () => {
     expect(fx.emitted.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'server-code-response-coverage-gap')).toBe(true);
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
-    // One-shot watcher already consumed — dev's corrected re-emit needs a consumer.
     expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
   });
 
   it('unknown findingId → intervention with unknownFindingIds, response not stored, re-armed', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
-    // Covers the real finding f-1 but invents f99 — must fail closed (would otherwise persist).
     fx.transport.readResponse.mockResolvedValue({
       round: 1,
       responses: [
@@ -675,7 +665,6 @@ describe('afterDone snapshot', () => {
   });
 
   it('publish gate reads the task snapshot, not live config', async () => {
-    // Live config says null, but the task was published under afterDone:'pr'.
     const fx = makeFixture({ status: 'approved', afterDone: 'pr' }, { afterDone: null });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
     expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
@@ -742,7 +731,6 @@ describe('Codex: reviewed-head anchor', () => {
 });
 
 describe('guard exits re-arm the consumed signal', () => {
-  // [name, task, emit type, signal kind, armed agent, holds-on-arm-failure, seed?]
   type ReArmRow = [string, Partial<TaskState>, string, string, string, boolean, SeedRound?];
 
   const reArmCases: ReArmRow[] = [
@@ -774,7 +762,6 @@ describe('guard exits re-arm the consumed signal', () => {
     expect(fx.calls.setupPhaseSignal).toContainEqual(armed);
     if (holds) expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(armed);
     else expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
-    // dispatch-entry guards (code-done / spec-done) must not dispatch a review
     if (type.endsWith('.ready')) expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
@@ -796,10 +783,8 @@ describe('aggregation id disambiguation', () => {
     await putRound(fx.store, 'code', 2, {
       batchFindings: [{
         round: 2, verdict: 'request-changes',
-        // Restated unresolved finding keeps its round-1 namespaced id…
         findings: [
           { id: 'b0-f-1', severity: 'major', message: 'still open' },
-          // …while a NEW batch-0 finding f-1 would prefix to the same b0-f-1.
           { id: 'f-1', severity: 'minor', message: 'new issue' },
         ],
       }],
@@ -887,7 +872,6 @@ describe('Codex: cap at verdict', () => {
     await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    // Snapshot 'pr' wins: dispatches publish instead of landing at ready (null path).
     expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'pr']);
     expect(fx.calls.updateTask).not.toContainEqual(['t1', { afterDone: null }]);
   });
@@ -900,8 +884,6 @@ describe('max_rounds releases agents and clears references', () => {
     findings: [{ id: 'f-1', severity: 'major', message: 'gap', location: 'S1' }],
   };
 
-  // toEqual treats { qaAgentId: undefined } and { agentId: undefined } as equal
-  // (undefined props are ignored) — assert on patch KEYS instead.
   function clearedFields(fx: Fixture): string[] {
     return fx.calls.updateTask
       .filter(c => c[0] === 't1')

@@ -6,7 +6,6 @@ export type ReviewMode = 'github' | 'server';
 export type AfterDone = 'pr' | 'branch' | null;
 
 export interface HostConfig {
-  // Registry entries carry a generated id agents reference; legacy inline hosts omit it.
   id?: string;
   hostname: string;
   port?: number;
@@ -20,7 +19,6 @@ export interface AgentConfig {
   runtime: AgentRuntime;
   role: AgentRole;
   mode: AgentMode;
-  // string = registry host id; object = legacy inline host (back-compat).
   host?: string | HostConfig;
   workdir?: string;
   yolo?: boolean;
@@ -41,22 +39,13 @@ export interface ProjectReviewConfig {
 }
 
 export interface ReviewConfig {
-  /**
-   * Maximum review iterations for this task. Applies to BOTH the code-review
-   * loop (dev↔qa code rounds) AND the spec-review loop (dev↔qa spec rounds);
-   * same numeric cap. If the two ever need to diverge, split this field then.
-   */
   rounds: number;
-  /** 'github' keeps PR-based review; 'server' uses the server-mediated protocol. */
   mode?: ReviewMode;
-  /** Server mode only: what dev publishes after QA approves. Ignored when mode==='github'. */
   afterDone?: AfterDone;
 }
 
 export interface HttpsConfig {
-  /** Absolute path to PEM-encoded private key, readable by the server user. */
   keyFile: string;
-  /** Absolute path to PEM-encoded full-chain certificate. */
   certFile: string;
 }
 
@@ -64,12 +53,7 @@ export interface ServerConfig {
   port: number;
   host: string;
   token?: string;
-  /** When set, server listens with TLS instead of plain HTTP. */
   https?: HttpsConfig;
-  /**
-   * Allowed Host header values. Empty/undefined = accept any (dev default).
-   * Set in production to mitigate Host-header attacks.
-   */
   allowedHosts?: string[];
   githubPollIntervalMs: number;
   tmuxProbePollIntervalMs: number;
@@ -115,8 +99,6 @@ export type TaskStatus =
 
 export type TaskPhase = 'spec' | 'code';
 
-// baxian 自己设的 lifecycle 状态（权威），区别于 AgentRuntimeStatus（探针派生量）。
-// awaiting_human: 自动调度路径无法继续，必须 operator 显式 resumeAgent 才放出。
 export type AgentLifecycleStatus = 'ok' | 'awaiting_human';
 
 export interface AgentBindingFacts {
@@ -126,10 +108,6 @@ export interface AgentBindingFacts {
   worktreePath?: string;
   repoPath?: string;
   startedAt?: string;
-  // Set while a NEW dispatch is mid-bootstrap for this taskId (running-binding written, prompt not yet
-  // ack'd); cleared once injectAndAwaitAck confirms delivery. recover() rolls a develop task back only
-  // when this names it — a legacy binding (older build, no field) is left alone, so its still-running
-  // prompt isn't duplicated or its worktree removed out from under it.
   bootstrappingTaskId?: string;
   updatedAt: string;
   paneId?: string;
@@ -160,7 +138,6 @@ export interface AgentSnapshot {
   latestBootstrapError?: AgentErrorSummary;
   reason?: string;
   message?: string;
-  /** Agent Pet assignment; the web animates this pet in place of the status pill. */
   petId?: string;
 }
 
@@ -185,60 +162,24 @@ export interface TaskState {
   prNumber?: number;
   prUrl?: string;
   branch?: string;
-  /** Server-trusted PR head SHA — anchor for review.submitted staleness checks. */
   latestHeadSha?: string;
-  /**
-   * Immutable head SHA captured at the moment QA was dispatched for review/recheck.
-   * Pane-signal verdicts (no SHA in payload) use this as `reviewedHeadSha` so they
-   * approve only the commit QA actually looked at — protecting against the race
-   * where dev pushes a new head mid-review and `latestHeadSha` shifts under us.
-   * Cleared when the task leaves the review state machine.
-   */
   reviewHeadAnchorSha?: string;
-  /**
-   * Wall-clock time the current QA review/recheck pass was dispatched. A poller
-   * verdict whose GitHub `submitted_at` precedes this belongs to a SUPERSEDED
-   * pass (dev force-pushed mid-review → server re-dispatched a fresh pass) and is
-   * rejected. GitHub attributes a review to the submit-time head, so commit_id
-   * alone can't catch this race — only baxian knows when it dispatched the pass.
-   */
   reviewDispatchedAt?: string;
-  /**
-   * Wall-clock time the current code-fix round was dispatched (REQUEST_CHANGES →
-   * fixing). The pr-fixed verifier uses THIS, not reviewDispatchedAt, as the lower
-   * bound for "did the dev do anything": a QA/human top-level comment left during
-   * the review (after reviewDispatchedAt, before fixing) must NOT count as dev
-   * activity, or a pure no-op would be falsely advanced.
-   */
   fixDispatchedAt?: string;
   reviewRound: number;
-  /** Spec review round, isolated from PR review round. */
   specReviewRound?: number;
-  /** undefined ≡ 'code' for backward compatibility. */
   phase?: TaskPhase;
-  /** Uploaded image filenames staged under ${stateDir}/state/task-images/<id>/. */
   images?: string[];
-  /** Signal token for the current pending pane signal; rotated each dispatch/phase transition. */
   signalToken?: string;
-  /** Review mode snapshotted at task creation; hot config changes do not retarget live tasks. */
   reviewMode?: ReviewMode;
-  /** Server-mode large-diff batching cursor (0-based); undefined when not batching. */
   batchIndex?: number;
   batchTotal?: number;
-  /** Human "continue one round" grants past the review cap (server mode). */
   maxRoundsContinues?: number;
-  /** afterDone snapshotted when the approve verdict routed it; confirm reads THIS, not live config. */
   afterDone?: AfterDone;
-  /**
-   * Set when the publish prompt was DELIVERED (ack'd + watcher armed); cleared on
-   * dispatch failure. Distinguishes a real in-flight publish from a failed,
-   * retryable one across restarts — recovered watchers alone cannot tell.
-   */
   publishDispatchedAt?: string;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
-  /** Computed at snapshot time; true when review has been pending past REVIEW_VERDICT_TIMEOUT_MS. */
   verdictOverdue?: boolean;
 }
 
@@ -278,13 +219,10 @@ export interface ReviewRound {
   phase: TaskPhase;
   content: string;
   contentTruncated?: boolean;
-  /** Full-scope diffstat captured with the diff; batch continuations re-inject it. */
   diffstat?: string;
-  /** Merge-base SHA used when this round's diff was computed (audit only). */
   baseSha?: string;
   findings?: ReviewFindings;
   response?: ReviewResponse;
-  /** Raw per-batch findings before aggregation (large-diff batching). */
   batchFindings?: ReviewFindings[];
   startedAt: string;
   completedAt?: string;

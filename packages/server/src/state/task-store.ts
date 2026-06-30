@@ -15,11 +15,9 @@ const TASK_FIELDS = [
   'reviewMode', 'batchIndex', 'batchTotal', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
 ] as const;
 
-// Legacy task files may have issue fields and missing required fields.
 type LegacyTaskShape = Partial<TaskState> & {
   issueNumber?: number;
   issueUrl?: string;
-  // Pre-refactor: pane phase signal token was named specMarkerToken.
   specMarkerToken?: string;
 };
 
@@ -36,7 +34,6 @@ function sanitizeTask(state: unknown): TaskState {
     out.signalToken = raw.specMarkerToken;
   }
 
-  // Hand-edited JSON can contain null, wrong-typed, or whitespace-only fields.
   if (typeof out.title !== 'string' || out.title.trim() === '') {
     const legacyIssue = raw.issueNumber;
     out.title = legacyIssue
@@ -75,8 +72,6 @@ export class TaskStore {
     try {
       content = await readFile(this.path(id), 'utf-8');
     } catch (err) {
-      // Only "file absent" is a real null. Corrupt/permission/IO errors must surface, not
-      // masquerade as "task missing" — else the state machine wrongly releases a live binding.
       if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null;
       throw err;
     }
@@ -131,7 +126,6 @@ export class TaskStore {
     try {
       await unlink(this.path(id));
     } catch (err) {
-      // ENOENT is idempotent; other errors mean file still on disk → don't broadcast.
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code !== 'ENOENT') {
         console.error(`[TaskStore] delete ${id} failed; not broadcasting:`, err);

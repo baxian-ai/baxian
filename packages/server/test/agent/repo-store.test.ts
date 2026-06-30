@@ -16,8 +16,6 @@ function originStdout(url: string): ExecResult {
   return { stdout: `${url}\n`, stderr: '', exitCode: 0 };
 }
 
-// Handler for an existing checkout whose origin reports the given URL:
-// dir + origin probe pass, sync/fetch commands succeed, everything else fails.
 function existingOrigin(originUrl: string): (cmd: string) => ExecResult {
   return cmd => {
     if (cmd.includes('test -d')) return OK;
@@ -33,7 +31,6 @@ const GH_ORIGIN = 'https://github.com/user/repo.git';
 const fetchCount = (runner: { exec: ExecMock }): number =>
   runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
 
-// Existing GitHub checkout where every non-origin command (incl. fetch) succeeds.
 function existingGitHubOriginAllOk(cmd: string): ExecResult {
   if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
   return OK;
@@ -45,7 +42,7 @@ describe('RepoStore.ensure (clone path)', () => {
 
   it('clones with gh repo clone --no-upstream when neither dir nor .git exists', async () => {
     const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL; // both checks fail = nothing exists
+      if (cmd.includes('test -d')) return FAIL;
       if (cmd.startsWith('mkdir -p ')) return OK;
       if (cmd.includes('gh repo clone')) return OK;
       if (cmd.includes('git fetch')) return OK;
@@ -102,7 +99,7 @@ describe('RepoStore.ensure (clone path)', () => {
 
   it('skips clone when dir + .git both exist and origin matches', async () => {
     const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK; // both exist
+      if (cmd.includes('test -d')) return OK;
       if (cmd.includes('git -C') && cmd.includes('remote get-url origin')) {
         return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
       }
@@ -156,7 +153,7 @@ describe('RepoStore.ensure (clone path)', () => {
   it('throws when dir exists but .git does not (unsafe to overwrite)', async () => {
     const runner = makeRunner(cmd => {
       if (cmd.endsWith(`test -d ${shellQuote(`${homedir()}/.baxian/repos/user/repo/.git`)}`)) return FAIL;
-      if (cmd.includes('test -d')) return OK; // dir exists, .git doesn't
+      if (cmd.includes('test -d')) return OK;
       return FAIL;
     });
     const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
@@ -222,9 +219,6 @@ describe('RepoStore — mutex serialization', () => {
 });
 
 describe('RepoStore — hostKey isolation', () => {
-  // Each case seeds HOME cache keys (so resolveHome never shells out), runs a "first" store then a
-  // "second" store sharing the same $HOME, and asserts the second still fetches — i.e. they don't
-  // collapse into one throttle key.
   type Host = ConstructorParameters<typeof RepoStore>[3];
   it.each<{ name: string; homeKeys: string[]; first: ['local' | 'remote', Host]; second: ['local' | 'remote', Host] }>([
     {
@@ -482,17 +476,13 @@ describe('syncOriginUrl — real git integration', () => {
       const work = join(tmp, 'work');
       const runW = (cmd: string) => execSync(cmd, { cwd: work, encoding: 'utf8', stdio: 'pipe' });
 
-      // multi-URL: add a second fetch URL
       runW('git remote set-url --add origin https://backup.example.com/proj.git');
-      // multi-pushurl: add explicit pushurls
       runW(`git remote set-url --push origin ${join(tmp, 'bare.git')}`);
       runW('git remote set-url --push --add origin https://push-backup.example.com/proj.git');
 
       const newUrl = 'ssh://git@gitlab.example.com/group/proj.git';
-      // config --replace-all replaces ALL fetch URLs with the new one
       runW(`git config --replace-all remote.origin.url '${newUrl}'`);
-      // config --unset-all clears all pushurl entries
-      try { runW('git config --unset-all remote.origin.pushurl'); } catch { /* exit 5 if absent */ }
+      try { runW('git config --unset-all remote.origin.pushurl'); } catch { }
 
       const fetchUrl = runW('git remote get-url origin').trim();
       const pushUrl = runW('git remote get-url --push origin').trim();

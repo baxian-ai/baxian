@@ -65,8 +65,6 @@ function resolveBranch(branch: Branch, cmd: string): ExecResult | Promise<ExecRe
   return typeof branch === 'function' ? branch(cmd) : branch;
 }
 
-// Standard tmux-probe command dispatch. Each branch defaults to a healthy/idle response;
-// override only the branch a test cares about (static ExecResult or a (cmd) => result fn).
 function makeExec(overrides: ExecOverrides = {}): CommandRunner['exec'] {
   const branches = {
     hasSession: overrides.hasSession ?? present,
@@ -89,7 +87,6 @@ function execForSession(result: ExecResult): CommandRunner['exec'] {
   return makeExec({ hasSession: result, capturePane: readyCapture });
 }
 
-// Returns a branch that yields each scripted result on successive calls, clamping at the last.
 function scripted(results: ExecResult[]): (cmd: string) => ExecResult {
   let i = 0;
   return () => results[Math.min(i++, results.length - 1)];
@@ -144,16 +141,11 @@ const FIVE_MIN = 5 * 60 * 1000;
 const SIX_MIN = 6 * 60 * 1000;
 
 type ProbeStep = {
-  // Run before the poll (flip closure state the exec branches read).
   set?: () => void;
-  // Advance the injected clock by this many ms before polling.
   advance?: number;
-  // Assert on the store after this poll resolves.
   then?: (store: TmuxSessionStatusStore) => void;
 };
 
-// Declarative probe driver: builds a poller over a mutable clock, runs `steps` in order
-// (advance clock → pollOnce → per-step assert), then runs the final `expect` on the store.
 async function runProbeScenario(opts: {
   store?: TmuxSessionStatusStore;
   agentId?: string;
@@ -166,9 +158,8 @@ async function runProbeScenario(opts: {
   agents?: AgentConfig[];
   config?: BaxianConfig;
   steps: ProbeStep[];
-  // Final assertions on the probed agent's observation (any subset may be combined):
-  expectMatch?: Record<string, unknown>; // store.get(agentId) toMatchObject
-  expectClear?: boolean;                  // runtimeStatusHint AND reason are both undefined
+  expectMatch?: Record<string, unknown>;
+  expectClear?: boolean;
   expect?: (store: TmuxSessionStatusStore) => void;
 }): Promise<TmuxSessionStatusStore> {
   const store = opts.store ?? new TmuxSessionStatusStore();
@@ -446,12 +437,10 @@ describe('TmuxProbePoller', () => {
     });
 
     it('flags STUCK_BUSY when a live spinner stays frozen for the grace window', async () => {
-      // A spinner whose elapsed-seconds NEVER advance across polls = a frozen runtime.
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({ capturePane: text('· Wrangling… (42s · esc to interrupt)') }),
         steps: [
-          // First poll: busy but baseline just established → still 'working'.
           { then: (s) => expect(s.get('dev-1').runtimeStatusHint).toBe('working') },
           { advance: SIX_MIN },
         ],
@@ -484,14 +473,11 @@ describe('TmuxProbePoller', () => {
     });
 
     it('a quoted/leftover spinner above an idle prompt is classified as PENDING_IDLE', async () => {
-      // A spinner-shaped line lingers near the top; the active region at the bottom is an idle ready prompt.
       const quotedSpinnerIdle: ExecResult = text(['· Wrangling… (24s)', ...Array(12).fill(''), '❯ '].join('\n'));
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({ capturePane: quotedSpinnerIdle }),
         steps: [{}, { advance: SIX_MIN }],
-        // Spinner is only in scrollback (not the active region) and the bottom is an idle prompt → the
-        // long-static screen must surface as PENDING_IDLE, not 'working'.
         expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
       });
     });
@@ -503,7 +489,6 @@ describe('TmuxProbePoller', () => {
         exec: makeExec({ capturePane: () => text(`· Working… (${secs} s · esc to interrupt)`) }),
         steps: [
           {},
-          // spinner elapsed-seconds advance → screen changes every poll
           ...Array.from({ length: 6 }, () => ({ set: () => { secs += 90; }, advance: 90 * 1000 })),
         ],
         expect: (store) => {
@@ -514,7 +499,6 @@ describe('TmuxProbePoller', () => {
     });
 
     it('stale esc-to-interrupt above a ready prompt is NOT busy → static screen → PENDING_IDLE, not STUCK_BUSY', async () => {
-      // 'esc to interrupt' lingers high in the viewport; the bottom 8 lines are an idle ready prompt.
       const staleAnchor: ExecResult = text('esc to interrupt\n\n\n\n\n\n\n\n\n❯ ');
       await runProbeScenario({
         binding: { taskId: 'task-001' },
@@ -840,7 +824,6 @@ describe('TmuxProbePoller', () => {
     const store = new TmuxSessionStatusStore();
     const oldInstance = makeAgent('dev-1');
     const newInstance = makeAgent('dev-1');
-    // Sanity: prepareConfig produces fresh AgentConfig per pass; this test relies on that invariant.
     expect(oldInstance).not.toBe(newInstance);
 
     let releaseHasSession!: () => void;

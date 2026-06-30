@@ -29,9 +29,9 @@ function createFakePty(): MinimalPty {
   return {
     onData() { return { dispose: () => undefined }; },
     onExit() { return { dispose: () => undefined }; },
-    resize() { /* noop */ },
-    write() { /* noop */ },
-    kill() { /* noop */ },
+    resize() { },
+    write() { },
+    kill() { },
   };
 }
 
@@ -74,12 +74,10 @@ function waitForOpenOrError(ws: WebSocket): Promise<{ kind: 'open' } | { kind: '
   return new Promise((resolve) => {
     ws.on('open', () => resolve({ kind: 'open' }));
     ws.on('unexpected-response', (_req, res) => resolve({ kind: 'error', status: res.statusCode }));
-    ws.on('error', () => { /* unexpected-response fires first for HTTP errors */ });
+    ws.on('error', () => { });
   });
 }
 
-// Messages can arrive back-to-back; queue them up so consumers can pull
-// sequentially without race conditions vs. `ws.once('message', ...)`.
 function attachMessageReader(ws: WebSocket): {
   next: (timeoutMs?: number) => Promise<StreamServerMsg>;
 } {
@@ -274,8 +272,8 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
     const reader = attachMessageReader(ws);
     await waitOpen(ws);
     send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
-    await reader.next();  // snapshot
-    await reader.next();  // subscribed (now active)
+    await reader.next();
+    await reader.next();
     send(ws, { op: 'input', subscriberId: 'sub-1', data: 'hi' });
     const m = await reader.next();
     expect(m.type).toBe('error');
@@ -303,8 +301,8 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
     const reader = attachMessageReader(ws);
     await waitOpen(ws);
     send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
-    await reader.next();  // snapshot
-    await reader.next();  // subscribed
+    await reader.next();
+    await reader.next();
     send(ws, { op: 'resize', subscriberId: 'sub-1', cols: -1, rows: 10 });
     const m = await reader.next();
     expect(m.type).toBe('error');
@@ -315,14 +313,13 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
   it('enqueueInput rejection surfaces input_failed to subscriber', async () => {
     const { app, port: p, ctx } = await startApp({ withPaneStreamerManager: true });
     runningApp = app;
-    // Override enqueueInput to reject with a known error
     ctx.paneStreamerManager!.enqueueInput = vi.fn().mockRejectedValue(new Error('load-buffer boom'));
     const ws = openWs(p);
     const reader = attachMessageReader(ws);
     await waitOpen(ws);
     send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
-    await reader.next();  // snapshot
-    await reader.next();  // subscribed
+    await reader.next();
+    await reader.next();
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       send(ws, { op: 'input', subscriberId: 'sub-1', data: 'hello' });
@@ -385,14 +382,10 @@ describe('streamWsPlugin /api/stream — transport error handling', () => {
     runningApp = app;
     const ws = openWs(p);
     await waitOpen(ws);
-    // Bypass ws library framing and write bytes that aren't a valid WS
-    // continuation — server-side ws will emit 'error' on the socket.
     const inner = (ws as unknown as { _socket: { write: (b: Buffer) => boolean } })._socket;
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       inner.write(Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
-      // If error handler missing, server crashes here (Node uncaughtException).
-      // Give it a tick to process, then verify a fresh connection still opens.
       await new Promise((r) => setTimeout(r, 100));
       const ws2 = openWs(p);
       const r = await waitForOpenOrError(ws2);

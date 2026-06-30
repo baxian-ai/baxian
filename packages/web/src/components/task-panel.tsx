@@ -5,8 +5,6 @@ import { TASK_ACTIVE_STATUS_SET, REVIEW_VERDICT_TIMEOUT_MS, TASK_LIST_PAGE_SIZE,
 
 interface TaskPanelProps {
   projectId: string;
-  // Live open working set (active + pending) from the project-tasks WS frame; the
-  // panel reuses it so 状态 / Round N update without a manual refresh.
   openTasks: TaskState[];
   className?: string;
 }
@@ -32,8 +30,6 @@ function byUpdatedDesc(a: TaskState, b: TaskState): number {
   return nb - na;
 }
 
-// Client-paginated live section: status / round track the WS frame in real time,
-// while only TASK_LIST_PAGE_SIZE rows render until the user asks for more.
 function useLiveSection(all: TaskState[], projectId: string) {
   const [visible, setVisible] = useState(TASK_LIST_PAGE_SIZE);
   useEffect(() => setVisible(TASK_LIST_PAGE_SIZE), [projectId]);
@@ -52,8 +48,6 @@ interface DoneState {
   load: (mode: 'first' | 'more') => void;
 }
 
-// 已处理 are terminal (status no longer changes) and accumulate without bound, so
-// they stay on the server-paged REST path, fetched only when the user expands them.
 function useDoneSection(projectId: string): DoneState {
   const [items, setItems] = useState<TaskState[]>([]);
   const [hasMore, setHasMore] = useState(false);

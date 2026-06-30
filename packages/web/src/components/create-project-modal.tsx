@@ -12,8 +12,6 @@ interface Props {
 }
 
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
-// Mirrors server-side parseGitRemote (shared/git-url.ts): any-host https/ssh/scp git URL,
-// plus legacy bare "owner/repo". The server validator is authoritative; this is a fast pre-check.
 const REPO_URL_PATTERNS = [
   /^https?:\/\/[^/\s]+\/[^\s]+$/,
   /^ssh:\/\/[^/\s]+\/[^\s]+$/,

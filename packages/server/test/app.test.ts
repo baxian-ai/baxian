@@ -80,8 +80,6 @@ describe('buildApp', () => {
   });
 
   it('onClose destroys all pane streamers (PTY teardown) and does NOT release the process lock', async () => {
-    // The lock release is intentionally NOT an onClose hook: Fastify runs onClose LIFO, so a lock
-    // hook would fire before this cleanup. index.ts releases the lock AFTER app.close() instead.
     const ctx = await createTestContext(tempDir);
     const destroyAll = vi.fn(async () => undefined);
     ctx.paneStreamerManager = { destroyAll } as never;

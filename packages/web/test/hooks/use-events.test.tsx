@@ -74,7 +74,6 @@ describe('useTask', () => {
     const { useTask } = await import('../../src/hooks/use-events.ts');
     const { result } = renderHook(() => useTask('t-missing'));
 
-    // First render: never received anything.
     expect(result.current.loaded).toBe(false);
     expect(result.current.data).toBe(null);
 
@@ -86,9 +85,6 @@ describe('useTask', () => {
       ws.push({ type: 'data', topic: 'task:t-missing', data: null });
     });
 
-    // Server replied with `null` snapshot — task is gone. loaded=true says
-    // "we heard from the server"; the page can now switch from spinner to
-    // not-found UI.
     expect(result.current.loaded).toBe(true);
     expect(result.current.data).toBe(null);
   });
@@ -164,8 +160,6 @@ describe('useProjectTasks', () => {
     const { result } = renderHook(() => useProjectTasks('proj-1'));
 
     const ws = MockWebSocket.lastInstance!;
-    // Simulate WS connect failure: socket closes before opening, mirroring proxy
-    // / auth rejection. EventsClient.onclose treats !opened as broadcastable error.
     act(() => { ws.onclose?.(); });
 
     expect(result.current.error).toEqual({
@@ -178,7 +172,6 @@ describe('useProjectTasks', () => {
       expect(result.current.data?.map(t => t.id)).toEqual(['t1', 't2']);
       expect(result.current.loaded).toBe(true);
     });
-    // WS error stays visible so the user knows realtime updates won't arrive.
     expect(result.current.error?.code).toBe('connection_failed');
   });
 
@@ -225,7 +218,6 @@ describe('useProjectTasks', () => {
       act(() => { ws1.onclose?.(); });
       expect(apiTasksList).toHaveBeenCalled();
 
-      // Auto-reconnect fires a fresh socket via the configured backoff.
       await act(async () => { await vi.advanceTimersByTimeAsync(600); });
       const ws2 = MockWebSocket.lastInstance!;
       expect(ws2).not.toBe(ws1);
@@ -239,7 +231,6 @@ describe('useProjectTasks', () => {
       });
       expect(result.current.data?.map(t => t.id)).toEqual(['t-fresh']);
 
-      // Stale REST resolves AFTER WS already delivered — must not overwrite.
       await act(async () => {
         resolveRest([{ id: 't-stale', status: 'pending' }]);
         await Promise.resolve();

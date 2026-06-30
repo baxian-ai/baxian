@@ -37,7 +37,6 @@ function presentObs(overrides: Partial<TmuxSessionObservation> = {}): TmuxSessio
 
 const reviewQaTask = (): TaskState => ({ ...task('review'), qaAgentId: 'qa-1' });
 
-// Unreachable probe still inside the grace window (20s after last present sighting).
 const withinGraceUnreachable: TmuxSessionObservation = {
   tmuxSessionStatus: 'unreachable',
   observedAt: '2026-05-14T05:00:20.000Z',
@@ -334,10 +333,6 @@ describe('agentSnapshot', () => {
   });
 
   it('shows latestBootstrapError even when binding.repoPath exists (later failure after first success)', () => {
-    // binding.repoPath was set by a previous successful bootstrap; later the
-    // remote was rotated and bootstrap regressed. The new error MUST surface — don't gate on
-    // a stale "has succeeded once" signal. (Stale error clearing on success is handled by
-    // purgeBootstrapForAgent in the success path, not by snapshot-time suppression.)
     const snapshot = agentSnapshot(
       { id: 'dev-1', projectId: 'proj' },
       binding({ repoPath: '/local/repo' }),
@@ -354,10 +349,6 @@ describe('agentSnapshot', () => {
   });
 
   it('shows latestBootstrapError for never-dispatched config-only agents (no binding at all)', () => {
-    // Auto-mode agents that have never been task-dispatched have NO AgentStore binding. The
-    // old binding.repoPath gate would never trigger for them → red card stuck forever. After
-    // the fix, snapshot uses purge-on-success as the truth source and just renders whatever
-    // bootstrap error record exists.
     const snapshot = agentSnapshot(
       { id: 'dev-1', projectId: 'proj' },
       undefined,

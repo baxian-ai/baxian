@@ -102,11 +102,6 @@ describe('server dispatch guards (spec unification)', () => {
 
 describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s pre-inject hook', () => {
   it('defers the spec-reviewed read-file watcher arm into startSession (not eagerly before the session exists)', async () => {
-    // Regression: arming the watcher BEFORE startSession attaches PaneStreamer to a QA tmux session
-    // that does not exist yet on a cold first dispatch → handleAttachExit sees hasSession=false →
-    // onSessionGone deletes the just-armed entry, and the first server-spec-review loses its
-    // read-file/verdict watcher. The arm must ride startSession's pre-inject hook (pane created by
-    // ensureSession), so the dispatcher hands over armBeforeInject instead of arming directly.
     const f = await makeFixture('github');
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
@@ -132,9 +127,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
       .catch(() => undefined);
 
     expect(startSpy).toHaveBeenCalled();
-    // The QA pane may not exist before startSession runs ensureSession, so the arm must be deferred.
     expect(armedBeforeStart).toBe(false);
-    // The dispatcher hands startSession a pre-inject hook that arms the spec-reviewed read-file watcher.
     expect(capturedOpts?.armBeforeInject).toBeTypeOf('function');
     await capturedOpts!.armBeforeInject!();
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
@@ -147,8 +140,6 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
 
 describe('dispatchServerReviewToQa rollback restores originalPhase', () => {
   it('first spec dispatch failure rolls task back to pre-spec shape', async () => {
-    // Default mock (exitCode:0 everywhere) drives: has-session alive → adoptOrRestartSession
-    // → getOption empty → claim mismatch → EnsureSessionError → rollback AFTER phase:'spec' was written.
     const f = await makeFixture('github');
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({

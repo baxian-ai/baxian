@@ -22,7 +22,6 @@ const SKILL_NAMES = [
   'baxian-pr-review',
   'baxian-pr-feedback',
   'baxian-pr-recheck',
-  // Required whenever a prompt carries a signalToken — the dispatch preview now does.
   'baxian-signals',
 ];
 
@@ -64,7 +63,6 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
   const mockRunner = {
     exec: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
     writeFile: vi.fn().mockResolvedValue(undefined),
-    // Plan A3: CommandRunner.execWithStdin added; mock returns success by default.
     execWithStdin: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
   };
 

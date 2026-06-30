@@ -37,9 +37,6 @@ async function startApp(opts: { configToken?: string } = {}): Promise<{
   }
   const broker = new EventBroker();
   ctx.eventBroker = broker;
-  // Wire store mutations to the broker like index.ts does in production. Use
-  // 0 debounce so tests don't have to advance fake timers for the 'agents'
-  // burst-coalesce window.
   const snapshotCtx = {
     agentManager: ctx.agentManager,
     agentStore: ctx.agentStore,
@@ -68,7 +65,7 @@ function waitOpen(ws: WebSocket): Promise<{ kind: 'open' } | { kind: 'error'; st
   return new Promise((resolve) => {
     ws.on('open', () => resolve({ kind: 'open' }));
     ws.on('unexpected-response', (_req, res) => resolve({ kind: 'error', status: res.statusCode }));
-    ws.on('error', () => { /* covered above */ });
+    ws.on('error', () => { });
   });
 }
 
@@ -113,7 +110,6 @@ describe('events ws plugin (/api/realtime)', () => {
       expect(Array.isArray(initial.data)).toBe(true);
     }
 
-    // Triggering an agent state mutation should fire a 'data' update on 'agents'.
     await ctx.agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
@@ -186,7 +182,6 @@ describe('events ws plugin (/api/realtime)', () => {
     expect(initialDataFrames).toBe(1);
     expect(subscribeSpy).toHaveBeenCalledTimes(1);
 
-    // Re-subscribe on the same socket must be a no-op (avoid snapshot/live race).
     ws.send(JSON.stringify({ op: 'subscribe', topic: 'agents' }));
     ws.send(JSON.stringify({ op: 'ping' }));
     await waitForPredicate(() => frames.some((f) => f.type === 'pong'));
@@ -210,8 +205,6 @@ describe('events ws plugin (/api/realtime)', () => {
   it('live publish during snapshot fetch is buffered and flushed AFTER snapshot in order', async () => {
     const { port, ctx, broker } = await startApp();
 
-    // Make taskStore.get for t1 stall so we can trigger a broker.publish in
-    // the gap between broker.subscribe (registers callback) and snapshot send.
     let resolveFetch: ((task: { id: string; v: number } | null) => void) | null = null;
     const stalled = new Promise<{ id: string; v: number } | null>((r) => {
       resolveFetch = r;
@@ -228,20 +221,14 @@ describe('events ws plugin (/api/realtime)', () => {
     ws.on('message', (raw) => frames.push(JSON.parse(String(raw)) as EventsServerMsg));
 
     ws.send(JSON.stringify({ op: 'subscribe', topic: 'task:t1' }));
-    // Give the server a tick to register the broker subscriber.
     await new Promise((r) => setTimeout(r, 30));
 
-    // Simulate a mutation racing the snapshot fetch — publishes the NEW value.
     broker.publish('task:t1', { id: 't1', v: 2 });
 
-    // Now resolve the snapshot fetch with the OLD value.
     resolveFetch!({ id: 't1', v: 1 });
     await new Promise((r) => setTimeout(r, 50));
 
     const dataFrames = frames.filter((f) => f.type === 'data') as Array<{ type: 'data'; data: { v: number } | null }>;
-    // Must be: snapshot (v=1) FIRST, then buffered live update (v=2). Without
-    // the buffer fix, order would be live (v=2) then snapshot (v=1) → client
-    // cache ends up with stale v=1.
     expect(dataFrames.map((f) => f.data?.v)).toEqual([1, 2]);
     ws.close();
   });
@@ -421,7 +408,6 @@ describe('events ws plugin (/api/realtime)', () => {
     await nextMsg(ws);
     expect(broker.hasSubscribers('agents')).toBe(true);
     ws.close();
-    // Give Fastify a tick to handle the close event.
     await new Promise((r) => setTimeout(r, 50));
     expect(broker.hasSubscribers('agents')).toBe(false);
   });

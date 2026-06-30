@@ -14,7 +14,7 @@ import { ErrorRecordStore } from '../../src/state/error-record-store.js';
 
 const NOW = '2026-04-28T10:00:00Z';
 const devAgent: AgentConfig = {
-  id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', // no workdir → auto mode
+  id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local',
 };
 const config: BaxianConfig = {
   github: {} as never, review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
@@ -65,9 +65,6 @@ afterEach(async () => { await rm(tempDir, { recursive: true }); });
 describe('BootstrapPoller', () => {
   it('start/stop schedules and halts periodic ticks', async () => {
     vi.useFakeTimers();
-    // Strip fs latency from agentStore.update so PeriodicTaskRunner's running
-    // flag has cleared before the next setInterval tick fires; otherwise the
-    // 60_000ms advance can race with a still-in-flight first tick.
     vi.spyOn(agentStore, 'update').mockResolvedValue(undefined);
     const ensure = vi.fn().mockResolvedValue('/repo/path');
     const poller = makePoller({ ensure });
@@ -180,8 +177,6 @@ describe('BootstrapPoller', () => {
     });
 
     it('returns knownProject=true + ran=0 + ok=true for project with no auto-mode agents (success no-op)', async () => {
-      // All agents have explicit workdir → collectTargets returns 0 targets for this project.
-      // This is a legitimate success, not a failure — operator shouldn't see a warn toast.
       const cfgOnlyManual: BaxianConfig = {
         ...cfgTwoProjects,
         project: [{
@@ -202,8 +197,6 @@ describe('BootstrapPoller', () => {
     });
 
     it('bypasses suppressFailureMessage dedup so the same error re-emits on retry', async () => {
-      // Operator clicked Retry expecting a fresh signal. The automatic poll path dedupes by
-      // last-seen message; manual retry should NOT inherit that suppression.
       const ensure = vi.fn().mockRejectedValue(new Error('access denied'));
       const poller = makePoller({ config: cfgTwoProjects, ensure });
       await poller.pollOnce();

@@ -25,7 +25,6 @@ interface Case {
   expect: Expectation;
 }
 
-// The canonical "herdr wants to run this bash command" permission block, reused across cases.
 const BASH_PERMISSION_PROMPT = [
   '  herdr wants to run this bash command:',
   '    rm -rf /tmp/test',

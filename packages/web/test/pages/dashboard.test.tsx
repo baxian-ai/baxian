@@ -56,7 +56,6 @@ const projectTasksHookState = {
 vi.mock('../../src/hooks/use-events.ts', () => ({
   useAgents: () => agentsHookState,
   useProjectTasks: () => projectTasksHookState,
-  // 真实 task-detail-modal（经 importOriginal 透传）顶层导入 useTask，mock 需保持完整。
   useTask: () => ({ data: null, loaded: true, error: null }),
 }));
 

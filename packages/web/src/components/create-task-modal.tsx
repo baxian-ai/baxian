@@ -64,7 +64,6 @@ function saveDraft(key: string, draft: CreateTaskDraft): void {
     if (empty) localStorage.removeItem(key);
     else localStorage.setItem(key, JSON.stringify({ ...draft, updatedAt: Date.now() }));
   } catch {
-    // quota / disabled
   }
 }
 
@@ -72,7 +71,6 @@ function clearDraft(key: string): void {
   try {
     localStorage.removeItem(key);
   } catch {
-    // disabled
   }
 }
 
@@ -91,7 +89,7 @@ function loadDraftForContext(projectIdProp: string | undefined): CreateTaskDraft
       return global;
     }
   }
-  try { localStorage.removeItem(globalKey); } catch { /* disabled */ }
+  try { localStorage.removeItem(globalKey); } catch { }
   return useGlobal ? global : own;
 }
 
@@ -116,18 +114,14 @@ export function CreateTaskModal(props: Props) {
   const [preferredAgentId, setPreferredAgentId] = useState<string>(initialPreferred);
   const [title, setTitle] = useState(initialTitle);
   const [description, setDescription] = useState(initialDescription);
-  // Entry B: create-only image attachments; never persisted to the localStorage draft.
   const [images, setImages] = useState<File[]>([]);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draftRestored, setDraftRestored] = useState(false);
   const sessionRef = useRef(0);
-  // save effect's first fire after restore still closes over stale state; skip + prime
   const hydrationSessionRef = useRef(0);
   const lastSavedSessionRef = useRef(0);
-  // 已结算 Dev 默认值的 project：自动默认过，或草稿已恢复用户的显式选择。
-  // 据此跳过回填，避免覆盖用户/草稿里的「暂不指定」（含切走再切回同一 project）。
   const devDefaultSettledRef = useRef<Set<string>>(new Set());
 
   const draftKeyValue = isEdit ? null : draftKey(projectIdProp);
@@ -204,7 +198,6 @@ export function CreateTaskModal(props: Props) {
   useEffect(() => {
     if (isEdit) return;
     if (project === null) return;
-    // 空串 = '暂不指定'，是合法选项；只有当选了一个已经不存在的 dev 才回退到 ''。
     if (preferredAgentId !== '' && !visibleDevs.find(d => d.id === preferredAgentId)) {
       setPreferredAgentId('');
     }
@@ -302,7 +295,7 @@ export function CreateTaskModal(props: Props) {
 
   const handleAddImages = (e: ChangeEvent<HTMLInputElement>) => {
     const picked = Array.from(e.target.files ?? []);
-    e.target.value = ''; // let the same file be re-picked
+    e.target.value = '';
     if (picked.length === 0) return;
     const sized = picked.filter((f) => {
       if (f.size > IMAGE_UPLOAD_MAX_BYTES) {

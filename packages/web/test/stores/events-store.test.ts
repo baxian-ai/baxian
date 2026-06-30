@@ -61,8 +61,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Some tests (C1) flip to real timers mid-body to flush microtasks; reset
-  // explicitly so the next test's beforeEach lands on a clean fake-timer state.
   vi.useRealTimers();
 });
 
@@ -159,16 +157,10 @@ describe('EventsClient', () => {
 
     const late = vi.fn();
     client.subscribe('agents', late);
-    // Before the microtask runs, a fresh ws message updates the cache. The
-    // pre-fix bug captured 'OLD' synchronously and would still deliver it,
-    // overwriting the live 'NEW' the same handler already saw.
     ws.push({ type: 'data', topic: 'agents', data: [{ id: 'NEW' }] });
 
     vi.useRealTimers();
     await new Promise((r) => setTimeout(r, 0));
-    // late was called once via live dispatch (NEW), and once via the
-    // microtask. After the fix, the microtask reads the latest cache, so the
-    // microtask delivery is also NEW — never an OLD overwrite.
     const args = late.mock.calls.map((c) => (c[0] as Array<{ id: string }>)[0].id);
     expect(args).not.toContain('OLD');
     expect(args).toContain('NEW');
@@ -181,7 +173,6 @@ describe('EventsClient', () => {
     client.subscribe('agents', vi.fn(), errAgents);
     client.subscribe('task:t1', vi.fn(), errTask);
     const ws = lastWs();
-    // close-without-open: simulates 401/403/network-down on initial handshake.
     ws.closeFromServer();
     expect(errAgents).toHaveBeenCalledWith(expect.objectContaining({ code: 'connection_failed' }));
     expect(errTask).toHaveBeenCalledWith(expect.objectContaining({ code: 'connection_failed' }));
@@ -201,15 +192,11 @@ describe('EventsClient', () => {
     const { client, lastWs } = makeClient();
     const handlerAgents = vi.fn();
     const handlerTask = vi.fn();
-    // 'task:t1' keeps topics non-empty across the unsubscribe — otherwise
-    // teardownSocket would clear outbox and the bug wouldn't trigger.
     client.subscribe('task:t1', handlerTask);
     const unsubAgents = client.subscribe('agents', handlerAgents);
     const ws1 = lastWs();
     ws1.open();
     ws1.closeFromServer();
-    // CONNECTING window: drop 'agents' then re-subscribe to it. Outbox now
-    // contains [unsub agents, sub agents]; topics map ends with 'agents' active.
     unsubAgents();
     client.subscribe('agents', handlerAgents);
     vi.advanceTimersByTime(500);
@@ -218,14 +205,10 @@ describe('EventsClient', () => {
     ws2.open();
 
     const sentOps = ws2.sentParsed();
-    // Reconnect's onopen loop re-issues subscribe for every active topic.
-    // After the fix, the stale unsubscribe is dropped — server keeps the
-    // sub, client keeps receiving updates.
     expect(sentOps.filter((m) => m.op === 'unsubscribe')).toHaveLength(0);
     const subs = sentOps.filter((m) => m.op === 'subscribe' && m.topic === 'agents');
     expect(subs).toHaveLength(1);
 
-    // Verify the live path actually delivers post-reconnect.
     ws2.push({ type: 'data', topic: 'agents', data: [{ id: 'dev-1' }] });
     expect(handlerAgents).toHaveBeenCalledWith([{ id: 'dev-1' }]);
   });
@@ -244,8 +227,6 @@ describe('EventsClient', () => {
     expect(ws2.sentParsed()).toEqual([{ op: 'subscribe', topic: 'agents' }]);
 
     unsub();
-    // No more subs: socket teardown wins, reconnect timers should not produce
-    // a new ws even after every backoff slot has elapsed.
     vi.advanceTimersByTime(60_000);
     const after = MockWebSocket.instances.length;
     vi.advanceTimersByTime(60_000);

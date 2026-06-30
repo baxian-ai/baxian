@@ -1,8 +1,5 @@
 import { randomUUID } from 'node:crypto';
 
-// Server-side scanner/builder for baxian's agent→server signals, which ride in
-// the agent's pane text. Wire format and the full signalling protocol — the
-// single source of truth — live in skills/baxian-signals/SKILL.md.
 
 export type PhaseSignalKind =
   | 'spec-fixed'
@@ -17,7 +14,6 @@ export type PhaseSignalKind =
   | 'code-reviewed'
   | 'code-fixed'
   | 'code-ready'
-  // Agent-level capability handshake at bootstrap, not a task transition.
   | 'greeting';
 
 export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
@@ -36,9 +32,6 @@ export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
   'greeting',
 ] as const;
 
-// Discriminated union: kinds carry exactly the fields the protocol defines.
-// `pr-created` is the only kind with a payload (PR number) because that's the
-// moment a new PR artifact first enters server's view.
 export type PhaseSignal =
   | { kind: 'spec-fixed'; token: string }
   | { kind: 'pr-created'; token: string; prNumber: number }
@@ -59,8 +52,6 @@ const VALID_KINDS = new Set<PhaseSignalKind>(PHASE_SIGNAL_KINDS);
 const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const OSC_PATTERN = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;
 
-// Token range: 6-64 chars of base64url+dash.
-// `pr-created` extracts the PR number (1+ digits) before the token segment.
 const TOKEN_RANGE = '[A-Za-z0-9_-]{6,64}';
 const COMPACT_SIGNAL_RE_PR_CREATED = new RegExp(
   `\\[bx:(pr-created):(\\d+):(${TOKEN_RANGE})\\]`,
@@ -70,7 +61,6 @@ const COMPACT_SIGNAL_RE_PLAIN = new RegExp(
   `\\[bx:(spec-fixed|pr-approved|pr-changes-requested|pr-fixed|pr-merge-ready|spec-done|spec-reviewed|code-done|code-reviewed|code-fixed|greeting):(${TOKEN_RANGE})\\]`,
   'g',
 );
-// code-ready's PR-number segment is optional: afterDone:'pr' emits 3-segment, 'branch' 2-segment.
 const COMPACT_SIGNAL_RE_CODE_READY = new RegExp(
   `\\[bx:(code-ready)(?::(\\d+))?:(${TOKEN_RANGE})\\]`,
   'g',
@@ -80,8 +70,6 @@ export function stripSignalAnsi(text: string): string {
   return text.replace(OSC_PATTERN, '').replace(ANSI_PATTERN, '');
 }
 
-// Builder overloads enforce that pr-created MUST receive a prNumber, code-ready
-// MAY (afterDone:'pr'), and other kinds MUST NOT.
 export function buildPhaseSignal(
   kind: Exclude<PhaseSignalKind, 'pr-created' | 'code-ready'>,
   token: string,
@@ -113,29 +101,15 @@ export function buildPhaseSignal(
   return `[bx:${kind}:${token}]`;
 }
 
-// 12 hex chars = 48 bits, plenty against guess/collision for per-signal tokens
-// (only one is active per task+kind at a time, and rotate-on-dispatch makes
-// stale tokens unusable).
 export function createSignalToken(): string {
   return randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
-// Template embeds placeholders — `<token>` for the token, `<pr_number>` for
-// pr-created's PR number — so the prompt itself does NOT contain a fireable
-// signal. The agent must actively substitute placeholders when it decides to
-// emit. The placeholders use angle brackets specifically because the strict
-// scanner regexes (`\d+` for prNumber, `[A-Za-z0-9_-]+` for token) cannot
-// match them, so a verbatim echo of the template is harmless.
 export function buildPhaseSignalTemplate(kind: PhaseSignalKind): string {
   if (kind === 'pr-created') return '[bx:pr-created:<pr_number>:<token>]';
   return `[bx:${kind}:<token>]`;
 }
 
-// Scan a chunk of pane bytes for phase signals. Strips ANSI escapes, then
-// strips whitespace so TUI soft-wrap inside the signal still matches.
-// Returns signals in text-order: when develop dispatches a multi-kind watcher
-// (e.g. {spec-done, pr-created}), "first match wins" must mean first by position
-// in the stream, not first by which regex pass we happened to run.
 export function scanPhaseSignals(text: string): PhaseSignal[] {
   const stripped = stripSignalAnsi(text);
   const compact = stripped.replace(/\s+/g, '');
@@ -155,7 +129,7 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
   }
   for (const m of compact.matchAll(COMPACT_SIGNAL_RE_PLAIN)) {
     const kind = m[1] as PhaseSignalKind;
-    if (kind === 'pr-created') continue; // handled above
+    if (kind === 'pr-created') continue;
     if (!VALID_KINDS.has(kind)) continue;
     found.push({ index: m.index ?? 0, signal: { kind, token: m[2] } as PhaseSignal });
   }
@@ -163,8 +137,6 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
   return found.map(f => f.signal);
 }
 
-// QA → server context request during server-mode review (spec §8). Path safety
-// validation lives in ReviewTransport — the scanner only parses the wire shape.
 export interface ReadFileSignal {
   file: string;
   startLine: number;

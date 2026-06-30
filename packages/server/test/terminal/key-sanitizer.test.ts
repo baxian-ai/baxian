@@ -17,9 +17,6 @@ describe('sanitizeWebInput', () => {
   });
 
   it('strips a prefix even when the follow-up key arrives in a separate message', () => {
-    // term.onData fires once per physical keystroke: `Ctrl+B` and `d` are two
-    // independent WS messages. Both must be sanitized in isolation; the
-    // hidden client sees neither half of the would-be combo.
     expect(sanitizeWebInput(PFX)).toBe('');
     expect(sanitizeWebInput('d')).toBe('d');
   });

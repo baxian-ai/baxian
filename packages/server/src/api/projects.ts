@@ -61,9 +61,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     if (!app.ctx.bootstrapPoller) {
       return reply.status(503).send({ error: 'bootstrap poller not initialised' });
     }
-    // Use the poller's view of config (not app.ctx.config) as the source of truth — PATCH /config
-    // updates ctx.config but only DELETE /agents currently hot-replaces the poller, so during the
-    // PATCH-then-restart window ctx.config can list projects the poller doesn't know yet.
     const result = await app.ctx.bootstrapPoller.pollProject(request.params.id);
     if (!result.knownProject) {
       return reply.status(404).send({
@@ -71,7 +68,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       });
     }
     if (result.ran === 0) {
-      // Project exists but has no auto-mode agents (all have explicit workdir) → success no-op.
       return reply.send({ ok: true, ran: 0, message: 'no bootstrap targets for this project' });
     }
     return reply.send({ ok: result.ok, ran: result.ran });
@@ -194,7 +190,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // Config commit precedes bootstrap; failures emit events instead of rolling back config.
   app.post<{
     Params: { projectId: string };
     Body: AgentConfig & { pairWith?: string };
@@ -346,9 +341,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         for (const id of targets) {
           const state = await app.ctx.agentStore.get(id);
           const task = state?.taskId ? await app.ctx.taskStore.get(state.taskId) : null;
-          // active task 始终拒——即使 awaiting_human 也不行，否则会留 orphan task 指向已删 agent。
-          // operator 必须先 cancelTask 让 task 进 cancelled，再 DELETE。
-          // active 含 max_rounds：其 dev 是 reserved 态（持锁+worktree），删它同样会留 orphan。
           if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
             return reply.status(409).send({
               error:
@@ -356,7 +348,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
                 `(prevents orphan task / tmux session / lock / worktree).`,
             });
           }
-          // awaiting_human + 无活跃 task = 合法回收出口。
           if (state?.status === 'awaiting_human') continue;
           if (state?.creationToken) {
             return reply.status(409).send({
@@ -366,11 +357,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           }
         }
 
-        // An active task can reference a target it no longer has BOUND — e.g. a spec-phase
-        // max_rounds task whose dev/QA were released (agentId/qaAgentId cleared) but whose
-        // preferredAgentId is kept for Retry. The binding-based checks above miss that; deleting
-        // the agent would dangle the reference and break Retry. Refuse if any active task names a
-        // target via preferredAgentId / agentId / qaAgentId.
         const targetSet = new Set(targets);
         const referencing = (await app.ctx.taskStore.list({})).find(t =>
           TASK_ACTIVE_STATUS_SET.has(t.status)
@@ -386,8 +372,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           });
         }
 
-        // claim deletion 占位：挡住第二个 DELETE 在 awaiting_human stale-lock takeover 路径下
-        // 撞同一 agent → 否则 phase2 (cleanupRemovedAgentRuntime) 会并发 kill 同一 tmux/worktree。
         const conflict = app.ctx.agentManager.tryClaimDeletion(targets);
         if (conflict) {
           return reply.status(409).send({
@@ -399,9 +383,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         for (const id of targets) {
           const ok = await app.ctx.lockManager.acquire(id);
           if (!ok) {
-            // awaiting_human 状态下 lock 是前任 op 留下的 stale lock（markAwaitingHuman 不释放
-            // lock），DELETE 是显式回收入口，直接接管——不计入 acquiredLocks，cleanupRemovedAgentRuntime
-            // 会一并删除 stale lock 文件。deletionInFlight claim 已挡住并发 DELETE。
             const state = await app.ctx.agentStore.get(id);
             if (state?.status === 'awaiting_human') continue;
             for (const got of acquiredLocks) {
@@ -495,9 +476,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
             app.log.warn({ err: delErr, agentId: id },
               'DELETE /agents Phase 3 agentStore.delete failed');
           }
-          // Clear stale error records so reusing the same agent id (delete + recreate) doesn't
-          // inherit the previous incarnation's bootstrap failures in the new snapshot.
-          // Best-effort; failure is logged but doesn't block deletion.
           if (app.ctx.errorRecordStore) {
             try {
               await app.ctx.errorRecordStore.purgeAgent(id);
@@ -506,8 +484,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
                 'DELETE /agents errorRecordStore.purgeAgent failed');
             }
           }
-          // Same reason as the error-record purge: drop the pet assignment so reusing the
-          // agent id (delete + recreate) doesn't inherit the previous incarnation's pet.
           if (app.ctx.petStore) {
             try {
               await app.ctx.petStore.setAssignment(id, null);
@@ -537,12 +513,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (!cfg || cfg.projectId !== projectId) {
         return reply.status(404).send({ error: `Agent "${agentId}" not found in project "${projectId}"` });
       }
-      // withConfigLock 与 DELETE / create-agent 同一把锁串行化——避免 operator 同时
-      // 发起 DELETE 和 Resume 时，Resume 把 state 改回 ok，而 DELETE 的
-      // cleanupRemovedAgentRuntime 还在杀 tmux/删 worktree。
       return withConfigLock(async () => {
-        // DELETE phase2 (cleanupRemovedAgentRuntime) 在 phase1 释放 withConfigLock 后无锁运行；
-        // 期间 Resume 拿到 withConfigLock 仍可能撞——deletionInFlight claim 跨 phase 持有，拒绝 Resume。
         if (app.ctx.agentManager.isDeletionInFlight(agentId)) {
           return reply.status(409).send({
             error: `Agent "${agentId}" is being deleted; Resume not allowed.`,
@@ -644,7 +615,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           updatedAt: now,
         });
       } catch (err) {
-        // dialogPending check must precede createdSession-kill (kill strips dismiss handle).
         if (await app.ctx.agentManager.handleDialogPendingFromRuntime(agentId, err)) {
           if (!owner.takeover) await app.ctx.lockManager.release(agentId);
           return reply.status(202).send({
@@ -679,7 +649,6 @@ interface LockOwner {
   takeover: boolean;
 }
 
-/** dev keeps its lock across the fix loop — restart/retry must reuse it. */
 async function resolveLockOwnership(
   app: FastifyInstance,
   agentId: string,
@@ -690,14 +659,12 @@ async function resolveLockOwnership(
   if (!state?.taskId) return { takeover: false };
   const task = await app.ctx.taskStore.get(state.taskId);
   if (!task) return { takeover: false };
-  // max_rounds 含在内：reserved dev 持锁，restart/retry 应保留锁（takeover），勿误 release。
   if (!TASK_ACTIVE_STATUS_SET.has(task.status)) return { takeover: false };
   const locked = await app.ctx.lockManager.isLocked(agentId);
   if (!locked) return { takeover: false };
   return { takeover: true };
 }
 
-/** Returns null when the agent is open for ops. */
 async function rejectIfOpInProgress(
   app: FastifyInstance,
   agentId: string,
@@ -709,7 +676,6 @@ async function rejectIfOpInProgress(
   return null;
 }
 
-/** Terminal task → idle release; active task → mark waiting (keeps lock). */
 async function pendingCleanupAfterReplReady(
   app: FastifyInstance,
   agentId: string,
@@ -718,8 +684,6 @@ async function pendingCleanupAfterReplReady(
   const state = await app.ctx.agentStore.get(agentId);
   const taskId = state?.taskId;
   if (!taskId) {
-    // A greeting_failed hold must re-prove signal capability, not be silently cleared:
-    // re-run the handshake on the restarted REPL; only a pass clears the hold.
     if (state?.awaitingPhase === 'greeting_failed') {
       await app.ctx.agentManager.regreetHeldAgent(agentId);
     } else {
@@ -729,10 +693,6 @@ async function pendingCleanupAfterReplReady(
     return;
   }
   const task = await app.ctx.taskStore.get(taskId);
-  // restart-repl / retry 是显式 operator 操作，已确认 REPL 重启；前面的 ack_unknown/dev-wait-gate-failed/
-  // dialog_pending Held 状态都因新 REPL 而不再成立 → 用 allowAwaitingHuman + clearAwaitingHuman 清掉。
-  // 否则 endpoint 返回 200 但 agent 仍 Held + Resume 也拒，operator 卡死。
-  // max_rounds 非终态：reserved dev restart 后走 markWaiting 保锁+worktree，不被误 idle-release 删 worktree。
   if (!task || TASK_TERMINAL_STATUS_SET.has(task.status)) {
     await app.ctx.agentManager.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true })
       .catch(err => app.log.warn({ err, agentId, taskId }, 'restart/retry idle-release failed'));

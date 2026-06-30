@@ -4,7 +4,6 @@ import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js
 import { IMAGE_UPLOAD_ROUTE_BODY_LIMIT } from '../shared/index.js';
 
 export async function agentRoutes(app: FastifyInstance): Promise<void> {
-  // Use the startup agent index so /agents matches preview/stop until restart.
   app.get('/agents', async () => buildAllAgentSnapshots(app.ctx));
 
   app.get<{ Params: { id: string } }>('/agents/:id', async (request, reply) => {
@@ -22,8 +21,6 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
       try {
         await app.ctx.agentManager.cancelTask(state.taskId);
       } catch (err) {
-        // Task may already be terminal (cancel during merge race); 204 is the right
-        // response either way — the route's contract is "no active session for this agent".
         const message = err instanceof Error ? err.message : String(err);
         app.log.warn({ err: message, agentId: request.params.id, taskId: state.taskId },
           'DELETE /agents/:id/session: cancelTask failed; proceeding with idle response');
@@ -42,8 +39,6 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(200).send({ cleared: true });
   });
 
-  // Upload an image to a running agent; server writes it to the agent
-  // host and pastes the absolute path into the live pane (no Enter).
   app.post<{ Params: { id: string }; Body: { dataBase64?: unknown } }>(
     '/agents/:id/images',
     { bodyLimit: IMAGE_UPLOAD_ROUTE_BODY_LIMIT },

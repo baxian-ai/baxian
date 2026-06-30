@@ -87,8 +87,6 @@ describe('loadConfig', () => {
     expect(config.project[0].merge).toBeNull();
     expect(config.review.mode).toBe('github');
     expect(config.project[0].review?.mode).toBeUndefined();
-    // afterDone is intentionally NOT defaulted to null — an omitted value stays undefined so a
-    // non-GitHub repo can tell "unset → deliver-by-default ('branch')" from explicit "null → review-only".
     expect(config.review.afterDone).toBeUndefined();
   });
 
@@ -142,16 +140,12 @@ describe('loadConfig', () => {
 
 describe('prepareConfig type guards', () => {
   it('throws ConfigValidationError when project is not an array', () => {
-    // applyDefaults still normalises non-array project to [], so the check must run
-    // before defaults — otherwise the validator only sees [] and thinks all is well.
     expect(() => prepareConfig({ project: 'oops' })).toThrow(ConfigValidationError);
     expect(() => prepareConfig({ project: { id: 'p1' } })).toThrow(ConfigValidationError);
     expect(() => prepareConfig({ project: 42 })).toThrow(ConfigValidationError);
   });
 
   it('rejects malformed project/agent element shapes instead of dropping them or throwing raw TypeError', () => {
-    // Before: applyDefaults filter(isRecord) silently dropped non-record projects, and
-    // pair.map() threw a raw TypeError on a non-array agent pair. All must be ConfigValidationError.
     expect(() => prepareConfig({ project: [null] })).toThrow(/project\[0\] must be an object/);
     expect(() => prepareConfig({ project: ['oops'] })).toThrow(/project\[0\] must be an object/);
     expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: 42 }] }))
@@ -160,7 +154,6 @@ describe('prepareConfig type guards', () => {
       .toThrow(/project\[0\]\.agent\[0\] must be an array of agents/);
     expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [[null]] }] }))
       .toThrow(/project\[0\]\.agent\[0\]\[0\] must be an object/);
-    // All raised ConfigValidationError, never a raw TypeError.
     expect(() => prepareConfig({ project: [{ id: 'pp', repo: 'u/r', agent: [{}] }] }))
       .toThrow(ConfigValidationError);
   });
@@ -172,10 +165,8 @@ describe('prepareConfig type guards', () => {
   });
 
   it('leaves an omitted host.port undefined (honors ~/.ssh/config), never coercing an invalid value past the validator', () => {
-    // Omitted → undefined, so the ssh builders skip -p and ~/.ssh/config's Port is honored.
     const ok = prepareConfig({ host: [{ id: 'box', hostname: 'h' }], project: [] });
     expect(ok.host[0].port).toBeUndefined();
-    // A non-numeric / string port must reach validateHosts and be rejected, not silently coerced.
     expect(() => prepareConfig({ host: [{ id: 'box', hostname: 'h', port: '2222' }], project: [] }))
       .toThrow(/host\[0\]\.port/);
     expect(() => prepareConfig({ host: [{ id: 'box', hostname: 'h', port: '22; touch x' }], project: [] }))
@@ -191,10 +182,6 @@ describe('prepareConfig type guards', () => {
   });
 
   it('throws on malformed top-level raw config (string / null / array / number / boolean)', () => {
-    // normalizeConfig silently coerces non-object raw → {}; combined with the
-    // missing-project zero-config path that previously made `"oops"` / `null` /
-    // `[]` accepted as phantom default config. Pin top-level shape so garbage
-    // file content fails fast.
     expect(() => prepareConfig('oops')).toThrow(/config must be a JSON object \(got string\)/);
     expect(() => prepareConfig(null)).toThrow(/got null/);
     expect(() => prepareConfig([])).toThrow(/got array/);
@@ -245,8 +232,6 @@ describe('prepareConfig type guards', () => {
   });
 
   it('rejects out-of-range / non-integer server.githubPollIntervalMs via ConfigValidationError (so PATCH returns 400 instead of silently falling back)', () => {
-    // 500: below 1s floor (would exhaust GitHub rate limit); 1500.5: non-integer (setInterval clamps
-    // to 1ms); 0 / negative; 2^31: above timer ceiling (TimeoutOverflowWarning).
     for (const value of [500, 1500.5, 0, -1000, 2147483648]) {
       expect(() => withServer({ githubPollIntervalMs: value })).toThrow(ConfigValidationError);
     }
@@ -299,8 +284,6 @@ describe('prepareConfig type guards', () => {
     });
     expect(cfg.review.mode).toBe('github');
     expect(cfg.project[0].review?.mode).toBeUndefined();
-    // NOT defaulted to null — non-GitHub repos distinguish unset (deliver-by-default) from
-    // explicit null (review-only); GitHub collapses both via `?? null`, so this is behavior-neutral.
     expect(cfg.review.afterDone).toBeUndefined();
   });
 
@@ -479,7 +462,6 @@ describe('resolveConfigPath / resolveStateDir / userConfigPath / userStateDir', 
   beforeEach(async () => {
     originalCwd = process.cwd();
     const fakeHome = await mkdtemp(join(tmpdir(), 'baxian-home-'));
-    // macOS /var/folders → /private/var/folders aliasing breaks path equality unless canonicalised.
     cwdReal = await realpath(tempDir);
     homeReal = await realpath(fakeHome);
     vi.stubEnv('HOME', homeReal);
@@ -529,16 +511,11 @@ describe('resolveConfigPath / resolveStateDir / userConfigPath / userStateDir', 
   });
 
   it('resolveStateDir(alias inside ~/.baxian/) still returns ~/.baxian — not nested', () => {
-    // Symlink/alias scenario: user does `ln -s ~/.baxian/config.json ~/.baxian/cfg-alias.json`
-    // then runs `baxian -c ~/.baxian/cfg-alias.json`. String-equality on the full path
-    // would miss this and fall back to dirname/.baxian → ~/.baxian/.baxian/ (nested),
-    // splitting locks/state from the zero-config path. dirname match keeps them shared.
     const alias = join(homeReal, '.baxian', 'cfg-alias.json');
     expect(resolveStateDir(alias)).toBe(userStateDir());
   });
 
   it('resolveStateDir(deeper subdir under ~/.baxian/) falls through to sibling .baxian/', () => {
-    // User actively chose a subdir — preserve sibling-state convention there.
     const deep = join(homeReal, '.baxian', 'sub', 'cfg.json');
     expect(resolveStateDir(deep)).toBe(join(homeReal, '.baxian', 'sub', '.baxian'));
   });
@@ -585,8 +562,6 @@ describe('createDefaultConfig', () => {
   it('template content loads cleanly through loadConfig (validator + normalizer)', async () => {
     const target = join(homeReal, '.baxian', 'config.json');
     await createDefaultConfig(target);
-    // loadConfig runs prepareConfig (normalizer + validator). Empty project is now allowed,
-    // so a freshly auto-created config must load without ConfigValidationError.
     const cfg = await loadConfig(target);
     expect(cfg.project).toEqual([]);
   });

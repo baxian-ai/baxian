@@ -52,7 +52,6 @@ const projectTasksState = {
 vi.mock('../../src/hooks/use-events.ts', () => ({
   useAgents: () => agentsHookState,
   useProjectTasks: () => projectTasksState,
-  // 真实 task-detail-modal（经 importOriginal 透传）顶层导入 useTask，mock 需保持完整。
   useTask: () => ({ data: null, loaded: true, error: null }),
 }));
 
@@ -206,7 +205,6 @@ describe('Project Task panel', () => {
     const heading = screen.getByRole('heading', { name: 'Tasks' });
     const agentsHeading = screen.getByRole('heading', { name: 'Agents' });
     const closeBtn = screen.getByRole('button', { name: '关闭 Task 面板' });
-    // 标题与关闭按钮在面板外，标题样式与左侧「Agents」标题一致。
     expect(panel.contains(heading)).toBe(false);
     expect(panel.contains(closeBtn)).toBe(false);
     expect(heading.className).toBe(agentsHeading.className);
@@ -220,7 +218,6 @@ describe('Project Task panel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '关闭 Task 面板' }));
     await waitFor(() => expect(screen.queryByRole('complementary', { name: 'Task 面板' })).toBeNull());
-    // 关闭按钮卸载后焦点回到三点菜单触发按钮，而非丢回 body（WCAG 2.4.3）。
     expect(document.activeElement).toBe(menuBtn);
 
     await openProjectMenu();
@@ -228,9 +225,7 @@ describe('Project Task panel', () => {
     fireEvent.click(reopen);
 
     expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task 面板' }))).toBeTruthy();
-    // 菜单项卸载后焦点同样回到触发按钮。
     expect(document.activeElement).toBe(menuBtn);
-    // 面板打开后菜单里不再有「显示 Task 面板」入口。
     await openProjectMenu();
     expect(screen.queryByRole('menuitem', { name: '显示 Task 面板' })).toBeNull();
   });

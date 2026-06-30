@@ -17,7 +17,6 @@ const CLI_BINARY: Record<AgentRuntime, string> = {
 
 const PREFLIGHT_PROBE_TIMEOUT_MS = 5000;
 
-// login-interactive shells may print banners before `which`; the path is the last line.
 function lastNonEmptyLine(s: string): string {
   const lines = s.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -63,7 +62,6 @@ export async function runPreflight(
   repo: string,
   host?: HostConfig,
 ): Promise<PreflightResult[]> {
-  // Trim so a whitespace-padded config value probes the same canonical URL RepoStore clones.
   repo = repo.trim();
   const results: PreflightResult[] = [];
   const binary = CLI_BINARY[agent.runtime];
@@ -74,8 +72,6 @@ export async function runPreflight(
       return results;
     }
     const target = sshTarget(host);
-    // `--` guards ssh target values starting with `-`. noMux forces a fresh authenticated connection
-    // so a stale ControlMaster can't report OK after the saved password/key has become invalid.
     await ensureMuxDir();
     const sshCmd = `ssh ${buildSshOptions(host, { noMux: true })} -- ${shellQuote(target)} echo ok`;
     const env = await sshEnv(host);
@@ -90,7 +86,6 @@ export async function runPreflight(
     if (sshCheck.exitCode !== 0) return results;
   }
 
-  // Match the interactive tmux pane shell mode for accurate probes.
   results.push(
     await probeBinary(
       runner,
@@ -102,7 +97,6 @@ export async function runPreflight(
     ),
   );
 
-  // tmux runs via default login shell; match it.
   results.push(
     await probeBinary(
       runner,
@@ -132,8 +126,6 @@ export async function runPreflight(
     await runManualModePreflight(runner, agent.workdir!, repo, results);
   }
 
-  // GitHub-only platform checks: a generic git remote has no gh CLI / API. Its access is
-  // proven by the `git ls-remote` step in the mode-specific preflight above.
   if (isGitHubRepo(repo)) {
     const slug = repoSlug(repo);
     const ghCheck = await runner.exec('gh auth status');
@@ -203,7 +195,6 @@ async function runAutoModePreflight(
     return;
   }
 
-  // Existing auto-mode paths must be git repos.
   const dirCheck = await runner.exec(`test -d ${absRepoPath}`);
   if (dirCheck.exitCode === 0) {
     const gitCheck = await runner.exec(`test -d ${absRepoPath}/.git`);
@@ -229,15 +220,12 @@ async function runAutoModePreflight(
   }
 
   if (!gh) {
-    // Generic remote: plain git is the only assumed capability; the full URL carries credentials.
     const ls = await runner.exec(`git ls-remote ${shellQuote(repo)} HEAD`);
     results.push({
       step: 'git',
       ok: ls.exitCode === 0,
       message: ls.exitCode === 0
         ? 'git ls-remote OK'
-        // redact: a non-github HTTPS remote may carry an embedded token, and this message is
-        // returned to the /checks caller — never echo the raw credentialed URL.
         : `git ls-remote ${redactGitCredentials(repo)} failed — check the git credentials (HTTPS credential helper or SSH key) for this host`,
     });
     return;

@@ -11,13 +11,9 @@ import { usePetSpritesheet } from '../hooks/use-pets.ts';
 export interface PetAnimationRow {
   state: string;
   row: number;
-  /** Per-frame hold time in ms; length is the used frame count for the row. */
   durations: number[];
 }
 
-// hatch-pet animation contract (references/animation-rows.md). Frame counts and
-// per-frame durations differ by row; trailing cells are transparent, so the renderer
-// must cycle ONLY durations.length frames or the pet flickers through empty cells.
 export const PET_ANIMATION_ROWS: readonly PetAnimationRow[] = [
   { state: 'idle', row: 0, durations: [280, 110, 110, 140, 140, 320] },
   { state: 'running-right', row: 1, durations: [120, 120, 120, 120, 120, 120, 120, 220] },
@@ -31,7 +27,7 @@ export const PET_ANIMATION_ROWS: readonly PetAnimationRow[] = [
 ];
 
 export function petRowForStatus(status: AgentRuntimeStatus, bootstrapping: boolean): number {
-  if (bootstrapping) return 3; // waving while the agent starts up
+  if (bootstrapping) return 3;
   switch (status) {
     case 'working': return 7;
     case 'waiting': return 6;
@@ -59,7 +55,6 @@ export interface AgentPetProps {
   petId: string;
   status: AgentRuntimeStatus;
   bootstrapping?: boolean;
-  /** Human-readable status text — used as the accessible label and the loading fallback. */
   label: string;
   displayHeight?: number;
   className?: string;

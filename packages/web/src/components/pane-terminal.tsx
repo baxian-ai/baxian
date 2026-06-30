@@ -19,8 +19,6 @@ const LIVE_QUEUE_MAX_CHARS = 256 * 1024;
 
 export const TERMINAL_BG = '#fdfdfd';
 
-// Keep in sync with theme.fontFamily.mono in tailwind.config.js — xterm needs
-// a CSS string while Tailwind needs an array, so we can't share a single source.
 export const TERMINAL_MONO_STACK =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
 
@@ -48,7 +46,6 @@ export const ZED_LIGHT_THEME: ITheme = {
   brightWhite: '#0d0d0f',
 };
 
-// Drop xterm.js auto-replies (DA/DSR/CPR) — tmux answers app queries itself.
 export const TERMINAL_REPLY_PATTERN =
   /\x1b\[(?:\?[\d;]*c|>[\d;]*c|\??\d+;\d+R|\d+n)/g;
 
@@ -58,16 +55,12 @@ export function stripTerminalAutoReplies(data: string): string {
 
 const OSC52_MAX_B64 = 1024 * 1024;
 
-// OSC 52 payload is `<selector>;<base64>`; tmux emits an empty selector (`;<b64>`). Returns the text
-// to copy, or null to ignore: read requests (`?`), empty, oversize, or non-base64 — never echoed back.
 export function parseOsc52Clipboard(payload: string): string | null {
   const sep = payload.indexOf(';');
   if (sep === -1) return null;
   const b64 = payload.slice(sep + 1);
   if (b64.length === 0 || b64 === '?' || b64.length > OSC52_MAX_B64) return null;
   try {
-    // Tight loop, not Uint8Array.from(str, mapFn): the latter invokes a JS callback per byte and
-    // janks the main thread for ~MB payloads.
     const bin = atob(b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -134,10 +127,6 @@ export function PaneTerminal({
     });
   };
 
-  // Preview keeps the server's full-screen geometry, which is taller than the card; the default
-  // browser behavior reveals the TOP rows (oldest). Anchor the cursor row to the bottom of the
-  // visible slice so the latest output is always in view — for every preview render, whether it is
-  // maxLines-clipped (activity preview) or just overflow-clipped by its container (embedded card).
   const isStaticPreview = streamMode === 'preview';
   const scrollPreviewToCursor = (): void => {
     if (!isStaticPreview) return;
@@ -237,9 +226,6 @@ export function PaneTerminal({
         enqueueTerminalTask(async (term) => {
           term.reset();
           if (canResize) {
-            // Fit to the container BEFORE writing: adopting the server pane's taller rows would clip
-            // the bottom status bar past overflow-hidden, and refitting AFTER a server-geometry write
-            // reflow-trims the rows below the cursor and drops that bar. Write then pins to bottom.
             refitToContainerRef.current?.();
             await writeTerminalData(term, data);
           } else {
@@ -284,7 +270,6 @@ export function PaneTerminal({
   const forwardInput = useCallback((data: string) => {
     const cleaned = stripTerminalAutoReplies(data);
     if (cleaned.length === 0) return;
-    // Pending non-empty means resubscribe/drain hasn't run yet — direct send could hit a stale or null subscriberId.
     if (shouldDeferFull && (!fullActivated || pendingDeferredInputRef.current.length > 0)) {
       pendingDeferredInputRef.current += cleaned;
       activateFullStream();
@@ -322,9 +307,6 @@ export function PaneTerminal({
 
     if (interactive) {
       term.onData(forwardInput);
-      // tmux (set-clipboard external) emits OSC 52 on copy-mode copy; mirror it into the browser
-      // clipboard — only once the user has activated this pane (full stream), never from a background
-      // preview. Write only: parseOsc52Clipboard drops read requests, so we never echo the clipboard back.
       if (streamMode === 'full') {
         term.parser.registerOscHandler(52, (payload) => {
           const text = parseOsc52Clipboard(payload);
@@ -372,7 +354,6 @@ export function PaneTerminal({
       observer.observe(container);
     };
 
-    // Preview mode keeps server geometry; refitting would reflow the snapshot.
     const scheduleFit = () => {
       raf = requestAnimationFrame(() => {
         raf = null;
@@ -437,8 +418,6 @@ export function PaneTerminal({
     try { termRef.current?.focus(); } catch {}
   };
 
-  // xterm.js 在 viewport 上注册 wheel(passive:false) 并 preventDefault，未激活态下也会"吞掉"页面滚动。
-  // capture-phase 上拦截并 stopPropagation，xterm 的 bubble 监听不会触发，浏览器照常滚动祖先（页面）。
   useEffect(() => {
     if (interactive) return;
     const container = containerRef.current;
@@ -462,9 +441,6 @@ export function PaneTerminal({
           {sessionGone ? 'session ended' : error}
         </div>
       )}
-      {/* Padding lives on the outer wrapper so the scroll container (ref'd below) is a pure
-          overflow box — its scrollTop maps 1:1 to xterm row offsets, which scrollPreviewToCursor
-          relies on. */}
       <div className="flex flex-1 min-h-0 px-2 py-1.5" style={containerStyle}>
         <div
           ref={containerRef}

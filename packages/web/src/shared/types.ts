@@ -19,7 +19,6 @@ export interface AgentConfig {
   runtime: AgentRuntime;
   role: AgentRole;
   mode: AgentMode;
-  // string = registry host id; object = legacy inline host.
   host?: string | HostConfig;
   workdir?: string;
   yolo?: boolean;
@@ -40,20 +39,13 @@ export interface ProjectReviewConfig {
 }
 
 export interface ReviewConfig {
-  /**
-   * Maximum review iterations for this task. Applies to BOTH the code-review
-   * loop (dev↔qa code rounds) AND the spec-review loop (dev↔qa spec rounds);
-   * same numeric cap. If the two ever need to diverge, split this field then.
-   */
   rounds: number;
   mode?: ReviewMode;
   afterDone?: AfterDone;
 }
 
 export interface HttpsConfig {
-  /** Absolute path to PEM-encoded private key, readable by the server user. */
   keyFile: string;
-  /** Absolute path to PEM-encoded full-chain certificate. */
   certFile: string;
 }
 
@@ -61,14 +53,8 @@ export interface ServerConfig {
   port: number;
   token?: string;
   host?: string;
-  /** When set, server listens with TLS instead of plain HTTP. */
   https?: HttpsConfig;
-  /**
-   * Allowed Host header values. Empty/undefined = accept any (dev default).
-   * Set in production to mitigate Host-header attacks.
-   */
   allowedHosts?: string[];
-  /** Per-repo poller cadence in ms. Default 30_000. */
   githubPollIntervalMs?: number;
   tmuxProbePollIntervalMs?: number;
   tmuxProbeTimeoutMs?: number;
@@ -113,8 +99,6 @@ export type TaskStatus =
 
 export type TaskPhase = 'spec' | 'code';
 
-// baxian 自己设的 lifecycle 状态（权威），区别于 AgentRuntimeStatus（探针派生量）。
-// awaiting_human: 自动调度路径无法继续，必须 operator 显式 resumeAgent 才放出。
 export type AgentLifecycleStatus = 'ok' | 'awaiting_human';
 
 export interface AgentBindingFacts {
@@ -153,7 +137,6 @@ export interface AgentSnapshot {
   latestBootstrapError?: AgentErrorSummary;
   reason?: string;
   message?: string;
-  /** Agent Pet assignment; the web animates this pet in place of the status pill. */
   petId?: string;
 }
 
@@ -178,18 +161,13 @@ export interface TaskState {
   prNumber?: number;
   prUrl?: string;
   branch?: string;
-  /** Server-trusted PR head SHA — anchor for review.submitted staleness checks. */
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
   reviewRound: number;
-  /** Spec review round, isolated from PR review round. */
   specReviewRound?: number;
-  /** undefined ≡ 'code' for backward compatibility. */
   phase?: TaskPhase;
-  /** Signal token for the current pending pane signal; rotated each dispatch/phase transition. */
   signalToken?: string;
-  /** Review mode snapshotted at task creation. */
   reviewMode?: ReviewMode;
   batchIndex?: number;
   batchTotal?: number;

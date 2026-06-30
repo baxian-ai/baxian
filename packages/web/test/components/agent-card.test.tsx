@@ -283,11 +283,9 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-launching', { creationToken: 'create-1' }),
     }));
 
-    // Greeting handshake is still mid-flight, so the agent stays visibly "Starting"...
     expect(screen.getByText('Starting')).toBeTruthy();
     expect(screen.getByRole('img', { name: 'Starting session' })).toBeTruthy();
     expect(screen.queryByText('等待人工介入')).toBeNull();
-    // ...but the live pane is now reachable so the operator can watch greeting progress and failures.
     expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
     expect(terminalHrefs()).toEqual(['/terminal/dev-launching']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
@@ -315,7 +313,6 @@ describe('AgentCard', () => {
     }), { terminalMode: 'embedded-full' });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    // Exact match targets the terminal placeholder, not the startup banner that also begins with this text.
     expect(screen.getByText('Agent 正在启动')).toBeTruthy();
   });
 
@@ -484,7 +481,6 @@ describe('AgentCard', () => {
       const trigger = kebab();
       expect(trigger.getAttribute('aria-haspopup')).toBe('menu');
       expect(trigger.getAttribute('aria-expanded')).toBe('false');
-      // 菜单未渲染时不得保留指向不存在节点的 aria-controls（无效引用）。
       expect(trigger.getAttribute('aria-controls')).toBeNull();
       expect(trigger.querySelector('svg')).toBeTruthy();
       expect(screen.queryByText('🗑')).toBeNull();
@@ -723,10 +719,9 @@ describe('AgentCard', () => {
   describe('Agent Pet', () => {
     it('renders the animated pet in place of the status pill when petId is set', () => {
       renderCard(makeSnapshot({ id: 'dev-pet', runtimeStatus: 'working', petId: 'pet-1' }));
-      // The "Working" pill text is gone; the pet exposes the status via aria-label.
       expect(screen.queryByText('Working')).toBeNull();
       const pet = screen.getByRole('img', { name: 'Working' });
-      expect(pet.getAttribute('data-pet-row')).toBe('7'); // working → running row
+      expect(pet.getAttribute('data-pet-row')).toBe('7');
     });
 
     it('renders the card pet larger and lets it escape the card border', () => {

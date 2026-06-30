@@ -43,8 +43,6 @@ function runner(): CommandRunner {
   };
 }
 
-// recover() now runs its re-greet in the background (so server startup is not blocked); poll for the
-// resulting state instead of asserting synchronously right after recover() returns.
 async function waitFor(check: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -207,8 +205,6 @@ describe('AgentManager.startBootstrapAsync', () => {
 });
 
 describe('AgentManager greeting capability gate', () => {
-  // The base manager has no phaseSignalWatcher, so greeting is skipped there. These build a
-  // manager WITH a mock watcher to exercise the gate, stubbing the low-level pane inject.
   function makeManagerWithWatcher(awaitOnce: ReturnType<typeof vi.fn>) {
     const localEvents: BaxianEvent[] = [];
     const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
@@ -245,7 +241,6 @@ describe('AgentManager greeting capability gate', () => {
     expect(state?.status).toBeUndefined();
     expect(state?.paneId).toBe('%0');
     expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
-    // One inject, awaiting a greeting-kind signal, via the skill (prose) path.
     expect(injectSpy).toHaveBeenCalledTimes(1);
     expect(awaitOnce).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'dev-1', kind: 'greeting' }));
     expect(String(injectSpy.mock.calls[0][2])).toContain('baxian-greeting');
@@ -265,14 +260,11 @@ describe('AgentManager greeting capability gate', () => {
       e.type === 'human.intervention' && e.data.phase === 'greeting_failed',
     )).toBe(true);
     expect(localEvents.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
-    // Retries up to greetingMaxAttempts before giving up.
     expect(awaitOnce).toHaveBeenCalledTimes(2);
-    // A held agent is not dispatchable.
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 
   it('retries on session-gone (a transient subscribe fault must not fail a capable agent)', async () => {
-    // First attempt loses the subscription, second verifies — agent should end up ready.
     const awaitOnce = vi.fn()
       .mockResolvedValueOnce('session-gone')
       .mockResolvedValueOnce('matched');
@@ -289,7 +281,6 @@ describe('AgentManager greeting capability gate', () => {
   it('does not wait for the signal when the greeting paste fails — it retries the paste', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('matched');
     const { mgr, injectSpy } = makeManagerWithWatcher(awaitOnce);
-    // Inject fails every attempt → agent never echoes; awaitOnce must never be armed.
     injectSpy.mockRejectedValue(new Error('pane busy'));
 
     await mgr.startBootstrapAsync('dev-1', 'token-abc');
@@ -302,26 +293,23 @@ describe('AgentManager greeting capability gate', () => {
   it('holds without retrying when the greeting paste fails ack_unknown (unconfirmed composer)', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('matched');
     const { mgr, injectSpy } = makeManagerWithWatcher(awaitOnce);
-    // ack_unknown = composer could not be confirmed clean; a second paste would land on unsafe input.
     injectSpy.mockRejectedValue(new DispatchTerminalError('ack_unknown', 'pre-ack failure'));
 
     await mgr.startBootstrapAsync('dev-1', 'token-abc');
 
     expect((await agentStore.get('dev-1'))?.status).toBe('awaiting_human');
-    expect(injectSpy).toHaveBeenCalledTimes(1); // NO second paste onto the unconfirmed composer
+    expect(injectSpy).toHaveBeenCalledTimes(1);
     expect(awaitOnce).not.toHaveBeenCalled();
   });
 
   it('only kills the orphan session (no greeting_failed hold) when creationToken rotates mid-greeting', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('timeout');
     const { mgr } = makeManagerWithWatcher(awaitOnce);
-    // A newer create rotates the token while greeting is still timing out.
     await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
 
     await mgr.startBootstrapAsync('dev-1', 'token-abc');
 
     const state = await agentStore.get('dev-1');
-    // The stale generation must NOT overwrite the newer one with a greeting_failed hold.
     expect(state?.creationToken).toBe('token-newer');
     expect(state?.awaitingPhase).not.toBe('greeting_failed');
   });
@@ -340,7 +328,6 @@ describe('AgentManager greeting capability gate', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
-    // A held, unverified agent must stay non-dispatchable after a restart.
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 
@@ -350,7 +337,6 @@ describe('AgentManager greeting capability gate', () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
 
     await mgr.recover();
-    // Re-greet runs in the background; wait for it to clear the token to 'ready'.
     await waitFor(async () => (await agentStore.get('dev-1'))?.creationToken === undefined);
 
     const state = await agentStore.get('dev-1');
@@ -365,7 +351,6 @@ describe('AgentManager greeting capability gate', () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-crash', updatedAt: NOW });
 
     await mgr.recover();
-    // Re-greet runs in the background; wait for the failure to land the greeting_failed hold.
     await waitFor(async () => (await agentStore.get('dev-1'))?.awaitingPhase === 'greeting_failed');
 
     const state = await agentStore.get('dev-1');
@@ -402,8 +387,6 @@ describe('AgentManager greeting capability gate', () => {
   });
 
   it('regreetHeldAgent does not clear a binding that was recreated mid-handshake (generation guard)', async () => {
-    // A DELETE+recreate lands a new generation (creationToken set, no greeting_failed) while the
-    // handshake is still running; the stale regreet must NOT clear it.
     const awaitOnce = vi.fn().mockImplementation(async () => {
       await agentStore.set({ id: 'dev-1', projectId: 'proj', creationToken: 'tok-new', updatedAt: 'LATER' });
       return 'matched';
@@ -421,10 +404,6 @@ describe('AgentManager greeting capability gate', () => {
     expect(state?.awaitingPhase).toBeUndefined();
   });
 
-  // NOTE: slowPollDialogPending's bootstrap path also runs the greeting gate (manager.ts) — a direct
-  // mirror of startBootstrapAsync's gate covered above. It is not unit-tested here on purpose: driving
-  // the private while-loop needs a global setTimeout swap + a waitReplReady prototype spy, which races
-  // under CI coverage load (busy-spin → timeout). The mirrored logic is what the gate tests above pin.
 
   it('Resume refuses a greeting_failed hold — capability must be re-proven, not overridden', async () => {
     const { mgr } = makeManagerWithWatcher(vi.fn().mockResolvedValue('matched'));
@@ -436,12 +415,10 @@ describe('AgentManager greeting capability gate', () => {
     const res = await mgr.resumeAgent('dev-1');
 
     expect(res.resumed).toBe(false);
-    // The refusal must carry an actionable reason, not be swallowed into a generic API fallback.
     expect(res.reason).toMatch(/Restart REPL/);
     const state = await agentStore.get('dev-1');
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
-    // Still not dispatchable — Resume did not slip it into the pool.
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 
@@ -456,7 +433,6 @@ describe('AgentManager greeting capability gate', () => {
       markDialogPending: (id: string, tok: string | undefined) => Promise<void>;
     }).markDialogPending('dev-1', undefined);
 
-    // The hold must stay greeting_failed — else a dialog-collision would let Resume release it.
     expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('greeting_failed');
   });
 
@@ -473,7 +449,6 @@ describe('AgentManager greeting capability gate', () => {
     expect(state?.status).toBe('awaiting_human');
     expect(state?.awaitingPhase).toBe('greeting_failed');
     expect(state?.paneId).toBe('%0');
-    // A transient tmux absence must not turn an unverified agent back into a dispatch candidate.
     expect(await mgr.pickAgent('proj', 'dev-1')).toBeNull();
   });
 });
@@ -529,7 +504,6 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
   const TOKEN = 'token-abc';
 
   it('no longer hard-fails after 10 minutes when the dialog stays unresolved', async () => {
-    // Date.now 合成推进：真实等 10 分钟在 CI 不现实。
     await agentStore.update('dev-1', (s) => s ? {
       ...s,
       creationToken: TOKEN,
@@ -575,7 +549,6 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
   });
 
   it('exits cleanly when creationToken is cleared mid-flight (DELETE/recreate)', async () => {
-    // 确认 generational guard 在 slowPoll 上下文中也生效（startBootstrapAsync 之外的独立入口）。
     await agentStore.update('dev-1', (s) => s ? {
       ...s,
       paneId: '%0',
@@ -600,9 +573,6 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
   });
 
   it('recovers a runtime dialog after the tmux pane was recreated (stale stored paneId)', async () => {
-    // Held on agent_dialog_pending (runtime path: no creationToken, no taskId) with a paneId that
-    // points at a pane the session no longer owns — the runtime relaunched into a fresh pane that is
-    // already at a ready REPL. slowPoll must follow the session's live pane, not the dead snapshot.
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
@@ -657,7 +627,6 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
 
     const realSetTimeout = globalThis.setTimeout;
     globalThis.setTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
-    // Force-exit guard: the buggy code polls the dead %old forever, so cap the loop instead of hanging.
     const realGet = agentStore.get.bind(agentStore);
     let polls = 0;
     const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
@@ -699,20 +668,18 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
     let polls = 0;
     const getSpy = vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
       polls++;
-      // 模拟 operator 在第 2 轮 poll 时 DELETE 掉 agent。
       if (polls === 2) {
         await agentStore.delete('dev-1');
       }
       return realGet(id);
     });
     try {
-      // 不会无限挂——agentStore.get 返回 null 触发 line 595 的 return。
       await (manager as unknown as {
         slowPollDialogPending: (id: string, token: string) => Promise<void>;
       }).slowPollDialogPending('dev-1', TOKEN);
 
       expect(polls).toBeGreaterThanOrEqual(2);
-      expect(polls).toBeLessThan(10); // 没失控
+      expect(polls).toBeLessThan(10);
       expect(events.some(e => e.type === 'agent.bootstrap_failed')).toBe(false);
       expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(false);
     } finally {

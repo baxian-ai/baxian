@@ -90,7 +90,7 @@ describe('ws-auth', () => {
 
     it('returns undefined when hex portion is malformed', () => {
       expect(extractTokenFromProtocols('baxian.token.zzzz')).toBeUndefined();
-      expect(extractTokenFromProtocols('baxian.token.abc')).toBeUndefined();  // odd length
+      expect(extractTokenFromProtocols('baxian.token.abc')).toBeUndefined();
     });
   });
 });

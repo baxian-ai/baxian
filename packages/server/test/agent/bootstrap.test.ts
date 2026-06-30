@@ -151,10 +151,6 @@ describe('runSingleTarget — new behaviors', () => {
   });
 
   it('purges stale bootstrap error records for the target agents on success', async () => {
-    // Truth source for the red card is errorRecordStore presence (snapshot.ts no longer
-    // gates on binding.repoPath). Success must clear those records or the card sticks
-    // forever for never-dispatched agents (no binding for repoPath to land on) and shows a
-    // misleading stale failure for first-success-then-regress cycles.
     const purgeBootstrapForAgent = vi.fn().mockResolvedValue({ removed: 1 });
     const target = collectTargets(baseConfig)[0];
     await runSingleTarget(
@@ -188,7 +184,6 @@ describe('runSingleTarget — new behaviors', () => {
   });
 
   it('calls onAgentAffected with target agent ids on manual retry (emitOnUnchanged=true)', async () => {
-    // Manual retry path always notifies — operator clicked Retry expecting fresh signal.
     const onAgentAffected = vi.fn();
     const target = collectTargets(baseConfig)[0];
     await runSingleTarget(target, { ...buildDeps(), onAgentAffected }, { emitOnUnchanged: true });
@@ -196,10 +191,6 @@ describe('runSingleTarget — new behaviors', () => {
     expect(onAgentAffected).toHaveBeenCalledWith(target.agents.map(a => a.id));
   });
 
-  // Success path (emitOnUnchanged=false). onAgentAffected only fires when the snapshot actually
-  // changes for a reason AgentStore.onChange doesn't already cover — i.e. a stale bootstrap error
-  // was purged. A binding update (updated>0) does NOT trigger it (onChange already publishes), and
-  // steady-state (no update, no purge) is silent so the 60s poller doesn't spam agents-topic.
   it.each<{ name: string; seedBindings: boolean; removed: number; called: boolean }>([
     { name: 'does NOT call onAgentAffected when only updated>0 (AgentStore.onChange already publishes)', seedBindings: true, removed: 0, called: false },
     { name: 'does NOT call onAgentAffected on steady-state success (no binding update, no stale error)', seedBindings: false, removed: 0, called: false },
@@ -234,8 +225,6 @@ describe('runSingleTarget — new behaviors', () => {
   });
 
   it('skips onAgentAffected when failure is suppressed (dedup path)', async () => {
-    // If the message matches suppressFailureMessage, we don't append/emit — and we also shouldn't
-    // republish a phantom "snapshot changed" event since the snapshot is in fact unchanged.
     const onAgentAffected = vi.fn();
     const target = collectTargets(baseConfig)[0];
     await runSingleTarget(
@@ -320,9 +309,6 @@ describe('classifyBootstrapError', () => {
 
   it.each<{ name: string; input: string; reason: string; extra?: (out: Out) => void }>([
     {
-      // Real GraphQL phrasing from `gh repo clone` against a private repo the active gh account
-      // isn't a collaborator on. This must classify as ACCESS_DENIED so the UI surfaces an
-      // actionable "grant collaborator" hint instead of a generic ensure-failed message.
       name: 'maps gh GraphQL "Could not resolve to a Repository" to ACCESS_DENIED',
       input: `gh repo clone ${repo} failed: GraphQL: Could not resolve to a Repository with the name 'owner/missing'. (repository)`,
       reason: ACCESS,
@@ -334,7 +320,6 @@ describe('classifyBootstrapError', () => {
     },
     { name: 'maps "Repository not found" (gh CLI) to ACCESS_DENIED', input: 'fatal: Repository not found', reason: ACCESS },
     { name: 'maps bare "404" (gh poller failure) to ACCESS_DENIED', input: 'gh: Not Found (HTTP 404)', reason: ACCESS },
-    // SSH-specific marker is GitHub context enough.
     { name: 'maps "Permission denied (publickey)" (ssh git clone) to ACCESS_DENIED', input: 'Permission denied (publickey).', reason: ACCESS },
     {
       name: 'falls through to ENSURE_FAILED for network / unknown failures',
@@ -344,8 +329,6 @@ describe('classifyBootstrapError', () => {
     },
     { name: 'does NOT match "404" embedded in longer numbers (word-boundary guard)', input: 'exit code 4040', reason: ENSURE },
     {
-      // Local fs permission errors share the keyword "Permission denied" but have no GitHub
-      // context. The repo recommendation would point the user at the wrong fix.
       name: 'does NOT classify local mkdir EACCES as ACCESS_DENIED — would mislead UI to "grant gh collaborator"',
       input: `EACCES: permission denied, mkdir '/var/baxian/repos/${repo}'`,
       reason: ENSURE,
@@ -353,14 +336,8 @@ describe('classifyBootstrapError', () => {
     },
     { name: 'does NOT classify standalone "access denied" without GitHub context as ACCESS_DENIED', input: 'access denied: filesystem readonly', reason: ENSURE },
     { name: 'treats bare "Permission denied" PAIRED with github.com mention as ACCESS_DENIED', input: 'Permission denied while talking to https://github.com/...', reason: ACCESS },
-    // Round-3 review: bare /\bgh:\s/i was too broad and caught gh CLI runtime errors
-    // (tool missing, rate limited, etc.) which need a different fix (install/auth gh), not
-    // "grant collaborator access". /^gh:\s/m (line-start) lets `gh: Not Found (HTTP 404)`
-    // upgrade via the 404 generic but stops the `sh: gh:` shell-prefix form.
     { name: 'does NOT classify "sh: gh: command not found" as ACCESS_DENIED', input: 'sh: gh: command not found', reason: ENSURE },
-    // Even with line-start `gh:`, no generic-auth keyword means no upgrade.
     { name: 'does NOT classify "gh: API rate limit exceeded" as ACCESS_DENIED (no auth keyword)', input: 'gh: API rate limit exceeded', reason: ENSURE },
-    // Line-start `gh:` is real github context; combined with `HTTP 404` generic → upgrade.
     { name: 'DOES classify line-start "gh: Not Found (HTTP 404)" as ACCESS_DENIED', input: 'gh: Not Found (HTTP 404)', reason: ACCESS },
   ])('$name', ({ input, reason, extra }) => {
     const out = classifyBootstrapError(input, repo);
@@ -389,11 +366,8 @@ describe('classifyBootstrapError — non-GitHub (generic git) repos', () => {
     { name: 'maps ssh "Permission denied (publickey)" to ACCESS_DENIED', input: 'git@gitlab.example.com: Permission denied (publickey).', reason: ACCESS },
     { name: 'maps repository-not-found (with scheme) to ACCESS_DENIED', input: `fatal: repository 'https://gitlab.example.com/group/proj.git/' not found`, reason: ACCESS },
     { name: 'host-unreachable (no scheme / auth keyword) stays ENSURE_FAILED', input: 'fatal: unable to access: Could not resolve host: gitlab.example.com', reason: ENSURE },
-    // The repos-ext dir embeds the host, but a local fs error carries no scheme / git@ / publickey.
     { name: 'does NOT match a local mkdir error that merely embeds the repos-ext host path', input: "EACCES: permission denied, mkdir '/home/u/.baxian/repos-ext/gitlab.example.com/group/proj'", reason: ENSURE },
-    // git binary missing on the agent host — a shell command-not-found, not a remote repo-not-found.
     { name: 'does NOT classify "git: command not found" (with URL context) as ACCESS_DENIED', input: `git clone ${repo} failed: /bin/sh: git: command not found`, reason: ENSURE },
-    // dash (/bin/sh on Debian) prints "git: not found" without "command" — still a missing binary.
     { name: 'does NOT classify dash\'s "git: not found" (missing binary) as ACCESS_DENIED', input: `git clone ${repo} failed: /bin/sh: 1: git: not found`, reason: ENSURE },
     {
       name: 'redacts an embedded token from the access-denied classification message',

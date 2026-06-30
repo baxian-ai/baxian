@@ -112,12 +112,12 @@ describe('AgentPetConfigModal', () => {
 
   it('toggle-off clears even when opened with no pet (select before the snapshot lands)', async () => {
     renderModal(null);
-    await act(async () => { fireEvent.click(screen.getByLabelText('启用 Agent Pet')); }); // enable
+    await act(async () => { fireEvent.click(screen.getByLabelText('启用 Agent Pet')); });
     const fox = await screen.findByRole('button', { name: 'Foxy' });
-    await act(async () => { fireEvent.click(fox); }); // optimistic select; currentPetId prop stays null
+    await act(async () => { fireEvent.click(fox); });
     expect(setPetMock).toHaveBeenCalledWith('dev-1', 'pet-1');
     setPetMock.mockClear();
-    await act(async () => { fireEvent.click(screen.getByLabelText('启用 Agent Pet')); }); // disable
+    await act(async () => { fireEvent.click(screen.getByLabelText('启用 Agent Pet')); });
     expect(setPetMock).toHaveBeenCalledWith('dev-1', null);
   });
 
@@ -127,7 +127,7 @@ describe('AgentPetConfigModal', () => {
     const delBtn = await screen.findByRole('button', { name: '删除 Cat' });
     await act(async () => { fireEvent.click(delBtn); });
     expect(removeMock).toHaveBeenCalledWith('pet-2');
-    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2)); // initial + refresh
+    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
     confirmSpy.mockRestore();
   });
 });

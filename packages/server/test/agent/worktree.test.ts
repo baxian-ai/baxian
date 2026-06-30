@@ -18,7 +18,6 @@ describe('WorktreeManager', () => {
   let runner: ReturnType<typeof mockRunner>;
   let wt: WorktreeManager;
 
-  // Stub the exec sequence in call order; each entry is one mockResolvedValueOnce.
   function queueExec(...results: ExecResult[]): void {
     for (const r of results) runner.exec.mockResolvedValueOnce(r);
   }
@@ -65,10 +64,10 @@ describe('WorktreeManager', () => {
   describe('create with custom branchName', () => {
     it('checks local and remote ref before creating with -b (not -B)', async () => {
       queueExec(
-        fail('', 128),  // rev-parse: not found
-        exitOk,         // ls-remote: no match
-        exitOk,         // worktree add -b
-        exitOk,         // excludeBaxianDir
+        fail('', 128),
+        exitOk,
+        exitOk,
+        exitOk,
       );
       const path = await wt.create('/repo', 'task-001', 'origin/HEAD', 'feat/my-feature');
       expect(path).toMatch(/task-001_[0-9a-f]{16}$/);
@@ -98,10 +97,10 @@ describe('WorktreeManager', () => {
 
     it('uses full ref path for ls-remote so team/foo does not block foo', async () => {
       queueExec(
-        fail('', 128),  // rev-parse: not found
-        exitOk,         // ls-remote: empty (no exact match)
-        exitOk,         // worktree add -b
-        exitOk,         // excludeBaxianDir
+        fail('', 128),
+        exitOk,
+        exitOk,
+        exitOk,
       );
       await wt.create('/repo', 'task-001', undefined, 'foo');
       expect(cmdAt(1)).toContain('refs/heads/foo');
@@ -111,9 +110,9 @@ describe('WorktreeManager', () => {
   describe('adopt', () => {
     it('fetches and creates worktree with -b on happy path', async () => {
       queueExec(
-        exitOk,  // fetch + worktree add -b
-        exitOk,  // set-upstream-to
-        exitOk,  // excludeBaxianDir
+        exitOk,
+        exitOk,
+        exitOk,
       );
       const path = await wt.adopt('/repo', 'task-001', 'feat/existing');
       expect(path).toMatch(/task-001_[0-9a-f]{16}$/);
@@ -133,7 +132,7 @@ describe('WorktreeManager', () => {
       queueExec(
         exitOk,
         fail('error: no upstream'),
-        exitOk,  // remove
+        exitOk,
       );
       await expect(wt.adopt('/repo', 'task-001', 'feat/x'))
         .rejects.toThrow(/Failed to set upstream tracking/);
@@ -143,12 +142,12 @@ describe('WorktreeManager', () => {
     it('handles local branch already exists with matching SHA', async () => {
       queueExec(
         fail("fatal: 'feat/x' already exists", 128),
-        out('worktree /repo\nbranch refs/heads/main\n'),  // list
-        out('abc123\n'),   // local sha
-        out('abc123\n'),   // remote sha
-        exitOk,            // worktree add (retry)
-        exitOk,            // set-upstream-to
-        exitOk,            // excludeBaxianDir
+        out('worktree /repo\nbranch refs/heads/main\n'),
+        out('abc123\n'),
+        out('abc123\n'),
+        exitOk,
+        exitOk,
+        exitOk,
       );
       const path = await wt.adopt('/repo', 'task-001', 'feat/x');
       expect(path).toMatch(/task-001_[0-9a-f]{16}$/);
@@ -167,9 +166,9 @@ describe('WorktreeManager', () => {
       queueExec(
         fail("fatal: 'feat/x' already exists", 128),
         out('worktree /repo\nbranch refs/heads/main\n'),
-        out('aaa111\n'),   // local sha
-        out('bbb222\n'),   // remote sha
-        fail('', 1),       // merge-base: not ancestor
+        out('aaa111\n'),
+        out('bbb222\n'),
+        fail('', 1),
       );
       await expect(wt.adopt('/repo', 'task-001', 'feat/x'))
         .rejects.toThrow(/diverges from/);
@@ -190,7 +189,6 @@ describe('WorktreeManager', () => {
   });
 
   describe('excludes .baxian/ after every successful add', () => {
-    // The exclude command runs as a SECOND exec, after the add (calls[0]) succeeds.
     const isExcludeCmd = (cmd: string) =>
       cmd.includes('info/exclude') && cmd.includes('.baxian/');
 
@@ -218,7 +216,6 @@ describe('WorktreeManager', () => {
     });
 
     it('throws when the exclude write fails, and removes the just-created worktree', async () => {
-      // First exec (add) succeeds; second exec (exclude) is a real failure.
       queueExec(exitOk, fail('permission denied'));
       await expect(wt.create('/repo', 'task-001')).rejects.toThrow(/exclude/i);
       expect(runner.exec).toHaveBeenCalledTimes(3);
@@ -230,12 +227,12 @@ describe('WorktreeManager', () => {
 
     it('custom branch: exclude failure also deletes the orphaned branch ref', async () => {
       queueExec(
-        fail('', 128),               // rev-parse: not found
-        exitOk,                      // ls-remote: no match
-        exitOk,                      // worktree add -b
-        fail('permission denied'),   // exclude fails
-        exitOk,                      // worktree remove (inside excludeBaxianDir)
-        exitOk,                      // git branch -D
+        fail('', 128),
+        exitOk,
+        exitOk,
+        fail('permission denied'),
+        exitOk,
+        exitOk,
       );
       await expect(wt.create('/repo', 'task-001', 'origin/HEAD', 'feat/my-feature'))
         .rejects.toThrow(/exclude/i);

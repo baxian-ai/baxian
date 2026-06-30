@@ -508,7 +508,6 @@ describe('TmuxManager', () => {
 
     it('busy baseline is non-ackable: no observable idle→busy transition (pasted prompt text looks busy)', async () => {
       const baseline = buildBaseline('do X\n  esc to interrupt\n', 3);
-      // even if the visible pane later changes, a busy baseline can never produce a trustworthy ack.
       let n = 0;
       runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout(`do X\n  esc to interrupt\n[Image #1] frame ${n++}\n`, 3), stderr: '', exitCode: 0 }));
       await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
@@ -559,8 +558,6 @@ describe('TmuxManager', () => {
       expect(resend).toHaveBeenCalled();
     });
 
-    // A long injected prompt wraps the composer across many rows — the case a narrow pane made worse.
-    // The swallowed-Enter recovery must still fire (it keys off "an Enter here would submit").
     it('re-sends Enter for a long multi-line pasted prompt held in the composer (no message left unsent)', async () => {
       const longComposer = Array.from({ length: 40 }, (_, i) => `wrapped prompt line ${i} ......................`).join('\n') + '\n';
       const baseline = buildBaseline(longComposer, 0);
@@ -577,14 +574,9 @@ describe('TmuxManager', () => {
       expect(resend).toHaveBeenCalled();
     });
 
-    // Codex $skill dispatch repro: the first Enter was eaten by the $skill completion popup
-    // ("Enter to insert"), which redrew the composer so it no longer matched the pre-Enter
-    // baseline — yet the prompt is still unsent. Recovery must key off "Enter here submits"
-    // (idle, non-busy, no menu/popup), NOT byte-identity to baseline, or the prompt sticks forever.
     it('re-sends Enter after the composer diverged from baseline but is still an idle composer', async () => {
       const baseline = buildBaseline('idle composer\n', 0);
       let submitted = false;
-      // visible differs from baseline (the eaten Enter left an extra blank line) yet is still idle.
       runner.exec.mockImplementation(async () => ({
         stdout: composeSnapStdout(submitted ? 'working\n  esc to interrupt\n' : 'idle composer\n\n', 0),
         stderr: '',
@@ -598,8 +590,6 @@ describe('TmuxManager', () => {
     });
 
     it('does NOT re-send Enter while a Codex completion popup is open (Enter would insert, not submit)', async () => {
-      // $skill / @file / /command popup: footer says Enter inserts the highlighted item. Resending
-      // here corrupts the composer instead of submitting — wait for it to close.
       const baseline = buildBaseline('› $baxian-pr-review\n  phase: review\n', 0);
       runner.exec.mockResolvedValue({
         stdout: composeSnapStdout('› $baxian-pr-review\n  phase: review\n\n  Press enter to insert or esc to close\n', 0),
@@ -613,9 +603,6 @@ describe('TmuxManager', () => {
       expect(resend).not.toHaveBeenCalled();
     });
 
-    // The popup footer is detected ONLY as the bottom-most UI line. A task body that merely quotes
-    // "Press enter to insert or esc to close" (e.g. a prompt describing this very bug) keeps the model
-    // status line below it — it is NOT an open popup, so a swallowed first Enter must still recover.
     it('re-sends Enter when the prompt body quotes the popup footer but the status line is still below it', async () => {
       const held = '› $baxian-pr-review\n  note: Press enter to insert or esc to close\n\n  gpt-5.5 xhigh · ~/repo\n';
       const baseline = buildBaseline(held, 0);
@@ -632,9 +619,6 @@ describe('TmuxManager', () => {
       expect(resend).toHaveBeenCalled();
     });
 
-    // Menu/startup footers a resend must avoid are detected only as the bottom-most line. A task body
-    // that quotes "Enter to select · Esc to cancel" higher up keeps the composer + status line below it,
-    // so a swallowed first Enter must still recover (the quoted footer is not the active UI).
     it('re-sends Enter when the prompt body quotes a menu footer but the composer is held below it', async () => {
       const held = '› $baxian-task\n  describe a menu: Enter to select · Esc to cancel\n'
         + Array.from({ length: 20 }, (_, i) => `  detail line ${i}`).join('\n')
@@ -654,8 +638,6 @@ describe('TmuxManager', () => {
     });
 
     it('detects a Codex completion popup whose footer a narrow pane wrapped across two rows', async () => {
-      // PaneStreamer.resize can narrow the pane until "Press enter to insert or esc to close" wraps;
-      // the footer is still the bottom-most overlay, so the wrapped rows must join into one match.
       const baseline = buildBaseline('› $baxian-pr-review\n  phase: review\n', 0);
       runner.exec.mockResolvedValue({
         stdout: composeSnapStdout('› $baxian-pr-review\n  Build Web Apps [Plugin]\n\n  Press enter to insert or esc\n  to close\n', 0),
@@ -670,8 +652,6 @@ describe('TmuxManager', () => {
     });
 
     it('does NOT re-send Enter once the pane leaves the composer for a menu — detect-only policy', async () => {
-      // First Enter is assumed to have submitted; the runtime then parks on an interactive menu
-      // (NOT busy, NOT the composer). Resending here would answer the menu — forbidden.
       const baseline = buildBaseline('idle composer\n', 0);
       runner.exec.mockResolvedValue({
         stdout: composeSnapStdout('Pick one\nEnter to select · Esc to cancel\n', 0),
@@ -737,7 +717,7 @@ describe('TmuxManager', () => {
         stdout: 'Quick safety check\n❯ 1. Yes, I trust this folder\n',
         stderr: '', exitCode: 0,
       });
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 }); // sendKeys Enter
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });
       const answered = await tmux.handleTrustDialog('%0', 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
       expect(answered).toBe(true);
       const sentKeys = runner.exec.mock.calls[1][0] as string;
@@ -826,6 +806,14 @@ describe('TmuxManager', () => {
         '─ Worked for 4m 02s ─────────────────────────────\n\n' +
           '› Check current PR feedback\n\n' +
           '  o3 high · ~/.baxian/repos/baxian-ai/baxian\n',
+        'codex' as const,
+      ],
+      [
+        'codex: accepts the backtrack hint footer (Esc on an empty composer) as idle/ready',
+        'node\n',
+        '─ Worked for 1m 14s ─────────────────\n\n' +
+          '› Use /skills to list available skills\n\n' +
+          '  esc again to edit previous message\n',
         'codex' as const,
       ],
     ])('%s', async (_label, procTitle, anchor, runtimeKind) => {
@@ -1303,6 +1291,26 @@ describe('hasRuntimeReadyView', () => {
   it('rejects codex → prompt when output follows it', () => {
     expect(hasRuntimeReadyView('→ baxian git:(main)\nStill working on the request...\n', 'codex')).toBe(false);
   });
+
+  it('accepts codex backtrack hint footer (Esc on empty composer) as idle/ready', () => {
+    const screen =
+      '─ Worked for 1m 14s ─────────────────\n\n' +
+      '› Use /skills to list available skills\n\n' +
+      '  esc again to edit previous message\n';
+    expect(hasRuntimeReadyView(screen, 'codex')).toBe(true);
+  });
+
+  it('only treats the backtrack hint as ready when it is the bottom footer (busy marker below → not ready)', () => {
+    const screen =
+      '› Use /skills to list available skills\n\n' +
+      '  esc again to edit previous message\n' +
+      '· Working (8s)\n';
+    expect(hasRuntimeReadyView(screen, 'codex')).toBe(false);
+  });
+
+  it('does not treat the backtrack hint as ready for claude-code', () => {
+    expect(hasRuntimeReadyView('  esc again to edit previous message\n', 'claude-code')).toBe(false);
+  });
 });
 
 describe('runtimeBusyCheck', () => {
@@ -1338,7 +1346,6 @@ describe('runtimeBusyCheck', () => {
 });
 
 describe('hasRuntimeReadyView accepts a cleared bare Codex › only when nothing runtime-owned is on screen', () => {
-  // Cleared composer = a bare › as the last non-blank line, only blanks below (detect/manifests codex_idle_prompt).
   it('treats a bare › (only blank lines below) as a ready idle composer', () => {
     expect(hasRuntimeReadyView('› \n', 'codex')).toBe(true);
     expect(hasRuntimeReadyView('output scrolled up\n›\n\n', 'codex')).toBe(true);
@@ -1357,8 +1364,6 @@ describe('hasRuntimeReadyView accepts a cleared bare Codex › only when nothing
     expect(hasRuntimeReadyView('> require("fs")\n> \n', 'codex')).toBe(false);
   });
 
-  // A `›` with ANY non-blank line below it (ordinary text OR a status footer) is NOT empty — that is the
-  // with-text idle form (handled by the ready-anchor), not a cleared composer. No footer-below special case.
   it('does NOT treat a bare › as ready when ordinary user text follows it (pasted/leftover transcript)', () => {
     expect(hasRuntimeReadyView('›\nplease finish the refactor\n', 'codex')).toBe(false);
     expect(hasRuntimeReadyView('some output\n›\nleftover line\n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
@@ -1400,16 +1405,15 @@ describe('hasRuntimeIdleComposerPrompt', () => {
 
   it('matches a bare › empty composer — only blank lines may follow (col-0 OR indented marker)', () => {
     expect(hasRuntimeIdleComposerPrompt('› \n', 'codex')).toBe(true);
-    expect(hasRuntimeIdleComposerPrompt('  ›\n', 'codex')).toBe(true);                              // Codex indents the marker
-    expect(hasRuntimeIdleComposerPrompt('old output\n  ›\n\n', 'codex')).toBe(true);               // bottom bare › + blanks
-    expect(hasRuntimeIdleComposerPrompt('› with text\n', 'codex')).toBe(false);                    // not empty → not idle
-    expect(hasRuntimeIdleComposerPrompt('› \n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);   // footer below bare › → not the empty form
+    expect(hasRuntimeIdleComposerPrompt('  ›\n', 'codex')).toBe(true);
+    expect(hasRuntimeIdleComposerPrompt('old output\n  ›\n\n', 'codex')).toBe(true);
+    expect(hasRuntimeIdleComposerPrompt('› with text\n', 'codex')).toBe(false);
+    expect(hasRuntimeIdleComposerPrompt('› \n  gpt-5.5 xhigh · ~/repo\n', 'codex')).toBe(false);
   });
 
   it('a bare › is empty only when ONLY blank lines follow — any non-blank line below means dirty', () => {
     expect(hasRuntimeIdleComposerPrompt('›\nleftover user text\n', 'codex')).toBe(false);
-    expect(hasRuntimeIdleComposerPrompt('›\nold output\n› still typing\n', 'codex')).toBe(false);  // bottom prompt not bare
-    // bottom line is a bare (indented) › with nothing below → the cleared composer; older content scrolled up
+    expect(hasRuntimeIdleComposerPrompt('›\nold output\n› still typing\n', 'codex')).toBe(false);
     expect(hasRuntimeIdleComposerPrompt('› old typing\n  wrapped\n  ›\n', 'codex')).toBe(true);
   });
 
@@ -1527,7 +1531,6 @@ describe('hasActiveSpinnerInTail (active-region-scoped, used for stuck-busy)', (
 
   it('does NOT match a quoted/leftover spinner high in scrollback above an idle prompt', () => {
     const screen = ['· Wrangling… (24s)', ...Array(12).fill(''), '❯ '].join('\n');
-    // spinner is present anywhere (hasActiveSpinner true) but NOT in the active tail region.
     expect(hasActiveSpinner(screen)).toBe(true);
     expect(hasActiveSpinnerInTail(screen)).toBe(false);
   });

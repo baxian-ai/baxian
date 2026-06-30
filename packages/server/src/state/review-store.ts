@@ -5,9 +5,6 @@ import type { ReviewRound, TaskPhase } from '../shared/index.js';
 const ROUND_FILE_RE = /^round-(\d+)\.json$/;
 const PHASES: readonly TaskPhase[] = ['spec', 'code'];
 
-// Server-mode review persistence: state/reviews/{taskId}/{phase}/round-N.json.
-// Phase subdirs prevent spec round-1 colliding with code round-1 (reviewRound
-// resets to 0 on the spec→code transition). Data outlives the task (audit).
 export class ReviewStore {
   private readonly memory = new Map<string, ReviewRound>();
 

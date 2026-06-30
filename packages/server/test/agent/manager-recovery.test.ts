@@ -115,7 +115,6 @@ async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles>
   return { removeSpy, watchSpy };
 }
 
-// Common rollback outcome: task reopened to pending, binding + lock cleared.
 async function expectRolledBack(taskId: string, agentId: string): Promise<void> {
   expect((await taskStore.get(taskId))?.status).toBe('pending');
   expect((await agentStore.get(agentId))?.taskId).toBeUndefined();
@@ -152,7 +151,6 @@ afterEach(async () => {
 
 describe('recover()', () => {
   it('revalidates persisted bindings and clears creationToken on success', async () => {
-    // legacy binding: no bootstrappingTaskId → revalidate the live REPL, don't roll back
     const { watchSpy } = await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-1', creationToken: 'tok' }],
       tasks: [{ id: 'task-1' }],
@@ -190,13 +188,12 @@ describe('recover()', () => {
   });
 
   it('preserves Held state (status=awaiting_human + awaitingPhase/Reason/Since) when recovering an ack_unknown agent with active bound task', async () => {
-    // REPL-ready doesn't prove the prompt finished; operator must keep Resume/cancel/DELETE. Only dialog_pending is resolved by recover.
     await runRecovery({
       agents: [{
         id: 'qa-1', taskId: 'task-active', paneId: '%0', status: 'awaiting_human',
         awaitingPhase: 'dispatch-failed:ack_unknown', awaitingReason: 'simulated ack_unknown', awaitingSince: NOW,
       }],
-      tasks: [{ id: 'task-active', preferredAgentId: 'qa-1', agentId: 'qa-1', reviewRound: 1, status: 'review' }], // active
+      tasks: [{ id: 'task-active', preferredAgentId: 'qa-1', agentId: 'qa-1', reviewRound: 1, status: 'review' }],
       locks: ['qa-1'],
     });
 
@@ -206,18 +203,17 @@ describe('recover()', () => {
     expect(state?.awaitingReason).toBe('simulated ack_unknown');
     expect(state?.awaitingSince).toBe(NOW);
     expect(state?.taskId).toBe('task-active');
-    expect(state?.paneId).toBe('%1'); // pane 已刷新到 recover 探到的最新 id
+    expect(state?.paneId).toBe('%1');
     expect(await lockManager.isLocked('qa-1')).toBe(true);
   });
 
   it('preserves Held state for agent_dialog_pending + active bound task (crash window before task fail)', async () => {
-    // Crash between markAwaitingHuman and transitionTaskStatus leaves a real Held state; recover must preserve it, not silently clear.
     await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-active', paneId: '%0', status: 'awaiting_human',
         awaitingPhase: 'agent_dialog_pending', awaitingReason: 'CLI update notice', awaitingSince: NOW,
       }],
-      tasks: [{ id: 'task-active' }], // active
+      tasks: [{ id: 'task-active' }],
       locks: ['dev-1'],
     });
 
@@ -230,7 +226,6 @@ describe('recover()', () => {
   });
 
   it('clears Held state (status=ok) when recovering an agent_dialog_pending agent (recover dismissed the dialog)', async () => {
-    // 对比测：agent_dialog_pending 是 recover 直接解决的 phase——ensureSession 成功 = dialog 已 dismissed → 切 ok。
     await runRecovery({
       agents: [{
         id: 'dev-1', paneId: '%0', status: 'awaiting_human',
@@ -239,7 +234,6 @@ describe('recover()', () => {
     });
 
     const state = await agentStore.get('dev-1');
-    // status='ok' 在 normalizeBinding 内被规范化为 undefined（status 字段只存 awaiting_human）
     expect(state?.status).toBeUndefined();
     expect(state?.awaitingPhase).toBeUndefined();
     expect(state?.awaitingReason).toBeUndefined();
@@ -247,7 +241,6 @@ describe('recover()', () => {
   });
 
   it('rolls back a mid-bootstrap develop task even when recovery rebuilds a fresh REPL (marker set)', async () => {
-    // Marker present → roll back regardless of freshRuntime: the prompt never ran, so no work is lost.
     const { watchSpy } = await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-1', startedAt: NOW, bootstrappingTaskId: 'task-1' }],
       tasks: [{ id: 'task-1' }],
@@ -261,7 +254,6 @@ describe('recover()', () => {
   });
 
   it('does NOT roll back / remove worktree for a delivered task whose REPL was lost (freshRuntime=true, no marker)', async () => {
-    // No marker (delivered) → freshRuntime alone must not remove completed-but-unpushed work; leave it intact.
     const { removeSpy, watchSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW,
@@ -281,7 +273,6 @@ describe('recover()', () => {
   });
 
   it('rolls back an in_progress develop task whose live REPL is mid-bootstrap (bootstrappingTaskId set, never ack\'d)', async () => {
-    // Crash before injectAndAwaitAck: recover adopts the live REPL (freshRuntime=false) but the marker says undelivered → roll back.
     const { watchSpy } = await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0', bootstrappingTaskId: 'task-1' }],
       tasks: [{ id: 'task-1' }],
@@ -294,10 +285,6 @@ describe('recover()', () => {
   });
 
   it('removes the orphaned worktree before rolling back a mid-bootstrap recovery task (else re-dispatch hits a busy branch)', async () => {
-    // startSession had already created+persisted the worktree (branch bx/task-1) and the bootstrap marker
-    // before the crash. The rollback must `git worktree remove` it first — rollbackFailedDispatch only
-    // drops the field — or the next dispatch's `git worktree add -B bx/task-1` fails on the busy branch.
-    // Capture binding at removal time to prove the worktree is gone BEFORE the binding is cleared.
     let boundWhenRemoved: string | undefined;
     const { removeSpy } = await runRecovery({
       agents: [{
@@ -316,7 +303,6 @@ describe('recover()', () => {
   });
 
   it('does NOT roll back a legacy in_progress binding (no bootstrap marker) on a live REPL — leaves worktree + binding intact', async () => {
-    // Missing marker on a live REPL = older-build prompt may be running; removing its worktree would re-dispatch a duplicate.
     const { removeSpy, watchSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
@@ -335,7 +321,6 @@ describe('recover()', () => {
   });
 
   it('rolls back a mid-bootstrap task that comes back blocked on a startup dialog (not held forever)', async () => {
-    // Marker says never-ack'd + active task can't Resume past a dialog → roll back, don't markDialogPending.
     const dialogSpy = vi.spyOn(
       manager as never as { markDialogPending: (...a: unknown[]) => Promise<void> }, 'markDialogPending',
     ).mockResolvedValue(undefined);
@@ -357,7 +342,6 @@ describe('recover()', () => {
   });
 
   it('rolls back a mid-bootstrap task previously held on a dialog once its REPL recovers (marker still set)', async () => {
-    // Held awaiting_human must not shield the never-ack'd marker from rollback once the dialog resolves.
     await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
@@ -370,14 +354,12 @@ describe('recover()', () => {
 
     await expectRolledBack('task-1', 'dev-1');
     const rolled = await agentStore.get('dev-1');
-    // Held state must be cleared too, else the now-unbound agent stays non-dispatchable (no Resume needed).
     expect(rolled?.status).toBeUndefined();
     expect(rolled?.awaitingPhase).toBeUndefined();
     expect(canDispatchWithBinding(rolled)).toBe(true);
   });
 
   it('does NOT roll back a mid-bootstrap task when a session.started event proves delivery (stale marker)', async () => {
-    // A durable session.started event overrides a stale marker: recover clears the marker and re-attaches.
     const { removeSpy, watchSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
@@ -395,14 +377,12 @@ describe('recover()', () => {
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     const reattached = await agentStore.get('dev-1');
     expect(reattached?.taskId).toBe('task-1');
-    expect(reattached?.bootstrappingTaskId).toBeUndefined(); // stale marker cleared
+    expect(reattached?.bootstrappingTaskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(watchSpy).toHaveBeenCalledWith('dev-1');
   });
 
   it('does NOT roll back a delivered task held on a failed marker-clear (bootstrap-marker-clear-failed)', async () => {
-    // Marker present but the hold phase says the prompt WAS delivered (clear write blipped) — its prompt is
-    // running, so preserve the binding + worktree; recover must not treat it as never-delivered.
     const { removeSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
@@ -590,16 +570,12 @@ describe('setupRecoveredSpecSignals()', () => {
     return { watcher, events: localEvents };
   }
 
-  // Each row arms exactly one task and asserts watcher.start receives the matching options.
-  // spec-review rows use objectContaining because onReadFile is a fresh closure per call.
   it.each<[string, Partial<TaskState> & { id: string }, unknown]>([
     ['sets up spec-done|pr-created when phase is undefined (pre-spec-review) and status is in_progress',
       { id: 'task-1', signalToken: 'tok-ready' },
       {
         taskId: 'task-1', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-done', 'pr-created'], token: 'tok-ready',
-        // pre-spec spec-done has only the pane channel (no poller backstop, agents
-        // don't re-emit), so the snapshot must be scanned on recovery.
         skipSnapshot: false, recovered: true,
       }],
     ['sets up pr-created for code-phase tasks (dispatched after spec approval)',
@@ -613,8 +589,6 @@ describe('setupRecoveredSpecSignals()', () => {
       expect.objectContaining({
         taskId: 'task-2', projectId: 'proj', agentId: 'qa-1',
         expectedKinds: ['spec-reviewed'], token: 'tok-review',
-        // spec phase always uses server protocol (pane signals are the only verdict
-        // channel — no poller backstop), so snapshot scan and read-file are enabled.
         skipSnapshot: false, onReadFile: expect.any(Function), recovered: true,
       })],
     ['sets up spec-fixed for spec-phase fixing tasks',
@@ -622,7 +596,6 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-3', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-fixed'], token: 'tok-fix',
-        // spec phase always uses server protocol — scan snapshot on recovery.
         skipSnapshot: false, recovered: true,
       }],
     ['sets up pr-fixed for code-phase fixing tasks',
@@ -630,19 +603,13 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-code-fix', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['pr-fixed'], token: 'tok-prfix',
-        // pr-fixed is a one-shot completion signal: scan snapshot on recovery so an
-        // already-echoed signal isn't lost (handler is replay-safe via token+status).
         skipSnapshot: false, recovered: true,
       }],
-    // phase undefined or 'code' is both fine; 'spec' is excluded.
     ['sets up PR verdict-choice {pr-approved, pr-changes-requested} for review-phase tasks with qaAgentId',
       { id: 'task-pr-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review', signalToken: 'tok-verdict', prNumber: 50 },
       {
         taskId: 'task-pr-review', projectId: 'proj', agentId: 'qa-1',
         expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'tok-verdict',
-        // PR verdict recovery scans the snapshot: QA may have echoed before
-        // review.submitted persisted, so we re-read scrollback (token rotation
-        // gates stale verdicts). Other phases stay skipSnapshot=true.
         skipSnapshot: false, recovered: true,
       }],
     ['sets up snapshot scan and read-file for github spec-review tasks',
@@ -705,7 +672,6 @@ describe('setupRecoveredSpecSignals()', () => {
 
     await manager.setupRecoveredSpecSignals();
 
-    // 唯一任务 → calls[0] 稳定；objectContaining 无法断言键不存在，需 raw access。
     const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
     expect(args.expectedKinds).toEqual(['pr-created']);
     expect(args.skipSnapshot).toBe(true);
@@ -718,13 +684,11 @@ describe('setupRecoveredSpecSignals()', () => {
 
     await manager.setupRecoveredSpecSignals();
 
-    // watcher 应 set up spec-done|pr-created (auto fire 仍可工作)。
     expect(watcher.start).toHaveBeenCalledTimes(1);
     expect(watcher.start.mock.calls[0]![0]).toMatchObject({
       expectedKinds: ['spec-done', 'pr-created'],
       token: 'tok-pre-spec',
     });
-    // 但 intervention 不应 emit — pre-spec 阶段等不到 signal 不算 stuck。
     const setupInterventions = localEvents.filter(e =>
       e.type === 'human.intervention'
       && (e.data.phase as string) === 'spec-signal-setup-during-recovery',

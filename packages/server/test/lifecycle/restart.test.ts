@@ -10,7 +10,6 @@ vi.mock('node:child_process', async () => {
   return { ...actual, spawn: vi.fn() };
 });
 
-// Default mock forwards so happy-path tests can inspect the sentinel file.
 vi.mock('../../src/lifecycle/restart-sentinel.js', async () => {
   const actual = await vi.importActual<
     typeof import('../../src/lifecycle/restart-sentinel.js')

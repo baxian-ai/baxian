@@ -26,8 +26,6 @@ export default defineConfig({
   },
   server: {
     port: 8123,
-    // Fail fast on port conflict instead of silently jumping to 8124+; ops docs
-    // (`lsof -iTCP:8123`) and systemd unit both assume vite actually binds to 8123.
     strictPort: true,
     proxy: {
       '/api': {

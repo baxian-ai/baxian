@@ -33,8 +33,6 @@ export class EventBus {
     }
   }
 
-  // Persisted events for date range [from, to] (YYYY-MM-DD). The log lives in its own files, so it
-  // survives an agent-store-specific write failure — recover() uses it as durable delivery proof.
   async readRange(from: string, to: string): Promise<BaxianEvent[]> {
     return this.log.readRange(from, to);
   }

@@ -31,7 +31,6 @@ describe('detectImageType', () => {
   it('returns null for non-image / empty buffers', () => {
     expect(detectImageType(Buffer.from('not an image at all'))).toBeNull();
     expect(detectImageType(Buffer.alloc(0))).toBeNull();
-    // RIFF without WEBP tag (e.g. a WAV) must not pass.
     expect(detectImageType(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE')]))).toBeNull();
   });
 });
@@ -97,7 +96,6 @@ describe('writeImageToHost', () => {
     expect(command).toContain('cat >');
     expect(command).toContain(path);
     expect((stdin as Buffer).equals(big)).toBe(true);
-    // The bytes must NOT be embedded in the command string (would blow MAX_ARG_STRLEN).
     expect((command as string).includes(big.toString('base64'))).toBe(false);
     expect(Buffer.byteLength(command as string, 'utf8')).toBeLessThan(4096);
   });

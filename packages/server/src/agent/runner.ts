@@ -11,7 +11,6 @@ export interface ExecResult {
   exitCode: number;
 }
 
-// login-interactive matches tmux pane PATH; login skips banners.
 export type RemoteShellMode = 'login' | 'login-interactive';
 
 export interface ExecOptions {
@@ -20,14 +19,12 @@ export interface ExecOptions {
   maxBuffer?: number;
   remoteShell?: RemoteShellMode;
   stdin?: Buffer;
-  // Extra env merged over process.env for the spawned shell. Carries SSH_ASKPASS for password hosts.
   env?: Record<string, string>;
 }
 
 export interface CommandRunner {
   exec(command: string, options?: ExecOptions): Promise<ExecResult>;
   writeFile(path: string, content: Buffer | string): Promise<void>;
-  /** stdin bypasses argv ARG_MAX (~1MB). */
   execWithStdin(command: string, stdin: Buffer, options?: ExecOptions): Promise<ExecResult>;
 }
 
@@ -79,13 +76,11 @@ function runShell(command: string, options: ExecOptions): Promise<ExecResult> {
       options.signal.addEventListener('abort', onUserAbort, { once: true });
     }
 
-    // detached → process-group kill prevents orphaning ssh/git children.
     const child = spawn('/bin/bash', ['-c', command], {
       detached: true,
       ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
     });
     if (options.stdin) {
-      // EPIPE on child exit during write — convert to abort.
       child.stdin?.on('error', () => {
         bufferExceeded = false;
         internalAbort.abort();
@@ -101,7 +96,6 @@ function runShell(command: string, options: ExecOptions): Promise<ExecResult> {
       try {
         process.kill(-child.pid, sig);
       } catch {
-        // group already gone
       }
     };
 
@@ -173,20 +167,12 @@ function runShell(command: string, options: ExecOptions): Promise<ExecResult> {
   });
 }
 
-// OpenSSH ControlMaster lets a backlog of short commands share one TCP+SSH session per target,
-// cutting per-call TCP handshake + key exchange (~tens-of-ms each on LAN, much more on WAN).
-// Caveats this design accepts: socket lives under the local user's HOME (multi-user boxes get
-// per-user mux pools), and a crashed master leaves a stale socket — ControlMaster=auto detects
-// and falls back to a fresh connection in that case.
 const SSH_MUX_DIR = join(homedir(), '.baxian', 'ssh-mux');
 const SSH_CONTROL_PERSIST = '5m';
 
 let muxDirReady: Promise<void> | undefined;
 export function ensureMuxDir(): Promise<void> {
   if (!muxDirReady) {
-    // Read-only HOME / permission glitches must not strand the whole SSH path:
-    // ControlMaster=auto falls back to a fresh TCP connection when ControlPath is
-    // unreachable. Log + reset the singleton so a transient failure can recover next call.
     muxDirReady = mkdir(SSH_MUX_DIR, { recursive: true, mode: 0o700 })
       .then(() => undefined)
       .catch(err => {
@@ -197,13 +183,10 @@ export function ensureMuxDir(): Promise<void> {
   return muxDirReady;
 }
 
-// Test-only: reset the singleton so each spec exercises the first-call path.
 export function __resetMuxDirReadyForTests(): void {
   muxDirReady = undefined;
 }
 
-// Helper ssh invokes for the password: SSH_ASKPASS reads it from the child env (BAXIAN_SSH_PASSWORD),
-// so the secret never lands in argv (the sshpass `ps`-leak) or logs. OpenSSH 8.4+ + REQUIRE=force.
 const SSH_ASKPASS_PATH = join(homedir(), '.baxian', 'ssh-askpass');
 const SSH_ASKPASS_SCRIPT = '#!/bin/sh\nprintf \'%s\\n\' "$BAXIAN_SSH_PASSWORD"\n';
 let askpassReady: Promise<string> | undefined;
@@ -222,12 +205,10 @@ export function ensureAskpassHelper(): Promise<string> {
   return askpassReady;
 }
 
-// Test-only: reset the singleton so each spec exercises the first-call path.
 export function __resetAskpassReadyForTests(): void {
   askpassReady = undefined;
 }
 
-// Resolve an agent's host reference (registry id) — or a legacy inline host object — to a HostConfig.
 export function resolveAgentHost(
   hosts: HostConfig[] | undefined,
   ref: string | HostConfig | undefined,
@@ -237,9 +218,6 @@ export function resolveAgentHost(
   return ref;
 }
 
-// Cache/grouping key shared by RepoStore + bootstrap so the same physical machine de-dups.
-// "no explicit port" must NOT collapse to ":22": such a host honors ~/.ssh/config's Port
-// (the SSH builders omit -p), so it may reach a different machine than an explicit-22 registry host.
 export function hostGroupKey(mode: AgentMode, host: HostConfig | undefined): string {
   if (mode === 'local') return 'local';
   if (!host) return 'remote:';
@@ -253,8 +231,6 @@ export function sshTarget(host: HostConfig): string {
   return host.user ? `${host.user}@${host.hostname}` : host.hostname;
 }
 
-// Env for the spawned ssh: password hosts get SSH_ASKPASS (force) so auth is non-interactive
-// without exposing the secret in argv. Key hosts get nothing (rely on ~/.ssh / agent).
 export async function sshEnv(host: HostConfig | undefined): Promise<Record<string, string>> {
   if (!host?.password) return {};
   const helper = await ensureAskpassHelper();
@@ -266,12 +242,8 @@ export async function sshEnv(host: HostConfig | undefined): Promise<Record<strin
   };
 }
 
-// Targets we've opened a ControlMaster mux to, so shutdown can converge them (keyed by target:port).
 const activeMuxTargets = new Map<string, { target: string; port: number | undefined }>();
 
-// Tell each persisted master to exit instead of lingering for ControlPersist (5m) past
-// process death. Best-effort: a missing socket means the master already exited; a peer
-// instance sharing HOME just reconnects via ControlMaster=auto.
 export async function closeSshMux(local: CommandRunner = new LocalRunner()): Promise<void> {
   const targets = [...activeMuxTargets.values()];
   activeMuxTargets.clear();
@@ -284,25 +256,19 @@ export async function closeSshMux(local: CommandRunner = new LocalRunner()): Pro
         { timeout: 3000 },
       );
     } catch {
-      // master already gone / socket missing — nothing to converge
     }
   }));
 }
 
-// Test-only: drop tracked targets between specs.
 export function __resetMuxTargetsForTests(): void {
   activeMuxTargets.clear();
 }
 
 export interface BuildSshOptionsArgs {
   connectTimeoutSec?: number;
-  // Force a fresh authenticated connection (no mux reuse) — connectivity checks need this so a
-  // lingering authenticated master can't make a wrong updated password pass `ssh echo ok`.
   noMux?: boolean;
 }
 
-// Auth -o flags: key hosts fail fast (BatchMode); password hosts allow askpass (force) + auto-accept
-// a new host key so the yes/no prompt doesn't get the password as its answer.
 export function sshAuthArgs(host: HostConfig | undefined): string[] {
   if (host?.password) {
     return [
@@ -314,9 +280,6 @@ export function sshAuthArgs(host: HostConfig | undefined): string[] {
   return ['-o', 'BatchMode=yes'];
 }
 
-// Canonical ssh option args (for spawn): -o pairs + -p port, host-aware (BatchMode vs askpass).
-// -p is emitted ONLY when the host supplies a port; a host with no port (form left blank, or a
-// legacy inline host) keeps honoring its ~/.ssh/config `Port`.
 export function buildSshArgs(host: HostConfig | undefined, args: BuildSshOptionsArgs = {}): string[] {
   const connectTimeoutSec = args.connectTimeoutSec ?? 10;
   const out: string[] = [...sshAuthArgs(host)];
@@ -338,8 +301,6 @@ export function buildSshArgs(host: HostConfig | undefined, args: BuildSshOptions
   return out;
 }
 
-// String form for `bash -c` command lines. Only the ControlPath value is shell-quoted (a HOME with
-// spaces must stay one argv); other -o values are metachar-free, kept bare to match the original format.
 export function buildSshOptions(host: HostConfig | undefined, args: BuildSshOptionsArgs = {}): string {
   const connectTimeoutSec = args.connectTimeoutSec ?? 10;
   const parts: string[] = [sshAuthArgs(host).join(' ')];
@@ -391,13 +352,10 @@ export class SshRunner implements CommandRunner {
     return this.local.exec(ssh, await this.withSshEnv(options));
   }
 
-  // openssl avoids GNU/BSD base64 flag drift; payloads must stay below ARG_MAX.
   async writeFile(filePath: string, content: Buffer | string): Promise<void> {
     const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
     const b64 = buf.toString('base64');
     const eof = `BAXIAN_EOF_${randomBytes(4).toString('hex')}`;
-    // Run the heredoc under POSIX `sh`: wrapRemoteCommand hands this to the user's login shell
-    // ($SHELL -l -c), and fish has no `<<EOF` heredocs — a fish login host would fail every write.
     const inner =
       `mkdir -p ${shellQuote(dirname(filePath))} && ` +
       `openssl base64 -d -A > ${shellQuote(filePath)} <<'${eof}'\n${b64}\n${eof}`;
@@ -407,7 +365,6 @@ export class SshRunner implements CommandRunner {
     }
   }
 
-  /** Login wrapper may consume stdin via rc — use execRawRemoteWithStdin for clean stdin. */
   async execWithStdin(
     command: string,
     stdin: Buffer,
@@ -420,7 +377,6 @@ export class SshRunner implements CommandRunner {
     return this.local.execWithStdin(ssh, stdin, await this.withSshEnv(options));
   }
 
-  /** No login wrapper — clean stdin for load-buffer; remote runs with non-login PATH. */
   async execRawRemoteWithStdin(
     remoteCommand: string,
     stdin: Buffer,
@@ -437,7 +393,6 @@ export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-// sh as outer shell so fish accepts the $SHELL handoff.
 export function wrapRemoteCommand(command: string, mode: RemoteShellMode = 'login'): string {
   const flags = mode === 'login-interactive' ? '-l -i -c' : '-l -c';
   const inner = `exec "\${SHELL:-/bin/sh}" ${flags} "$1"`;

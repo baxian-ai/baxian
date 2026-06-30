@@ -41,12 +41,10 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   };
 }
 
-// The canonical valid create payload; spread + override per case.
 function createPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { projectId: 'proj', title: 't', description: 'd', preferredAgentId: 'dev-1', ...overrides };
 }
 
-// Persist a task built from makeTask overrides — the dominant arrange step in this file.
 function seedTask(overrides: Partial<TaskState> = {}): Promise<void> {
   return app.ctx.taskStore.set(makeTask(overrides));
 }
@@ -71,7 +69,6 @@ describe('POST /api/tasks with images', () => {
     expect((spy.mock.calls[0][1] as { images?: unknown[] }).images).toHaveLength(TASK_IMAGE_MAX_COUNT);
   });
 
-  // Each rejected image payload → 400 before dispatch. `images` built per-row to keep buffer construction explicit.
   it.each([
     ['more than the max image count', () => Array.from({ length: TASK_IMAGE_MAX_COUNT + 1 }, () => ({ dataBase64: PNG_B64 }))],
     ['a non-image payload', () => [{ dataBase64: Buffer.from('not an image').toString('base64') }]],
@@ -180,7 +177,6 @@ describe('GET /api/tasks', () => {
       const response = await get('/api/tasks?projectId=proj&category=active');
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body) as { tasks: TaskState[] };
-      // the timestamped task sorts before the timestamp-less one under desc order.
       expect(body.tasks.map((t) => t.id)).toEqual(['task-001', 'task-002']);
     });
   });
@@ -221,7 +217,6 @@ describe('GET /api/tasks', () => {
       for (let i = 1; i <= 25; i += 1) {
         await seedTask({ id: `task-${String(i).padStart(3, '0')}`, status: 'merged' });
       }
-      // open 任务不应出现在 done 列表里
       await seedTask({ id: 'task-999', status: 'in_progress' });
 
       const response = await get('/api/tasks?projectId=proj&category=done');
@@ -374,7 +369,6 @@ describe('POST /api/tasks', () => {
     );
   });
 
-  // Payload validation that rejects before reaching the manager. Each row: [label, body, status, errorMatch].
   it.each([
     ['title + issueNumber → 400 mutually exclusive', createPayload({ title: 'x', description: 'y', issueNumber: 5 }), 400, /mutually exclusive/],
     ['only issueNumber → 400 (issue-bound unsupported)', { projectId: 'proj', issueNumber: 5 }, 400, undefined],
@@ -402,7 +396,6 @@ describe('POST /api/tasks', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  // Empty/whitespace preferredAgentId (and omission) all resolve to the unassigned-create path → 201.
   it.each([
     ['missing preferredAgentId → 201', { projectId: 'proj', title: 't', description: 'd' }, 'task-unassigned'],
     ['empty preferredAgentId → 201', createPayload({ preferredAgentId: '' }), 'task-empty'],
@@ -431,7 +424,7 @@ describe('POST /api/tasks', () => {
     const response = await post('/api/tasks', createPayload({ preferredAgentId: '  dev-1  ' }));
     expect(response.statusCode).toBe(201);
     expect(createSpy).toHaveBeenCalledWith('proj', expect.objectContaining({
-      preferredAgentId: 'dev-1', // trimmed
+      preferredAgentId: 'dev-1',
     }), { background: true });
   });
 
@@ -548,7 +541,6 @@ describe('POST /api/tasks/:id/dispatch', () => {
     expect(spy).toHaveBeenCalledWith('task-pending', undefined);
   });
 
-  // Manager returns an errorCode → route surfaces it verbatim (no body-shape guard fires first).
   it.each([
     ['unassigned task, no agentId → 400', 'task-unassigned', {},
       { task: null, errorCode: 400, error: 'Task task-unassigned has no preferredAgentId; agentId is required in request body' }, 400, /agentId is required/],
@@ -567,7 +559,6 @@ describe('POST /api/tasks/:id/dispatch', () => {
     expect(response.statusCode).toBe(404);
   });
 
-  // Body-shape guards reject before any manager call.
   it.each([
     ['primitive number body → 400', 123 as unknown, undefined, 400, /JSON object/],
     ['array body → 400', ['dev-1'] as unknown, undefined, 400, undefined],
@@ -633,7 +624,6 @@ describe('PATCH /api/tasks/:id', () => {
     expect(spy).toHaveBeenCalledWith('task-001', { preferredAgentId: 'dev-2' });
   });
 
-  // Pure PATCH body validation, rejected before manager. Each row: [label, body, errorMatch].
   it.each([
     ['title all-whitespace → 400 1-200', { title: '   ' }, /1-200/],
     ['title over 200 → 400', { title: 'x'.repeat(201) }, undefined],
@@ -757,7 +747,7 @@ describe('POST /api/tasks - op-aware gates', () => {
 
   it('previewPromptBytesForTaskInput returns over-limit → 400', async () => {
     vi.spyOn(app.ctx.agentManager, 'previewPromptBytesForTaskInput')
-      .mockReturnValue(100 * 1024); // > MAX_PROMPT_BYTES_ROUTE_LIMIT (79KB)
+      .mockReturnValue(100 * 1024);
 
     const response = await post('/api/tasks', createPayload({
       title: 'tiny title',

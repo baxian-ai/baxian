@@ -32,7 +32,6 @@ function taskIdNum(id: string): number {
   return match ? parseInt(match[1], 10) : Number.NaN;
 }
 
-// Numeric task-NNN order; non-conforming ids fall back to a stable string compare.
 function compareTaskId(a: TaskState, b: TaskState, dir: 1 | -1): number {
   const na = taskIdNum(a.id);
   const nb = taskIdNum(b.id);
@@ -40,8 +39,6 @@ function compareTaskId(a: TaskState, b: TaskState, dir: 1 | -1): number {
   return (na - nb) * dir;
 }
 
-// Recently-updated first; tolerates legacy tasks that lack updatedAt (sanitizeTask
-// drops missing fields), tie-breaking on id so the order stays deterministic.
 function compareByUpdatedDesc(a: TaskState, b: TaskState): number {
   const cmp = (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '');
   return cmp !== 0 ? cmp : compareTaskId(a, b, -1);
@@ -58,9 +55,6 @@ function paginate(pool: TaskState[], rawOffset: string | undefined): TaskPage {
   };
 }
 
-// Every task-list query returns at most TASK_LIST_PAGE_SIZE rows; the category /
-// status filter picks the pool and its sort. Default (no filter) = open working
-// set, active first.
 function selectTaskPool(all: TaskState[], category?: string, status?: TaskStatus): TaskState[] {
   if (status) {
     return all.filter((t) => t.status === status).sort((a, b) => compareTaskId(a, b, -1));
@@ -153,7 +147,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: `title must be 1-${TITLE_MAX_LEN} characters` });
     }
     if (/[\r\n]/.test(titleTrimmed)) {
-      // Title is embedded as a single line in the prompt's <task> block.
       return reply.status(400).send({ error: 'title must be a single line (no \\r or \\n)' });
     }
 
@@ -194,8 +187,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       preferredAgentId: preferredAgentIdTrimmed,
     });
 
-    // Validate + decode images in the route (the authoritative gate);
-    // pass ready bytes to the manager, which persists them before any dispatch.
     let decodedImages: { bytes: Buffer; ext: string }[] | undefined;
     if (body.images !== undefined) {
       if (!Array.isArray(body.images)) {
@@ -218,8 +209,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    // Return as soon as the task record exists; the agent bootstrap runs in the background so the
-    // create UI isn't blocked on tens of seconds of worktree/REPL startup (the task list tracks it live).
     const task = await app.ctx.agentManager.createAndStartTask(projectIdTrimmed, {
       title: titleTrimmed,
       description: descriptionTrimmed,
@@ -265,13 +254,11 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(202).send(updated);
   });
 
-  // Manually finish a max_rounds task: merge its PR + run the normal post-merge cleanup.
   app.post<{ Params: { id: string } }>('/tasks/:id/complete', async (request, reply) => {
     const updated = await app.ctx.agentManager.markTaskComplete(request.params.id);
     return reply.status(202).send(updated);
   });
 
-  // Review-round history (ReviewStore); [] when the task has no recorded rounds (unknown task / no spec or server review ran).
   app.get<{ Params: { id: string } }>('/tasks/:id/reviews', async (request, reply) => {
     const store = app.ctx.agentManager.getReviewStore();
     if (!store) return reply.send([]);
@@ -279,7 +266,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(rounds);
   });
 
-  // Manually push a max_rounds task through one more dev fix round (→ QA review).
   app.post<{ Params: { id: string } }>('/tasks/:id/continue', async (request, reply) => {
     const updated = await app.ctx.agentManager.continueDevRound(request.params.id);
     return reply.status(202).send(updated);

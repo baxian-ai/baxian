@@ -1,6 +1,6 @@
 {
   "name": "baxian",
-  "version": "1.2.25",
+  "version": "1.2.26",
   "description": "AI agent orchestration",
   "license": "Apache-2.0",
   "repository": {
@@ -21,7 +21,7 @@
   ],
   "scripts": {
     "build": "pnpm -r build",
-    "test": "pnpm -r test && npm run test:docs",
+    "test": "pnpm -r test && pnpm run test:docs",
     "test:docs": "node --test docs/scripts/*.test.mjs",
     "test:coverage": "pnpm -r --if-present test:coverage",
     "lint": "eslint .",

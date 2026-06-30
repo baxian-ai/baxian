@@ -8,7 +8,6 @@ import type { AgentRole } from '../shared/index.js';
 export interface SkillFile {
   relPath: string;
   content: Buffer;
-  // UTF-8-decoded text; binaries are rejected at scan.
   text: string;
 }
 
@@ -17,7 +16,6 @@ export interface SkillDef {
   dir: string;
   path: string;
   content: string;
-  // Frontmatter `description` field; empty string when missing.
   description: string;
   files: SkillFile[];
 }
@@ -30,7 +28,6 @@ export class SkillScanError extends Error {
 }
 
 const MAX_SKILL_FILE_BYTES = 100 * 1024;
-// XML 1.0 illegal control chars (tab/LF/CR valid; everything else in 0x00-0x1F is not).
 const ILLEGAL_XML = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/u;
 const utf8Strict = new TextDecoder('utf-8', { fatal: true });
 
@@ -53,8 +50,6 @@ function decodeStrictUtf8(path: string, buf: Buffer): string {
   return text;
 }
 
-// Narrow frontmatter parser: pulls a single-line `description: <value>` from the
-// leading `---\n...\n---` block. Avoids a full YAML dependency.
 function parseSkillDescription(content: string): string {
   if (!content.startsWith('---\n')) return firstParagraph(content);
   const end = content.indexOf('\n---', 4);
@@ -101,10 +96,8 @@ async function walk(dir: string, base: string = dir): Promise<SkillFile[]> {
     try {
       s = await lstat(entryPath);
     } catch {
-      continue; // race: entry removed between readdir and lstat
+      continue;
     }
-    // lstat, not stat: our skills are regular files only — a symlink/special
-    // file isn't ours, so skip it rather than follow it out of the tree.
     if (s.isDirectory()) {
       out.push(...(await walk(entryPath, base)));
     } else if (s.isFile()) {
@@ -122,7 +115,6 @@ async function walk(dir: string, base: string = dir): Promise<SkillFile[]> {
 
 export class SkillRegistry {
   private skills = new Map<string, SkillDef>();
-  // skillsDir holds the package-shipped skills (npm packaging puts them next to dist).
   constructor(private skillsDir?: string) {}
 
   async scan(): Promise<void> {
@@ -140,20 +132,16 @@ export class SkillRegistry {
       try {
         s = await lstat(entryPath);
       } catch {
-        continue; // race: entry removed between readdir and lstat
+        continue;
       }
-      // lstat skips a symlinked dir too: a skill dir must be a real directory we own.
       if (!s.isDirectory()) continue;
       const skillFile = join(entryPath, 'SKILL.md');
       let skillStat;
       try {
         skillStat = await lstat(skillFile);
       } catch {
-        continue; // no SKILL.md, or race
+        continue;
       }
-      // SKILL.md must be a real file we own. A symlink would register the skill
-      // (readFile follows it) while walk() skips it, so materialize() never writes
-      // it out — a registered-but-unmaterialized skill the agent can't discover.
       if (!skillStat.isFile()) continue;
       let skillBuf: Buffer;
       try {
@@ -194,10 +182,6 @@ export class SkillRegistry {
     return phaseConfig.skills.filter((name) => this.skills.has(name));
   }
 
-  // Write every scanned skill (SKILL.md + helper files) under destRoot/<name>/<relPath>
-  // so the agent host's `claude`/`codex` REPL discovers them as native skills. `write`
-  // abstracts the transport (CommandRunner.writeFile for SSH/local) so this stays
-  // decoupled from the agent layer. Returns the absolute file paths written.
   async materialize(write: SkillFileWriter, destRoot: string): Promise<string[]> {
     const written: string[] = [];
     for (const def of this.skills.values()) {
@@ -210,8 +194,6 @@ export class SkillRegistry {
     return written;
   }
 
-  // Stable digest of all scanned skill content. The on-host version marker compares
-  // against it so a redeploy with edited skills re-materializes, an unchanged one skips.
   contentHash(): string {
     const h = createHash('sha256');
     for (const name of [...this.skills.keys()].sort()) {
@@ -227,14 +209,8 @@ export class SkillRegistry {
 
 export type SkillFileWriter = (path: string, content: Buffer) => Promise<void>;
 
-// Skills the greeting gate + signal dispatch hard-depend on. The gate is unconditional, so
-// their absence is never a valid "skill-less" deployment — it is a packaging/scan error.
 export const CORE_SKILLS = ['baxian-greeting', 'baxian-signals'] as const;
 
-// Throw at startup when a core skill is missing. An EMPTY registry (dropped skills/ dir or a
-// bad skillsDir) is the worst case and must be fatal too: otherwise the server boots, the gate
-// injects /baxian-greeting that resolves to nothing, and every agent burns the full greeting
-// timeout into greeting_failed instead of the error surfacing loudly at boot.
 export function assertCoreSkillsPresent(registry: SkillRegistry, skillsDir?: string): void {
   const missing = CORE_SKILLS.filter((name) => !registry.has(name));
   if (missing.length === 0) return;

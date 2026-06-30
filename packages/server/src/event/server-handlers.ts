@@ -15,12 +15,7 @@ import { buildBatches, countLines, splitDiffByFile, type DiffFile } from '../age
 import { ReviewExchangeError } from '../agent/review-transport.js';
 import type { PhaseSignalKind } from '../agent/phase-signal.js';
 
-// Server review mode event handlers (spec §6). Fully independent from the
-// github-mode handler chain in handlers.ts — control flow here is command-driven
-// (server reads agent machines via runners), not poller-driven.
 
-// Keep injected diffs inside the 80KB prompt ceiling with headroom for skills
-// and instructions; oversize content truncates with the read-file escape hatch.
 const PROMPT_CONTENT_BYTE_BUDGET = 56 * 1024;
 
 function truncateUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -36,12 +31,7 @@ function aggregateBatchFindings(batches: ReviewFindings[], round: number): Revie
   const used = new Set<string>();
   for (const [i, batch] of batches.entries()) {
     for (const f of batch.findings) {
-      // Recheck rounds restate unresolved findings under their already-namespaced
-      // id (b0-f-1); re-prefixing would drift the id every round (b0-b0-f-1).
       let id = /^b\d+-/.test(f.id) ? f.id : `b${i}-${f.id}`;
-      // A restated b0-f-1 and a NEW batch-0 f-1 would otherwise collide — one
-      // response id would ambiguously cover two findings. Disambiguate with the
-      // round (then a counter) so coverage stays one-to-one.
       if (used.has(id)) {
         let candidate = `b${i}-r${round}-${f.id}`;
         for (let n = 2; used.has(candidate); n++) candidate = `b${i}-r${round}-${f.id}-${n}`;
@@ -94,7 +84,6 @@ async function gate(
   expect: {
     status: TaskState['status'];
     phase: 'spec' | 'code' | 'any';
-    // spec review 总走 server 中转，不受 task.reviewMode 约束。
     requireServerMode: boolean;
   },
 ): Promise<Gate | null> {
@@ -128,11 +117,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   const reviewStore = configured;
   const transport = () => manager.getReviewTransport();
 
-  // Release an agent at a max_rounds pause and clear its TaskState reference —
-  // ONLY when actually unbound. A stale reference on this still-active status
-  // would let the released agent's later failures sweep the paused task to
-  // failed via failTasksForAgent; a failed release keeps the reference so the
-  // fault stays attributable (mirrors the GitHub cap paths).
   async function releaseAndClearAtCap(
     task: TaskState,
     agentId: string,
@@ -156,9 +140,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       .catch(err => console.error(`[ServerHandler] max_rounds clear ${field}(${task.id}) failed:`, err));
   }
 
-  // Persist a verdict/response save; on failure re-arm the consumed signal so
-  // the agent's re-emit retries the whole read→store path (the exchange file is
-  // only deleted AFTER a successful store, so the retry re-reads it).
   async function putVerdictRound(
     task: TaskState,
     agentId: string,
@@ -179,9 +160,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
   }
 
-  // Missing-config guard exits: the re-arm's resolveAgent IS the getAgentConfig
-  // that just failed, so arming misses until the config is restored — hold the
-  // agent so the stall is explicit (operator restores config, then cancels to retry).
   async function rearmOrHold(task: TaskState, agentId: string, kind: PhaseSignalKind): Promise<void> {
     const armed = await manager.setupPhaseSignal(task.id, agentId, kind, { skipSnapshot: true });
     if (!armed) await manager.holdAgentForUnarmedSignal(task.id, agentId, kind);
@@ -239,8 +217,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
   }
 
-  // Shared by code-done (first review) and code-fixed (recheck): read the dev
-  // diff, persist the round, size/batch, dispatch QA.
   async function prepareAndDispatchCodeReview(
     task: TaskState,
     opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string },
@@ -260,9 +236,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
       if (!capResult) return;
       const paused = capResult.task;
-      // QA was unbound when the fix dispatched but its TaskState reference
-      // lingers — clear it so a released agent's later failures can't sweep
-      // this paused gate to failed.
       if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
       await bus.emit({
         id: '',
@@ -277,10 +250,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
 
     await manager.refreshWorktreeCacheFor(task.agentId);
-    // Anchor BEFORE diff: a commit landing between the two reads then shows up
-    // in the diff but not the anchor → publish refuses (fail-closed). The
-    // reverse order would let an unreviewed commit publish under a matching
-    // anchor.
     let content;
     let reviewHeadAnchorSha: string;
     try {
@@ -291,9 +260,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         phase: 'server-code-content-read-failed',
         error: err instanceof Error ? err.message : String(err),
       });
-      // First review entry consumed code-done; rechecks enter from code-fixed
-      // (status 'fixing'). Re-arm whichever signal was consumed so the dev can
-      // re-emit after the worktree/read issue is fixed.
       const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
       await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
       return;
@@ -308,8 +274,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       startedAt: new Date().toISOString(),
     };
 
-    // The entry signal is already consumed — a persistence failure must re-arm
-    // it like content-read failures do, or the dev's re-emit has no consumer.
     const putEntryRound = async (data: ReviewRound): Promise<boolean> => {
       try {
         await reviewStore.putRound(task.id, 'code', data);
@@ -367,15 +331,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(diffstat ? { diffstat } : {}),
       ...(sized.truncated ? { contentTruncated: true } : {}),
       batch: { index, total: batches.length },
-      // Only the round-opening slice pins the anchor; continuations are the same round.
       ...(index === 0 && opts.reviewHeadAnchorSha ? { reviewHeadAnchorSha: opts.reviewHeadAnchorSha } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
     });
   }
 
-  // Re-slice the stored round content for batch continuation after restart or
-  // between batches — batches are deterministic for a given content + threshold.
   function rebuildBatches(roundData: ReviewRound): DiffFile[][] {
     return buildBatches(splitDiffByFile(roundData.content), DIFF_LARGE_THRESHOLD);
   }
@@ -423,15 +384,10 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         reason,
         error: err instanceof Error ? err.message : String(err),
       });
-      // The one-shot watcher consumed the signal; re-arm with the SAME token so
-      // QA can fix the file and re-emit instead of stranding the review.
       await manager.setupPhaseSignal(task.id, qa.id, 'code-reviewed', { skipSnapshot: true });
       return;
     }
 
-    // findings === null with data already stored = crash-replay after the file
-    // was deleted but before the flow advanced; fall through with the STORED
-    // data so the continuation resumes instead of stranding the task.
     let current = roundData;
     if (findings === null) {
       const alreadyStored = task.batchTotal !== undefined
@@ -443,8 +399,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         return;
       }
     } else if (findings.round !== round) {
-      // Stale exchange file from an old round (delete failed / agent reuse) —
-      // never route an old verdict as the current round's.
       await emitIntervention(bus, task, {
         phase: 'server-code-findings-round-mismatch',
         round,
@@ -465,15 +419,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await transport().deleteFindings(qa);
     }
 
-    // Recheck rounds are every round after the first; survives crash-replay
-    // (the prior hardcoded recheck:false lost this on batch continuation).
     const isRecheck = round > 1;
 
     if (task.batchTotal !== undefined && task.batchIndex !== undefined) {
       const nextIndex = task.batchIndex + 1;
       if (nextIndex < task.batchTotal) {
-        // Recheck continuation batches still need the prior round's findings and
-        // response — without them QA can't verify closure for this slice's files.
         const prev = isRecheck ? await reviewStore.getRound(task.id, 'code', round - 1) : null;
         await dispatchBatch(task.id, rebuildBatches(current), nextIndex, current.diffstat, {
           recheck: isRecheck,
@@ -502,10 +452,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
 
   async function routeCodeVerdict(task: TaskState, findings: ReviewFindings): Promise<void> {
     if (findings.verdict === 'approve') {
-      // Snapshot afterDone the moment the verdict routes it — confirm must not
-      // read live config a hot-reload may have flipped mid-gate. On crash-replay
-      // the EXISTING snapshot wins (resolveAfterDone) so the verdict-time
-      // decision stays stable across restarts.
       const afterDone = manager.resolveAfterDone(task);
       if (task.afterDone === undefined) {
         await manager.updateTask(task.id, { afterDone });
@@ -523,17 +469,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await manager.dispatchServerAfterDone(task.id, afterDone);
       return;
     }
-    // Cap check at VERDICT time, like the GitHub handler: dispatching a fix in
-    // the final round would let dev change code that QA never rechecks before
-    // max_rounds complete can merge it.
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     if (task.reviewRound >= cap) {
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
       if (!capResult) return;
       const paused = capResult.task;
-      // QA is bound at verdict time and the verdict arriving IS its turn
-      // completing, so a Held QA must still be releasable; dev stays reserved
-      // for Continue/Complete.
       if (paused.qaAgentId) {
         await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId', { allowAwaitingHuman: true });
       }
@@ -589,7 +529,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
         return;
       }
-      // Crash-replay after delete: response is stored — resume the recheck dispatch.
       await prepareAndDispatchCodeReview(task, {
         recheck: true,
         priorFindingsJson: JSON.stringify(roundData.findings),
@@ -608,8 +547,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return;
     }
 
-    // Fail-closed coverage: every finding id must have exactly one response item,
-    // and no response may reference an id QA never raised (hallucinated f99).
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
     if (gaps.missing.length > 0 || gaps.unknown.length > 0) {
       await emitIntervention(bus, task, {
@@ -638,16 +575,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const { task } = gated;
     const prNumber = typeof event.data?.prNumber === 'number' ? event.data.prNumber : undefined;
     if (prNumber === undefined && manager.resolveAfterDone(task) === 'pr' && task.prNumber === undefined) {
-      // afterDone:'pr' without a PR number would sail through confirm as plain
-      // 'done', leaving the created PR unmerged. Make dev re-emit with the number.
       await emitIntervention(bus, task, { phase: 'server-code-published-missing-pr-number' });
       await manager.setupPhaseSignal(task.id, task.agentId, 'code-ready', { skipSnapshot: true });
       return;
     }
     if (prNumber !== undefined) {
-      // Same trust model as pane pr-created: never act on an agent-reported PR
-      // number without confirming its head branch is OURS (typo/hallucination
-      // would point Confirm/Cancel at someone else's PR).
       const verified = await manager.verifyPaneSignalPrNumber(task.id, prNumber);
       if (!verified) {
         await emitIntervention(bus, task, {
@@ -659,9 +591,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
       await manager.updateTask(task.id, { prNumber });
     }
-    // Reviewed-head capture for BOTH pr and branch publishes — the confirm-time
-    // merge guard depends on it, so a capture failure must NOT reach ready
-    // (fail-open would re-enable blind merges of post-gate pushes).
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       await emitIntervention(bus, task, { phase: 'server-code-published-no-dev-agent' });
@@ -679,10 +608,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await manager.setupPhaseSignal(task.id, task.agentId, 'code-ready', { skipSnapshot: true });
       return;
     }
-    // QA reviewed the diff pinned at dispatch (reviewHeadAnchorSha); a publish
-    // from any other head carries commits no server review ever saw. No re-arm:
-    // the publish already happened — the exits are Cancel (retract the
-    // PR/branch) then Retry for a fresh review.
     if (publishedHead !== task.reviewHeadAnchorSha) {
       await emitIntervention(bus, task, {
         phase: 'server-code-published-head-mismatch',
@@ -733,8 +658,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
       if (!capResult) return;
       const paused = capResult.task;
-      // Spec-phase max_rounds has no Continue/Complete — Retry/Cancel only.
-      // Release BOTH agents and clear their references (GitHub spec-cap parity).
       if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
       if (paused.agentId) await releaseAndClearAtCap(paused, paused.agentId, 'agentId');
       return;
@@ -808,7 +731,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await manager.setupPhaseSignal(task.id, qa.id, 'spec-reviewed', { skipSnapshot: true });
       return;
     }
-    // Crash-replay after delete: route on the STORED findings.
     let effective = findings;
     if (effective === null) {
       if (roundData.findings === undefined) {
@@ -847,8 +769,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
       return;
     }
-    // Cap at verdict time (mirrors the code path): a final-round fix would
-    // never be rechecked before the spec cap pauses the task.
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     if ((task.specReviewRound ?? 0) >= cap) {
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
@@ -898,7 +818,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
         return;
       }
-      // Crash-replay after delete: response is stored — resume the recheck dispatch.
       await dispatchSpecReview(task, {
         findingsJson: JSON.stringify(roundData.findings),
         responseJson: JSON.stringify(roundData.response),

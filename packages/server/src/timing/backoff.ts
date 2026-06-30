@@ -2,7 +2,6 @@ export interface BackoffParams {
   baseMs: number;
   maxMs: number;
   factor?: number;
-  // Fraction in [0,1]: delay is reduced by up to jitter*delay so concurrent retriers desync.
   jitter?: number;
   random?: () => number;
 }

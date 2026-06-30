@@ -80,13 +80,10 @@ async function makeFixture(
     platformRunner: runner,
     ...(reviewStore ? { reviewStore } : {}),
   });
-  // Shrink the cancel /clear busy→idle poll so cancelTask tests don't wait real seconds.
   Object.assign(manager, { compactIdlePollMs: 5, compactIdleWaitMs: 200, clearContextWaitMs: 200 });
   return { manager, taskStore, agentStore, execCalls, events };
 }
 
-// Pane responses that satisfy interruptPaneAndWaitReady for a claude-code dev:
-// ESC lands, then capture-pane shows an idle REPL.
 function readyPaneExec(cmd: string): Partial<ExecResult> {
   if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
     return { stdout: 'claude\n' };
@@ -97,7 +94,6 @@ function readyPaneExec(cmd: string): Partial<ExecResult> {
   return {};
 }
 
-// Bind an agent to a task in the given store, stamping updatedAt for the caller.
 function bindAgent(
   store: AgentStore,
   id: string,
@@ -108,19 +104,15 @@ function bindAgent(
   }));
 }
 
-// Bind dev-1 (%1) and/or qa-1 (%2) to task-1 with a live pane, the standard
-// starting state for the dispatch-failure-recovery cases.
 function bindToTask(agentStore: AgentStore, id: 'dev-1' | 'qa-1', now: string): Promise<unknown> {
   const paneId = id === 'dev-1' ? '%1' : '%2';
   return agentStore.update(id, () => ({ id, projectId: 'proj', taskId: 'task-1', paneId, updatedAt: now }));
 }
 
-// Stub a private AgentManager method that the test does not exercise directly.
 function stubMethod<T>(manager: AgentManager, name: string, impl: T): void {
   (manager as unknown as Record<string, T>)[name] = impl;
 }
 
-// Record dispatchServerAfterDone calls as `${taskId}:${kind}` while returning the live task.
 function recordAfterDone(manager: AgentManager, taskStore: TaskStore): string[] {
   const dispatched: string[] = [];
   stubMethod(manager, 'dispatchServerAfterDone', async (id: string, kind: string) => {
@@ -149,8 +141,6 @@ function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
   };
 }
 
-// An approved PR gate carrying the publish-dispatched marker (the shape every
-// "cancel after a dispatched-but-unconfirmed publish" case starts from).
 function approvedPrMarkerFixture(overrides: Partial<TaskState> = {}): TaskState {
   return taskFixture({
     status: 'approved', afterDone: 'pr', prNumber: 31,
@@ -191,7 +181,6 @@ describe('confirmHumanGate via markTaskComplete', () => {
     await taskStore.set(taskFixture({ latestHeadSha: 'head123' }));
     const result = await manager.markTaskComplete('task-1');
     expect(result.status).toBe('merged');
-    // Ref-to-ref push never touches the working tree.
     expect(execCalls.some(c => c.includes(`git push origin 'origin/bx/task-1':'main'`))).toBe(true);
     expect(execCalls.some(c => c.includes('git checkout') || c.includes('merge --ff-only'))).toBe(false);
     expect(execCalls.some(c => c.includes('git push origin --delete'))).toBe(true);
@@ -207,7 +196,6 @@ describe('confirmHumanGate via markTaskComplete', () => {
     await taskStore.set(taskFixture());
     await expect(manager.markTaskComplete('task-1')).rejects.toThrow(/Merge failed/);
     const task = await taskStore.get('task-1');
-    // Retryable: another Confirm or a Cancel resolves it — never terminal 'failed'.
     expect(task?.status).toBe('ready');
   });
 
@@ -268,7 +256,6 @@ describe('server-mode max_rounds escape', () => {
 
 describe('snapshot + resume semantics', () => {
   it('ready confirm uses task.afterDone over hot config', async () => {
-    // Config flipped to 'pr' after publish; task snapshot says 'branch' + merge null → done.
     const { manager, taskStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ afterDone: 'branch' }));
     const result = await manager.markTaskComplete('task-1');
@@ -292,7 +279,6 @@ describe('snapshot + resume semantics', () => {
     expect(result.resumed).toBe(true);
     expect(continued).toEqual(['task-1:dev-1:code']);
     const state = await agents.get('dev-1');
-    // agent-store normalizes status:'ok' to undefined (only awaiting_human persists).
     expect(state?.status).toBeUndefined();
     expect(state?.taskId).toBe('task-1');
   });
@@ -343,11 +329,8 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     expect(deleteAt).toBeGreaterThan(interruptAt);
   });
 
-  // Every case carries the approved-PR delivery marker but the dev interrupt is
-  // unconfirmable, so cancel must skip remote retirement and emit the skip event.
   it.each([
     {
-      // No paneId and list-panes returns nothing → interruptPaneAndWaitReady fails.
       label: 'a FAILED dev interrupt → skips remote retirement and intervenes (publish may still be running)',
       seed: (agentStore: AgentStore) => bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' }),
       task: {} as Partial<TaskState>,
@@ -534,7 +517,6 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
     const result = await manager.dispatchServerFixToDev('task-1', '[]');
 
     expect(result).toBeNull();
-    // The QA binding (and worktree) must survive a dev acquire failure.
     expect((await agentStore.get('qa-1'))?.taskId).toBe('task-1');
     expect(rearmSpy).toHaveBeenCalledWith('task-1', 'qa-1', 'code-reviewed', { skipSnapshot: true });
   });
@@ -547,7 +529,6 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
     const result = await manager.dispatchServerFixToDev('task-1', '[]');
 
     expect(result).toBeNull();
-    // The winning chain (e.g. an in-flight publish) still owns the binding.
     expect((await agentStore.get('dev-1'))?.taskId).toBe('task-1');
   });
 
@@ -559,8 +540,6 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
     });
     await taskStore.set(taskFixture({ status: 'max_rounds', reviewRound: 10 }));
     const dispatchSpy = vi.spyOn(manager, 'dispatchServerFixToDev');
-    // Simulate Complete winning the window between the entry checks and the
-    // locked claim: the last lock-free await is the stored-findings read.
     const origGetRound = reviewStore.getRound.bind(reviewStore);
     vi.spyOn(reviewStore, 'getRound').mockImplementation(async (taskId, phase, round) => {
       const r = await origGetRound(taskId, phase, round);
@@ -582,15 +561,12 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
     });
     await taskStore.set(taskFixture({ status: 'max_rounds', reviewRound: 10 }));
     vi.spyOn(manager, 'dispatchServerFixToDev').mockImplementation(async () => {
-      // A concurrent Continue's grant lands while this dispatch is in flight.
       const t = await taskStore.get('task-1');
       await taskStore.set({ ...t!, maxRoundsContinues: (t!.maxRoundsContinues ?? 0) + 1 });
       return null;
     });
 
     await expect(manager.continueDevRound('task-1')).rejects.toMatchObject({ status: 500 });
-    // Own grant rolled back (decrement), the concurrent one survives — a
-    // snapshot write-back would have erased both.
     expect((await taskStore.get('task-1'))?.maxRoundsContinues).toBe(1);
   });
 });

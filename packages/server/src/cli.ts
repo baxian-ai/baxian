@@ -39,7 +39,6 @@ export function buildLocalAttachCommands(
       file: 'tmux',
       args: ['set-option', '-t', `=${agentId}:`, 'window-size', 'latest'],
     },
-    // Server option: must be on before the client attaches for tmux to request focus reporting.
     {
       kind: 'configure',
       file: 'tmux',
@@ -59,13 +58,8 @@ export function buildRemoteAttachSshArgs(
   const autoSizePrefix =
     `tmux set-option -t ${quotedWindow} window-size latest 2>/dev/null || true; `;
   const focusEventsPrefix = 'tmux set-option -g focus-events on 2>/dev/null || true; ';
-  // Interactive CLI attach: do NOT derive auth from sshAuthArgs(). The host password from /config is
-  // redacted ('***') and unusable here, and forcing PreferredAuthentications=password would exclude
-  // publickey. Use ssh's default order (publickey → keyboard-interactive → password prompt) so a key
-  // works when configured and a real password host still prompts the user at the tty.
   return [
     '-o', 'ConnectTimeout=10',
-    // Only force -p when the host has an explicit port; inline hosts without one keep ~/.ssh/config Port.
     ...(host.port !== undefined ? ['-p', String(host.port)] : []),
     '-t',
     '--',
@@ -169,7 +163,6 @@ async function withErrors(action: () => Promise<void>): Promise<void> {
   }
 }
 
-// `--version` must always respond, hence the 'unknown' fallback rather than a throw.
 export function readPackageVersion(): string {
   try {
     const pkgPath = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
@@ -195,8 +188,6 @@ export function buildCli(): Command {
     token: cmdOpts.token ?? program.opts().token,
   });
 
-  // `start` is the default command — `baxian` (with optional -c) launches the server
-  // without requiring users to type `baxian start` explicitly.
   program
     .command('start', { isDefault: true })
     .description('Start the baxian server (default command)')
@@ -253,9 +244,6 @@ export function buildCli(): Command {
 
       const dims = readTtyDimensions(process.stdout);
       if (agent && agent.mode === 'remote' && resolvedHost) {
-        // /config redacts the password to '***', so we never feed it to ssh via SSH_ASKPASS here.
-        // CLI attach is interactive: a password host (no BatchMode) prompts the user at the tty;
-        // a key host authenticates non-interactively.
         const sshArgs = buildRemoteAttachSshArgs(resolvedHost, agentId, dims);
         const result = spawnSync('ssh', sshArgs, { stdio: 'inherit' });
         process.exit(result.status ?? 0);
@@ -401,7 +389,6 @@ export function buildCli(): Command {
   return program;
 }
 
-// npm bin shims are symlinks → realpath both sides before comparing.
 const isMainModule = (() => {
   try {
     const argv1 = process.argv[1];

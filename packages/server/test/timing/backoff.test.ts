@@ -39,11 +39,8 @@ describe('computeBackoffMs', () => {
   });
 
   it('clamps jitter into [0,1] and ignores non-finite jitter (no negative / NaN delays)', () => {
-    // jitter > 1 clamps to 1 → with random()=1 the delay floors at 0, never negative
     expect(computeBackoffMs(1, { baseMs: 1000, maxMs: 30_000, jitter: 5, random: () => 1 })).toBe(0);
-    // negative jitter clamps to 0 → no reduction
     expect(computeBackoffMs(1, { baseMs: 1000, maxMs: 30_000, jitter: -1, random: () => 1 })).toBe(1000);
-    // NaN jitter is ignored → no reduction
     expect(computeBackoffMs(1, { baseMs: 1000, maxMs: 30_000, jitter: NaN, random: () => 1 })).toBe(1000);
   });
 });

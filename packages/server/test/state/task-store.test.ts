@@ -31,8 +31,6 @@ async function writeRawTask(id: string, raw: Record<string, unknown>): Promise<v
   await writeFile(join(tasksDir, `${id}.json`), JSON.stringify(raw, null, 2) + '\n');
 }
 
-// On-disk shape with the common required fields pre-filled; overrides win, and an explicit
-// `undefined` deletes a key so callers can exercise the "field absent on disk" sanitize paths.
 async function writeLegacyTask(id: string, overrides: Record<string, unknown> = {}): Promise<void> {
   const raw: Record<string, unknown> = {
     id,
@@ -83,8 +81,6 @@ describe('TaskStore', () => {
   });
 
   it('preserves server review mode fields across persistence round-trip', async () => {
-    // The sanitize allowlist silently strips unknown fields — a missing entry
-    // here turns every persisted server-mode task back into github mode.
     const task = makeTask('task-srv', {
       reviewMode: 'server',
       batchIndex: 1,
@@ -163,8 +159,6 @@ describe('TaskStore', () => {
     await store.delete('task-missing');
     expect(fired).toEqual([['delete', 'task-missing']]);
 
-    // Substitute a directory at the would-be unlink path to force a non-ENOENT
-    // error; broadcasting `delete` would lie about persistence.
     const { mkdir } = await import('node:fs/promises');
     await mkdir(join(tempDir, 'state', 'tasks', 'task-stuck.json'), { recursive: true });
     fired.length = 0;
@@ -285,14 +279,14 @@ describe('TaskStore sanitize', () => {
       preferredAgentId: '   ',
     });
     const loaded = await store.get('task-ws');
-    expect(loaded!.title).toBe('(legacy) task-ws'); // ' ' 不算合法 title
-    expect(loaded!.preferredAgentId).toBe('dev-1'); // ' ' fallback 到 agentId
+    expect(loaded!.title).toBe('(legacy) task-ws');
+    expect(loaded!.preferredAgentId).toBe('dev-1');
   });
 
   it('coerces null/wrong-typed fields via fallback (hand-edit corruption)', async () => {
     await writeLegacyTask('task-corrupt', {
-      title: null, // wrong type
-      description: 42, // wrong type
+      title: null,
+      description: 42,
       preferredAgentId: null,
     });
     const loaded = await store.get('task-corrupt');
@@ -364,7 +358,7 @@ describe('TaskStore.migrateLegacyFiles', () => {
     expect(result.migrated).toBe(0);
 
     const after = await readRawTask('task-clean');
-    expect(after.updatedAt).toBe(beforeMtime); // unchanged
+    expect(after.updatedAt).toBe(beforeMtime);
   });
 
   it('counts failed migrations without aborting the rest', async () => {
@@ -396,7 +390,7 @@ describe('TaskStore.migrateLegacyFiles', () => {
 
     const onDisk = await readRawTask('task-noid');
     expect(onDisk.id).toBe('task-noid');
-    expect(onDisk.title).toBe('(legacy) task-noid'); // 不是 '(legacy) unknown'
+    expect(onDisk.title).toBe('(legacy) task-noid');
   });
 
   it('uses filename as authoritative id; rewrites raw.id mismatch instead of writing to undefined.json', async () => {
@@ -417,9 +411,9 @@ describe('TaskStore.migrateLegacyFiles', () => {
 
   it('migrates files with null/whitespace fields (predicate aligned with sanitize)', async () => {
     await writeLegacyTask('task-corrupt-disk', {
-      title: null, // wrong type
-      description: 42, // wrong type
-      preferredAgentId: '   ', // whitespace-only
+      title: null,
+      description: 42,
+      preferredAgentId: '   ',
     });
 
     const result = await store.migrateLegacyFiles();
@@ -440,8 +434,8 @@ describe('TaskStore.migrateLegacyFiles', () => {
     expect(result.failed).toBe(0);
 
     const onDisk = await readRawTask('task-partial');
-    expect(onDisk.title).toBe('(legacy) task-partial'); // sanitize fallback
+    expect(onDisk.title).toBe('(legacy) task-partial');
     expect(onDisk.description).toBe('');
-    expect(onDisk.preferredAgentId).toBe('dev-1'); // 从 agentId fallback
+    expect(onDisk.preferredAgentId).toBe('dev-1');
   });
 });

@@ -43,9 +43,6 @@ export class BootstrapPoller {
     });
   }
 
-  // PATCH /api/config 增删 agent 后，updates the config snapshot so subsequent ticks
-  // see fresh targets — otherwise pollOnce would keep ensure-ing deleted agents'
-  // repos and resurrect their binding record via runSingleTarget's failure path.
   replaceConfig(validated: BaxianConfig): void {
     this.opts = { ...this.opts, config: validated };
     const validKeys = new Set(collectTargets(validated).map(targetKey));
@@ -71,14 +68,6 @@ export class BootstrapPoller {
     await this.periodicRunner.runOnce();
   }
 
-  // User-triggered retry from the web UI. Bypasses suppressFailureMessage dedup so the same
-  // error re-emits on the bus / errorRecordStore even if it matches the last cached failure —
-  // operators clicking "Retry" want a fresh signal, not silent "still failing".
-  //
-  // knownProject distinguishes "project doesn't exist in the active poller config" (404 in the
-  // endpoint) from "project has zero auto-mode targets" (legitimate ran=0 success). Without
-  // this, a PATCH /config that adds a project but hasn't been replaceConfig'd onto the poller
-  // yet would silently return ran=0 and the operator would think retry succeeded.
   async pollProject(projectId: string): Promise<{ ok: boolean; ran: number; knownProject: boolean }> {
     const knownProject = this.opts.config.project.some(p => p.id === projectId);
     if (!knownProject) return { ok: false, ran: 0, knownProject: false };

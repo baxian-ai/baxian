@@ -61,7 +61,6 @@ function prListJson(...prs: PrOverrides[]): string {
   return JSON.stringify(prs.map(makePr));
 }
 
-// Runs `body` with a fresh temp `cursor.json` path, cleaning the dir up afterward.
 async function withTempStatePath(body: (statePath: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'baxian-poller-'));
   try {
@@ -73,7 +72,6 @@ async function withTempStatePath(body: (statePath: string) => Promise<void>): Pr
 
 type ExecResult = { stdout: string; stderr: string; exitCode: number };
 
-// Runner whose /pulls? response switches from `first` to `second` after the first poll.
 function makeStagedPullsRunner(first: string, second: string): CommandRunner {
   const runner = {
     exec: vi
@@ -90,8 +88,6 @@ function makeStagedPullsRunner(first: string, second: string): CommandRunner {
   return runner;
 }
 
-// Runner whose first exec() blocks until `release()` is called; subsequent execs return [].
-// `count()` reports how many execs have begun.
 function makeHangingFirstPollRunner(): {
   runner: CommandRunner;
   release: () => void;
@@ -121,8 +117,6 @@ function makePoller(runner: CommandRunner, onEvent: (e: MappedEvent) => void) {
   return { poller, entry };
 }
 
-// Silences console.error for the duration of `body` (poll() logs swallowed sub-poll failures),
-// always restoring the spy afterward.
 async function withErrorSpy(body: () => Promise<void>): Promise<void> {
   const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
   try {
@@ -132,7 +126,6 @@ async function withErrorSpy(body: () => Promise<void>): Promise<void> {
   }
 }
 
-// Poller wired to a fixed on-disk statePath, collecting emitted events into `emitted`.
 function makeStatePoller(statePath: string, runner: CommandRunner) {
   const emitted: MappedEvent[] = [];
   const poller = new GitHubPoller({ runner, onEvent: (_pid, e) => emitted.push(e) });
@@ -140,14 +133,12 @@ function makeStatePoller(statePath: string, runner: CommandRunner) {
   return { poller, emitted };
 }
 
-// Declarative single-cycle harness: configure API responses, run `polls` cycles of
-// pollPullRequests, then run any combination of the declarative checks plus `assert`.
 async function runPollScenario(opts: {
   runner?: CommandRunner;
   responses?: Record<string, string>;
   polls?: number;
-  expectNoEmits?: boolean;                  // emitted is empty
-  expectCounts?: Record<string, number>;    // count of emits per event type
+  expectNoEmits?: boolean;
+  expectCounts?: Record<string, number>;
   assert?: (ctx: { emitted: MappedEvent[]; runner: CommandRunner }) => void;
 }): Promise<void> {
   const runner = opts.runner ?? makeRunner(opts.responses ?? {});
@@ -629,8 +620,6 @@ describe('GitHubPoller', () => {
   });
 
   describe('staged cursor promotion across mergedPrs / reviews / reviewComments / pullsByHead', () => {
-    // Each case: emit throws once on a matching event → cursor for that stream is not
-    // stamped → the next poll re-emits the same event (total 2 emits).
     const stagedReemitCases: Array<{
       name: string;
       responses: Record<string, string>;
@@ -1121,8 +1110,6 @@ describe('GitHubPoller', () => {
       expect(pollerStatePathFor('/sd', 'ssh://git@github.com/owner/repo.git')).toBe(base);
     });
 
-    // Cursor must survive a config rewrite that relabels the same repo. After the rewrite,
-    // re-polling the same PR must not re-emit pr.created.
     it.each([
       ['the cursor when project.repo is rewritten from slug to URL form', 'p1', makeProject('p1', 'https://github.com/owner/repo.git')],
       ['cursor when owner changes for the same repo', 'owner-old', makeProject('owner-new', 'owner/repo')],

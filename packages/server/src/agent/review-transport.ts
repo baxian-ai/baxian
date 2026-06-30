@@ -12,10 +12,6 @@ import {
 } from '../shared/index.js';
 import type { CommandRunner } from './runner.js';
 
-// Runner-based review I/O for server mode (spec §4): the server actively reads
-// diffs/spec docs from the dev machine and findings/response files from agent
-// worktrees. Reads and deletes are separate so the caller can persist to
-// ReviewStore between them (read → validate → store → delete, spec §4 ordering).
 
 export class ReviewExchangeError extends Error {
   constructor(
@@ -34,7 +30,6 @@ export function shellQuote(value: string): string {
 export interface ReadContentResult {
   content: string;
   diffstat?: string;
-  /** Merge-base SHA the diff was computed against (audit only, spec §4). */
   baseSha?: string;
   defaultBranch?: string;
 }
@@ -75,8 +70,6 @@ export function validateReviewFindings(raw: unknown): ReviewFindings {
       throw new ReviewExchangeError('schema', `finding.message missing for ${f.id}`);
     }
   }
-  // Verdict/finding consistency: approve may only carry minor suggestions, and a
-  // change request without findings gives dev nothing to act on.
   const verdict = raw.verdict as ReviewFindings['verdict'];
   if (verdict === 'approve') {
     const blocking = (raw.findings as Finding[]).find(f => f.severity !== 'minor');
@@ -106,8 +99,6 @@ export function validateReviewResponse(raw: unknown): ReviewResponse {
     if (typeof r.findingId !== 'string' || r.findingId.trim() === '') {
       throw new ReviewExchangeError('schema', 'response.findingId must be a non-empty string');
     }
-    // Coverage uses a Set — a duplicate would let conflicting fix/reject evidence
-    // for the same finding sail through to QA recheck.
     if (responseIds.has(r.findingId)) {
       throw new ReviewExchangeError('schema', `duplicate response findingId: ${r.findingId}`);
     }
@@ -144,8 +135,6 @@ export class ReviewTransport {
       return { content: r.stdout };
     }
     const cd = `cd ${shellQuote(wt)} && `;
-    // Every step is load-bearing: a stale fetch silently reviews against an old
-    // base; a failed merge-base/stat poisons the audit fields. Fail loud on each.
     const fetch = await runner.exec(`${cd}git fetch origin --quiet`);
     if (fetch.exitCode !== 0) {
       throw new ReviewExchangeError('fetch-failed', `git fetch failed: ${fetch.stderr.trim()}`);
@@ -196,8 +185,6 @@ export class ReviewTransport {
     await this.deleteExchangeFile(devAgent, 'response.json');
   }
 
-  // Reviewed-head capture at publish time; confirm passes it as mergePr's
-  // --match-head-commit guard so a post-gate push can never be merged blind.
   async readHeadSha(devAgent: AgentConfig): Promise<string> {
     const wt = this.requireWorktree(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
@@ -224,10 +211,6 @@ export class ReviewTransport {
     }
     const wt = this.requireWorktree(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
-    // Symlink containment without `realpath -m` (absent on stock macOS/BSD):
-    // walk every path component up to the worktree root and reject any symlink.
-    // Stricter than resolve-and-compare — a worktree-internal symlink is also
-    // refused — but POSIX-portable and QA targets are regular files anyway.
     const symlinkWalk =
       `p=${shellQuote(`${wt}/${file}`)}; ` +
       `while [ "$p" != ${shellQuote(wt)} ] && [ "$p" != "/" ] && [ -n "$p" ]; do ` +

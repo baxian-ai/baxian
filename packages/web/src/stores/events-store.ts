@@ -52,7 +52,6 @@ export class EventsClient {
 
   private ws: WebSocket | null = null;
   private topics = new Map<EventsTopic, TopicSubscribers>();
-  /** Replayed to new local subs to avoid empty-state flash. */
   private cache = new Map<EventsTopic, unknown>();
   private outbox: EventsClientMsg[] = [];
   private readonly reconnectScheduler: ReconnectScheduler;
@@ -86,7 +85,6 @@ export class EventsClient {
       this.ensureSocket();
       this.wsSendOrQueue({ op: 'subscribe', topic });
     } else if (this.cache.has(topic)) {
-      // Defer the lookup so a live update between subscribe() and microtask wins.
       queueMicrotask(() => {
         if (!this.topics.get(topic)?.data.has(onData as EventsHandler<unknown>)) return;
         if (!this.cache.has(topic)) return;
@@ -207,7 +205,6 @@ export class EventsClient {
       if (ws !== this.ws) return;
       this.ws = null;
       if (this.explicitlyClosed) return;
-      // close-without-open means we never passed upgrade — surface so hooks render error.
       if (!opened) {
         this.broadcastConnectionError({
           code: 'connection_failed',
@@ -218,7 +215,6 @@ export class EventsClient {
       this.scheduleReconnect();
     };
 
-    /** onclose fires after onerror; reconnect happens there. */
     ws.onerror = () => {};
   }
 

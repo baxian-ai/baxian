@@ -143,7 +143,7 @@ describe('tasks query', () => {
     });
 
     const tasks = await api.tasks.list('proj-1');
-    expect(tasks).toHaveLength(22); // 1 active + 21 pending
+    expect(tasks).toHaveLength(22);
     expect(tasks.map((t) => (t as { id: string }).id)).toContain('p-21');
     const urls = fetchSpy.mock.calls.map((c) => c[0] as string);
     expect(urls).toContain('/api/tasks?projectId=proj-1&category=pending&offset=20');
@@ -151,7 +151,6 @@ describe('tasks query', () => {
 
   it('tasks.list de-dupes by id across pages', async () => {
     fetchSpy.mockImplementation(async (url: string) => {
-      // active returns the same id twice across two pages — must collapse to one.
       const body = url.includes('category=active')
         ? (url.includes('offset=20')
           ? { tasks: [{ id: 'dup' }], hasMore: false, nextOffset: 21 }

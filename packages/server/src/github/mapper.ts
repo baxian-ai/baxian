@@ -31,12 +31,6 @@ export interface GitHubWebhookPayload {
   ref?: string;
 }
 
-// Verdict is derived from the native GitHub review state — the authoritative
-// path for PR verdicts (QA agents run `gh pr review`; humans review in the UI).
-// QA only echoes a pane-signal verdict (pr-approved / pr-changes-requested) as a
-// FALLBACK when it shares a GitHub identity with the dev: `gh pr review` 422s on
-// your own PR, leaving no review state to poll. The old "COMMENTED + PR body
-// marker" grammar (`<!-- baxian:<agent>:approve -->`) is long retired.
 export function reviewVerdict(args: {
   state: string;
 }): { action: 'APPROVE' | 'REQUEST_CHANGES' } | undefined {
@@ -46,12 +40,6 @@ export function reviewVerdict(args: {
   return undefined;
 }
 
-// Per-pass identity stamp QA embeds in its `gh pr review` body so the server can
-// bind a verdict to the dispatch it belongs to (signalToken rotates per dispatch).
-// Hidden HTML comment — invisible in rendered markdown. Uses the same verdict
-// kinds as the pane signal (pr-approved / pr-changes-requested) for consistency,
-// but the VERDICT still comes from the native review state; the server only reads
-// the token here, purely as an anti-stale guard.
 const REVIEW_PASS_RE = /<!--\s*baxian:(?:pr-approved|pr-changes-requested):([A-Za-z0-9_-]{6,64})\s*-->/;
 export function extractReviewPassToken(body: string | null | undefined): string | undefined {
   if (typeof body !== 'string') return undefined;
@@ -59,7 +47,6 @@ export function extractReviewPassToken(body: string | null | undefined): string 
   return m ? m[1] : undefined;
 }
 
-// Missing body passes; explicit null means no marker.
 export function isManagedPr(
   branch: string,
   body: string | null | undefined,

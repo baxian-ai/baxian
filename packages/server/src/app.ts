@@ -44,7 +44,6 @@ export interface AppContext {
   tmuxProbePoller?: TmuxProbePoller;
   bootstrapPoller?: BootstrapPoller;
   configPath?: string;
-  /** Resolved server state directory (`~/.baxian` or equivalent); required for hot-reload paths that compute per-project state files. */
   stateDir?: string;
   poller?: GitHubPoller;
   paneStreamerManager?: PaneStreamerManager;
@@ -61,15 +60,12 @@ declare module 'fastify' {
 }
 
 export interface BuildAppOpts {
-  /** When set, server listens with TLS instead of plain HTTP. */
   https?: { key: Buffer | string; cert: Buffer | string };
-  /** Absolute filesystem path to vite build output (packages/web/dist). */
   webRoot?: string;
 }
 
 const IS_API_REQUEST = /^\/api(\/|\?|$)/;
 
-// Allowlist, not "contains dot", so SPA routes like /users/alice.smith stay routed.
 const ASSET_EXTENSIONS = new Set([
   'js', 'mjs', 'cjs', 'css', 'map',
   'ico', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif', 'bmp',
@@ -86,7 +82,6 @@ function lastPathExtension(rawUrl: string): string | undefined {
   return seg.slice(dot + 1).toLowerCase();
 }
 
-// request.hostname has no port; bring entries to the same form (strip port/brackets, lowercase).
 function normalizeHost(raw: string): string {
   const s = raw.trim().toLowerCase();
   if (s.startsWith('[')) {
@@ -100,7 +95,6 @@ function normalizeHost(raw: string): string {
   return s;
 }
 
-// Match decoded URL too — otherwise /%61pi/foo bypasses /api auth (find-my-way decodes before routing).
 function isApiRequest(rawUrl: string): { isApi: boolean; malformed: boolean } {
   let decoded: string;
   try {
@@ -122,7 +116,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
       reply.status(err.status).send({ error: err.message });
       return;
     }
-    // Preserve Fastify client errors instead of masking them as 500s.
     const statusCode = (err as { statusCode?: unknown }).statusCode;
     if (typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500) {
       const msg = (err as { message?: unknown }).message;
@@ -139,8 +132,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
     app.ctx.tmuxProbePoller?.stop();
     app.ctx.bootstrapPoller?.stop();
     app.ctx.poller?.stop();
-    // Pollers first, then live attach PTYs, then the persisted SSH mux — so neither signals
-    // nor /api/restart leave orphaned ssh/tmux children behind (they share this one path).
     try {
       await app.ctx.paneStreamerManager?.destroyAll();
     } catch (err) {
@@ -153,10 +144,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
     }
   });
 
-  // 404 (not 403) on Host-header mismatch — don't leak that validation exists.
-  // Reads allowedHosts from live ctx.config so PATCH /config takes effect immediately;
-  // memoizes the Set keyed on the array reference (a new validated config produces a
-  // new array, so the memo refreshes when the list actually changes).
   let allowedHostsMemo: { ref: readonly string[]; set: Set<string> } | null = null;
   app.addHook('onRequest', async (request, reply) => {
     const list = app.ctx.config.server.allowedHosts;
@@ -170,7 +157,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
     }
   });
 
-  // Only /api/* requires Bearer — browsers can't attach Authorization on first nav.
   app.addHook('onRequest', async (request, reply) => {
     const token = app.ctx.config.server.token;
     if (!token) return;
@@ -206,14 +192,12 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
   await app.register(eventsWsPlugin, { prefix: '/api' });
 
   if (opts.webRoot) {
-    // cacheControl:false stops @fastify/send injecting a default header that would overwrite setHeaders.
     await app.register(fastifyStatic, {
       root: opts.webRoot,
       prefix: '/',
       wildcard: false,
       cacheControl: false,
       setHeaders: (res, filePath) => {
-        // index.html names hashed assets — must not cache or clients lock to deleted bundles after deploy.
         if (filePath.endsWith('index.html')) {
           res.setHeader('Cache-Control', 'no-cache');
         } else {
@@ -228,7 +212,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         return reply.status(404).send({ error: 'not_found' });
       }
-      // 404 asset miss — falling through serves HTML as JS/CSS and breaks the page silently.
       const ext = lastPathExtension(request.url);
       if (ext !== undefined && ASSET_EXTENSIONS.has(ext)) {
         return reply.status(404).send({ error: 'not_found' });

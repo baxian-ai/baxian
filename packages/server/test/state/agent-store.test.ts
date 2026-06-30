@@ -112,16 +112,11 @@ describe('AgentStore', () => {
 
   it('delete fires onChange("delete") on ENOENT (idempotent semantics)', async () => {
     const fired = captureChanges();
-    // No prior set; unlink will throw ENOENT but callers depend on idempotent
-    // delete, so the delete event is still legitimate ("it's gone, as you asked").
     await store.delete('nonexistent');
     expect(fired).toEqual([['delete', 'nonexistent']]);
   });
 
   it('delete does NOT fire onChange when unlink fails for non-ENOENT reasons', async () => {
-    // Create a directory at the path the store would unlink, so unlink throws
-    // EISDIR (or EPERM on macOS) rather than ENOENT — simulates "file still on
-    // disk after delete attempt", where firing 'delete' would lie.
     const dir = join(agentsDir(), 'stuck.json');
     await mkdir(dir, { recursive: true });
     const fired = captureChanges();

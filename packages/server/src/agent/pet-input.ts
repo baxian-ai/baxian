@@ -37,7 +37,6 @@ export function validatePetManifest(raw: unknown): PetManifest {
   return { displayName, description };
 }
 
-// Magic-byte sniff is authoritative — Codex pets ship as PNG or WebP only.
 function detectSpritesheetExt(buf: Buffer): PetSpritesheetExt | null {
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
     return 'png';
@@ -52,8 +51,6 @@ function detectSpritesheetExt(buf: Buffer): PetSpritesheetExt | null {
   return null;
 }
 
-// Header-only dimension read for PNG and the three WebP chunk variants (VP8/VP8L/VP8X).
-// Returns null when the bytes are not a recognizable, well-formed image header.
 export function readImageSize(buf: Buffer): { width: number; height: number } | null {
   if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
     return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };

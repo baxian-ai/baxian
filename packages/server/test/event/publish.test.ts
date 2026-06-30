@@ -4,8 +4,6 @@ import type { AgentSnapshotCtx } from '../../src/state/snapshot.js';
 import { EventBroker } from '../../src/event/broker.js';
 import { EventPublisher } from '../../src/event/publish.js';
 
-// Lightweight in-memory fakes — the publisher only depends on the small set of
-// methods exercised here; full-store coverage lives in state/*.test.ts.
 function makeFakes() {
   const states = new Map<string, AgentBindingFacts>();
   const tasks = new Map<string, TaskState | null>();
@@ -58,9 +56,6 @@ describe('EventPublisher', () => {
     let callCount = 0;
     taskStore.get = vi.fn(async (id: string) => {
       callCount += 1;
-      // First call returns a delayed promise; second call resolves immediately
-      // with whatever's in the map. Without per-topic serialization the second
-      // publish would land before the first's snapshot.
       return callCount === 1 ? await slowFirst : realGet(id);
     });
 
@@ -72,7 +67,6 @@ describe('EventPublisher', () => {
     tasks.set('t1', { ...baseTask('t1'), status: 'review' });
     publisher.publishTaskChange('set', 't1');
 
-    // Resolve the slow first read AFTER the second mutation enqueued.
     resolveFirst!({ ...baseTask('t1'), status: 'in_progress' });
 
     await vi.runAllTimersAsync();
@@ -89,7 +83,7 @@ describe('EventPublisher', () => {
     const broker = new EventBroker();
     let agentsCount = 0;
     broker.subscribe('agents', () => { agentsCount += 1; });
-    broker.subscribe('agent:dev-1', () => undefined);  // keeps per-id chain warm
+    broker.subscribe('agent:dev-1', () => undefined);
 
     const publisher = new EventPublisher(broker, ctx, taskStore, { agentsDebounceMs: 50 });
 
@@ -100,7 +94,6 @@ describe('EventPublisher', () => {
     states.set('dev-1', baseAgentState('dev-1', 'task-3'));
     publisher.publishAgentChange('set', 'dev-1');
 
-    // Before debounce window elapses, no agents broadcast yet.
     expect(agentsCount).toBe(0);
 
     await vi.advanceTimersByTimeAsync(50);

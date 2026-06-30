@@ -22,7 +22,6 @@ function installDefaultFetchMock(startedAt = 'STABLE') {
   });
 }
 
-// /health reports a mutable startedAt; /api/restart returns `restart`. onRestart can advance startedAt.
 function installRestartFetchMock(opts: {
   startedAt: string;
   restart: { status: number; body: unknown };
@@ -58,7 +57,6 @@ function readPersisted() {
   return JSON.parse(localStorage.getItem(STORAGE_KEY)!);
 }
 
-// Simulate another same-origin tab writing storage: persist newValue then fire the cross-tab event.
 function fireCrossTabStorage(oldValue: string | null, newValue: string | null): void {
   if (newValue === null) localStorage.removeItem(STORAGE_KEY);
   else localStorage.setItem(STORAGE_KEY, newValue);

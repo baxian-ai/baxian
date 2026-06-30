@@ -89,9 +89,6 @@ export function HostManagementModal({ open, onClose }: Props) {
     const input: HostInput = {
       hostname: form.hostname.trim(),
     };
-    // On edit, send alias/user/port explicitly so a blank CLEARS — PATCH treats an omitted field as
-    // "keep current", so omitting would silently revert. Port clears with null ('' isn't a number),
-    // letting a host wrongly saved as 22 fall back to ~/.ssh/config. On create, omit empties.
     if (editingId) {
       input.port = form.port.trim() ? Number(form.port) : null;
       input.alias = form.alias.trim();
@@ -101,8 +98,6 @@ export function HostManagementModal({ open, onClose }: Props) {
       if (form.alias.trim()) input.alias = form.alias.trim();
       if (form.user.trim()) input.user = form.user.trim();
     }
-    // Password is opt-in to change: empty field = keep current. An explicit "clear" sends '' so the
-    // server drops the stored secret (switch a host back to key auth); a typed value sets a new one.
     if (editingId && clearPassword) {
       input.password = '';
     } else if (form.password) {

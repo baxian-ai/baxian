@@ -58,19 +58,12 @@ export function AgentGroup({
   useEffect(() => {
     if (!selectableTerminals) return;
     const onDocClick = (e: MouseEvent) => {
-      // React 18 commits the re-render before the native event finishes bubbling, so
-      // by the time we run, the click target may already be detached (e.g. PaneTerminal
-      // swapped its preview/full subtree). composedPath() is a dispatch-time snapshot and
-      // survives that mutation; target.closest() would not.
       const path = e.composedPath();
       const insideCard = path.some(node => node instanceof Element && node.hasAttribute('data-agent-card'));
       if (!insideCard) setActiveAgentId(null);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      // Esc inside any card belongs to the terminal app (vim/less/Claude TUI etc.) or to a
-      // focused control inside the card (its own onKeyDown should win). Only demote when
-      // focus has moved entirely outside the card grid.
       const focused = document.activeElement;
       if (focused instanceof Element && focused.closest('[data-agent-card]')) return;
       setActiveAgentId(null);

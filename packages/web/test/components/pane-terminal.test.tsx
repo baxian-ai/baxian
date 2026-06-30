@@ -30,8 +30,8 @@ class FakeTerminal {
     this.opts = opts ?? {};
     fakeTerminals.push(this);
   }
-  loadAddon(): void { /* no-op */ }
-  open(): void { /* no-op */ }
+  loadAddon(): void { }
+  open(): void { }
   onData(cb: (data: string) => void): void {
     this.onDataCallback = cb;
   }
@@ -129,8 +129,8 @@ class MockResizeObserver {
     this.callback = cb;
     MockResizeObserver.lastCallback = cb;
   }
-  observe(): void { /* no-op */ }
-  disconnect(): void { /* no-op */ }
+  observe(): void { }
+  disconnect(): void { }
 }
 
 beforeEach(() => {
@@ -170,15 +170,12 @@ function importPane(): Promise<PaneModule> {
   return import('../../src/components/pane-terminal.tsx');
 }
 
-// Import the mocked module and render a pane (agentId defaults to 'dev-1'). Returns the render
-// result plus the freshly constructed FakeTerminal — the common preamble for render-only tests.
 async function renderPane(props: PaneProps): Promise<ReturnType<typeof render> & { term: FakeTerminal }> {
   const { PaneTerminal } = await importPane();
   const result = render(<PaneTerminal agentId="dev-1" {...props} />);
   return Object.assign(result, { term: lastTerminal() });
 }
 
-// Install a mock navigator.clipboard.writeText and return the spy for assertions.
 function stubClipboard(): ReturnType<typeof vi.fn> {
   const writeText = vi.fn().mockResolvedValue(undefined);
   Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
@@ -186,9 +183,6 @@ function stubClipboard(): ReturnType<typeof vi.fn> {
 }
 
 describe('stripTerminalAutoReplies (filter for xterm.js capability-query replies)', () => {
-  // Each case lists [input chunk, expected residue] pairs. Auto-replies (DA1/DA2, DSR cursor /
-  // device-status) get stripped to ''. Legit input that shares the CSI prefix (arrows, F-keys,
-  // Home/End, ctrl chars, text) must pass through unchanged.
   it.each<[string, Array<[string, string]>]>([
     ['strips secondary DA reply that hz1 was leaking into codex stdin', [['\x1b[>0;276;0c', '']]],
     ['strips primary DA reply', [['\x1b[?64;1;2;6;9;15;18;21;22c', '']]],
@@ -204,10 +198,10 @@ describe('stripTerminalAutoReplies (filter for xterm.js capability-query replies
       ['\x1b[D', '\x1b[D'],
     ]],
     ['does NOT strip function keys / home / end / ctrl chars / regular text', [
-      ['\x1bOP', '\x1bOP'], // F1
-      ['\x1b[H', '\x1b[H'], // Home
-      ['\x1b[F', '\x1b[F'], // End
-      ['\x03', '\x03'],     // Ctrl+C
+      ['\x1bOP', '\x1bOP'],
+      ['\x1b[H', '\x1b[H'],
+      ['\x1b[F', '\x1b[F'],
+      ['\x03', '\x03'],
       ['hello', 'hello'],
       ['\r', '\r'],
     ]],
@@ -246,8 +240,6 @@ describe('parseOsc52Clipboard (OSC 52 clipboard payload parsing)', () => {
   });
 });
 
-// Real xterm parser (canvas-free @xterm/headless; only @xterm/xterm is mocked above) to prove the
-// handler we register fires exactly once on a fragmented OSC 52, the way the live PTY stream chunks it.
 describe('parseOsc52Clipboard wired to the real xterm OSC parser (chunk reassembly)', () => {
   it('reassembles a fragmented OSC 52 sequence and invokes the handler once with the full payload', async () => {
     const { Terminal } = await import('@xterm/headless');
@@ -319,8 +311,6 @@ describe('PaneTerminal', () => {
 
   it('interactive but deferred (preview until focus) does NOT register an OSC 52 handler yet', async () => {
     const { term } = await renderPane({ mode: 'full', interactive: true, autoFocus: false, deferFullUntilFocus: true });
-    // streamMode stays 'preview' until the user activates the pane — background tmux copies must not
-    // reach the clipboard before the user engages this terminal.
     expect(term.oscHandlers.get(52)).toBeUndefined();
   });
 
@@ -413,7 +403,6 @@ describe('PaneTerminal', () => {
 
   it('resizable snapshot fits the container instead of adopting server pane geometry, then pins to bottom (keeps the agent bottom bar in view)', async () => {
     const { term } = await mountWithHandshake({ mode: 'full', interactive: true }, { cols: 200, rows: 50, data: 'AAA' });
-    // The taller server geometry (200x50) is NOT adopted — the fitted container size is kept.
     expect(term.cols).toBe(80);
     expect(term.rows).toBe(24);
     expect(term.writes).toEqual(['AAA']);
@@ -525,34 +514,28 @@ describe('PaneTerminal', () => {
     const scrollEl = container.querySelector('.overflow-hidden') as HTMLDivElement;
     expect(scrollEl).toBeTruthy();
     expect(scrollEl.className).not.toMatch(/(^|\s)p[ytb]?-/);
-    // The padding wrapper is the scroll container's direct parent.
     const padWrapper = scrollEl.parentElement!;
     expect(padWrapper.className).toContain('py-1.5');
     expect(padWrapper.className).toContain('px-2');
   });
 
   it('preview clipping scrolls container so cursor row anchors to the bottom (not the top)', async () => {
-    // Agent has filled the 50-row server pane; cursor sits near the bottom at row 42 (0-indexed).
     const { scrollState } = await mountWithScrollAnchor({
       scroll: { scrollHeight: 900, clientHeight: 108 },
       props: { mode: 'preview', interactive: false, maxLines: 6 },
       cursorY: 42,
       handshake: { cols: 200, rows: 50, data: 'AAA' },
     });
-    // (cursorY+1) * LINE_HEIGHT(18) - clientHeight(108) = 43*18 - 108 = 666
     expect(scrollState.value).toBe(666);
   });
 
   it('embedded preview (no maxLines) still anchors the cursor row to the bottom so the card shows the latest, not the top', async () => {
-    // Embedded card preview: full server geometry, no maxLines clip — the h-80 box overflow-hides it.
-    // Agent filled the 50-row server pane; cursor sits near the bottom at row 42 (0-indexed).
     const { scrollState } = await mountWithScrollAnchor({
       scroll: { clientHeight: 300 },
       props: { mode: 'preview', interactive: false },
       cursorY: 42,
       handshake: { cols: 200, rows: 50, data: 'AAA' },
     });
-    // (cursorY+1) * LINE_HEIGHT(18) - clientHeight(300) = 43*18 - 300 = 474 → anchored to bottom, not 0 (top).
     expect(scrollState.value).toBe(474);
   });
 
@@ -834,15 +817,9 @@ describe('PaneTerminal control bar layout', () => {
 
     const keypad = screen.getByRole('group', { name: /终端方向键/ });
     const bar = keypad.parentElement!;
-    // Symmetric 1fr | auto | 1fr template → the key pad (auto column) is centered in the bar,
-    // independent of the upload button's width in the left gutter.
     expect(bar.className).toContain('grid');
     expect(bar.className).toContain('grid-cols-[1fr_auto_1fr]');
-    // Symmetric gap keeps a minimum distance between the upload button and the key pad on narrow
-    // widths without disturbing centering (the gaps flank the auto column symmetrically).
     expect(bar.className).toMatch(/\bgap(-x)?-2\b/);
-    // Regression: the key pad must not be the flex-1 leftover filler — that only centered it
-    // within the space to the right of the upload button.
     expect(keypad.className).not.toContain('flex-1');
     expect(screen.getByRole('button', { name: /上传图片/ })).toBeTruthy();
   });
@@ -893,8 +870,6 @@ function inputsSince(ws: MockWebSocket, before: number): StreamMessage[] {
   return ws.sent.slice(before).map((s) => JSON.parse(s) as StreamMessage);
 }
 
-// Flatten messages across the deferred-subscription handoff: the pane swaps WebSockets when it
-// upgrades preview→full, so ws1 and ws2 may differ (or be the same instance).
 function messagesAcross(ws1: MockWebSocket, ws2: MockWebSocket): StreamMessage[] {
   return [...sentMessages(ws1), ...(ws2 === ws1 ? [] : sentMessages(ws2))];
 }
@@ -905,8 +880,6 @@ function subscribeModesAcross(ws1: MockWebSocket, ws2: MockWebSocket): Array<str
     .map((m) => m.mode);
 }
 
-// Append a child to the xterm host, attach a bubble-phase wheel listener on the host, then dispatch
-// a wheel from the child. Returns the listener so the caller asserts whether the event reached it.
 function fireWheelFromChild(xtermHost: HTMLElement): ReturnType<typeof vi.fn> {
   const child = document.createElement('div');
   xtermHost.appendChild(child);
@@ -952,7 +925,6 @@ function stubScroll(overrides: { scrollHeight?: number; clientHeight?: number } 
     });
   }
   state.restore = () => {
-    // beforeEach re-installs default clientHeight (480) for the next case.
     delete (HTMLElement.prototype as { scrollTop?: unknown }).scrollTop;
     if (overrides.scrollHeight !== undefined) {
       delete (HTMLElement.prototype as { scrollHeight?: unknown }).scrollHeight;
@@ -989,8 +961,6 @@ interface MountedPane {
   sid: string;
 }
 
-// Point the singleton pane-stream client at a MockWebSocket, then reset it to null after the test
-// (onTestFinished runs even if assertions throw, so the client never leaks into the next case).
 async function installPaneStreamForTest(): Promise<void> {
   const { _resetPaneStreamClientForTest, PaneStreamClient } =
     await import('../../src/stores/pane-stream-store.ts');
@@ -1004,8 +974,6 @@ async function installPaneStreamForTest(): Promise<void> {
   onTestFinished(() => _resetPaneStreamClientForTest(null));
 }
 
-// Render a pane, install the mock stream, wait for the WebSocket to open, and deliver the initial
-// snapshot+subscribed handshake — the standard preamble for the live-stream behavior tests.
 async function mountWithHandshake(
   props: MountOptions,
   handshake: { cols?: number; rows?: number; data?: string } = {},
@@ -1028,9 +996,6 @@ async function mountWithHandshake(
   return { term, ws, sid };
 }
 
-// Stub container scrollTop/scrollHeight/clientHeight, render a pane, place the cursor row, then
-// deliver the handshake — exercises the cursor-anchor scroll math. Stub + stream are torn down
-// after the test via onTestFinished so assertion failures still restore jsdom defaults.
 async function mountWithScrollAnchor(spec: {
   scroll?: { scrollHeight?: number; clientHeight?: number };
   props: PaneProps;
@@ -1048,8 +1013,6 @@ async function mountWithScrollAnchor(spec: {
   return { scrollState };
 }
 
-// Render a deferred pane (preview-until-focus) and wait for its initial preview WebSocket to open.
-// The full subscription only activates later via focus/keystroke (see activateFullSubscription).
 async function renderDeferredPane(
   opts: { arrowKeys?: boolean } = {},
 ): Promise<{ container: HTMLElement; ws1: MockWebSocket }> {
@@ -1069,8 +1032,6 @@ async function renderDeferredPane(
   return { container, ws1: lastMockWs()! };
 }
 
-// After a deferred pane is activated, settle the WebSocket handoff and return the full-mode
-// subscriber: the pane swaps to a fresh socket (ws2) carrying the 'full' subscribe.
 async function activateFullSubscription(): Promise<{ ws2: MockWebSocket; fullSid: string }> {
   const ws2 = lastMockWs()!;
   await act(async () => {

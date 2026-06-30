@@ -134,8 +134,6 @@ describe('PATCH /api/config', () => {
     await seedConfigPath(app, tempDir);
     app.ctx.config = { ...app.ctx.config, host: [{ id: 'box', hostname: 'h', port: 22, password: 'real-secret' }] };
 
-    // Any host in the body (well-formed or not) is rejected — it would bypass /hosts' connectivity +
-    // structural-change liveness guards. The stored registry (incl. password) must be untouched.
     for (const hostPayload of [
       [{ id: 'box', hostname: 'moved', port: 2222 }],
       [{ id: 'box', hostname: 'h', port: 22, password: '***' }],
@@ -153,9 +151,9 @@ describe('PATCH /api/config', () => {
   it('returns 400 (not 500) for a malformed project on PATCH /config (host-ref guard runs post-validation)', async () => {
     await seedConfigPath(app, tempDir);
     for (const bad of [
-      { id: 'bad' },                                                     // object, not array
-      'oops',                                                            // string
-      [{ id: 'pp', repo: 'u/r', merge: null, agent: { not: 'array' } }], // nested agent not an array
+      { id: 'bad' },
+      'oops',
+      [{ id: 'pp', repo: 'u/r', merge: null, agent: { not: 'array' } }],
     ]) {
       const response = await patch('/api/config', { project: bad }, { headers: JSON_HEADERS });
       expect(response.statusCode, JSON.stringify(bad)).toBe(400);
@@ -172,7 +170,7 @@ describe('PATCH /api/config', () => {
         agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' }]],
       }],
     };
-    app.ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' }); // live
+    app.ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' });
 
     const response = await patch('/api/config', {
       project: [{
@@ -181,7 +179,6 @@ describe('PATCH /api/config', () => {
       }],
     }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(409);
-    // unchanged in memory
     expect((app.ctx.config.project[0].agent[0][0]).host).toBe('box');
   });
 
@@ -195,7 +192,6 @@ describe('PATCH /api/config', () => {
     for (const bad of [500, 1500.5, 2147483648]) {
       const response = await patch('/api/config', { server: { port: 3000, githubPollIntervalMs: bad } }, { headers: JSON_HEADERS });
       expect(response.statusCode).toBe(400);
-      // Existing value preserved — operator's saved 45_000 is not clobbered.
       expect(app.ctx.config.server.githubPollIntervalMs).toBe(45000);
     }
   });
@@ -216,7 +212,6 @@ describe('PATCH /api/config', () => {
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body) as { details?: Array<{ path: string }> };
     expect(body.details?.some(e => e.path === 'codereview')).toBe(true);
-    // Original config unchanged — no partial apply.
     expect(app.ctx.config.review.rounds).toBe(originalRounds);
   });
 
@@ -232,9 +227,6 @@ describe('PATCH /api/config', () => {
   });
 
   it('sweeps errorRecordStore by new auto-bootstrap id set on bulk config replace', async () => {
-    // PATCH /config bulk-replace must clean up stale bootstrap errors so removed-then-readded
-    // ids don't resurrect red cards. Uses same sweep helper as startup so it also catches ids
-    // that stay but leave auto-mode (workdir set) — see next test for that case.
     await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
@@ -248,16 +240,11 @@ describe('PATCH /api/config', () => {
 
     const response = await patch('/api/config', { project: [] }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
-    // Sweep called with empty active set (all agents gone) — any stale bootstrap record
-    // would be filtered out.
     expect(sweepStaleBootstrapErrors).toHaveBeenCalledTimes(1);
     expect(sweepStaleBootstrapErrors.mock.calls[0][0].size).toBe(0);
   });
 
   it('sweep treats agent transitioned to explicit workdir as no longer in auto-bootstrap', async () => {
-    // Round-5 P2: same agent id, but config flips it from auto-bootstrap (no workdir) to
-    // manual (workdir set). The id is NOT removed — old diff-by-id logic missed it; sweep
-    // by autoBootstrapAgentIds set catches it because the agent left the active set.
     await seedConfigPath(app, tempDir);
     app.ctx.config = {
       ...app.ctx.config,
@@ -275,7 +262,6 @@ describe('PATCH /api/config', () => {
     }] }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
     const activeSet = sweepStaleBootstrapErrors.mock.calls[0][0] as Set<string>;
-    // becoming-manual now has workdir → NOT in active auto-bootstrap set, sweep would purge it.
     expect(activeSet.has('becoming-manual')).toBe(false);
   });
 

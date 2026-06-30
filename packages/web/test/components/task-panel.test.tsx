@@ -120,7 +120,6 @@ describe('TaskPanel', () => {
     expect(initialRound.compareDocumentPosition(initialDot) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(initialDot.nextElementSibling).toBeNull();
 
-    // Simulate a WS frame: same task advanced to review, round 1.
     rerender(
       <MemoryRouter>
         <TaskPanel
@@ -214,9 +213,9 @@ describe('TaskPanel', () => {
 
     clickDone();
     await screen.findByText('shipped');
-    clickDone(); // collapse
+    clickDone();
     expect(screen.queryByText('shipped')).toBeNull();
-    clickDone(); // expand again
+    clickDone();
     await waitFor(() => expect(doneCalls().length).toBe(2));
   });
 
@@ -239,7 +238,6 @@ describe('TaskPanel', () => {
     expect(screen.queryByRole('region', { name: '待处理' })).toBeNull();
     expect(screen.queryByRole('button', { name: '刷新 Task 列表' })).toBeNull();
     expect(screen.queryByRole('button', { name: '+ 新建 Task' })).toBeNull();
-    // 标题与关闭按钮已移出面板，由 Project 页面在面板外渲染。
     expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
     expect(screen.queryByRole('button', { name: '关闭 Task 面板' })).toBeNull();
   });
@@ -265,7 +263,6 @@ describe('TaskPanel', () => {
       task({ id: 'task-004', status: 'approved' }),
       task({ id: 'task-005', status: 'pending' }),
     ]);
-    // No status text in the row anymore — the pill collapsed to a dot, status moved to hover.
     expect(screen.queryByText('in_progress')).toBeNull();
     expect(screen.getByRole('img', { name: 'in_progress' }).className).toContain('bg-success');
     expect(screen.getByRole('img', { name: 'review' }).className).toContain('bg-accent');
@@ -293,8 +290,6 @@ describe('TaskPanel', () => {
 
   it('gives the DONE divider the same hairline as the live sections', () => {
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
-    // The DONE wrapper no longer carries its own thick 2px rule; the divider above
-    // it is PENDING's bottom hairline — identical to the one above PENDING.
     const doneWrapper = screen.getByRole('button', { name: /DONE/ }).parentElement!;
     expect(doneWrapper.className).not.toContain('border-t-2');
     const pending = screen.getByRole('region', { name: 'PENDING' });

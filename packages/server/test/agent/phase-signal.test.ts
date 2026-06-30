@@ -36,7 +36,6 @@ describe('phase signal protocol', () => {
     expect(scanPhaseSignals('hi\n[bx:greeting:abc123def456]')).toEqual([
       { kind: 'greeting', token: 'abc123def456' },
     ]);
-    // The angle-bracket template must not self-fire the scanner (would false-pass the handshake).
     expect(scanPhaseSignals(buildPhaseSignalTemplate('greeting'))).toEqual([]);
   });
 
@@ -53,7 +52,6 @@ describe('phase signal protocol', () => {
   it('builds template with <token> / <pr_number> placeholders — never the filled signal', () => {
     expect(buildPhaseSignalTemplate('spec-done')).toBe('[bx:spec-done:<token>]');
     expect(buildPhaseSignalTemplate('pr-created')).toBe('[bx:pr-created:<pr_number>:<token>]');
-    // Templates intentionally cannot match the strict regexes.
     expect(scanPhaseSignals(buildPhaseSignalTemplate('spec-done'))).toEqual([]);
     expect(scanPhaseSignals(buildPhaseSignalTemplate('pr-created'))).toEqual([]);
   });
@@ -96,9 +94,9 @@ describe('phase signal protocol', () => {
 
   it('ignores unknown kinds and malformed tokens', () => {
     expect(scanPhaseSignals('[bx:unknown-kind:abc123]')).toEqual([]);
-    expect(scanPhaseSignals('[bx:spec-done:abc]')).toEqual([]);          // token too short (<6)
-    expect(scanPhaseSignals('[bx:spec-done:tok]extra]')).toEqual([]);    // missing closing bracket
-    expect(scanPhaseSignals('[bx:pr-created:abc:tok123abc]')).toEqual([]);  // prNumber not digits
+    expect(scanPhaseSignals('[bx:spec-done:abc]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:spec-done:tok]extra]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:pr-created:abc:tok123abc]')).toEqual([]);
   });
 
   it('accepts legacy UUID-shaped tokens (with dashes) so cross-upgrade tasks still parse', () => {
@@ -118,11 +116,6 @@ describe('phase signal protocol', () => {
   });
 
   it('returns signals in text order, so first-match-wins respects pane sequence (e.g. spec-done before pr-created)', () => {
-    // Develop dispatch arms {spec-done, pr-created}; if the dev emits
-    // spec-done first to request review, then accidentally continues to
-    // pr-created, the watcher must see spec-done FIRST. A naive
-    // implementation that ran the pr-created regex pass before plain kinds
-    // would yield pr-created first and bypass spec review entirely.
     const text = '[bx:spec-done:tokSpec01234]\nlater\n[bx:pr-created:42:tokPR0123456]';
     expect(scanPhaseSignals(text)).toEqual([
       { kind: 'spec-done', token: 'tokSpec01234' },

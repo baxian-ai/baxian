@@ -58,7 +58,6 @@ it('add flow: shows the password warning and creates a host on save', async () =
   render(<HostManagementModal open onClose={() => {}} />);
   fireEvent.click(await screen.findByText('+ 添加 Host'));
 
-  // the warning is shown in the form.
   expect(screen.getByText(/明文/)).toBeTruthy();
 
   fireEvent.change(screen.getByLabelText('Host 地址'), { target: { value: 'h.example.com' } });
@@ -134,7 +133,6 @@ it('edit: clearing alias/user sends explicit empty strings so PATCH can clear th
   listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />);
   fireEvent.click(await screen.findByText('编辑'));
-  // Form is prefilled; clear alias + user.
   fireEvent.change(screen.getByLabelText('别名（可选）'), { target: { value: '' } });
   fireEvent.change(screen.getByLabelText('用户名（可选）'), { target: { value: '' } });
   fireEvent.click(screen.getByRole('button', { name: '保存' }));
@@ -166,7 +164,7 @@ it('edit: an unchanged prefilled port is sent as its number (not cleared)', asyn
 });
 
 it('edit: "clear saved password" checkbox sends password: "" so the server can drop it', async () => {
-  listMock.mockResolvedValue([HOST]); // HOST.password === '***' → checkbox is shown
+  listMock.mockResolvedValue([HOST]);
   render(<HostManagementModal open onClose={() => {}} />);
   fireEvent.click(await screen.findByText('编辑'));
   fireEvent.click(screen.getByRole('checkbox', { name: /清除已保存的密码/ }));

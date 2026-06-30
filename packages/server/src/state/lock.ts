@@ -4,9 +4,6 @@ import { join } from 'node:path';
 export class LockManager {
   constructor(private dir: string) {}
 
-  // owner: optional identity of the flow holding the lock (e.g. a taskId). Lets callers later
-  // distinguish "I still hold this lock" from "someone else does" without a separate registry —
-  // see ownerOf(). The file lock itself is anonymous; owner is the only ownership proof.
   async acquire(agentId: string, owner?: string): Promise<boolean> {
     try {
       await writeFile(
@@ -23,7 +20,7 @@ export class LockManager {
   async release(agentId: string): Promise<void> {
     try {
       await unlink(this.path(agentId));
-    } catch { /* ignore */ }
+    } catch { }
   }
 
   async isLocked(agentId: string): Promise<boolean> {
@@ -35,8 +32,6 @@ export class LockManager {
     }
   }
 
-  // Returns the owner recorded at acquire time, or null when the lock is absent / unowned /
-  // unreadable. Used to prove a specific flow still holds the lock (owner === expected).
   async ownerOf(agentId: string): Promise<string | null> {
     try {
       const raw = await readFile(this.path(agentId), 'utf8');

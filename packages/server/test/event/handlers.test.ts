@@ -182,7 +182,6 @@ type ManagerMethod = {
 type StubSpec = Partial<Record<ManagerMethod, unknown>>;
 type StubSpies = Record<string, ReturnType<typeof vi.spyOn>>;
 
-// Spy each listed manager method and resolve it to the given value (undefined → resolves void).
 function stubManager(spec: StubSpec, target: AgentManager = manager): StubSpies {
   const spies: StubSpies = {};
   for (const [method, value] of Object.entries(spec)) {
@@ -209,8 +208,6 @@ function findInterventionByPhase(phase: string): BaxianEvent | undefined {
   );
 }
 
-// A QA review pass mid-flight: status=review, round 1, PR #214, head anchored at HEAD_SHA.
-// The head/time/token gate tests share this exact shape and vary only by id + one extra field.
 function seedReviewPass(id: string, extra: Partial<TaskState> = {}): Promise<TaskState> {
   return seedTask({
     id, status: 'review', reviewRound: 1, prNumber: 214,
@@ -219,7 +216,6 @@ function seedReviewPass(id: string, extra: Partial<TaskState> = {}): Promise<Tas
   });
 }
 
-// The accept-path stub: QA released, dev acquired + resumed, merge stubbed, authoritative head = HEAD_SHA.
 function stubApproveFlow(): StubSpies {
   return stubManager({
     releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true,
@@ -227,8 +223,6 @@ function stubApproveFlow(): StubSpies {
   });
 }
 
-// A self-contained manager + bus + handlers on its own EventLog dir, for tests that need a
-// non-default config (no-QA pairing, manual merge) without disturbing the shared `manager`.
 async function makeLocalHandlers(
   config: BaxianConfig,
   eventsDirName: string,
@@ -273,8 +267,6 @@ describe('pr.created handler', () => {
     expect(startSpy).not.toHaveBeenCalled();
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-noarm', 'idle');
     const task = await taskStore.get('task-noarm');
-    // Full rollback: status restored to in_progress, the rotated token reverted to the dev token,
-    // qaAgentId cleared — not left stranded in 'review' with no QA.
     expect(task!.status).toBe('in_progress');
     expect(task!.signalToken).toBe('dev-token');
     expect(task!.qaAgentId).toBeUndefined();
@@ -282,10 +274,6 @@ describe('pr.created handler', () => {
   });
 
   it('pane-signal pr.created (no event.data.headSha) verifies prNumber via gh + pins latestHeadSha + reviewHeadAnchorSha', async () => {
-    // pane-signal pr.created carries prNumber but no headSha; agent-emitted
-    // prNumber must be verified to belong to task.branch (Codex P1 #3323644756)
-    // and the resolved headSha is then pinned as both latestHeadSha and the
-    // immutable reviewHeadAnchorSha for the upcoming QA review.
     await seedTask({ id: 'task-pane-create', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-pane-create');
     stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
@@ -296,7 +284,6 @@ describe('pr.created handler', () => {
       kind: 'pr-created',
       prNumber: 199,
       source: 'pane-signal',
-      // intentionally no headSha — pane signal does not carry it
     });
 
     expect(verifySpy).toHaveBeenCalledWith('task-pane-create', 199);
@@ -370,9 +357,6 @@ describe('pr.created handler', () => {
   });
 
   it('pane-signal pr.created reject re-sets up develop watcher so a corrected emit can be consumed', async () => {
-    // The watcher fires + deletes its entry on the rejected signal; without
-    // re-arm, dev's corrected `[bx:pr-created:<right-num>:token]` would be
-    // unconsumed until a server restart.
     await seedTask({ id: 'task-pane-rearm', status: 'in_progress', reviewRound: 0 });
     const { setupPhaseSignal: armSpy } = stubManager({ verifyPaneSignalPrNumber: undefined, setupPhaseSignal: true });
 
@@ -453,13 +437,13 @@ describe('pr.created handler', () => {
   it('pr.created rotates signalToken in the transition so a failed QA dispatch invalidates the old pass token', async () => {
     await seedTask({ id: 'task-cr-tokrot', status: 'fixing', reviewRound: 1, prNumber: 70, signalToken: 'old-pass-token-1' });
     await seedDevAgent('task-cr-tokrot');
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false); // QA dispatch fails here
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
 
     await emitPrCreated('task-cr-tokrot', { prNumber: 70, headSha: HEAD_SHA });
 
     const task = await taskStore.get('task-cr-tokrot');
     expect(task!.signalToken).toBeTruthy();
-    expect(task!.signalToken).not.toBe('old-pass-token-1'); // rotated despite the failed acquire
+    expect(task!.signalToken).not.toBe('old-pass-token-1');
     const intervention = findIntervention('task-cr-tokrot', 'qa-acquire-failed');
     expect(intervention).toBeTruthy();
   });
@@ -486,8 +470,6 @@ describe('pr.created handler', () => {
     expect(task!.status).toBe('cancelled');
     expect(startSpy).not.toHaveBeenCalled();
     expect(markWaitSpy).not.toHaveBeenCalled();
-    // rotateAndSetupPhaseSignal updates signalToken before dispatch — that's the
-    // one allowed side effect. No other field changes.
     const nonSignalUpdates = updateSpy.mock.calls.filter(([_id, patch]) =>
       !patch || Object.keys(patch).some(k => k !== 'signalToken'),
     );
@@ -508,7 +490,7 @@ describe('pr.created handler', () => {
       ...CONFIG,
       project: [{
         ...CONFIG.project[0],
-        agent: [[CONFIG.project[0].agent[0][0]]], // dev only
+        agent: [[CONFIG.project[0].agent[0][0]]],
       }],
     };
     const { manager: lonelyManager, bus: localBus } = await makeLocalHandlers(noQaConfig, 'events-lonely');
@@ -530,15 +512,12 @@ describe('pr.created handler', () => {
 
     expect(startSpy).not.toHaveBeenCalled();
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-noqa');
-    // No QA partner → no qaAgentId persist.
     const qaPersists = updateSpy.mock.calls.filter(([_id, patch]) =>
       patch != null && Object.prototype.hasOwnProperty.call(patch, 'qaAgentId'),
     );
     expect(qaPersists).toHaveLength(0);
     const task = await taskStore.get('task-noqa');
     expect(task!.status).toBe('review');
-    // No QA pass actually started (no partner) → round NOT consumed; stays 0 so a later
-    // dispatchReviewToQa counts the real first review as Round 1.
     expect(task!.reviewRound).toBe(0);
   });
 
@@ -552,9 +531,6 @@ describe('pr.created handler', () => {
     expect(task!.status).toBe('review');
     expect(task!.prNumber).toBe(22);
     expect(markWaitSpy).not.toHaveBeenCalled();
-    // qaAgentId is persisted BEFORE arming the verdict watcher so a fast pane
-    // verdict can find the QA via task.qaAgentId; on startSession failure it's
-    // rolled back to undefined. Net effect: pre-arm set then rollback unset.
     const qaWrites = updateSpy.mock.calls.filter(([_id, patch]) =>
       patch && 'qaAgentId' in patch,
     );
@@ -568,7 +544,6 @@ describe('pr.created handler', () => {
   });
 
   it('startSession throws EnsureSessionError(handled=true) → caller SKIPS releaseAgentForTask (dialog pane stays locked)', async () => {
-    // handled=true tells the caller to skip release; otherwise terminal boundTask would unlock the stuck dialog pane.
     await seedTask({ id: 'task-dialog-handled', status: 'in_progress', reviewRound: 0 });
     const dialogErr = new EnsureSessionError(
       { createdSession: true, agentId: 'qa-1', dialogPending: true, handled: true },
@@ -669,7 +644,6 @@ describe('pr.created handler', () => {
 
     await emitPrCreated('task-mk-fail', { prNumber: 51 });
 
-    // 关键差异：不再裸 release QA pane（review prompt 可能仍在跑），改为 markAwaitingHuman
     expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-mk-fail', 'idle');
     expect(awaitingSpy).toHaveBeenCalledWith(
       'qa-1',
@@ -680,10 +654,6 @@ describe('pr.created handler', () => {
   });
 
   it('order: updateTask(qaAgentId) BEFORE startSession, markAgentWaiting after startSession resolves true', async () => {
-    // qaAgentId must be persisted before startSession so the poller verdict's
-    // review.submitted release path can read task.qaAgentId. Without this, a
-    // verdict that lands right after dispatch finds qaAgentId=undefined, the
-    // release is skipped, and the QA stays locked on a task past review.
     await seedTask({ id: 'task-order', status: 'in_progress', reviewRound: 0 });
     const calls: string[] = [];
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
@@ -716,8 +686,6 @@ describe('pr.created handler', () => {
 });
 
 describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
-  // Only the FIRST review pass (from in_progress, round 0) bumps to round 1; a re-push from
-  // fixing (round 2) is a recheck and keeps the round.
   it.each([
     ['in_progress' as TaskStatus, 0, 'task-rr-created', 58, 1],
     ['fixing' as TaskStatus, 2, 'task-rr-created-fixing', 60, 2],
@@ -780,8 +748,6 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     await emitReview('task-prfix-noarm', { action: 'REQUEST_CHANGES', prNumber: 50 });
 
     expect(continueSpy).not.toHaveBeenCalled();
-    // Explicit recoverable hold (resumeAgent refuses signal-arm-failed) instead of a silent
-    // 'waiting' state that mislabels the dev as working with no fix prompt running.
     expect(markWaitSpy).not.toHaveBeenCalled();
     expect(holdSpy).toHaveBeenCalledWith(
       'dev-1',
@@ -791,8 +757,6 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     );
   });
 
-  // 1-based cap with rounds=2: round 2 + REQUEST_CHANGES overflows (3 > 2) → max_rounds;
-  // round 1 is still allowed to advance to fixing round 2.
   it.each([
     ['2 + REQUEST_CHANGES → max_rounds (3 > 2)', 'task-rr-cap-over', 2, 32, 'max_rounds' as TaskStatus, undefined],
     ['1 + REQUEST_CHANGES → fixing reviewRound 2 (allowed)', 'task-rr-cap-allow', 1, 33, 'fixing' as TaskStatus, 2],
@@ -843,21 +807,16 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
   });
 
   it('stale catch-up THEN a valid verdict still counts Round 1 (no lost first review)', async () => {
-    // Regression: a stale verdict catches the task up to review (round still 0) and is
-    // rejected. The NEXT valid verdict no longer re-enters catch-up, yet must still
-    // count the first review — reviewRound 0 in the APPROVE branch ⇒ Round 1.
     await seedTask({ id: 'task-rr-stale-then-valid', status: 'in_progress', reviewRound: 0, prNumber: 81, latestHeadSha: NEXT_HEAD_SHA });
     await seedDevAgent('task-rr-stale-then-valid');
     stubManager({ markAgentWaiting: true, releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
     vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh offline'));
 
-    // 1) stale APPROVE (reviewed an old head; authoritative head = NEXT_HEAD_SHA) → rejected.
     await emitReview('task-rr-stale-then-valid', { action: 'APPROVE', prNumber: 81, headSha: HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA });
     const afterStale = await taskStore.get('task-rr-stale-then-valid');
     expect(afterStale!.status).toBe('review');
     expect(afterStale!.reviewRound).toBe(0);
 
-    // 2) valid APPROVE on the current head → approved, first review finally counted as Round 1.
     await emitReview('task-rr-stale-then-valid', { action: 'APPROVE', prNumber: 81, headSha: NEXT_HEAD_SHA, currentHeadSha: NEXT_HEAD_SHA });
     const afterValid = await taskStore.get('task-rr-stale-then-valid');
     expect(afterValid!.status).toBe('approved');
@@ -865,10 +824,6 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
   });
 
   it('pr.created: same-identity verdict races in during startSession → no double count (count-once token no-ops)', async () => {
-    // Codex P1: a same-identity QA can emit its verdict between startSession and the
-    // post-success count. Simulate that by having the verdict's effect land during
-    // startSession (task → approved, first review already counted 0→1). The count-once
-    // token (expectedRound=0) sees reviewRound moved to 1 and no-ops → stays 1 (not 2).
     await seedTask({ id: 'task-rr-race', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-rr-race');
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
@@ -885,12 +840,6 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
   });
 
   it('pr.updated approved re-review: same-identity verdict races in (does NOT catch-count) → pass still counted once (round 2)', async () => {
-    // Codex P2 #3330096838: on an approved→review re-review reviewRound is already ≥1, so
-    // the verdict's APPROVE handler does NOT catch-count (that only fires at reviewRound 0).
-    // Simulate the verdict winning the race by moving the task back to approved WITHOUT
-    // counting (reviewRound stays 1). The count-once token (expectedRound=1) must still
-    // count this genuinely-started pass → round 2 (the old status==='review' guard wrongly
-    // no-opped here, leaving round 1).
     await seedTask({ id: 'task-rr-appr-race', status: 'approved', reviewRound: 1, prNumber: 91, qaAgentId: 'qa-1' });
     await seedDevAgent('task-rr-appr-race');
     stubManager({ releaseAgentForTask: true, markAgentWaiting: true, acquireAgentForTask: true });
@@ -1191,7 +1140,7 @@ describe('pr.updated handler', () => {
       reviewRound: 1,
       prNumber: 71,
       qaAgentId: 'qa-1',
-      latestHeadSha: HEAD_SHA, // older
+      latestHeadSha: HEAD_SHA,
     });
     stubManager({ releaseAgentForTask: true, startSession: true });
 
@@ -1211,10 +1160,6 @@ describe('pr.updated handler', () => {
   });
 
   it('push kind in review (dev pushed during QA review): stop old QA + start recheck (neutral prompt, no false premise)', async () => {
-    // A mid-review push re-dispatches as 'recheck'. The recheck prompt is phrased
-    // neutrally ("re-check the new commits and any prior feedback"), so it does NOT
-    // make the false "dev addressed your prior changes-requested" claim even when no
-    // verdict was issued yet — and a push during an actual recheck keeps recheck framing.
     await seedTask({ id: 'task-up-rr', status: 'review', reviewRound: 0, prNumber: 70, qaAgentId: 'qa-1' });
     const { releaseAgentForTask: stopSpy, startSession: startSpy } = stubManager({ releaseAgentForTask: true, startSession: true });
 
@@ -1244,18 +1189,15 @@ describe('pr.updated handler', () => {
   });
 
   it('push redispatch rotates signalToken in the transition so a failed redispatch invalidates the old pass token', async () => {
-    // If acquire/startSession of the new QA fails, the token must already have rotated
-    // (atomic with the anchors) — otherwise an old QA pass could submit a verdict whose
-    // stamp still equals the un-rotated task.signalToken and slip past the token gate.
     await seedTask({ id: 'task-up-tokrot', status: 'review', reviewRound: 1, prNumber: 70, signalToken: 'old-pass-token-1', qaAgentId: 'qa-1' });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false); // redispatch fails here
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
 
     await emitPrUpdated('task-up-tokrot', { prNumber: 70, kind: 'push' });
 
     const task = await taskStore.get('task-up-tokrot');
     expect(task!.signalToken).toBeTruthy();
-    expect(task!.signalToken).not.toBe('old-pass-token-1'); // rotated despite the failed acquire
+    expect(task!.signalToken).not.toBe('old-pass-token-1');
     const intervention = findIntervention('task-up-tokrot', 'qa-acquire-failed');
     expect(intervention).toBeTruthy();
   });
@@ -1303,14 +1245,11 @@ describe('pr.updated handler', () => {
   });
 
   it('fixing → review recheck: QA started + markAgentWaiting false → markAwaitingHuman on QA (do NOT release)', async () => {
-    // 用 fixing 作为 previousStatus 走 markAgentWaiting 分支（approved 走 early release，
-    // 不经过 line 553 的 markAgentWaiting）。
     await seedTask({ id: 'task-up-mk-fail', status: 'fixing', reviewRound: 1, prNumber: 75, qaAgentId: 'qa-1' });
     const { releaseAgentForTask: releaseSpy, markAwaitingHuman: awaitingSpy } = stubManager({ startSession: true, updateTask: undefined, markAgentWaiting: false, releaseAgentForTask: true, markAwaitingHuman: undefined });
 
     await emitPrUpdated('task-up-mk-fail', { prNumber: 75, kind: 'push' });
 
-    // 不再裸 release QA pane（recheck prompt 可能仍在跑），改为 markAwaitingHuman
     expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-up-mk-fail', 'idle');
     expect(awaitingSpy).toHaveBeenCalledWith(
       'qa-1',
@@ -1334,8 +1273,6 @@ describe('pr.updated handler', () => {
   });
 
   it('approved-push recheck verdict arm fails → stays in review (NOT rolled back to approved), releases QA + intervention', async () => {
-    // Rolling back to approved would re-mark the task approved while the new push is unreviewed and
-    // the post-approve completion was already cleared by the transition. Stay in review instead.
     await seedTask({ id: 'task-up-approved-noarm', status: 'approved', reviewRound: 1, prNumber: 74, qaAgentId: 'qa-1' });
     const { startSession: startSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'rotated', armed: false }, startSession: true });
 
@@ -1348,8 +1285,6 @@ describe('pr.updated handler', () => {
     expect(findInterventionByPhase('qa-recheck-arm-failed-after-approved-push')).toBeDefined();
   });
 
-  // A post-approve complete signal (poller-sourced or pane-signal) reaches the same merge-ready
-  // gate: transition to merge-ready, clear the completion, mark dev waiting, never auto-merge.
   it.each([
     ['poller signal', 'task-up-post-approved', 75, 'post-token-75', {}],
     ['pane signal source', 'task-up-post-pane', 76, 'post-token-76', { source: 'pane-signal' }],
@@ -1381,7 +1316,6 @@ describe('pr.updated handler', () => {
     expect((await taskStore.get('task-up-post-merge-fail'))!.status).toBe('merge-ready');
     expect(mergeSpy).not.toHaveBeenCalled();
 
-    // project.merge defaults to 'auto' in this fixture's config — confirm executes it.
     await manager.markTaskComplete('task-up-post-merge-fail');
     expect(mergeSpy).toHaveBeenCalledWith('task-up-post-merge-fail', { matchHeadSha: HEAD_SHA });
   });
@@ -1407,8 +1341,6 @@ describe('pr.updated handler', () => {
       manager.getPostApproveCompletion('task-up-post-manual-complete'),
     ).resolves.toBeNull();
 
-    // Once merge-ready, baxian hands off to the human: a later plain comment does not
-    // re-run the post-approve check (REQUEST_CHANGES / push are the formal re-open paths).
     await emitPrUpdated('task-up-post-manual-complete', { prNumber: 81, kind: 'comment' });
 
     const afterComment = await taskStore.get('task-up-post-manual-complete');
@@ -1562,8 +1494,6 @@ describe('pr.updated handler', () => {
     expect(startSpy).not.toHaveBeenCalled();
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-noarm', 'idle');
     const task = await taskStore.get('task-up-noarm');
-    // Rolled back to fixing AND the rotated token reverted, so the dev's prior pr-fixed prompt
-    // signal isn't stranded by a token mismatch.
     expect(task!.status).toBe('fixing');
     expect(task!.signalToken).toBe('fixing-token');
     expect(task!.qaAgentId).toBeUndefined();
@@ -1602,7 +1532,6 @@ describe('pr.updated handler', () => {
 });
 
 describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
-  // A dev fix in flight: status=fixing, phase=code, head anchored at HEAD_SHA, dispatched now.
   function seedFixingPass(id: string, extra: Partial<TaskState> = {}): Promise<TaskState> {
     return seedTask({
       id, status: 'fixing', phase: 'code', reviewRound: 1,
@@ -1677,14 +1606,14 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
 
     const task = await taskStore.get('task-pf-headfail');
     expect(task!.status).toBe('fixing');
-    expect(replySpy).not.toHaveBeenCalled(); // never reaches reply/no-op path
+    expect(replySpy).not.toHaveBeenCalled();
     expect(findInterventionByPhase('fix-verify-head-fetch-failed')).toBeDefined();
     expect(findInterventionByPhase('fix-no-op-no-commit-no-reply')).toBeUndefined();
   });
 
   it('reply fetch fails → fail-closed escalation, not treated as no-op', async () => {
     await seedFixingPass('task-pf-replyfail', { prNumber: 76, signalToken: 'tok-rf' });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA); // no new commit
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
     vi.spyOn(manager, 'prHasDevReplySince').mockRejectedValue(new Error('gh api offline'));
 
     await emitPrFixSubmitted('task-pf-replyfail', { kind: 'pr-fixed', token: 'tok-rf', verdictAgentId: 'dev-1', source: 'pane-signal' });
@@ -1705,8 +1634,6 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
 
     await emitPrFixSubmitted('task-pf-bound', { kind: 'pr-fixed', token: 'tok-bd', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
-    // QA/human comments left during the prior review (after reviewDispatchedAt,
-    // before fixing) must NOT count — bound is fixDispatchedAt.
     expect(replySpy).toHaveBeenCalledWith('task-pf-bound', '2026-06-01T00:05:00.000Z');
   });
 
@@ -1715,7 +1642,7 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
       prNumber: 81, signalToken: 'tok-ra', fixDispatchedAt: new Date().toISOString(),
     });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
-    vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false); // no-op
+    vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(false);
     const armSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
 
     await emitPrFixSubmitted('task-pf-rearm', { kind: 'pr-fixed', token: 'tok-ra', verdictAgentId: 'dev-1', source: 'pane-signal' });
@@ -1726,7 +1653,7 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
   it('missing reviewHeadAnchorSha fails closed with escalation instead of no-op', async () => {
     await seedFixingPass('task-pf-noanchor', {
       prNumber: 82, signalToken: 'tok-na', fixDispatchedAt: new Date().toISOString(),
-      reviewHeadAnchorSha: undefined, // bail at no-anchor before the reply check
+      reviewHeadAnchorSha: undefined,
     });
     const { prHasDevReplySince: replySpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, prHasDevReplySince: false, setupPhaseSignal: true });
 
@@ -1734,7 +1661,7 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
 
     const task = await taskStore.get('task-pf-noanchor');
     expect(task!.status).toBe('fixing');
-    expect(replySpy).not.toHaveBeenCalled(); // bailed at no-anchor before the reply check
+    expect(replySpy).not.toHaveBeenCalled();
     expect(findInterventionByPhase('fix-verify-no-anchor')).toBeDefined();
   });
 
@@ -1742,24 +1669,20 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
     await seedFixingPass('task-pf-rollback', {
       prNumber: 83, signalToken: 'tok-rb', qaAgentId: 'qa-1', fixDispatchedAt: new Date().toISOString(),
     });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA); // no new commit
-    vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(true); // has replies → advance
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
+    vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(true);
     stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'tok2', armed: true }, setupPhaseSignal: true });
-    // QA dispatch fails → pr.updated push handler rolls review back to fixing.
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
 
     await emitPrFixSubmitted('task-pf-rollback', { kind: 'pr-fixed', token: 'tok-rb', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-rollback');
-    expect(task!.status).toBe('fixing'); // rolled back by the push handler
+    expect(task!.status).toBe('fixing');
     expect(findInterventionByPhase('fix-advance-rolled-back')).toBeDefined();
   });
 });
 
 describe('pr.merged handler', () => {
-  // max_rounds is non-terminal (paused awaiting a human decision), so a merge of its PR —
-  // manual mark-complete or an externally-merged PR the poller detects — must still transition
-  // to merged and run the normal post-merge cleanup, like the active statuses.
   it.each([
     ['in_progress' as TaskStatus, 'task-m1', 10, { reviewRound: 0 }],
     ['merge-ready' as TaskStatus, 'task-mr-merged', 18, { reviewRound: 1 }],
@@ -1776,9 +1699,6 @@ describe('pr.merged handler', () => {
     expect(cleanupSpy).toHaveBeenCalledWith(id);
   });
 
-  // review → merged dispatches post-merge cleanup to QA WITHOUT an up-front release. The cleanup
-  // flow keeps QA bound (non-dispatchable / Start disabled) and releases only after /clear, so the
-  // next task can't start before QA cleaned its branch + cleared context.
   it.each([
     ['task-m3', 12],
     ['task-m3-cleanup', 77],
@@ -1808,8 +1728,6 @@ describe('pr.merged handler', () => {
 
   it('approved external merge routes the post-approve dev through post-merge cleanup', async () => {
     await seedTask({ id: 'task-m4-post-approve', status: 'approved', reviewRound: 1, prNumber: 130 });
-    // cleanupAfterMerge runs for real and must delegate dev cleanup to dispatchPostMergeCleanup,
-    // which keeps the dev bound until branch delete + /clear finish.
     const dispatchSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
 
     await emitPrMerged('task-m4-post-approve', { prNumber: 130 });
@@ -1888,8 +1806,6 @@ describe('review.submitted (manual review terminal-task escape)', () => {
     });
   }
 
-  // max_rounds is intentionally absent: it is non-terminal now, so the terminal escape
-  // does not apply to it (and in the real flow its QA is already released at the pause).
   it.each([
     ['merged' as TaskStatus, 'APPROVE'],
     ['cancelled' as TaskStatus, 'REQUEST_CHANGES'],
@@ -1938,9 +1854,6 @@ describe('review.submitted (manual review terminal-task escape)', () => {
     expect(findInterventionByPhase('manual-review-on-terminal-task-completed')).toBeUndefined();
   });
 
-  // max_rounds is non-terminal now, so a spec-phase max_rounds review.submitted no longer
-  // hits the terminal escape; the spec gate early-returns and the event is inert (the code
-  // protocol must never mutate a spec-phase task's status).
   it('spec phase + max_rounds → no terminal escape, spec gate early-returns (inert)', async () => {
     await seedTask({
       id: 'task-spec-max-rounds',
@@ -1961,7 +1874,6 @@ describe('review.submitted (manual review terminal-task escape)', () => {
 
     await emitReview('task-spec-max-rounds', { action: 'REQUEST_CHANGES', prNumber: 110, headSha: HEAD_SHA }, 'dev-1');
 
-    // 状态不被改（spec gate 早退），且未触发 terminal escape 的 intervention。
     expect(transitionSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-spec-max-rounds');
     expect(task!.status).toBe('max_rounds');
@@ -2017,10 +1929,6 @@ describe('review.submitted spec-phase gate', () => {
 
 describe('review.submitted APPROVE', () => {
   it('pane-fallback APPROVE (same-identity 422, no event.data.headSha) uses task.reviewHeadAnchorSha and reaches the approve branch', async () => {
-    // Same-identity (422) fallback: QA echoes pr-approved as a pane signal (no
-    // headSha — the agent doesn't observe SHAs). Handler must pin reviewedHeadSha
-    // to task.reviewHeadAnchorSha (snapshotted at dispatch), NOT task.latestHeadSha
-    // (which can be re-anchored by a mid-review push).
     await seedReviewPass('task-pane-approve', { prNumber: 200 });
     stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined });
 
@@ -2029,7 +1937,6 @@ describe('review.submitted APPROVE', () => {
       action: 'APPROVE',
       verdictAgentId: 'qa-1',
       source: 'pane-signal',
-      // intentionally no headSha — that's the fallback case under test.
     });
 
     const task = await taskStore.get('task-pane-approve');
@@ -2041,11 +1948,7 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('pane-fallback APPROVE under push-during-review rejects as stale (head-race protection via anchor)', async () => {
-    // QA dispatched at head A → reviewHeadAnchorSha=A (immutable). Dev pushes head
-    // B mid-review → latestHeadSha=B. QA pane-approves (no headSha). reviewedHeadSha
-    // = anchor A, GitHub authoritative head = B, A != B → stale-approval-head-mismatch.
     const HEAD_B = NEXT_HEAD_SHA;
-    // anchor pinned at A (dispatch head); latestHeadSha moved to B by a mid-review push.
     await seedReviewPass('task-race', { prNumber: 300, latestHeadSha: HEAD_B });
     stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true, mergePr: undefined, fetchPrHeadSha: HEAD_B });
 
@@ -2063,9 +1966,6 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('poller verdict tears down the fallback verdict watcher (distinct-identity: armed but never fired)', async () => {
-    // Distinct identity: QA approves via `gh pr review`, never emits a pane signal.
-    // The fallback verdict watcher stays armed; the poller verdict must tear it
-    // down so it neither leaks the subscription nor raises a spurious session-gone.
     await seedReviewPass('task-teardown', { prNumber: 210 });
     stubApproveFlow();
     const stopSpy = vi.spyOn(manager, 'stopPhaseSignalWatcher');
@@ -2073,7 +1973,7 @@ describe('review.submitted APPROVE', () => {
     await emitReview('task-teardown', {
       action: 'APPROVE',
       prNumber: 210,
-      headSha: HEAD_SHA,       // poller-sourced commit_id
+      headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
     });
 
@@ -2083,19 +1983,15 @@ describe('review.submitted APPROVE', () => {
   });
 
   it('head-stale APPROVE does NOT tear down the watcher (rejected before any transition)', async () => {
-    // bx-cx review: teardown must run only after the verdict is actually consumed.
-    // A head-stale verdict is rejected (stale-approval-head-mismatch) before the
-    // approved transition — tearing the watcher down there would strand a same-identity
-    // 422 fallback (no watcher to catch a corrected emit) or clobber pr-merge-ready.
     await seedReviewPass('task-stale-noteardown', { prNumber: 220, latestHeadSha: NEXT_HEAD_SHA });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA); // current head moved on
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(NEXT_HEAD_SHA);
     const stopSpy = vi.spyOn(manager, 'stopPhaseSignalWatcher');
 
     await emitReview('task-stale-noteardown', {
       action: 'APPROVE',
       prNumber: 220,
-      headSha: HEAD_SHA,          // verdict reviewed the OLD head
+      headSha: HEAD_SHA,
       currentHeadSha: NEXT_HEAD_SHA,
     });
 
@@ -2103,7 +1999,7 @@ describe('review.submitted APPROVE', () => {
     expect(stale).toBeDefined();
     expect(stopSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-stale-noteardown');
-    expect(task!.status).toBe('review'); // unchanged
+    expect(task!.status).toBe('review');
   });
 
   it('review → approved + release QA + dispatch dev post-approve feedback check', async () => {
@@ -2333,9 +2229,6 @@ describe('review.submitted APPROVE', () => {
     expect(intervention2?.data.fetchError).toContain('gh api offline');
   });
 
-  // On fetch failure the staleness check falls back: to task.latestHeadSha when present
-  // (source=task-store, surfacing the fetchError), else to the verdict's own currentHeadSha
-  // (source=payload-self). Either way the stale APPROVE is rejected.
   it.each([
     ['task.latestHeadSha (source=task-store)', 'task-fetch-fallback-store', 302, 'gh api offline', { latestHeadSha: NEXT_HEAD_SHA }, HEAD_SHA, 'task-store', 'gh api offline'],
     ['payload-self (source=payload-self)', 'task-fetch-fallback-payload', 303, 'gh pr view: 404', {}, NEXT_HEAD_SHA, 'payload-self', undefined],
@@ -2383,9 +2276,6 @@ describe('review.submitted APPROVE', () => {
 
 describe('review.submitted freshness (superseded-pass guard)', () => {
   it('rejects a poller verdict submitted before the current review pass was dispatched', async () => {
-    // Race: an earlier QA pass reviewed the old head and posted CHANGES_REQUESTED,
-    // but a recheck was dispatched (reviewDispatchedAt) BEFORE that late
-    // verdict arrived. The verdict belongs to the superseded pass — must not apply.
     await seedReviewPass('task-stale-pass', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z' });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
@@ -2395,19 +2285,18 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
       prNumber: 214,
       headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
-      submittedAt: '2026-05-30T04:02:50Z', // before reviewDispatchedAt → stale
+      submittedAt: '2026-05-30T04:02:50Z',
     });
 
     const task = await taskStore.get('task-stale-pass');
-    expect(task!.status).toBe('review'); // unchanged — not driven into fixing
-    expect(task!.reviewRound).toBe(1); // not bumped
+    expect(task!.status).toBe('review');
+    expect(task!.reviewRound).toBe(1);
     expect(transitionSpy).not.toHaveBeenCalled();
     const stale = findInterventionByPhase('stale-verdict-superseded-pass');
     expect(stale).toBeDefined();
   });
 
   it('accepts a poller verdict submitted after the current review pass was dispatched', async () => {
-    // The fresh recheck verdict (submitted after pass #2 dispatch) must pass the gate.
     await seedReviewPass('task-fresh-pass', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z' });
     stubApproveFlow();
 
@@ -2416,7 +2305,7 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
       prNumber: 214,
       headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
-      submittedAt: '2026-05-30T04:06:01Z', // after reviewDispatchedAt → fresh
+      submittedAt: '2026-05-30T04:06:01Z',
     });
 
     const task = await taskStore.get('task-fresh-pass');
@@ -2426,9 +2315,6 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
   });
 
   it('does NOT reject a fresh verdict whose second-granular submitted_at is within the clock-skew budget', async () => {
-    // GitHub submitted_at is second-granular; baxian reviewDispatchedAt is ms. A
-    // verdict submitted in (or just before) the same wall-clock second as dispatch
-    // must NOT be killed by sub-second rounding / minor clock drift.
     await seedReviewPass('task-skew', { reviewDispatchedAt: '2026-05-30T04:03:00.500Z' });
     stubApproveFlow();
 
@@ -2437,7 +2323,7 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
       prNumber: 214,
       headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
-      submittedAt: '2026-05-30T04:03:00Z', // 0.5s before dispatch, within skew budget
+      submittedAt: '2026-05-30T04:03:00Z',
     });
 
     const task = await taskStore.get('task-skew');
@@ -2449,10 +2335,6 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
 
 describe('review.submitted per-pass token gate (binds verdict to the dispatched pass)', () => {
   it('rejects a verdict whose review-pass token does not match the current signalToken', async () => {
-    // Old QA pass reviewed the prior code, finished and submitted AFTER a mid-review
-    // push re-dispatched (signalToken rotated). Its review body stamps the OLD token;
-    // GitHub attributes the verdict to the new head, so the head/time gates miss it —
-    // only the stamp catches it.
     await seedReviewPass('task-wrongpass', { signalToken: 'current-token-22' });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
@@ -2462,11 +2344,11 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
       prNumber: 214,
       headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
-      reviewPassToken: 'stale-token-11', // != current signalToken → superseded pass
+      reviewPassToken: 'stale-token-11',
     });
 
     const task = await taskStore.get('task-wrongpass');
-    expect(task!.status).toBe('review'); // unchanged
+    expect(task!.status).toBe('review');
     expect(transitionSpy).not.toHaveBeenCalled();
     const wrong = findInterventionByPhase('stale-verdict-wrong-pass');
     expect(wrong).toBeDefined();
@@ -2481,7 +2363,7 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
       prNumber: 214,
       headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
-      reviewPassToken: 'current-token-22', // matches → fresh
+      reviewPassToken: 'current-token-22',
     });
 
     const task = await taskStore.get('task-rightpass');
@@ -2497,7 +2379,6 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
       prNumber: 214,
       headSha: HEAD_SHA,
       currentHeadSha: HEAD_SHA,
-      // no reviewPassToken
     });
 
     const task = await taskStore.get('task-notoken');
@@ -2507,10 +2388,7 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
   });
 
   it('rejects a stale PANE-fallback verdict whose data.token no longer matches the rotated signalToken', async () => {
-    // After a redispatch rotated task.signalToken, an old QA's not-yet-replaced watcher
-    // can still fire [bx:pr-approved:<old-token>]. The gate must reject it via data.token,
-    // not bind a headSha-less pane verdict to the new reviewHeadAnchorSha.
-    await seedReviewPass('task-stale-pane', { signalToken: 'current-token-22' }); // already rotated by the redispatch
+    await seedReviewPass('task-stale-pane', { signalToken: 'current-token-22' });
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
@@ -2519,11 +2397,11 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
       action: 'APPROVE',
       verdictAgentId: 'qa-1',
       source: 'pane-signal',
-      token: 'stale-token-11', // old watcher's token != current signalToken
+      token: 'stale-token-11',
     });
 
     const task = await taskStore.get('task-stale-pane');
-    expect(task!.status).toBe('review'); // not approved
+    expect(task!.status).toBe('review');
     expect(transitionSpy).not.toHaveBeenCalled();
     const wrong = findInterventionByPhase('stale-verdict-wrong-pass');
     expect(wrong).toBeDefined();
@@ -2539,7 +2417,7 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
       action: 'APPROVE',
       verdictAgentId: 'qa-1',
       source: 'pane-signal',
-      token: 'current-token-22', // matches current pass → accept
+      token: 'current-token-22',
     });
 
     const task = await taskStore.get('task-legit-pane');
@@ -2616,9 +2494,6 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(intervention!.data.phase).toBe('post-approve-dev-wait-gate-failed-before-fix');
   });
 
-  // A stale REQUEST_CHANGES (verdict reviewed an older head) on an approved task is rejected:
-  // approval + round + active token preserved, no dev/QA dispatch, and it can never push an
-  // approved newer head into max_rounds even at the round cap.
   it.each([
     ['for an older head preserves approval and active token', 'task-r-approved-stale', 1, 37, false],
     ['cannot move an approved newer head to max_rounds', 'task-r-approved-stale-max', 3, 38, true],
@@ -2684,9 +2559,6 @@ describe('review.submitted REQUEST_CHANGES', () => {
   });
 
   it('honors live config: manager.replaceConfig lowering rounds takes effect on the very next REQUEST_CHANGES', async () => {
-    // PATCH /config rounds=10 → 1 must NOT require a server restart. Issue #167 regression:
-    // handlers used to close over the initial config at boot time; if they still do, this
-    // test fails because the captured rounds=3 would let round-2 continue instead of capping.
     await seedTask({ id: 'task-rounds-live', status: 'review', reviewRound: 1, prNumber: 77, qaAgentId: 'qa-1' });
     stubManager({ releaseAgentForTask: true, continueSession: true });
 
@@ -2700,7 +2572,6 @@ describe('review.submitted REQUEST_CHANGES', () => {
 
   it('exceeds rounds → max_rounds + emit review.max_rounds', async () => {
     await seedTask({ id: 'task-r3', status: 'review', reviewRound: 3, prNumber: 32, qaAgentId: 'qa-1' });
-    // QA bound to the task (it was reviewing) → release path runs.
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'running', taskId: 'task-r3', paneId: '%2', updatedAt: new Date().toISOString() });
     const { releaseAgentForTask: stopSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, continueSession: true });
 
@@ -2708,13 +2579,10 @@ describe('review.submitted REQUEST_CHANGES', () => {
 
     const task = await taskStore.get('task-r3');
     expect(task!.status).toBe('max_rounds');
-    // QA released via the outcome path (allowAwaitingHuman, so a Held QA whose verdict arrived is releasable).
     expect(stopSpy).toHaveBeenCalledWith('qa-1', 'task-r3', 'idle', { allowAwaitingHuman: true });
     expect(continueSpy).not.toHaveBeenCalled();
-    // code-phase pause: dev is RETAINED (reserved with its worktree), only QA is released.
     expect(stopSpy).not.toHaveBeenCalledWith('dev-1', 'task-r3', 'idle');
     expect(stopSpy).not.toHaveBeenCalledWith('dev-1', 'task-r3', 'idle', { allowAwaitingHuman: true });
-    // F4: the released QA's stale id is cleared so a later QA failure can't false-fail this paused task.
     expect(task!.qaAgentId).toBeUndefined();
 
     const maxEvent = emittedEvents.find(e => e.type === 'review.max_rounds');
@@ -2722,11 +2590,8 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(maxEvent!.taskId).toBe('task-r3');
   });
 
-  // G1: if the QA release is REFUSED (e.g. still bound/held and the gate declines), the stale
-  // qaAgentId must NOT be cleared — keep the reference so a later Cancel/Complete can reclaim it.
   it('exceeds rounds → does NOT clear qaAgentId when the QA release is refused', async () => {
     await seedTask({ id: 'task-r3b', status: 'review', reviewRound: 3, prNumber: 33, qaAgentId: 'qa-1' });
-    // QA still bound (held) → release path runs but is refused → keep the reference.
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'awaiting_human', taskId: 'task-r3b', paneId: '%2', updatedAt: new Date().toISOString() });
     stubManager({ releaseAgentForTask: false, continueSession: true });
 
@@ -2737,12 +2602,8 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(task!.qaAgentId).toBe('qa-1');
   });
 
-  // I1: REQUEST_CHANGES can hit the cap from merge-ready/approved, where the APPROVE path already
-  // released the QA WITHOUT clearing qaAgentId. The stale id must still be cleared at max_rounds so
-  // the released QA's later failure can't false-fail this paused (active) task.
   it('merge-ready → max_rounds clears the stale qaAgentId of an already-released QA', async () => {
     await seedTask({ id: 'task-mr-cap', status: 'merge-ready', reviewRound: 3, prNumber: 34, qaAgentId: 'qa-1' });
-    // QA already released by the approve path: unbound (no taskId).
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'idle', paneId: '%2', updatedAt: new Date().toISOString() });
 
     await emitReview('task-mr-cap', { action: 'REQUEST_CHANGES', prNumber: 34 });
@@ -2837,7 +2698,6 @@ describe('review.submitted late-review catch-up', () => {
 });
 
 describe('event-driven release does not interrupt agent mid-action', () => {
-  // Regression: PR webhook → release path must not send C-c to a busy dev pane.
   it('review.submitted REQUEST_CHANGES on approved task with busy dev pane: no C-c, dev binding preserved through waiting release', async () => {
     await seedTask({ id: 'task-busy-redispatch', status: 'approved', reviewRound: 1, prNumber: 113, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
     await seedDevAgent('task-busy-redispatch');
@@ -2896,7 +2756,6 @@ describe('event-driven release does not interrupt agent mid-action', () => {
   });
 
   it('REQUEST_CHANGES on approved + post-approve completion still active: emits intervention + skips fix dispatch (avoid prompt collision)', async () => {
-    // Dev still running post-approve check; release(waiting) just bumps updatedAt → fix prompt would land in the busy pane.
     await seedTask({ id: 'task-postapprove-busy', status: 'approved', reviewRound: 1, prNumber: 200, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
     await seedDevAgent('task-postapprove-busy');
     await lockManager.acquire('dev-1');
@@ -2906,20 +2765,16 @@ describe('event-driven release does not interrupt agent mid-action', () => {
 
     await emitReview('task-postapprove-busy', { action: 'REQUEST_CHANGES', prNumber: 200, headSha: HEAD_SHA });
 
-    // fix dispatch 必须跳过——既不 release(waiting) 也不 acquire(fix) 也不 continueSession(fix)
     expect(releaseSpy).not.toHaveBeenCalledWith('dev-1', 'task-postapprove-busy', 'waiting');
     expect(acquireSpy).not.toHaveBeenCalled();
     expect(continueSpy).not.toHaveBeenCalled();
 
-    // task 保持 approved (transition 没发生)
     const task = await taskStore.get('task-postapprove-busy');
     expect(task!.status).toBe('approved');
 
-    // intervention 已 emit
     const intervention = findInterventionByPhase('request-changes-during-post-approve');
     expect(intervention).toBeTruthy();
 
-    // PostApproveCompletion must clear, else signal completion + pendingRedispatch=false would auto-merge despite the REQUEST_CHANGES.
     const completionAfter = await manager.getPostApproveCompletion('task-postapprove-busy');
     expect(completionAfter).toBeNull();
   });

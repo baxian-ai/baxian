@@ -175,10 +175,6 @@ describe('mapGitHubEvent', () => {
   });
 
   it('ignores any reply-marker text in a review-comment body (post-approve-reply marker is retired)', () => {
-    // Idempotency during post-approve is now enforced by the pr-feedback
-    // skill scanning each thread for its own reply, not by a token-bearing
-    // marker. The mapper must not surface postApproveReplyAgentId/Token
-    // even if a legacy comment still contains the marker text.
     const payload = {
       action: 'created',
       repository: { full_name: REPO },
@@ -288,7 +284,6 @@ describe('mapGitHubEvent', () => {
   });
 
   it('treats issue_comment containing a (retired) completion marker as a plain comment', () => {
-    // Completion route retired (pane signal now); a comment containing the marker is plain feedback.
     const payload = {
       action: 'created',
       repository: { full_name: REPO },

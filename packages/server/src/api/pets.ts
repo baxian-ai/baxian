@@ -49,8 +49,6 @@ export async function petRoutes(app: FastifyInstance): Promise<void> {
     const sprite = await store.readSpritesheet(request.params.id);
     if (!sprite) return reply.status(404).send({ error: 'pet not found' });
     reply.header('Content-Type', sprite.ext === 'png' ? 'image/png' : 'image/webp');
-    // private (not public): the response is fetched with a bearer token, so a shared/proxy
-    // cache must not store and replay it. UUID-keyed + immutable → safe in the browser cache only.
     reply.header('Cache-Control', 'private, max-age=31536000, immutable');
     return reply.send(sprite.bytes);
   });
@@ -68,9 +66,6 @@ export async function petRoutes(app: FastifyInstance): Promise<void> {
       if (typeof petId === 'string' && !(await store.getMeta(petId))) {
         return reply.status(404).send({ error: 'pet not found' });
       }
-      // Serialize with DELETE /agents (same config lock + deletion claim): otherwise a PUT that
-      // passes the agent check during DELETE's lock-free phase2 can write AFTER phase3 cleared
-      // this agent's assignment, leaving a stale assignment a recreated id would inherit.
       return withConfigLock(async () => {
         if (app.ctx.agentManager.isDeletionInFlight(agentId)) {
           return reply.status(409).send({ error: `Agent "${agentId}" is being deleted; cannot set pet.` });

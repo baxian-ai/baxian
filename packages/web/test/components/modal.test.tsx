@@ -15,7 +15,6 @@ describe('Modal', () => {
   });
 
   it('does not steal focus when parent re-renders with a fresh inline onClose', () => {
-    // Reproduces the polling-disrupts-input bug.
     function Parent() {
       const [tick, setTick] = useState(0);
       return (
@@ -80,8 +79,6 @@ describe('Modal', () => {
   });
 
   it('does not close when a text selection starts inside the content and the mouse is released on the backdrop', () => {
-    // Reproduces: selecting text in an input and dragging past the content box fired a click on the
-    // common ancestor (the backdrop) → modal closed. Only a press that also starts on the backdrop dismisses.
     const handler = vi.fn();
     render(
       <Modal open onClose={handler} title="t">

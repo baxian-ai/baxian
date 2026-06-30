@@ -26,8 +26,6 @@ describe('buildLaunchCommand', () => {
     expect(cmd).not.toMatch(/^CLAUDE_CODE_NO_FLICKER=1\b/);
   });
 
-  // Disables Claude Code's "How is Claude doing this session?" survey: its overlay masks the REPL ready
-  // anchor, and on macOS Escape/Ctrl-C can't dismiss it, so a cancel's interrupt would stall (task-167).
   it('claude-code disables the session feedback survey; codex carries no such env', () => {
     expect(buildLaunchCommand(agent({ runtime: 'claude-code' }))).toContain('CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1');
     expect(buildLaunchCommand(agent({ runtime: 'codex' }))).not.toContain('CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY');
@@ -82,12 +80,8 @@ describe('buildLaunchCommand', () => {
     expect(cmd).toBe(
       "codex --dangerously-bypass-approvals-and-sandbox --model 'evil'\\''; rm -rf /;'\\'''",
     );
-    // Invariant: the only unquoted ' chars are exactly the `'\''` triplets.
     const modelArg = cmd.split(' --model ')[1];
     const stripped = modelArg.replace(/'\\''/g, '');
-    // After collapsing the close-escape-reopen triplets, the remaining string
-    // must start with ' and end with ' (the outer quotes), with no bare `'`
-    // inside — proving every embedded apostrophe was properly escaped.
     expect(stripped.startsWith("'")).toBe(true);
     expect(stripped.endsWith("'")).toBe(true);
     expect(stripped.slice(1, -1)).not.toContain("'");

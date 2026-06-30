@@ -15,7 +15,6 @@ let openApps: FastifyInstance[];
 
 interface Captured { cmd: string; env?: Record<string, string> }
 
-// A project whose single remote agent references host `box` — used by the live-agent guards.
 function remoteAgentProject(): ProjectConfig {
   return {
     id: 'proj', repo: 'user/repo', merge: null,
@@ -69,7 +68,7 @@ describe('POST /api/hosts', () => {
     const body = JSON.parse(res.body);
     expect(body.host.id).toBe('prod-db');
     expect(body.host.password).toBe('***');
-    expect(ctx.config.host[0].password).toBe('sekret'); // stored in the clear in memory/disk
+    expect(ctx.config.host[0].password).toBe('sekret');
   });
 
   it('rejects with 400 and does NOT persist when connectivity fails', async () => {
@@ -127,7 +126,7 @@ describe('PATCH /api/hosts/:id', () => {
   });
 
   it('editing a portless host does not resurrect a default port (stays undefined → ~/.ssh/config)', async () => {
-    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }]; // no port, key auth
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
     const { app } = await makeApp(true);
     const res = await app.inject({
       method: 'PATCH', url: '/api/hosts/box',
@@ -166,7 +165,7 @@ describe('PATCH /api/hosts/:id', () => {
       payload: { hostname: 'attacker.host' },
     });
     expect(res.statusCode).toBe(400);
-    expect(calls).toHaveLength(0); // never probed → the stored password is never sent anywhere
+    expect(calls).toHaveLength(0);
   });
 
   it('allows an endpoint change on a password host when an explicit password is provided', async () => {
@@ -180,8 +179,6 @@ describe('PATCH /api/hosts/:id', () => {
   });
 
   it('blocks a structural change while a referencing agent is live', async () => {
-    // Key host (no password) so the structural change reaches the live-agent guard rather than the
-    // "endpoint change needs an explicit password" gate.
     ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
     ctx.config.project = [remoteAgentProject()];
     ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' });
@@ -191,7 +188,7 @@ describe('PATCH /api/hosts/:id', () => {
       payload: { hostname: 'moved.example.com' },
     });
     expect(res.statusCode).toBe(409);
-    expect(ctx.config.host[0].hostname).toBe('h'); // unchanged
+    expect(ctx.config.host[0].hostname).toBe('h');
   });
 
   it('allows a non-structural change (alias) even with a live referencing agent', async () => {
@@ -206,18 +203,18 @@ describe('PATCH /api/hosts/:id', () => {
   });
 
   it('treats a port:22 edit of a portless password host as an endpoint change (no secret exfiltration via undefined↔22)', async () => {
-    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u', password: 'orig' }]; // no port → honors ~/.ssh/config
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u', password: 'orig' }];
     const { app, calls } = await makeApp(true);
     const res = await app.inject({
       method: 'PATCH', url: '/api/hosts/box',
-      payload: { port: 22 }, // no explicit password
+      payload: { port: 22 },
     });
     expect(res.statusCode).toBe(400);
-    expect(calls).toHaveLength(0); // stored password never sent to the :22 endpoint
+    expect(calls).toHaveLength(0);
   });
 
   it('blocks a port:22 edit of a portless host while a referencing agent is live (undefined↔22 is structural)', async () => {
-    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }]; // key auth, no port
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
     ctx.config.project = [remoteAgentProject()];
     ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' });
     const { app } = await makeApp(true);
@@ -226,11 +223,11 @@ describe('PATCH /api/hosts/:id', () => {
       payload: { port: 22 },
     });
     expect(res.statusCode).toBe(409);
-    expect(ctx.config.host[0].port).toBeUndefined(); // unchanged
+    expect(ctx.config.host[0].port).toBeUndefined();
   });
 
   it('clears the port when port:null is sent, so a host wrongly saved as 22 falls back to ~/.ssh/config', async () => {
-    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }]; // key auth, mis-saved 22
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
     const { app } = await makeApp(true);
     const res = await app.inject({
       method: 'PATCH', url: '/api/hosts/box',
@@ -285,7 +282,6 @@ describe('POST /api/hosts/check', () => {
   it('does NOT reuse the stored password when checking a different endpoint (no exfiltration)', async () => {
     ctx.config.host = [{ id: 'box', hostname: 'real.host', user: 'u', port: 22, password: 'stored-pw' }];
     const { app, calls } = await makeApp(true);
-    // Same id but a caller-chosen hostname, password omitted ('keep stored' intent).
     await app.inject({
       method: 'POST', url: '/api/hosts/check',
       payload: { id: 'box', hostname: 'attacker.host', user: 'u', port: 22 },
@@ -305,7 +301,7 @@ describe('POST /api/hosts/check', () => {
   });
 
   it('does NOT reuse the stored password when a portless host is checked with an explicit port:22 (undefined↔22 is a different endpoint)', async () => {
-    ctx.config.host = [{ id: 'box', hostname: 'real.host', user: 'u', password: 'stored-pw' }]; // no port
+    ctx.config.host = [{ id: 'box', hostname: 'real.host', user: 'u', password: 'stored-pw' }];
     const { app, calls } = await makeApp(true);
     await app.inject({
       method: 'POST', url: '/api/hosts/check',
@@ -345,7 +341,7 @@ describe('host routes reject malformed (non-string) fields with 400, never 500',
     expect(post.statusCode).toBe(400);
     expect(patch.statusCode).toBe(400);
     expect(check.statusCode).toBe(400);
-    expect(calls).toHaveLength(0); // never reached the ssh runner
+    expect(calls).toHaveLength(0);
   });
 
   it('rejects a non-string optional field (e.g. numeric alias)', async () => {
@@ -367,14 +363,12 @@ describe('PATCH /api/hosts/:id streamer invalidation + concurrency', () => {
     const { app } = await makeApp(true);
     const res = await app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { password: 'newpw' } });
     expect(res.statusCode).toBe(200);
-    // Non-silent destroy so onSessionGone fires and open /api/stream sockets release + reconnect.
     expect(destroyed).toContainEqual({ id: 'rdev', silent: undefined });
   });
 
   it('blocks a structural change when an active web terminal streamer references the host (even if binding looks idle)', async () => {
     ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
     ctx.config.project = [remoteAgentProject()];
-    // No active task / paneId, tmux unknown — but a web terminal streamer is open.
     (ctx as unknown as { paneStreamerManager: unknown }).paneStreamerManager = {
       has: (agentId: string) => agentId === 'rdev',
       destroy: async () => undefined,
@@ -405,7 +399,6 @@ describe('PATCH /api/hosts/:id streamer invalidation + concurrency', () => {
       app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { password: 'newpw' } }),
       app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'B-alias' } }),
     ]);
-    // Neither field reverted: the second writer rebased its patch onto the first writer's result.
     expect(ctx.config.host[0].password).toBe('newpw');
     expect(ctx.config.host[0].alias).toBe('B-alias');
   });
@@ -416,7 +409,6 @@ describe('PATCH /api/hosts/:id connectivity re-check on concurrent connection ed
     ctx.config.host = [{ id: 'box', hostname: 'old.example', port: 22, user: 'u', password: 'orig' }];
     const runner: CommandRunner = {
       exec: async (cmd, options) => {
-        // Only the never-probed combination (new hostname + new password) is unreachable.
         const bad = cmd.includes('new.example') && options?.env?.BAXIAN_SSH_PASSWORD === 'newpw';
         return { stdout: bad ? '' : 'ok', stderr: bad ? 'unreachable combo' : '', exitCode: bad ? 1 : 0 };
       },

@@ -39,7 +39,6 @@ class MockWebSocket {
     this.onclose?.();
   }
 
-  // helpers
   open(): void {
     this.readyState = MockWebSocket.OPEN;
     this.onopen?.();
@@ -79,7 +78,6 @@ function makeClient(opts: { wsUrl?: string } = {}): { client: PaneStreamClient; 
 beforeEach(() => {
   MockWebSocket.instances = [];
   vi.useFakeTimers();
-  // expose constructor for runtime readyState constants used by store
   (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = MockWebSocket;
 });
 
@@ -173,17 +171,14 @@ describe('PaneStreamClient', () => {
     const onData2 = vi.fn();
     const h2 = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: onSnap2, onData: onData2 });
 
-    // Live data while h2 is pending; h1 sees immediately, h2 queues.
     ws.push({ type: 'data', agentId: 'dev-1', data: 'X', seq: 4 });
     expect(onData1).toHaveBeenCalledWith('X');
 
     ackSubscribe(ws, h2.subscriberId, { data: 'INIT_X', seq: 4 });
 
     expect(onSnap2).toHaveBeenCalledWith({ cols: 80, rows: 24, data: 'INIT_X' });
-    // 'X' had seq=4, snapshotSeq for h2 = 4 → not greater, must be skipped (already in snapshot).
     expect(onData2).not.toHaveBeenCalled();
 
-    // New live event after h2 active should flow to both.
     ws.push({ type: 'data', agentId: 'dev-1', data: 'Y', seq: 5 });
     expect(onData1).toHaveBeenCalledWith('Y');
     expect(onData2).toHaveBeenCalledWith('Y');
@@ -218,9 +213,7 @@ describe('PaneStreamClient', () => {
     const h = client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot: vi.fn(), onData: vi.fn() });
     const ws = lastWs();
     ws.open();
-    // Simulate component calling resize before server has acked subscribe.
     client.resize(h.subscriberId, 120, 40);
-    // No resize op should have been emitted yet.
     expect(ws.sentParsed().filter((m) => m.op === 'resize')).toHaveLength(0);
 
     ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
@@ -283,8 +276,6 @@ describe('PaneStreamClient', () => {
     const ws = lastWs();
     ws.open();
     h.unsubscribe();
-    // unsubscribe path tore down ws; advancing past every backoff must not
-    // open a fresh ws because there are no consumers left.
     vi.advanceTimersByTime(60_000);
     expect(MockWebSocket.instances).toHaveLength(1);
   });
@@ -295,8 +286,6 @@ describe('PaneStreamClient', () => {
     const ws1 = lastWs();
     ws1.open();
     ws1.closeFromServer();
-    // After unsubscribe→teardown, a *fresh* subscribe goes through ensureSocket→openSocket:
-    // we want exactly one new ws opened, with no straggler from the backoff timer.
     h1.unsubscribe();
     client.subscribe({ agentId: 'dev-2', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
     const before = MockWebSocket.instances.length;
@@ -309,7 +298,6 @@ describe('PaneStreamClient', () => {
     const h = client.subscribe({ agentId: 'dev-1', mode: 'full', onSnapshot: vi.fn(), onData: vi.fn() });
     const ws = lastWs();
     ws.open();
-    // ws is OPEN, subscribe was forwarded, but server hasn't ack'd yet → sub is pending.
     client.send(h.subscriberId, 'pre-ack-keystroke');
     expect(ws.sentParsed().some((m) => m.op === 'input')).toBe(false);
     ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
@@ -324,14 +312,11 @@ describe('PaneStreamClient', () => {
     const ws = lastWs();
     ws.open();
     ws.closeFromServer();
-    // Disconnected: input goes to outbox.
     client.send(h.subscriberId, 'typed-while-down');
     vi.advanceTimersByTime(500);
     const ws2 = lastWs();
     expect(ws2).not.toBe(ws);
     ws2.open();
-    // Right after onopen, the sub is back in pending; outbox flush MUST NOT
-    // drop the input. It belongs in outbox until subscribed ack arrives.
     expect(ws2.sentParsed().some((m) => m.op === 'input')).toBe(false);
     ackSubscribe(ws2, h.subscriberId, { data: '', seq: 0 });
     const inputs = ws2.sentParsed().filter((m) => m.op === 'input');

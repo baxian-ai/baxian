@@ -128,7 +128,6 @@ export class PaneStreamClient {
 
   send(subscriberId: string, data: string): void {
     if (!this.subs.has(subscriberId)) return;
-    // Pre-active server rejects input — park until `subscribed` ack.
     if (this.snapshotPending.has(subscriberId)) {
       this.outbox.push({ op: 'input', subscriberId, data });
       return;
@@ -267,7 +266,6 @@ export class PaneStreamClient {
       this.scheduleReconnect();
     };
 
-    /** onclose fires after onerror; reconnect happens there. */
     ws.onerror = () => {};
   }
 

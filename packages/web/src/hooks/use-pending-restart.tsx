@@ -50,7 +50,6 @@ function persist(state: Persisted): void {
     if (state.count <= 0) localStorage.removeItem(STORAGE_KEY);
     else localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   } catch {
-    // quota / disabled
   }
 }
 
@@ -102,7 +101,6 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
           return b;
         });
       } catch {
-        // server unreachable on mount — leave persisted state alone
       }
     })();
 
@@ -136,7 +134,6 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
           setBaseline(null);
         }
       } catch {
-        // corrupt storage from another tab — ignore
       }
     };
     window.addEventListener('storage', onStorage);
@@ -164,7 +161,6 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
           const live = await api.health.get();
           setBaseline(latest => latest ?? live.startedAt);
         } catch {
-          // health probe failed — baseline stays null
         } finally {
           baselineFetchInFlightRef.current = false;
         }
@@ -213,7 +209,6 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
           return;
         }
       } catch {
-        // server still down, keep polling
       }
     }
 

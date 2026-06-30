@@ -95,7 +95,6 @@ describe('attachImageToRunningAgent (entry A)', () => {
 
     expect(path).toMatch(/^\/tmp\/baxian\/upload\/dev-1\/[0-9a-f-]+\.png$/);
     expect(mockRunner.writeFile).toHaveBeenCalledWith(path, PNG);
-    // injectPrompt pastes via the runner (load-buffer + paste-buffer).
     expect(mockRunner.exec).toHaveBeenCalled();
   });
 
@@ -143,8 +142,6 @@ describe('persistTaskImages / materializeTaskImages (entry B core)', () => {
     });
   });
 
-  // Regression: IMAGE_DISPATCH_PHASES must all materialize the task image so rework on a fresh
-  // runtime still sees it. QA phases + post-approve must not.
   it('imagePathsForDispatch materializes for dev deliverable phases, skips QA/post-approve', async () => {
     await mkdir(join(stagingRoot, 'task-c'), { recursive: true });
     await writeFile(join(stagingRoot, 'task-c', 'g.png'), PNG);
@@ -193,7 +190,6 @@ describe('createAndStartTask image ordering + rollback', () => {
     expect(startSpy).not.toHaveBeenCalled();
     expect(task.images).toHaveLength(1);
     expect((await readdir(join(stagingRoot, task.id)))).toHaveLength(1);
-    // the persisted store record is visible WITH its images (not a later patch).
     expect((await taskStore.get(task.id))?.images).toHaveLength(1);
   });
 
@@ -207,7 +203,6 @@ describe('createAndStartTask image ordering + rollback', () => {
       images: [{ bytes: PNG, ext: 'png' }],
     })).rejects.toThrow('disk full');
 
-    // Staging precedes the store write + lock, so a failure leaves nothing behind.
     expect(await taskStore.list()).toHaveLength(0);
     expect(startSpy).not.toHaveBeenCalled();
     expect(await lockManager.acquire('dev-1')).toBeTruthy();
@@ -263,7 +258,6 @@ describe('retryTask image preservation', () => {
 
     await expect(manager.retryTask('task-001')).rejects.toMatchObject({ status: 409 });
 
-    // No new task created; old one untouched; no dispatch; dev not locked.
     expect(await taskStore.list()).toHaveLength(1);
     expect((await taskStore.get('task-001'))?.status).toBe('failed');
     expect(startSpy).not.toHaveBeenCalled();

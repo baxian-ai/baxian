@@ -1,5 +1,3 @@
-// Pure helpers for server-mode large-diff batching (spec §7): split a unified
-// diff per file, group by directory, pack groups into line-capped batches.
 
 export interface DiffFile {
   path: string;
@@ -40,7 +38,6 @@ export function splitDiffByFile(diff: string): DiffFile[] {
   return out;
 }
 
-// 'src/agent/x.ts' → 'src/agent'; root-level files group under '.'.
 export function topDir(path: string): string {
   const idx = path.lastIndexOf('/');
   return idx === -1 ? '.' : path.slice(0, idx);
@@ -73,7 +70,6 @@ export function buildBatches(files: DiffFile[], maxLines: number): DiffFile[][] 
 
   for (const group of groups) {
     if (group.lines > maxLines) {
-      // Oversized group: per-file batches; a single file over the cap still ships alone.
       flushPending();
       for (const file of group.files) batches.push([file]);
       continue;

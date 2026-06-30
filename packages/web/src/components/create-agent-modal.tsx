@@ -27,13 +27,11 @@ interface FormState {
   role: AgentRole;
   pairWith: string;
   mode: AgentMode;
-  /** Registry host id (remote mode). */
   host: string;
   runtime: AgentRuntime | '';
   workdir: string;
   yolo: boolean;
   model: string;
-  /** Newline-separated --add-dir paths. */
   addDirs: string;
 }
 
@@ -86,7 +84,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       const ids = new Set<string>();
       cfg.project.forEach(p => p.agent.forEach(pair => pair.forEach(a => ids.add(a.id))));
       setAllAgentIds(ids);
-    }).catch(() => {/* not fatal */});
+    }).catch(() => {});
   }, [open, projectId]);
 
   const handleDismiss = () => {

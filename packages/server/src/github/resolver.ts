@@ -11,7 +11,6 @@ export async function resolveEventRouting(
   manager: AgentManager,
   event: MappedEvent,
 ): Promise<ResolvedRouting> {
-  // Fail closed on unknown repo so events from unrelated repos can't drive a same-numbered task.
   const projectId = manager.getProjectByRepo(event.repo)?.id;
   if (!projectId) return {};
 

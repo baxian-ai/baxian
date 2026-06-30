@@ -214,9 +214,7 @@ describe('AgentGroup', () => {
     const petFrame = pet.parentElement as HTMLElement;
     const card = pet.closest('.card') as HTMLElement;
     const grid = card.parentElement as HTMLElement;
-    // No reserved top padding — the task bar stays close to the card; the pet is allowed to overlap it.
     expect(classToken(grid, 'pt-')).toBe('');
-    // The pet still escapes the card border upward (so it overlaps the task bar rather than being clipped).
     expect(classToken(petFrame, '-top-').length).toBeGreaterThan(0);
   });
 
@@ -275,9 +273,6 @@ describe('AgentGroup', () => {
     activate(devCard);
     expect(devCard.className).toContain('ring-accent');
 
-    // Simulate the real-browser race: re-render detaches the original click target
-    // (PaneTerminal swaps preview→full subtree). Build an event whose live target is
-    // detached but whose composedPath still recalls the card it originated in.
     const detached = document.createElement('div');
     const event = new MouseEvent('click', { bubbles: true });
     Object.defineProperty(event, 'composedPath', {
@@ -325,7 +320,6 @@ describe('AgentGroup', () => {
     activate(devCard);
     expect(devCard.className).toContain('ring-accent');
 
-    // Pretend an element inside the active card holds focus (e.g. xterm textarea, Stop button, etc.).
     const fakeFocus = document.createElement('input');
     devCard.appendChild(fakeFocus);
     fakeFocus.focus();
@@ -427,7 +421,6 @@ describe('AgentGroup', () => {
   it('claimable list renders ALONGSIDE active task summary when dev is idle (post-approve / approved state)', () => {
     const activeApproved = task({ id: 'task-old', status: 'approved', preferredAgentId: 'dev-1', agentId: 'dev-1' });
     const pendingForDev = task({ id: 'task-new', status: 'pending', preferredAgentId: 'dev-1', agentId: '' });
-    // dev 已被 release (no binding.taskId) → devDispatchReady=true，即便 activeTasks 含 approved task
     renderGroup([activeApproved, pendingForDev]);
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     expect(within(region).getByText('task-old')).toBeTruthy();

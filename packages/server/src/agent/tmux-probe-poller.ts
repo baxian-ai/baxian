@@ -131,8 +131,6 @@ export class TmuxProbePoller {
   private failureThreshold: number;
   private lastRecordedIssue = new Map<string, string>();
   private lastScreen = new Map<string, { hash: string; changedAt: number; taskId: string | null }>();
-  // id → current AgentConfig reference. Reference identity is the generation token:
-  // every prepareConfig produces fresh instances, so DELETE→CREATE same-id is detectable.
   private validInstances = new Map<string, AgentConfig>();
   private manifests = loadManifests();
   private debouncers = new Map<string, WorkingToIdleDebounce>();
@@ -194,13 +192,10 @@ export class TmuxProbePoller {
     this.lastPublishedState.delete(id);
   }
 
-  // Instance equality, not just id: DELETE→CREATE same id swaps the AgentConfig reference,
-  // so an in-flight probe whose captured agent is now stale won't pass this gate.
   private isCurrentInstance(agent: AgentConfig): boolean {
     return this.validInstances.get(agent.id) === agent;
   }
 
-  // Race guard #2: observePresentSession / recordProbeError can still await past the entry-time check.
   private commitObservation(agent: AgentConfig, entry: TmuxSessionObservation): void {
     if (!this.isCurrentInstance(agent)) {
       this.purgeAgent(agent.id);
@@ -273,8 +268,6 @@ export class TmuxProbePoller {
         error: err instanceof Error ? err.message : String(err),
       };
     }
-    // Issue #120: an in-flight probe must not resurrect stale observations after the agent
-    // was DELETEd (gone from config) OR DELETE→CREATE-d same id (new AgentConfig instance).
     if (!this.isCurrentInstance(agent)) {
       this.purgeAgent(agent.id);
       return;
@@ -287,9 +280,6 @@ export class TmuxProbePoller {
       const failures = (this.failureCounts.get(agent.id) ?? 0) + 1;
       this.failureCounts.set(agent.id, failures);
       if (failures >= this.failureThreshold) {
-        // Only reset the idle baseline when the store is actually flipping to non-present;
-        // single transient probe failures below the threshold must not zero the timer or a
-        // truly idle session on a flaky link would never accumulate 5 minutes.
         this.resetDetectionBaseline(agent.id);
         const latestError = await this.recordProbeError(agent, now, result.error);
         this.commitObservation(agent, {
@@ -347,10 +337,6 @@ export class TmuxProbePoller {
           })
         : '';
       const liveRuntime = paneState.kind === 'live-runtime';
-      // taskId is part of the baseline key: a new (or different, or just-released) task must
-      // restart the 5-min grace. Without this, an agent idling on `❯` for 10 min before being
-      // bound to a fresh task would mis-fire PENDING_IDLE on the very first post-bind probe
-      // because the hash hadn't changed.
       const currentTaskId = liveRuntime && this.agentStore
         ? (await this.agentStore.get(agent.id))?.taskId ?? null
         : null;
@@ -358,7 +344,7 @@ export class TmuxProbePoller {
       if (liveRuntime) {
         try {
           oscTitle = await tmux.readPaneTitle(paneId, { timeout: this.probeTimeoutMs });
-        } catch { /* best-effort */ }
+        } catch { }
       }
       if (liveRuntime) {
         const hash = createHash('sha1').update(runtimeScreen).update(oscTitle).digest('hex');
@@ -408,9 +394,6 @@ export class TmuxProbePoller {
         ...(latestError ? { latestError } : {}),
       };
     } catch (err) {
-      // Probe failed mid-session: PANE_PROBE_FAILED is a discontinuity in observation. The
-      // "5 minutes static" claim requires unbroken sampling, so drop the baseline; next
-      // successful probe will rebuild it and start the grace period fresh.
       this.resetDetectionBaseline(agent.id);
       const message = err instanceof Error ? err.message : String(err);
       const issue = {
@@ -428,8 +411,6 @@ export class TmuxProbePoller {
     }
   }
 
-  // True when the captured screen has not changed for the grace window while bound to a task —
-  // shared by PENDING_IDLE (idle screen) and STUCK_BUSY (busy anchor frozen) inference.
   private screenStaticForGrace(agentId: string, paneState: AdoptPaneState): boolean {
     if (paneState.kind !== 'live-runtime') return false;
     const entry = this.lastScreen.get(agentId);

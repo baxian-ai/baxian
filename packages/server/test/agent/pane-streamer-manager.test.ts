@@ -34,7 +34,7 @@ function createFakePty(): MinimalPty & {
   return {
     onData(cb) { dataListener = cb; return { dispose: () => { dataListener = null; } }; },
     onExit(cb) { exitListener = cb; return { dispose: () => { exitListener = null; } }; },
-    resize() { /* noop */ },
+    resize() { },
     write(data: string) {
       const impl = (this as { writeImpl?: (d: string) => void }).writeImpl;
       if (impl) impl(data);
@@ -110,7 +110,6 @@ describe('PaneStreamerManager', () => {
     it('destroyAll tears down every live streamer + its PTY (shutdown path)', async () => {
       const { manager, fakePty } = makeManager();
       const agentB: AgentConfig = { ...TEST_AGENT, id: 'qa-1' };
-      // Bring one streamer's PTY up so we can assert destroyAll kills it.
       await manager.ensure(TEST_AGENT).subscribeAtomic(cbs);
       manager.ensure(agentB);
       expect(manager.has(TEST_AGENT.id)).toBe(true);

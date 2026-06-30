@@ -47,7 +47,6 @@ function StatusDot({ state }: { state: TmuxDotState }) {
 interface AgentCardProps {
   agent: AgentSnapshot;
   projectId: string;
-  /** Distinguishes dev vs QA card — "Call review" only shows on dev. */
   role: AgentRole;
   runtime?: AgentRuntime;
   onDeleted?: () => void;
@@ -55,7 +54,6 @@ interface AgentCardProps {
   terminalLoading?: boolean;
   showTaskBinding?: boolean;
   terminalMode?: TerminalMode;
-  /** embedded-full only: when defined, card runs in selectable mode — preview by default, full + interactive only while active. */
   active?: boolean;
   onActivate?: () => void;
 }
@@ -121,14 +119,11 @@ export function AgentCard({
   }, [menuOpen]);
   const taskId = agent.binding?.taskId;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
-  // greeting_failed 不能靠 Resume 清除（能力必须重新验证）——同一个 Resume 按钮改走 restart-repl 重跑握手。
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
-  // Without these exemptions, an in-flight waitReplReady looks identical to a needs-human pane.
   const isBootstrapping = !!agent.binding?.creationToken
     && !agent.binding?.paneId
     && !isAwaitingHuman
     && agent.reason !== 'PENDING_HUMAN';
-  // 启动期 tmux session 一出现就放行终端：greeting 握手跑在这个活 pane 里，让操作者实时看到失败原因，而非干等 paneId 落库。
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const runtimeBadge = isBootstrapping
     ? { label: 'Starting', cls: 'pill pill-review' }
@@ -137,7 +132,6 @@ export function AgentCard({
   const showTerminalPreview = terminalMode === 'activity-preview' &&
     !bootstrapBlocksTerminal && (agent.runtimeStatus === 'working' || agent.runtimeStatus === 'pending');
   const showEmbeddedTerminal = terminalMode === 'embedded-full';
-  // onActivate's presence opts into selectable mode; absence preserves the legacy "always full" path.
   const isSelectableEmbedded = showEmbeddedTerminal && typeof onActivate === 'function';
   const isActiveSelected = isSelectableEmbedded && active === true;
   const terminalDisabled = terminalLoading || pendingRestart || bootstrapBlocksTerminal;
@@ -200,8 +194,6 @@ export function AgentCard({
     setResuming(true);
     try {
       if (needsRegreet) {
-        // restart-repl 复用存活会话；会话已丢失（absent/unreachable/unknown）时它会报 "use retry to rebuild"，
-        // 走 retry 重建会话——两条路都接 regreetHeldAgent 重跑握手。
         if (agent.tmuxSessionStatus === 'present') {
           await api.projects.restartRepl(projectId, agent.id);
         } else {
@@ -288,8 +280,6 @@ export function AgentCard({
       setDeleting(false);
     }
   };
-  // Activation lives on the terminal container only — keeping it off the card root prevents
-  // inner controls (Stop/Resume/Terminal link/kebab menu) from bubbling into onActivate.
   const allowSelection = isSelectableEmbedded && !terminalDisabled && !isActiveSelected;
   const cardClassName = [
     'card relative flex h-full min-w-0 flex-col overflow-visible p-4',

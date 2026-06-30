@@ -10,9 +10,6 @@ export interface ImageUploadButtonProps {
 
 const MAX_MIB = Math.floor(IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024);
 
-// Entry A: upload an image to the running agent's host; the server pastes its
-// absolute path into the live pane. The path then shows up in the streamed terminal — the
-// user appends their instruction and presses Enter.
 export function ImageUploadButton({ agentId, className }: ImageUploadButtonProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
@@ -20,7 +17,7 @@ export function ImageUploadButton({ agentId, className }: ImageUploadButtonProps
 
   const onPick = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    e.target.value = ''; // let the same file be re-picked
+    e.target.value = '';
     if (!file) return;
     if (file.size > IMAGE_UPLOAD_MAX_BYTES) {
       show({ kind: 'error', title: '图片过大', body: `单张图片不能超过 ${MAX_MIB} MiB` });

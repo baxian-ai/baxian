@@ -5,7 +5,6 @@ import { createRunner, LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, s
 
 interface ProbeRequest {
   mode: AgentMode;
-  // Either an inline host (legacy) or a registry host id resolved server-side (so password stays server-side).
   host?: { hostname?: string; user?: string; port?: number };
   hostId?: string;
 }
@@ -34,7 +33,6 @@ interface ProbeRunner {
   ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 }
 
-// Interactive shells may print banners before `which`; the path is the last line.
 function lastNonEmptyLine(s: string): string {
   const lines = s.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -70,7 +68,6 @@ async function probeWhich(
 }
 
 export interface ProbeRoutesOptions {
-  // Tests inject these to avoid spawning real ssh / which against the host machine.
   localRunnerFactory?: () => CommandRunner;
   remoteRunnerFactory?: (host: HostConfig) => CommandRunner;
 }
@@ -89,13 +86,11 @@ export async function probeRoutes(app: FastifyInstance, options: ProbeRoutesOpti
     let host: HostConfig | undefined;
     if (mode === 'remote') {
       if (hostId) {
-        // Resolve the registry entry server-side so the real password never crosses the wire.
         host = app.ctx.config.host.find(h => h.id === hostId);
         if (!host) {
           return reply.status(400).send({ error: `unknown host id "${hostId}"` });
         }
       } else if (typeof inlineHost?.hostname === 'string' && inlineHost.hostname.trim()) {
-        // Carry the (validated) inline port through so non-default-port hosts are probed correctly.
         const port = inlineHost.port;
         if (port !== undefined && (!Number.isInteger(port) || port <= 0 || port > 65535)) {
           return reply.status(400).send({ error: 'host.port must be a positive integer ≤ 65535' });
@@ -121,7 +116,6 @@ export async function probeRoutes(app: FastifyInstance, options: ProbeRoutesOpti
     if (mode === 'remote') {
       const target = sshTarget(host!);
       await ensureMuxDir();
-      // noMux: force a fresh authenticated connection so a stale mux can't mask a wrong password.
       const sshCmd = `ssh ${buildSshOptions(host!, { connectTimeoutSec: 5, noMux: true })} -- ${shellQuote(target)} echo ok`;
       const env = await sshEnv(host!);
       const sshResult = await makeLocal()
@@ -145,7 +139,6 @@ export async function probeRoutes(app: FastifyInstance, options: ProbeRoutesOpti
     }
 
     const runner = mode === 'remote' ? makeRemote(host as HostConfig) : makeLocal();
-    // Match each binary's runtime shell mode to avoid false-positive probes.
     const [tmux, claude, codex] = await Promise.all([
       probeWhich(runner, 'tmux', '请安装 tmux'),
       probeWhich(runner, 'claude', '请先安装 Claude Code CLI', 'login-interactive'),

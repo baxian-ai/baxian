@@ -15,7 +15,6 @@ let ptyModule: typeof import('node-pty') | null = null;
 try {
   ptyModule = await import('node-pty');
 } catch {
-  // node-pty native build unavailable
 }
 
 interface SubState {
@@ -36,7 +35,6 @@ export async function streamWsPlugin(app: FastifyInstance): Promise<void> {
     '/stream',
     {
       websocket: true,
-      // Auth must run before node-pty probe.
       preValidation: async (request: FastifyRequest, reply: FastifyReply) => {
         const origin = request.headers.origin as string | undefined;
         const host = request.headers.host as string | undefined;
@@ -80,7 +78,6 @@ function handleConnection(
     }
   }
 
-  /** Idempotent; the only path that decrements refcount. */
   function releaseSub(subscriberId: string): void {
     const s = subs.get(subscriberId);
     if (!s || s.phase === 'released') return;
@@ -121,7 +118,6 @@ function handleConnection(
       return;
     }
 
-    // Sync reservation precedes first await so concurrent unsub can find this entry.
     const subState: SubState = { agentId, mode, phase: 'pending' };
     subs.set(subscriberId, subState);
 
@@ -439,7 +435,6 @@ function handleConnection(
     }
   });
 
-  /** 'close' handles per-sub cleanup; this listener just prevents crash. */
   socket.on('error', (err: unknown) => {
     console.warn('[stream-ws] socket error:', err);
   });

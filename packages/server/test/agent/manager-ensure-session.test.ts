@@ -42,15 +42,12 @@ describe('AgentManager.ensureSession', () => {
     return runner.exec.mock.calls.map(c => c[0] as string);
   }
 
-  // Filter recorded `tmux set-option` commands by the substrings each test cares about.
   function setOptionCalls(...needles: string[]): string[] {
     return execCmds().filter(
       c => c.includes('set-option') && needles.every(n => c.includes(n)),
     );
   }
 
-  // Drive ensureSession down either the create path or the adopt path (the latter
-  // needs a pre-seeded session that dev-1 already claims).
   function runEnsure(path: 'create' | 'adopt'): Promise<unknown> {
     if (path === 'adopt') {
       tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
@@ -59,8 +56,6 @@ describe('AgentManager.ensureSession', () => {
     return manager.ensureSession('dev-1', 'create');
   }
 
-  // Override only the commands matching `when`, falling back to the default
-  // bootstrap-happy mock for everything else.
   function overrideExec(when: (cmd: string) => boolean, response: Partial<ExecResult>): void {
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> =>
       when(cmd)
@@ -75,8 +70,6 @@ describe('AgentManager.ensureSession', () => {
     return { destroy, ensure: vi.fn(), has: vi.fn(), enqueueInput: vi.fn() };
   }
 
-  // Exec mock for cleanupRemovedAgentRuntime: resolves has-session/show-option
-  // against tmuxSessions and routes kill-session to the caller's handler.
   function mockCleanupExec(onKill: () => void): void {
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('kill-session')) {
@@ -100,8 +93,6 @@ describe('AgentManager.ensureSession', () => {
     });
   }
 
-  // A throwaway AgentManager backed by its own state subdirs (so cleanup tests don't
-  // collide with the shared `manager`), wired to the same mocked runner.
   function makeManager(suffix: string, paneStreamerManager: unknown): AgentManager {
     return new AgentManager({
       config: CONFIG,
@@ -115,8 +106,6 @@ describe('AgentManager.ensureSession', () => {
     });
   }
 
-  // CONFIG with the qa-1 partner added to the dev-1 pair, used by the
-  // prepareRemoveTargets / replaceConfig tests.
   function expandedConfig(): BaxianConfig {
     return {
       ...CONFIG,
@@ -158,7 +147,6 @@ describe('AgentManager.ensureSession', () => {
     overrides: { trustDialogReady?: boolean } = {},
   ): (cmd: string) => Promise<ExecResult> {
     return async (cmd: string): Promise<ExecResult> => {
-      // tmux has-session
       if (cmd.includes('has-session')) {
         const m = cmd.match(/'=([^']+)'/);
         const name = m?.[1] ?? '';
@@ -166,14 +154,12 @@ describe('AgentManager.ensureSession', () => {
           ? { stdout: '', stderr: '', exitCode: 0 }
           : { stdout: '', stderr: `can't find session: ${name}`, exitCode: 1 };
       }
-      // tmux new-session
       if (cmd.includes('new-session')) {
         const m = cmd.match(/-s '([^']+)'/);
         const name = m?.[1] ?? '';
         tmuxSessions.set(name, { claim: name, readyOnce: false });
         return { stdout: '', stderr: '', exitCode: 0 };
       }
-      // tmux set-option @baxian-...
       if (cmd.includes('set-option')) {
         const m = cmd.match(/'=([^']+):'/);
         const name = m?.[1] ?? '';
@@ -186,7 +172,6 @@ describe('AgentManager.ensureSession', () => {
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
-      // tmux show-option -v <key> → bare value
       if (cmd.includes('show-option')) {
         const m = cmd.match(/'=([^']+):'/);
         const name = m?.[1] ?? '';
@@ -200,22 +185,18 @@ describe('AgentManager.ensureSession', () => {
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
-      // tmux list-panes (paneId resolution)
       if (cmd.includes('list-panes')) {
         return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
       }
-      // tmux send-keys (launch + dialog Enter)
       if (cmd.includes('send-keys')) {
         return { stdout: '', stderr: '', exitCode: 0 };
       }
-      // Must match BEFORE the per-cmd handlers below.
       if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
         return {
           stdout: 'claude\n___bx-classify-sep___\n⏵⏵ bypass permissions on\n',
           stderr: '', exitCode: 0,
         };
       }
-      // tmux capture-pane (waitReplReady + handleTrustDialog)
       if (cmd.includes('capture-pane')) {
         if (overrides.trustDialogReady) {
           return {
@@ -228,7 +209,6 @@ describe('AgentManager.ensureSession', () => {
           stderr: '', exitCode: 0,
         };
       }
-      // tmux display-message (pane_current_command for waitReplReady)
       if (cmd.includes('display-message')) {
         return { stdout: 'claude\n', stderr: '', exitCode: 0 };
       }
@@ -250,8 +230,6 @@ describe('AgentManager.ensureSession', () => {
     const eventLog = new EventLog(join(tempDir, 'events'));
     const eventBus = new EventBus(eventLog);
     const skillsDir = join(tempDir, 'skills');
-    // Seed every skill declared by AGENT_PHASES so previewPromptBytesForTaskInput
-    // and any startSession-path test using dev.develop passes fail-fast validation.
     for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-signals']) {
       await mkdir(join(skillsDir, name), { recursive: true });
       await writeFile(
@@ -337,7 +315,6 @@ describe('AgentManager.ensureSession', () => {
 
   it('runtime mode, shell relaunch path tags the session with the skills version (so the next adopt is not seen stale)', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
-    // classifyPaneForAdopt sees a shell foreground → relaunch path (not live-runtime).
     overrideExec(
       c => c.includes('display-message') && c.includes('capture-pane'),
       { stdout: 'zsh\n___bx-classify-sep___\n' },
@@ -348,8 +325,6 @@ describe('AgentManager.ensureSession', () => {
 
   it('runtime mode, live REPL with a stale skills version → kills + rebuilds so /baxian-* resolves', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
-    // The live REPL reports an OLD skills version (it launched before the current skills),
-    // so it cannot resolve a dispatched /baxian-* — adopt must rebuild instead of reusing.
     overrideExec(
       c => c.includes('show-option') && c.includes('@baxian-skills-version'),
       { stdout: 'stale-version\n' },
@@ -363,7 +338,6 @@ describe('AgentManager.ensureSession', () => {
 
   it('runtime mode, a tmux probe failure during the skills-version check surfaces as EnsureSessionError (does NOT kill the live REPL)', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
-    // Unexpected exit (not 0/1) → getOption throws a real probe error (not a missing tag).
     overrideExec(
       c => c.includes('show-option') && c.includes('@baxian-skills-version'),
       { stderr: 'tmux probe boom', exitCode: 2 },
@@ -384,17 +358,12 @@ describe('AgentManager.ensureSession', () => {
     expect(setOptionCalls('window-size')).toHaveLength(0);
   });
 
-  // create path locks prefix=C-b + prefix2=None (so WS sanitizer strip 0x02 stays
-  // sufficient); adopt path re-locks the same (defends against ~/.tmux.conf drift).
   it.each(['create', 'adopt'] as const)('%s path locks prefix=C-b + prefix2=None', async (path) => {
     await runEnsure(path);
     expect(setOptionCalls("'prefix'", "'C-b'")).toHaveLength(1);
     expect(setOptionCalls("'prefix2'", "'None'")).toHaveLength(1);
   });
 
-  // create path pins mouse=on (ssh attach gets wheel-scroll / selection / pane
-  // click); adopt path re-pins it (retrofits sessions created when mouse=off was
-  // the default). Only the create path also asserts mouse=off is never set.
   it.each(['create', 'adopt'] as const)('%s path pins mouse=on', async (path) => {
     await runEnsure(path);
     const mouseOn = setOptionCalls("'mouse'", "'on'");
@@ -440,8 +409,6 @@ describe('AgentManager.ensureSession', () => {
     expect(tmuxSessions.has('dev-1')).toBe(true);
   });
 
-  // waitReplReady never sees its anchor: the pane sits on `screen` until timeout,
-  // so ensureSession throws with createdSession=true and the captured last screen.
   it.each([
     {
       label: 'dialog signal triggers dialogPending=true',
@@ -527,7 +494,6 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('release on a non-ready pane (mode=idle): clears binding and lock regardless of REPL state', async () => {
-    // release 已解耦 REPL gate — pane 不 ready 也必须能落地状态清理。
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
     await seedRunningTask('task-r1');
     await manager.acquireAgentForTask('dev-1', 'task-r1', 'develop');
@@ -603,9 +569,6 @@ describe('AgentManager.ensureSession', () => {
     expect(manager.getAgentConfig('qa-1')).toBeDefined();
   });
 
-  // restartReplOnly re-provisions skills then relaunches the REPL. The skills-version tag must
-  // only be written when the provision SUCCEEDED: tagging after a failed provision would mark a
-  // REPL that scanned the stale tree as current, defeating ensureSession's rebuild self-heal.
   type RestartReplPrivates = {
     pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
     ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }>;

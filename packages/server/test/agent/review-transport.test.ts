@@ -169,7 +169,6 @@ describe('readFileRange security contract', () => {
     const { transport, calls } = makeTransport(ok);
     const text = await transport.readFileRange(DEV, 'src/a.ts', 80, 120);
     expect(text).toBe('line80\nline81');
-    // POSIX-portable containment: per-component symlink walk, no realpath.
     expect(calls.some(c => c.includes('-L "$p"'))).toBe(true);
     expect(calls.some(c => c.includes('realpath'))).toBe(false);
     expect(calls.some(c => c.includes("'80,120p'"))).toBe(true);

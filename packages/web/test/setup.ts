@@ -1,7 +1,6 @@
 import { afterEach } from 'vitest';
 import { cleanup } from '@testing-library/react';
 
-// jsdom localStorage needs Storage methods for pending-restart tests.
 class MemoryStorage implements Storage {
   private store = new Map<string, string>();
   get length(): number { return this.store.size; }

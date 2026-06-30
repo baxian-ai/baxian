@@ -5,7 +5,6 @@ import { scanPhaseSignals } from './phase-signal.js';
 export const BAXIAN_PR_CLAIM = '<!-- baxian:managed -->';
 
 export const MAX_PROMPT_BYTES = 80 * 1024;
-// 1KB margin: preview uses placeholders; real worktree path may be longer at inject.
 export const MAX_PROMPT_BYTES_ROUTE_LIMIT = MAX_PROMPT_BYTES - 1024;
 
 export class PromptSizeError extends Error {
@@ -28,18 +27,11 @@ export class RequiredSkillsMissingError extends Error {
   }
 }
 
-// Each runtime exposes on-disk skills as a single command: Claude Code fires
-// `/skill-name`, Codex fires `$skill-name`. baxian controls the pasted bytes, so
-// emitting the command on the first line force-loads that skill's full body
-// deterministically; the multi-line task body rides along as the command input.
 const SKILL_INVOKE_SIGIL: Record<AgentRuntime, string> = {
   'claude-code': '/',
   codex: '$',
 };
 
-// The one phase-specific skill to force-load via the single per-message command
-// slot. undefined when a phase declares no skill (merge / server-* run on inline
-// instructions only).
 function phasePrimarySkill(role: AgentRole, phase: string): string | undefined {
   const skills = AGENT_PHASES[role]?.[phase as keyof (typeof AGENT_PHASES)[AgentRole]]?.skills ?? [];
   return skills[0];
@@ -51,16 +43,10 @@ export interface BuildPromptOpts {
   agent: AgentConfig;
   worktreePath: string;
   skillRegistry: SkillRegistry;
-  /** Current pending pane-signal token. Required for phases that emit a signal. */
   signalToken?: string;
-  // >0 → post-approve prompt 走 incremental nudge：dev pane 已带完整 post-approve 上下文，
-  // 重灌完整长段会让 agent 失焦，只发"有新 feedback 增量再扫一遍"的短指令。
   postApproveRedispatchCount?: number;
-  /** Caller-transmitted round — task field is stale during dispatch. */
   currentSpecRound?: number;
-  /** Absolute agent-host image paths to weave into the task body. */
   imagePaths?: string[];
-  /** Server mode: injected review input (diff or spec doc), pre-sized by the caller. */
   serverContent?: string;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
@@ -68,22 +54,12 @@ export interface BuildPromptOpts {
   serverPriorResponse?: string;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   contentTruncated?: boolean;
-  // === false 时 develop prompt 不提供 spec review 路线（无 QA 则 spec-done 是死路）；
-  // undefined 视为未知，保留该段（尺寸预估等路径取 worst-case）。
   hasQaPartner?: boolean;
 }
 
 export const MAX_INLINE_FINDINGS_BYTES = 10 * 1024;
 
-// Throws PromptSizeError when fullPrompt > MAX_PROMPT_BYTES, or
-// RequiredSkillsMissingError when a phase-declared skill cannot be resolved.
-// The check exists because skillsForPhase() silently filters missing names —
-// without this fail-fast the prompt would build with silently-degraded behavior
-// and no operator-visible signal.
 export function buildPromptInline(opts: BuildPromptOpts): string {
-  // A signal-emitting prompt now points at the baxian-signals skill for the emit rules
-  // instead of inlining them, so that skill MUST be resolvable — fail loud here rather than
-  // ship a prompt whose signal silently never fires because the rules were never loadable.
   const required = [
     ...(AGENT_PHASES[opts.agent.role]?.[opts.phase]?.skills ?? []),
     ...(opts.signalToken ? ['baxian-signals'] : []),
@@ -108,16 +84,7 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     contentTruncated: opts.contentTruncated,
     hasQaPartner: opts.hasQaPartner,
   });
-  // Force-load the phase skill via the runtime's command on the first line. EVERY dispatch
-  // re-emits it: a dispatch is one slash-command invocation, and re-firing re-injects the
-  // (small) skill body deterministically, so the procedure is guaranteed resident regardless
-  // of prior /compact or context drift — never assume the model still remembers an earlier load.
   const primary = phasePrimarySkill(opts.agent.role, opts.phase);
-  // A signal-emitting phase with NO primary skill (the server-* phases) would otherwise leave the
-  // command slot empty and rely on the model to implicitly load baxian-signals — but the emit rules
-  // now live ONLY there, so a miss means the signal silently never fires. Force-load baxian-signals
-  // into the free slot so the protocol is deterministically in context (GitHub phases keep their
-  // primary skill, whose own body points at baxian-signals).
   const slotSkill = primary ?? (opts.signalToken ? 'baxian-signals' : undefined);
   const invokeLine = slotSkill
     ? `${SKILL_INVOKE_SIGIL[opts.agent.runtime]}${slotSkill}\n`
@@ -128,10 +95,6 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
   return fullPrompt;
 }
 
-// Bootstrap capability handshake. Force-loads the baxian-greeting skill exactly like a real
-// phase dispatch force-loads its primary skill (the command slot is free during bootstrap), and
-// that skill delegates the wire rules to baxian-signals — so a passing greeting exercises the
-// same force-load + signal-skill chain real dispatches use. The token rides as the command input.
 export function buildGreetingPrompt(token: string, runtime: AgentRuntime): string {
   return `${SKILL_INVOKE_SIGIL[runtime]}baxian-greeting\ntoken: ${token}\n`;
 }
@@ -169,18 +132,12 @@ interface PhasePromptCtx {
   contentTruncated?: boolean;
   hasQaPartner?: boolean;
 }
-// The prompt body baxian injects is a structured descriptor, not prose: `fields` are
-// the per-dispatch key:value lines (variable data only), `blocks` are large injected
-// payloads (diff / spec / findings) appended after the task body. All procedure lives
-// in the force-loaded phase skill, which reads these fields by name.
 interface PhasePrompt {
   fields: string[];
   blocks?: string[];
 }
 type PhasePromptBuilder = (ctx: PhasePromptCtx) => PhasePrompt;
 
-// review/recheck verdict via native `gh pr review` (no completion signal); the 422
-// fallback signal kinds are fixed and live in the skill, so only pr + anchor-sha vary.
 function reviewFields({ task }: PhasePromptCtx): PhasePrompt {
   return {
     fields: [
@@ -190,14 +147,8 @@ function reviewFields({ task }: PhasePromptCtx): PhasePrompt {
   };
 }
 
-// Single source of truth for per-phase prompt instructions, keyed by an exhaustive
-// Record<DispatchPhase, …>: a phase shipped without a builder is a COMPILE error.
-// `merge` runs through the /compact cleanup path (not buildTaskBody), so its builder is empty by design.
 const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
   merge: () => ({ fields: [] }),
-  // develop: implement and emit the done-signal (pr-created on GitHub, code-done on
-  // server). When a QA partner exists, spec-signal offers the optional SDD route. All
-  // mechanics live in baxian-task-check §Develop.
   develop: ({ task, signalToken, hasQaPartner }) => {
     if (!signalToken) return { fields: [] };
     return {
@@ -302,24 +253,13 @@ function buildTaskBody(args: TaskBodyArgs): string {
     serverPriorFindings, serverPriorResponse, serverAfterDone, contentTruncated,
     hasQaPartner,
   } = args;
-  // Server-transit phases exchange via .baxian/review files (no PR/Issue), so the
-  // GitHub-PR conventions would contradict the same prompt's server-mode steps. Key
-  // on the PHASE, not task.reviewMode: SDD spec review/feedback run server-spec-review
-  // / server-feedback even on a GitHub-mode task (reviewMode !== 'server'). The only
-  // exception is server-after-done's PR variant — it opens a PR (managed marker); its
-  // branch variant just pushes a branch (code-ready) and keeps the server header.
   const isPrPublish = phase === 'server-after-done' && serverAfterDone?.kind === 'pr';
   const serverExchange = !isPrPublish
     && (phase.startsWith('server-') || task.reviewMode === 'server');
-  // exchange selects the cross-agent medium; the full conventions for each mode live in the
-  // force-loaded phase skill (GitHub PR vs `.baxian/review/*.json`), not inline.
   const exchange = serverExchange ? 'server-files' : 'github-pr';
   if (phase === 'post-approve' && !signalToken) {
     throw new Error('post-approve prompt requires signalToken');
   }
-  // 'code' (pr-created) always needs a token; review/recheck need it for the
-  // same-identity (422) fallback verdict signal; 'fix' needs it for the pr-fixed
-  // completion signal that drives fixing→review — see the phase blocks below.
   if ((phase === 'code' || phase === 'review' || phase === 'recheck' || phase === 'fix') && !signalToken) {
     throw new Error(`${phase} prompt requires signalToken`);
   }
@@ -329,8 +269,6 @@ function buildTaskBody(args: TaskBodyArgs): string {
 
   const phaseBuilder = (PHASE_PROMPT_BUILDERS as Record<string, PhasePromptBuilder>)[phase];
   if (!phaseBuilder) {
-    // Fail loud: an unknown phase reaching here is a dispatch typo, not an empty
-    // prompt to ship silently.
     throw new Error(`buildTaskBody: no prompt builder registered for phase "${phase}"`);
   }
   const { fields, blocks } = phaseBuilder({
@@ -340,9 +278,6 @@ function buildTaskBody(args: TaskBodyArgs): string {
     hasQaPartner,
   });
 
-  // Structured descriptor: baxian metadata as key:value the force-loaded phase skill reads
-  // by name. token rides as a field (never a filled `[bx:...]` literal) so the prompt itself
-  // can't self-fire the watcher.
   const descriptor = [
     `phase: ${phase}`,
     `role: ${role}`,
@@ -360,11 +295,6 @@ function buildTaskBody(args: TaskBodyArgs): string {
     : '';
   const injected = blocks && blocks.length > 0 ? '\n\n' + blocks.join('\n') : '';
   const body = `${descriptor}\n\n${titleAndBody}${imagesBlock}${injected}\n`;
-  // Guard: the rendered body must not contain a filled signal literal that
-  // would fire the watcher. We run the scanner over body and reject any match
-  // whose token equals the active signalToken. This catches accidental leaks
-  // from skill content / task title / description, and is the same logic
-  // PaneStreamer uses to identify fireable signals.
   if (signalToken) {
     const leaked = scanPhaseSignals(body).find(s => s.token === signalToken);
     if (leaked) {
@@ -374,11 +304,6 @@ function buildTaskBody(args: TaskBodyArgs): string {
   return body;
 }
 
-
-// Exchange-JSON injection must NEVER drop structural ids: findings ids feed the
-// dev's coverage validation, response ids feed QA's closure verification —
-// a tail-truncated set self-locks or blinds the round. Compact the prose
-// fields (message/rationale) instead; structural skeletons always survive.
 function compactFindings(text: string): { text: string; truncated: boolean } {
   if (Buffer.byteLength(text, 'utf8') <= MAX_INLINE_FINDINGS_BYTES) {
     return { text, truncated: false };
@@ -406,9 +331,6 @@ function compactFindings(text: string): { text: string; truncated: boolean } {
       return { text: out, truncated: true };
     }
   }
-  // Last tier: structural fields only, NO tail truncation — a clipped id set
-  // self-locks the round on coverage validation. The 80KB prompt ceiling is the
-  // remaining (loud) backstop for pathological finding counts.
   const idsOnly = JSON.stringify({
     ...parsed,
     note: 'messages omitted for size; respond to EVERY finding id below',
@@ -454,15 +376,11 @@ function compactResponses(parsed: { responses: Array<Record<string, unknown>> })
 function truncateFindings(text: string): { text: string; truncated: boolean } {
   const buf = Buffer.from(text, 'utf8');
   if (buf.byteLength <= MAX_INLINE_FINDINGS_BYTES) return { text, truncated: false };
-  // 回退到 UTF-8 字符边界，避免截出不可解析的多字节序列。
   let cut = MAX_INLINE_FINDINGS_BYTES;
   while (cut > 0 && (buf[cut]! & 0xc0) === 0x80) cut--;
   return { text: buf.subarray(0, cut).toString('utf8'), truncated: true };
 }
 
-
-// Post-merge cleanup is silent toward the agent (no notification): baxian removes the worktree,
-// deletes the local branch, then /clears the idle pane. This carries just the ids that cleanup needs.
 export interface PostMergeCleanupContext {
   taskId: string;
   branch: string;

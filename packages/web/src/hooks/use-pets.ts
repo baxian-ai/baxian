@@ -33,11 +33,7 @@ export function usePets(): UsePetsResult {
   return { pets, loading, error, refresh };
 }
 
-// Spritesheets are immutable per (UUID) petId, so one fetch+objectURL is shared across
-// every card that renders the same pet; the blob URL outlives unmounts on purpose.
 const spriteCache = new Map<string, Promise<string>>();
-// Synchronous view of already-resolved URLs, so switching to an already-fetched pet shows it
-// instantly (no flicker) while switching to a not-yet-fetched pet clears the previous one.
 const resolvedSprites = new Map<string, string>();
 
 export function usePetSpritesheet(petId: string | undefined): string | null {
@@ -47,8 +43,6 @@ export function usePetSpritesheet(petId: string | undefined): string | null {
       setUrl(null);
       return;
     }
-    // Never keep the previous pet's sprite while the new one loads — show its cached URL if we
-    // have it, otherwise clear immediately so a slow fetch can't render the wrong pet.
     const cached = resolvedSprites.get(petId);
     setUrl(cached ?? null);
     if (cached) return;

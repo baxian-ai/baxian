@@ -23,8 +23,6 @@ export interface PollerOptions {
   knownBranchesFor?: KnownBranchesProvider;
 }
 
-// Slug-normalized so a config rewrite between URL and "owner/repo" spellings
-// keeps the same state file — losing the cursor would replay every PR as pr.created.
 export function pollerStatePathFor(stateDir: string, repo: string): string {
   return join(stateDir, 'state', `poller-${encodeURIComponent(repoSlug(repo).toLowerCase())}.json`);
 }
@@ -56,7 +54,6 @@ function emptyStatus(): EntryStatus {
   return { isPolling: false, consecutiveFailures: 0 };
 }
 
-// head.sha (not updated_at) so metadata edits aren't mistaken for pushes.
 interface PollerCursor {
   pullsByHead: Record<string, string>;
   legacyAdoptionPending?: Record<string, string>;
@@ -85,7 +82,6 @@ function emptyCursor(): PollerCursor {
 
 const SHA_REGEX = /^[0-9a-f]{40}$/;
 
-// Bound gh hangs so isPolling cannot stay true forever.
 const POLL_EXEC_TIMEOUT_MS = 60_000;
 
 const CURSOR_RETENTION = 5000;
@@ -128,8 +124,6 @@ export class GitHubPoller {
   add(entry: PollerEntry): InternalEntry {
     const internal: InternalEntry = {
       ...entry,
-      // Entries hold the slug regardless of how project.repo was spelled:
-      // it feeds gh API paths and event routing keys.
       repo: repoSlug(entry.repo),
       cursor: emptyCursor(),
       loaded: false,
@@ -146,17 +140,12 @@ export class GitHubPoller {
     return true;
   }
 
-  // Dedup by repo (lowercase) — same as initial bootstrap in index.ts. Updates
-  // existing entries' projectId in place when the owning project changes so cursor
-  // state is not discarded. Reschedules timer if githubPollIntervalMs differs.
   replaceConfig(
     config: BaxianConfig,
     options: { statePathFor?: StatePathProvider } = {},
   ): void {
     const wantedByRepo = new Map<string, ProjectConfig>();
     for (const project of config.project) {
-      // Mirror index.ts startup gating: non-GitHub repos are never polled (no PR platform),
-      // so a hot-reload (POST /projects / PATCH /config) must not add an entry either.
       if (!isGitHubRepo(project.repo)) continue;
       const key = repoSlug(project.repo).toLowerCase();
       if (!wantedByRepo.has(key)) wantedByRepo.set(key, project);
@@ -228,8 +217,6 @@ export class GitHubPoller {
       entry.loaded = true;
       return;
     }
-    // ENOENT = first boot; other read/parse errors propagate so a corrupt
-    // file isn't silently overwritten and replayed.
     try {
       const raw = await readFile(entry.statePath, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<PollerCursor>;
@@ -366,7 +353,6 @@ export class GitHubPoller {
   }
 
   async pollPullRequests(entry: InternalEntry): Promise<void> {
-    // First page only; --paginate would refetch full history each cycle.
     const url = `repos/${entry.repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`;
     const cmd = `gh api '${url}'`;
     const result = await this.runner.exec(cmd, { timeout: POLL_EXEC_TIMEOUT_MS });
@@ -443,7 +429,6 @@ export class GitHubPoller {
             emitOk = false;
           }
         } else if (!SHA_REGEX.test(lastSha)) {
-          // Two-step legacy adoption avoids swallowing a push that lands during upgrade.
           const pending = entry.cursor.legacyAdoptionPending ?? {};
           entry.cursor.legacyAdoptionPending = pending;
           const tentative = pending[pr.head.ref];
@@ -503,7 +488,6 @@ export class GitHubPoller {
     }
 
     if (cycleErrors.length > 0) {
-      // Persist cursor advancement from successful emits so restart doesn't re-emit them.
       try {
         await this.saveEntry(entry);
       } catch (saveErr) {

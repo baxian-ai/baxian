@@ -34,13 +34,9 @@ export interface WaitReplReadyOpts extends WaitOpts {
 export interface WaitSubmitAckOpts extends WaitOpts {
   resend?: () => Promise<void>;
   resendIntervalMs?: number;
-  // Treat any change away from the pre-Enter composer as proof of submission (not only a busy frame).
-  // For meta-commands like /clear that redraw the screen instead of going busy, the cleared composer is
-  // the submission evidence; a swallowed Enter leaves the composer unchanged and still triggers resend.
   acceptComposerChange?: boolean;
 }
 
-// claude shows semver on linux / `claude.exe` on macOS; `node` is codex-only.
 const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /^(?:claude(?:\.exe)?|\d+\.\d+\.\d+)$/,
   codex: /^(?:codex|node)$/,
@@ -51,13 +47,11 @@ const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
   codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n\s*)?$/,
 };
 
-// Question + option must co-occur — either alone could appear in normal output.
 const TRUST_DIALOGS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /Quick safety check[\s\S]{0,500}Yes, I trust this folder/,
   codex: /Do you trust the contents[\s\S]{0,500}Yes, continue/,
 };
 
-// Detection only — operator dismisses; auto-answer would override product decisions.
 const STARTUP_DIALOG_SIGNALS: readonly RegExp[] = [
   /Press (?:enter|return|any key) to (?:continue|proceed)/i,
   /Enter to confirm[^\n]{0,40}Esc to cancel/i,
@@ -77,7 +71,6 @@ export function detectStartupDialog(stripped: string, runtime?: AgentRuntimeKind
   return RUNTIME_STARTUP_DIALOG_SIGNALS[runtime]?.some(re => re.test(stripped)) ?? false;
 }
 
-// Anchored footer "Enter to … · … Esc to": the "·" hint separator survives mid-footer mangling (overflow-overlay / narrow pane clobbers the verbs + "cancel" tail) yet rules out comma-style prose ("Enter to continue, Esc to abort").
 const RUNTIME_MENU_SIGNALS: readonly RegExp[] = [
   /^[ \t]*Enter to\b[^\n]{0,160}·[^\n]{0,40}\bEsc to\b/im,
 ];
@@ -86,10 +79,6 @@ export function detectRuntimeMenu(stripped: string): boolean {
   return RUNTIME_MENU_SIGNALS.some(re => re.test(stripped));
 }
 
-// Codex completion popup: its footer means Enter *inserts* the choice, not submit, so a resubmit must
-// refuse while it shows. The overlay replaces the status line as the bottom UI — scan up from the
-// bottom but stop at the status line (`·`), so a body merely quoting the footer (status line still
-// below it) isn't read as a popup; the joined lines also recover a footer a narrow pane wrapped.
 const RUNTIME_COMPLETION_POPUP_RE = /\benter to insert\b[^\n]{0,40}\besc to close\b/i;
 const COMPLETION_POPUP_FOOTER_LINES = 3;
 export function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKind): boolean {
@@ -105,12 +94,15 @@ export function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRun
   return RUNTIME_COMPLETION_POPUP_RE.test(footer.join(' '));
 }
 
+// codex 空 composer 上按一次 Esc 会 arm backtrack，footer 变成此提示、替换掉带 `·` 的状态行；
+// 它只在空闲态出现（工作中 Esc 是打断），故等价于一个 ready anchor。锚定屏幕底部避免误吃历史输出。
+const CODEX_BACKTRACK_HINT_RE = /(?:^|\n)[ \t]*esc again to edit previous message[ \t]*(?:\n[ \t]*)*$/i;
+
 export function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolean {
-  return READY_ANCHORS[runtime].test(stripped);
+  if (READY_ANCHORS[runtime].test(stripped)) return true;
+  return runtime === 'codex' && CODEX_BACKTRACK_HINT_RE.test(stripped);
 }
 
-// A turn can be working with a momentarily-static screen, signalled only by a braille spinner in the OSC pane
-// title. Same pattern both runtimes use in detect/manifests/*.json `osc_title_working`.
 const OSC_TITLE_WORKING_RE = /^[⠀-⣿] /;
 export function hasOscTitleWorking(paneTitle: string): boolean {
   return OSC_TITLE_WORKING_RE.test(paneTitle);
@@ -130,10 +122,6 @@ const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
 const CODEX_WORKING_TAIL_LINES = 8;
 const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t]*[❯>][ \t]*$/m;
 
-// A live, incomplete spinner ("· Verb… (Ns"): its elapsed-seconds advance every second, so the
-// captured screen mutates between polls during genuine work. A FROZEN spinner across polls is thus a
-// reliable "runtime stuck" signal — unlike a static "esc to interrupt" anchor, which a long-running
-// Codex task keeps on screen while perfectly healthy.
 export function hasActiveSpinner(stripped: string): boolean {
   for (const m of stripped.matchAll(SPINNER_LINE_RE)) {
     if (!COMPLETION_MARKER_RE.test(stripped.slice(m.index + m[0].length))) return true;
@@ -141,10 +129,6 @@ export function hasActiveSpinner(stripped: string): boolean {
   return false;
 }
 
-// Stuck-busy needs the spinner in the ACTIVE region — the activity line that sits just above the
-// status footer — NOT high in scrollback: a quoted/leftover "· Verb… (Ns)" on an otherwise-idle
-// screen (its "Worked for" marker scrolled off) must not escalate to a STUCK_BUSY error.
-// Window = footer (~5 lines) + the activity line(s) above it.
 const ACTIVE_SPINNER_TAIL_LINES = 10;
 
 export function hasActiveSpinnerInTail(stripped: string): boolean {
@@ -210,7 +194,6 @@ export function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeK
     || codexWorkingInTail(stripped, runtime);
 }
 
-// Empty Codex composer: bare `›` (may be indented) as the last non-blank line. Mirrors codex.json codex_idle_prompt.
 const CODEX_EMPTY_COMPOSER_RE = /(?:^|\n)[ \t]*›[ \t]*(?:\n[ \t]*)*$/;
 
 export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRuntimeKind): boolean {
@@ -234,17 +217,12 @@ export function hasRuntimeReadyView(stripped: string, runtime: AgentRuntimeKind)
   return true;
 }
 
-// codex: position-aware — stale busy above → prompt is not active
-// claude-code: full-screen spinner — can sit above ❯ composer in tall panes
 export function runtimeBusyCheck(stripped: string, runtime: AgentRuntimeKind): boolean {
   return runtime === 'codex'
     ? detectActiveRegionBusy(stripped, runtime)
     : detectReplActiveBusy(stripped);
 }
 
-// submit-ack busy: full-screen spinner + position-aware esc-to-interrupt.
-// Excludes codexWorkingInTail — pasted prompt text can contain "Working (...)"
-// which must not trip the baseline check before Enter.
 function submitAckBusy(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (runtime === 'codex') {
     return hasActiveSpinner(stripped) || escToInterruptActiveInTail(stripped, runtime);
@@ -284,7 +262,6 @@ const stripAnsi = (s: string): string => s.replace(ANSI_PATTERN, '');
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
-// Floor for poll loops so an explicit intervalMs of 0 can't spin the shell.
 const MIN_POLL_INTERVAL_MS = 50;
 
 const HISTORY_SUFFIX_RE = /\n---history_size:\d+---$/;
@@ -309,7 +286,6 @@ export class TmuxManager {
     return { major: parseInt(match[1], 10), minor: parseInt(match[2], 10) };
   }
 
-  // PATH literal — fish would corrupt the colon form on $PATH expansion.
   async createSession(name: string, workdir: string): Promise<void> {
     const PATH = '/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
     const result = await run(
@@ -343,7 +319,6 @@ export class TmuxManager {
         throw new Error(`tmux sendInput ${name} paste-buffer failed: ${r2.stderr || 'unknown error'}`);
       }
     } finally {
-      // -d skips delete on paste failure; force explicit delete to avoid leak.
       await run(this.runner, deleteCmd).catch(() => undefined);
     }
   }
@@ -459,7 +434,6 @@ export class TmuxManager {
     }
   }
 
-  // grep -F gate prevents `set -sa` from duplicating on repeat calls.
   async appendServerOptionIfMissing(key: string, value: string): Promise<void> {
     const result = await run(
       this.runner,
@@ -509,7 +483,6 @@ export class TmuxManager {
     }
   }
 
-  /** Prefer {@link sendKeysToPane}. */
   async sendKeys(name: string, keys: string): Promise<void> {
     const result = await run(
       this.runner,
@@ -565,7 +538,6 @@ export class TmuxManager {
     }
   }
 
-  // Visible + history_size in one command to avoid torn baselines.
   async capturePaneSnapshot(paneId: string): Promise<string> {
     const SEP = '___bx-snap-sep___';
     const cmd =
@@ -589,8 +561,6 @@ export class TmuxManager {
     await this.sendKeysToPane(paneId, 'Enter');
   }
 
-  // Best-effort pre-Enter settle: poll until two consecutive snapshots match (or the timeout), so an
-  // async image-attach redraw is less likely to be mid-flight when Enter is sent.
   async captureSettledSnapshot(paneId: string, opts: WaitOpts = {}): Promise<string> {
     const deadline = Date.now() + (opts.timeoutMs ?? 3_000);
     const interval = Math.max(opts.intervalMs ?? 150, MIN_POLL_INTERVAL_MS);
@@ -604,9 +574,6 @@ export class TmuxManager {
     return prev;
   }
 
-  // Ack on a fresh idle→busy transition (a swallowed Enter can't fake it); an already-busy baseline is non-ackable.
-  // A first Enter swallowed by paste-end handling or eaten by a $skill popup leaves the prompt unsent;
-  // resend (if given) while the pane still reads as an Enter-would-submit composer.
   async waitSubmitAck(
     paneId: string,
     baseline: string,
@@ -624,13 +591,7 @@ export class TmuxManager {
     while (Date.now() < deadline) {
       const visible = stripHistorySuffix(await this.capturePaneSnapshot(paneId));
       if (submitAckBusy(visible, runtime)) return;
-      // For meta-commands (acceptComposerChange) a cleared/redrawn composer is itself the submission
-      // proof — they may never show a busy frame.
       if (opts.acceptComposerChange && visible !== composerBaseline) return;
-      // Key resend on "an Enter here would submit", not byte-identity to baseline — a popup/redraw breaks
-      // that permanently and would strand the prompt. The menu/startup footer a resend must avoid is the
-      // bottom-most UI line; scoping there (not whole-screen) stops task-body text that merely quotes such
-      // a footer from blocking recovery. (Popup detector scans the bottom itself.)
       const bottomLine = bottomNonBlankLine(visible);
       const enterWouldSubmit =
         !detectRuntimeMenu(bottomLine)
@@ -676,7 +637,6 @@ export class TmuxManager {
     return false;
   }
 
-  // procTitle is authoritative (pane_pid is shell pid, not foreground); check before regexes.
   async classifyPaneForAdopt(
     paneId: string,
     runtime: AgentRuntimeKind,
@@ -720,7 +680,6 @@ export class TmuxManager {
     const deadline = Date.now() + (opts.timeoutMs ?? 30_000);
     const interval = opts.intervalMs ?? 500;
     const failFastOnShell = opts.failFastOnShell ?? false;
-    // scrollback=0: history would let a stale anchor satisfy the check.
     const scrollback = opts.scrollback ?? 0;
     const procTitle = REPL_PROC_TITLES[runtime];
     const cmdOpts = opts.perCommandTimeoutMs ? { timeout: opts.perCommandTimeoutMs } : undefined;
@@ -746,7 +705,6 @@ export class TmuxManager {
 }
 
 function isSessionAbsent(stderr: string): boolean {
-  // Strict whitelist — unknown stderr escalates as unexpected to avoid masking infra failures.
   const s = (stderr || '').trim().toLowerCase();
   return (
     s.includes('no server running') ||

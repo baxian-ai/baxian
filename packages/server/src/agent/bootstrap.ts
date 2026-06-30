@@ -22,10 +22,6 @@ export interface BootstrapDeps {
     host: HostConfig | undefined,
     cache: RepoStoreCache,
   ) => RepoStore;
-  // Notification hook for EventPublisher. Bootstrap failures/successes only touch
-  // errorRecordStore / eventBus (audit log), not agentStore — without this hook open
-  // agents-topic subscribers would keep the stale snapshot and the new "Retry bootstrap"
-  // button's toast would point at a red card that never updates.
   onAgentAffected?: (agentIds: string[]) => void;
 }
 
@@ -33,7 +29,6 @@ export interface BootstrapTarget {
   project: ProjectConfig;
   agents: AgentConfig[];
   representativeAgent: AgentConfig;
-  // Registry host resolved against the config that produced this target (undefined for local).
   resolvedHost?: HostConfig;
 }
 
@@ -54,9 +49,6 @@ export async function bootstrapAutoRepos(deps: BootstrapDeps): Promise<void> {
   );
 }
 
-// Set of agent ids that are subject to bootstrap (auto-mode = no explicit workdir). Used by
-// the sweep path in startup / config-replace to filter stale bootstrap errors for agents that
-// no longer participate in bootstrap (either deleted or transitioned to explicit workdir).
 export function autoBootstrapAgentIds(config: BaxianConfig): Set<string> {
   const ids = new Set<string>();
   for (const project of config.project) {
@@ -76,8 +68,6 @@ export function collectTargets(config: BaxianConfig): BootstrapTarget[] {
     for (const pair of project.agent) {
       for (const agent of pair) {
         if (agent.workdir) continue;
-        // Resolve the host ref so agents sharing one machine (same id, or different ids → same
-        // hostname:port:user) collapse to one RepoStore.hostKey-matching group.
         const resolvedHost = resolveAgentHost(config.host, agent.host);
         const key = `${project.id}::${hostGroupKey(agent.mode, resolvedHost)}`;
         const existing = groups.get(key);
@@ -139,13 +129,6 @@ export async function runSingleTarget(
         data: { repoPath, agentIds: affectedAgentIds, updated },
       });
     }
-    // Truth source for the red card is "is there a current bootstrap error record?". Purge stale
-    // failures so retries that succeed actually clear the card — covers (a) never-dispatched
-    // agents that have no binding for repoPath-based gating to work on, and (b) post-first-success
-    // failure → retry → success cycles where binding.repoPath was set long ago and isn't temporal.
-    // purgeBootstrapForAgent uses an internal substring quickCheck so the no-stale common case
-    // is just one readFile per jsonl with no parse/rewrite, and returns removed count so we can
-    // gate the downstream snapshot publish on actual state change (not synthetic noop publishes).
     let bootstrapErrorPurged = 0;
     if (deps.errorRecordStore) {
       for (const id of affectedAgentIds) {
@@ -157,12 +140,6 @@ export async function runSingleTarget(
         }
       }
     }
-    // Notify only for state changes that bypass agentStore. Binding updates (updated > 0) already
-    // fire AgentStore.onChange → eventPublisher.publishAgentChange in production wiring; calling
-    // onAgentAffected here too would double-publish the same snapshot. The two cases that *do*
-    // need this hook are (a) bootstrap error cleared without touching agentStore (red card just
-    // disappeared from the snapshot but agentStore is untouched), (b) manual retry which wants a
-    // fresh signal regardless. Steady-state success is a no-op.
     if (bootstrapErrorPurged > 0 || opts.emitOnUnchanged) {
       deps.onAgentAffected?.(affectedAgentIds);
     }
@@ -185,20 +162,12 @@ export async function runSingleTarget(
   return { ok: false, failureMessage: message };
 }
 
-// Strong, GitHub-specific failure signatures from `gh repo clone` / GraphQL — no risk of
-// false-matching local errors. These alone justify the "grant collaborator access" hint.
-//
-// Intentionally NOT including bare `/\bgh:\s/i` — `gh: command not found`, `gh: API rate limit
-// exceeded`, etc. are gh CLI runtime/tooling errors, not repo access denials, and would mislead
-// operators toward fixing repo permissions instead of installing/authenticating gh.
 const STRONG_ACCESS_PATTERNS = [
   /could not resolve to a repository/i,
   /repository not found/i,
   /\bGraphQL:/,
 ];
 
-// Generic auth/permission keywords that ALSO match local OS errors (mkdir EACCES, etc.).
-// Only treat as ACCESS_DENIED when paired with a GitHub-context signal (see GITHUB_CONTEXT_PATTERNS).
 const GENERIC_AUTH_PATTERNS = [
   /permission denied/i,
   /authentication failed/i,
@@ -206,12 +175,6 @@ const GENERIC_AUTH_PATTERNS = [
   /\b(HTTP\s+)?404\b/,
 ];
 
-// Markers that the failing operation was actually talking to GitHub (vs. local fs / unrelated
-// network). Required to disambiguate `Permission denied` from a real gh-permission issue vs.
-// a local `mkdir EACCES`.
-// `/^gh:\s/m` (line-start) lets `gh: Not Found (HTTP 404)` upgrade to ACCESS_DENIED via the
-// 404 generic, but stops `sh: gh: command not found` from matching because there gh: isn't at
-// line start (the runtime shell prefix wins).
 const GITHUB_CONTEXT_PATTERNS = [
   /github\.com/i,
   /\bgit@/,
@@ -225,11 +188,7 @@ export function classifyBootstrapError(message: string, repo: string): {
   message: string;
   recommendation: string;
 } {
-  // Non-GitHub repos clone via plain `git` (no gh/GraphQL) — different failure signatures.
   if (!isGitHubRepo(repo)) return classifyGenericGitError(message, repo);
-  // Intentionally do NOT use `message.includes(repo)` as a GitHub-context signal — local
-  // mkdir/path errors embed the repo string in filesystem paths (e.g. `/var/baxian/repos/<repo>`)
-  // and would false-match. Trust only the explicit GitHub markers below.
   const accessDenied = STRONG_ACCESS_PATTERNS.some(re => re.test(message))
     || (GENERIC_AUTH_PATTERNS.some(re => re.test(message))
         && GITHUB_CONTEXT_PATTERNS.some(re => re.test(message)));
@@ -247,9 +206,6 @@ export function classifyBootstrapError(message: string, repo: string): {
   };
 }
 
-// Generic `git clone` (non-GitHub) failure classification. git-context signals (URL scheme,
-// scp `git@`, publickey) gate the auth keywords; a scheme/`git@` never appears in a local
-// fs path (unlike the repos-ext/<host> dir), so this won't false-match local mkdir errors.
 function classifyGenericGitError(message: string, repo: string): {
   reason: string;
   message: string;
@@ -262,15 +218,12 @@ function classifyGenericGitError(message: string, repo: string): {
   const accessDenied = gitContext && (
     GENERIC_AUTH_PATTERNS.some(re => re.test(message))
     || /could not read (?:Username|Password)/i.test(message)
-    // remote repository-not-found ONLY — never a shell missing-binary ("command not found", or
-    // dash's "git: not found"), which is an env problem (ENSURE_FAILED), not a credentials one.
     || /\brepository\b[\s\S]*?\bnot found\b/i.test(message)
     || /could not be found/i.test(message)
   );
   if (accessDenied) {
     return {
       reason: 'BOOTSTRAP_REPO_ACCESS_DENIED',
-      // redact: repo / underlying error may carry an embedded token before it lands in the error record.
       message: redactGitCredentials(`Repo "${repo}" not found or access denied (underlying error: ${message}).`),
       recommendation:
         `Verify the repo URL and the git credentials (HTTPS credential helper or SSH key) for ` +

@@ -40,7 +40,6 @@ describe('password redaction (recursively masks host and server-token secrets)',
     expect(out.host[0].password).toBe('***');
     expect((out.project[0].agent[0][0].host as { password?: string }).password).toBe('***');
     expect(out.server.token).toBe('***');
-    // Original config object is not mutated.
     expect(config.host[0].password).toBe('regpw');
   });
 });

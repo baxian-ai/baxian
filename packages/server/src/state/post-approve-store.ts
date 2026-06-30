@@ -5,9 +5,7 @@ export interface PostApproveCompletion {
   token: string;
   approvedHeadSha: string;
   updatedAt: string;
-  // Capped by REDISPATCH_CAP in handlers.ts; over-cap escalates to intervention.
   redispatchCount?: number;
-  // Set when feedback arrives mid-pass; handlers redispatch instead of auto-merging.
   pendingRedispatch?: boolean;
 }
 
@@ -37,7 +35,6 @@ export class PostApproveStore {
     try {
       content = await readFile(this.path(taskId), 'utf-8');
     } catch (err) {
-      // ENOENT = no completion; corrupt/permission/IO errors must surface, not look "absent".
       if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null;
       throw err;
     }

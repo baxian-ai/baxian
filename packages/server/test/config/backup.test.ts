@@ -58,7 +58,6 @@ describe('cleanupOldBackups', () => {
     await writeFile(`${configPath}.20260428-100000`, 'newest');
     await writeFile(`${configPath}.20260415-100000`, 'middle');
 
-    // With MAX_CONFIG_BACKUPS = 7, all 3 should survive
     await cleanupOldBackups(configPath);
 
     const files = (await readdir(tempDir)).filter(f => /\.\d{8}-\d{6}$/.test(f));

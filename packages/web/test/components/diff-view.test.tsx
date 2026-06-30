@@ -42,7 +42,6 @@ describe('parseUnifiedDiff', () => {
   });
 
   it('treats hunk content starting with --- / +++ as del/add, not file headers', () => {
-    // deleting markdown frontmatter `---` → `----`; adding `+++` content → `++++`
     const diff = '@@ -1,3 +1,3 @@\n----\n++++\n ---';
     expect(parseUnifiedDiff(diff).map((l) => l.type)).toEqual(['hunk', 'del', 'add', 'context']);
   });

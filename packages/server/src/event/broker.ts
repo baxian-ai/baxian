@@ -2,7 +2,6 @@ import type { EventsTopic } from '../shared/index.js';
 
 type Subscriber = (data: unknown) => void;
 
-// Non-durable hot-path pub/sub — see EventBus for the persisted audit log.
 export class EventBroker {
   private topics = new Map<EventsTopic, Set<Subscriber>>();
 
@@ -24,7 +23,6 @@ export class EventBroker {
   publish(topic: EventsTopic, data: unknown): void {
     const set = this.topics.get(topic);
     if (!set) return;
-    // Snapshot — subscribers may unsubscribe mid-dispatch.
     for (const fn of [...set]) {
       try {
         fn(data);

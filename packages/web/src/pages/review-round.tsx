@@ -33,8 +33,6 @@ export function ReviewRoundPage() {
   const navigate = useNavigate();
   const { hash } = useLocation();
   const { data: task } = useTask(taskId);
-  // Same revision key as the conversation list: an in-progress round refetches as
-  // QA findings / dev response land, instead of being stuck at the mount snapshot.
   const revision = task
     ? `${task.specReviewRound ?? 0}:${task.reviewRound}:${task.status}:${task.phase ?? 'code'}`
     : undefined;

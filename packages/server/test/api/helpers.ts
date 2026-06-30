@@ -23,7 +23,6 @@ export async function teardownApiHarness(harness?: ApiHarness): Promise<void> {
   if (!harness) return;
   const { app, tempDir } = harness;
   await app.close();
-  // maxRetries guards macOS APFS ENOTEMPTY from background fsync racing rm.
   await rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 }
 
@@ -47,7 +46,6 @@ export function requesters(getApp: () => FastifyInstance): RequestHelpers {
   };
 }
 
-// Assert HTTP status, and (when given) that the response body's `error` matches.
 export function expectStatus(
   response: LightMyRequestResponse,
   status: number,
@@ -58,7 +56,6 @@ export function expectStatus(
   if (errorMatch) expect.soft(JSON.parse(response.body).error, label).toMatch(errorMatch);
 }
 
-// PATCH /config writes to ctx.configPath; point it at an empty file under tempDir.
 export async function seedConfigPath(app: FastifyInstance, tempDir: string): Promise<string> {
   const configPath = join(tempDir, 'baxian.json');
   await writeFile(configPath, '{}');

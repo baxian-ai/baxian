@@ -36,12 +36,10 @@ function makeConfig(overrides: Partial<BaxianConfig> = {}): BaxianConfig {
   };
 }
 
-// Most cases vary only the single project under test; this trims the makeConfig({ project: [{...}] }) boilerplate.
 function withProject(project: ProjectConfig, rest: Partial<BaxianConfig> = {}): BaxianConfig {
   return makeConfig({ project: [project], ...rest });
 }
 
-// Standard single-agent project skeleton; callers override id/repo/agent as needed.
 function devProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
   return {
     id: 'pp', repo: 'u/r', merge: null,
@@ -170,8 +168,8 @@ describe('validateConfig', () => {
 
   it('rejects github multi-segment paths and non-github paths with unsafe segments', () => {
     const bad = [
-      'https://github.com/group/sub/proj.git',          // github keeps the owner/repo single-segment rule
-      'https://github.com:443/org/repo.git',            // ported github → rejected, not routed to server mode
+      'https://github.com/group/sub/proj.git',
+      'https://github.com:443/org/repo.git',
       'https://gitlab.example.com/group/../proj.git',
       'https://gitlab.example.com/group//proj.git',
       'https://gitlab.example.com/.hidden/proj',
@@ -184,8 +182,8 @@ describe('validateConfig', () => {
 
   it('rejects non-github repos with an unsafe host (path traversal / command injection)', () => {
     const bad = [
-      'https://../group/proj.git',                          // host ".." → traversal out of repos-ext
-      'https://gitlab.example.com;touch x/group/proj.git',  // shell metachar → preflight injection
+      'https://../group/proj.git',
+      'https://gitlab.example.com;touch x/group/proj.git',
       'https://gitlab.example.com$(touch x)/group/proj.git',
       'https://gitlab.example.com`id`/group/proj.git',
       'https://gitlab.example.com|x/group/proj.git',
@@ -358,7 +356,6 @@ describe('validateConfig', () => {
     }
   });
 
-  // null override → makeConfig() default; otherwise each ms is set via withServer.
   it.each<[string, number[] | null, boolean]>([
     ['rejects non-positive server.bootstrapRetryIntervalMs', [0], true],
     ['rejects non-integer server.bootstrapRetryIntervalMs', [1.5], true],
@@ -376,7 +373,6 @@ describe('validateConfig', () => {
 
   it.each<[string, number[], boolean]>([
     ['accepts server.githubPollIntervalMs within [1000, 2^31-1]', [1000, 60000, 2147483647], false],
-    // sub-second floor, non-integer, zero, negative, 32-bit overflow
     ['rejects server.githubPollIntervalMs out of [1000, 2^31-1] or non-integer', [500, 0, -1000, 1500.5, 2147483648], true],
   ])('%s', (_label, samples, rejected) => {
     for (const ms of samples) {

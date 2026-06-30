@@ -106,7 +106,6 @@ function makeStreamer(opts: MakeStreamerOpts = {}): MadeStreamer {
   return { streamer, fakePty, runner };
 }
 
-// makeStreamer + the near-universal first subscribe (registers the shared `cbs`).
 async function subscribed(opts: MakeStreamerOpts = {}): Promise<MadeStreamer> {
   const made = makeStreamer(opts);
   await made.streamer.subscribeAtomic(cbs);
@@ -135,7 +134,6 @@ async function expectDims(streamer: PaneStreamer, cols: number, rows: number): P
   expect(snapshot.rows).toBe(rows);
 }
 
-// `tmux has-session` reports the session is gone; everything else succeeds.
 function mockSessionGone(runner: ReturnType<typeof mockRunner>): void {
   runner.exec.mockImplementation(async (cmd: string) =>
     cmd.includes('has-session')
@@ -147,12 +145,9 @@ function mockSessionGone(runner: ReturnType<typeof mockRunner>): void {
 interface CountingFactory {
   factory: PtyFactory;
   calls: () => number;
-  // advance fake timers by `ms`, then assert the factory has been invoked `expected` times.
   expectAfter: (ms: number, expected: number) => Promise<void>;
 }
 
-// A counting PTY factory: returns ptys[0], ptys[1], … in order. `failAt` indices throw
-// (simulating a failed reattach); any call past the provided ptys also throws.
 function countingFactory(ptys: FakePty[], failAt: number[] = []): CountingFactory {
   let calls = 0;
   const factory: PtyFactory = () => {
@@ -167,8 +162,6 @@ function countingFactory(ptys: FakePty[], failAt: number[] = []): CountingFactor
   return { factory, calls: () => calls, expectAfter };
 }
 
-// Most timer-driven reconnect tests share the same scaffold: spy on console, build a
-// streamer with a counting factory, subscribe, switch to fake timers, then advance.
 async function withTimerHarness(
   run: (ctx: {
     streamer: PaneStreamer;
@@ -234,7 +227,7 @@ describe('PaneStreamer', () => {
 
     it('lazy-starts PTY on first subscribe', async () => {
       const { streamer, fakePty } = await subscribed();
-      expect(fakePty.killCalled).toBe(0);  // pty alive
+      expect(fakePty.killCalled).toBe(0);
       streamer.destroy();
     });
 
@@ -310,7 +303,6 @@ describe('PaneStreamer', () => {
 
       fakePty.emitData('world');
       await flush(streamer);
-      // getSnapshotAtomic never registered a live cb, so only the original `cbs` saw the data.
       expect(liveCalls.map(c => c.data)).toEqual(['hello', 'world']);
 
       streamer.destroy();
@@ -398,7 +390,6 @@ describe('PaneStreamer', () => {
         await expectAfter(1, 2);
         expect(warnSpy).toHaveBeenCalledTimes(1);
 
-        // backoff doubled: the second retry waits 2000ms, not another 1000ms
         await expectAfter(1999, 2);
         await expectAfter(1, 3);
         vi.useRealTimers();
@@ -485,9 +476,6 @@ describe('PaneStreamer', () => {
       }, { ptyFactory: factory, reattachDelayMs: 1000, reattachMaxDelayMs: 15_000, random: () => 0 });
     });
 
-    // Regression: a failing reattach often emits bytes (SSH banner, "Connection closed"
-    // stderr, login text) before the connection dies. Those bytes must NOT count as recovery
-    // or the backoff resets to base every cycle and the storm returns.
     it('keeps backing off when a reattach emits output then exits without staying stable', async () => {
       const ptys = makePtys(3);
       const { factory, expectAfter } = countingFactory(ptys);
@@ -497,12 +485,10 @@ describe('PaneStreamer', () => {
 
         await expectAfter(1000, 2);
 
-        // ptys[1] spews failure noise as PTY data, then dies inside the stability window
         ptys[1].emitData('Connection closed by 1.2.3.4 port 6003\r\n');
         ptys[1].emitExit(0);
         await tick();
 
-        // backoff must have grown to 2000ms — interim data must not reset it to 1000
         await expectAfter(1999, 2);
         await expectAfter(1, 3);
       }, {
@@ -523,16 +509,15 @@ describe('PaneStreamer', () => {
         ptys[0].emitExit(0);
         await tick();
 
-        await vi.advanceTimersByTimeAsync(1000);   // attempt1 → factory throws → outage warn
+        await vi.advanceTimersByTimeAsync(1000);
         expect(warnSpy).toHaveBeenCalledTimes(1);
-        await expectAfter(2000, 3);                // attempt2 → ptys[2] attaches, stays alive
+        await expectAfter(2000, 3);
 
         await vi.advanceTimersByTimeAsync(4999);
-        expect(recoveredLines()).toEqual([]);      // not recovered until the window elapses
+        expect(recoveredLines()).toEqual([]);
         await vi.advanceTimersByTimeAsync(1);
         expect(recoveredLines()).toEqual(['[pane-streamer] dev-1 attach recovered']);
 
-        // backoff was reset: a later drop reschedules from base (1000), not the grown delay
         ptys[2].emitExit(0);
         await tick();
         await expectAfter(999, 3);
@@ -575,8 +560,6 @@ describe('PaneStreamer', () => {
       for (let i = 0; i < 200; i++) fakePty.emitData(`line-${i}\r\n`);
       await flush(streamer);
       const { snapshot } = await streamer.getSnapshotAtomic();
-      // viewport (rows) + 5 scrollback lines — far below the 200 lines emitted; an unbounded
-      // (default 1000-line) buffer would retain all 200.
       expect(snapshot.data.split('\n').length).toBeLessThan(80);
       expect(snapshot.data).not.toContain('line-0');
       streamer.destroy();
@@ -722,7 +705,6 @@ describe('PaneStreamer', () => {
       });
       streamer.destroy();
       expect(sessionGoneFired).toBe(1);
-      // sessionGoneCb runs BEFORE pty.kill — onExit's empty-set firing is harmless.
       expect(killedAtFire).toBe(0);
       expect(fakePty.killCalled).toBe(1);
     });
@@ -744,7 +726,6 @@ describe('PaneStreamer host re-resolution', () => {
     );
     await streamer.subscribeAtomic(NOOP_CBS);
 
-    // The host was resolved at attach time (not captured in the constructor) and drives the command.
     expect(resolveCalls).toBeGreaterThanOrEqual(1);
     expect(captured[0].args).toContain('-p');
     expect(captured[0].args).toContain('2222');
@@ -759,7 +740,6 @@ describe('ensureSpawnHelperExecutable', () => {
   const activeDir = () => join(dir, 'prebuilds', `${process.platform}-${process.arch}`);
   const helper = () => join(activeDir(), 'spawn-helper');
   const buildHelper = () => join(dir, 'build', 'Release', 'spawn-helper');
-  // Fake node-pty loader: pty.node "loads" only under the given subpath, mirroring require() success.
   const loadsUnder = (sub: string) => (modulePath: string) => {
     if (!modulePath.includes(join(...sub.split('/')))) throw new Error(`cannot load ${modulePath}`);
   };
@@ -774,7 +754,6 @@ describe('ensureSpawnHelperExecutable', () => {
     if (dir) rmSync(dir, { recursive: true, force: true });
   });
 
-  // These two exercise the real chmodSync fs path, which is POSIX-only (Windows fs has no exec bit).
   it.skipIf(process.platform === 'win32')('adds +x to a spawn-helper shipped as 0644 (node-pty#850)', () => {
     writeFileSync(helper(), 'binary', { mode: 0o644 });
     chmodSync(helper(), 0o644);
@@ -804,8 +783,6 @@ describe('ensureSpawnHelperExecutable', () => {
     expect(chmodded).toEqual([buildHelper()]);
   });
 
-  // build/Release/pty.node present but unloadable (ABI mismatch after a Node upgrade): node-pty falls
-  // back to the prebuild, so we must fix the prebuilt helper, not the inert build/Release one.
   it('falls back to the prebuild when build/Release pty.node fails to load', () => {
     mkdirSync(join(dir, 'build', 'Release'), { recursive: true });
     writeFileSync(buildHelper(), 'binary', { mode: 0o644 });
@@ -832,8 +809,6 @@ describe('ensureSpawnHelperExecutable', () => {
     ).toThrow(/chmod \+x/);
   });
 
-  // root:group-owned 0550 + service user in that group: not world-exec and not chmod-able by us, but
-  // runnable. Must not chmod-EPERM-throw on an install that already works.
   it('skips chmod (no throw) when the current process can already execute the helper', () => {
     writeFileSync(helper(), 'binary', { mode: 0o550 });
     chmodSync(helper(), 0o550);
@@ -859,8 +834,6 @@ describe('ensureSpawnHelperExecutable', () => {
     expect(() => ensureSpawnHelperExecutable(dir, { load: prebuildLoads })).not.toThrow();
   });
 
-  // Passing '' exercises the unresolved branch without triggering the resolveNodePtyDir() default
-  // (which would load/stat/chmod the real installed node-pty).
   it('does not touch real node-pty when the package dir cannot be resolved', () => {
     const mustNotRun = () => {
       throw new Error('must not run when packageDir is unresolved');

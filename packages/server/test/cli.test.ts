@@ -54,7 +54,6 @@ describe('buildLocalAttachCommands', () => {
     const attachIdx = cmds.findIndex(c => c.kind === 'attach');
     expect(focusIdx).toBeGreaterThanOrEqual(0);
     expect(focusIdx).toBeLessThan(attachIdx);
-    // configure steps run with ignored stdio/status, so a set-option failure cannot block attach.
     expect(cmds[focusIdx].kind).toBe('configure');
   });
 
@@ -103,7 +102,6 @@ describe('buildRemoteAttachSshArgs', () => {
     const targetIdx = args.indexOf('baxian@hz1');
     expect(dashDashIdx).toBeGreaterThanOrEqual(0);
     expect(targetIdx).toBe(dashDashIdx + 1);
-    // Interactive attach must not force key-only (BatchMode) or password-only auth.
     expect(args).not.toContain('BatchMode=yes');
     expect(args.join(' ')).not.toContain('PreferredAuthentications=password');
   });
@@ -116,7 +114,7 @@ describe('buildRemoteAttachSshArgs', () => {
     );
     expect(args.join(' ')).not.toContain('PreferredAuthentications=password');
     expect(args).not.toContain('BatchMode=yes');
-    expect(args.join(' ')).not.toContain('***'); // redacted marker never reaches the ssh command
+    expect(args.join(' ')).not.toContain('***');
   });
 
   it('auto-size repair failure does not block attach (|| true keeps stale-session race recoverable)', () => {
@@ -135,9 +133,6 @@ describe('buildRemoteAttachSshArgs', () => {
 
 describe('readPackageVersion', () => {
   it('returns a semver-shaped string from the sibling package.json', () => {
-    // In monorepo dev mode this reads packages/server/package.json.
-    // In published npm package layout (post pnpm pack) it would read baxian/package.json.
-    // Both must produce a string `x.y.z`; never crash, never empty.
     const v = readPackageVersion();
     expect(v).toMatch(/^\d+\.\d+\.\d+/);
   });

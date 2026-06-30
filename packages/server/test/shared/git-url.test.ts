@@ -89,7 +89,7 @@ describe('isGitHubRepo', () => {
       'ssh://git@github.com/o/r',
       'owner/repo',
       'https://GITHUB.com/o/r',
-      'https://github.com:443/o/r.git',   // ported github → still detected (validator then rejects)
+      'https://github.com:443/o/r.git',
       'ssh://git@github.com:22/o/r',
     ]) expect.soft(isGitHubRepo(repo), repo).toBe(true);
   });

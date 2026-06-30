@@ -92,9 +92,6 @@ describe('ErrorRecordStore', () => {
   });
 
   it('latestBootstrapForAgent ignores non-bootstrap operations', async () => {
-    // dispatch error after bootstrap error — latestForAgent would return dispatch (newest),
-    // but latestBootstrapForAgent must still return the older bootstrap one because the
-    // snapshot card semantically only surfaces bootstrap-stage failures.
     await appendRecord({ operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'gh 404' });
     await appendRecord({ operation: 'dispatch', reason: 'DISPATCH_TIMEOUT', message: 'ack timeout', occurredAt: '2026-05-14T06:00:00.000Z' });
 
@@ -117,8 +114,6 @@ describe('ErrorRecordStore', () => {
   });
 
   it('latestBootstrapByAgent batches all agents in one readAll', async () => {
-    // Different agents + different operations; only the latest bootstrap-typed record per
-    // agent should land in the map. This is the path buildAllAgentSnapshots takes.
     await appendRecord({ projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ENSURE_FAILED', message: 'old', occurredAt: '2026-05-14T01:00:00.000Z' });
     await appendRecord({ projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'new', occurredAt: '2026-05-15T01:00:00.000Z' });
     await appendRecord({ projectId: 'p', operation: 'dispatch', reason: 'DISPATCH_TIMEOUT', message: 'should be ignored', occurredAt: '2026-05-15T02:00:00.000Z' });
@@ -139,9 +134,7 @@ describe('ErrorRecordStore', () => {
 
     const result = await store.purgeAgent('dev-1');
     expect(result.removed).toBe(2);
-    // dev-1 cleared
     expect(await store.latestForAgent('dev-1')).toBeUndefined();
-    // dev-2 untouched
     expect(await store.latestForAgent('dev-2')).toMatchObject({ message: 'other agent' });
   });
 
@@ -151,22 +144,16 @@ describe('ErrorRecordStore', () => {
   });
 
   it('purgeBootstrapForAgent keeps other operations from the same agent', async () => {
-    // Used by runSingleTarget success path to clear the red card while preserving
-    // non-bootstrap (tmux-probe / dispatch) history that's still relevant for diagnosis.
     await appendRecord({ projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'old boot fail', occurredAt: '2026-05-14T01:00:00.000Z' });
     await appendRecord({ projectId: 'p', operation: 'tmux-probe', reason: 'TMUX_UNREACHABLE', message: 'ssh timeout', occurredAt: '2026-05-14T02:00:00.000Z' });
 
     const result = await store.purgeBootstrapForAgent('dev-1');
     expect(result.removed).toBe(1);
-    // bootstrap gone, tmux-probe preserved
     expect(await store.latestBootstrapForAgent('dev-1')).toBeUndefined();
     expect((await store.latestForAgent('dev-1'))?.reason).toBe('TMUX_UNREACHABLE');
   });
 
   it('sweepStaleBootstrapErrors keeps records for active agents, drops everything else (bootstrap-typed only)', async () => {
-    // Called on startup + PATCH /config to clean up stale red cards for agents that no longer
-    // participate in bootstrap (deleted entirely OR transitioned to explicit workdir mode).
-    // Must preserve non-bootstrap records and bootstrap records of still-active agents.
     await appendRecord({ agentId: 'still-active', projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'keep', occurredAt: '2026-05-14T01:00:00.000Z' });
     await appendRecord({ agentId: 'deleted', projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'drop (deleted)', occurredAt: '2026-05-14T02:00:00.000Z' });
     await appendRecord({ agentId: 'now-manual', projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'drop (transitioned to workdir)', occurredAt: '2026-05-14T03:00:00.000Z' });
@@ -174,18 +161,13 @@ describe('ErrorRecordStore', () => {
 
     const result = await store.sweepStaleBootstrapErrors(new Set(['still-active']));
     expect(result.removed).toBe(2);
-    // still-active bootstrap kept
     expect((await store.latestBootstrapForAgent('still-active'))?.message).toBe('keep');
-    // deleted + now-manual bootstrap dropped
     expect(await store.latestBootstrapForAgent('deleted')).toBeUndefined();
     expect(await store.latestBootstrapForAgent('now-manual')).toBeUndefined();
-    // now-manual non-bootstrap record preserved (sweep is narrow: only bootstrap operation)
     expect((await store.latestForAgent('now-manual'))?.reason).toBe('TMUX_UNREACHABLE');
   });
 
   it('sweepStaleBootstrapErrors short-circuits files with no bootstrap records (hot path)', async () => {
-    // Startup sweep is one-shot, but PATCH /config sweeps every config update — must not
-    // rewrite files that don't contain any bootstrap records. mtime stability assertion.
     await appendRecord({ agentId: 'a', projectId: 'p', operation: 'tmux-probe', reason: 'TMUX_UNREACHABLE', message: 'no bootstrap in file', occurredAt: '2026-05-14T01:00:00.000Z' });
     const path = jsonlPath('2026-05-14');
     const before = (await stat(path)).mtimeMs;
@@ -197,12 +179,9 @@ describe('ErrorRecordStore', () => {
   });
 
   it('purgeBootstrapForAgent skips files with no matching records (avoid unnecessary rewrite)', async () => {
-    // Hot-path concern: this method runs on EVERY successful 60s BootstrapPoller tick. In the
-    // common case (no stale errors) it must not rewrite files. Verified via mtime stability.
     const path = jsonlPath('2026-05-14');
     await appendRecord({ agentId: 'other', projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'other agent fail', occurredAt: '2026-05-14T01:00:00.000Z' });
     const statBefore = await stat(path);
-    // Sleep 5ms so mtime can change on filesystems with sub-ms resolution if a rewrite happens.
     await new Promise(r => setTimeout(r, 5));
 
     const result = await store.purgeBootstrapForAgent('dev-1');
@@ -212,33 +191,24 @@ describe('ErrorRecordStore', () => {
   });
 
   it('purgeAgent returns removed=0 and preserves original file when rewrite fails', async () => {
-    // Wire-level review: callers (bootstrap.ts success path) use removed > 0 to decide whether
-    // to publish a "stale error cleared" event. If we count records as removed before the
-    // atomic rename actually succeeds, a writeFile/rename failure silently produces a false
-    // positive and an open dashboard would clear its red card even though disk state is unchanged.
-    // Failure injection: chmod the errors/ dir to read-only so writeFile of the .tmp lands in
-    // EACCES. ESM-mode vitest can't spyOn fs/promises exports, so use real permission denial.
     await appendRecord({ projectId: 'p', operation: 'bootstrap', reason: 'BOOTSTRAP_REPO_ACCESS_DENIED', message: 'still here', occurredAt: '2026-05-14T01:00:00.000Z' });
     const dir = errorsDir();
     const path = jsonlPath('2026-05-14');
     const before = await readFile(path, 'utf-8');
 
-    await chmod(dir, 0o555); // read+exec only — writeFile of new .tmp will EACCES
+    await chmod(dir, 0o555);
     try {
       const result = await store.purgeAgent('dev-1');
       expect(result.removed).toBe(0);
-      // Original file untouched.
       expect(await readFile(path, 'utf-8')).toBe(before);
     } finally {
-      await chmod(dir, 0o755); // restore so afterEach rm() works
+      await chmod(dir, 0o755);
     }
-    // No orphan .tmp left behind (we unlink in catch on best-effort basis).
     const files = await readdir(dir);
     expect(files.filter(f => f.endsWith('.tmp'))).toHaveLength(0);
   });
 
   it('purgeAgent rewrites via tmp+rename, surviving partial state of in-place writes', async () => {
-    // After purge: target file should contain only kept lines; no .tmp file lingering.
     await appendRecord({ projectId: 'p', operation: 'bootstrap', reason: 'X', message: 'one', occurredAt: '2026-05-14T01:00:00.000Z' });
     await appendRecord({ agentId: 'dev-2', projectId: 'p', operation: 'bootstrap', reason: 'X', message: 'two', occurredAt: '2026-05-14T02:00:00.000Z' });
     await store.purgeAgent('dev-1');

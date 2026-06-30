@@ -12,7 +12,6 @@ export class ImageValidationError extends Error {
   }
 }
 
-// Magic-byte sniff is authoritative — client-declared content-type / filename is never trusted.
 export function detectImageType(buf: Buffer): { ext: ImageExt } | null {
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
     return { ext: 'png' };
@@ -53,8 +52,6 @@ export function agentHostPath(scope: string, filename: string): string {
   return `${AGENT_HOST_UPLOAD_DIR}/${scope}/${filename}`;
 }
 
-// Remote: stream raw bytes over ssh stdin (8-bit clean) — NEVER via argv, which would
-// blow MAX_ARG_STRLEN for a multi-MB image. Mirrors TmuxManager.sendInput's load-buffer.
 export async function writeImageToHost(
   runner: CommandRunner,
   path: string,
