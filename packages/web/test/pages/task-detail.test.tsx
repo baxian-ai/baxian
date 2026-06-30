@@ -46,11 +46,6 @@ vi.mock('../../src/components/review-conversation.tsx', () => ({
     <div data-testid="review-conversation" data-task={task.id} />
   ),
 }));
-vi.mock('../../src/components/github-review-entry.tsx', () => ({
-  GithubReviewEntry: ({ task }: { task: TaskState }) => (
-    <div data-testid="github-review-entry" data-task={task.id} />
-  ),
-}));
 vi.mock('../../src/components/create-task-modal.tsx', () => ({
   CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div data-testid="edit-modal" /> : null),
 }));
@@ -188,7 +183,6 @@ describe('TaskDetail page — header & info', () => {
     expect(container.textContent).toContain('Round: 1 spec: 0');
     expect(container.textContent).toContain('Branch:');
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
-    expect(screen.getByTestId('github-review-entry').getAttribute('data-task')).toBe('task-010');
   });
 
   it('shows runtime labels next to task agent names in the meta block', () => {

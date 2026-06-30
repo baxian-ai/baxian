@@ -101,7 +101,7 @@ function RoundDetail({ round }: { round: ReviewRound }) {
         )}
         {round.content ? (
           round.phase === 'spec' ? (
-            <pre className="card whitespace-pre-wrap p-4 text-[13px] text-og-800">{round.content}</pre>
+            <pre className="card whitespace-pre-wrap break-words p-4 text-[13px] text-og-800">{round.content}</pre>
           ) : (
             <DiffView content={round.content} diffstat={round.diffstat} />
           )
@@ -124,10 +124,10 @@ function RoundDetail({ round }: { round: ReviewRound }) {
                   <span className="font-mono text-og-400">{f.id}</span>
                   <span className={SEVERITY_CLASS[f.severity]}>{f.severity}</span>
                   {findingLocation(f) && (
-                    <span className="font-mono text-[12px] text-og-500">{findingLocation(f)}</span>
+                    <span className="min-w-0 break-all font-mono text-[12px] text-og-500">{findingLocation(f)}</span>
                   )}
                 </div>
-                <div className="whitespace-pre-wrap text-og-800">{f.message}</div>
+                <div className="whitespace-pre-wrap break-words text-og-800">{f.message}</div>
               </div>
             ))}
           </div>
@@ -149,8 +149,8 @@ function RoundDetail({ round }: { round: ReviewRound }) {
                       <span className="font-mono text-[12px] text-og-500">{r.commitSha.slice(0, 9)}</span>
                     )}
                   </div>
-                  {f && <div className="mb-1 text-[12px] text-og-500">↳ {f.message}</div>}
-                  <div className="whitespace-pre-wrap text-og-800">{r.rationale}</div>
+                  {f && <div className="mb-1 break-words text-[12px] text-og-500">↳ {f.message}</div>}
+                  <div className="whitespace-pre-wrap break-words text-og-800">{r.rationale}</div>
                 </div>
               );
             })}

@@ -72,7 +72,7 @@ export function GithubReviewPage() {
         <span className="text-[15px] font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-[12px] text-og-500">
-        <span className="pill">代码评审 · GitHub PR</span>
+        <span className="pill">代码评审</span>
         {prUrl && prNumber !== undefined && (
           <a href={prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
             Open PR #{prNumber}
@@ -133,7 +133,7 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
           {item.author && <span className="text-[12px] text-og-400">{item.author}</span>}
           {item.createdAt && <span className="text-[12px] text-og-400">{fmt(item.createdAt)}</span>}
         </div>
-        {item.body && <div className="whitespace-pre-wrap text-og-800">{item.body}</div>}
+        {item.body && <div className="whitespace-pre-wrap break-words text-og-800">{item.body}</div>}
       </div>
     );
   }
@@ -144,7 +144,7 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
         <span className="pill shrink-0">{isInline ? '行内评论' : '评论'}</span>
         {item.author && <span className="font-medium text-og-700">{item.author}</span>}
         {isInline && item.path && (
-          <span className="font-mono text-[12px] text-og-500">
+          <span className="min-w-0 break-all font-mono text-[12px] text-og-500">
             {item.line !== undefined ? `${item.path}:${item.line}` : item.path}
           </span>
         )}
@@ -161,7 +161,9 @@ function ReviewBlock({ item }: { item: GithubReviewItem }) {
   return (
     <div className="card p-3 text-[13px]">
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className="pill pill-review shrink-0">QA</span>
+        <span className="shrink-0 min-w-[1.75rem] text-[11px] font-semibold uppercase tracking-wide text-[#c2410c]">
+          QA
+        </span>
         <span className={VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
         {item.author && <span className="text-[12px] text-og-400">{item.author}</span>}
         {item.commitSha && <span className="font-mono text-[12px] text-og-500">{item.commitSha.slice(0, 9)}</span>}
@@ -176,7 +178,7 @@ function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: str
   return (
     <>
       {item.body ? (
-        <div className="whitespace-pre-wrap text-og-800">{item.body}</div>
+        <div className="whitespace-pre-wrap break-words text-og-800">{item.body}</div>
       ) : placeholder ? (
         <div className="text-og-400">{placeholder}</div>
       ) : null}

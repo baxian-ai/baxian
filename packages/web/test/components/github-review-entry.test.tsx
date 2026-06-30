@@ -27,23 +27,17 @@ beforeEach(() => navigateMock.mockReset());
 afterEach(() => cleanup());
 
 describe('GithubReviewEntry', () => {
-  it('renders the entry for a github-mode task with a PR', () => {
+  it('renders the 代码评审 sub-group with the PR-review link', () => {
     renderEntry(task({ reviewMode: 'github' }));
+    expect(screen.getByText('代码评审')).toBeTruthy();
     expect(screen.getByText(/查看 PR 评审过程/)).toBeTruthy();
   });
 
-  it('renders nothing for a server-mode task', () => {
-    const { container } = render(
-      <MemoryRouter><GithubReviewEntry task={task({ reviewMode: 'server' })} /></MemoryRouter>,
-    );
-    expect(container.querySelector('section')).toBeNull();
-  });
-
-  it('renders nothing when the task has no PR', () => {
-    const { container } = render(
-      <MemoryRouter><GithubReviewEntry task={task({ prNumber: undefined })} /></MemoryRouter>,
-    );
-    expect(container.querySelector('section')).toBeNull();
+  it('marks the row with QA as orange text, not a pill', () => {
+    renderEntry(task({ reviewMode: 'github' }));
+    const qa = screen.getByText('QA');
+    expect(qa.className).toContain('text-[#c2410c]');
+    expect(qa.className).not.toContain('pill');
   });
 
   it('navigates to the review page on click', () => {

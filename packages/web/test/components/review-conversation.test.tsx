@@ -72,8 +72,28 @@ describe('ReviewConversation gating', () => {
       { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
-    expect(await screen.findByText('规格评审 (spec)')).toBeTruthy();
+    expect(await screen.findByText('规格评审')).toBeTruthy();
     expect(reviewsMock).toHaveBeenCalled();
+  });
+});
+
+describe('ReviewConversation github code-review group', () => {
+  it('renders the 代码评审 group (PR link) under 评审记录 without fetching rounds', () => {
+    renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 0 }));
+    expect(screen.getByText('评审记录')).toBeTruthy();
+    expect(screen.getByText('代码评审')).toBeTruthy();
+    expect(screen.getByText(/查看 PR 评审过程/)).toBeTruthy();
+    expect(reviewsMock).not.toHaveBeenCalled();
+  });
+
+  it('shows 规格评审 and 代码评审 together for a github SDD task with spec rounds + PR', async () => {
+    reviewsMock.mockResolvedValue([
+      { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 1 }));
+    expect(await screen.findByText('规格评审')).toBeTruthy();
+    expect(screen.getByText('代码评审')).toBeTruthy();
+    expect(screen.getByText(/查看 PR 评审过程/)).toBeTruthy();
   });
 });
 
@@ -94,14 +114,27 @@ describe('ReviewConversation server mode', () => {
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
     ] as ReviewRound[]);
     renderConv(makeTask());
-    expect(await screen.findByText('规格评审 (spec)')).toBeTruthy();
+    expect(await screen.findByText('规格评审')).toBeTruthy();
     expect(screen.getByText('评审记录')).toBeTruthy();
-    expect(screen.getByText('代码评审 (code)')).toBeTruthy();
+    expect(screen.getByText('代码评审')).toBeTruthy();
     expect(screen.getByText('提交规格稿')).toBeTruthy();
     expect(screen.getByText('提交代码改动')).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(screen.getByText('反馈')).toBeTruthy();
+  });
+
+  it('renders dev/QA role markers as colored text, not pills', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1 }));
+    const qa = await screen.findByText('QA');
+    expect(qa.className).toContain('text-[#c2410c]');
+    expect(qa.className).not.toContain('pill');
+    const dev = screen.getByText('dev');
+    expect(dev.className).toContain('text-accent');
+    expect(dev.className).not.toContain('pill');
   });
 
   it('navigates to the round detail (with hash) on click', async () => {

@@ -4,7 +4,6 @@ import { api } from '../api.ts';
 import { AgentCard } from '../components/agent-card.tsx';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
-import { GithubReviewEntry } from '../components/github-review-entry.tsx';
 import { useToast } from '../components/toast.tsx';
 import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath } from '../components/task-status.tsx';
 import { useAgents, useTask } from '../hooks/use-events.ts';
@@ -393,7 +392,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         </div>
 
         <ReviewConversation task={task} />
-        <GithubReviewEntry task={task} />
       </div>
     );
   }

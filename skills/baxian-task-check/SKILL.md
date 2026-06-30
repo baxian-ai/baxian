@@ -4,7 +4,7 @@ description: How a dev analyzes and executes a baxian-managed develop/code task 
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields followed by the task `title:` and its description. Work in the directory named by `worktree:` — cd there before any file operation. Route on `phase:`: `develop` → §Develop, `code` → §Code.
+baxian dispatches you with a block of `key: value` dispatch fields followed by the task `title:` and its description. Work in the directory named by `worktree:` — cd there before any file operation. Route on `phase:`: follow §Develop for `develop`, §Code for `code`.
 
 If an `images:` list is present, read each path (baxian downloaded the user's uploads to the agent host) and factor them into the task.
 
@@ -13,11 +13,6 @@ If an `images:` list is present, read each path (baxian downloaded the user's up
 1. Read `title:` and the description — the authoritative task source (no `.baxian/task.md` file).
 2. Identify acceptance criteria, explicit vs implied requirements, edge cases, file/function references, linked docs/specs.
 3. Plan the files to modify and the tests to write.
-
-When to ask vs proceed:
-- Clear → start.
-- Minor ambiguity → proceed, record the assumption (PR description, task note, or commit message).
-- Blocked → pick a reasonable interpretation and record it after the `<!-- baxian:managed -->` marker (marker MUST be line 1), or create a task if truly blocked.
 
 ## Conventions
 
@@ -29,16 +24,18 @@ A PR you open MUST be ready for review (not Draft): do NOT use `--draft`; if it 
 
 ## Develop
 
+Analyze the task's complexity before coding: a simple task goes Direct (just implement it); a complex one goes SDD (write a spec for QA review).
+
 Two mutually-exclusive routes — pick ONE and emit only its signal:
 
-- **SDD** (only when a `spec-signal:` field is present, i.e. a QA partner exists) — get your design reviewed first: follow §Specification-Driven Development, then emit `spec-signal:` (`spec-done`) with `token:`. Do NOT emit the default `signal:` on this route — that would skip spec review and push an unimplemented task forward. After QA approves the spec, baxian dispatches the code phase. Use SDD when the design is non-trivial; skip it when the change is small or unambiguous.
-- **Direct** — implement the change, then emit `signal:` with `token:`: `exchange: github-pr` → after `gh pr create` (ready for review), emit `pr-created`; `exchange: server-files` → after a local commit (do NOT push), emit `code-done`.
+- **Direct** — implement the change, then emit `signal:` with `token:`: for `exchange: github-pr`, after `gh pr create` (ready for review) emit `pr-created`; for `exchange: server-files`, after a local commit (do NOT push) emit `code-done`.
+- **SDD** — available only when the dispatch carries a `spec-signal:` field (a QA partner exists); without it, Direct is your only route. Follow §Specification-Driven Development to get your design reviewed first, then emit `spec-signal:` (`spec-done`) with `token:`. Do NOT emit the default `signal:` on this route — that would skip spec review and push an unimplemented task forward. After QA approves the spec, baxian dispatches the code phase.
 
 ## Code
 
 The spec is approved at `.baxian/spec.md`. Implement it, then emit your `signal:` with `token:`:
-- `exchange: github-pr` → commit + push, `gh pr create` (ready for review), emit `pr-created`.
-- `exchange: server-files` → local commit only (do NOT push, no PR), emit `code-done`.
+- `exchange: github-pr`: commit + push, `gh pr create` (ready for review), emit `pr-created`.
+- `exchange: server-files`: local commit only (do NOT push, no PR), emit `code-done`.
 
 ## Specification-Driven Development (SDD)
 

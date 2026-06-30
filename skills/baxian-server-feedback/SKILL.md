@@ -4,7 +4,7 @@ description: Dev responds to QA's server-review findings (response.json) and pub
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields. Work in `worktree:`. Route on `phase:`: `server-feedback` → §Feedback, `server-after-done` → §Publish.
+baxian dispatches you with a block of `key: value` dispatch fields. Work in `worktree:`. Route on `phase:`: follow §Feedback for `server-feedback`, §Publish for `server-after-done`.
 
 ## Feedback
 
@@ -13,7 +13,7 @@ QA's findings ride in the `findings:` block. Judge each finding independently �
 Do NOT push to any remote and do NOT open a PR in this phase — baxian reads your worktree directly; publishing is deferred to the `server-after-done` phase.
 
 For each finding:
-- `fix` — `feedback: code` → change the code (or spec), commit, include the `commitSha` in your response item. `feedback: spec` → revise `.baxian/spec.md` in place. Do NOT commit or push it — baxian reads the file directly.
+- `fix` — for `feedback: code`, change the code (or spec), commit, include the `commitSha` in your response item; for `feedback: spec`, revise `.baxian/spec.md` in place. Do NOT commit or push it — baxian reads the file directly.
 - `reject` — concrete rationale why the finding is wrong or not applicable. Never reject just to save effort.
 - `out-of-scope` — rationale plus where it is tracked (issue link or task note).
 

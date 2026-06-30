@@ -20,9 +20,9 @@ gh api --paginate repos/OWNER/REPO/issues/N/comments
 
 ## Decision Path
 
-- Head changed → review increment, verify all prior findings closed, new behavior has tests.
-- Head unchanged + dev replied → judge reply against code. No "fixed" without evidence.
-- Neither changed → report unchanged, keep prior findings.
+- Head changed: review increment, verify all prior findings closed, new behavior has tests.
+- Head unchanged + dev replied: judge reply against code. No "fixed" without evidence.
+- Neither changed: report unchanged, keep prior findings.
 - Post to PR with concrete evidence for unresolved issues.
 
 ## Verdict

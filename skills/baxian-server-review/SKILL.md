@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 baxian dispatches you with a block of `key: value` dispatch fields; the review input rides in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `prior-findings:` / `prior-response:` on a recheck. Do NOT fetch branches or use `gh` — those blocks ARE the review input. Work in `worktree:`. QA judges risk independently — human authorization is input, not a bypass. If a `content: truncated` field is present, request the missing context via the read-file side-channel.
 
-Route on `phase:`: `server-review` → §Code Review; `server-recheck` → §Code Review + §Recheck Closure; `server-spec-review` → §Spec Review.
+Route on `phase:`: follow §Code Review for `server-review`; §Code Review + §Recheck Closure for `server-recheck`; §Spec Review for `server-spec-review`.
 
 ## Code Review
 
@@ -21,8 +21,8 @@ Judge the `diff:` block against the task spec: correctness, tests, edge cases, s
 The `prior-findings:` and `prior-response:` blocks carry the earlier findings and the dev response. Close them out before judging anything new.
 
 - Resolve the status of EVERY prior finding first.
-- A finding the dev claims fixed → verify it in the new diff. No "fixed" without evidence.
-- A finding the dev rejected / called out-of-scope → judge the rationale on merit; re-raise it with concrete counter-evidence if it is wrong.
+- A finding the dev claims fixed: verify it in the new diff. No "fixed" without evidence.
+- A finding the dev rejected / called out-of-scope: judge the rationale on merit; re-raise it with concrete counter-evidence if it is wrong.
 - Any prior finding NOT closed reappears in `findings.json` with its ORIGINAL id and the evidence restated — do not renumber or drop it.
 - Verdict `approve` ONLY when every prior finding is closed AND the new diff is clean. An unresolved finding may not be downgraded to a minor suggestion to justify approve — otherwise `request-changes`.
 - After closure, scan the new diff for regressions AND for behavior the fixes introduced that lacks test coverage.

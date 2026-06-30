@@ -4,7 +4,7 @@ description: Dev processes PR review feedback (fix phase) and the pre-merge feed
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields. Work in `worktree:`; the PR is in `pr:`. Communicate via the GitHub PR; stay in scope (out-of-scope → new Issue). Route on `phase:`: `fix` → §Fix, `post-approve` → §Post-Approve.
+baxian dispatches you with a block of `key: value` dispatch fields. Work in `worktree:`; the PR is in `pr:`. Communicate via the GitHub PR; stay in scope (out-of-scope work goes to a new Issue). Route on `phase:`: follow §Fix for `fix`, §Post-Approve for `post-approve`.
 
 ## Fetch Feedback
 
@@ -22,10 +22,10 @@ gh pr view N --json title,body,headRefName,headRefOid,baseRefName,reviewDecision
 Judge each finding independently. No batch-dismissing.
 
 For each actionable item:
-1. In scope → fix. Reply `Fixed` (own line) + commit SHA.
-2. Not appropriate → reply `Won't fix` (own line) + concrete reason.
-3. Out of scope → create Issue, reply with link.
-4. Already fixed → verify in code, reply `Fixed` + SHA.
+1. In scope: fix. Reply `Fixed` (own line) + commit SHA.
+2. Not appropriate: reply `Won't fix` (own line) + concrete reason.
+3. Out of scope: create Issue, reply with link.
+4. Already fixed: verify in code, reply `Fixed` + SHA.
 
 Reply to every item, including duplicates (reference primary). Thread inline comments.
 
