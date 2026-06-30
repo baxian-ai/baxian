@@ -24,11 +24,11 @@ vi.mock('../../src/api.ts', () => ({
   },
 }));
 
-const openTaskMock = vi.fn();
-vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/components/task-detail-modal.tsx')>();
-  return { ...actual, useTaskDetail: () => ({ openTask: openTaskMock }) };
-});
+const navigateMock = vi.fn();
+vi.mock('react-router-dom', async (orig) => ({
+  ...(await orig<typeof import('react-router-dom')>()),
+  useNavigate: () => navigateMock,
+}));
 
 vi.mock('../../src/components/pane-terminal.tsx', () => ({
   TERMINAL_BG: '#fdfdfd',
@@ -47,7 +47,7 @@ import { AgentGroup } from '../../src/components/agent-group.tsx';
 
 beforeEach(() => {
   tasksDispatchMock.mockReset();
-  openTaskMock.mockReset();
+  navigateMock.mockReset();
 });
 
 const GROUP: AgentConfig[] = [
@@ -154,7 +154,7 @@ describe('AgentGroup', () => {
     expect(within(region).getAllByText('dev-1').length).toBeGreaterThanOrEqual(1);
     expect(within(region).getAllByText('qa-1').length).toBeGreaterThanOrEqual(1);
     fireEvent.click(taskButton);
-    expect(openTaskMock).toHaveBeenCalledWith('task-001');
+    expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-001');
   });
 
   it('passes configured runtime labels to the paired agent card names', () => {

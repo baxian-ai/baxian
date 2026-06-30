@@ -4,19 +4,19 @@ import { MemoryRouter } from 'react-router-dom';
 import type { TaskState } from '../../src/shared/index.js';
 import { REVIEW_VERDICT_TIMEOUT_MS } from '../../src/shared/index.js';
 
-const { pageMock, openTaskMock } = vi.hoisted(() => ({
+const { pageMock, navigateMock } = vi.hoisted(() => ({
   pageMock: vi.fn(),
-  openTaskMock: vi.fn(),
+  navigateMock: vi.fn(),
 }));
 vi.mock('../../src/api.ts', () => ({
   UNAUTHORIZED_EVENT: 'baxian:unauthorized',
   api: { tasks: { page: pageMock } },
 }));
 
-vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/components/task-detail-modal.tsx')>();
-  return { ...actual, useTaskDetail: () => ({ openTask: openTaskMock }) };
-});
+vi.mock('react-router-dom', async (orig) => ({
+  ...(await orig<typeof import('react-router-dom')>()),
+  useNavigate: () => navigateMock,
+}));
 
 import { TaskPanel } from '../../src/components/task-panel.tsx';
 
@@ -72,7 +72,7 @@ beforeEach(() => {
   cleanup();
   pageMock.mockReset();
   pageMock.mockResolvedValue(emptyPage());
-  openTaskMock.mockReset();
+  navigateMock.mockReset();
 });
 
 describe('TaskPanel', () => {
@@ -305,11 +305,11 @@ describe('TaskPanel', () => {
     expect(panel.querySelector('.overflow-y-auto')).toBeNull();
   });
 
-  it('clicking a task row opens its detail modal instead of navigating', () => {
+  it('clicking a task row navigates to its detail page', () => {
     renderPanel([task({ id: 'task-042', status: 'in_progress', title: 'pick me' })]);
     const active = screen.getByRole('region', { name: 'IN PROGRESS' });
     fireEvent.click(within(active).getByRole('button', { name: /pick me/ }));
-    expect(openTaskMock).toHaveBeenCalledWith('task-042');
+    expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-042');
   });
 
   it('shortens the task id to its number and keeps the full id as hover text', () => {

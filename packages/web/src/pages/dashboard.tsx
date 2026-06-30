@@ -1,12 +1,12 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { AgentGroup } from '../components/agent-group.tsx';
 import { CreateProjectModal } from '../components/create-project-modal.tsx';
 import { CreateAgentModal } from '../components/create-agent-modal.tsx';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { HostManagementModal } from '../components/host-management-modal.tsx';
 import { Modal } from '../components/modal.tsx';
-import { useTaskDetail } from '../components/task-detail-modal.tsx';
+import { taskDetailPath } from '../components/task-status.tsx';
 import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
@@ -18,7 +18,7 @@ type ContinueState =
   | { kind: 'addingAgent'; projectId: string };
 
 export function Dashboard() {
-  const { openTask } = useTaskDetail();
+  const navigate = useNavigate();
   const { projects: projectsData, error: projectsError, refresh: refreshProjects } = useProjects();
   const projects = projectsData ?? [];
   const projectsLoaded = projectsData !== null;
@@ -214,7 +214,7 @@ export function Dashboard() {
       <CreateTaskModal
         open={createTaskOpen}
         onClose={() => setCreateTaskOpen(false)}
-        onCreated={(task) => openTask(task.id)}
+        onCreated={(task) => navigate(taskDetailPath(task.projectId, task.id))}
       />
     </div>
   );

@@ -16,7 +16,7 @@ const VERDICT_LABEL: Record<GithubReviewVerdict, string> = {
 };
 
 const REASON_TEXT: Record<NonNullable<ReturnType<typeof reasonOf>>, string> = {
-  'server-mode': '该 task 为 server 评审模式，代码评审记录见任务详情的「Dev ↔ QA 评审记录」。',
+  'server-mode': '该 task 为 server 评审模式，代码评审记录见任务详情的「评审记录」。',
   'no-pr': '该 task 还没有 PR，暂无代码评审记录。',
   'not-github': '该 task 的仓库不是 GitHub 仓库，无法拉取 PR 评审记录。',
 };

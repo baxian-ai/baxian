@@ -11,6 +11,9 @@ vi.mock('../src/pages/dashboard.tsx', () => ({
 vi.mock('../src/pages/project.tsx', () => ({
   Project: () => <div data-testid="page-project" />,
 }));
+vi.mock('../src/pages/task-detail.tsx', () => ({
+  TaskDetail: () => <div data-testid="page-task-detail" />,
+}));
 vi.mock('../src/pages/terminal.tsx', () => ({
   Terminal: () => <div data-testid="page-terminal" />,
 }));
@@ -66,6 +69,13 @@ describe('App shell layout', () => {
   it('still routes "/" to the Dashboard page even though its nav link was removed', () => {
     render(<App />);
     expect(screen.getByTestId('page-dashboard')).toBeTruthy();
+  });
+
+  it('routes /project/:id/task/:taskId to the TaskDetail page', () => {
+    window.history.pushState({}, '', '/project/baxian/task/task-172');
+    render(<App />);
+    expect(screen.getByTestId('page-task-detail')).toBeTruthy();
+    expect(screen.queryByTestId('page-project')).toBeNull();
   });
 
   it('uses dynamic viewport sizing and aligned nav/main padding', () => {

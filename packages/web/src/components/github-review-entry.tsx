@@ -3,15 +3,13 @@ import type { TaskState } from '../shared/index.js';
 
 interface Props {
   task: TaskState;
-  onClose: () => void;
 }
 
-export function GithubReviewEntry({ task, onClose }: Props) {
+export function GithubReviewEntry({ task }: Props) {
   const navigate = useNavigate();
   if (task.reviewMode === 'server' || task.prNumber === undefined) return null;
 
   function open() {
-    onClose();
     navigate(`/tasks/${encodeURIComponent(task.id)}/github-review`);
   }
 

@@ -11,7 +11,6 @@ import { useReviewRounds } from '../hooks/use-review-rounds.ts';
 
 interface Props {
   task: TaskState;
-  onClose: () => void;
 }
 
 const PHASE_LABEL: Record<TaskPhase, string> = {
@@ -67,28 +66,27 @@ function responseSummary(response: ReviewResponse): string {
   return parts.join(' · ') || `${response.responses.length} 条反馈`;
 }
 
-export function ReviewConversation({ task, onClose }: Props) {
+export function ReviewConversation({ task }: Props) {
   const hasReviewRecords = task.reviewMode === 'server' || (task.specReviewRound ?? 0) > 0;
   if (!hasReviewRecords) return null;
-  return <ReviewConversationBody task={task} onClose={onClose} />;
+  return <ReviewConversationBody task={task} />;
 }
 
-function ReviewConversationBody({ task, onClose }: Props) {
+function ReviewConversationBody({ task }: Props) {
   const navigate = useNavigate();
   const revision = `${task.specReviewRound ?? 0}:${task.reviewRound}:${task.status}:${task.phase ?? 'code'}`;
   const { rounds, loaded, error } = useReviewRounds(task.id, revision);
 
   function openRound(phase: TaskPhase, round: number, hash: string) {
-    onClose();
     navigate(`/tasks/${encodeURIComponent(task.id)}/rounds/${phase}/${round}${hash}`);
   }
 
   const hasRounds = (rounds?.length ?? 0) > 0;
 
   return (
-    <section className="mt-4" aria-label="Dev ↔ QA 评审记录">
+    <section className="mt-4" aria-label="评审记录">
       <div className="mb-2 text-[11px] font-normal uppercase tracking-[0.05em] text-og-500">
-        Dev ↔ QA 评审记录
+        评审记录
       </div>
       {error && <div className="text-[13px] text-danger">加载评审记录失败：{error}</div>}
       {!loaded && !error && <div className="text-[13px] text-og-400">加载评审记录…</div>}

@@ -32,14 +32,13 @@ function codeRound(round: number, extra: Partial<ReviewRound> = {}): ReviewRound
   };
 }
 
-function renderConv(task: TaskState, onClose = vi.fn()) {
+function renderConv(task: TaskState) {
   render(
     <MemoryRouter initialEntries={['/start']}>
-      <ReviewConversation task={task} onClose={onClose} />
+      <ReviewConversation task={task} />
       <LocationProbe />
     </MemoryRouter>,
   );
-  return onClose;
 }
 
 beforeEach(() => { reviewsMock.mockReset(); });
@@ -50,10 +49,10 @@ describe('ReviewConversation gating', () => {
     reviewsMock.mockResolvedValue([]);
     render(
       <MemoryRouter>
-        <ReviewConversation task={makeTask({ reviewMode: 'github' })} onClose={vi.fn()} />
+        <ReviewConversation task={makeTask({ reviewMode: 'github' })} />
       </MemoryRouter>,
     );
-    expect(screen.queryByText('Dev ↔ QA 评审记录')).toBeNull();
+    expect(screen.queryByText('评审记录')).toBeNull();
     expect(reviewsMock).not.toHaveBeenCalled();
   });
 
@@ -61,10 +60,10 @@ describe('ReviewConversation gating', () => {
     reviewsMock.mockResolvedValue([]);
     render(
       <MemoryRouter>
-        <ReviewConversation task={makeTask({ reviewMode: undefined })} onClose={vi.fn()} />
+        <ReviewConversation task={makeTask({ reviewMode: undefined })} />
       </MemoryRouter>,
     );
-    expect(screen.queryByText('Dev ↔ QA 评审记录')).toBeNull();
+    expect(screen.queryByText('评审记录')).toBeNull();
     expect(reviewsMock).not.toHaveBeenCalled();
   });
 
@@ -96,6 +95,7 @@ describe('ReviewConversation server mode', () => {
     ] as ReviewRound[]);
     renderConv(makeTask());
     expect(await screen.findByText('规格评审 (spec)')).toBeTruthy();
+    expect(screen.getByText('评审记录')).toBeTruthy();
     expect(screen.getByText('代码评审 (code)')).toBeTruthy();
     expect(screen.getByText('提交规格稿')).toBeTruthy();
     expect(screen.getByText('提交代码改动')).toBeTruthy();
@@ -104,22 +104,20 @@ describe('ReviewConversation server mode', () => {
     expect(screen.getByText('反馈')).toBeTruthy();
   });
 
-  it('closes the modal and navigates to the round detail (with hash) on click', async () => {
+  it('navigates to the round detail (with hash) on click', async () => {
     reviewsMock.mockResolvedValue([
       codeRound(2, { findings: { round: 2, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'critical', message: 'x', file: 'a.ts', line: 3 }] } }),
     ] as ReviewRound[]);
-    const onClose = renderConv(makeTask({ reviewRound: 2 }));
+    renderConv(makeTask({ reviewRound: 2 }));
     const qaRow = await screen.findByText('评审');
     fireEvent.click(qaRow.closest('button')!);
-    expect(onClose).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/2#review');
   });
 
   it('refetches and grows as reviewRound advances', async () => {
     reviewsMock.mockResolvedValueOnce([codeRound(1, { findings: { round: 1, verdict: 'request-changes', findings: [] } })] as ReviewRound[]);
-    const onClose = vi.fn();
     const { rerender } = render(
-      <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 1 })} onClose={onClose} /></MemoryRouter>,
+      <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 1 })} /></MemoryRouter>,
     );
     await screen.findByText('第 1 轮');
     expect(reviewsMock).toHaveBeenCalledTimes(1);
@@ -129,7 +127,7 @@ describe('ReviewConversation server mode', () => {
       codeRound(2, { findings: { round: 2, verdict: 'approve', findings: [] } }),
     ] as ReviewRound[]);
     rerender(
-      <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 2 })} onClose={onClose} /></MemoryRouter>,
+      <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 2 })} /></MemoryRouter>,
     );
     await waitFor(() => expect(reviewsMock).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('第 2 轮')).toBeTruthy();

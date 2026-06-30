@@ -63,12 +63,6 @@ vi.mock('../../src/components/create-agent-modal.tsx', () => ({
   CreateAgentModal: ({ open }: { open: boolean }) => (open ? <div data-testid="create-agent-modal" /> : null),
 }));
 
-const openTaskMock = vi.fn();
-vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/components/task-detail-modal.tsx')>();
-  return { ...actual, useTaskDetail: () => ({ openTask: openTaskMock }) };
-});
-
 import { Project } from '../../src/pages/project.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
@@ -118,7 +112,6 @@ beforeEach(() => {
   agentsHookState.error = null;
   projectTasksState.data = [];
   projectTasksState.error = null;
-  openTaskMock.mockClear();
 });
 
 describe('Project page header', () => {

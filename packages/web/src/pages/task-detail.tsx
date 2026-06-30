@@ -1,22 +1,27 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.ts';
-import { Modal } from './modal.tsx';
-import { CreateTaskModal } from './create-task-modal.tsx';
-import { ReviewConversation } from './review-conversation.tsx';
-import { GithubReviewEntry } from './github-review-entry.tsx';
-import { useToast } from './toast.tsx';
-import { useTask } from '../hooks/use-events.ts';
+import { AgentCard } from '../components/agent-card.tsx';
+import { CreateTaskModal } from '../components/create-task-modal.tsx';
+import { ReviewConversation } from '../components/review-conversation.tsx';
+import { GithubReviewEntry } from '../components/github-review-entry.tsx';
+import { useToast } from '../components/toast.tsx';
+import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath } from '../components/task-status.tsx';
+import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import {
   agentRuntimeLabel,
   agentRuntimeTitle,
   REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
+  type AgentConfig,
   type AgentRuntime,
+  type AgentSnapshot,
   type ReviewRound,
   type TaskState,
-  type TaskStatus,
 } from '../shared/index.js';
+
+const RETRYABLE_STATUSES = TASK_TERMINAL_STATUS_SET;
 
 function useVerdictOverdue(task: TaskState | null): boolean {
   const [overdue, setOverdue] = useState(false);
@@ -36,81 +41,6 @@ function useVerdictOverdue(task: TaskState | null): boolean {
   return overdue;
 }
 
-interface TaskDetailContextValue {
-  openTask: (taskId: string) => void;
-}
-
-const TaskDetailContext = createContext<TaskDetailContextValue | null>(null);
-
-export function TaskDetailProvider({ children }: { children: ReactNode }) {
-  const [taskId, setTaskId] = useState<string | null>(null);
-  const openTask = useCallback((id: string) => setTaskId(id), []);
-  const close = useCallback(() => setTaskId(null), []);
-  return (
-    <TaskDetailContext.Provider value={{ openTask }}>
-      {children}
-      {taskId !== null && (
-        <TaskDetailModal key={taskId} taskId={taskId} onClose={close} onOpenTask={setTaskId} />
-      )}
-    </TaskDetailContext.Provider>
-  );
-}
-
-export function useTaskDetail(): TaskDetailContextValue {
-  const ctx = useContext(TaskDetailContext);
-  if (!ctx) throw new Error('useTaskDetail must be inside <TaskDetailProvider>');
-  return ctx;
-}
-
-const RETRYABLE_STATUSES = TASK_TERMINAL_STATUS_SET;
-
-export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {
-  pending: 'pill',
-  in_progress: 'pill pill-live',
-  review: 'pill pill-review',
-  fixing: 'pill pill-warn',
-  approved: 'pill pill-live',
-  'merge-ready': 'pill pill-live',
-  ready: 'pill pill-live',
-  merged: 'pill pill-live',
-  done: 'pill pill-live',
-  failed: 'pill pill-warn',
-  max_rounds: 'pill pill-warn',
-  cancelled: 'pill',
-};
-
-const STATUS_DOT_COLORS: Record<TaskStatus, string> = {
-  pending: 'bg-og-300',
-  in_progress: 'bg-success',
-  review: 'bg-accent',
-  fixing: 'bg-warn',
-  approved: 'bg-success',
-  'merge-ready': 'bg-success',
-  ready: 'bg-success',
-  merged: 'bg-success',
-  done: 'bg-success',
-  failed: 'bg-warn',
-  max_rounds: 'bg-warn',
-  cancelled: 'bg-og-300',
-};
-
-export function TaskStatusDot({ status }: { status: TaskStatus }) {
-  return (
-    <span
-      role="img"
-      aria-label={status}
-      title={status}
-      className={`inline-block h-2 w-2 shrink-0 rounded-full ${STATUS_DOT_COLORS[status] ?? 'bg-og-300'}`}
-    />
-  );
-}
-
-export function shortTaskId(id: string): string {
-  if (!id) return '';
-  const match = id.match(/^task-(\d+)$/);
-  return match ? match[1] : id;
-}
-
 function AgentName({ id, runtime }: { id: string; runtime?: AgentRuntime }) {
   const label = agentRuntimeLabel(runtime);
   if (!id) return <span className="font-mono text-og-800">—</span>;
@@ -122,25 +52,15 @@ function AgentName({ id, runtime }: { id: string; runtime?: AgentRuntime }) {
   );
 }
 
-function formatTaskTimestamp(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  const normalized = String(value).trim();
-  if (!normalized) return '';
-  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::(\d{2}))?/);
-  if (match) return `${match[1]} ${match[2]}:${match[3] ?? '00'}`;
-
-  const date = new Date(normalized);
-  if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 19).replace('T', ' ');
-  return normalized;
+export function TaskDetail() {
+  const { taskId = '' } = useParams<{ id: string; taskId: string }>();
+  // key on taskId so switching tasks on this shared route remounts with fresh
+  // per-task state (override/edit/busy) instead of leaking the previous task's.
+  return <TaskDetailView key={taskId} taskId={taskId} />;
 }
 
-interface TaskDetailModalProps {
-  taskId: string;
-  onClose: () => void;
-  onOpenTask: (taskId: string) => void;
-}
-
-function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) {
+function TaskDetailView({ taskId }: { taskId: string }) {
+  const navigate = useNavigate();
   const { show } = useToast();
   const [editOpen, setEditOpen] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -151,6 +71,7 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
+  const { data: agents, loaded: agentsLoaded, error: agentsErrorPayload } = useAgents();
   const task = override ?? streamed;
   const verdictOverdue = useVerdictOverdue(task);
   const error = errorPayload?.message ?? null;
@@ -163,6 +84,10 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
     }
     return next;
   }, [projects]);
+  const agentsById = useMemo(
+    () => new Map((agents ?? []).map((agent) => [agent.id, agent])),
+    [agents],
+  );
 
   useEffect(() => {
     if (override && streamed && streamed.updatedAt >= override.updatedAt) {
@@ -218,7 +143,7 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
     try {
       const fresh = await api.tasks.retry(task.id);
       show({ kind: 'success', title: `已新建 task ${fresh.id}` });
-      onOpenTask(fresh.id);
+      navigate(taskDetailPath(fresh.projectId, fresh.id));
     } catch (err) {
       show({ kind: 'error', title: 'Retry 失败', body: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -271,43 +196,46 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
     }
   };
 
-  if (editOpen && task) {
-    return (
-      <CreateTaskModal
-        mode="edit"
-        open
-        onClose={() => setEditOpen(false)}
-        task={task}
-        onUpdated={commitTaskExternal}
-      />
-    );
-  }
-
-  const modalTitle = task ? `${task.id} ${task.title}` : taskId;
-
   return (
-    <Modal
-      open
-      onClose={onClose}
-      title={modalTitle}
-      titleContent={task ? (
-        <span className="inline-flex min-w-0 max-w-full items-baseline gap-2">
-          <span className="shrink-0 font-mono text-og-400">{task.id}</span>
-          <span className="min-w-0 truncate text-og-1000">{task.title}</span>
-        </span>
-      ) : undefined}
-      size="lg"
-      footer={task ? actions(task) : undefined}
-    >
-      {body()}
-    </Modal>
+    <div>
+      <button type="button" onClick={() => navigate(-1)} className="btn-ghost mb-3">
+        ← 返回
+      </button>
+      {error && !task && <div className="text-[13px] text-danger">Error: {error}</div>}
+      {loaded && !task && !error && <div className="text-[13px] text-danger">Task not found: {taskId}</div>}
+      {!task && !error && !loaded && <div className="text-[13px] text-og-500">Loading…</div>}
+      {task && (
+        <>
+          <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <h1 className="flex min-w-0 items-baseline gap-2">
+              <span className="shrink-0 font-mono text-[15px] text-og-400">{task.id}</span>
+              <span className="min-w-0 truncate font-display text-[17px] font-semibold tracking-tight text-og-1000" title={task.title}>
+                {task.title}
+              </span>
+            </h1>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">{renderActions(task)}</div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3 lg:items-start">
+            <section className="min-w-0 lg:col-span-2">{renderInfo(task)}</section>
+            <aside className="min-w-0 space-y-4 lg:col-span-1">{renderAgents(task)}</aside>
+          </div>
+        </>
+      )}
+
+      {editOpen && task && (
+        <CreateTaskModal
+          mode="edit"
+          open
+          onClose={() => setEditOpen(false)}
+          task={task}
+          onUpdated={commitTaskExternal}
+        />
+      )}
+    </div>
   );
 
-  function body() {
-    if (error && !task) return <div className="text-[13px] text-danger">Error: {error}</div>;
-    if (loaded && !task) return <div className="text-[13px] text-danger">Task not found: {taskId}</div>;
-    if (!task) return <div className="text-[13px] text-og-500">Loading…</div>;
-
+  function renderInfo(task: TaskState) {
     const isLegacy = task.preferredAgentId === '';
     const showApprovedAction = task.status === 'approved' && task.prNumber !== undefined;
     const showMergeReadyAction = task.status === 'merge-ready' && task.prNumber !== undefined;
@@ -464,13 +392,60 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
           </div>
         </div>
 
-        <ReviewConversation task={task} onClose={onClose} />
-        <GithubReviewEntry task={task} onClose={onClose} />
+        <ReviewConversation task={task} />
+        <GithubReviewEntry task={task} />
       </div>
     );
   }
 
-  function actions(task: TaskState) {
+  function renderAgents(task: TaskState) {
+    if (projects === null) {
+      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-[13px] text-og-400">加载中…</div>;
+    }
+    const project = projects.find((p) => p.id === task.projectId);
+    const devId = task.agentId || task.preferredAgentId;
+    const group = project?.agent.find((g) => g.some((a) => a.id === devId))
+      ?? (task.qaAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.qaAgentId)) : undefined);
+    const devConfig = group?.find((a) => a.role === 'dev');
+    const qaConfig = group?.find((a) => a.role === 'qa');
+
+    if (!devConfig && !qaConfig) {
+      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-[13px] text-og-400">暂无关联 Agent</div>;
+    }
+
+    return (
+      <>
+        {devConfig ? renderAgentCard(task, devConfig) : <AgentSlotPlaceholder role="dev" />}
+        {qaConfig ? renderAgentCard(task, qaConfig) : <AgentSlotPlaceholder role="qa" />}
+      </>
+    );
+  }
+
+  function renderAgentCard(task: TaskState, cfg: AgentConfig) {
+    const snapshot = agentsById.get(cfg.id);
+    const state: AgentSnapshot = snapshot ?? {
+      id: cfg.id,
+      projectId: task.projectId,
+      runtimeStatus: 'unknown',
+      tmuxSessionStatus: 'unknown',
+      stale: true,
+    };
+    return (
+      <AgentCard
+        key={cfg.id}
+        agent={state}
+        projectId={task.projectId}
+        role={cfg.role}
+        runtime={cfg.runtime}
+        pendingRestart={agentsLoaded && !snapshot}
+        terminalLoading={!agentsLoaded && !snapshot && !agentsErrorPayload}
+        showTaskBinding={false}
+        terminalMode="embedded-full"
+      />
+    );
+  }
+
+  function renderActions(task: TaskState) {
     const isMaxRounds = task.status === 'max_rounds';
     const isCodeMaxRounds = isMaxRounds && task.phase !== 'spec';
     const isSpecMaxRounds = isMaxRounds && task.phase === 'spec';
@@ -580,6 +555,14 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
       </>
     );
   }
+}
+
+function AgentSlotPlaceholder({ role }: { role: 'dev' | 'qa' }) {
+  return (
+    <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-[13px] text-og-400">
+      暂无 {role === 'dev' ? 'Dev' : 'QA'} Agent
+    </div>
+  );
 }
 
 function ReviewSummary({ taskId }: { taskId: string }) {

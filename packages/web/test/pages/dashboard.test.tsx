@@ -59,11 +59,6 @@ vi.mock('../../src/hooks/use-events.ts', () => ({
   useTask: () => ({ data: null, loaded: true, error: null }),
 }));
 
-vi.mock('../../src/components/task-detail-modal.tsx', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/components/task-detail-modal.tsx')>();
-  return { ...actual, useTaskDetail: () => ({ openTask: vi.fn() }) };
-});
-
 import { Dashboard } from '../../src/pages/dashboard.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 

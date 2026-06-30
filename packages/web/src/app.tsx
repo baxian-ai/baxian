@@ -1,12 +1,12 @@
 import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { Dashboard } from './pages/dashboard.tsx';
 import { Project } from './pages/project.tsx';
+import { TaskDetail } from './pages/task-detail.tsx';
 import { Terminal } from './pages/terminal.tsx';
 import { ReviewRoundPage } from './pages/review-round.tsx';
 import { GithubReviewPage } from './pages/github-review.tsx';
 import { BrandToggle } from './components/brand-toggle.tsx';
 import { PendingRestartBanner } from './components/pending-restart-banner.tsx';
-import { TaskDetailProvider } from './components/task-detail-modal.tsx';
 import { TOPBAR_ACTIONS_ID } from './components/topbar-actions.tsx';
 
 function AppShell() {
@@ -33,6 +33,7 @@ function AppShell() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/project/:id" element={<Project />} />
+          <Route path="/project/:id/task/:taskId" element={<TaskDetail />} />
           <Route path="/terminal/:agentId" element={<Terminal />} />
           <Route path="/tasks/:taskId/rounds/:phase/:round" element={<ReviewRoundPage />} />
           <Route path="/tasks/:taskId/github-review" element={<GithubReviewPage />} />
@@ -50,9 +51,7 @@ function AppShell() {
 export function App() {
   return (
     <BrowserRouter>
-      <TaskDetailProvider>
-        <AppShell />
-      </TaskDetailProvider>
+      <AppShell />
     </BrowserRouter>
   );
 }

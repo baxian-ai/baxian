@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
-import { TaskStatusDot, shortTaskId, useTaskDetail } from './task-detail-modal.tsx';
+import { TaskStatusDot, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { TASK_ACTIVE_STATUS_SET, REVIEW_VERDICT_TIMEOUT_MS, TASK_LIST_PAGE_SIZE, type TaskState } from '../shared/index.js';
 
 interface TaskPanelProps {
@@ -224,13 +225,13 @@ function useVerdictOverdue(task: TaskState): boolean {
 }
 
 function TaskRow({ task }: { task: TaskState }) {
-  const { openTask } = useTaskDetail();
+  const navigate = useNavigate();
   const round = task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
   const overdue = useVerdictOverdue(task);
   return (
     <button
       type="button"
-      onClick={() => openTask(task.id)}
+      onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
       className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] transition-colors hover:bg-og-50/60"
     >
       <span className="shrink-0 font-mono text-[11px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>

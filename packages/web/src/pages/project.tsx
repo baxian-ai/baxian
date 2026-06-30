@@ -6,7 +6,7 @@ import { TaskPanel } from '../components/task-panel.tsx';
 import { CreateAgentModal } from '../components/create-agent-modal.tsx';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { Modal } from '../components/modal.tsx';
-import { useTaskDetail } from '../components/task-detail-modal.tsx';
+import { taskDetailPath } from '../components/task-status.tsx';
 import { useToast } from '../components/toast.tsx';
 import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
@@ -29,7 +29,6 @@ export function Project() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { show } = useToast();
-  const { openTask } = useTaskDetail();
   const { refresh: refreshProjectsList } = useProjects();
   const [project, setProject] = useState<ProjectConfig | null>(null);
   const [projectError, setProjectError] = useState<string | null>(null);
@@ -276,7 +275,7 @@ export function Project() {
         open={createTaskOpen}
         projectId={project.id}
         onClose={() => setCreateTaskOpen(false)}
-        onCreated={(task) => openTask(task.id)}
+        onCreated={(task) => navigate(taskDetailPath(task.projectId, task.id))}
       />
 
       <Modal

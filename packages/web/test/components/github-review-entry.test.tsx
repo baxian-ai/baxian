@@ -15,13 +15,12 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
   return { id: 'task-9', reviewRound: 0, status: 'review', prNumber: 7, ...overrides } as TaskState;
 }
 
-function renderEntry(t: TaskState, onClose = vi.fn()) {
+function renderEntry(t: TaskState) {
   render(
     <MemoryRouter>
-      <GithubReviewEntry task={t} onClose={onClose} />
+      <GithubReviewEntry task={t} />
     </MemoryRouter>,
   );
-  return onClose;
 }
 
 beforeEach(() => navigateMock.mockReset());
@@ -35,22 +34,21 @@ describe('GithubReviewEntry', () => {
 
   it('renders nothing for a server-mode task', () => {
     const { container } = render(
-      <MemoryRouter><GithubReviewEntry task={task({ reviewMode: 'server' })} onClose={vi.fn()} /></MemoryRouter>,
+      <MemoryRouter><GithubReviewEntry task={task({ reviewMode: 'server' })} /></MemoryRouter>,
     );
     expect(container.querySelector('section')).toBeNull();
   });
 
   it('renders nothing when the task has no PR', () => {
     const { container } = render(
-      <MemoryRouter><GithubReviewEntry task={task({ prNumber: undefined })} onClose={vi.fn()} /></MemoryRouter>,
+      <MemoryRouter><GithubReviewEntry task={task({ prNumber: undefined })} /></MemoryRouter>,
     );
     expect(container.querySelector('section')).toBeNull();
   });
 
-  it('closes the modal and navigates to the review page on click', () => {
-    const onClose = renderEntry(task({ id: 'task-42', reviewMode: 'github' }));
+  it('navigates to the review page on click', () => {
+    renderEntry(task({ id: 'task-42', reviewMode: 'github' }));
     fireEvent.click(screen.getByRole('button'));
-    expect(onClose).toHaveBeenCalledOnce();
     expect(navigateMock).toHaveBeenCalledWith('/tasks/task-42/github-review');
   });
 });

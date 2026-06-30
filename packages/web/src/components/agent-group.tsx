@@ -1,10 +1,11 @@
 import type { AgentConfig, AgentSnapshot, TaskState } from '../shared/index.js';
 import { TASK_ACTIVE_STATUS_SET } from '../shared/index.js';
 import { useEffect, useId, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AgentCard, type TerminalMode } from './agent-card.tsx';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
-import { STATUS_BADGE_COLORS, shortTaskId, useTaskDetail } from './task-detail-modal.tsx';
+import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath } from './task-status.tsx';
 
 interface AgentGroupProps {
   group: AgentConfig[];
@@ -49,7 +50,7 @@ export function AgentGroup({
     && !devSnapshot.binding?.taskId;
 
   const label = `Agent group ${group.map(agent => agent.id).join(' / ')}`;
-  const { openTask } = useTaskDetail();
+  const navigate = useNavigate();
 
   const selectableTerminals = terminalMode === 'embedded-full';
   const groupId = useId();
@@ -119,7 +120,7 @@ export function AgentGroup({
               <button
                 key={task.id}
                 type="button"
-                onClick={() => openTask(task.id)}
+                onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
                 className="flex w-full items-center gap-3 px-3 py-2 text-left text-[13px] transition-colors hover:bg-og-50/60"
               >
                 <div className="min-w-0 flex-1 flex items-center gap-2">
@@ -185,7 +186,7 @@ interface ClaimableListProps {
 
 function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProps) {
   const { show } = useToast();
-  const { openTask } = useTaskDetail();
+  const navigate = useNavigate();
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
 
   const handleDispatch = async (taskId: string) => {
@@ -220,7 +221,7 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
           >
             <button
               type="button"
-              onClick={() => openTask(task.id)}
+              onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
               className="min-w-0 flex-1 flex items-center gap-2 text-left transition-colors hover:text-accent-hover"
             >
               <span className="shrink-0 font-mono text-[11px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
