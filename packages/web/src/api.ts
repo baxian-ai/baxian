@@ -9,6 +9,7 @@ import type {
   MergeStrategy,
   ProjectReviewConfig,
   ReviewRound,
+  GithubReviewConversation,
   PetMeta,
 } from './shared/index.js';
 
@@ -266,6 +267,8 @@ export const api = {
     complete: (id: string) => post<TaskState>(`/tasks/${enc(id)}/complete`),
     continue: (id: string) => post<TaskState>(`/tasks/${enc(id)}/continue`),
     reviews: (id: string) => get<ReviewRound[]>(`/tasks/${enc(id)}/reviews`),
+    githubReview: (id: string) =>
+      get<GithubReviewConversation>(`/tasks/${enc(id)}/github-review`),
     dispatch: (id: string, body: { agentId: string }) =>
       post<TaskState>(`/tasks/${enc(id)}/dispatch`, body),
   },

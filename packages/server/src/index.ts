@@ -310,6 +310,7 @@ export async function startServer(configPath?: string): Promise<void> {
         configPath: cfgPath,
         stateDir,
         poller,
+        githubRunner: createRunner('local'),
         paneStreamerManager,
         eventBroker,
         errorRecordStore,

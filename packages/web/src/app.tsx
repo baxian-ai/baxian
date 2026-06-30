@@ -3,6 +3,7 @@ import { Dashboard } from './pages/dashboard.tsx';
 import { Project } from './pages/project.tsx';
 import { Terminal } from './pages/terminal.tsx';
 import { ReviewRoundPage } from './pages/review-round.tsx';
+import { GithubReviewPage } from './pages/github-review.tsx';
 import { BrandToggle } from './components/brand-toggle.tsx';
 import { PendingRestartBanner } from './components/pending-restart-banner.tsx';
 import { TaskDetailProvider } from './components/task-detail-modal.tsx';
@@ -34,6 +35,7 @@ function AppShell() {
           <Route path="/project/:id" element={<Project />} />
           <Route path="/terminal/:agentId" element={<Terminal />} />
           <Route path="/tasks/:taskId/rounds/:phase/:round" element={<ReviewRoundPage />} />
+          <Route path="/tasks/:taskId/github-review" element={<GithubReviewPage />} />
         </Routes>
         {showBottomBrand && (
           <footer className="mt-auto flex justify-center pb-4 pt-24">

@@ -132,7 +132,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
 
   it('does not render any dialog until a task is opened', () => {
     setTasks({ 'task-010': makeTask() });
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
+    render(<MemoryRouter><TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider></MemoryRouter>);
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
@@ -221,7 +221,7 @@ describe('TaskDetailProvider / useTaskDetail', () => {
     });
     tasksRetryMock.mockResolvedValue(makeTask({ id: 'task-011', status: 'pending', title: 'new one' }));
 
-    render(<TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider>);
+    render(<MemoryRouter><TaskDetailProvider><Opener taskId="task-010" /></TaskDetailProvider></MemoryRouter>);
     fireEvent.click(screen.getByRole('button', { name: 'open-task-010' }));
     expect(screen.getByRole('dialog', { name: 'task-010 old one' })).toBeTruthy();
 

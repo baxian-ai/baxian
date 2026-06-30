@@ -3,6 +3,7 @@ import { api } from '../api.ts';
 import { Modal } from './modal.tsx';
 import { CreateTaskModal } from './create-task-modal.tsx';
 import { ReviewConversation } from './review-conversation.tsx';
+import { GithubReviewEntry } from './github-review-entry.tsx';
 import { useToast } from './toast.tsx';
 import { useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
@@ -464,6 +465,7 @@ function TaskDetailModal({ taskId, onClose, onOpenTask }: TaskDetailModalProps) 
         </div>
 
         <ReviewConversation task={task} onClose={onClose} />
+        <GithubReviewEntry task={task} onClose={onClose} />
       </div>
     );
   }

@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import type { TaskState, TaskStatus } from '../shared/index.js';
+import type { TaskState, TaskStatus, GithubReviewItem } from '../shared/index.js';
 import {
   TASK_IMAGE_MAX_COUNT,
   TASK_CREATE_ROUTE_BODY_LIMIT,
@@ -7,8 +7,12 @@ import {
   TASK_TERMINAL_STATUS_SET,
   TASK_ACTIVE_STATUS_SET,
   TASK_STATUS_SET,
+  isGitHubRepo,
+  repoSlug,
 } from '../shared/index.js';
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
+import { createRunner } from '../agent/runner.js';
+import { buildGithubReviewConversation } from '../github/pr-conversation.js';
 import { enrichTaskSnapshot } from '../state/snapshot.js';
 
 const TITLE_MAX_LEN = 200;
@@ -264,6 +268,31 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     if (!store) return reply.send([]);
     const rounds = await store.listRounds(request.params.id);
     return reply.send(rounds);
+  });
+
+  app.get<{ Params: { id: string } }>('/tasks/:id/github-review', async (request, reply) => {
+    const task = await app.ctx.taskStore.get(request.params.id);
+    if (!task) return reply.status(404).send({ error: 'task not found' });
+    const empty: GithubReviewItem[] = [];
+    if (task.reviewMode === 'server') {
+      return reply.send({ available: false, reason: 'server-mode', items: empty });
+    }
+    if (task.prNumber === undefined) {
+      return reply.send({ available: false, reason: 'no-pr', items: empty });
+    }
+    const repo = app.ctx.agentManager.getProjectConfig(task.projectId)?.repo;
+    if (!repo || !isGitHubRepo(repo)) {
+      return reply.send({ available: false, reason: 'not-github', items: empty });
+    }
+    const runner = app.ctx.githubRunner ?? createRunner('local');
+    const convo = await buildGithubReviewConversation(runner, repoSlug(repo), task.prNumber);
+    return reply.send({
+      available: true,
+      prNumber: task.prNumber,
+      ...(task.prUrl ? { prUrl: task.prUrl } : {}),
+      items: convo.items,
+      ...(convo.error ? { error: convo.error } : {}),
+    });
   });
 
   app.post<{ Params: { id: string } }>('/tasks/:id/continue', async (request, reply) => {

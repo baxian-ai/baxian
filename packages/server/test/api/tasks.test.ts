@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { TaskState } from '../../src/shared/index.js';
+import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { ApiError } from '../../src/errors.js';
 import {
   TASK_IMAGE_MAX_COUNT,
@@ -804,5 +805,58 @@ describe('server review mode API', () => {
     const response = await patch('/api/tasks/task-ready2', { status: 'cancelled' });
     expect(response.statusCode).toBe(200);
     expect(JSON.parse(response.body).status).toBe('cancelled');
+  });
+});
+
+describe('GET /api/tasks/:id/github-review', () => {
+  function fakeRunner(byPath: Record<string, string>): CommandRunner {
+    return {
+      exec: async (cmd: string): Promise<ExecResult> => {
+        for (const [key, stdout] of Object.entries(byPath)) {
+          if (cmd.includes(key)) return { stdout, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      },
+      writeFile: async () => undefined,
+      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    };
+  }
+
+  it('404 when the task does not exist', async () => {
+    const res = await get('/api/tasks/missing/github-review');
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('available:false (server-mode) for server-mode tasks', async () => {
+    await seedTask({ id: 'gh-srv', reviewMode: 'server', prNumber: 9 });
+    const res = await get('/api/tasks/gh-srv/github-review');
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'server-mode', items: [] });
+  });
+
+  it('available:false (no-pr) when the task has no PR', async () => {
+    await seedTask({ id: 'gh-nopr' });
+    const res = await get('/api/tasks/gh-nopr/github-review');
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'no-pr' });
+  });
+
+  it('available:false (not-github) when the project repo is unresolvable', async () => {
+    await seedTask({ id: 'gh-other', projectId: 'ghost', prNumber: 3 });
+    const res = await get('/api/tasks/gh-other/github-review');
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'not-github' });
+  });
+
+  it('available:true passes through items and PR metadata', async () => {
+    app.ctx.githubRunner = fakeRunner({
+      'pulls/7/reviews': JSON.stringify({ id: 1, state: 'APPROVED', body: 'lgtm', submitted_at: '2026-06-01T10:00:00Z' }),
+    });
+    await seedTask({ id: 'gh-ok', prNumber: 7, prUrl: 'https://github.com/user/repo/pull/7' });
+    const res = await get('/api/tasks/gh-ok/github-review');
+    const body = JSON.parse(res.body);
+    expect(body.available).toBe(true);
+    expect(body.prNumber).toBe(7);
+    expect(body.prUrl).toBe('https://github.com/user/repo/pull/7');
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]).toMatchObject({ kind: 'review', verdict: 'approve' });
   });
 });

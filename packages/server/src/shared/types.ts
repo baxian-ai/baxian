@@ -228,6 +228,33 @@ export interface ReviewRound {
   completedAt?: string;
 }
 
+export type GithubReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
+
+export type GithubReviewVerdict = 'approve' | 'request-changes' | 'comment';
+
+export interface GithubReviewItem {
+  kind: GithubReviewItemKind;
+  id: string;
+  author?: string;
+  body?: string;
+  bodyTruncated?: boolean;
+  createdAt?: string;
+  verdict?: GithubReviewVerdict;
+  path?: string;
+  line?: number;
+  commitSha?: string;
+  inReplyTo?: boolean;
+}
+
+export interface GithubReviewConversation {
+  available: boolean;
+  reason?: 'server-mode' | 'no-pr' | 'not-github';
+  prNumber?: number;
+  prUrl?: string;
+  items: GithubReviewItem[];
+  error?: string;
+}
+
 export type EventType =
   | 'task.created'
   | 'task.assigned'

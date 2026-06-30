@@ -10,6 +10,7 @@ import type { LockManager } from './state/lock.js';
 import type { EventBus } from './event/bus.js';
 import type { EventLog } from './event/log.js';
 import type { GitHubPoller } from './github/poller.js';
+import type { CommandRunner } from './agent/runner.js';
 import type { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import type { BootstrapPoller } from './agent/bootstrap-poller.js';
 import type { PaneStreamerManager } from './agent/pane-streamer-manager.js';
@@ -46,6 +47,7 @@ export interface AppContext {
   configPath?: string;
   stateDir?: string;
   poller?: GitHubPoller;
+  githubRunner?: CommandRunner;
   paneStreamerManager?: PaneStreamerManager;
   restartCoordinator?: RestartCoordinator;
   eventBroker?: EventBroker;
