@@ -9,12 +9,9 @@ import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath } from '../com
 import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import {
-  agentRuntimeLabel,
-  agentRuntimeTitle,
   REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
   type AgentConfig,
-  type AgentRuntime,
   type AgentSnapshot,
   type ReviewRound,
   type TaskState,
@@ -40,15 +37,12 @@ function useVerdictOverdue(task: TaskState | null): boolean {
   return overdue;
 }
 
-function AgentName({ id, runtime }: { id: string; runtime?: AgentRuntime }) {
-  const label = agentRuntimeLabel(runtime);
-  if (!id) return <span className="font-mono text-og-800">—</span>;
-  return (
-    <span className="inline-flex min-w-0 max-w-full items-baseline gap-1 align-baseline" title={agentRuntimeTitle(id, runtime)}>
-      <span className="min-w-0 truncate font-mono text-og-800">{id}</span>
-      {label && <span className="hidden shrink-0 whitespace-nowrap text-[12px] text-og-400 sm:inline">({label})</span>}
-    </span>
-  );
+function branchTreeUrl(prUrl: string | undefined, branch: string): string | null {
+  if (!prUrl || !branch) return null;
+  const base = prUrl.match(/^(https?:\/\/[^/]+\/[^/]+\/[^/]+)\/pull\/\d+/);
+  if (!base) return null;
+  const path = branch.split('/').map(encodeURIComponent).join('/');
+  return `${base[1]}/tree/${path}`;
 }
 
 export function TaskDetail() {
@@ -74,15 +68,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const task = override ?? streamed;
   const verdictOverdue = useVerdictOverdue(task);
   const error = errorPayload?.message ?? null;
-  const agentRuntimeById = useMemo(() => {
-    const next = new Map<string, AgentRuntime>();
-    for (const project of projects ?? []) {
-      for (const group of project.agent) {
-        for (const agent of group) next.set(agent.id, agent.runtime);
-      }
-    }
-    return next;
-  }, [projects]);
   const agentsById = useMemo(
     () => new Map((agents ?? []).map((agent) => [agent.id, agent])),
     [agents],
@@ -205,19 +190,19 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       {!task && !error && !loaded && <div className="text-[13px] text-og-500">Loading…</div>}
       {task && (
         <>
-          <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div className="mb-4">
             <h1 className="flex min-w-0 items-baseline gap-2">
               <span className="shrink-0 font-mono text-[15px] text-og-400">{task.id}</span>
               <span className="min-w-0 truncate font-display text-[17px] font-semibold tracking-tight text-og-1000" title={task.title}>
                 {task.title}
               </span>
             </h1>
-            <div className="flex shrink-0 flex-wrap items-center gap-2">{renderActions(task)}</div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
           </div>
 
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3 lg:items-start">
-            <section className="min-w-0 lg:col-span-2">{renderInfo(task)}</section>
-            <aside className="min-w-0 space-y-4 lg:col-span-1">{renderAgents(task)}</aside>
+          <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
+            <section className="min-w-0">{renderInfo(task)}</section>
+            <aside className="min-w-0 space-y-4">{renderAgents(task)}</aside>
           </div>
         </>
       )}
@@ -241,6 +226,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showReadyGate = task.status === 'ready';
     const showCodeMaxRounds = task.status === 'max_rounds' && task.phase !== 'spec';
     const showSpecMaxRounds = task.status === 'max_rounds' && task.phase === 'spec';
+    const branchUrl = branchTreeUrl(task.prUrl, task.branch ?? '');
 
     return (
       <div>
@@ -255,6 +241,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         <div className="mb-2 flex flex-wrap items-center gap-3">
           <span className={STATUS_BADGE_COLORS[task.status]}>{task.status}</span>
+          <span className="text-[12px] text-og-500">Round <span className="font-semibold text-og-800">{task.reviewRound}</span></span>
+          <span className="text-[12px] text-og-500">Spec <span className="font-semibold text-og-800">{task.specReviewRound ?? 0}</span></span>
         </div>
         <div className="mb-4 text-[12px] text-og-500">
           Created at {formatTaskTimestamp(task.createdAt)}, Updated at {formatTaskTimestamp(task.updatedAt)}
@@ -358,38 +346,36 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           </div>
         )}
 
+        <div className="card mb-4 space-y-2 p-4 text-[13px]">
+          <div className="text-og-500">
+            PR:{' '}
+            {task.prNumber ? (
+              task.prUrl ? (
+                <a href={task.prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">#{task.prNumber}</a>
+              ) : (
+                <span className="font-mono text-og-800">#{task.prNumber}</span>
+              )
+            ) : (
+              <span className="text-og-400">—</span>
+            )}
+          </div>
+          <div className="text-og-500">
+            Branch:{' '}
+            {task.branch ? (
+              branchUrl ? (
+                <a href={branchUrl} target="_blank" rel="noopener noreferrer" className="font-mono text-accent hover:text-accent-hover">{task.branch}</a>
+              ) : (
+                <span className="font-mono text-og-800">{task.branch}</span>
+              )
+            ) : (
+              <span className="text-og-400">—</span>
+            )}
+          </div>
+        </div>
+
         <pre className="card mb-4 whitespace-pre-wrap p-4 text-[13px] text-og-800">
           {task.description || <span className="text-og-400">（无描述）</span>}
         </pre>
-
-        <div className="card space-y-2 p-4 text-[13px]">
-          <div className="grid grid-cols-1 gap-x-6 gap-y-2 md:grid-cols-2">
-            <div className="text-og-500">Project: <span className="font-mono text-og-800">{task.projectId}</span></div>
-            <div className="text-og-500">
-              Round: <span className="font-mono text-og-800">{task.reviewRound}</span>{' '}
-              <span>spec: <span className="font-mono text-og-800">{task.specReviewRound ?? 0}</span></span>
-            </div>
-          </div>
-          <div className="grid grid-cols-1 gap-x-6 gap-y-2 md:grid-cols-2">
-            <div className="text-og-500">Dev: <AgentName id={task.agentId} runtime={agentRuntimeById.get(task.agentId)} /></div>
-            <div className="text-og-500">QA: <AgentName id={task.qaAgentId ?? ''} runtime={agentRuntimeById.get(task.qaAgentId ?? '')} /></div>
-          </div>
-          <div className="grid grid-cols-1 gap-x-6 gap-y-2 md:grid-cols-2">
-            <div className="text-og-500">
-              PR:{' '}
-              {task.prNumber ? (
-                task.prUrl ? (
-                  <a href={task.prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">#{task.prNumber}</a>
-                ) : (
-                  <span className="font-mono text-og-800">#{task.prNumber}</span>
-                )
-              ) : (
-                <span className="text-og-400">—</span>
-              )}
-            </div>
-            <div className="text-og-500">Branch: <span className="font-mono text-og-800">{task.branch || '—'}</span></div>
-          </div>
-        </div>
 
         <ReviewConversation task={task} />
       </div>

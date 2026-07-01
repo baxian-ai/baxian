@@ -15,7 +15,7 @@ interface Props {
 }
 
 const PHASE_LABEL: Record<TaskPhase, string> = {
-  spec: '规格评审',
+  spec: 'Spec 评审',
   code: '代码评审',
 };
 
@@ -73,7 +73,7 @@ export function ReviewConversation({ task }: Props) {
   if (!hasRoundRecords && !hasGithubReview) return null;
   return (
     <section className="mt-4" aria-label="评审记录">
-      <div className="mb-2 text-[11px] font-medium uppercase tracking-[0.06em] text-og-500">
+      <div className="mb-2 text-[15px] text-og-700">
         评审记录
       </div>
       <div className="space-y-4">
@@ -119,7 +119,7 @@ function ReviewRounds({ task }: Props) {
 function ReviewGroup({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div>
-      <div className="mb-1.5 text-[12px] font-medium text-og-700">{title}</div>
+      <div className="mb-1.5 text-[11px] text-og-700">{title}</div>
       <div className="space-y-3">{children}</div>
     </div>
   );
@@ -185,11 +185,11 @@ function TurnRow({
       className="card flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:border-accent"
     >
       <span
-        className={`shrink-0 min-w-[1.75rem] text-[11px] font-semibold uppercase tracking-wide ${role === 'qa' ? 'text-[#c2410c]' : 'text-accent'}`}
+        className={`shrink-0 min-w-[1.75rem] text-[11px] uppercase tracking-wide ${role === 'qa' ? 'text-[#c2410c]' : 'text-accent'}`}
       >
         {role === 'qa' ? 'QA' : 'dev'}
       </span>
-      <span className="shrink-0 font-medium text-og-800">{label}</span>
+      <span className="shrink-0 text-og-800">{label}</span>
       {badge}
       <span className="min-w-0 flex-1 truncate text-og-500">{summary}</span>
       <span aria-hidden className="shrink-0 text-og-300">›</span>

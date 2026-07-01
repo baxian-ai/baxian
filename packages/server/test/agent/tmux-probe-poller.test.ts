@@ -59,6 +59,7 @@ interface ExecOverrides {
   classifySep?: Branch;
   capturePane?: Branch;
   paneTitle?: Branch;
+  paneWidth?: Branch;
 }
 
 function resolveBranch(branch: Branch, cmd: string): ExecResult | Promise<ExecResult> {
@@ -72,6 +73,7 @@ function makeExec(overrides: ExecOverrides = {}): CommandRunner['exec'] {
     classifySep: overrides.classifySep ?? liveRuntimePane,
     capturePane: overrides.capturePane ?? readyCapture,
     paneTitle: overrides.paneTitle ?? emptyPaneTitle,
+    paneWidth: overrides.paneWidth ?? text('80'),
   };
   return vi.fn(async (cmd: string) => {
     if (cmd.includes('has-session')) return resolveBranch(branches.hasSession, cmd);
@@ -79,6 +81,7 @@ function makeExec(overrides: ExecOverrides = {}): CommandRunner['exec'] {
     if (cmd.includes('___bx-classify-sep___')) return resolveBranch(branches.classifySep, cmd);
     if (cmd.includes('capture-pane')) return resolveBranch(branches.capturePane, cmd);
     if (cmd.includes('pane_title')) return resolveBranch(branches.paneTitle, cmd);
+    if (cmd.includes('pane_width')) return resolveBranch(branches.paneWidth, cmd);
     return present;
   });
 }
@@ -329,6 +332,46 @@ describe('TmuxProbePoller', () => {
         binding: { taskId: 'task-001' },
         exec: execScripted([idleCapture, idleCaptureDifferent, idleCaptureDifferent]),
         steps: [{}, { advance: 4 * 60 * 1000 }, { advance: 4 * 60 * 1000 }],
+        expectClear: true,
+      });
+    });
+
+    it('a viewer resize (idle→idle reflow at a NEW pane width) does NOT reset the PENDING_IDLE grace', async () => {
+      const idleReflowed: ExecResult = text('done\n❯ '); // reflowed idle composer (still visibleIdle)
+      await runProbeScenario({
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          capturePane: scripted([idleCapture, idleCapture, idleReflowed]),
+          paneWidth: scripted([text('80'), text('80'), text('120')]), // resize on the 3rd poll
+        }),
+        steps: [{}, { advance: FIVE_MIN + 1 }, {}],
+        expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
+      });
+    });
+
+    it('real output that returns to an idle prompt at the SAME width DOES reset the grace', async () => {
+      const idleAfterOutput: ExecResult = text('ran tests\nAll green\n❯ '); // new output, back to idle, no resize
+      await runProbeScenario({
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          capturePane: scripted([idleCapture, idleCapture, idleAfterOutput]),
+          paneWidth: text('80'), // width unchanged throughout
+        }),
+        steps: [{}, { advance: FIVE_MIN + 1 }, {}],
+        expectClear: true,
+      });
+    });
+
+    it('resizing while the short idle capture is byte-identical still lets later real output reset the grace (width cache stays fresh)', async () => {
+      const idleAfterOutput: ExecResult = text('ran tests\nAll green\n❯ ');
+      await runProbeScenario({
+        binding: { taskId: 'task-001' },
+        exec: makeExec({
+          // poll3: resize 80→120 but the bare `❯ ` capture is byte-identical; poll4: real output at 120
+          capturePane: scripted([idleCapture, idleCapture, idleCapture, idleAfterOutput]),
+          paneWidth: scripted([text('80'), text('80'), text('120'), text('120')]),
+        }),
+        steps: [{}, { advance: FIVE_MIN + 1 }, {}, {}],
         expectClear: true,
       });
     });

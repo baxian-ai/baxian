@@ -130,7 +130,7 @@ export class TmuxProbePoller {
   private concurrency: number;
   private failureThreshold: number;
   private lastRecordedIssue = new Map<string, string>();
-  private lastScreen = new Map<string, { hash: string; changedAt: number; taskId: string | null }>();
+  private lastScreen = new Map<string, { hash: string; changedAt: number; taskId: string | null; idle: boolean; width: number }>();
   private validInstances = new Map<string, AgentConfig>();
   private manifests = loadManifests();
   private debouncers = new Map<string, WorkingToIdleDebounce>();
@@ -209,10 +209,10 @@ export class TmuxProbePoller {
     runtime: AgentRuntimeKind,
     runtimeScreen: string,
     oscTitle: string,
-  ): { runtimeStatusHint?: AgentRuntimeStatus; visibleBlocker: boolean; visibleWorking: boolean } | 'skip' {
+  ): { runtimeStatusHint?: AgentRuntimeStatus; visibleBlocker: boolean; visibleWorking: boolean; visibleIdle: boolean } | 'skip' {
     const manifest = this.manifests.get(runtime);
     if (!manifest) {
-      return { runtimeStatusHint: undefined, visibleBlocker: false, visibleWorking: false };
+      return { runtimeStatusHint: undefined, visibleBlocker: false, visibleWorking: false, visibleIdle: false };
     }
 
     const input: DetectionInput = { screen: runtimeScreen, oscTitle };
@@ -233,6 +233,7 @@ export class TmuxProbePoller {
       runtimeStatusHint: published === 'working' || published === 'pending' ? published : undefined,
       visibleBlocker: detection.visibleBlocker,
       visibleWorking: detection.visibleWorking,
+      visibleIdle: detection.visibleIdle,
     };
   }
 
@@ -341,24 +342,36 @@ export class TmuxProbePoller {
         ? (await this.agentStore.get(agent.id))?.taskId ?? null
         : null;
       let oscTitle = '';
+      let paneWidth = 0;
       if (liveRuntime) {
         try {
           oscTitle = await tmux.readPaneTitle(paneId, { timeout: this.probeTimeoutMs });
         } catch { }
+        try {
+          paneWidth = parseInt(await tmux.displayMessage(paneId, '#{pane_width}', { timeout: this.probeTimeoutMs }), 10) || 0;
+        } catch { }
       }
+      const manifestResult = liveRuntime
+        ? this.detectViaManifest(agent.id, agent.runtime, runtimeScreen, oscTitle)
+        : undefined;
+
       if (liveRuntime) {
         const hash = createHash('sha1').update(runtimeScreen).update(oscTitle).digest('hex');
+        const idleNow = manifestResult && manifestResult !== 'skip' ? manifestResult.visibleIdle : false;
         const prev = this.lastScreen.get(agent.id);
-        if (!prev || prev.hash !== hash || prev.taskId !== currentTaskId) {
-          this.lastScreen.set(agent.id, { hash, changedAt: this.now(), taskId: currentTaskId });
+        if (!prev || prev.taskId !== currentTaskId) {
+          this.lastScreen.set(agent.id, { hash, changedAt: this.now(), taskId: currentTaskId, idle: idleNow, width: paneWidth });
+        } else if (prev.hash !== hash) {
+          // A viewer resize reflows an idle pane (pane_width changes) — that is not runtime activity; real output keeps the same width. Only a width-changing idle→idle reflow keeps the idle-grace clock.
+          const cosmeticIdleReflow = idleNow && prev.idle && prev.width > 0 && paneWidth > 0 && prev.width !== paneWidth;
+          this.lastScreen.set(agent.id, { hash, changedAt: cosmeticIdleReflow ? prev.changedAt : this.now(), taskId: currentTaskId, idle: idleNow, width: paneWidth });
+        } else if (prev.width !== paneWidth) {
+          // Hash unchanged but pane_width changed (a resize that did not alter a short capture) — sync the cached width so the next real output compares against the current width, not a stale pre-resize one.
+          this.lastScreen.set(agent.id, { ...prev, width: paneWidth });
         }
       } else {
         this.resetDetectionBaseline(agent.id);
       }
-
-      const manifestResult = liveRuntime
-        ? this.detectViaManifest(agent.id, agent.runtime, runtimeScreen, oscTitle)
-        : undefined;
 
       if (manifestResult === 'skip') {
         const prev = this.store.get(agent.id);

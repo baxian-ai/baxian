@@ -177,25 +177,45 @@ describe('TaskDetail page — header & info', () => {
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
     expect(within(container.querySelector('section')!).getByText('approved').className).toContain('pill');
-    expect(container.textContent).toContain('Created at 2026-05-10 12:00:00, Updated at 2026-05-10 13:00:00');
+    expect(container.textContent).toContain('Created at 2026-05-10 20:00:00, Updated at 2026-05-10 21:00:00');
     expect(container.textContent).toContain('Task body here');
-    expect(container.textContent).toContain('Project: baxian');
-    expect(container.textContent).toContain('Round: 1 spec: 0');
+    expect(container.textContent).toContain('Round 1');
+    expect(container.textContent).toContain('Spec 0');
     expect(container.textContent).toContain('Branch:');
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
   });
 
-  it('shows runtime labels next to task agent names in the meta block', () => {
-    open();
-    expect(screen.getByText('bx-dev').parentElement?.getAttribute('title')).toBe('bx-dev (Claude Code)');
-    expect(screen.getByText('bx-qa').parentElement?.getAttribute('title')).toBe('bx-qa (Codex)');
-    expect(screen.getByText('(Claude Code)')).toBeTruthy();
-    expect(screen.getByText('(Codex)')).toBeTruthy();
+  it('shows bold Round/Spec counts beside the status pill', () => {
+    const { container } = open({ reviewRound: 3, specReviewRound: 2 });
+    const status = within(container.querySelector('section')!).getByText('approved').parentElement!;
+    expect(within(status).getByText('3').className).toContain('font-semibold');
+    expect(within(status).getByText('2').className).toContain('font-semibold');
   });
 
-  it('formats timestamps without timezone conversion and tolerates empty values', () => {
-    open({ createdAt: '2026-05-10T13:00+08:00', updatedAt: null as unknown as string });
-    expect(screen.getByText('Created at 2026-05-10 13:00:00, Updated at')).toBeTruthy();
+  it('shows only PR and Branch in the info card, with a branch hyperlink, dropping project/agent rows', () => {
+    const { container } = open();
+    const section = container.querySelector('section')!;
+    expect(within(section).getByRole('link', { name: '#55' }).getAttribute('href'))
+      .toBe('https://github.com/baxian-ai/baxian/pull/55');
+    expect(within(section).getByRole('link', { name: 'bx/task-010' }).getAttribute('href'))
+      .toBe('https://github.com/baxian-ai/baxian/tree/bx/task-010');
+    expect(section.textContent).not.toContain('Project:');
+    expect(section.textContent).not.toContain('Dev:');
+    expect(section.textContent).not.toContain('QA:');
+  });
+
+  it('renders timestamps in the local timezone and tolerates empty values', () => {
+    open({ createdAt: '2026-05-10T12:00:00.000Z', updatedAt: null as unknown as string });
+    expect(screen.getByText('Created at 2026-05-10 20:00:00, Updated at')).toBeTruthy();
+  });
+
+  it('places the action buttons on their own row below the title', () => {
+    const { container } = open({ status: 'pending' });
+    const h1 = container.querySelector('h1')!;
+    const actionsRow = screen.getByRole('button', { name: 'Edit' }).parentElement!;
+    expect(h1.contains(actionsRow)).toBe(false);
+    expect(h1.nextElementSibling).toBe(actionsRow);
+    expect(actionsRow.className).toContain('mt-3');
   });
 
   const QA_BANNER = 'QA approved · verifying feedback';
@@ -213,12 +233,15 @@ describe('TaskDetail page — header & info', () => {
 });
 
 describe('TaskDetail page — layout & agent cards', () => {
-  it('splits into a 2/3 info column and a 1/3 agent column', () => {
+  it('splits info and agents into two equal columns aligned to the top', () => {
     const { container } = open();
-    const grid = container.querySelector('.lg\\:grid-cols-3')!;
+    const grid = container.querySelector('.lg\\:grid-cols-2')!;
     expect(grid).toBeTruthy();
-    expect(grid.querySelector('section')!.className).toContain('lg:col-span-2');
-    expect(grid.querySelector('aside')!.className).toContain('lg:col-span-1');
+    // items-start keeps agent cards at their natural height (no bottom blank at narrow widths)
+    expect(grid.className).toContain('items-start');
+    expect(grid.querySelector('section')).toBeTruthy();
+    expect(grid.querySelector('aside')).toBeTruthy();
+    expect(container.querySelector('.lg\\:grid-cols-3')).toBeNull();
   });
 
   it('renders the dev card above the qa card, styled like dashboard/project cards', () => {

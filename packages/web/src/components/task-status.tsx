@@ -51,12 +51,13 @@ export function formatTaskTimestamp(value: unknown): string {
   if (value === null || value === undefined) return '';
   const normalized = String(value).trim();
   if (!normalized) return '';
-  const match = normalized.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::(\d{2}))?/);
-  if (match) return `${match[1]} ${match[2]}:${match[3] ?? '00'}`;
-
-  const date = new Date(normalized);
-  if (!Number.isNaN(date.getTime())) return date.toISOString().slice(0, 19).replace('T', ' ');
-  return normalized;
+  // space-separated "YYYY-MM-DD HH:mm" is implementation-defined for Date.parse
+  // (Safari returns Invalid Date); normalize to the ISO 'T' form before parsing.
+  const date = new Date(normalized.replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T'));
+  if (Number.isNaN(date.getTime())) return normalized;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 export function taskDetailPath(projectId: string, taskId: string): string {

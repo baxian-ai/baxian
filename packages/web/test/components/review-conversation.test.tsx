@@ -72,7 +72,7 @@ describe('ReviewConversation gating', () => {
       { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
-    expect(await screen.findByText('规格评审')).toBeTruthy();
+    expect(await screen.findByText('Spec 评审')).toBeTruthy();
     expect(reviewsMock).toHaveBeenCalled();
   });
 });
@@ -86,12 +86,12 @@ describe('ReviewConversation github code-review group', () => {
     expect(reviewsMock).not.toHaveBeenCalled();
   });
 
-  it('shows 规格评审 and 代码评审 together for a github SDD task with spec rounds + PR', async () => {
+  it('shows Spec 评审 and 代码评审 together for a github SDD task with spec rounds + PR', async () => {
     reviewsMock.mockResolvedValue([
       { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 1 }));
-    expect(await screen.findByText('规格评审')).toBeTruthy();
+    expect(await screen.findByText('Spec 评审')).toBeTruthy();
     expect(screen.getByText('代码评审')).toBeTruthy();
     expect(screen.getByText(/查看 PR 评审过程/)).toBeTruthy();
   });
@@ -114,7 +114,7 @@ describe('ReviewConversation server mode', () => {
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
     ] as ReviewRound[]);
     renderConv(makeTask());
-    expect(await screen.findByText('规格评审')).toBeTruthy();
+    expect(await screen.findByText('Spec 评审')).toBeTruthy();
     expect(screen.getByText('评审记录')).toBeTruthy();
     expect(screen.getByText('代码评审')).toBeTruthy();
     expect(screen.getByText('提交规格稿')).toBeTruthy();

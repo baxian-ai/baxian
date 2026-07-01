@@ -40,6 +40,18 @@ describe('GithubReviewEntry', () => {
     expect(qa.className).not.toContain('pill');
   });
 
+  it('styles the 代码评审 title and QA marker like 第 x 轮: 11px and non-bold', () => {
+    renderEntry(task({ reviewMode: 'github' }));
+    const title = screen.getByText('代码评审');
+    expect(title.className).toContain('text-[11px]');
+    expect(title.className).not.toContain('font-medium');
+    expect(title.className).not.toContain('font-semibold');
+    const qa = screen.getByText('QA');
+    expect(qa.className).toContain('text-[11px]');
+    expect(qa.className).not.toContain('font-semibold');
+    expect(qa.className).not.toContain('font-medium');
+  });
+
   it('navigates to the review page on click', () => {
     renderEntry(task({ id: 'task-42', reviewMode: 'github' }));
     fireEvent.click(screen.getByRole('button'));
