@@ -16,10 +16,10 @@ const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const PROBE_DEBOUNCE_MS = 500;
 
 const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[13px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-[12px] font-medium text-og-700';
-const fieldErrCls = 'mt-1 text-[12px] text-danger';
-const helpCls = 'mt-1 text-[12px] text-og-500';
+  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[14px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
+const labelCls = 'mb-1.5 block text-[13px] font-medium text-og-700';
+const fieldErrCls = 'mt-1 text-[13px] text-danger';
+const helpCls = 'mt-1 text-[13px] text-og-500';
 const radioCls = 'h-3.5 w-3.5 accent-[#1348dc]';
 
 interface FormState {
@@ -194,26 +194,26 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const RuntimeStatus = ({ rt }: { rt: AgentRuntime }) => {
     const isRemoteNoHost = form.mode === 'remote' && !form.host;
-    if (isRemoteNoHost) return <span className="ml-2 text-[12px] text-og-400">（请先选择 Host）</span>;
-    if (probeLoading) return <span className="ml-2 text-[12px] text-og-400">…探测中</span>;
-    if (!probe) return <span className="ml-2 text-[12px] text-og-400">?</span>;
+    if (isRemoteNoHost) return <span className="ml-2 text-[13px] text-og-400">（请先选择 Host）</span>;
+    if (probeLoading) return <span className="ml-2 text-[13px] text-og-400">…探测中</span>;
+    if (!probe) return <span className="ml-2 text-[13px] text-og-400">?</span>;
     const status = probe.runtimes[rt];
-    if (status.ok) return <span className="ml-2 text-[12px] text-success">✓ {status.path ?? ''}</span>;
-    return <span className="ml-2 text-[12px] text-danger" title={status.message}>⨯ {status.message}</span>;
+    if (status.ok) return <span className="ml-2 text-[13px] text-success">✓ {status.path ?? ''}</span>;
+    return <span className="ml-2 text-[13px] text-danger" title={status.message}>⨯ {status.message}</span>;
   };
 
   const TmuxStatus = () => {
     if (form.mode === 'remote' && !form.host) return null;
-    if (probeLoading) return <div className="text-[12px] text-og-400">tmux: …探测中</div>;
+    if (probeLoading) return <div className="text-[13px] text-og-400">tmux: …探测中</div>;
     if (!probe) return null;
-    if (probe.tmux.ok) return <div className="text-[12px] text-success">tmux: ✓ {probe.tmux.path ?? ''}</div>;
-    return <div className="text-[12px] text-danger">tmux: ⨯ {probe.tmux.message}</div>;
+    if (probe.tmux.ok) return <div className="text-[13px] text-success">tmux: ✓ {probe.tmux.path ?? ''}</div>;
+    return <div className="text-[13px] text-danger">tmux: ⨯ {probe.tmux.message}</div>;
   };
 
   const SshStatus = () => {
     if (form.mode !== 'remote' || !form.host || !probe?.ssh) return null;
-    if (probe.ssh.ok) return <div className="text-[12px] text-success">SSH: ✓ {probe.ssh.message}</div>;
-    return <div className="text-[12px] text-danger">SSH: ⨯ {probe.ssh.message}</div>;
+    if (probe.ssh.ok) return <div className="text-[13px] text-success">SSH: ✓ {probe.ssh.message}</div>;
+    return <div className="text-[13px] text-danger">SSH: ⨯ {probe.ssh.message}</div>;
   };
 
   return (
@@ -235,7 +235,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     >
       <form id="create-agent-form" onSubmit={handleSubmit} className="space-y-3">
         {error && (
-          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[13px] text-danger">
+          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[14px] text-danger">
             {error}
           </div>
         )}
@@ -264,12 +264,12 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           <label className="mr-4 inline-flex items-center gap-2">
             <input type="radio" name="role" checked={form.role === 'dev'} className={radioCls}
               onChange={() => setForm({ ...form, role: 'dev', pairWith: '' })} disabled={submitting} />
-            <span className="text-[13px] text-og-800">Dev</span>
+            <span className="text-[14px] text-og-800">Dev</span>
           </label>
           <label className="inline-flex items-center gap-2" title={!canSelectQa ? '请先创建一个 Dev Agent' : ''}>
             <input type="radio" name="role" checked={form.role === 'qa'} className={radioCls}
               onChange={() => setForm({ ...form, role: 'qa' })} disabled={submitting || !canSelectQa} />
-            <span className={`text-[13px] ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA</span>
+            <span className={`text-[14px] ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA</span>
           </label>
         </div>
 
@@ -293,12 +293,12 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <input type="radio" name="mode" checked={form.mode === 'local'} className={radioCls}
               onChange={() => setForm({ ...form, mode: 'local', host: '' })}
               disabled={submitting} />
-            <span className="text-[13px] text-og-800">本机</span>
+            <span className="text-[14px] text-og-800">本机</span>
           </label>
           <label className="inline-flex items-center gap-2">
             <input type="radio" name="mode" checked={form.mode === 'remote'} className={radioCls}
               onChange={() => setForm({ ...form, mode: 'remote' })} disabled={submitting} />
-            <span className="text-[13px] text-og-800">远程 (SSH)</span>
+            <span className="text-[14px] text-og-800">远程 (SSH)</span>
           </label>
         </div>
 
@@ -306,7 +306,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           <div>
             <label className={labelCls} htmlFor="host">Host</label>
             {hosts.length === 0 ? (
-              <div className="rounded-md border border-og-100 bg-og-50/40 px-3 py-2 text-[12px] text-og-600">
+              <div className="rounded-md border border-og-100 bg-og-50/40 px-3 py-2 text-[13px] text-og-600">
                 还没有配置 Host。请先在右上角菜单的「Host 管理」中添加。
               </div>
             ) : (
@@ -325,9 +325,9 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
         <div>
           <div className="mb-1.5 flex items-center justify-between">
-            <span className="text-[12px] font-medium text-og-700">运行时</span>
+            <span className="text-[13px] font-medium text-og-700">运行时</span>
             <button type="button" onClick={runProbe}
-              className="text-[12px] text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              className="text-[13px] text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
               disabled={submitting || probeLoading || (form.mode === 'remote' && !form.host)}>
               ↻ 重新探测
             </button>
@@ -336,14 +336,14 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <input type="radio" name="runtime" checked={form.runtime === 'claude-code'} className={radioCls}
               onChange={() => setForm({ ...form, runtime: 'claude-code' })}
               disabled={submitting || (probe ? !probe.runtimes['claude-code'].ok : false)} />
-            <span className="text-[13px] text-og-800">Claude Code</span>
+            <span className="text-[14px] text-og-800">Claude Code</span>
             <RuntimeStatus rt="claude-code" />
           </label>
           <label className="mt-1 flex items-center gap-2">
             <input type="radio" name="runtime" checked={form.runtime === 'codex'} className={radioCls}
               onChange={() => setForm({ ...form, runtime: 'codex' })}
               disabled={submitting || (probe ? !probe.runtimes['codex'].ok : false)} />
-            <span className="text-[13px] text-og-800">Codex</span>
+            <span className="text-[14px] text-og-800">Codex</span>
             <RuntimeStatus rt="codex" />
           </label>
           <div className="mt-2"><TmuxStatus /></div>
@@ -356,7 +356,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             onClick={() => setShowAdvanced(v => !v)}
             aria-expanded={showAdvanced}
             aria-controls={showAdvanced ? 'advanced-options' : undefined}
-            className="flex w-full items-center justify-between rounded-md px-1 py-1.5 text-left text-[12px] font-medium text-og-700 transition-colors hover:bg-og-50"
+            className="flex w-full items-center justify-between rounded-md px-1 py-1.5 text-left text-[13px] font-medium text-og-700 transition-colors hover:bg-og-50"
           >
             <span>高级选项</span>
             <span className="text-og-400">{showAdvanced ? '收起' : '展开'}</span>
@@ -386,7 +386,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
                 <label className={labelCls} htmlFor="addDirs">Additional Dirs（可选）</label>
                 <textarea id="addDirs" value={form.addDirs}
                   onChange={e => setForm({ ...form, addDirs: e.target.value })}
-                  className={`${inputCls} font-mono text-[12px]`}
+                  className={`${inputCls} font-mono text-[13px]`}
                   rows={3}
                   placeholder={'每行一个绝对路径，例:\n/Users/me/shared-libs\n/Users/me/extra-repo'}
                   disabled={submitting} />
@@ -401,9 +401,9 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <input type="checkbox" className="mt-1 h-3.5 w-3.5 accent-[#1348dc]" checked={form.yolo}
               onChange={e => setForm({ ...form, yolo: e.target.checked })}
               disabled={submitting} />
-            <div className="text-[13px] text-og-800">
+            <div className="text-[14px] text-og-800">
               <div className="font-medium">YOLO 模式（推荐开启）</div>
-              <div className="mt-1 text-[12px] text-warn">
+              <div className="mt-1 text-[13px] text-warn">
                 Agent 自主执行所有命令、文件改动，无需逐条确认。开启后体验更顺滑，
                 但<strong className="font-semibold">请确认在受控环境（容器、隔离 worktree）中运行</strong>。
               </div>

@@ -70,6 +70,7 @@ function renderPanel(openTasks: TaskState[], projectId = 'proj') {
 
 beforeEach(() => {
   cleanup();
+  localStorage.clear();
   pageMock.mockReset();
   pageMock.mockResolvedValue(emptyPage());
   navigateMock.mockReset();
@@ -217,6 +218,34 @@ describe('TaskPanel', () => {
     expect(screen.queryByText('shipped')).toBeNull();
     clickDone();
     await waitFor(() => expect(doneCalls().length).toBe(2));
+  });
+
+  it('persists the DONE expand/collapse state to localStorage', async () => {
+    mockDoneOnly(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
+    renderPanel([]);
+    expect(localStorage.getItem('baxian.taskPanel.doneOpen')).toBe('0');
+
+    clickDone();
+    await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.doneOpen')).toBe('1'));
+
+    clickDone();
+    await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.doneOpen')).toBe('0'));
+  });
+
+  it('restores the DONE section as expanded from localStorage and auto-loads it', async () => {
+    localStorage.setItem('baxian.taskPanel.doneOpen', '1');
+    mockDoneOnly(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
+    renderPanel([]);
+
+    expect(screen.getByRole('button', { name: /DONE/ }).getAttribute('aria-expanded')).toBe('true');
+    expect(await screen.findByText('shipped')).toBeTruthy();
+    expect(doneCalls().some((c) => (c[1]?.offset ?? 0) === 0)).toBe(true);
+  });
+
+  it('keeps the DONE section collapsed by default without querying', () => {
+    renderPanel([]);
+    expect(screen.getByRole('button', { name: /DONE/ }).getAttribute('aria-expanded')).toBe('false');
+    expect(pageMock).not.toHaveBeenCalled();
   });
 
   it('surfaces a 已处理 load error instead of failing silently', async () => {

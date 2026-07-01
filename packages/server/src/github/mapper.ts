@@ -1,6 +1,5 @@
 import type { EventType } from '../shared/index.js';
 import { BRANCH_PREFIX } from '../shared/index.js';
-import { BAXIAN_PR_CLAIM } from '../agent/prompt.js';
 
 export interface MappedEvent {
   type: EventType;
@@ -20,7 +19,7 @@ export interface GitHubWebhookPayload {
     };
   };
   pull_request?: {
-    head?: { ref?: string; sha?: string };
+    head?: { ref?: string; sha?: string; repo?: { full_name?: string } | null };
     body?: string | null;
     number?: number;
     html_url?: string;
@@ -49,14 +48,23 @@ export function extractReviewPassToken(body: string | null | undefined): string 
 
 export function isManagedPr(
   branch: string,
-  body: string | null | undefined,
-  knownBranches?: ReadonlySet<string>,
+  prNumber?: number,
+  knownPrNumbers?: ReadonlySet<number>,
 ): boolean {
-  if (body === null) return false;
-  if (typeof body === 'string' && !body.includes(BAXIAN_PR_CLAIM)) return false;
+  // bx/<taskId> is baxian's own unique namespace, always ours. A custom branch name can be reused, so
+  // it is ours only when the PR number itself is one a task already tracks — never by name match alone
+  // (else a stale/foreign PR sharing the branch name would be polled and routed onto the task).
   if (branch.startsWith(BRANCH_PREFIX)) return true;
-  if (knownBranches?.has(branch) === true) return true;
-  return false;
+  return prNumber !== undefined && knownPrNumbers?.has(prNumber) === true;
+}
+
+// baxian only opens PRs from its own repo, so a head repo that differs from — or is missing (a
+// deleted/invisible fork) — the base means an external PR that merely reused a managed branch name.
+// Fail closed: only a confirmed same-repo PR is ours.
+function isForkPr(payload: GitHubWebhookPayload): boolean {
+  const headRepo = payload.pull_request?.head?.repo?.full_name;
+  const baseRepo = payload.repository?.full_name;
+  return !headRepo || headRepo !== baseRepo;
 }
 
 export function mapGitHubEvent(
@@ -69,8 +77,7 @@ export function mapGitHubEvent(
   switch (eventType) {
     case 'pull_request': {
       const branch: string = payload.pull_request?.head?.ref ?? '';
-      const body: string | null | undefined = payload.pull_request?.body;
-      if (!isManagedPr(branch, body)) return null;
+      if (!isManagedPr(branch, payload.pull_request?.number) || isForkPr(payload)) return null;
 
       if (action === 'opened') {
         return {
@@ -130,8 +137,7 @@ export function mapGitHubEvent(
     case 'pull_request_review_comment': {
       if (action !== 'created') return null;
       const branch: string = payload.pull_request?.head?.ref ?? '';
-      const body: string | null | undefined = payload.pull_request?.body;
-      if (!isManagedPr(branch, body)) return null;
+      if (!isManagedPr(branch, payload.pull_request?.number) || isForkPr(payload)) return null;
       return {
         type: 'pr.updated',
         repo,
@@ -152,8 +158,7 @@ export function mapGitHubEvent(
     case 'pull_request_review': {
       if (action !== 'submitted') return null;
       const branch: string = payload.pull_request?.head?.ref ?? '';
-      const body: string | null | undefined = payload.pull_request?.body;
-      if (!isManagedPr(branch, body)) return null;
+      if (!isManagedPr(branch, payload.pull_request?.number) || isForkPr(payload)) return null;
 
       const state: string = payload.review?.state ?? '';
       const verdict = reviewVerdict({ state });

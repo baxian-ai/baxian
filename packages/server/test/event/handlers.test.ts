@@ -307,27 +307,54 @@ describe('pr.created handler', () => {
     expect(intervention!.data.claimedPrNumber).toBe(9999);
   });
 
-  it('pane-signal pr.created reconciles task.branch atomically via transition patch', async () => {
+  it("pane-signal pr.created adopts the task's own bx/<id> branch via the fallback (verify raced)", async () => {
     await seedTask({ id: 'task-pane-recon', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-pane-recon');
     stubManager({ startSession: true, markAgentWaiting: true, verifyPaneSignalPrNumber: undefined });
     vi.spyOn(manager, 'fetchPrHeadRef')
-      .mockResolvedValue({ headRefName: 'fix/custom-branch', headSha: HEAD_SHA, body: '<!-- baxian:managed -->\nsome description' });
+      .mockResolvedValue({ headRefName: 'bx/task-pane-recon', headSha: HEAD_SHA, body: 'some description' });
     vi.spyOn(manager, 'findTaskByBranch').mockResolvedValue(undefined);
 
     await emitPrCreated('task-pane-recon', { prNumber: 200, source: 'pane-signal' });
 
     const task = await taskStore.get('task-pane-recon');
     expect(task!.status).toBe('review');
-    expect(task!.branch).toBe('fix/custom-branch');
+    expect(task!.branch).toBe('bx/task-pane-recon');
     expect(task!.latestHeadSha).toBe(HEAD_SHA);
+  });
+
+  it('pane-signal pr.created REJECTS an unbound custom branch (no deterministic ownership proof)', async () => {
+    await seedTask({ id: 'task-pane-noproof', status: 'in_progress', reviewRound: 0 });
+    vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'fix/unmanaged', headSha: HEAD_SHA, body: 'just a plain PR' });
+    stubManager({ findTaskByBranch: undefined, setupPhaseSignal: true });
+
+    await emitPrCreated('task-pane-noproof', { prNumber: 9999, source: 'pane-signal' });
+
+    const task = await taskStore.get('task-pane-noproof');
+    expect(task!.status).toBe('in_progress');
+    expect(task!.branch).toBe('bx/task-pane-noproof');
+    const intervention = findIntervention('task-pane-noproof');
+    expect(intervention!.data.phase).toBe('pane-pr-created-branch-mismatch');
+  });
+
+  it('pr.created (poller source) does NOT adopt an untracked PR on a custom-branch task', async () => {
+    await seedTask({ id: 'task-c-poll', status: 'in_progress', reviewRound: 0, prNumber: undefined, branch: 'feat/custom' });
+    const startSpy = vi.spyOn(manager, 'startSession');
+
+    await emitPrCreated('task-c-poll', { prNumber: 500, branch: 'feat/custom' });
+
+    const task = await taskStore.get('task-c-poll');
+    expect(task!.status).toBe('in_progress');
+    expect(startSpy).not.toHaveBeenCalled();
   });
 
   it('pane-signal pr.created REJECTS when PR branch is bound to another task', async () => {
     await seedTask({ id: 'task-pane-bound', status: 'in_progress', reviewRound: 0 });
     stubManager({ startSession: true, verifyPaneSignalPrNumber: undefined });
     vi.spyOn(manager, 'fetchPrHeadRef')
-      .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
+      .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: 'some description' });
     vi.spyOn(manager, 'findTaskByBranch')
       .mockResolvedValue({ id: 'task-other', branch: 'bx/task-other' } as TaskState);
     vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
@@ -340,20 +367,18 @@ describe('pr.created handler', () => {
     expect(intervention!.data.phase).toBe('pane-pr-created-branch-mismatch');
   });
 
-  it.each([
-    ['foreign bx/ prefix', 'task-pane-bx', { headRefName: 'bx/task-other', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' }],
-    ['PR body lacks managed marker', 'task-pane-nomark', { headRefName: 'fix/unmanaged', headSha: HEAD_SHA, body: 'just a plain PR' }],
-  ])('pane-signal pr.created REJECTS when %s', async (_label, id, headRef) => {
-    await seedTask({ id, status: 'in_progress', reviewRound: 0 });
+  it("pane-signal pr.created REJECTS when the PR is on another task's bx/ branch", async () => {
+    await seedTask({ id: 'task-pane-bx', status: 'in_progress', reviewRound: 0 });
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
-    vi.spyOn(manager, 'fetchPrHeadRef').mockResolvedValue(headRef);
+    vi.spyOn(manager, 'fetchPrHeadRef')
+      .mockResolvedValue({ headRefName: 'bx/task-other', headSha: HEAD_SHA, body: 'some description' });
     stubManager({ findTaskByBranch: undefined, setupPhaseSignal: true });
 
-    await emitPrCreated(id, { prNumber: 9999, source: 'pane-signal' });
+    await emitPrCreated('task-pane-bx', { prNumber: 9999, source: 'pane-signal' });
 
-    const task = await taskStore.get(id);
+    const task = await taskStore.get('task-pane-bx');
     expect(task!.status).toBe('in_progress');
-    expect(task!.branch).toBe(`bx/${id}`);
+    expect(task!.branch).toBe('bx/task-pane-bx');
   });
 
   it('pane-signal pr.created reject re-sets up develop watcher so a corrected emit can be consumed', async () => {
@@ -395,7 +420,7 @@ describe('pr.created handler', () => {
     await seedTask({ id: 'task-pane-txfail', status: 'in_progress', reviewRound: 0 });
     vi.spyOn(manager, 'verifyPaneSignalPrNumber').mockResolvedValue(undefined);
     vi.spyOn(manager, 'fetchPrHeadRef')
-      .mockResolvedValue({ headRefName: 'fix/conflict-branch', headSha: HEAD_SHA, body: '<!-- baxian:managed -->' });
+      .mockResolvedValue({ headRefName: 'bx/task-pane-txfail', headSha: HEAD_SHA, body: 'some description' });
     const { setupPhaseSignal: armSpy } = stubManager({ findTaskByBranch: undefined, transitionTaskStatus: null, setupPhaseSignal: true });
 
     await emitPrCreated('task-pane-txfail', { prNumber: 200, source: 'pane-signal' });
@@ -1758,8 +1783,8 @@ describe('pr.merged handler', () => {
     expect(cleanupSpy).toHaveBeenCalledWith('task-m6');
   });
 
-  it('persists prNumber/prUrl from event payload', async () => {
-    await seedTask({ id: 'task-m7', status: 'in_progress', reviewRound: 0, prNumber: undefined });
+  it('persists prNumber/prUrl from the merge of the PR it is tracking', async () => {
+    await seedTask({ id: 'task-m7', status: 'in_progress', reviewRound: 0, prNumber: 16 });
     vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
 
     await emitPrMerged('task-m7', { prNumber: 16, prUrl: 'https://github.com/user/repo/pull/16' });
@@ -1767,6 +1792,29 @@ describe('pr.merged handler', () => {
     const task = await taskStore.get('task-m7');
     expect(task!.prNumber).toBe(16);
     expect(task!.prUrl).toBe('https://github.com/user/repo/pull/16');
+  });
+
+  it('does NOT complete a custom-branch task from the merge of a PR it is not tracking (reused branch)', async () => {
+    await seedTask({ id: 'task-m-stale', status: 'in_progress', reviewRound: 0, prNumber: 58, branch: 'feat/reused' });
+    const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
+
+    await emitPrMerged('task-m-stale', { prNumber: 999, branch: 'feat/reused' });
+
+    const task = await taskStore.get('task-m-stale');
+    expect(task!.status).toBe('in_progress');
+    expect(cleanupSpy).not.toHaveBeenCalled();
+  });
+
+  it('completes a task on the merge of its own bx/<id> branch even if prNumber was never recorded', async () => {
+    await seedTask({ id: 'task-m-ownbx', status: 'in_progress', reviewRound: 0, prNumber: undefined });
+    const cleanupSpy = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
+
+    await emitPrMerged('task-m-ownbx', { prNumber: 77, branch: 'bx/task-m-ownbx' });
+
+    const task = await taskStore.get('task-m-ownbx');
+    expect(task!.status).toBe('merged');
+    expect(task!.prNumber).toBe(77);
+    expect(cleanupSpy).toHaveBeenCalledWith('task-m-ownbx');
   });
 
   it('already-merged task → no-op (terminal)', async () => {

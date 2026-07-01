@@ -73,7 +73,7 @@ export function ReviewConversation({ task }: Props) {
   if (!hasRoundRecords && !hasGithubReview) return null;
   return (
     <section className="mt-4" aria-label="评审记录">
-      <div className="mb-2 text-[15px] text-og-700">
+      <div className="mb-2 text-[16px] text-og-700">
         评审记录
       </div>
       <div className="space-y-4">
@@ -93,9 +93,9 @@ function ReviewRounds({ task }: Props) {
     navigate(`/tasks/${encodeURIComponent(task.id)}/rounds/${phase}/${round}${hash}`);
   }
 
-  if (error) return <div className="text-[13px] text-danger">加载评审记录失败：{error}</div>;
-  if (!loaded) return <div className="text-[13px] text-og-400">加载评审记录…</div>;
-  if ((rounds?.length ?? 0) === 0) return <div className="text-[13px] text-og-400">评审尚未开始</div>;
+  if (error) return <div className="text-[14px] text-danger">加载评审记录失败：{error}</div>;
+  if (!loaded) return <div className="text-[14px] text-og-400">加载评审记录…</div>;
+  if ((rounds?.length ?? 0) === 0) return <div className="text-[14px] text-og-400">评审尚未开始</div>;
 
   return (
     <>
@@ -119,7 +119,7 @@ function ReviewRounds({ task }: Props) {
 function ReviewGroup({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div>
-      <div className="mb-1.5 text-[11px] text-og-700">{title}</div>
+      <div className="mb-1.5 text-[12px] text-og-700">{title}</div>
       <div className="space-y-3">{children}</div>
     </div>
   );
@@ -135,7 +135,7 @@ function RoundBlock({
   const isSpec = round.phase === 'spec';
   return (
     <div>
-      <div className="mb-1 text-[11px] text-og-400">第 {round.round} 轮</div>
+      <div className="mb-1 text-[12px] text-og-400">第 {round.round} 轮</div>
       <div className="space-y-1.5">
         <TurnRow
           role="dev"
@@ -182,10 +182,10 @@ function TurnRow({
     <button
       type="button"
       onClick={onClick}
-      className="card flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] hover:border-accent"
+      className="card flex w-full items-center gap-2 px-3 py-2 text-left text-[14px] hover:border-accent"
     >
       <span
-        className={`shrink-0 min-w-[1.75rem] text-[11px] uppercase tracking-wide ${role === 'qa' ? 'text-[#c2410c]' : 'text-accent'}`}
+        className={`shrink-0 min-w-[1.75rem] text-[12px] uppercase tracking-wide ${role === 'qa' ? 'text-[#c2410c]' : 'text-accent'}`}
       >
         {role === 'qa' ? 'QA' : 'dev'}
       </span>

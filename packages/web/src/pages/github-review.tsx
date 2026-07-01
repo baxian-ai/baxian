@@ -69,9 +69,9 @@ export function GithubReviewPage() {
       </button>
       <div className="mb-1 flex flex-wrap items-baseline gap-2">
         <span className="font-mono text-og-400">{taskId}</span>
-        <span className="text-[15px] font-semibold text-og-1000">{task?.title ?? ''}</span>
+        <span className="text-[16px] font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
-      <div className="mb-4 flex flex-wrap items-center gap-2 text-[12px] text-og-500">
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-[13px] text-og-500">
         <span className="pill">代码评审</span>
         {prUrl && prNumber !== undefined && (
           <a href={prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
@@ -80,22 +80,22 @@ export function GithubReviewPage() {
         )}
       </div>
 
-      {!loaded && <div className="text-[13px] text-og-500">加载中…</div>}
-      {loaded && error && <div className="text-[13px] text-danger">加载评审记录失败：{error}</div>}
+      {!loaded && <div className="text-[14px] text-og-500">加载中…</div>}
+      {loaded && error && <div className="text-[14px] text-danger">加载评审记录失败：{error}</div>}
       {loaded && !error && data && !data.available && (
-        <div className="text-[13px] text-og-500">{REASON_TEXT[reasonOf(data.reason) ?? 'no-pr']}</div>
+        <div className="text-[14px] text-og-500">{REASON_TEXT[reasonOf(data.reason) ?? 'no-pr']}</div>
       )}
       {loaded && !error && data?.available &&
         (data.items.length === 0 ? (
           data.error ? (
-            <div className="text-[13px] text-warn">评审记录拉取失败：{data.error}</div>
+            <div className="text-[14px] text-warn">评审记录拉取失败：{data.error}</div>
           ) : (
-            <div className="text-[13px] text-og-400">评审尚未开始</div>
+            <div className="text-[14px] text-og-400">评审尚未开始</div>
           )
         ) : (
           <>
             {data.error && (
-              <div className="mb-3 text-[12px] text-warn">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
+              <div className="mb-3 text-[13px] text-warn">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
             )}
             <div className="space-y-5">
               {rounds.map((round, i) => (
@@ -112,7 +112,7 @@ function RoundBlock({ round, index }: { round: Round; index: number }) {
   const label = round.review ? `第 ${index + 1} 轮` : '进行中';
   return (
     <div>
-      <div className="mb-1.5 text-[12px] font-medium text-og-700">{label}</div>
+      <div className="mb-1.5 text-[13px] font-medium text-og-700">{label}</div>
       <div className="space-y-2">
         {round.items.map((it) => (
           <ItemRow key={`${it.kind}-${it.id}`} item={it} />
@@ -126,12 +126,12 @@ function RoundBlock({ round, index }: { round: Round; index: number }) {
 function ItemRow({ item }: { item: GithubReviewItem }) {
   if (item.kind === 'commit') {
     return (
-      <div className="card p-3 text-[13px]">
+      <div className="card p-3 text-[14px]">
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <span className="pill shrink-0">提交</span>
-          {item.commitSha && <span className="font-mono text-[12px] text-og-500">{item.commitSha.slice(0, 9)}</span>}
-          {item.author && <span className="text-[12px] text-og-400">{item.author}</span>}
-          {item.createdAt && <span className="text-[12px] text-og-400">{fmt(item.createdAt)}</span>}
+          {item.commitSha && <span className="font-mono text-[13px] text-og-500">{item.commitSha.slice(0, 9)}</span>}
+          {item.author && <span className="text-[13px] text-og-400">{item.author}</span>}
+          {item.createdAt && <span className="text-[13px] text-og-400">{fmt(item.createdAt)}</span>}
         </div>
         {item.body && <div className="whitespace-pre-wrap break-words text-og-800">{item.body}</div>}
       </div>
@@ -139,17 +139,17 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
   }
   const isInline = item.kind === 'review-comment';
   return (
-    <div className="card p-3 text-[13px]">
+    <div className="card p-3 text-[14px]">
       <div className="mb-1 flex flex-wrap items-center gap-2">
         <span className="pill shrink-0">{isInline ? '行内评论' : '评论'}</span>
         {item.author && <span className="font-medium text-og-700">{item.author}</span>}
         {isInline && item.path && (
-          <span className="min-w-0 break-all font-mono text-[12px] text-og-500">
+          <span className="min-w-0 break-all font-mono text-[13px] text-og-500">
             {item.line !== undefined ? `${item.path}:${item.line}` : item.path}
           </span>
         )}
-        {item.inReplyTo && <span className="text-[12px] text-og-400">↩ 回复</span>}
-        {item.createdAt && <span className="text-[12px] text-og-400">{fmt(item.createdAt)}</span>}
+        {item.inReplyTo && <span className="text-[13px] text-og-400">↩ 回复</span>}
+        {item.createdAt && <span className="text-[13px] text-og-400">{fmt(item.createdAt)}</span>}
       </div>
       <Body item={item} />
     </div>
@@ -159,15 +159,15 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
 function ReviewBlock({ item }: { item: GithubReviewItem }) {
   const verdict = item.verdict ?? 'comment';
   return (
-    <div className="card p-3 text-[13px]">
+    <div className="card p-3 text-[14px]">
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className="shrink-0 min-w-[1.75rem] text-[11px] font-semibold uppercase tracking-wide text-[#c2410c]">
+        <span className="shrink-0 min-w-[1.75rem] text-[12px] font-semibold uppercase tracking-wide text-[#c2410c]">
           QA
         </span>
         <span className={VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
-        {item.author && <span className="text-[12px] text-og-400">{item.author}</span>}
-        {item.commitSha && <span className="font-mono text-[12px] text-og-500">{item.commitSha.slice(0, 9)}</span>}
-        {item.createdAt && <span className="text-[12px] text-og-400">{fmt(item.createdAt)}</span>}
+        {item.author && <span className="text-[13px] text-og-400">{item.author}</span>}
+        {item.commitSha && <span className="font-mono text-[13px] text-og-500">{item.commitSha.slice(0, 9)}</span>}
+        {item.createdAt && <span className="text-[13px] text-og-400">{fmt(item.createdAt)}</span>}
       </div>
       <Body item={item} placeholder="（无评审正文）" />
     </div>
@@ -182,7 +182,7 @@ function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: str
       ) : placeholder ? (
         <div className="text-og-400">{placeholder}</div>
       ) : null}
-      {item.bodyTruncated && <div className="mt-1 text-[12px] text-warn">内容较大，已截断。</div>}
+      {item.bodyTruncated && <div className="mt-1 text-[13px] text-warn">内容较大，已截断。</div>}
     </>
   );
 }

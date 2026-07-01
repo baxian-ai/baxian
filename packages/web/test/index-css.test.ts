@@ -8,6 +8,14 @@ const css = readFileSync(
   'utf8',
 );
 
+describe('index.css base typography', () => {
+  it('sets the base body font-size to 15px (one notch above the former 14px baseline)', () => {
+    const body = css.match(/body\s*\{([\s\S]*?)\}/);
+    expect(body).not.toBeNull();
+    expect(body![1]).toMatch(/font-size:\s*15px/);
+  });
+});
+
 describe('index.css mobile rules', () => {
   it('disables iOS landscape text inflation via text-size-adjust on the body', () => {
     expect(css).toMatch(/-webkit-text-size-adjust:\s*100%/);

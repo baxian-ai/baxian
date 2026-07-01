@@ -20,9 +20,9 @@ const REPO_URL_PATTERNS = [
 ];
 
 const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[13px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-[12px] font-medium text-og-700';
-const fieldErrCls = 'mt-1 text-[12px] text-danger';
+  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[14px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
+const labelCls = 'mb-1.5 block text-[13px] font-medium text-og-700';
+const fieldErrCls = 'mt-1 text-[13px] text-danger';
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [id, setId] = useState('');
@@ -122,7 +122,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     >
       <form id="create-project-form" onSubmit={handleSubmit} className="space-y-3">
         {error && (
-          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[13px] text-danger">
+          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[14px] text-danger">
             {error}
           </div>
         )}
@@ -166,7 +166,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-[#1348dc]"
             />
-            <span className="text-[13px] text-og-800">人类合并（默认）</span>
+            <span className="text-[14px] text-og-800">人类合并（默认）</span>
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -177,7 +177,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-[#1348dc]"
             />
-            <span className="text-[13px] text-og-800">QA Approve 后自动合并</span>
+            <span className="text-[14px] text-og-800">QA Approve 后自动合并</span>
           </label>
         </div>
 
@@ -192,7 +192,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-[#1348dc]"
             />
-            <span className="text-[13px] text-og-800">跟随全局</span>
+            <span className="text-[14px] text-og-800">跟随全局</span>
           </label>
           <label className="mb-1 flex items-center gap-2">
             <input
@@ -203,7 +203,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-[#1348dc]"
             />
-            <span className="text-[13px] text-og-800">GitHub PR</span>
+            <span className="text-[14px] text-og-800">GitHub PR</span>
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -214,7 +214,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-[#1348dc]"
             />
-            <span className="text-[13px] text-og-800">Server</span>
+            <span className="text-[14px] text-og-800">Server</span>
           </label>
         </div>
       </form>

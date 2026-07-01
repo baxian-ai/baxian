@@ -177,7 +177,7 @@ describe('TaskDetail page — header & info', () => {
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
     expect(within(container.querySelector('section')!).getByText('approved').className).toContain('pill');
-    expect(container.textContent).toContain('Created at 2026-05-10 20:00:00, Updated at 2026-05-10 21:00:00');
+    expect(container.textContent).toContain('Created at 2026-05-10 20:00, Updated at 2026-05-10 21:00');
     expect(container.textContent).toContain('Task body here');
     expect(container.textContent).toContain('Round 1');
     expect(container.textContent).toContain('Spec 0');
@@ -204,18 +204,19 @@ describe('TaskDetail page — header & info', () => {
     expect(section.textContent).not.toContain('QA:');
   });
 
-  it('renders timestamps in the local timezone and tolerates empty values', () => {
+  it('renders timestamps at minute precision and tolerates empty values', () => {
     open({ createdAt: '2026-05-10T12:00:00.000Z', updatedAt: null as unknown as string });
-    expect(screen.getByText('Created at 2026-05-10 20:00:00, Updated at')).toBeTruthy();
+    expect(screen.getByText('Created at 2026-05-10 20:00, Updated at')).toBeTruthy();
   });
 
-  it('places the action buttons on their own row below the title', () => {
+  it('places the action buttons on their own row below the status capsule, not in the title', () => {
     const { container } = open({ status: 'pending' });
-    const h1 = container.querySelector('h1')!;
+    const section = container.querySelector('section')!;
     const actionsRow = screen.getByRole('button', { name: 'Edit' }).parentElement!;
-    expect(h1.contains(actionsRow)).toBe(false);
-    expect(h1.nextElementSibling).toBe(actionsRow);
-    expect(actionsRow.className).toContain('mt-3');
+    expect(container.querySelector('h1')!.contains(actionsRow)).toBe(false);
+    expect(section.contains(actionsRow)).toBe(true);
+    const capsuleRow = within(section).getByText('pending').parentElement!;
+    expect(capsuleRow.compareDocumentPosition(actionsRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   const QA_BANNER = 'QA approved · verifying feedback';

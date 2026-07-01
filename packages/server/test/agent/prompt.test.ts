@@ -651,17 +651,16 @@ describe('server review mode prompt builders', () => {
   });
 });
 
-describe('server-phase prompt builders (managed-PR marker, findings compaction)', () => {
+describe('server-phase prompt builders (findings compaction)', () => {
   const getRegistry = useServerPhaseRegistry('baxian-r8-');
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
 
-  it('baxian-server-feedback §Publish demands the managed-PR marker and the PR-number signal', async () => {
+  it('baxian-server-feedback §Publish emits the PR-number signal', async () => {
     const body = await readFile(
       fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
       'utf-8',
     );
     expect(body).toContain('## Publish');
-    expect(body).toContain('<!-- baxian:managed -->');
     expect(body).toContain('[bx:code-ready:<pr_number>:<token>]');
   });
 

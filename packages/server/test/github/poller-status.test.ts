@@ -25,8 +25,8 @@ function managedPr(o: ManagedPrOverrides = {}): Record<string, unknown> {
   return {
     number,
     html_url: o.html_url ?? `https://github.com/u/r/pull/${number}`,
-    body: '<!-- baxian:managed -->',
-    head: { ref: o.ref ?? `bx/task-${number}`, sha: o.sha ?? 'a'.repeat(40) },
+    head: { ref: o.ref ?? `bx/task-${number}`, sha: o.sha ?? 'a'.repeat(40), repo: { full_name: REPO } },
+    base: { repo: { full_name: REPO } },
     state: 'open',
     merged_at: null,
     updated_at: o.updated_at ?? '2026-05-12T00:00:00Z',
@@ -275,7 +275,8 @@ describe('GitHubPoller.snapshots()', () => {
       }));
       const prData = JSON.stringify([{
         number: 300,
-        head: { ref: 'bx/task-legacy', sha },
+        head: { ref: 'bx/task-legacy', sha, repo: { full_name: REPO } },
+        base: { repo: { full_name: REPO } },
         html_url: 'https://github.com/u/r/pull/300',
         state: 'open',
         merged_at: null,

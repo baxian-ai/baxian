@@ -2,8 +2,6 @@ import { AGENT_PHASES, type AgentConfig, type AgentRole, type AgentRuntime, type
 import type { SkillRegistry } from '../skill/registry.js';
 import { scanPhaseSignals } from './phase-signal.js';
 
-export const BAXIAN_PR_CLAIM = '<!-- baxian:managed -->';
-
 export const MAX_PROMPT_BYTES = 80 * 1024;
 export const MAX_PROMPT_BYTES_ROUTE_LIMIT = MAX_PROMPT_BYTES - 1024;
 

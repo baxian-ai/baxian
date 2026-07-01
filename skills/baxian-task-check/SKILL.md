@@ -17,7 +17,7 @@ If an `images:` list is present, read each path (baxian downloaded the user's up
 ## Conventions
 
 Your `exchange:` field selects the cross-agent medium:
-- `github-pr` — communicate via the GitHub PR (description, commits, reviews, comments). A managed PR's description first line MUST be `<!-- baxian:managed -->`. Stay in scope — out-of-scope work goes to a new GitHub Issue.
+- `github-pr` — communicate via the GitHub PR (description, commits, reviews, comments). Commit on the branch already checked out in your `worktree:` — do NOT create or push a differently-named branch, or baxian can't match the PR to your task. Stay in scope — out-of-scope work goes to a new GitHub Issue.
 - `server-files` — baxian reads your worktree directly; do NOT push or open a PR (the publish phase does that). Stay in scope.
 
 A PR you open MUST be ready for review (not Draft): do NOT use `--draft`; if it is draft after creation, run `gh pr ready` before signaling.

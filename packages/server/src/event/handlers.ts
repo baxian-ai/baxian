@@ -1,5 +1,4 @@
 import { createSignalToken, type PhaseSignalKind } from '../agent/phase-signal.js';
-import { BAXIAN_PR_CLAIM } from '../agent/prompt.js';
 import { BRANCH_PREFIX, TASK_TERMINAL_STATUS_SET, isValidBranchName, type BaxianEvent, type TaskState } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import { type AgentManager, DispatchTerminalError, EnsureSessionError } from '../agent/manager.js';
@@ -856,9 +855,13 @@ export function registerEventHandlers(
               const isForeignBxBranch = prInfo.headRefName.startsWith(BRANCH_PREFIX)
                 && prInfo.headRefName !== ownPrefix;
               const bound = await manager.findTaskByBranch(prInfo.headRefName, taskNow.projectId);
-              const hasClaimMarker = prInfo.body.includes(BAXIAN_PR_CLAIM);
-              if (!isForeignBxBranch && hasClaimMarker && isValidBranchName(prInfo.headRefName)
-                && (!bound || bound.id === taskNow.id)) {
+              const isOwnBxBranch = prInfo.headRefName === ownPrefix;
+              const boundToThisTask = !!bound && bound.id === taskNow.id;
+              // Adopt only on deterministic ownership — our own bx/<taskId> namespace or a branch this
+              // task already owns. A dev-chosen branch that is neither is rejected to intervention, not
+              // adopted on an unverifiable claim (a mis-reported PR number must not rebind the task).
+              if (!isForeignBxBranch && isValidBranchName(prInfo.headRefName)
+                && (isOwnBxBranch || boundToThisTask)) {
                 reconciledBranch = prInfo.headRefName;
                 verified = prInfo;
               }
@@ -902,6 +905,20 @@ export function registerEventHandlers(
 
     const createdHeadSha = validHeadSha(event.data.headSha) ?? paneVerifiedHeadSha;
     const taskBeforeTransition = await manager.getTask(event.taskId);
+    // A poller-sourced pr.created adopts by branch match alone (no pane verify). bx/<taskId> is unique
+    // to this task; a custom branch name can be reused, so for a custom-branch task only accept a PR it
+    // already tracks — a new custom-branch PR must arrive via the deterministic pane signal, not by the
+    // poller matching a stale/foreign open PR that happens to share the branch name.
+    if (event.data.source !== 'pane-signal'
+      && taskBeforeTransition
+      && taskBeforeTransition.branch !== BRANCH_PREFIX + event.taskId
+      && taskBeforeTransition.prNumber !== event.data.prNumber) {
+      console.warn(
+        `[EventHandler] pr.created: ignoring poller-sourced PR ${event.data.prNumber} on custom branch ` +
+        `for task ${event.taskId} (untracked; custom-branch PRs adopt via the pane signal)`,
+      );
+      return;
+    }
     const result = await manager.transitionTaskStatus(
       event.taskId,
       'review',
@@ -1069,6 +1086,17 @@ export function registerEventHandlers(
 
     const eventPrNumber = event.data.prNumber as number | undefined;
     const eventPrUrl = event.data.prUrl as string | undefined;
+
+    // The poller surfaces every merged PR on a managed branch — including a stale one whose number
+    // this task never tracked (e.g. a reused custom branch name). bx/<taskId> is unique to this task,
+    // so its merge is definitively ours even if pr.created was missed and prNumber was never recorded;
+    // for any other branch require the tracked PR number to match, else a foreign/stale merge on a
+    // reused custom branch name could prematurely finish an active task.
+    const taskBefore = await manager.getTask(event.taskId);
+    if (!taskBefore) return;
+    const mergedOwnBxBranch = (event.data.branch as string | undefined) === BRANCH_PREFIX + event.taskId;
+    if (!mergedOwnBxBranch && typeof eventPrNumber === 'number' && taskBefore.prNumber !== eventPrNumber) return;
+
     const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
       ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
       ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),

@@ -32,7 +32,7 @@ Then emit your `signal:` (`code-fixed` or `spec-fixed`) with `token:`.
 ## Publish
 
 Publish the reviewed `branch:`:
-- `publish: pr` — `git push -u origin <branch>`, open a managed PR (`gh pr create`; the body MUST end with the `<!-- baxian:managed -->` marker or baxian ignores the PR's merge/comment events; ready for review, not Draft). Emit `code-ready` carrying the new PR number: `[bx:code-ready:<pr_number>:<token>]`.
+- `publish: pr` — `git push -u origin <branch>`, open a managed PR (`gh pr create`; ready for review, not Draft). Emit `code-ready` carrying the new PR number: `[bx:code-ready:<pr_number>:<token>]`.
 - `publish: branch` — `git push -u origin <branch>`, then emit `code-ready` with `token:`.
 
 Signal wire format and emit rules: see the **baxian-signals** skill.

@@ -437,7 +437,7 @@ export function PaneTerminal({
   return (
     <div className={className ?? 'flex flex-col h-full w-full min-h-0 bg-[#fdfdfd]'}>
       {(error || sessionGone) && (
-        <div className="border-b border-[#fecaca] bg-[#fef2f2] px-3 py-1 font-mono text-[11px] text-danger">
+        <div className="border-b border-[#fecaca] bg-[#fef2f2] px-3 py-1 font-mono text-[12px] text-danger">
           {sessionGone ? 'session ended' : error}
         </div>
       )}

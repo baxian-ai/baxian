@@ -320,16 +320,16 @@ export function AgentCard({
       )}
       <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-mono text-[11px] font-medium uppercase tracking-[0.05em] text-og-500">{role}</span>
+          <span className="shrink-0 font-mono text-[12px] font-medium uppercase tracking-[0.05em] text-og-500">{role}</span>
           <span
-            className="min-w-0 truncate whitespace-nowrap font-display text-[14px] font-semibold text-og-1000"
+            className="min-w-0 truncate whitespace-nowrap font-display text-[15px] font-semibold text-og-1000"
             title={agentRuntimeTitle(agent.id, runtime)}
           >
             {agent.id}
           </span>
           {runtimeTypeLabel && (
             <span
-              className="hidden shrink-0 whitespace-nowrap text-[12px] text-og-400 sm:inline"
+              className="hidden shrink-0 whitespace-nowrap text-[13px] text-og-400 sm:inline"
               title={runtimeTypeLabel}
             >
               ({runtimeTypeLabel})
@@ -352,18 +352,18 @@ export function AgentCard({
         </div>
       </div>
       {bootstrapBlocksTerminal && (
-        <div className="mb-2 rounded-md border border-accent-soft bg-accent-soft/40 px-2.5 py-2 text-[12px] text-accent">
+        <div className="mb-2 rounded-md border border-accent-soft bg-accent-soft/40 px-2.5 py-2 text-[13px] text-accent">
           Agent 正在启动，终端可用后会自动刷新。
         </div>
       )}
       {isAwaitingHuman && (
-        <div className="mb-2 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-2 text-[12px] text-warn">
+        <div className="mb-2 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-2 text-[13px] text-warn">
           <span className="font-mono">{agent.binding?.awaitingPhase}</span>
           {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
         </div>
       )}
       {!isBootstrapping && agent.runtimeStatus === 'pending' && (
-        <div className="mb-2 space-y-1 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-2 text-[12px] text-warn">
+        <div className="mb-2 space-y-1 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-2 text-[13px] text-warn">
           <div className="font-medium">等待人工介入</div>
           <div>
             Agent 正在等待人工输入。请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">Terminal</Link> 处理；
@@ -372,19 +372,19 @@ export function AgentCard({
         </div>
       )}
       {agent.latestError && (
-        <div className="mb-2 space-y-1 rounded-md border border-[#fecaca] bg-[#fef2f2] px-2.5 py-2 text-[12px] text-danger">
+        <div className="mb-2 space-y-1 rounded-md border border-[#fecaca] bg-[#fef2f2] px-2.5 py-2 text-[13px] text-danger">
           <div className="break-words font-medium">{agent.latestError.message}</div>
-          <div className="font-mono text-[11px] opacity-80">{agent.latestError.reason} · {agent.latestError.occurredAt}</div>
+          <div className="font-mono text-[12px] opacity-80">{agent.latestError.reason} · {agent.latestError.occurredAt}</div>
         </div>
       )}
       {agent.latestBootstrapError && (
-        <div className="mb-2 space-y-1 rounded-md border border-[#fecaca] bg-[#fef2f2] px-2.5 py-2 text-[12px] text-danger">
+        <div className="mb-2 space-y-1 rounded-md border border-[#fecaca] bg-[#fef2f2] px-2.5 py-2 text-[13px] text-danger">
           <div className="break-words font-medium">{agent.latestBootstrapError.message}</div>
           {agent.latestBootstrapError.recommendation && (
             <div className="break-words">{agent.latestBootstrapError.recommendation}</div>
           )}
           <div className="flex items-center justify-between gap-2">
-            <div className="truncate font-mono text-[11px] opacity-80">
+            <div className="truncate font-mono text-[12px] opacity-80">
               {agent.latestBootstrapError.reason} · {agent.latestBootstrapError.occurredAt}
             </div>
             <button
@@ -399,7 +399,7 @@ export function AgentCard({
         </div>
       )}
       {showTaskBinding && taskId && (
-        <div className="mb-2 text-[12px] text-og-500">
+        <div className="mb-2 text-[13px] text-og-500">
           Task: <span className="font-mono text-og-700">{taskId}</span>
         </div>
       )}
@@ -418,7 +418,7 @@ export function AgentCard({
           onKeyDown={onTerminalContainerKeyDown}
         >
           {terminalDisabled ? (
-            <div className="flex h-full items-center justify-center px-3 text-[13px] text-og-500">
+            <div className="flex h-full items-center justify-center px-3 text-[14px] text-og-500">
               {terminalDisabledMessage}
             </div>
           ) : isSelectableEmbedded ? (
@@ -433,14 +433,14 @@ export function AgentCard({
         </div>
       )}
       {pendingRestart && (
-        <div className="mb-2 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-1.5 text-[12px] text-warn">
+        <div className="mb-2 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-1.5 text-[13px] text-warn">
           ⚠️ 重启 baxian server 后生效
         </div>
       )}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-none">
           {terminalDisabled ? (
-            <span className="shrink-0 cursor-not-allowed text-[13px] text-og-400" title={terminalDisabledMessage}>
+            <span className="shrink-0 cursor-not-allowed text-[14px] text-og-400" title={terminalDisabledMessage}>
               Terminal
             </span>
           ) : (
@@ -513,7 +513,7 @@ export function AgentCard({
                 onClick={() => { setMenuOpen(false); setPetModalOpen(true); }}
                 disabled={compacting || clearing || deleting}
                 title="配置 Agent Pet（在状态位置显示动画宠物）"
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-[14px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Agent Pet
               </button>
@@ -523,7 +523,7 @@ export function AgentCard({
                 onClick={() => { setMenuOpen(false); void handleCompact(); }}
                 disabled={compacting || clearing || deleting}
                 title="向 agent runtime 发送 /compact 压缩上下文"
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-[14px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {compacting ? 'Compacting…' : 'Compact'}
               </button>
@@ -533,7 +533,7 @@ export function AgentCard({
                 onClick={() => { setMenuOpen(false); void handleClear(); }}
                 disabled={clearing || compacting || deleting}
                 title="向 agent runtime 发送 /clear 清空上下文"
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-[14px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {clearing ? 'Clearing…' : 'Clear'}
               </button>
@@ -544,7 +544,7 @@ export function AgentCard({
                   onClick={() => { setMenuOpen(false); void handleRequestReview(); }}
                   disabled={reviewing || deleting}
                   title={`让 QA 立即对 task ${taskId} 跑一轮 review（需要该 task 已有 PR）`}
-                  className="block w-full px-3 py-1.5 text-left text-[13px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="block w-full px-3 py-1.5 text-left text-[14px] text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {reviewing ? 'Dispatching…' : 'Call review'}
                 </button>
@@ -554,7 +554,7 @@ export function AgentCard({
                 role="menuitem"
                 onClick={() => { setMenuOpen(false); void handleDelete(); }}
                 disabled={deleting || compacting || clearing}
-                className="block w-full px-3 py-1.5 text-left text-[13px] text-danger hover:bg-[#fef2f2] disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-[14px] text-danger hover:bg-[#fef2f2] disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {deleting ? 'Deleting…' : 'Delete'}
               </button>
@@ -562,8 +562,8 @@ export function AgentCard({
           )}
         </div>
       </div>
-      {stopError && <div className="mt-1.5 break-words text-[12px] text-danger">{stopError}</div>}
-      {deleteError && <div className="mt-1.5 break-words text-[12px] text-danger">{deleteError}</div>}
+      {stopError && <div className="mt-1.5 break-words text-[13px] text-danger">{stopError}</div>}
+      {deleteError && <div className="mt-1.5 break-words text-[13px] text-danger">{deleteError}</div>}
       {petModalOpen && (
         <AgentPetConfigModal
           agentId={agent.id}

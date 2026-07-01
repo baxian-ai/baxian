@@ -15,12 +15,12 @@ export interface PollerEntry {
 
 export type StatePathProvider = (project: ProjectConfig) => string | undefined;
 
-export type KnownBranchesProvider = (projectId: string) => Promise<ReadonlySet<string>>;
+export type KnownPrNumbersProvider = (projectId: string) => Promise<ReadonlySet<number>>;
 
 export interface PollerOptions {
   runner: CommandRunner;
   onEvent: (projectId: string, event: MappedEvent) => void | Promise<void>;
-  knownBranchesFor?: KnownBranchesProvider;
+  knownPrNumbersFor?: KnownPrNumbersProvider;
 }
 
 export function pollerStatePathFor(stateDir: string, repo: string): string {
@@ -108,7 +108,7 @@ function trimStderr(stderr: string, maxLen = 500): string {
 export class GitHubPoller {
   private runner: CommandRunner;
   private onEvent: (projectId: string, event: MappedEvent) => void | Promise<void>;
-  private knownBranchesFor?: KnownBranchesProvider;
+  private knownPrNumbersFor?: KnownPrNumbersProvider;
   private entries: InternalEntry[] = [];
   private periodicRunner?: PeriodicTaskRunner;
   private intervalMs?: number;
@@ -118,7 +118,7 @@ export class GitHubPoller {
   constructor(options: PollerOptions) {
     this.runner = options.runner;
     this.onEvent = options.onEvent;
-    this.knownBranchesFor = options.knownBranchesFor;
+    this.knownPrNumbersFor = options.knownPrNumbersFor;
   }
 
   add(entry: PollerEntry): InternalEntry {
@@ -365,8 +365,8 @@ export class GitHubPoller {
     let prs: Array<{
       number: number;
       html_url: string;
-      body?: string | null;
-      head: { ref: string; sha: string };
+      head: { ref: string; sha: string; repo?: { full_name?: string } | null };
+      base: { repo?: { full_name?: string } };
       state: 'open' | 'closed';
       merged_at: string | null;
       updated_at: string;
@@ -382,14 +382,20 @@ export class GitHubPoller {
       throw new Error(`pollPullRequests: expected array, got ${typeof prs}`);
     }
 
-    const knownBranches = await this.knownBranchesFor?.(entry.projectId)
-      ?? new Set<string>();
+    const knownPrNumbers = await this.knownPrNumbersFor?.(entry.projectId)
+      ?? new Set<number>();
 
     const seenMerged = new Set(entry.cursor.mergedPrs);
     const cycleErrors: string[] = [];
 
     for (const pr of prs) {
-      if (!isManagedPr(pr.head.ref, pr.body, knownBranches)) continue;
+      if (!isManagedPr(pr.head.ref, pr.number, knownPrNumbers)) continue;
+      // baxian only ever opens PRs from its own repo; a head repo that differs from — or is missing
+      // (a deleted/invisible fork) — the base repo means an external PR that merely reused a bx/ or
+      // known branch name. Fail closed: only a confirmed same-repo PR is ours.
+      const headRepo = pr.head.repo?.full_name;
+      const baseRepo = pr.base?.repo?.full_name;
+      if (!headRepo || headRepo !== baseRepo) continue;
 
       if (pr.state === 'closed' && pr.merged_at && !seenMerged.has(pr.number)) {
         try {

@@ -94,6 +94,17 @@ describe('formatTaskTimestamp', () => {
   it('falls back to the raw string when it is not a parseable date', () => {
     expect(formatTaskTimestamp('not-a-date')).toBe('not-a-date');
   });
+
+  it('drops seconds down to minute precision when withSeconds is false', () => {
+    expect(formatTaskTimestamp('2026-05-10T12:00:45.000Z', false)).toBe('2026-05-10 20:00');
+    expect(formatTaskTimestamp('2026-05-10 14:30:45', false)).toBe('2026-05-10 14:30');
+    expect(formatTaskTimestamp('2026-05-10 14:30', false)).toBe('2026-05-10 14:30');
+  });
+
+  it('still returns "" for empty values regardless of precision', () => {
+    expect(formatTaskTimestamp(null, false)).toBe('');
+    expect(formatTaskTimestamp('   ', false)).toBe('');
+  });
 });
 
 describe('taskDetailPath', () => {

@@ -55,9 +55,9 @@ export function ReviewRoundPage() {
       </button>
       <div className="mb-1 flex flex-wrap items-baseline gap-2">
         <span className="font-mono text-og-400">{taskId}</span>
-        <span className="text-[15px] font-semibold text-og-1000">{task?.title ?? ''}</span>
+        <span className="text-[16px] font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
-      <div className="mb-4 flex flex-wrap items-center gap-2 text-[12px] text-og-500">
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-[13px] text-og-500">
         <span className="pill">{phase}</span>
         <span>第 {round} 轮</span>
         {data?.findings && (
@@ -73,12 +73,12 @@ export function ReviewRoundPage() {
         )}
       </div>
 
-      {!loaded && <div className="text-[13px] text-og-500">加载中…</div>}
+      {!loaded && <div className="text-[14px] text-og-500">加载中…</div>}
       {loaded && error && (
-        <div className="text-[13px] text-danger">加载评审记录失败：{error}</div>
+        <div className="text-[14px] text-danger">加载评审记录失败：{error}</div>
       )}
       {loaded && !error && !data && (
-        <div className="text-[13px] text-danger">未找到该轮评审（{phase} 第 {round} 轮）。</div>
+        <div className="text-[14px] text-danger">未找到该轮评审（{phase} 第 {round} 轮）。</div>
       )}
       {data && <RoundDetail round={data} />}
     </div>
@@ -93,38 +93,38 @@ function RoundDetail({ round }: { round: ReviewRound }) {
   return (
     <div className="space-y-6">
       <section id="diff">
-        <h2 className="mb-2 text-[13px] font-semibold text-og-800">
+        <h2 className="mb-2 text-[14px] font-semibold text-og-800">
           {round.phase === 'spec' ? '规格稿' : '代码改动'}
         </h2>
         {round.contentTruncated && (
-          <div className="mb-2 text-[12px] text-warn">内容较大，展示的是截断后的片段。</div>
+          <div className="mb-2 text-[13px] text-warn">内容较大，展示的是截断后的片段。</div>
         )}
         {round.content ? (
           round.phase === 'spec' ? (
-            <pre className="card whitespace-pre-wrap break-words p-4 text-[13px] text-og-800">{round.content}</pre>
+            <pre className="card whitespace-pre-wrap break-words p-4 text-[14px] text-og-800">{round.content}</pre>
           ) : (
             <DiffView content={round.content} diffstat={round.diffstat} />
           )
         ) : (
-          <div className="text-[13px] text-og-400">无内容</div>
+          <div className="text-[14px] text-og-400">无内容</div>
         )}
       </section>
 
       <section id="review">
-        <h2 className="mb-2 text-[13px] font-semibold text-og-800">QA 评审</h2>
+        <h2 className="mb-2 text-[14px] font-semibold text-og-800">QA 评审</h2>
         {round.findings === undefined ? (
-          <div className="text-[13px] text-og-400">评审尚未提交。</div>
+          <div className="text-[14px] text-og-400">评审尚未提交。</div>
         ) : findings.length === 0 ? (
-          <div className="text-[13px] text-og-400">本轮无 findings。</div>
+          <div className="text-[14px] text-og-400">本轮无 findings。</div>
         ) : (
           <div className="space-y-2">
             {findings.map((f) => (
-              <div key={f.id} className="card p-3 text-[13px]">
+              <div key={f.id} className="card p-3 text-[14px]">
                 <div className="mb-1 flex flex-wrap items-center gap-2">
                   <span className="font-mono text-og-400">{f.id}</span>
                   <span className={SEVERITY_CLASS[f.severity]}>{f.severity}</span>
                   {findingLocation(f) && (
-                    <span className="min-w-0 break-all font-mono text-[12px] text-og-500">{findingLocation(f)}</span>
+                    <span className="min-w-0 break-all font-mono text-[13px] text-og-500">{findingLocation(f)}</span>
                   )}
                 </div>
                 <div className="whitespace-pre-wrap break-words text-og-800">{f.message}</div>
@@ -136,20 +136,20 @@ function RoundDetail({ round }: { round: ReviewRound }) {
 
       {responses.length > 0 && (
         <section id="response">
-          <h2 className="mb-2 text-[13px] font-semibold text-og-800">Dev 反馈</h2>
+          <h2 className="mb-2 text-[14px] font-semibold text-og-800">Dev 反馈</h2>
           <div className="space-y-2">
             {responses.map((r) => {
               const f = findingById.get(r.findingId);
               return (
-                <div key={r.findingId} className="card p-3 text-[13px]">
+                <div key={r.findingId} className="card p-3 text-[14px]">
                   <div className="mb-1 flex flex-wrap items-center gap-2">
                     <span className="font-mono text-og-400">{r.findingId}</span>
                     <span className={ACTION_CLASS[r.action]}>{r.action}</span>
                     {r.commitSha && (
-                      <span className="font-mono text-[12px] text-og-500">{r.commitSha.slice(0, 9)}</span>
+                      <span className="font-mono text-[13px] text-og-500">{r.commitSha.slice(0, 9)}</span>
                     )}
                   </div>
-                  {f && <div className="mb-1 break-words text-[12px] text-og-500">↳ {f.message}</div>}
+                  {f && <div className="mb-1 break-words text-[13px] text-og-500">↳ {f.message}</div>}
                   <div className="whitespace-pre-wrap break-words text-og-800">{r.rationale}</div>
                 </div>
               );

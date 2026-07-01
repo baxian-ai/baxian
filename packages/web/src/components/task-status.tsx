@@ -47,7 +47,7 @@ export function shortTaskId(id: string): string {
   return match ? match[1] : id;
 }
 
-export function formatTaskTimestamp(value: unknown): string {
+export function formatTaskTimestamp(value: unknown, withSeconds = true): string {
   if (value === null || value === undefined) return '';
   const normalized = String(value).trim();
   if (!normalized) return '';
@@ -56,8 +56,9 @@ export function formatTaskTimestamp(value: unknown): string {
   const date = new Date(normalized.replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T'));
   if (Number.isNaN(date.getTime())) return normalized;
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
-    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const day = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return withSeconds ? `${day} ${time}:${pad(date.getSeconds())}` : `${day} ${time}`;
 }
 
 export function taskDetailPath(projectId: string, taskId: string): string {

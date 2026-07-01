@@ -11,7 +11,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
       },
     };
     const result = mapGitHubEvent('pull_request', payload);
@@ -29,25 +29,11 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123', sha: 'abc1234567890123456789012345678901234567' },
+        head: { ref: 'bx/task-123', sha: 'abc1234567890123456789012345678901234567', repo: { full_name: REPO } },
       },
     };
     const result = mapGitHubEvent('pull_request', payload);
     expect(result?.data.headSha).toBe('abc1234567890123456789012345678901234567');
-  });
-
-  it('accepts pull_request.opened with bx/ branch and body containing the marker', () => {
-    const payload = {
-      action: 'opened',
-      repository: { full_name: REPO },
-      pull_request: {
-        number: 7,
-        html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
-        body: '<!-- baxian:managed -->\n\nAdds login fix',
-      },
-    };
-    expect(mapGitHubEvent('pull_request', payload)).not.toBeNull();
   });
 
   it('maps pull_request.edited with bx/ branch to pr.updated with kind=pr-edit', () => {
@@ -57,7 +43,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
       },
     };
     const result = mapGitHubEvent('pull_request', payload);
@@ -83,6 +69,7 @@ describe('mapGitHubEvent', () => {
         head: {
           ref: 'bx/task-123',
           sha: 'cccccccccccccccccccccccccccccccccccccccc',
+          repo: { full_name: REPO },
         },
       },
     };
@@ -107,7 +94,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
         merged: true,
       },
     };
@@ -130,7 +117,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
       },
       comment: { id: 555, body: 'inline review note' },
     };
@@ -155,7 +142,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
       },
       comment: { id: 556, body: 'Fixed in latest push', in_reply_to_id: 555 },
     };
@@ -181,7 +168,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
       },
       comment: {
         id: 557,
@@ -206,6 +193,7 @@ describe('mapGitHubEvent', () => {
         head: {
           ref: 'bx/task-123',
           sha: 'dddddddddddddddddddddddddddddddddddddddd',
+          repo: { full_name: REPO },
         },
       },
       review: {
@@ -239,7 +227,7 @@ describe('mapGitHubEvent', () => {
       pull_request: {
         number: 7,
         html_url: 'https://github.com/user/repo/pull/7',
-        head: { ref: 'bx/task-123' },
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
       },
       review: { state: 'changes_requested' },
     };
@@ -323,9 +311,25 @@ describe('mapGitHubEvent', () => {
     expect(result?.data.prUrl).toBe('https://github.com/user/repo/pull/42');
   });
 
+  it('maps a bx/ pull_request.opened to pr.created even when the body lacks the marker', () => {
+    const payload = {
+      action: 'opened',
+      repository: { full_name: REPO },
+      pull_request: {
+        number: 7,
+        html_url: 'https://github.com/user/repo/pull/7',
+        head: { ref: 'bx/task-123', repo: { full_name: REPO } },
+        body: '-',
+      },
+    };
+    const result = mapGitHubEvent('pull_request', payload);
+    expect(result?.type).toBe('pr.created');
+    expect(result?.data.branch).toBe('bx/task-123');
+  });
+
   it.each<[string, string, unknown]>([
     [
-      'pull_request.opened with bx/ branch but null body (no marker)',
+      'pull_request.opened from a fork whose head branch reused a bx/ name',
       'pull_request',
       {
         action: 'opened',
@@ -333,22 +337,7 @@ describe('mapGitHubEvent', () => {
         pull_request: {
           number: 7,
           html_url: 'https://github.com/user/repo/pull/7',
-          head: { ref: 'bx/task-123' },
-          body: null,
-        },
-      },
-    ],
-    [
-      'pull_request.opened with bx/ branch but body lacking marker',
-      'pull_request',
-      {
-        action: 'opened',
-        repository: { full_name: REPO },
-        pull_request: {
-          number: 7,
-          html_url: 'https://github.com/user/repo/pull/7',
-          head: { ref: 'bx/task-123' },
-          body: 'Just a regular PR description with no marker.',
+          head: { ref: 'bx/task-123', repo: { full_name: 'attacker/repo' } },
         },
       },
     ],
@@ -448,43 +437,21 @@ describe('mapGitHubEvent', () => {
   });
 });
 
-const MARKER = '<!-- baxian:managed -->';
-
-describe('isManagedPr with knownBranches', () => {
-  it('bx/ prefix + body marker → true (no Set needed)', () => {
-    expect(isManagedPr('bx/task-001', MARKER)).toBe(true);
+describe('isManagedPr', () => {
+  it('bx/ prefix → true (unique namespace, PR number irrelevant)', () => {
+    expect(isManagedPr('bx/task-001')).toBe(true);
   });
 
-  it('bx/ prefix + no Set → true (backward compat)', () => {
-    expect(isManagedPr('bx/task-001', MARKER, undefined)).toBe(true);
+  it('custom branch whose PR number is tracked by a task → true', () => {
+    expect(isManagedPr('feat/my-feature', 20, new Set([20]))).toBe(true);
   });
 
-  it('custom branch in knownBranches + body marker → true', () => {
-    const set = new Set(['feat/my-feature']);
-    expect(isManagedPr('feat/my-feature', MARKER, set)).toBe(true);
+  it('custom branch whose PR number is NOT tracked → false (reused branch name)', () => {
+    expect(isManagedPr('feat/my-feature', 20, new Set([99]))).toBe(false);
   });
 
-  it('custom branch in knownBranches + no body marker → false', () => {
-    const set = new Set(['feat/my-feature']);
-    expect(isManagedPr('feat/my-feature', 'no marker here', set)).toBe(false);
-  });
-
-  it('custom branch NOT in knownBranches + body marker → false', () => {
-    const set = new Set(['other/branch']);
-    expect(isManagedPr('feat/my-feature', MARKER, set)).toBe(false);
-  });
-
-  it('non-bx/ branch + no Set + body marker → false', () => {
-    expect(isManagedPr('feat/my-feature', MARKER)).toBe(false);
-  });
-
-  it('null body → false regardless of branch or Set', () => {
-    const set = new Set(['feat/my-feature']);
-    expect(isManagedPr('feat/my-feature', null, set)).toBe(false);
-    expect(isManagedPr('bx/task-001', null)).toBe(false);
-  });
-
-  it('empty Set behaves like no Set', () => {
-    expect(isManagedPr('feat/my-feature', MARKER, new Set())).toBe(false);
+  it('custom branch with no PR number or no tracked set → false', () => {
+    expect(isManagedPr('feat/my-feature')).toBe(false);
+    expect(isManagedPr('feat/my-feature', 20)).toBe(false);
   });
 });

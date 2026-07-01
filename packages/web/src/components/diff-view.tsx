@@ -58,16 +58,16 @@ const LINE_CLASS: Record<DiffLineType, string> = {
 export function DiffView({ content, diffstat }: { content: string; diffstat?: string }) {
   const lines = parseUnifiedDiff(content);
   if (lines.length === 0) {
-    return <div className="text-[13px] text-og-400">无内容</div>;
+    return <div className="text-[14px] text-og-400">无内容</div>;
   }
   return (
     <div>
       {diffstat && (
-        <pre className="mb-2 overflow-x-auto rounded-md border border-hairline bg-og-50 p-3 font-mono text-[12px] text-og-700">
+        <pre className="mb-2 overflow-x-auto rounded-md border border-hairline bg-og-50 p-3 font-mono text-[13px] text-og-700">
           {diffstat.trimEnd()}
         </pre>
       )}
-      <div className="overflow-auto rounded-md border border-hairline bg-surface font-mono text-[12px] leading-[1.5] [max-height:70vh]">
+      <div className="overflow-auto rounded-md border border-hairline bg-surface font-mono text-[13px] leading-[1.5] [max-height:70vh]">
         {lines.map((line, i) => (
           <div key={i} className={`whitespace-pre px-3 ${LINE_CLASS[line.type]}`}>
             {line.text === '' ? ' ' : line.text}

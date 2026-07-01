@@ -94,9 +94,9 @@ function loadDraftForContext(projectIdProp: string | undefined): CreateTaskDraft
 }
 
 const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[13px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-[12px] font-medium text-og-700';
-const counterCls = 'mt-1 text-right text-[12px] text-og-400';
+  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[14px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
+const labelCls = 'mb-1.5 block text-[13px] font-medium text-og-700';
+const counterCls = 'mt-1 text-right text-[13px] text-og-400';
 const MAX_IMAGE_MIB = Math.floor(IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024);
 
 export function CreateTaskModal(props: Props) {
@@ -340,7 +340,7 @@ export function CreateTaskModal(props: Props) {
     >
       <form id="create-task-form" onSubmit={handleSubmit} className="space-y-3">
         {!isEdit && draftRestored && (
-          <div className="flex items-center justify-between gap-3 rounded-md border border-accent-soft bg-accent-soft/30 px-3 py-2 text-[12px] text-accent">
+          <div className="flex items-center justify-between gap-3 rounded-md border border-accent-soft bg-accent-soft/30 px-3 py-2 text-[13px] text-accent">
             <span>已恢复上次未提交的草稿</span>
             <button
               type="button"
@@ -352,7 +352,7 @@ export function CreateTaskModal(props: Props) {
           </div>
         )}
         {error && (
-          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[13px] text-danger">
+          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[14px] text-danger">
             {error}
           </div>
         )}
@@ -395,7 +395,7 @@ export function CreateTaskModal(props: Props) {
               <option key={d.id} value={d.id}>{d.id}</option>
             ))}
           </select>
-          {noDevHint && <div className="mt-1 text-[12px] text-warn">{noDevHint}</div>}
+          {noDevHint && <div className="mt-1 text-[13px] text-warn">{noDevHint}</div>}
         </div>
 
         <div>
@@ -422,7 +422,7 @@ export function CreateTaskModal(props: Props) {
             onChange={e => setDescription(e.target.value)}
             maxLength={DESCRIPTION_MAX}
             rows={8}
-            className={`${inputCls} font-mono text-[12px]`}
+            className={`${inputCls} font-mono text-[13px]`}
             placeholder="详细描述任务，支持 markdown；简单任务可不填"
             disabled={submitting}
           />
@@ -455,7 +455,7 @@ export function CreateTaskModal(props: Props) {
                     key={`${f.name}-${i}`}
                     className="flex items-center justify-between rounded-md border border-og-100 bg-surface px-2.5 py-1.5"
                   >
-                    <span title={f.name} className="truncate text-[12px] text-og-700">{f.name}</span>
+                    <span title={f.name} className="truncate text-[13px] text-og-700">{f.name}</span>
                     <button
                       type="button"
                       aria-label={`移除图片 ${f.name}`}

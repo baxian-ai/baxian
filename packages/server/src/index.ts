@@ -32,7 +32,7 @@ import { GitHubPoller, pollerStatePathFor } from './github/poller.js';
 import { resolveEventRouting } from './github/resolver.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
 import type { AgentConfig, HostConfig } from './shared/index.js';
-import { BRANCH_PREFIX, isGitHubRepo, repoSlug } from './shared/index.js';
+import { isGitHubRepo, repoSlug } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
 import { buildApp } from './app.js';
@@ -248,12 +248,12 @@ export async function startServer(configPath?: string): Promise<void> {
 
     const poller = new GitHubPoller({
       runner: createRunner('local'),
-      knownBranchesFor: async (projectId) => {
+      knownPrNumbersFor: async (projectId) => {
         const tasks = await agentManager.listTasksByProject(projectId);
         return new Set(
           tasks
-            .filter(t => t.branch && !t.branch.startsWith(BRANCH_PREFIX) && t.agentId)
-            .map(t => t.branch!),
+            .filter(t => typeof t.prNumber === 'number' && t.agentId)
+            .map(t => t.prNumber!),
         );
       },
       onEvent: async (projectId, mapped) => {

@@ -92,7 +92,7 @@ export function Modal({ open, onClose, title, titleContent, children, footer, si
         aria-label={title}
       >
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-hairline px-5 py-3">
-          <h2 title={title} className="min-w-0 truncate font-display text-[15px] font-semibold tracking-tight text-og-1000">
+          <h2 title={title} className="min-w-0 truncate font-display text-[16px] font-semibold tracking-tight text-og-1000">
             {titleContent ?? title}
           </h2>
           <button

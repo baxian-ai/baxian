@@ -47,7 +47,8 @@ function makePr(o: PrOverrides = {}): Record<string, unknown> {
   const number = o.number ?? 7;
   const pr: Record<string, unknown> = {
     number,
-    head: { ref: o.ref ?? `bx/task-${number}`, sha: o.sha ?? 'a'.repeat(40) },
+    head: { ref: o.ref ?? `bx/task-${number}`, sha: o.sha ?? 'a'.repeat(40), repo: { full_name: REPO } },
+    base: { repo: { full_name: REPO } },
     html_url: o.html_url ?? `https://github.com/user/repo/pull/${number}`,
     state: o.state ?? 'open',
     merged_at: o.merged_at ?? null,
@@ -340,33 +341,72 @@ describe('GitHubPoller', () => {
     });
   });
 
-  it('ignores PRs lacking baxian:managed marker even on bx/ branch', async () => {
+  it('manages a bx/ branch PR even when its body lacks the marker', async () => {
     await runPollScenario({
       responses: {
         '/pulls?': prListJson({
           number: 15, ref: 'bx/task-15', sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
-          body: 'manually opened on a bx/ branch with no marker',
+          body: '-',
         }),
       },
-      expectNoEmits: true,
+      expectCounts: { 'pr.created': 1 },
       assert: ({ runner }) => {
-        const reviewCalls = runner.exec.mock.calls.filter((c) => c[0].includes('/pulls/15'));
-        expect(reviewCalls).toHaveLength(0);
+        const reviewCalls = runner.exec.mock.calls.filter((c) => c[0].includes('/pulls/15/reviews'));
+        expect(reviewCalls.length).toBeGreaterThan(0);
       },
     });
   });
 
-  it('emits pr.created for custom branch PR when knownBranchesFor includes it', async () => {
+  it('skips a fork PR that reused a bx/ branch name (head repo differs from base)', async () => {
+    const forkPr = JSON.stringify([{
+      number: 42,
+      head: { ref: 'bx/task-42', sha: 'b'.repeat(40), repo: { full_name: 'attacker/repo' } },
+      base: { repo: { full_name: 'user/repo' } },
+      html_url: 'https://github.com/user/repo/pull/42',
+      state: 'open',
+      merged_at: null,
+      updated_at: '2026-04-30T00:00:00Z',
+    }]);
+    await runPollScenario({
+      responses: { '/pulls?': forkPr },
+      expectNoEmits: true,
+      assert: ({ runner }) => {
+        const subCalls = runner.exec.mock.calls.filter((c) => c[0].includes('/pulls/42/'));
+        expect(subCalls).toHaveLength(0);
+      },
+    });
+  });
+
+  it('skips a PR whose head repo is missing/null (deleted or invisible fork — fail closed)', async () => {
+    const noHeadRepo = JSON.stringify([{
+      number: 43,
+      head: { ref: 'bx/task-43', sha: 'c'.repeat(40), repo: null },
+      base: { repo: { full_name: 'user/repo' } },
+      html_url: 'https://github.com/user/repo/pull/43',
+      state: 'open',
+      merged_at: null,
+      updated_at: '2026-04-30T00:00:00Z',
+    }]);
+    await runPollScenario({
+      responses: { '/pulls?': noHeadRepo },
+      expectNoEmits: true,
+      assert: ({ runner }) => {
+        const subCalls = runner.exec.mock.calls.filter((c) => c[0].includes('/pulls/43/'));
+        expect(subCalls).toHaveLength(0);
+      },
+    });
+  });
+
+  it('emits pr.created for a custom branch PR when knownPrNumbersFor tracks its PR number', async () => {
     const prData = prListJson({
       number: 20, ref: 'feat/my-feature', sha: 'cafe0000cafe0000cafe0000cafe0000cafe0000',
-      body: '<!-- baxian:managed -->',
     });
     const runner = makeRunner({ '/pulls?': prData });
     const emitted: MappedEvent[] = [];
     const opts: PollerOptions = {
       runner,
       onEvent: (_projectId, e) => emitted.push(e),
-      knownBranchesFor: async () => new Set(['feat/my-feature']),
+      knownPrNumbersFor: async () => new Set([20]),
     };
     const poller = new GitHubPoller(opts);
     const entry = poller.add({ projectId: 'test-proj', repo: REPO });
@@ -376,13 +416,16 @@ describe('GitHubPoller', () => {
     expect(emitted.some(e => e.type === 'pr.created' && e.data.branch === 'feat/my-feature')).toBe(true);
   });
 
-  it('filters out custom branch PR when knownBranchesFor is not injected', async () => {
+  it('does NOT emit or sub-poll a custom branch PR whose number is not tracked (reused-name / stale PR)', async () => {
     await runPollScenario({
       responses: {
         '/pulls?': prListJson({
           number: 21, ref: 'feat/other', sha: 'dead0000dead0000dead0000dead0000dead0000',
-          body: '<!-- baxian:managed -->',
         }),
+      },
+      assert: ({ runner }) => {
+        const subCalls = runner.exec.mock.calls.filter((c) => c[0].includes('/pulls/21/'));
+        expect(subCalls).toHaveLength(0);
       },
       expectNoEmits: true,
     });
@@ -1116,7 +1159,7 @@ describe('GitHubPoller', () => {
     ] as const)('replaceConfig preserves %s', async (_label, addProjectId, rewritten) => {
       await withTempStatePath(async (statePath) => {
         const prData = prListJson({
-          number: 1, html_url: 'https://example.com/pr/1', body: '<!-- baxian:managed -->',
+          number: 1, html_url: 'https://example.com/pr/1',
           ref: 'bx/task-1', sha: 'a'.repeat(40), updated_at: '2026-05-25T10:00:00Z',
         });
         const runner = makeRunner({ '/pulls?': prData });
