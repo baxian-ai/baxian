@@ -486,8 +486,26 @@ describe('TmuxManager', () => {
 
   describe('waitSubmitAck (ack = a fresh idle→busy transition only)', () => {
     const buildBaseline = buildSnapshot;
+    let captureFrames: string[];
+    let titleFrames: string[];
+    let paneTitle: string;
+    beforeEach(() => {
+      captureFrames = [];
+      titleFrames = [];
+      paneTitle = '';
+      runner.exec.mockImplementation(async () => ({
+        stdout: captureFrames.shift() ?? composeSnapStdout('idle composer\n', 0),
+        stderr: '',
+        exitCode: 0,
+      }));
+      // Decouple the OSC title from runner.exec so tests overriding runner.exec for snapshot content can't leak into pane_title reads.
+      vi.spyOn(tmux, 'readPaneTitle').mockImplementation(async () => titleFrames.shift() ?? paneTitle);
+    });
     const primeSnapshot = (visible: string, history: number): void => {
-      runner.exec.mockResolvedValueOnce({ stdout: composeSnapStdout(visible, history), stderr: '', exitCode: 0 });
+      captureFrames.push(composeSnapStdout(visible, history));
+    };
+    const primeTitle = (title: string): void => {
+      titleFrames.push(title);
     };
 
     it('acks on an idle→busy transition (runtime starts working after submit)', async () => {
@@ -496,6 +514,30 @@ describe('TmuxManager', () => {
       primeSnapshot('working\n  esc to interrupt\n', 0);
       await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
+    });
+
+    it('acks via the OSC-title working spinner when in-pane content stays unrecognized-as-busy (narrow/wrapped pane)', async () => {
+      const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
+      primeTitle('~/repo');        // baseline: idle title
+      primeTitle('⠹ Reviewing');   // OSC spinner appears once the runtime starts working
+      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+        .resolves.toBeUndefined();
+    });
+
+    it('rejects (busy baseline) when the pane is ALREADY working at entry — a spinner refresh is not a fresh ack', async () => {
+      const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
+      primeTitle('⠹ Reviewing');   // already working at entry (a prior turn; narrow pane hid the in-pane busy line)
+      primeTitle('⠸ Reviewing');   // spinner rotates — must NOT be read as this prompt's idle→working ack
+      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 200, intervalMs: 50 }))
+        .rejects.toThrow(/pane already busy at baseline/);
+    });
+
+    it('honors a caller-provided PRE-Enter baseline title: a title already working on the first post-submit read still acks', async () => {
+      const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
+      primeTitle('⠹ Reviewing'); // runtime flipped the OSC title to working immediately after Enter — the first read the loop sees
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50, baselineTitle: '~/repo' }),
+      ).resolves.toBeUndefined();
     });
 
     it('does NOT ack on scrollback growth alone when the runtime never goes busy (uncommitted redraw)', async () => {

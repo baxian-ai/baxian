@@ -90,6 +90,7 @@ function fakeCompactionTmux(): Record<string, ReturnType<typeof vi.fn>> {
   return {
     injectPrompt: mockFn(),
     captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
+    readPaneTitle: vi.fn().mockResolvedValue(''),
     sendEnter: mockFn(),
     waitSubmitAck: mockFn(),
     sendKeysLiteral: mockFn(),
@@ -101,6 +102,7 @@ function fakeCompactionTmux(): Record<string, ReturnType<typeof vi.fn>> {
 function fakeDispatchTmux(): Record<string, ReturnType<typeof vi.fn>> {
   return {
     injectPrompt: mockFn(), captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
+    readPaneTitle: vi.fn().mockResolvedValue(''),
     sendEnter: mockFn(), waitSubmitAck: mockFn(),
   };
 }
@@ -380,6 +382,26 @@ describe('compactAgent', () => {
     await expect(dispatch).resolves.toMatchObject({ acked: true });
     expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'next prompt', 'dev-1');
     expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('samples the OSC title BEFORE sendEnter and threads it into waitSubmitAck (a post-submit working title must not become the baseline)', async () => {
+    await seedAgent();
+    setPollMs(1);
+    const fakeTmux = fakeDispatchTmux();
+    fakeTmux.readPaneTitle.mockResolvedValue('~/repo'); // pre-Enter idle title
+    const { gates, holder: manual } = await startGuarded();
+
+    const dispatch = injectAndAwaitAck(fakeTmux, '%7', 'p', 'dev-1', 'claude-code');
+    await drainHolderGates(gates, manual);
+    await expect(dispatch).resolves.toMatchObject({ acked: true });
+
+    // pre-Enter sampling: readPaneTitle runs before sendEnter…
+    expect(fakeTmux.readPaneTitle.mock.invocationCallOrder[0])
+      .toBeLessThan(fakeTmux.sendEnter.mock.invocationCallOrder[0]);
+    // …and is threaded to waitSubmitAck as the busy-baseline anchor
+    expect(fakeTmux.waitSubmitAck).toHaveBeenCalledWith(
+      '%7', 'snapshot', 'claude-code', expect.objectContaining({ baselineTitle: '~/repo' }),
+    );
   });
 
   it('aborts a guarded dispatch when the binding is released while waiting (task cancelled)', async () => {

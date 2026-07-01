@@ -35,6 +35,8 @@ export interface WaitSubmitAckOpts extends WaitOpts {
   resend?: () => Promise<void>;
   resendIntervalMs?: number;
   acceptComposerChange?: boolean;
+  // OSC title sampled by the caller BEFORE sendEnter — the idle anchor for the busy-baseline / transition check.
+  baselineTitle?: string;
 }
 
 const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
@@ -586,11 +588,18 @@ export class TmuxManager {
     if (submitAckBusy(composerBaseline, runtime)) {
       throw new Error(`runtime ack timeout (paneId=${paneId}): pane already busy at baseline`);
     }
+    // Width-independent busy authority: at narrow width the in-pane "working" line soft-wraps out of regex range, but the OSC title still transitions idle→working. Prefer the caller's PRE-Enter sample; reading here would race a runtime that flips to working right after submit.
+    const baselineTitle = opts.baselineTitle ?? await this.readPaneTitle(paneId);
+    if (hasOscTitleWorking(baselineTitle)) {
+      throw new Error(`runtime ack timeout (paneId=${paneId}): pane already busy at baseline`);
+    }
     const resendIntervalMs = Math.max(opts.resendIntervalMs ?? 3_000, interval);
     let lastResend = Date.now();
     while (Date.now() < deadline) {
       const visible = stripHistorySuffix(await this.capturePaneSnapshot(paneId));
       if (submitAckBusy(visible, runtime)) return;
+      const title = await this.readPaneTitle(paneId);
+      if (hasOscTitleWorking(title) && title !== baselineTitle) return;
       if (opts.acceptComposerChange && visible !== composerBaseline) return;
       const bottomLine = bottomNonBlankLine(visible);
       const enterWouldSubmit =

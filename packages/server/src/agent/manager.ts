@@ -1968,9 +1968,11 @@ export class AgentManager {
       await this.waitForReplPromptReady(tmux, paneId, runtime, this.clearContextWaitMs);
       await tmux.sendKeysLiteral(paneId, '/clear');
       const beforeSubmit = await tmux.capturePaneSnapshot(paneId);
+      const beforeSubmitTitle = await tmux.readPaneTitle(paneId);
       await tmux.sendEnter(paneId);
       await tmux.waitSubmitAck(paneId, beforeSubmit, runtime, {
         timeoutMs: this.clearContextWaitMs,
+        baselineTitle: beforeSubmitTitle,
         acceptComposerChange: true,
         resend: () => tmux.sendEnter(paneId),
         resendIntervalMs: this.compactIdlePollMs,
@@ -3723,8 +3725,10 @@ export class AgentManager {
   ): Promise<{ acked: boolean; composerDelivered: boolean }> {
     await tmux.injectPrompt(paneId, prompt, agentId);
     let baseline: string;
+    let baselineTitle = '';
     try {
       baseline = await tmux.captureSettledSnapshot(paneId, { timeoutMs: this.dispatchSettleTimeoutMs });
+      baselineTitle = await tmux.readPaneTitle(paneId);
       await tmux.sendEnter(paneId);
     } catch (preAckErr) {
       if (await this.clearComposerForReuse(tmux, paneId, agentId)) throw preAckErr;
@@ -3737,6 +3741,7 @@ export class AgentManager {
     try {
       await tmux.waitSubmitAck(paneId, baseline, runtime, {
         timeoutMs: this.dispatchAckTimeoutMs,
+        baselineTitle,
         resend: () => tmux.sendEnter(paneId),
         resendIntervalMs: this.dispatchAckResendIntervalMs,
       });
