@@ -26,8 +26,8 @@ describe('index.css base typography', () => {
     expect(body![1]).toMatch(/font-size:\s*14px/);
   });
 
-  it('limits app font-size utilities to xs, sm, and base', () => {
-    const allowed = new Set(['text-xs', 'text-sm', 'text-base', '!text-base']);
+  it('limits app font-size utilities to xs and sm', () => {
+    const allowed = new Set(['text-xs', 'text-sm']);
     const disallowed = sourceFiles(srcDir).flatMap((file) => {
       const source = readFileSync(file, 'utf8');
       return Array.from(source.matchAll(/!?text-(?:xs|sm|base|lg|xl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|9xl|\[(?!#)[^\]]+\])/g))
@@ -37,6 +37,20 @@ describe('index.css base typography', () => {
     });
 
     expect(disallowed).toEqual([]);
+  });
+
+  it('limits raw font-size declarations to the 14px body baseline, the 16px touch form exception, and the 13px xterm option', () => {
+    const hits = sourceFiles(srcDir).flatMap((file) => {
+      const source = readFileSync(file, 'utf8');
+      return Array.from(source.matchAll(/font-?[Ss]ize\s*[:=]\s*['"]?[\d.]+(?:px)?/g))
+        .map((match) => `${relative(srcDir, file).replace(/\\/g, '/')}:${match[0]}`);
+    });
+
+    expect(hits.sort()).toEqual([
+      'components/pane-terminal.tsx:fontSize: 13',
+      'index.css:font-size: 14px',
+      'index.css:font-size: 16px',
+    ]);
   });
 });
 

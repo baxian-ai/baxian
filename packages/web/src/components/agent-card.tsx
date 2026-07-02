@@ -322,7 +322,7 @@ export function AgentCard({
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-xs font-medium uppercase tracking-[0.05em] text-og-500">{role}</span>
           <span
-            className="min-w-0 truncate whitespace-nowrap font-display text-base font-semibold text-og-1000"
+            className="min-w-0 truncate whitespace-nowrap font-display text-sm font-semibold text-og-1000"
             title={agentRuntimeTitle(agent.id, runtime)}
           >
             {agent.id}

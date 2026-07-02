@@ -242,7 +242,7 @@ function DashboardProject({
   return (
     <div className="mb-10">
       <div className="mb-3 -mx-2 flex items-baseline gap-x-3 gap-y-1 px-2 py-1">
-        <h2 className="min-w-0 truncate font-display text-base font-semibold tracking-tight text-og-1000" title={project.id}>
+        <h2 className="min-w-0 truncate font-display text-sm font-semibold tracking-tight text-og-1000" title={project.id}>
           <Link to={`/project/${project.id}`} className="hover:text-accent-hover">{project.id}</Link>
         </h2>
         <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>

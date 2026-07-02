@@ -265,6 +265,7 @@ const stripAnsi = (s: string): string => s.replace(ANSI_PATTERN, '');
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
 const MIN_POLL_INTERVAL_MS = 50;
+export const COMPOSER_DIRTY_SETTLE_MS = 200;
 
 const HISTORY_SUFFIX_RE = /\n---history_size:\d+---$/;
 function stripHistorySuffix(snapshot: string): string {
@@ -561,6 +562,13 @@ export class TmuxManager {
 
   async sendEnter(paneId: string): Promise<void> {
     await this.sendKeysToPane(paneId, 'Enter');
+  }
+
+  // 空格先弄脏 composer——空 composer 上 C-c 会退出 codex；间隔防止连发被 codex 粘贴检测合并。
+  async clearComposerDraft(paneId: string): Promise<void> {
+    await this.sendKeysLiteral(paneId, ' ');
+    await sleep(COMPOSER_DIRTY_SETTLE_MS);
+    await this.sendKeysToPane(paneId, 'C-c');
   }
 
   async captureSettledSnapshot(paneId: string, opts: WaitOpts = {}): Promise<string> {

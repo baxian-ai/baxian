@@ -165,6 +165,7 @@ export interface TaskState {
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
+  prFeedbackReceivedAt?: string;
   fixDispatchedAt?: string;
   reviewRound: number;
   specReviewRound?: number;

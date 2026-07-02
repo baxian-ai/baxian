@@ -213,12 +213,14 @@ function freshRegistry(): SkillRegistry {
 }
 
 function makeInjectManager(runner: CommandRunner, ackMs: number, settleMs: number): AgentManager {
-  return makeManager({
+  const mgr = makeManager({
     skillRegistry: freshRegistry(),
     runnerFactory: () => runner,
     dispatchAckTimeoutMs: ackMs,
     dispatchSettleTimeoutMs: settleMs,
   });
+  Object.assign(mgr, { runtimeLivenessProbeMs: 1 });
+  return mgr;
 }
 
 type AckResult = { acked: boolean; composerDelivered?: boolean };
@@ -3040,16 +3042,18 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect(execs.join('\n')).not.toContain('/clear');
   });
 
-  it('does not send C-c on retry when binding is released/rebound between attempts', async () => {
+  it('stops touching the pane on retry when binding is released/rebound between attempts', async () => {
     const execs: string[] = [];
     const BUSY = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
     let captureCount = 0;
+    let rebindExecIdx = -1;
     manager = makeManager({
       runnerFactory: () => capturePaneRunner(execs, async () => {
         captureCount++;
         if (captureCount === 3) {
           const cur = await agentStore.get('dev-1');
           if (cur) await agentStore.set({ ...cur, taskId: 'new-review-task', updatedAt: new Date().toISOString() });
+          rebindExecIdx = execs.length;
         }
         return BUSY;
       }),
@@ -3060,7 +3064,9 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await new Promise(r => setTimeout(r, 500));
 
-    expect(execs.filter(c => c.includes('send-keys') && c.includes('C-c'))).toHaveLength(0);
+    expect(execs.filter(c => c.includes('send-keys') && c.includes('C-c'))).toHaveLength(1);
+    expect(rebindExecIdx).toBeGreaterThanOrEqual(0);
+    expect(execs.slice(rebindExecIdx).filter(c => c.includes('send-keys'))).toHaveLength(0);
     const binding = await agentStore.get('dev-1');
     expect(binding?.taskId).toBe('new-review-task');
   });
@@ -3837,7 +3843,7 @@ async function runAck(
 }
 
 describe('injectAndAwaitAck ack timeout', () => {
-  it('emits human.intervention dispatch-ack-timeout, does not throw, does not send C-c', async () => {
+  it('emits human.intervention dispatch-ack-timeout, does not throw, does not send C-c after submit', async () => {
     const sentCommands: string[] = [];
     const stuckRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
@@ -3875,8 +3881,10 @@ describe('injectAndAwaitAck ack timeout', () => {
     });
     expect((interventions[0].data as { paneId?: string }).paneId).toBe('%0');
 
-    const cCancelKeys = sentCommands.filter(c => c.includes('send-keys') && c.includes('C-c'));
-    expect(cCancelKeys).toHaveLength(0);
+    const firstEnterIdx = sentCommands.findIndex(c => c.includes('send-keys') && c.includes('Enter'));
+    expect(firstEnterIdx).toBeGreaterThanOrEqual(0);
+    const postSubmitCc = sentCommands.slice(firstEnterIdx).filter(c => c.includes('send-keys') && c.includes('C-c'));
+    expect(postSubmitCc).toHaveLength(0);
 
     expect((await taskStore.get(t.id))?.status).toBe('in_progress');
     expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
@@ -4041,13 +4049,18 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
 
   it('does NOT ack on busy text that was already in the pasted prompt when Enter is swallowed', async () => {
     const screen = `do X\n  esc to interrupt\n`;
+    let pasted = false;
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('paste-buffer')) {
+          pasted = true;
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
         if (cmd.includes('display-message')) {
-          return { stdout: `${screen}${ACK_SEP}\n3\n`, stderr: '', exitCode: 0 };
+          return { stdout: `${pasted ? screen : '❯ \n'}${ACK_SEP}\n3\n`, stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          return { stdout: screen, stderr: '', exitCode: 0 };
+          return { stdout: pasted ? screen : '❯ \n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
@@ -4097,7 +4110,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     } as unknown as CommandRunner;
   }
 
-  it('clears the composer with C-c after a pre-Enter capture failure → raw, never Enter, no kill probe', async () => {
+  it('clears the composer draft after a pre-Enter capture failure → raw, never Enter, no kill probe', async () => {
     const sent: string[] = [];
     let snaps = 0;
     const runner = recordRunner(sent, cmd => {
@@ -4111,49 +4124,58 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const { caught } = await runAck(runner);
     expect(caught).toBeInstanceOf(Error);
     expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
-    expect(ccCmds(sent)).toHaveLength(1);
+    expect(ccCmds(sent)).toHaveLength(2);
     expect(hasSessionCmds(sent)).toHaveLength(0);
     expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
   });
 
   it.each([
     {
-      name: 'clears the composer with C-c after a failed sendEnter → raw',
+      name: 'clears the composer draft after a failed sendEnter → raw',
       onHasSession: undefined as ExecResult | undefined,
       failKeys: 'enter' as 'enter' | 'all',
       sendKeys: { stdout: '', stderr: 'no such pane: %0', exitCode: 1 },
       expectAckUnknown: false,
+      expectCc: 2,
       hasSessionCount: undefined as number | undefined,
     },
     {
-      name: 'a transient C-c failure on a still-live session escalates to ack_unknown',
+      name: 'a transient reuse-clear failure on a still-live session escalates to ack_unknown (no blind C-c)',
       onHasSession: { stdout: '', stderr: '', exitCode: 0 },
-      failKeys: 'all' as 'enter' | 'all',
+      failKeys: 'after-preclear' as 'enter' | 'after-preclear',
       sendKeys: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 },
       expectAckUnknown: true,
+      expectCc: 1,
       hasSessionCount: 1,
     },
     {
-      name: 'a C-c failure on a CONFIRMED-DEAD session is reuse-safe → raw (next dispatch rebuilds fresh)',
+      name: 'a reuse-clear failure on a CONFIRMED-DEAD session is reuse-safe → raw (next dispatch rebuilds fresh)',
       onHasSession: { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 },
-      failKeys: 'all' as 'enter' | 'all',
+      failKeys: 'after-preclear' as 'enter' | 'after-preclear',
       sendKeys: { stdout: '', stderr: 'no such pane: %0', exitCode: 1 },
       expectAckUnknown: false,
+      expectCc: 1,
       hasSessionCount: 1,
     },
     {
-      name: 'an UNCONFIRMABLE session (C-c fails AND has-session probe fails) escalates to ack_unknown',
+      name: 'an UNCONFIRMABLE session (reuse clear fails AND has-session probe fails) escalates to ack_unknown',
       onHasSession: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 2 },
-      failKeys: 'all' as 'enter' | 'all',
+      failKeys: 'after-preclear' as 'enter' | 'after-preclear',
       sendKeys: { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 },
       expectAckUnknown: true,
+      expectCc: 1,
       hasSessionCount: 1,
     },
-  ])('$name', async ({ onHasSession, failKeys, sendKeys, expectAckUnknown, hasSessionCount }) => {
+  ])('$name', async ({ onHasSession, failKeys, sendKeys, expectAckUnknown, expectCc, hasSessionCount }) => {
     const sent: string[] = [];
+    let sendKeysSeen = 0;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('has-session')) return onHasSession;
-      if (cmd.includes('send-keys') && (failKeys === 'all' || cmd.includes('Enter'))) return sendKeys;
+      if (cmd.includes('send-keys')) {
+        sendKeysSeen++;
+        const preClearDone = sendKeysSeen > 2;
+        if (failKeys === 'after-preclear' ? preClearDone : cmd.includes('Enter')) return sendKeys;
+      }
       if (cmd.includes('display-message')) return { stdout: `idle\n${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
       return undefined;
     });
@@ -4165,16 +4187,18 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       expect(caught).toBeInstanceOf(Error);
       expect(caught instanceof DispatchTerminalError && caught.reason === 'ack_unknown').toBe(false);
     }
-    expect(ccCmds(sent)).toHaveLength(1);
+    expect(ccCmds(sent)).toHaveLength(expectCc);
     if (hasSessionCount !== undefined) expect(hasSessionCmds(sent)).toHaveLength(hasSessionCount);
   });
 
   it('does NOT touch the composer on a post-Enter ack_unknown — the prompt may be running', async () => {
     const sent: string[] = [];
     let enterSent = false;
+    let enterIdx = -1;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('send-keys') && cmd.includes('Enter')) {
         enterSent = true;
+        enterIdx = sent.length - 1;
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') || cmd.includes('display-message')) {
@@ -4186,13 +4210,15 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const { caught } = await runAck(runner);
     expect(caught).toBeInstanceOf(DispatchTerminalError);
     expect((caught as DispatchTerminalError).reason).toBe('ack_unknown');
-    expect(ccCmds(sent)).toHaveLength(0);
+    expect(enterIdx).toBeGreaterThanOrEqual(0);
+    expect(ccCmds(sent.slice(enterIdx))).toHaveLength(0);
     expect(hasSessionCmds(sent)).toHaveLength(0);
   });
 
   it('does NOT touch the composer on a clean ack', async () => {
     const sent: string[] = [];
     let enterSent = false;
+    let enterIdx = -1;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('display-message')) {
         const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
@@ -4200,14 +4226,256 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       }
       if (cmd.includes('send-keys') && cmd.includes('Enter')) {
         enterSent = true;
+        enterIdx = sent.length - 1;
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       return undefined;
     });
     const { result } = await runAck(runner);
     expect(result).toEqual({ acked: true, composerDelivered: true });
-    expect(ccCmds(sent)).toHaveLength(0);
+    expect(enterIdx).toBeGreaterThanOrEqual(0);
+    expect(ccCmds(sent.slice(enterIdx))).toHaveLength(0);
     expect(hasSessionCmds(sent)).toHaveLength(0);
+  });
+
+  it('clears any leftover composer draft (space then C-c) before pasting the prompt', async () => {
+    const sent: string[] = [];
+    let enterSent = false;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('display-message')) {
+        const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
+        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      }
+      return undefined;
+    });
+    const { result } = await runAck(runner);
+    expect(result).toEqual({ acked: true, composerDelivered: true });
+    const spaceIdx = sent.findIndex(c => c.includes('send-keys -l') && c.endsWith("' '"));
+    const ccIdx = sent.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
+    const pasteIdx = sent.findIndex(c => c.includes('paste-buffer'));
+    expect(spaceIdx).toBeGreaterThanOrEqual(0);
+    expect(ccIdx).toBeGreaterThan(spaceIdx);
+    expect(pasteIdx).toBeGreaterThan(ccIdx);
+  });
+
+  it('aborts the dispatch without pasting when the pre-inject composer clear fails (unconfirmed clear must not paste onto a leftover draft)', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('send-keys -l') && cmd.endsWith("' '")) {
+        return { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
+    expect(caught).toBeInstanceOf(Error);
+    expect(String((caught as Error).message)).toMatch(/sendKeysLiteral/);
+    expect(pasted).toBe(false);
+    expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
+  });
+
+  it('a visible ready view overrides a stale working title: the draft is still cleared and the prompt pasted', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    let enterSent = false;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) {
+        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+        return { stdout: '❯ \n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('history_size')) {
+        const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
+        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      return undefined;
+    });
+    await runAck(runner);
+    expect(pasted).toBe(true);
+    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(1);
+    expect(ccCmds(sent)).toHaveLength(1);
+  });
+
+  it('aborts without pasting when only the OSC title shows working and no ready view is visible (narrow pane wraps the busy line)', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    let captures = 0;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) {
+        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+        captures++;
+        return { stdout: `soft-wrapped output without any anchor line ${captures}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
+    expect(caught).toBeInstanceOf(Error);
+    expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
+    expect(pasted).toBe(false);
+    expect(ccCmds(sent)).toHaveLength(0);
+  });
+
+  it('clears a busy-looking leftover draft even under a stale working title when the frame is static (no live turn)', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    let enterSent = false;
+    const DRAFT = '› 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) {
+        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+        return { stdout: DRAFT, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('history_size')) {
+        const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
+        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      return undefined;
+    });
+    await runAck(runner);
+    expect(pasted).toBe(true);
+    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(1);
+    expect(ccCmds(sent)).toHaveLength(1);
+  });
+
+  it('aborts without pasting when the pane is visibly busy (pasting would feed the running turn or submit onto a leftover draft)', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    let captures = 0;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) {
+        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane') && !cmd.includes('display-message')) {
+        captures++;
+        return { stdout: `✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
+    expect(caught).toBeInstanceOf(Error);
+    expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
+    expect(pasted).toBe(false);
+    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(0);
+    expect(ccCmds(sent)).toHaveLength(0);
+  });
+
+  it('clears a leftover draft whose text merely looks busy: an idle title plus a static frame rules out a running turn', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    let enterSent = false;
+    const DRAFT = '❯ 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) {
+        return { stdout: 'dev-1\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+        return { stdout: DRAFT, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('history_size')) {
+        const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
+        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      if (cmd.includes('send-keys') && cmd.includes('Enter')) {
+        enterSent = true;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      return undefined;
+    });
+    await runAck(runner);
+    expect(pasted).toBe(true);
+    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(1);
+    expect(ccCmds(sent)).toHaveLength(1);
+  });
+
+  it('aborts when the text looks busy, the title is idle, but the frame is advancing (a real turn with a lost title)', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    let captures = 0;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('pane_title')) {
+        return { stdout: 'dev-1\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
+        captures++;
+        return { stdout: `✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      return undefined;
+    });
+    const { caught } = await runAck(runner);
+    expect(caught).toBeInstanceOf(Error);
+    expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
+    expect(pasted).toBe(false);
+    expect(ccCmds(sent)).toHaveLength(0);
+  });
+
+  it('re-validates the binding after the pre-inject clear: a task cancelled during the clear is never pasted', async () => {
+    const sent: string[] = [];
+    let pasted = false;
+    const runner = recordRunner(sent, cmd => {
+      if (cmd.includes('paste-buffer')) {
+        pasted = true;
+        return undefined;
+      }
+      return undefined;
+    });
+    const localManager = makeInjectManager(runner, 150, 150);
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+    const tmux = new TmuxManager(runner);
+    vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockImplementation(async () => {
+      const cur = await taskStore.get(t.id);
+      if (cur) await taskStore.set({ ...cur, status: 'cancelled' });
+    });
+    await expect(
+      callInjectAndAwaitAck(localManager, tmux, '%0', 'hello prompt', 'dev-1', 'claude-code'),
+    ).rejects.toThrow(/went terminal before paste/);
+    expect(pasted).toBe(false);
   });
 });
 

@@ -123,8 +123,8 @@ describe('buildPromptInline', () => {
     expect(prompt.startsWith('/baxian-task-check\nphase: develop\n')).toBe(true);
     expect(prompt).not.toContain('[baxian]');
     expect(prompt).toContain('phase: develop');
-    expect(prompt).toContain('role: dev');
-    expect(prompt).toContain('task: task-001');
+    expect(prompt).not.toContain('role:');
+    expect(prompt).not.toContain('task: task-001');
     expect(prompt).toContain('exchange: github-pr');
     expect(prompt).toContain('worktree: /tmp/repo/.baxian-worktrees/task-001_abc');
     expect(prompt).toContain('title: Fix login redirect');
@@ -439,6 +439,24 @@ describe('buildPromptInline', () => {
     expect(body).toContain('skip this check when `anchor-sha:` is absent');
   });
 
+  it('QA review skills treat the author narrative as material under review and read the diff before it', async () => {
+    for (const name of ['baxian-pr-review', 'baxian-pr-recheck']) {
+      const body = await readFile(
+        fileURLToPath(new URL(`../../../../skills/${name}/SKILL.md`, import.meta.url)),
+        'utf-8',
+      );
+      expect(body).toContain('not a bypass and not steering');
+      expect(body).toContain('Read the diff first');
+      expect(body.indexOf('gh pr diff N')).toBeGreaterThan(-1);
+      expect(body.indexOf('gh pr diff N')).toBeLessThan(body.indexOf('gh pr view N'));
+    }
+    const review = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-pr-review/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(review).toContain('a claim the code does not back is itself a finding');
+  });
+
   it('recheck descriptor carries pr + anchor-sha; verdict procedure lives in the skill', async () => {
     await seedRealSkillsAndScan(['baxian-pr-recheck']);
     const prompt = build({
@@ -462,6 +480,7 @@ describe('buildPromptInline', () => {
       signalToken: 'code-token-1',
     });
     expect(prompt).toContain('phase: code');
+    expect(prompt).toContain('exchange: github-pr');
     expect(prompt).toContain('signal: pr-created');
     expect(prompt).toContain('token: code-token-1');
     expect(prompt).not.toContain('gh pr create');
@@ -542,12 +561,12 @@ describe('server review mode prompt builders', () => {
     ['server-feedback code variant: feedback=code + code-fixed signal', 'server-feedback', DEV_AGENT,
       { serverPriorFindings: CODE_FINDINGS },
       { contains: ['feedback: code', 'signal: code-fixed'] }],
-    ['server-after-done pr variant: publish=pr + github-pr exchange + code-ready', 'server-after-done', DEV_AGENT,
+    ['server-after-done pr variant: publish=pr + code-ready', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'pr', branch: 'bx/task-001' } },
-      { contains: ['publish: pr', 'branch: bx/task-001', 'exchange: github-pr', 'signal: code-ready'], notContains: ['gh pr create'] }],
-    ['server-after-done branch variant: publish=branch + server-files exchange', 'server-after-done', DEV_AGENT,
+      { contains: ['publish: pr', 'branch: bx/task-001', 'signal: code-ready'], notContains: ['gh pr create', 'exchange:'] }],
+    ['server-after-done branch variant: publish=branch', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } },
-      { contains: ['publish: branch', 'exchange: server-files', 'signal: code-ready'], notContains: ['publish: pr'] }],
+      { contains: ['publish: branch', 'signal: code-ready'], notContains: ['publish: pr', 'exchange:'] }],
     ['contentTruncated adds the content: truncated field', 'server-review', QA_AGENT,
       { serverContent: 'partial diff', contentTruncated: true },
       { contains: ['content: truncated'] }],
@@ -572,6 +591,8 @@ describe('server review mode prompt builders', () => {
     );
     expect(body).toContain('correctness, tests, edge cases, security, regressions');
     expect(body).toContain('broken/unsafe');
+    expect(body).toContain('batch: i/n');
+    expect(body).toContain('their absence is not a finding');
     expect(body).toContain('ONLY when every prior finding is closed');
     expect(body).toContain('ORIGINAL id');
     expect(body).toContain('base-branch worktree');
@@ -598,21 +619,9 @@ describe('server review mode prompt builders', () => {
     expect(body).toContain('exactly one response item');
   });
 
-  it('descriptor exchange field is mode-aware: server phases → server-files, github → github-pr', () => {
-    const serverPrompt = build('server-review', QA_AGENT, { serverContent: 'diff x' });
-    expect(serverPrompt).toContain('exchange: server-files');
-    expect(serverPrompt).not.toContain('cross-agent communication is via the GitHub PR');
-    const githubPrompt = buildPromptInline({
-      task: TASK,
-      phase: 'merge',
-      agent: DEV_AGENT,
-      worktreePath: '/wt/x',
-      skillRegistry: getRegistry(),
-    } as Parameters<typeof buildPromptInline>[0]);
-    expect(githubPrompt).toContain('exchange: github-pr');
-  });
-
-  it('exchange keys on the phase, not reviewMode: SDD spec → server-files on a GitHub task; publish-as-PR → github-pr', () => {
+  it('phases outside develop/code omit the exchange field', () => {
+    const review = build('server-review', QA_AGENT, { serverContent: 'diff x' });
+    expect(review).not.toContain('exchange:');
     const sddSpec = buildPromptInline({
       task: TASK,
       phase: 'server-spec-review',
@@ -622,11 +631,15 @@ describe('server review mode prompt builders', () => {
       signalToken: 'srvtok123456',
       serverContent: '# spec',
     } as Parameters<typeof buildPromptInline>[0]);
-    expect(sddSpec).toContain('exchange: server-files');
-    const publish = build('server-after-done', DEV_AGENT, { serverAfterDone: { kind: 'pr', branch: 'bx/task-001' } });
-    expect(publish).toContain('exchange: github-pr');
-    const branchPublish = build('server-after-done', DEV_AGENT, { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } });
-    expect(branchPublish).toContain('exchange: server-files');
+    expect(sddSpec).not.toContain('exchange:');
+    const merge = buildPromptInline({
+      task: TASK,
+      phase: 'merge',
+      agent: DEV_AGENT,
+      worktreePath: '/wt/x',
+      skillRegistry: getRegistry(),
+    } as Parameters<typeof buildPromptInline>[0]);
+    expect(merge).not.toContain('exchange:');
   });
 
   it('every baxian skill disables implicit model-invocation (Claude frontmatter + Codex policy) so only baxian explicitly invokes the per-phase skill', async () => {

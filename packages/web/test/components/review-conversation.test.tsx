@@ -4,8 +4,14 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import type { ReviewRound, TaskState } from '../../src/shared/index.js';
 
 const reviewsMock = vi.fn();
+const githubReviewMock = vi.fn();
 vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { reviews: (...args: unknown[]) => reviewsMock(...args) } },
+  api: {
+    tasks: {
+      reviews: (...args: unknown[]) => reviewsMock(...args),
+      githubReview: (...args: unknown[]) => githubReviewMock(...args),
+    },
+  },
 }));
 
 import { ReviewConversation } from '../../src/components/review-conversation.tsx';
@@ -41,7 +47,10 @@ function renderConv(task: TaskState) {
   );
 }
 
-beforeEach(() => { reviewsMock.mockReset(); });
+beforeEach(() => {
+  reviewsMock.mockReset();
+  githubReviewMock.mockReset();
+});
 afterEach(() => cleanup());
 
 describe('ReviewConversation gating', () => {
@@ -78,22 +87,40 @@ describe('ReviewConversation gating', () => {
 });
 
 describe('ReviewConversation github code-review group', () => {
-  it('renders the 代码评审 group (PR link) under 评审记录 without fetching rounds', () => {
+  it('renders the 代码评审 process under 评审记录 without fetching server rounds', async () => {
+    githubReviewMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [
+        { kind: 'review-comment', id: '21', body: 'nit', path: 'a.ts', line: 12 },
+        { kind: 'commit', id: 'c1', body: 'fix: thing', commitSha: 'c1' },
+        { kind: 'review', id: '11', body: 'please fix', verdict: 'request-changes' },
+      ],
+    });
     renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 0 }));
     expect(screen.getByText('评审记录')).toBeTruthy();
+    expect(await screen.findByText('第 1 轮')).toBeTruthy();
     expect(screen.getByText('代码评审')).toBeTruthy();
-    expect(screen.getByText(/查看 PR 评审过程/)).toBeTruthy();
+    expect(screen.getByText('行内评论')).toBeTruthy();
+    expect(screen.getByText('提交代码改动')).toBeTruthy();
+    expect(screen.getByText('request-changes')).toBeTruthy();
     expect(reviewsMock).not.toHaveBeenCalled();
+    expect(githubReviewMock).toHaveBeenCalledWith('task-1');
   });
 
   it('shows Spec 评审 and 代码评审 together for a github SDD task with spec rounds + PR', async () => {
     reviewsMock.mockResolvedValue([
       { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
+    githubReviewMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [{ kind: 'review', id: '11', body: 'lgtm', verdict: 'approve' }],
+    });
     renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 1 }));
     expect(await screen.findByText('Spec 评审')).toBeTruthy();
     expect(screen.getByText('代码评审')).toBeTruthy();
-    expect(screen.getByText(/查看 PR 评审过程/)).toBeTruthy();
+    expect(await screen.findAllByText('approve')).toHaveLength(2);
   });
 });
 

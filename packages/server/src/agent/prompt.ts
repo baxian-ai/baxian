@@ -67,7 +67,6 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
   const taskBody = buildTaskBody({
     task: opts.task,
     phase: opts.phase,
-    role: opts.agent.role,
     worktreePath: opts.worktreePath,
     signalToken: opts.signalToken,
     postApproveRedispatchCount: opts.postApproveRedispatchCount,
@@ -100,7 +99,6 @@ export function buildGreetingPrompt(token: string, runtime: AgentRuntime): strin
 interface TaskBodyArgs {
   task: TaskState;
   phase: string;
-  role: AgentConfig['role'];
   worktreePath: string;
   signalToken?: string;
   postApproveRedispatchCount?: number;
@@ -245,16 +243,12 @@ function buildServerReviewInstructions(
 
 function buildTaskBody(args: TaskBodyArgs): string {
   const {
-    task, phase, role, worktreePath, signalToken, postApproveRedispatchCount,
+    task, phase, worktreePath, signalToken, postApproveRedispatchCount,
     currentSpecRound, imagePaths,
     serverContent, serverDiffstat, serverBatch,
     serverPriorFindings, serverPriorResponse, serverAfterDone, contentTruncated,
     hasQaPartner,
   } = args;
-  const isPrPublish = phase === 'server-after-done' && serverAfterDone?.kind === 'pr';
-  const serverExchange = !isPrPublish
-    && (phase.startsWith('server-') || task.reviewMode === 'server');
-  const exchange = serverExchange ? 'server-files' : 'github-pr';
   if (phase === 'post-approve' && !signalToken) {
     throw new Error('post-approve prompt requires signalToken');
   }
@@ -276,12 +270,13 @@ function buildTaskBody(args: TaskBodyArgs): string {
     hasQaPartner,
   });
 
+  // exchange 只有 baxian-task-check（develop/code）消费，其余 phase 不输出
+  const carriesExchange = phase === 'develop' || phase === 'code';
+  const exchange = task.reviewMode === 'server' ? 'server-files' : 'github-pr';
   const descriptor = [
     `phase: ${phase}`,
-    `role: ${role}`,
-    `task: ${task.id}`,
     `worktree: ${worktreePath}`,
-    `exchange: ${exchange}`,
+    ...(carriesExchange ? [`exchange: ${exchange}`] : []),
     ...fields,
     ...(signalToken ? [`token: ${signalToken}`] : []),
   ].join('\n');

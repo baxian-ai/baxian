@@ -95,6 +95,7 @@ function fakeCompactionTmux(): Record<string, ReturnType<typeof vi.fn>> {
     waitSubmitAck: mockFn(),
     sendKeysLiteral: mockFn(),
     sendKeysToPane: mockFn(),
+    clearComposerDraft: mockFn(),
     capturePaneById: vi.fn().mockResolvedValue(''),
   };
 }
@@ -104,6 +105,8 @@ function fakeDispatchTmux(): Record<string, ReturnType<typeof vi.fn>> {
     injectPrompt: mockFn(), captureSettledSnapshot: vi.fn().mockResolvedValue('snapshot'),
     readPaneTitle: vi.fn().mockResolvedValue(''),
     sendEnter: mockFn(), waitSubmitAck: mockFn(),
+    clearComposerDraft: mockFn(),
+    capturePaneById: vi.fn().mockResolvedValue(''),
   };
 }
 
@@ -215,7 +218,7 @@ afterEach(async () => {
 });
 
 describe('compactAgent', () => {
-  it('waits for an idle prompt, clears the composer with C-c (claude), then sends /compact + Enter', async () => {
+  it('waits for an idle prompt, clears the composer draft (space then C-c), then sends /compact + Enter', async () => {
     await seedAgent();
     waitReadySpy.mockResolvedValue(undefined);
 
@@ -229,9 +232,11 @@ describe('compactAgent', () => {
     expect(timeoutMs).toBe(5_000);
 
     const calls = execCalls();
+    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.endsWith("' '"));
     const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/compact'));
-    expect(ccIdx).toBeGreaterThanOrEqual(0);
+    expect(spaceIdx).toBeGreaterThanOrEqual(0);
+    expect(ccIdx).toBeGreaterThan(spaceIdx);
     expect(literalIdx).toBeGreaterThan(ccIdx);
     expect(calls[literalIdx]).toContain("'%7'");
     const enterIdx = calls.findIndex((c, i) => i > literalIdx && c.includes('send-keys') && c.includes('Enter'));
@@ -559,7 +564,7 @@ describe('compactAgent', () => {
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
-  it('interrupts with Esc before submitting the post-merge slash command', async () => {
+  it('clears the composer draft before submitting the post-merge slash command', async () => {
     await seedAgent({ taskId: 't1' });
     setPollMs(1);
     const releaseSpy = stubReleasePostMergeAgent();
@@ -569,14 +574,47 @@ describe('compactAgent', () => {
 
     await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
 
-    const escIdx = fakeTmux.sendKeysToPane.mock.calls.findIndex(([, key]) => key === 'Escape');
+    const draftIdx = fakeTmux.clearComposerDraft.mock.calls.findIndex(([paneId]) => paneId === '%7');
     const clearIdx = fakeTmux.sendKeysLiteral.mock.calls.findIndex(([, text]) => text === '/clear');
-    expect(escIdx).toBeGreaterThanOrEqual(0);
+    expect(draftIdx).toBeGreaterThanOrEqual(0);
     expect(clearIdx).toBeGreaterThanOrEqual(0);
-    expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'Escape');
-    expect(fakeTmux.sendKeysToPane.mock.invocationCallOrder[escIdx])
+    expect(fakeTmux.sendKeysToPane).not.toHaveBeenCalledWith('%7', 'Escape');
+    expect(fakeTmux.clearComposerDraft.mock.invocationCallOrder[draftIdx])
       .toBeLessThan(fakeTmux.sendKeysLiteral.mock.invocationCallOrder[clearIdx]);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
+    expect(guardSet().has('dev-1')).toBe(false);
+  });
+
+  it('re-verifies the binding before each clear attempt: a rebind during the retry sleep stops the second clear', async () => {
+    await seedAgent({ taskId: 't1' });
+    setPollMs(1);
+    const releaseSpy = stubReleasePostMergeAgent();
+    waitReadySpy.mockResolvedValue(undefined);
+
+    let lastLiteral = '';
+    let clearSubmits = 0;
+    const fakeTmux = {
+      ...fakeCompactionTmux(),
+      sendKeysLiteral: vi.fn(async (_paneId: string, text: string) => { lastLiteral = text; }),
+      sendEnter: vi.fn(async () => {
+        if (lastLiteral === '/clear') clearSubmits++;
+      }),
+      capturePaneById: vi.fn(async () => {
+        if (clearSubmits > 0) {
+          const cur = await agentStore.get('dev-1');
+          if (cur?.taskId === 't1') {
+            await agentStore.set({ ...cur, taskId: 'next-task', updatedAt: new Date().toISOString() });
+          }
+          return "■ '/clear' is disabled while a task is in progress.\n› \n\n  repo · 100% context left";
+        }
+        return '› \n\n  repo · 100% context left';
+      }),
+    };
+
+    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
+
+    expect(fakeTmux.clearComposerDraft.mock.calls.filter(([paneId]) => paneId === '%7')).toHaveLength(1);
+    expect(releaseSpy).not.toHaveBeenCalled();
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
@@ -605,7 +643,12 @@ describe('compactAgent', () => {
 
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
     expect(slashCalls).toHaveLength(2);
-    expect(fakeTmux.sendKeysToPane).toHaveBeenCalledWith('%7', 'C-c');
+    const draftCalls = fakeTmux.clearComposerDraft.mock.calls.filter(([paneId]) => paneId === '%7');
+    expect(draftCalls).toHaveLength(3);
+    const draftOrders = fakeTmux.clearComposerDraft.mock.invocationCallOrder;
+    const lastSlashOrder = Math.max(...fakeTmux.sendKeysLiteral.mock.calls
+      .map((c, i) => (c[1] === '/clear' ? fakeTmux.sendKeysLiteral.mock.invocationCallOrder[i] : -1)));
+    expect(draftOrders[draftOrders.length - 1]).toBeGreaterThan(lastSlashOrder);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });
@@ -703,7 +746,7 @@ describe('compactAgent', () => {
 
     const fakeTmux = {
       ...fakeCompactionTmux(),
-      sendKeysToPane: vi.fn().mockRejectedValue(new Error('keystroke failed')),
+      clearComposerDraft: vi.fn().mockRejectedValue(new Error('keystroke failed')),
       hasSession: vi.fn().mockResolvedValue(true),
     };
     await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
@@ -731,7 +774,7 @@ describe('clearAgent', () => {
     expect(enterIdx).toBeGreaterThan(literalIdx);
   });
 
-  it('interrupts with Escape and never C-c for a codex agent so Codex is not killed', async () => {
+  it('dirties the composer with a space before C-c for codex, so a leftover draft is cleared and an empty-composer C-c cannot kill the REPL', async () => {
     await seedAgent({ id: 'qa-1', paneId: '%3' });
     waitReadySpy.mockResolvedValue(undefined);
 
@@ -740,12 +783,14 @@ describe('clearAgent', () => {
 
     expect(waitReadySpy.mock.calls[0][2]).toBe('codex');
     const calls = execCalls();
-    expect(calls.some(c => c.includes('send-keys') && c.includes('C-c'))).toBe(false);
-    const escIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('Escape'));
+    expect(calls.some(c => c.includes('send-keys') && c.includes('Escape'))).toBe(false);
+    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.endsWith("' '"));
+    const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/clear'));
-    expect(escIdx).toBeGreaterThanOrEqual(0);
-    expect(literalIdx).toBeGreaterThan(escIdx);
-    expect(calls[escIdx]).toContain("'%3'");
+    expect(spaceIdx).toBeGreaterThanOrEqual(0);
+    expect(ccIdx).toBeGreaterThan(spaceIdx);
+    expect(literalIdx).toBeGreaterThan(ccIdx);
+    expect(calls[spaceIdx]).toContain("'%3'");
   });
 
   it('rejects 404 for an unknown agent', async () => {

@@ -192,8 +192,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         <>
           <div className="mb-4">
             <h1 className="flex min-w-0 items-baseline gap-2">
-              <span className="shrink-0 font-mono text-base text-og-400">{task.id}</span>
-              <span className="min-w-0 truncate font-display text-base font-semibold tracking-tight text-og-1000" title={task.title}>
+              <span className="shrink-0 font-mono text-sm text-og-400">{task.id}</span>
+              <span className="min-w-0 truncate font-display text-sm font-semibold tracking-tight text-og-1000" title={task.title}>
                 {task.title}
               </span>
             </h1>

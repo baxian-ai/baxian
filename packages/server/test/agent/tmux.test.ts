@@ -384,6 +384,26 @@ describe('TmuxManager', () => {
     });
   });
 
+  describe('clearComposerDraft (dirty-then-C-c: safe on empty and drafted composers)', () => {
+    it('injects a literal space before C-c so C-c always hits a non-empty composer', async () => {
+      await tmux.clearComposerDraft('%0');
+      const cmds = runner.exec.mock.calls.map(c => String(c[0]));
+      expect(cmds).toHaveLength(2);
+      expect(cmds[0]).toContain('tmux send-keys -l');
+      expect(cmds[0]).toContain("-t '%0'");
+      expect(cmds[0]).toContain("' '");
+      expect(cmds[1]).toContain('tmux send-keys');
+      expect(cmds[1]).toContain("'C-c'");
+      expect(cmds[1]).not.toContain('send-keys -l');
+    });
+
+    it('propagates failure when the space injection fails (no blind C-c on unknown composer)', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no such pane', exitCode: 1 });
+      await expect(tmux.clearComposerDraft('%0')).rejects.toThrow(/sendKeysLiteral/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('sendKeys (raw session-name target; prefer sendKeysToPane in new code)', () => {
     it('sends `keys + Enter` to the session via raw target', async () => {
       await tmux.sendKeys('dev', 'claude -p "hi"');

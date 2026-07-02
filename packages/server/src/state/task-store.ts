@@ -10,7 +10,7 @@ export interface TaskFilter {
 const TASK_FIELDS = [
   'id', 'projectId', 'title', 'description', 'preferredAgentId',
   'agentId', 'qaAgentId', 'prNumber', 'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha',
-  'reviewDispatchedAt', 'fixDispatchedAt', 'reviewRound', 'specReviewRound', 'phase', 'signalToken',
+  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'specReviewRound', 'phase', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
   'reviewMode', 'batchIndex', 'batchTotal', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
 ] as const;

@@ -1,13 +1,15 @@
 import { useNavigate, useParams } from 'react-router-dom';
 import type { GithubReviewItem, GithubReviewVerdict } from '../shared/index.js';
+import {
+  GITHUB_REVIEW_VERDICT_CLASS,
+  groupGithubReviewRounds,
+  githubReviewItemKey,
+  githubReviewRevision,
+  githubReviewRoundKey,
+  type GithubReviewRound,
+} from '../shared/github-review.js';
 import { useTask } from '../hooks/use-events.ts';
 import { useGithubReview } from '../hooks/use-github-review.ts';
-
-const VERDICT_CLASS: Record<GithubReviewVerdict, string> = {
-  approve: 'pill pill-live',
-  'request-changes': 'pill pill-warn',
-  comment: 'pill',
-};
 
 const VERDICT_LABEL: Record<GithubReviewVerdict, string> = {
   approve: 'approve',
@@ -31,36 +33,16 @@ function fmt(ts?: string): string {
   return m ? `${m[1]} ${m[2]}` : ts;
 }
 
-interface Round {
-  items: GithubReviewItem[];
-  review?: GithubReviewItem;
-}
-
-function groupRounds(items: GithubReviewItem[]): Round[] {
-  const rounds: Round[] = [];
-  let bucket: GithubReviewItem[] = [];
-  for (const it of items) {
-    if (it.kind === 'review') {
-      rounds.push({ items: bucket, review: it });
-      bucket = [];
-    } else {
-      bucket.push(it);
-    }
-  }
-  if (bucket.length > 0) rounds.push({ items: bucket });
-  return rounds;
-}
-
 export function GithubReviewPage() {
   const { taskId = '' } = useParams();
   const navigate = useNavigate();
   const { data: task } = useTask(taskId);
-  const revision = task ? `${task.reviewRound}:${task.latestHeadSha ?? ''}:${task.status}` : undefined;
+  const revision = task ? githubReviewRevision(task) : undefined;
   const { data, loaded, error } = useGithubReview(taskId, revision);
 
   const prNumber = data?.prNumber ?? task?.prNumber;
   const prUrl = data?.prUrl ?? task?.prUrl;
-  const rounds = data ? groupRounds(data.items) : [];
+  const rounds = data ? groupGithubReviewRounds(data.items) : [];
 
   return (
     <div className="mx-auto w-full max-w-5xl">
@@ -69,7 +51,7 @@ export function GithubReviewPage() {
       </button>
       <div className="mb-1 flex flex-wrap items-baseline gap-2">
         <span className="font-mono text-og-400">{taskId}</span>
-        <span className="text-base font-semibold text-og-1000">{task?.title ?? ''}</span>
+        <span className="text-sm font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
         <span className="pill">代码评审</span>
@@ -99,7 +81,7 @@ export function GithubReviewPage() {
             )}
             <div className="space-y-5">
               {rounds.map((round, i) => (
-                <RoundBlock key={i} round={round} index={i} />
+                <RoundBlock key={githubReviewRoundKey(round, String(i))} round={round} index={i} />
               ))}
             </div>
           </>
@@ -108,14 +90,14 @@ export function GithubReviewPage() {
   );
 }
 
-function RoundBlock({ round, index }: { round: Round; index: number }) {
+function RoundBlock({ round, index }: { round: GithubReviewRound; index: number }) {
   const label = round.review ? `第 ${index + 1} 轮` : '进行中';
   return (
     <div>
       <div className="mb-1.5 text-xs font-medium text-og-700">{label}</div>
       <div className="space-y-2">
-        {round.items.map((it) => (
-          <ItemRow key={`${it.kind}-${it.id}`} item={it} />
+        {round.items.map((it, itemIndex) => (
+          <ItemRow key={githubReviewItemKey(it, `${index}-${itemIndex}`)} item={it} />
         ))}
         {round.review && <ReviewBlock item={round.review} />}
       </div>
@@ -164,7 +146,7 @@ function ReviewBlock({ item }: { item: GithubReviewItem }) {
         <span className="shrink-0 min-w-[1.75rem] text-xs font-semibold uppercase tracking-wide text-[#c2410c]">
           QA
         </span>
-        <span className={VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
+        <span className={GITHUB_REVIEW_VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
         {item.author && <span className="text-xs text-og-400">{item.author}</span>}
         {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
         {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}

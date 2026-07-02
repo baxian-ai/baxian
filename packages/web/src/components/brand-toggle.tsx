@@ -7,7 +7,7 @@ export function BrandToggle() {
       type="button"
       onClick={() => setAsText((v) => !v)}
       aria-label={asText ? '切换为 Logo 图标' : '切换为 Logo 文字'}
-      className="flex h-7 min-w-[60px] shrink-0 items-center justify-center font-display text-base font-semibold tracking-tight text-og-1000"
+      className="flex h-7 min-w-[60px] shrink-0 items-center justify-center font-display text-sm font-semibold tracking-tight text-og-1000"
     >
       {asText ? (
         <span className="inline-flex h-6 items-center leading-none">baxian</span>

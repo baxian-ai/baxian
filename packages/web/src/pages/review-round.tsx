@@ -55,7 +55,7 @@ export function ReviewRoundPage() {
       </button>
       <div className="mb-1 flex flex-wrap items-baseline gap-2">
         <span className="font-mono text-og-400">{taskId}</span>
-        <span className="text-base font-semibold text-og-1000">{task?.title ?? ''}</span>
+        <span className="text-sm font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
         <span className="pill">{phase}</span>

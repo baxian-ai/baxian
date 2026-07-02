@@ -3129,7 +3129,7 @@ export class AgentManager {
       };
       await waitReady();
       await assertSessionUnchanged();
-      await tmux.sendKeysToPane(paneId, cfg.runtime === 'codex' ? 'Escape' : 'C-c');
+      await tmux.clearComposerDraft(paneId);
       await waitReady();
       await assertSessionUnchanged();
       await tmux.sendKeysLiteral(paneId, command);
@@ -3663,12 +3663,21 @@ export class AgentManager {
             `dispatch aborted: task ${now.taskId} for agent ${agentId} went terminal while waiting for pane mutex`,
           );
         }
-        const fresh = await this.agentStore.get(agentId);
-        if (!fresh || fresh.paneId !== before.paneId || fresh.taskId !== before.taskId || isCancelCleanupHold(fresh)) {
-          throw new Error(`dispatch aborted: agent ${agentId} taken over by cancel before paste`);
-        }
       }
-      return await this.injectAndAwaitAckSteps(tmux, paneId, prompt, agentId, runtime);
+      const revalidate = before
+        ? async (): Promise<void> => {
+          const fresh = await this.agentStore.get(agentId);
+          if (!fresh || fresh.paneId !== before.paneId || fresh.taskId !== before.taskId || isCancelCleanupHold(fresh)) {
+            throw new Error(`dispatch aborted: agent ${agentId} taken over by cancel before paste`);
+          }
+          const boundTask = fresh.taskId ? await this.taskStore.get(fresh.taskId) : null;
+          if (boundTask && TERMINAL_STATUSES.includes(boundTask.status)) {
+            throw new Error(`dispatch aborted: task ${fresh.taskId} for agent ${agentId} went terminal before paste`);
+          }
+        }
+        : undefined;
+      await revalidate?.();
+      return await this.injectAndAwaitAckSteps(tmux, paneId, prompt, agentId, runtime, revalidate);
     } finally {
       this.compactInFlight.delete(agentId);
     }
@@ -3680,7 +3689,19 @@ export class AgentManager {
     prompt: string,
     agentId: string,
     runtime: AgentConfig['runtime'],
+    revalidate?: () => Promise<void>,
   ): Promise<{ acked: boolean; composerDelivered: boolean }> {
+    // 静态忙信号（文本忙样式/working title）可能是残稿或 stale title 冒充，一律由帧活性仲裁；ready 视图覆盖 stale title。
+    const preTitle = await tmux.readPaneTitle(paneId);
+    const preFrame = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+    const staticBusy = hasOscTitleWorking(preTitle)
+      ? (runtimeBusyCheck(preFrame, runtime) || !hasRuntimeReadyView(preFrame, runtime))
+      : runtimeBusyCheck(preFrame, runtime);
+    if (staticBusy && await this.paneHasLiveTurn(tmux, paneId, runtime)) {
+      throw new Error(`pre-inject busy check: pane ${paneId} is still running a turn; dispatch aborted`);
+    }
+    await tmux.clearComposerDraft(paneId);
+    await revalidate?.();
     await tmux.injectPrompt(paneId, prompt, agentId);
     let baseline: string;
     let baselineTitle = '';
@@ -3737,10 +3758,10 @@ export class AgentManager {
 
   private async clearComposerForReuse(tmux: TmuxManager, paneId: string, agentId: string): Promise<boolean> {
     try {
-      await tmux.sendKeysToPane(paneId, 'C-c');
+      await tmux.clearComposerDraft(paneId);
       return true;
     } catch (err) {
-      console.warn(`[AgentManager] clearComposerForReuse: C-c failed for pane ${paneId}:`, err);
+      console.warn(`[AgentManager] clearComposerForReuse: composer clear failed for pane ${paneId}:`, err);
     }
     try {
       return !(await tmux.hasSession(agentId));
@@ -5370,7 +5391,8 @@ export class AgentManager {
   ): Promise<boolean> {
     let rejection: Error | undefined;
     for (let attempt = 1; attempt <= 2; attempt++) {
-      await tmux.sendKeysToPane(paneId, 'Escape');
+      if (!await bindingStillOurs()) return false;
+      await tmux.clearComposerDraft(paneId);
       await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
       if (!await bindingStillOurs()) return false;
       await tmux.sendKeysLiteral(paneId, '/clear');
@@ -5385,7 +5407,6 @@ export class AgentManager {
       if (attempt < 2) {
         console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) /clear rejected; retrying`);
         await new Promise(r => setTimeout(r, this.compactIdlePollMs));
-        if (!await bindingStillOurs()) return false;
       }
     }
     throw rejection ?? new Error('runtime rejected /clear');

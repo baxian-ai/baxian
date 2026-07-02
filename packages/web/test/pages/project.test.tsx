@@ -119,7 +119,7 @@ describe('Project page header', () => {
     renderProjectPage();
 
     const heading = await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
-    expect(heading.className).toContain('text-base');
+    expect(heading.className).toContain('text-sm');
     expect(heading.className).toContain('font-display');
     expect(heading.className).toContain('font-semibold');
 

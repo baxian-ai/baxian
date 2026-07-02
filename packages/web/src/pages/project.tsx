@@ -212,7 +212,7 @@ export function Project() {
       </TopbarActions>
       {error && <div className="mb-4 text-sm text-danger">Error: {error}</div>}
       <div className="mb-6 flex items-baseline gap-x-3">
-        <h1 className="min-w-0 truncate font-display text-base font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
+        <h1 className="min-w-0 truncate font-display text-sm font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
         <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
       </div>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">

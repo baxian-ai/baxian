@@ -941,6 +941,33 @@ describe('pr.updated handler', () => {
     expect(task!.status).toBe('fixing');
   });
 
+  it('review-window comment-only feedback refreshes the GitHub review revision source without opening a new QA pass', async () => {
+    await seedReviewPass('task-up-review-comment', {
+      reviewDispatchedAt: '2026-07-02T09:00:00.000Z',
+      prFeedbackReceivedAt: '2026-07-02T09:05:00.000Z',
+    });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
+
+    await emitAndWait({
+      type: 'pr.updated',
+      timestamp: '2026-07-02T09:30:00.000Z',
+      projectId: 'proj',
+      agentId: 'dev-1',
+      taskId: 'task-up-review-comment',
+      data: { prNumber: 214, kind: 'review-comment', headSha: NEXT_HEAD_SHA },
+    });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(transitionSpy).not.toHaveBeenCalled();
+    const task = await taskStore.get('task-up-review-comment');
+    expect(task!.status).toBe('review');
+    expect(task!.reviewRound).toBe(1);
+    expect(task!.latestHeadSha).toBe(HEAD_SHA);
+    expect(task!.reviewDispatchedAt).toBe('2026-07-02T09:00:00.000Z');
+    expect(task!.prFeedbackReceivedAt).toBe('2026-07-02T09:30:00.000Z');
+  });
+
   it('comment-only kind=comment after approval preserves the approved head and re-dispatches dev check', async () => {
     await seedTask({ id: 'task-up-approved-comment', status: 'approved', reviewRound: 1, prNumber: 63 });
     await manager.setPostApproveCompletion('task-up-approved-comment', { token: 'old-post-token', approvedHeadSha: HEAD_SHA });
@@ -954,6 +981,7 @@ describe('pr.updated handler', () => {
 
     const task = await taskStore.get('task-up-approved-comment');
     expect(task!.status).toBe('approved');
+    expect(task!.prFeedbackReceivedAt).toBeTruthy();
     const completion = await manager.getPostApproveCompletion('task-up-approved-comment');
     expect(completion?.token).not.toBe('old-post-token');
     expect(completion?.approvedHeadSha).toBe(HEAD_SHA);

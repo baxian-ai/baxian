@@ -15,6 +15,7 @@ Judge the `diff:` block against the task spec: correctness, tests, edge cases, s
 - Severity: `critical` = broken/unsafe, `major` = must fix before merge, `minor` = improvement.
 - Reference file + line for every code finding.
 - For unchanged files, read them directly from your own base-branch worktree; use the read-file side-channel only for content not present locally.
+- A `batch: i/n` field means the `diff:` block carries one slice of a larger change reviewed batch by batch, while `diffstat:` still lists every file. Files in the diffstat but absent from your slice belong to other batches — their absence is not a finding; fetch cross-slice context via the read-file side-channel when a judgement needs it.
 
 ## Recheck Closure
 

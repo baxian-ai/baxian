@@ -49,24 +49,25 @@ describe('border-radius design tokens', () => {
 });
 
 describe('font-size design tokens', () => {
-  it('uses a compact three-step UI scale', () => {
+  it('uses a two-step UI scale (12px meta, 14px primary)', () => {
     expect(fontSize).toMatchObject({
       xs: ['12px', { lineHeight: '1.4' }],
       sm: ['14px', { lineHeight: '1.55' }],
-      base: ['15px', { lineHeight: '1.5' }],
     });
   });
 
-  it('replaces the default font scale so larger text utilities are unavailable', () => {
-    expect(Object.keys(fontSize).sort()).toEqual(['base', 'sm', 'xs']);
-    for (const oversized of ['lg', 'xl', '2xl', '3xl']) {
-      expect(fontSize[oversized]).toBeUndefined();
+  it('replaces the default font scale so no third UI size utility exists', () => {
+    expect(Object.keys(fontSize).sort()).toEqual(['sm', 'xs']);
+    expect(tailwindConfig.theme?.extend?.fontSize).toBeUndefined();
+    for (const dropped of ['base', 'lg', 'xl', '2xl', '3xl']) {
+      expect(fontSize[dropped]).toBeUndefined();
     }
   });
 
-  it('keeps headings above body text without returning to the enlarged task-177 scale', () => {
+  it('keeps both steps distinct from each other and from the 13px web terminal, so the site has exactly three sizes', () => {
     expect(fontPx('xs')).toBeLessThan(fontPx('sm'));
-    expect(fontPx('sm')).toBeLessThan(fontPx('base'));
-    expect(fontPx('base')).toBeLessThanOrEqual(15);
+    for (const token of Object.keys(fontSize)) {
+      expect(fontPx(token)).not.toBe(13);
+    }
   });
 });

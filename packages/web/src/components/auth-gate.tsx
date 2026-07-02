@@ -95,7 +95,7 @@ function CenteredCard({ title, children }: { title: string; children: ReactNode 
   return (
     <div className="flex min-h-dvh items-center justify-center bg-page px-4">
       <div className="w-full max-w-sm rounded-lg border border-hairline bg-surface px-6 py-6">
-        <h1 className="mb-3 font-display text-base font-semibold tracking-tight text-og-1000">{title}</h1>
+        <h1 className="mb-3 font-display text-sm font-semibold tracking-tight text-og-1000">{title}</h1>
         {children}
       </div>
     </div>

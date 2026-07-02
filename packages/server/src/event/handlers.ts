@@ -289,18 +289,23 @@ async function handlePrFeedback(
   const eventPrNumber = event.data.prNumber as number | undefined;
   const eventPrUrl = event.data.prUrl as string | undefined;
   const eventKind = event.data.kind as string | undefined;
+  const isNewFeedback = eventKind === 'comment' || eventKind === 'review-comment';
   const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
     ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
     ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
   };
+  const taskPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'prFeedbackReceivedAt'>> = {
+    ...prPatch,
+    ...(isNewFeedback ? { prFeedbackReceivedAt: event.timestamp } : {}),
+  };
   const needsPatch =
     (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
-    || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl);
+    || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl)
+    || isNewFeedback;
   if (needsPatch) {
-    await manager.updateTask(taskId, prPatch);
+    await manager.updateTask(taskId, taskPatch);
   }
   if (taskNow.status !== 'approved') return;
-  const isNewFeedback = eventKind === 'comment' || eventKind === 'review-comment';
   if (!isNewFeedback) return;
 
   const completion = await manager.getPostApproveCompletion(taskNow.id);
@@ -338,7 +343,7 @@ async function handlePrFeedback(
   await dispatchDevPostApproveCheck(
     bus,
     manager,
-    { ...taskNow, ...prPatch },
+    { ...taskNow, ...taskPatch },
     completion.approvedHeadSha,
     { redispatchCount: nextCount },
   );
