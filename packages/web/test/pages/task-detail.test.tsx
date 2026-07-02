@@ -192,6 +192,16 @@ describe('TaskDetail page — header & info', () => {
     expect(within(status).getByText('2').className).toContain('font-semibold');
   });
 
+  it('keeps status and review round text at body size', () => {
+    const { container } = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
+    const section = container.querySelector('section')!;
+    const row = within(section).getByText('max_rounds').parentElement!;
+
+    expect(within(row).getByText('max_rounds').className).toContain('text-sm');
+    expect(within(row).getByText('Round').className).toContain('text-sm');
+    expect(within(row).getByText('Spec').className).toContain('text-sm');
+  });
+
   it('shows only PR and Branch in the info card, with a branch hyperlink, dropping project/agent rows', () => {
     const { container } = open();
     const section = container.querySelector('section')!;

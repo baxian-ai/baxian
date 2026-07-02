@@ -239,9 +239,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <span className={`${STATUS_BADGE_COLORS[task.status]} !text-base`}>{task.status}</span>
-          <span className="text-base text-og-500">Round <span className="font-semibold text-og-800">{task.reviewRound}</span></span>
-          <span className="text-base text-og-500">Spec <span className="font-semibold text-og-800">{task.specReviewRound ?? 0}</span></span>
+          <span className={`${STATUS_BADGE_COLORS[task.status]} text-sm`}>{task.status}</span>
+          <span className="text-sm text-og-500">Round <span className="font-semibold text-og-800">{task.reviewRound}</span></span>
+          <span className="text-sm text-og-500">Spec <span className="font-semibold text-og-800">{task.specReviewRound ?? 0}</span></span>
         </div>
         <div className="mb-4 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
         <div className="mb-4 text-xs text-og-500">
