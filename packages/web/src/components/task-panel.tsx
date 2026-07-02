@@ -147,7 +147,7 @@ export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelPro
             type="button"
             onClick={toggleDone}
             aria-expanded={doneExpanded}
-            className="flex w-full items-center justify-between px-3 py-2 text-left text-[12px] font-normal uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
+            className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-normal uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
           >
             <span>DONE</span>
             <span className="font-normal normal-case text-accent">{doneExpanded ? '收起' : '查看'}</span>
@@ -170,11 +170,11 @@ function LiveSection({
 }) {
   return (
     <section aria-label={title} className="border-b border-hairline">
-      <div className="px-3 py-2 text-[12px] font-normal uppercase tracking-[0.05em] text-og-500">
+      <div className="px-3 py-2 text-xs font-normal uppercase tracking-[0.05em] text-og-500">
         {title} <span className="text-og-400">({section.total})</span>
       </div>
       {section.items.length === 0 ? (
-        <div className="px-3 pb-3 text-[13px] text-og-400">{emptyHint}</div>
+        <div className="px-3 pb-3 text-xs text-og-400">{emptyHint}</div>
       ) : (
         <div className="divide-y divide-hairline">
           {section.items.map((task) => <TaskRow key={task.id} task={task} />)}
@@ -182,7 +182,7 @@ function LiveSection({
             <button
               type="button"
               onClick={section.loadMore}
-              className="w-full px-3 py-2 text-center text-[13px] text-accent transition-colors hover:bg-og-50/40"
+              className="w-full px-3 py-2 text-center text-xs text-accent transition-colors hover:bg-og-50/40"
             >
               加载更多
             </button>
@@ -198,17 +198,17 @@ function DoneBody({ state }: { state: DoneState }) {
   return (
     <div className="divide-y divide-hairline">
       {state.items.map((task) => <TaskRow key={task.id} task={task} />)}
-      {state.error && <div className="px-3 py-2 text-[13px] text-danger">加载失败：{state.error}</div>}
-      {showEmpty && <div className="px-3 pb-3 pt-1 text-[13px] text-og-400">暂无已处理的任务</div>}
+      {state.error && <div className="px-3 py-2 text-xs text-danger">加载失败：{state.error}</div>}
+      {showEmpty && <div className="px-3 pb-3 pt-1 text-xs text-og-400">暂无已处理的任务</div>}
       {state.loading && state.items.length === 0 && (
-        <div className="px-3 py-3 text-center text-[13px] text-og-400">加载中…</div>
+        <div className="px-3 py-3 text-center text-xs text-og-400">加载中…</div>
       )}
       {state.hasMore && (
         <button
           type="button"
           onClick={() => state.load('more')}
           disabled={state.loading}
-          className="w-full px-3 py-2 text-center text-[13px] text-accent transition-colors hover:bg-og-50/40 disabled:opacity-50"
+          className="w-full px-3 py-2 text-center text-xs text-accent transition-colors hover:bg-og-50/40 disabled:opacity-50"
         >
           {state.loading ? '加载中…' : '加载更多'}
         </button>
@@ -242,13 +242,13 @@ function TaskRow({ task }: { task: TaskState }) {
     <button
       type="button"
       onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
-      className="flex w-full items-center gap-2 px-3 py-2 text-left text-[14px] transition-colors hover:bg-og-50/60"
+      className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-og-50/60"
     >
-      <span className="shrink-0 font-mono text-[12px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
+      <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
       <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
       {task.phase === 'spec' && <span className="pill pill-review shrink-0">spec</span>}
       {overdue && <span className="pill pill-warn shrink-0" title="Review verdict missing">!</span>}
-      <span aria-label={`Round ${round}`} className="shrink-0 text-[12px] text-og-400">R{round}</span>
+      <span aria-label={`Round ${round}`} className="shrink-0 text-xs text-og-400">R{round}</span>
       <TaskStatusDot status={task.status} />
     </button>
   );

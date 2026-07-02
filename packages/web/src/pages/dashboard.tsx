@@ -125,7 +125,7 @@ export function Dashboard() {
                 type="button"
                 role="menuitem"
                 onClick={() => { setMoreMenuOpen(false); setCreateOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-[14px] text-og-800 hover:text-og-1000"
+                className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:text-og-1000"
               >
                 新建项目
               </button>
@@ -133,7 +133,7 @@ export function Dashboard() {
                 type="button"
                 role="menuitem"
                 onClick={() => { setMoreMenuOpen(false); setHostMgmtOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-[14px] text-og-800 hover:text-og-1000"
+                className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:text-og-1000"
               >
                 Host 管理
               </button>
@@ -142,9 +142,9 @@ export function Dashboard() {
         </div>
       </TopbarActions>
       <h1 className="sr-only">Dashboard</h1>
-      {error && <div className="mb-4 text-[14px] text-danger">Error: {error}</div>}
+      {error && <div className="mb-4 text-sm text-danger">Error: {error}</div>}
       {projectsLoaded && projects.length === 0 && !projectsError && (
-        <div className="rounded-lg border border-hairline bg-surface py-12 text-center text-[14px] text-og-500">
+        <div className="rounded-lg border border-hairline bg-surface py-12 text-center text-sm text-og-500">
           还没有项目。点击右上角"更多"菜单 → "新建项目"开始。
         </div>
       )}
@@ -199,7 +199,7 @@ export function Dashboard() {
           </>
         }
       >
-        <p className="text-[14px] text-og-700">现在添加第一个 Agent，还是稍后再加？</p>
+        <p className="text-sm text-og-700">现在添加第一个 Agent，还是稍后再加？</p>
       </Modal>
 
       {continueState.kind === 'addingAgent' && (
@@ -242,23 +242,23 @@ function DashboardProject({
   return (
     <div className="mb-10">
       <div className="mb-3 -mx-2 flex items-baseline gap-x-3 gap-y-1 px-2 py-1">
-        <h2 className="min-w-0 truncate font-display text-[18px] font-semibold tracking-tight text-og-1000" title={project.id}>
+        <h2 className="min-w-0 truncate font-display text-base font-semibold tracking-tight text-og-1000" title={project.id}>
           <Link to={`/project/${project.id}`} className="hover:text-accent-hover">{project.id}</Link>
         </h2>
-        <span className="hidden min-w-0 truncate font-mono text-[13px] text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
+        <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
         <Link
           to={`/project/${project.id}`}
-          className="ml-auto text-[14px] text-accent hover:text-accent-hover"
+          className="ml-auto text-sm text-accent hover:text-accent-hover"
           aria-label={`Details — ${project.id}`}
         >
           Details →
         </Link>
       </div>
       {tasksError && (
-        <div className="mb-2 text-[13px] text-danger">任务列表加载失败：{tasksError}</div>
+        <div className="mb-2 text-xs text-danger">任务列表加载失败：{tasksError}</div>
       )}
       {project.agent.flat().length === 0 ? (
-        <div className="rounded-lg border border-hairline bg-surface py-6 text-center text-[14px] text-og-500">
+        <div className="rounded-lg border border-hairline bg-surface py-6 text-center text-sm text-og-500">
           还没有 Agent。进入 Details 添加。
         </div>
       ) : (

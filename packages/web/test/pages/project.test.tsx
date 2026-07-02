@@ -119,13 +119,13 @@ describe('Project page header', () => {
     renderProjectPage();
 
     const heading = await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
-    expect(heading.className).toContain('text-[18px]');
+    expect(heading.className).toContain('text-base');
     expect(heading.className).toContain('font-display');
     expect(heading.className).toContain('font-semibold');
 
     const repo = screen.getByText('/tmp/demo-repo');
     expect(repo.className).toContain('font-mono');
-    expect(repo.className).toContain('text-[13px]');
+    expect(repo.className).toContain('text-xs');
     expect(repo.className).toContain('text-og-500');
     expect(repo.className).toContain('truncate');
     expect(repo.className).not.toContain('break-words');

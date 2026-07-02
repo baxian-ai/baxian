@@ -11,8 +11,8 @@ interface Props {
 
 const REDACTED = '***';
 const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-[14px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-[13px] font-medium text-og-700';
+  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
+const labelCls = 'mb-1.5 block text-xs font-medium text-og-700';
 
 interface FormState {
   hostname: string;
@@ -181,7 +181,7 @@ export function HostManagementModal({ open, onClose }: Props) {
       footer={view === 'list' ? listFooter : formFooter}
     >
       {error && (
-        <div className="mb-3 rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[14px] text-danger">
+        <div className="mb-3 rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-sm text-danger">
           {error}
         </div>
       )}
@@ -189,7 +189,7 @@ export function HostManagementModal({ open, onClose }: Props) {
       {view === 'list' ? (
         <div className="space-y-3">
           {hosts.length === 0 ? (
-            <p className="text-[14px] text-og-500">还没有配置 Host。点击下方「添加 Host」。</p>
+            <p className="text-sm text-og-500">还没有配置 Host。点击下方「添加 Host」。</p>
           ) : (
             <ul className="space-y-1.5">
               {hosts.map(h => (
@@ -198,19 +198,19 @@ export function HostManagementModal({ open, onClose }: Props) {
                   className="flex items-center justify-between gap-3 rounded-md border border-og-100 px-3 py-2"
                 >
                   <div className="min-w-0">
-                    <div className="truncate text-[14px] font-medium text-og-800">{hostLabel(h)}</div>
-                    <div className="truncate text-[13px] text-og-500">
+                    <div className="truncate text-sm font-medium text-og-800">{hostLabel(h)}</div>
+                    <div className="truncate text-xs text-og-500">
                       {(h.user ? `${h.user}@` : '') + h.hostname}{h.port != null ? `:${h.port}` : ''}
                       {h.password === REDACTED ? ' · 密码已保存' : ''}
                     </div>
                   </div>
                   <div className="flex shrink-0 gap-2">
                     <button type="button" onClick={() => startEdit(h)}
-                      className="text-[13px] text-accent transition-colors hover:text-accent-hover">
+                      className="text-xs text-accent transition-colors hover:text-accent-hover">
                       编辑
                     </button>
                     <button type="button" onClick={() => handleDelete(h)}
-                      className="text-[13px] text-danger transition-colors hover:opacity-80">
+                      className="text-xs text-danger transition-colors hover:opacity-80">
                       删除
                     </button>
                   </div>
@@ -234,7 +234,7 @@ export function HostManagementModal({ open, onClose }: Props) {
               onChange={e => setForm({ ...form, port: e.target.value })}
               className={inputCls} placeholder="22" disabled={submitting} />
             {form.port.trim() !== '' && !portValid && (
-              <div className="mt-1 text-[13px] text-danger">端口需为 1–65535 的整数</div>
+              <div className="mt-1 text-xs text-danger">端口需为 1–65535 的整数</div>
             )}
           </div>
           <div>
@@ -257,7 +257,7 @@ export function HostManagementModal({ open, onClose }: Props) {
               placeholder={hadPassword ? '已设置，留空保持不变' : '留空使用 key 认证'}
               disabled={submitting || clearPassword} autoComplete="new-password" />
             {editingId && hadPassword && (
-              <label className="mt-1.5 flex items-center gap-2 text-[13px] text-og-700">
+              <label className="mt-1.5 flex items-center gap-2 text-xs text-og-700">
                 <input type="checkbox" className="h-3.5 w-3.5 accent-[#1348dc]" checked={clearPassword}
                   onChange={e => setClearPassword(e.target.checked)} disabled={submitting} />
                 清除已保存的密码（改用 key 登录）
@@ -265,18 +265,18 @@ export function HostManagementModal({ open, onClose }: Props) {
             )}
           </div>
 
-          <div className="rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5 text-[13px] text-warn">
+          <div className="rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5 text-xs text-warn">
             建议为该 Host 配置好<strong className="font-semibold">免密码登入（SSH key）</strong>。
             否则填写的密码将以<strong className="font-semibold">明文</strong>保存到 baxian.json 中。
           </div>
 
           <div className="flex items-center gap-3">
             <button type="button" onClick={handleTest} disabled={!formValid || testing || submitting}
-              className="text-[13px] text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
+              className="text-xs text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
               {testing ? '测试中…' : '测试连接'}
             </button>
             {testResult && (
-              <span className={`text-[13px] ${testResult.ok ? 'text-success' : 'text-danger'}`}>
+              <span className={`text-xs ${testResult.ok ? 'text-success' : 'text-danger'}`}>
                 {testResult.ok ? '✓ ' : '⨯ '}{testResult.message}
               </span>
             )}

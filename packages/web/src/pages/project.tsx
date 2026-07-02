@@ -132,8 +132,8 @@ export function Project() {
   };
 
   if (!project) {
-    if (projectError) return <div className="text-[14px] text-danger">Error: {projectError}</div>;
-    return <div className="text-[14px] text-og-500">Loading…</div>;
+    if (projectError) return <div className="text-sm text-danger">Error: {projectError}</div>;
+    return <div className="text-sm text-og-500">Loading…</div>;
   }
 
   return (
@@ -182,7 +182,7 @@ export function Project() {
                   type="button"
                   role="menuitem"
                   onClick={() => { setMenuOpen(false); setTaskPanelOpen(true); menuButtonRef.current?.focus(); }}
-                  className="block w-full px-3 py-1.5 text-left text-[14px] text-og-800 hover:bg-og-50 hover:text-og-1000"
+                  className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:bg-og-50 hover:text-og-1000"
                 >
                   显示 Task 面板
                 </button>
@@ -191,7 +191,7 @@ export function Project() {
                 type="button"
                 role="menuitem"
                 onClick={() => { setMenuOpen(false); setCreateAgentOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-[14px] text-og-800 hover:bg-og-50 hover:text-og-1000"
+                className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:bg-og-50 hover:text-og-1000"
               >
                 添加 Agent
               </button>
@@ -202,7 +202,7 @@ export function Project() {
                 onClick={() => { setMenuOpen(false); setDeleteOpen(true); }}
                 disabled={!canDelete}
                 title={canDelete ? undefined : `请先删除项目下的 ${agentCount} 个 Agent`}
-                className="block w-full px-3 py-1.5 text-left text-[14px] text-danger hover:bg-[#fef2f2] disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
+                className="block w-full px-3 py-1.5 text-left text-sm text-danger hover:bg-[#fef2f2] disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
               >
                 删除项目…
               </button>
@@ -210,18 +210,18 @@ export function Project() {
           )}
         </div>
       </TopbarActions>
-      {error && <div className="mb-4 text-[14px] text-danger">Error: {error}</div>}
+      {error && <div className="mb-4 text-sm text-danger">Error: {error}</div>}
       <div className="mb-6 flex items-baseline gap-x-3">
-        <h1 className="min-w-0 truncate font-display text-[18px] font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
-        <span className="hidden min-w-0 truncate font-mono text-[13px] text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
+        <h1 className="min-w-0 truncate font-display text-base font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
+        <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
       </div>
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <div className="min-w-0 flex-1">
           <div className="mb-3 flex h-8 items-center gap-2">
-            <h2 className="font-display text-[13px] font-semibold uppercase tracking-[0.06em] text-og-500">Agents</h2>
+            <h2 className="font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">Agents</h2>
           </div>
           {project.agent.flat().length === 0 ? (
-            <div className="mb-8 rounded-lg border border-hairline bg-surface py-6 text-center text-[14px] text-og-500">
+            <div className="mb-8 rounded-lg border border-hairline bg-surface py-6 text-center text-sm text-og-500">
               还没有 Agent，点击右上角菜单添加。
             </div>
           ) : (
@@ -246,7 +246,7 @@ export function Project() {
         {taskPanelOpen && (
           <div className="w-full lg:w-[340px] lg:shrink-0 xl:w-[380px]">
             <div className="mb-3 flex h-8 items-center justify-between gap-2">
-              <h2 className="font-display text-[13px] font-semibold uppercase tracking-[0.06em] text-og-500">Tasks</h2>
+              <h2 className="font-display text-xs font-semibold uppercase tracking-[0.06em] text-og-500">Tasks</h2>
               <button
                 type="button"
                 onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
@@ -305,11 +305,11 @@ export function Project() {
         }
       >
         <div className="space-y-4">
-          <p className="text-[14px] text-og-700">
+          <p className="text-sm text-og-700">
             将从 <code className="font-mono text-og-1000">baxian.json</code> 中移除项目{' '}
             <span className="font-mono text-og-1000">{project.id}</span>。此操作不可撤销，且不会删除 Git 仓库本身。
           </p>
-          <p className="text-[14px] text-og-700">
+          <p className="text-sm text-og-700">
             如需确认，请在下方输入项目 ID <span className="font-mono text-og-1000">{project.id}</span>：
           </p>
           <input
@@ -322,10 +322,10 @@ export function Project() {
             spellCheck={false}
             disabled={deleting}
             aria-label="输入项目 ID 以确认删除"
-            className="w-full rounded border border-hairline bg-surface px-3 py-2 font-mono text-[14px] text-og-1000 focus:border-accent focus:outline-none"
+            className="w-full rounded border border-hairline bg-surface px-3 py-2 font-mono text-sm text-og-1000 focus:border-accent focus:outline-none"
           />
           {deleteError && (
-            <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-[13px] text-danger">
+            <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-xs text-danger">
               {deleteError}
             </div>
           )}

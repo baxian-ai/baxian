@@ -200,17 +200,12 @@ function recordingRunner(
 }
 
 function setCompactTiming(mgr: AgentManager, waitMs = 100, pollMs = 10): void {
-  Object.assign(mgr, { compactIdleWaitMs: waitMs, compactIdlePollMs: pollMs, clearContextWaitMs: waitMs });
+  Object.assign(mgr, { compactIdleWaitMs: waitMs, compactIdlePollMs: pollMs });
 }
 
 function mockInterruptPane(mgr: AgentManager, ok: boolean): ReturnType<typeof vi.spyOn> {
   return vi.spyOn(mgr as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
     .mockResolvedValue(ok) as ReturnType<typeof vi.spyOn>;
-}
-
-function stubClearPane(mgr: AgentManager, confirmed = true): ReturnType<typeof vi.spyOn> {
-  return vi.spyOn(mgr as unknown as { clearPaneContext: () => Promise<boolean> }, 'clearPaneContext')
-    .mockResolvedValue(confirmed) as ReturnType<typeof vi.spyOn>;
 }
 
 function freshRegistry(): SkillRegistry {
@@ -467,7 +462,6 @@ describe('AgentManager task binding flow', () => {
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
     mockInterruptPane(manager, true);
-    stubClearPane(manager);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await manager.cancelTask(t.id);
@@ -579,7 +573,6 @@ describe('AgentManager task binding flow', () => {
   it('createAndStartTask({ background: true }): cancel mid-bootstrap interrupts the pane, then idle-releases', async () => {
     mockStartSessionThatCancels();
     const interruptSpy = mockInterruptPane(manager, true);
-    stubClearPane(manager);
     let released!: () => void;
     const releaseDone = new Promise<void>((resolve) => { released = resolve; });
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockImplementation(async () => { released(); return true; });
@@ -616,26 +609,6 @@ describe('AgentManager task binding flow', () => {
 
     await holdDone;
     expect(holdSpy).toHaveBeenCalledWith('dev-1', 'cancel-interrupt-failed', expect.any(String), { expectedTaskId: created.id });
-    expect(releaseSpy).not.toHaveBeenCalled();
-  });
-
-  it('createAndStartTask({ background: true }): cancel mid-bootstrap holds the agent when /clear is not confirmed', async () => {
-    mockStartSessionThatCancels();
-    mockInterruptPane(manager, true);
-    stubClearPane(manager, false);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
-    let held!: () => void;
-    const holdDone = new Promise<void>((resolve) => { held = resolve; });
-    const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockImplementation(async () => { held(); });
-
-    const created = await manager.createAndStartTask(
-      'proj',
-      { title: 'T', description: 'D', preferredAgentId: 'dev-1' },
-      { background: true },
-    );
-
-    await holdDone;
-    expect(holdSpy).toHaveBeenCalledWith('dev-1', 'cancel-clear-failed', expect.any(String), { expectedTaskId: created.id });
     expect(releaseSpy).not.toHaveBeenCalled();
   });
 
@@ -1859,8 +1832,8 @@ describe('AgentManager runtime menu marker', () => {
   });
 });
 
-describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
-  it('sends ESC then /clear on both dev and qa, then clears both bindings', async () => {
+describe('cancelTask interrupts (ESC) then releases dev and qa panes without clearing', () => {
+  it('sends ESC to both dev and qa, never /clear, then clears both bindings', async () => {
     const sentKeys: string[] = [];
     const localManager = makeManager({
       skillRegistry: freshRegistry(),
@@ -1886,44 +1859,13 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
 
     expect(cancelled.status).toBe('cancelled');
     const escKeys = sentKeys.filter(k => k.includes("'Escape'"));
-    const clearKeys = sentKeys.filter(k => k.includes('send-keys -l') && k.includes('/clear'));
     expect(escKeys.length).toBeGreaterThanOrEqual(2);
-    expect(clearKeys.length).toBeGreaterThanOrEqual(2);
-    const escAt = sentKeys.findIndex(k => k.includes('%0') && k.includes("'Escape'"));
-    const ccAt = sentKeys.findIndex(k => k.includes('%0') && k.includes('C-c'));
-    const clearAt = sentKeys.findIndex(k => k.includes('%0') && k.includes('send-keys -l') && k.includes('/clear'));
-    expect(escAt).toBeGreaterThanOrEqual(0);
-    expect(ccAt).toBeGreaterThan(escAt);
-    expect(clearAt).toBeGreaterThan(ccAt);
+    expect(sentKeys.some(k => k.includes('send-keys -l') && k.includes('/clear'))).toBe(false);
+    expect(sentKeys.some(k => k.includes('%1') && k.includes('C-c'))).toBe(false);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
     expect(await lockManager.isLocked('qa-1')).toBe(false);
-  });
-
-  it('clears the composer (C-c) before /clear so an ack-timeout-left prompt is not submitted with /clear', async () => {
-    const sentKeys: string[] = [];
-    const localManager = makeManager({
-      skillRegistry: freshRegistry(),
-      runnerFactory: () => clearAwareRunner(sentKeys, () => CLAUDE_PANE),
-    });
-    setCompactTiming(localManager);
-
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
-
-    const cancelled = await localManager.cancelTask(t.id);
-    expect(cancelled.status).toBe('cancelled');
-
-    const ccAt = sentKeys.findIndex(k => k.includes('C-c'));
-    const clearAt = sentKeys.findIndex(k => k.includes('send-keys -l') && k.includes('/clear'));
-    const enterAfterClear = sentKeys.findIndex((k, i) => i > clearAt && k.includes("'Enter'"));
-    expect(ccAt).toBeGreaterThanOrEqual(0);
-    expect(clearAt).toBeGreaterThan(ccAt);
-    expect(enterAfterClear).toBeGreaterThan(clearAt);
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('skips interrupt/clear and release when agent has been rebound to a new task (race protection)', async () => {
@@ -2027,60 +1969,9 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     });
   });
 
-  it('holds the agent (no release) when /clear injection fails', async () => {
-    const sentKeys: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys')) {
-          sentKeys.push(cmd);
-          if (cmd.includes('send-keys -l') && cmd.includes('/clear')) {
-            return { stdout: '', stderr: 'tmux send failed', exitCode: 1 };
-          }
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
-    setCompactTiming(localManager);
-    mockInterruptPane(localManager, true);
-
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
-
-    const cancelled = await localManager.cancelTask(t.id);
-
-    expect(cancelled.status).toBe('cancelled');
-    expect(sentKeys.some(k => k.includes('send-keys -l') && k.includes('/clear'))).toBe(true);
-    const stateAfter = await agentStore.get('dev-1');
-    expect(stateAfter?.taskId).toBe(t.id);
-    expect(stateAfter?.status).toBe('awaiting_human');
-    expect(stateAfter?.awaitingPhase).toBe('cancel-clear-failed');
-    expect(await lockManager.isLocked('dev-1')).toBe(true);
-    expect(events.some(
-      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'cancel-clear-failed',
-    )).toBe(true);
-  });
-
-  it('holds the agent (no release) when the compact guard blocks /clear', async () => {
-    const sentKeys: string[] = [];
-    const runner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('send-keys')) sentKeys.push(cmd);
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
-    mockInterruptPane(localManager, true);
+  it('keeps the mutex-busy hold reason and emits a single intervention when the pane mutex stays busy', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+    Object.assign(localManager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
     (localManager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('dev-1');
 
     const t = await seedTask();
@@ -2090,25 +1981,19 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     const cancelled = await localManager.cancelTask(t.id);
 
     expect(cancelled.status).toBe('cancelled');
-    expect(sentKeys.some(k => k.includes('/clear'))).toBe(false);
-    const stateAfter = await agentStore.get('dev-1');
-    expect(stateAfter?.taskId).toBe(t.id);
-    expect(stateAfter?.status).toBe('awaiting_human');
-    expect(stateAfter?.awaitingPhase).toBe('cancel-clear-failed');
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBe(t.id);
+    expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
+    expect(dev?.awaitingReason).toContain('pane mutex');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
+    const holdEvents = events.filter(
+      e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'cancel-interrupt-failed',
+    );
+    expect(holdEvents).toHaveLength(1);
   });
 
-  it('interrupts both panes before clearing either, so a failed dev /clear does not strand qa', async () => {
-    const sentKeys: string[] = [];
-    const localManager = makeManager({
-      skillRegistry: freshRegistry(),
-      runnerFactory: () => clearAwareRunner(
-        sentKeys,
-        pane => (pane === '%1' ? CODEX_PANE : CLAUDE_PANE),
-        { failClear: pane => pane === '%0' },
-      ),
-    });
-    setCompactTiming(localManager);
+  it('releases neither agent until both panes are interrupted, so a slow qa interrupt cannot expose a freed dev', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
 
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -2116,35 +2001,117 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     await lockManager.acquire('dev-1');
     await lockManager.acquire('qa-1');
 
+    let devStillHeldDuringQaInterrupt: boolean | undefined;
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
+      .mockImplementation(async (state) => {
+        if (state.id === 'qa-1') {
+          devStillHeldDuringQaInterrupt =
+            (await agentStore.get('dev-1'))?.taskId === t.id && (await lockManager.isLocked('dev-1'));
+        }
+        return true;
+      });
+
     await localManager.cancelTask(t.id);
 
-    const qaEsc = sentKeys.findIndex(k => k.includes('%1') && k.includes("'Escape'"));
-    const devClear = sentKeys.findIndex(k => k.includes('%0') && k.includes('send-keys -l') && k.includes('/clear'));
-    expect(qaEsc).toBeGreaterThanOrEqual(0);
-    expect(devClear).toBeGreaterThanOrEqual(0);
-    expect(qaEsc).toBeLessThan(devClear);
+    expect(devStillHeldDuringQaInterrupt).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  it('refuses Resume while cancel cleanup is in flight, and the worker still completes both releases', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    await lockManager.acquire('dev-1');
+    await lockManager.acquire('qa-1');
+
+    let resumeDuringCancel: { resumed: boolean; reason?: string } | undefined;
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
+      .mockImplementation(async (state) => {
+        if (state.id === 'qa-1') {
+          resumeDuringCancel = await localManager.resumeAgent('dev-1');
+        }
+        return true;
+      });
+
+    await localManager.cancelTask(t.id);
+
+    expect(resumeDuringCancel?.resumed).toBe(false);
+    expect(resumeDuringCancel?.reason).toContain('in progress');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  it('a duplicate cancel of an already-cancelling task does not clear the in-flight guard early', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    await lockManager.acquire('dev-1');
+    await lockManager.acquire('qa-1');
+
+    let resumeAfterDuplicateCancel: { resumed: boolean; reason?: string } | undefined;
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
+      .mockImplementation(async (state) => {
+        if (state.id === 'qa-1') {
+          await localManager.cancelTask(t.id);
+          resumeAfterDuplicateCancel = await localManager.resumeAgent('dev-1');
+        }
+        return true;
+      });
+
+    await localManager.cancelTask(t.id);
+
+    expect(resumeAfterDuplicateCancel?.resumed).toBe(false);
+    expect(resumeAfterDuplicateCancel?.reason).toContain('in progress');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  it('a dev whose interrupt fails does not strand qa — qa is still interrupted and released', async () => {
+    const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
+
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    await lockManager.acquire('dev-1');
+    await lockManager.acquire('qa-1');
+
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
+      .mockImplementation(async (state) => state.id !== 'dev-1');
+
+    await localManager.cancelTask(t.id);
+
     const dev = await agentStore.get('dev-1');
     expect(dev?.status).toBe('awaiting_human');
-    expect(dev?.awaitingPhase).toBe('cancel-clear-failed');
+    expect(dev?.awaitingPhase).toBe('cancel-interrupt-failed');
     expect(dev?.taskId).toBe(t.id);
     const qa = await agentStore.get('qa-1');
     expect(qa?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('qa-1')).toBe(false);
   });
 
-  it('does not stale-mark a rebound agent as cancel-clear-failed (release+reassign race)', async () => {
+  it('does not stale-mark a rebound agent when it is reassigned mid-cleanup (release+reassign race)', async () => {
     const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
-    mockInterruptPane(localManager, true);
 
     const t = await seedTask();
     await taskStore.set(task({ id: 'task-new' }));
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await lockManager.acquire('dev-1');
 
-    vi.spyOn(localManager as unknown as { clearPaneContext: () => Promise<boolean> }, 'clearPaneContext')
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
       .mockImplementation(async () => {
         await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'task-new', paneId: '%0', updatedAt: new Date().toISOString() });
-        return false;
+        return true;
       });
 
     await localManager.cancelTask(t.id);
@@ -2171,7 +2138,6 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
 
   it('blocks a concurrent terminal-task escape release while cancel is mid-cleanup', async () => {
     const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
-    stubClearPane(localManager);
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
@@ -2204,10 +2170,8 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     await lockManager.acquire('dev-1');
     await lockManager.acquire('qa-1');
 
-    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
-      .mockResolvedValue(true);
     let devReleaseByNewTask: boolean | undefined;
-    vi.spyOn(localManager as unknown as { clearPaneContext: () => Promise<boolean> }, 'clearPaneContext')
+    vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
       .mockImplementation(async () => {
         if (devReleaseByNewTask === undefined) {
           devReleaseByNewTask = await localManager.releaseAgentForTask('dev-1', 'task-new', 'idle');
@@ -2236,7 +2200,7 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     expect((await agentStore.get('dev-1'))?.taskId).toBe('task-a');
   });
 
-  it('does not release a cancel-clear-failed hold via the escape or Resume', async () => {
+  it('escape release still refuses a legacy cancel-clear-failed hold, but Resume releases it to idle', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
     await lockManager.acquire('dev-1');
@@ -2246,56 +2210,24 @@ describe('cancelTask interrupts (ESC) then /clears dev and qa panes', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(true);
 
     const res = await manager.resumeAgent('dev-1');
-    expect(res.resumed).toBe(false);
+    expect(res.resumed).toBe(true);
+    expect(res.releasedBinding).toBe(true);
     const after = await agentStore.get('dev-1');
-    expect(after?.taskId).toBe(t.id);
-    expect(after?.awaitingPhase).toBe('cancel-clear-failed');
-    expect(await lockManager.isLocked('dev-1')).toBe(true);
-  });
-
-  it('resends the /clear Enter when the first is swallowed, then confirms and releases', async () => {
-    const sentKeys: string[] = [];
-    const localManager = makeManager({
-      skillRegistry: freshRegistry(),
-      runnerFactory: () => clearAwareRunner(sentKeys, () => CLAUDE_PANE, { swallowClearEnters: 1 }),
-    });
-    setCompactTiming(localManager);
-    (localManager as unknown as { clearContextWaitMs: number }).clearContextWaitMs = 2_000;
-
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
-
-    const cancelled = await localManager.cancelTask(t.id);
-
-    expect(cancelled.status).toBe('cancelled');
-    const clearAt = sentKeys.findIndex(k => k.includes('send-keys -l') && k.includes('/clear'));
-    const entersAfterClear = sentKeys.filter((k, i) => i > clearAt && k.includes("'Enter'"));
-    expect(entersAfterClear.length).toBeGreaterThanOrEqual(2);
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(after?.taskId).toBeUndefined();
+    expect(after?.awaitingPhase).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('cancel holds the pane (cancel-clear-failed) when /clear is rejected as disabled-while-task-in-progress', async () => {
-    const sentKeys: string[] = [];
-    const localManager = makeManager({
-      skillRegistry: freshRegistry(),
-      runnerFactory: () => clearAwareRunner(sentKeys, () => CLAUDE_PANE, { rejectClear: () => true }),
-    });
-    setCompactTiming(localManager);
-    (localManager as unknown as { clearContextWaitMs: number }).clearContextWaitMs = 2_000;
-
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+  it('Resume releases a stale cancel-clearing hold whose task already reached a terminal status', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
     await lockManager.acquire('dev-1');
 
-    const cancelled = await localManager.cancelTask(t.id);
-
-    expect(cancelled.status).toBe('cancelled');
-    const dev = await agentStore.get('dev-1');
-    expect(dev?.taskId).toBe(t.id);
-    expect(dev?.awaitingPhase).toBe('cancel-clear-failed');
-    expect(await lockManager.isLocked('dev-1')).toBe(true);
+    const res = await manager.resumeAgent('dev-1');
+    expect(res.resumed).toBe(true);
+    expect(res.releasedBinding).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('recover() holds a cancel-clearing agent bound to a cancelled task (restart mid-cleanup)', async () => {
@@ -2605,7 +2537,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     expect(keys).toEqual(['Escape', 'C-c']);
   });
 
-  it('holds DELETE-only (cancel-clear-failed) without sending keys when the pane mutex stays busy past the wait window', async () => {
+  it('holds (cancel-interrupt-failed) without sending keys when the pane mutex stays busy past the wait window', async () => {
     Object.assign(manager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
     const keys = spyKeys();
     (manager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('qa-1');
@@ -2615,7 +2547,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
 
     expect(ok).toBe(false);
     expect(keys).toEqual([]);
-    expect((await agentStore.get('qa-1'))?.awaitingPhase).toBe('cancel-clear-failed');
+    expect((await agentStore.get('qa-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
   });
 
   it('waits for a busy pane mutex and proceeds once the in-flight dispatch releases it (no instant hold)', async () => {
@@ -4566,7 +4498,6 @@ describe('AgentManager max_rounds manual actions', () => {
       taskId: 'task-mr', paneId: '%1',
     });
     mockInterruptPane(manager, true);
-    stubClearPane(manager);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
 
     const cancelled = await manager.cancelTask('task-mr');

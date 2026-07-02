@@ -1,18 +1,42 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { describe, it, expect } from 'vitest';
 
+const testDir = dirname(fileURLToPath(import.meta.url));
+const srcDir = resolve(testDir, '..', 'src');
 const css = readFileSync(
-  resolve(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'index.css'),
+  resolve(srcDir, 'index.css'),
   'utf8',
 );
 
+function sourceFiles(dir: string): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    const path = resolve(dir, entry);
+    const stat = statSync(path);
+    if (stat.isDirectory()) return sourceFiles(path);
+    return /\.(css|ts|tsx)$/.test(entry) ? [path] : [];
+  });
+}
+
 describe('index.css base typography', () => {
-  it('sets the base body font-size to 15px (one notch above the former 14px baseline)', () => {
+  it('sets the base body font-size to the original 14px baseline', () => {
     const body = css.match(/body\s*\{([\s\S]*?)\}/);
     expect(body).not.toBeNull();
-    expect(body![1]).toMatch(/font-size:\s*15px/);
+    expect(body![1]).toMatch(/font-size:\s*14px/);
+  });
+
+  it('limits app font-size utilities to xs, sm, and base', () => {
+    const allowed = new Set(['text-xs', 'text-sm', 'text-base', '!text-base']);
+    const disallowed = sourceFiles(srcDir).flatMap((file) => {
+      const source = readFileSync(file, 'utf8');
+      return Array.from(source.matchAll(/!?text-(?:xs|sm|base|lg|xl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|9xl|\[(?!#)[^\]]+\])/g))
+        .map((match) => match[0])
+        .filter((token) => !allowed.has(token))
+        .map((token) => `${relative(srcDir, file)}:${token}`);
+    });
+
+    expect(disallowed).toEqual([]);
   });
 });
 

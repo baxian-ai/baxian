@@ -185,15 +185,15 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       <button type="button" onClick={() => navigate(-1)} className="btn-ghost mb-3">
         ← 返回
       </button>
-      {error && !task && <div className="text-[14px] text-danger">Error: {error}</div>}
-      {loaded && !task && !error && <div className="text-[14px] text-danger">Task not found: {taskId}</div>}
-      {!task && !error && !loaded && <div className="text-[14px] text-og-500">Loading…</div>}
+      {error && !task && <div className="text-sm text-danger">Error: {error}</div>}
+      {loaded && !task && !error && <div className="text-sm text-danger">Task not found: {taskId}</div>}
+      {!task && !error && !loaded && <div className="text-sm text-og-500">Loading…</div>}
       {task && (
         <>
           <div className="mb-4">
             <h1 className="flex min-w-0 items-baseline gap-2">
-              <span className="shrink-0 font-mono text-[16px] text-og-400">{task.id}</span>
-              <span className="min-w-0 truncate font-display text-[18px] font-semibold tracking-tight text-og-1000" title={task.title}>
+              <span className="shrink-0 font-mono text-base text-og-400">{task.id}</span>
+              <span className="min-w-0 truncate font-display text-base font-semibold tracking-tight text-og-1000" title={task.title}>
                 {task.title}
               </span>
             </h1>
@@ -229,9 +229,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
     return (
       <div>
-        {error && <div className="mb-4 text-[14px] text-danger">Error: {error}</div>}
+        {error && <div className="mb-4 text-sm text-danger">Error: {error}</div>}
         {isLegacy && (
-          <div className="mb-4 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5 text-[13px] text-warn">
+          <div className="mb-4 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5 text-xs text-warn">
             {task.status === 'pending'
               ? <>This task has no dev assigned yet — click <b className="font-semibold">Edit</b> to choose one, or use the Start button on any idle dev card.</>
               : <>This is a legacy task with no preferred dev (read-only in status <b className="font-semibold">{task.status}</b>).</>}
@@ -239,17 +239,17 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <span className={`${STATUS_BADGE_COLORS[task.status]} !text-[15px]`}>{task.status}</span>
-          <span className="text-[15px] text-og-500">Round <span className="font-semibold text-og-800">{task.reviewRound}</span></span>
-          <span className="text-[15px] text-og-500">Spec <span className="font-semibold text-og-800">{task.specReviewRound ?? 0}</span></span>
+          <span className={`${STATUS_BADGE_COLORS[task.status]} !text-base`}>{task.status}</span>
+          <span className="text-base text-og-500">Round <span className="font-semibold text-og-800">{task.reviewRound}</span></span>
+          <span className="text-base text-og-500">Spec <span className="font-semibold text-og-800">{task.specReviewRound ?? 0}</span></span>
         </div>
         <div className="mb-4 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
-        <div className="mb-4 text-[13px] text-og-500">
+        <div className="mb-4 text-xs text-og-500">
           Created at {formatTaskTimestamp(task.createdAt, false)}, Updated at {formatTaskTimestamp(task.updatedAt, false)}
         </div>
 
         {verdictOverdue && (
-          <div className="mb-4 rounded-lg border border-[#fecaca] bg-[#fef2f2] p-4 text-[14px] text-danger">
+          <div className="mb-4 rounded-lg border border-[#fecaca] bg-[#fef2f2] p-4 text-sm text-danger">
             <div className="font-semibold">Review verdict missing</div>
             <div className="mt-1 text-og-700">
               QA dispatched at {formatTaskTimestamp(task.reviewDispatchedAt)} 超过 10 分钟未提交 verdict。
@@ -262,7 +262,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         {showApprovedAction && (
-          <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-[14px] text-success">
+          <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-sm text-success">
             <div className="font-semibold">QA approved · verifying feedback</div>
             <div className="mt-1 text-og-700">
               Dev keeps the task reserved while it checks whether all human or agent feedback has been handled.
@@ -281,7 +281,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         {showReadyGate && (
-          <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-[14px] text-success">
+          <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-sm text-success">
             <div className="font-semibold">✅ 评审通过 · 等待人工确认</div>
             <div className="mt-1 text-og-700">
               Server review 完成（{task.reviewRound} 轮）。点击「确认」收尾
@@ -302,7 +302,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         {showMergeReadyAction && (
-          <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-[14px] text-success">
+          <div className="mb-4 rounded-lg border border-[#bbf7d0] bg-[#f0fdf4] p-4 text-sm text-success">
             <div className="font-semibold">✅ PR ready · 等待人工确认</div>
             <div className="mt-1 text-og-700">
               Dev finished its post-approve checks — 点击「确认」收尾（merge:auto 时由 baxian 执行合并）。
@@ -321,7 +321,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         {showCodeMaxRounds && (
-          <div className="mb-4 rounded-lg border border-[#fde68a] bg-[#fef3c7]/60 p-4 text-[14px] text-warn">
+          <div className="mb-4 rounded-lg border border-[#fde68a] bg-[#fef3c7]/60 p-4 text-sm text-warn">
             <div className="font-semibold">已达 review 轮次上限（round {task.reviewRound}）</div>
             <div className="mt-1 text-og-700">
               可「标记完成」合并收尾，或「继续一轮」由 dev 再修一轮（完成后自动转 QA review）。
@@ -333,7 +333,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         )}
 
         {showSpecMaxRounds && (
-          <div className="mb-4 rounded-lg border border-[#fde68a] bg-[#fef3c7]/60 p-4 text-[14px] text-warn">
+          <div className="mb-4 rounded-lg border border-[#fde68a] bg-[#fef3c7]/60 p-4 text-sm text-warn">
             <div className="font-semibold">已达 spec review 轮次上限（round {task.specReviewRound ?? 0}）</div>
             <div className="mt-1 text-og-700">
               Spec 评审多轮未达成一致，任务已暂停。spec 是过程产物、没有可合并的成果，
@@ -346,7 +346,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           </div>
         )}
 
-        <div className="card mb-4 flex flex-wrap items-center gap-x-6 gap-y-1 p-4 text-[14px]">
+        <div className="card mb-4 flex flex-wrap items-center gap-x-6 gap-y-1 p-4 text-sm">
           <span className="text-og-500">
             PR:{' '}
             {task.prNumber ? (
@@ -373,7 +373,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           </span>
         </div>
 
-        <pre className="card mb-4 whitespace-pre-wrap p-4 text-[14px] text-og-800">
+        <pre className="card mb-4 whitespace-pre-wrap p-4 text-sm text-og-800">
           {task.description || <span className="text-og-400">（无描述）</span>}
         </pre>
 
@@ -384,7 +384,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   function renderAgents(task: TaskState) {
     if (projects === null) {
-      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-[14px] text-og-400">加载中…</div>;
+      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">加载中…</div>;
     }
     const project = projects.find((p) => p.id === task.projectId);
     const devId = task.agentId || task.preferredAgentId;
@@ -394,7 +394,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const qaConfig = group?.find((a) => a.role === 'qa');
 
     if (!devConfig && !qaConfig) {
-      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-[14px] text-og-400">暂无关联 Agent</div>;
+      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">暂无关联 Agent</div>;
     }
 
     return (
@@ -543,7 +543,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
 function AgentSlotPlaceholder({ role }: { role: 'dev' | 'qa' }) {
   return (
-    <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-[14px] text-og-400">
+    <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">
       暂无 {role === 'dev' ? 'Dev' : 'QA'} Agent
     </div>
   );
@@ -562,7 +562,7 @@ function ReviewSummary({ taskId }: { taskId: string }) {
   const last = rounds[rounds.length - 1];
   const findingsCount = rounds.reduce((n, r) => n + (r.findings?.findings.length ?? 0), 0);
   return (
-    <div className="mt-2 text-[13px] text-og-700">
+    <div className="mt-2 text-xs text-og-700">
       Review {rounds.length} 轮 · 最终 verdict <span className="font-mono">{last.findings?.verdict ?? '—'}</span>
       {' '}· findings 共 {findingsCount} 条
     </div>

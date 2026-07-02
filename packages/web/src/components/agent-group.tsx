@@ -121,14 +121,14 @@ export function AgentGroup({
                 key={task.id}
                 type="button"
                 onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
-                className="flex w-full items-center gap-3 px-3 py-2 text-left text-[14px] transition-colors hover:bg-og-50/60"
+                className="flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-og-50/60"
               >
                 <div className="min-w-0 flex-1 flex items-center gap-2">
-                  <span className="shrink-0 font-mono text-[12px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
+                  <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
                   <span className="truncate text-og-1000">{task.title}</span>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <span className="shrink-0 text-[13px] text-og-500">Round {round}</span>
+                  <span className="shrink-0 text-xs text-og-500">Round {round}</span>
                   <span className={`${STATUS_BADGE_COLORS[task.status]} shrink-0`}>{task.status}</span>
                 </div>
               </button>
@@ -138,7 +138,7 @@ export function AgentGroup({
       )}
       {showEmpty && (
         <div
-          className="mb-2 rounded-lg border border-hairline bg-surface px-3 py-2 text-[14px] text-og-400"
+          className="mb-2 rounded-lg border border-hairline bg-surface px-3 py-2 text-sm text-og-400"
           aria-label={`${label} no active task`}
         >
           暂无任务
@@ -217,14 +217,14 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
         return (
           <div
             key={task.id}
-            className="flex items-center gap-3 px-3 py-2 text-[14px]"
+            className="flex items-center gap-3 px-3 py-2 text-sm"
           >
             <button
               type="button"
               onClick={() => navigate(taskDetailPath(task.projectId, task.id))}
               className="min-w-0 flex-1 flex items-center gap-2 text-left transition-colors hover:text-accent-hover"
             >
-              <span className="shrink-0 font-mono text-[12px] text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
+              <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
               <span className="truncate text-og-1000" title={task.title}>{task.title}</span>
               {unassigned && <span className="pill shrink-0">未分配</span>}
             </button>
@@ -233,7 +233,7 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
               onClick={() => void handleDispatch(task.id)}
               disabled={!dispatchReady || busy}
               title={dispatchReady ? `派给 ${devId} 并立即开始` : 'Dev 当前不可派遣'}
-              className="shrink-0 text-[14px] font-medium text-accent transition-colors hover:text-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
+              className="shrink-0 text-sm font-medium text-accent transition-colors hover:text-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {busyTaskId === task.id ? 'Starting…' : 'Start'}
             </button>

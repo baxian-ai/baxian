@@ -160,7 +160,7 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
   return (
     <Modal open onClose={onClose} title="Agent Pet" size="md">
       <div className="space-y-4">
-        <label className="flex items-center gap-2 text-[14px] text-og-1000">
+        <label className="flex items-center gap-2 text-sm text-og-1000">
           <input
             type="checkbox"
             checked={enabled}
@@ -171,7 +171,7 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
         </label>
 
         {!enabled ? (
-          <p className="text-[13px] text-og-500">
+          <p className="text-xs text-og-500">
             开启后可上传 Codex Pet 文件包，或选择已上传过的 Pet 替换 Agent 卡片上的状态显示。
           </p>
         ) : (
@@ -192,13 +192,13 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
                 className="hidden"
                 onChange={(e) => void handleUpload(e)}
               />
-              <p className="mt-1 text-[13px] text-og-400">选择 Codex Pet 目录（含 pet.json 与精灵图）。</p>
+              <p className="mt-1 text-xs text-og-400">选择 Codex Pet 目录（含 pet.json 与精灵图）。</p>
             </div>
 
             {loading ? (
-              <p className="text-[14px] text-og-500">加载中…</p>
+              <p className="text-sm text-og-500">加载中…</p>
             ) : pets.length === 0 ? (
-              <p className="text-[14px] text-og-500">还没有上传过 Pet，点击上方按钮上传。</p>
+              <p className="text-sm text-og-500">还没有上传过 Pet，点击上方按钮上传。</p>
             ) : (
               <ul className="grid grid-cols-2 gap-2">
                 {pets.map((pet) => {
@@ -218,17 +218,17 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
                         onClick={() => void handleSelect(pet.id)}
                         disabled={busy || selected}
                         title={pet.description || pet.displayName}
-                        className="min-w-0 flex-1 truncate text-left text-[14px] text-og-1000 hover:text-accent-hover disabled:cursor-default"
+                        className="min-w-0 flex-1 truncate text-left text-sm text-og-1000 hover:text-accent-hover disabled:cursor-default"
                       >
                         {pet.displayName}
-                        {selected && <span className="ml-1 text-[12px] text-accent">（当前）</span>}
+                        {selected && <span className="ml-1 text-xs text-accent">（当前）</span>}
                       </button>
                       <button
                         type="button"
                         aria-label={`删除 ${pet.displayName}`}
                         onClick={() => void handleDelete(pet.id, pet.displayName)}
                         disabled={busy}
-                        className="shrink-0 text-[13px] text-danger hover:underline disabled:opacity-50"
+                        className="shrink-0 text-xs text-danger hover:underline disabled:opacity-50"
                       >
                         删除
                       </button>

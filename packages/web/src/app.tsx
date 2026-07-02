@@ -18,7 +18,7 @@ function AppShell() {
       <nav className="flex h-12 flex-none items-center border-b border-hairline bg-surface px-3 sm:px-6">
         <Link
           to="/"
-          className="flex shrink-0 items-center gap-2 font-display text-[16px] font-semibold tracking-tight text-og-1000"
+          className="flex shrink-0 items-center gap-2 font-display text-base font-semibold tracking-tight text-og-1000"
         >
           <span aria-hidden className="block h-2.5 w-2.5 rounded-full bg-accent" />
           baxian

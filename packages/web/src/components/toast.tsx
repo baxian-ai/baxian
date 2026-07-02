@@ -58,10 +58,10 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             role="status"
           >
             <div className="flex items-start gap-2">
-              <span aria-hidden className="text-[15px]">{KIND_ICON[t.kind]}</span>
+              <span aria-hidden className="text-base">{KIND_ICON[t.kind]}</span>
               <div className="flex-1">
-                <div className="text-[14px] font-semibold">{t.title}</div>
-                {t.body && <div className="mt-1 whitespace-pre-line text-[13px] text-og-700">{t.body}</div>}
+                <div className="text-sm font-semibold">{t.title}</div>
+                {t.body && <div className="mt-1 whitespace-pre-line text-xs text-og-700">{t.body}</div>}
               </div>
               <button
                 type="button"

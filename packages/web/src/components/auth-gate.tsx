@@ -53,7 +53,7 @@ export function AuthGate({ children }: Props) {
   if (state.kind === 'error') {
     return (
       <CenteredCard title="无法连接服务器">
-        <p className="text-[14px] text-og-600">{state.message}</p>
+        <p className="text-sm text-og-600">{state.message}</p>
         <button type="button" onClick={() => { void probe(); }} className="btn-primary mt-4 w-full">
           重试
         </button>
@@ -64,7 +64,7 @@ export function AuthGate({ children }: Props) {
   if (state.kind === 'probing') {
     return (
       <CenteredCard title="加载中">
-        <p className="text-[14px] text-og-500">正在检查登录状态…</p>
+        <p className="text-sm text-og-500">正在检查登录状态…</p>
       </CenteredCard>
     );
   }
@@ -95,7 +95,7 @@ function CenteredCard({ title, children }: { title: string; children: ReactNode 
   return (
     <div className="flex min-h-dvh items-center justify-center bg-page px-4">
       <div className="w-full max-w-sm rounded-lg border border-hairline bg-surface px-6 py-6">
-        <h1 className="mb-3 font-display text-[17px] font-semibold tracking-tight text-og-1000">{title}</h1>
+        <h1 className="mb-3 font-display text-base font-semibold tracking-tight text-og-1000">{title}</h1>
         {children}
       </div>
     </div>
@@ -133,9 +133,9 @@ function LoginForm({
 
   return (
     <CenteredCard title="登录 baxian">
-      <p className="mb-4 text-[14px] text-og-600">服务器开启了访问鉴权，请输入访问令牌继续。</p>
+      <p className="mb-4 text-sm text-og-600">服务器开启了访问鉴权，请输入访问令牌继续。</p>
       <form onSubmit={(e) => { void handleSubmit(e); }}>
-        <label className="mb-1.5 block text-[13px] font-medium text-og-700" htmlFor="baxian-token">
+        <label className="mb-1.5 block text-xs font-medium text-og-700" htmlFor="baxian-token">
           访问令牌
         </label>
         <input
@@ -145,12 +145,12 @@ function LoginForm({
           autoFocus
           value={token}
           onChange={(e) => setToken(e.target.value)}
-          className="w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 font-mono text-[14px] text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
+          className="w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 font-mono text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
           placeholder="请输入服务器配置的 token"
           disabled={submitting}
         />
         {displayError && (
-          <p role="alert" className="mt-2 text-[13px] text-danger">{displayError}</p>
+          <p role="alert" className="mt-2 text-xs text-danger">{displayError}</p>
         )}
         <button type="submit" disabled={submitting} className="btn-primary mt-4 w-full">
           {submitting ? '登录中…' : '登录'}

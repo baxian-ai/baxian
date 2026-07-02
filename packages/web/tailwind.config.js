@@ -9,6 +9,11 @@ export default {
       lg: '6px',
       full: '9999px',
     },
+    fontSize: {
+      xs: ['12px', { lineHeight: '1.4' }],
+      sm: ['14px', { lineHeight: '1.55' }],
+      base: ['15px', { lineHeight: '1.5' }],
+    },
     extend: {
       colors: {
         og: {

@@ -80,7 +80,7 @@ async function makeFixture(
     platformRunner: runner,
     ...(reviewStore ? { reviewStore } : {}),
   });
-  Object.assign(manager, { compactIdlePollMs: 5, compactIdleWaitMs: 200, clearContextWaitMs: 200 });
+  Object.assign(manager, { compactIdlePollMs: 5, compactIdleWaitMs: 200 });
   return { manager, taskStore, agentStore, execCalls, events };
 }
 
