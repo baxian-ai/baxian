@@ -1,26 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
-import { render, screen, cleanup, fireEvent, act, within } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, act, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import type { ProjectConfig, TaskState } from '../../src/shared/index.js';
+import type { ProjectConfig, ReviewRound, TaskState } from '../../src/shared/index.js';
 
-const { useTaskMock, useAgentsMock, useProjectsMock } = vi.hoisted(() => ({
-  useTaskMock: vi.fn(),
-  useAgentsMock: vi.fn(),
+const { useProjectsMock } = vi.hoisted(() => ({
   useProjectsMock: vi.fn(),
 }));
 
-vi.mock('../../src/hooks/use-events.ts', () => ({
-  useTask: useTaskMock,
-  useAgents: useAgentsMock,
-}));
+vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 vi.mock('../../src/hooks/use-projects.ts', () => ({
   useProjects: useProjectsMock,
 }));
 
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: vi.fn() }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
 vi.mock('../../src/components/agent-card.tsx', () => ({
   AgentCard: (props: {
@@ -28,7 +21,11 @@ vi.mock('../../src/components/agent-card.tsx', () => ({
     runtime?: string;
     terminalMode?: string;
     showTaskBinding?: boolean;
-    agent: { id: string };
+    pendingRestart?: boolean;
+    terminalLoading?: boolean;
+    active?: boolean;
+    onActivate?: () => void;
+    agent: { id: string; runtimeStatus?: string };
   }) => (
     <div
       data-testid="agent-card"
@@ -37,7 +34,15 @@ vi.mock('../../src/components/agent-card.tsx', () => ({
       data-runtime={props.runtime}
       data-terminal-mode={props.terminalMode}
       data-show-task-binding={String(props.showTaskBinding)}
-    />
+      data-runtime-status={props.agent?.runtimeStatus}
+      data-pending-restart={String(props.pendingRestart)}
+      data-terminal-loading={String(props.terminalLoading)}
+      data-active={String(props.active)}
+      data-agent-card={props.onActivate ? props.agent?.id : undefined}
+      onClick={props.onActivate}
+    >
+      <input aria-label={`focus ${props.agent?.id}`} />
+    </div>
   ),
 }));
 
@@ -50,29 +55,23 @@ vi.mock('../../src/components/create-task-modal.tsx', () => ({
   CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div data-testid="edit-modal" /> : null),
 }));
 
-const tasksRetryMock = vi.fn();
-const tasksUpdateMock = vi.fn();
-const tasksReviewMock = vi.fn();
-const tasksCompleteMock = vi.fn();
-const tasksContinueMock = vi.fn();
-const tasksReviewsMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    tasks: {
-      retry: (...args: unknown[]) => tasksRetryMock(...args),
-      update: (...args: unknown[]) => tasksUpdateMock(...args),
-      review: (...args: unknown[]) => tasksReviewMock(...args),
-      complete: (...args: unknown[]) => tasksCompleteMock(...args),
-      continue: (...args: unknown[]) => tasksContinueMock(...args),
-      reviews: (...args: unknown[]) => tasksReviewsMock(...args),
-    },
-  },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
+import { api } from '../../src/api.ts';
+import { useTaskMock, useAgentsMock } from '../helpers/events-mock.ts';
+import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
+import { toastShowMock } from '../helpers/toast-mock.tsx';
 import { TaskDetail } from '../../src/pages/task-detail.tsx';
 
+const tasksRetryMock = vi.mocked(api.tasks.retry);
+const tasksUpdateMock = vi.mocked(api.tasks.update);
+const tasksReviewMock = vi.mocked(api.tasks.review);
+const tasksCompleteMock = vi.mocked(api.tasks.complete);
+const tasksContinueMock = vi.mocked(api.tasks.continue);
+const tasksReviewsMock = vi.mocked(api.tasks.reviews);
+
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
-  return {
+  return makeTaskFixture({
     id: 'task-010',
     projectId: 'baxian',
     title: 'Clean tests',
@@ -88,7 +87,7 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     createdAt: '2026-05-10T12:00:00.000Z',
     updatedAt: '2026-05-10T13:00:00.000Z',
     ...overrides,
-  };
+  });
 }
 
 const PROJECT: ProjectConfig = {
@@ -162,6 +161,7 @@ beforeEach(() => {
   tasksContinueMock.mockReset();
   tasksReviewsMock.mockReset();
   tasksReviewsMock.mockResolvedValue([]);
+  toastShowMock.mockReset();
 });
 
 afterEach(() => {
@@ -185,21 +185,26 @@ describe('TaskDetail page — header & info', () => {
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
   });
 
-  it('shows bold Round/Spec counts beside the status pill', () => {
+  it('shows regular-weight Round/Spec counts beside the status pill', () => {
     const { container } = open({ reviewRound: 3, specReviewRound: 2 });
     const status = within(container.querySelector('section')!).getByText('approved').parentElement!;
-    expect(within(status).getByText('3').className).toContain('font-semibold');
-    expect(within(status).getByText('2').className).toContain('font-semibold');
+    expect(within(status).getByText('3').className).not.toContain('font-semibold');
+    expect(within(status).getByText('2').className).not.toContain('font-semibold');
   });
 
-  it('keeps status and review round text at body size', () => {
+  it('keeps status, review rounds, and timestamps at body size', () => {
     const { container } = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
     const section = container.querySelector('section')!;
     const row = within(section).getByText('max_rounds').parentElement!;
+    const round = within(row).getByText((_, el) => el?.textContent === 'Round 10');
+    const spec = within(row).getByText((_, el) => el?.textContent === 'Spec 0');
+    const timestamps = within(section).getByText('Created at 2026-05-10 20:00, Updated at 2026-05-10 21:00');
 
     expect(within(row).getByText('max_rounds').className).toContain('text-sm');
-    expect(within(row).getByText('Round').className).toContain('text-sm');
-    expect(within(row).getByText('Spec').className).toContain('text-sm');
+    expect(round.className).toContain('text-sm');
+    expect(spec.className).toContain('text-sm');
+    expect(timestamps.className).toContain('text-sm');
+    expect(timestamps.className).not.toContain('text-xs');
   });
 
   it('shows only PR and Branch in the info card, with a branch hyperlink, dropping project/agent rows', () => {
@@ -269,6 +274,59 @@ describe('TaskDetail page — layout & agent cards', () => {
       expect(card.getAttribute('data-terminal-mode')).toBe('embedded-full');
       expect(card.getAttribute('data-show-task-binding')).toBe('false');
     }
+  });
+
+  it('activates one task detail agent card at a time and clears it on outside click', () => {
+    const { container } = open();
+    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
+    const devCard = cards[0] as HTMLElement;
+    const qaCard = cards[1] as HTMLElement;
+
+    expect(devCard.getAttribute('data-active')).toBe('false');
+    expect(qaCard.getAttribute('data-active')).toBe('false');
+
+    fireEvent.click(devCard);
+    expect(devCard.getAttribute('data-active')).toBe('true');
+    expect(qaCard.getAttribute('data-active')).toBe('false');
+
+    fireEvent.click(qaCard);
+    expect(devCard.getAttribute('data-active')).toBe('false');
+    expect(qaCard.getAttribute('data-active')).toBe('true');
+
+    fireEvent.click(document.body);
+    expect(devCard.getAttribute('data-active')).toBe('false');
+    expect(qaCard.getAttribute('data-active')).toBe('false');
+  });
+
+  it('clears the active task detail agent card on Escape', () => {
+    const { container } = open();
+    const devCard = container.querySelector('[data-testid="agent-card"]') as HTMLElement;
+
+    fireEvent.click(devCard);
+    expect(devCard.getAttribute('data-active')).toBe('true');
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    });
+
+    expect(devCard.getAttribute('data-active')).toBe('false');
+  });
+
+  it('keeps the active task detail agent card when Escape starts from focus inside the card', () => {
+    const { container } = open();
+    const devCard = container.querySelector('[data-testid="agent-card"]') as HTMLElement;
+
+    fireEvent.click(devCard);
+    expect(devCard.getAttribute('data-active')).toBe('true');
+    const focusTarget = within(devCard).getByLabelText('focus bx-dev');
+    focusTarget.focus();
+    expect(document.activeElement).toBe(focusTarget);
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    });
+
+    expect(devCard.getAttribute('data-active')).toBe('true');
   });
 
   it('resolves the dev/qa pair from the project group even before agentId is assigned', () => {
@@ -411,5 +469,262 @@ describe('TaskDetail page — actions & states', () => {
       expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(true);
       expect(screen.getByText(/已达 spec review 轮次上限/)).toBeTruthy();
     });
+  });
+});
+
+describe('TaskDetail page — call review', () => {
+  it('confirms with the active-task prompt, dispatches, and reports the new round', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksReviewMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2, updatedAt: '2026-05-11T00:00:00.000Z' }));
+    open({ status: 'review' });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+    });
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('请 QA 重审 task task-010'));
+    expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已派 QA 重审 (round 2)' });
+  });
+
+  it('warns that re-reviewing a terminal task will not feed back into the state machine', () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    open({ status: 'merged' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('已是 merged 状态'));
+    expect(tasksReviewMock).not.toHaveBeenCalled();
+    expect(toastShowMock).not.toHaveBeenCalled();
+  });
+
+  it('shows an error toast when review dispatch fails', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksReviewMock.mockRejectedValue(new Error('qa is busy'));
+    open({ status: 'review' });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+    });
+
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Review 派发失败', body: 'qa is busy' });
+  });
+});
+
+describe('TaskDetail page — action failures surface error toasts', () => {
+  it('Cancel failure shows 取消失败 and re-enables the button', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksUpdateMock.mockRejectedValue(new Error('cancel nope'));
+    open({ status: 'in_progress' });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    });
+
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '取消失败', body: 'cancel nope' });
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('Retry on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksRetryMock.mockRejectedValue(new Error('retry nope'));
+    open({ status: 'cancelled' });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    });
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('这会新建一个 task 从头开始'));
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Retry 失败', body: 'retry nope' });
+    expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
+  });
+
+  it('标记完成 failure shows 标记完成失败', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksCompleteMock.mockRejectedValue(new Error('merge conflict'));
+    open({ status: 'max_rounds' });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '标记完成' }));
+    });
+
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '标记完成失败', body: 'merge conflict' });
+  });
+
+  it('继续一轮 failure shows 继续一轮失败', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksContinueMock.mockRejectedValue(new Error('dev is gone'));
+    open({ status: 'max_rounds' });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '继续一轮' }));
+    });
+
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '继续一轮失败', body: 'dev is gone' });
+  });
+});
+
+describe('TaskDetail page — human confirmation gates', () => {
+  function makeRounds(): ReviewRound[] {
+    return [
+      {
+        round: 1,
+        phase: 'code',
+        content: 'round 1 review',
+        startedAt: '2026-05-10T12:30:00.000Z',
+        findings: {
+          round: 1,
+          verdict: 'request-changes',
+          findings: [
+            { id: 'f1', severity: 'major', message: 'bug one' },
+            { id: 'f2', severity: 'minor', message: 'nit two' },
+          ],
+        },
+      },
+      {
+        round: 2,
+        phase: 'code',
+        content: 'round 2 review',
+        startedAt: '2026-05-10T13:30:00.000Z',
+        findings: { round: 2, verdict: 'approve', findings: [{ id: 'f3', severity: 'minor', message: 'nit three' }] },
+      },
+    ];
+  }
+
+  it('ready gate renders the banner plus review summary, and 确认 completes the task', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksReviewsMock.mockResolvedValue(makeRounds());
+    tasksCompleteMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
+    const { container } = open({ status: 'ready' });
+
+    expect(screen.getByText('✅ 评审通过 · 等待人工确认')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Open PR #55' })).toBeTruthy();
+    await waitFor(() => expect(container.textContent).toContain('Review 2 轮'));
+    expect(container.textContent).toContain('最终 verdict approve');
+    expect(container.textContent).toContain('findings 共 3 条');
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    });
+
+    expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已确认（done）' });
+  });
+
+  it('确认 is skipped when the confirm dialog is cancelled and reports failures', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    open({ status: 'merge-ready' });
+
+    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    expect(tasksCompleteMock).not.toHaveBeenCalled();
+
+    confirmSpy.mockReturnValue(true);
+    tasksCompleteMock.mockRejectedValue(new Error('gate says no'));
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    });
+
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '确认失败', body: 'gate says no' });
+  });
+
+  it('server-mode approved task offers 重试发布 which re-runs the publish step', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    tasksCompleteMock.mockResolvedValue(
+      makeTask({ reviewMode: 'server', status: 'ready', updatedAt: '2026-05-11T00:00:00.000Z' }),
+    );
+    open({ reviewMode: 'server', status: 'approved' });
+
+    expect(screen.queryByRole('button', { name: '确认' })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '重试发布' }));
+    });
+
+    expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已确认（ready）' });
+  });
+});
+
+describe('TaskDetail page — review verdict watchdog', () => {
+  it('flags a review dispatched over 10 minutes ago with the missing-verdict banner', () => {
+    open({ status: 'review', reviewDispatchedAt: '2026-05-10T12:00:00.000Z' });
+
+    expect(screen.getByText('Review verdict missing')).toBeTruthy();
+    expect(screen.getByText(/超过 10 分钟未提交 verdict/)).toBeTruthy();
+  });
+
+  it('keeps the banner hidden for a freshly dispatched review', () => {
+    open({ status: 'review', reviewDispatchedAt: new Date().toISOString() });
+    expect(screen.queryByText('Review verdict missing')).toBeNull();
+  });
+});
+
+describe('TaskDetail page — legacy tasks', () => {
+  it('pending legacy task explains how to assign a dev', () => {
+    setTask(makeTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
+    renderPage();
+    expect(screen.getByText(/This task has no dev assigned yet/)).toBeTruthy();
+  });
+
+  it('terminal legacy task disables Retry with the legacy tooltip', () => {
+    setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
+    renderPage();
+    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
+    expect(retry.disabled).toBe(true);
+    expect(retry.title).toBe('Legacy task has no preferred dev to retry against');
+  });
+});
+
+describe('TaskDetail page — PR/Branch fallbacks', () => {
+  it('renders plain mono PR number and branch when the task has no PR url', () => {
+    const { container } = open({ prUrl: undefined });
+    const section = container.querySelector('section')!;
+    expect(within(section).queryByRole('link', { name: '#55' })).toBeNull();
+    expect(within(section).getByText('#55').className).toContain('font-mono');
+    expect(within(section).queryByRole('link', { name: 'bx/task-010' })).toBeNull();
+    expect(within(section).getByText('bx/task-010').className).toContain('font-mono');
+  });
+
+  it('renders dashes when the task has neither PR nor branch', () => {
+    const { container } = open({ prNumber: undefined, prUrl: undefined, branch: undefined });
+    expect(within(container.querySelector('section')!).getAllByText('—')).toHaveLength(2);
+  });
+});
+
+describe('TaskDetail page — agent snapshot fallbacks', () => {
+  it('feeds a synthetic unknown snapshot and pendingRestart when the loaded agent list lacks the agent', () => {
+    useAgentsMock.mockReturnValue({ data: [], loaded: true, error: null });
+    const { container } = open();
+    const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
+    expect(cards).toHaveLength(2);
+    for (const card of cards) {
+      expect(card.getAttribute('data-runtime-status')).toBe('unknown');
+      expect(card.getAttribute('data-pending-restart')).toBe('true');
+      expect(card.getAttribute('data-terminal-loading')).toBe('false');
+    }
+  });
+
+  it('marks terminals as loading while the agent stream has not produced snapshots yet', () => {
+    useAgentsMock.mockReturnValue({ data: null, loaded: false, error: null });
+    const { container } = open();
+    const card = container.querySelector('[data-testid="agent-card"]')!;
+    expect(card.getAttribute('data-pending-restart')).toBe('false');
+    expect(card.getAttribute('data-terminal-loading')).toBe('true');
+  });
+
+  it('shows the QA slot placeholder when the group has no QA agent', () => {
+    setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][0]]] }]);
+    setTask(makeTask({ qaAgentId: undefined }));
+    const { container } = renderPage();
+    expect(screen.getByText('暂无 QA Agent')).toBeTruthy();
+    expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
+  });
+
+  it('shows the Dev slot placeholder when only the QA agent resolves via qaAgentId', () => {
+    setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
+    setTask(makeTask({ agentId: 'ghost-dev', preferredAgentId: 'ghost-dev', qaAgentId: 'bx-qa' }));
+    const { container } = renderPage();
+    expect(screen.getByText('暂无 Dev Agent')).toBeTruthy();
+    const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
+    expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-qa']);
   });
 });

@@ -54,6 +54,8 @@ interface Fixture {
   releaseAgentForTask: ReturnType<typeof vi.fn>;
   getAgentState: ReturnType<typeof vi.fn>;
   transitionTaskStatus: ReturnType<typeof vi.fn>;
+  transitionToCodePhase: ReturnType<typeof vi.fn>;
+  updateTask: ReturnType<typeof vi.fn>;
   emitted: BaxianEvent[];
   emit: (type: string, data: Record<string, unknown>) => Promise<void>;
 }
@@ -96,6 +98,14 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
   const getAgentState = vi.fn(async (agentId: string) => ({
     id: agentId, projectId: 'proj', taskId: task.id, updatedAt: 'now',
   }));
+  const updateTask = vi.fn(async (id: string, patch: Partial<TaskState>) => {
+    calls.updateTask.push([id, patch]);
+    Object.assign(task, patch);
+  });
+  const transitionToCodePhase = vi.fn(async (id: string) => {
+    calls.transitionToCodePhase.push([id]);
+    return task;
+  });
   const manager = {
     getReviewStore: () => store,
     getReviewTransport: () => transport,
@@ -112,10 +122,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     transitionTaskStatus,
     releaseAgentForTask,
     getAgentState,
-    updateTask: vi.fn(async (id: string, patch: Partial<TaskState>) => {
-      calls.updateTask.push([id, patch]);
-      Object.assign(task, patch);
-    }),
+    updateTask,
     dispatchServerReviewToQa: vi.fn(async (id: string, opts: unknown) => {
       calls.dispatchServerReviewToQa.push([id, opts]);
       task.status = 'review';
@@ -130,10 +137,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
       calls.dispatchServerAfterDone.push([id, kind]);
       return task;
     }),
-    transitionToCodePhase: vi.fn(async (id: string) => {
-      calls.transitionToCodePhase.push([id]);
-      return task;
-    }),
+    transitionToCodePhase,
     setupPhaseSignal: vi.fn(async (id: string, agentId: string, kinds: unknown) => {
       calls.setupPhaseSignal.push([id, agentId, kinds]);
       return agentId === DEV.id || agentId === QA.id;
@@ -159,7 +163,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
       data,
     });
   };
-  return { bus, store, task, calls, transport, releaseAgentForTask, getAgentState, transitionTaskStatus, emitted, emit };
+  return { bus, store, task, calls, transport, releaseAgentForTask, getAgentState, transitionTaskStatus, transitionToCodePhase, updateTask, emitted, emit };
 }
 
 const FINDINGS_RC: ReviewFindings = {
@@ -1016,5 +1020,313 @@ describe('gate relaxation: github tasks through server spec chain', () => {
     await f.emit('server.spec.ready', { token: 'WRONG' });
     expect(f.calls.dispatchServerReviewToQa).toHaveLength(0);
     expect(f.emitted.some(e => e.type === 'human.intervention')).toBe(true);
+  });
+});
+
+function interventionPhases(fx: Fixture): string[] {
+  return fx.emitted
+    .filter(e => e.type === 'human.intervention')
+    .map(e => String((e.data as { phase?: string }).phase ?? ''));
+}
+
+describe('registration guard', () => {
+  it('no ReviewStore configured → warns once and registers no handlers', async () => {
+    const bus = new EventBus({ append: async () => undefined } as unknown as EventLog);
+    const getTask = vi.fn();
+    const manager = { getReviewStore: () => undefined, getTask } as unknown as AgentManager;
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      registerServerEventHandlers(bus, manager);
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[ServerEventHandler] no ReviewStore configured; server review mode disabled',
+      );
+      await bus.emit({
+        id: '',
+        type: 'server.code.ready',
+        timestamp: new Date().toISOString(),
+        projectId: 'proj',
+        taskId: 't1',
+        data: { token: 'tok123' },
+      });
+      expect(getTask).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe('intervention emit failure containment', () => {
+  it('a failing human.intervention emit is warned, the handler itself does not throw', async () => {
+    const fx = makeFixture();
+    const original = fx.bus.emit.bind(fx.bus);
+    vi.spyOn(fx.bus, 'emit').mockImplementation(async (e: BaxianEvent) => {
+      if (e.type === 'human.intervention') throw new Error('bus down');
+      return original(e);
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await fx.emit('server.code.ready', { token: 'WRONG', kind: 'code-done' });
+      expect(warnSpy).toHaveBeenCalledWith(
+        '[ServerEventHandler] intervention emit failed:',
+        expect.any(Error),
+      );
+      expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe('prompt content truncation', () => {
+  it('oversized single-batch diff is truncated at a utf8 boundary and flagged, stored round keeps the full diff', async () => {
+    const fx = makeFixture();
+    const hugeDiff = `diff --git a/a.ts b/a.ts\n+${'哈'.repeat(30000)}`;
+    fx.transport.readContent.mockResolvedValue({ content: hugeDiff, baseSha: 'base123' });
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { content: string; contentTruncated?: boolean }];
+    expect(opts.contentTruncated).toBe(true);
+    const bytes = Buffer.byteLength(opts.content, 'utf8');
+    expect(bytes).toBeLessThanOrEqual(56 * 1024);
+    expect(bytes).toBeGreaterThan(56 * 1024 - 4);
+    expect(opts.content.at(-1)).toBe('哈');
+
+    const round = await fx.store.getRound('t1', 'code', 1);
+    expect(round?.content).toBe(hugeDiff);
+  });
+});
+
+describe('auto-approve failure paths', () => {
+  it('code auto-approve with a missing dev agent → intervention, nothing transitions', async () => {
+    const fx = makeFixture({ qaAgentId: undefined, agentId: 'ghost' }, { afterDone: 'branch' });
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(interventionPhases(fx)).toContain('server-code-auto-approve-no-dev-agent');
+    expect(fx.calls.transitionTaskStatus).toHaveLength(0);
+    expect(fx.calls.dispatchServerAfterDone).toHaveLength(0);
+  });
+
+  it('code auto-approve approved-transition refusal → intervention, afterDone not dispatched', async () => {
+    const fx = makeFixture({ qaAgentId: undefined }, { afterDone: 'branch' });
+    fx.transitionTaskStatus.mockResolvedValueOnce(null);
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(interventionPhases(fx)).toContain('server-code-auto-approve-transition-failed');
+    expect(fx.calls.dispatchServerAfterDone).toHaveLength(0);
+  });
+
+  it('spec auto-approve transition refusal (null result) → intervention', async () => {
+    const fx = makeFixture({ qaAgentId: undefined, phase: undefined });
+    fx.transitionToCodePhase.mockResolvedValueOnce(null);
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+    expect(interventionPhases(fx)).toContain('server-spec-auto-approve-transition-failed');
+  });
+
+  it('spec auto-approve transition throw → intervention carrying the error', async () => {
+    const fx = makeFixture({ qaAgentId: undefined, phase: undefined });
+    fx.transitionToCodePhase.mockRejectedValueOnce(new Error('phase locked'));
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+    const intervention = fx.emitted.find(
+      e => e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'server-spec-auto-approve-transition-failed',
+    );
+    expect(intervention).toBeDefined();
+    expect((intervention?.data as { error?: string }).error).toBe('phase locked');
+  });
+});
+
+describe('code verdict approve transition refusal', () => {
+  it('approved transition returning null → intervention, afterDone not dispatched', async () => {
+    const fx = makeFixture({ status: 'review', reviewRound: 1 }, { afterDone: 'pr' });
+    await putRound(fx.store, 'code', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
+    fx.transitionTaskStatus.mockResolvedValueOnce(null);
+    await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
+    expect(interventionPhases(fx)).toContain('server-code-approved-transition-failed');
+    expect(fx.calls.dispatchServerAfterDone).toHaveLength(0);
+  });
+});
+
+describe('code fix response guards', () => {
+  it('response file missing with no stored response → intervention + code-fixed re-arm', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue(null);
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(interventionPhases(fx)).toContain('server-code-response-missing');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('stale response round → deleted + re-arm, response never stored', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 2,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'late' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(interventionPhases(fx)).toContain('server-code-response-round-mismatch');
+    expect(fx.transport.deleteResponse).toHaveBeenCalled();
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    const round = await fx.store.getRound('t1', 'code', 1);
+    expect(round?.response).toBeUndefined();
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+});
+
+describe('publish failure paths', () => {
+  it('publish with a missing dev config → intervention, no ready transition', async () => {
+    const fx = makeFixture({ status: 'approved', agentId: 'ghost' });
+    await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
+    expect(interventionPhases(fx)).toContain('server-code-published-no-dev-agent');
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
+  });
+
+  it('published head read failure → intervention + code-ready re-arm', async () => {
+    const fx = makeFixture({ status: 'approved', reviewHeadAnchorSha: 'head123' });
+    fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git down'));
+    await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
+    expect(interventionPhases(fx)).toContain('server-code-published-head-capture-failed');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
+  });
+
+  it('latestHeadSha persist failure → intervention + code-ready re-arm, no ready transition', async () => {
+    const fx = makeFixture({ status: 'approved', reviewHeadAnchorSha: 'head123' });
+    fx.updateTask.mockRejectedValueOnce(new Error('disk full'));
+    await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
+    expect(interventionPhases(fx)).toContain('server-code-published-head-capture-failed');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
+  });
+});
+
+describe('spec review failure paths', () => {
+  it('spec content read failure → intervention + spec-done re-arm', async () => {
+    const fx = makeFixture({ phase: undefined, status: 'in_progress' });
+    fx.transport.readContent.mockRejectedValue(new Error('read fail'));
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+    expect(interventionPhases(fx)).toContain('server-spec-content-read-failed');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-done']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('spec round store failure → intervention + spec-done re-arm', async () => {
+    const fx = makeFixture({ phase: undefined, status: 'in_progress' });
+    fx.transport.readContent.mockResolvedValue({ content: '# Spec' });
+    const failing = fx.store as unknown as { putRound: (...a: unknown[]) => Promise<void> };
+    failing.putRound = async () => { throw new Error('disk full'); };
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+    expect(interventionPhases(fx)).toContain('server-spec-round-store-failed');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-done']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('spec findings read failure → intervention + spec-reviewed re-arm', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockRejectedValue(new Error('bad json'));
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    expect(interventionPhases(fx)).toContain('server-spec-findings-invalid');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
+    expect(fx.calls.transitionToCodePhase).toHaveLength(0);
+  });
+
+  it('spec findings missing (never stored) → intervention + spec-reviewed re-arm', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue(null);
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    expect(interventionPhases(fx)).toContain('server-spec-findings-missing');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
+  });
+
+  it('stale spec findings round → deleted + re-arm, verdict never stored or routed', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue({ ...APPROVE_R1, round: 2 });
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    expect(interventionPhases(fx)).toContain('server-spec-findings-round-mismatch');
+    expect(fx.transport.deleteFindings).toHaveBeenCalled();
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
+    const round = await fx.store.getRound('t1', 'spec', 1);
+    expect(round?.findings).toBeUndefined();
+    expect(fx.calls.transitionToCodePhase).toHaveLength(0);
+  });
+
+  it('spec approve with a throwing code-phase transition → intervention', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
+    fx.transitionToCodePhase.mockRejectedValueOnce(new Error('locked'));
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    const intervention = fx.emitted.find(
+      e => e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'server-spec-approve-transition-failed',
+    );
+    expect(intervention).toBeDefined();
+    expect((intervention?.data as { error?: string }).error).toBe('locked');
+  });
+
+  it('spec request-changes below the cap dispatches the fix to dev with findings JSON', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue({
+      round: 1,
+      verdict: 'request-changes',
+      findings: [{ id: 'f-1', severity: 'major', message: 'gap', location: 'S1' }],
+    });
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    expect(fx.calls.dispatchServerFixToDev).toHaveLength(1);
+    const [, json] = fx.calls.dispatchServerFixToDev[0] as [string, string];
+    expect(JSON.parse(json).findings[0].id).toBe('f-1');
+    const round = await fx.store.getRound('t1', 'spec', 1);
+    expect(round?.findings?.verdict).toBe('request-changes');
+  });
+});
+
+describe('spec fix response guards', () => {
+  const SPEC_ROUND_FINDINGS = {
+    findings: {
+      round: 1,
+      verdict: 'request-changes',
+      findings: [{ id: 'f-1', severity: 'major', message: 'gap', location: 'S1' }],
+    } as ReviewFindings,
+  };
+
+  it('spec response read failure → intervention + spec-fixed re-arm', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1, SPEC_ROUND_FINDINGS);
+    fx.transport.readResponse.mockRejectedValue(new Error('corrupt'));
+    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
+    expect(interventionPhases(fx)).toContain('server-spec-response-invalid');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('spec response missing with none stored → intervention + spec-fixed re-arm', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1, SPEC_ROUND_FINDINGS);
+    fx.transport.readResponse.mockResolvedValue(null);
+    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
+    expect(interventionPhases(fx)).toContain('server-spec-response-missing');
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('stale spec response round → deleted + re-arm, no re-dispatch', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1, SPEC_ROUND_FINDINGS);
+    fx.transport.readResponse.mockResolvedValue({
+      round: 2,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'late' }],
+    });
+    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
+    expect(interventionPhases(fx)).toContain('server-spec-response-round-mismatch');
+    expect(fx.transport.deleteResponse).toHaveBeenCalled();
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    const round = await fx.store.getRound('t1', 'spec', 1);
+    expect(round?.response).toBeUndefined();
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 });

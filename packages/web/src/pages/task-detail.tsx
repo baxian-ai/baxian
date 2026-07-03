@@ -6,6 +6,7 @@ import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
 import { useToast } from '../components/toast.tsx';
 import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath } from '../components/task-status.tsx';
+import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import {
@@ -65,6 +66,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
   const { data: agents, loaded: agentsLoaded, error: agentsErrorPayload } = useAgents();
+  const { activeAgentId, activateAgentCard } = useActiveAgentCard();
   const task = override ?? streamed;
   const verdictOverdue = useVerdictOverdue(task);
   const error = errorPayload?.message ?? null;
@@ -240,11 +242,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         <div className="mb-3 flex flex-wrap items-center gap-3">
           <span className={`${STATUS_BADGE_COLORS[task.status]} text-sm`}>{task.status}</span>
-          <span className="text-sm text-og-500">Round <span className="font-semibold text-og-800">{task.reviewRound}</span></span>
-          <span className="text-sm text-og-500">Spec <span className="font-semibold text-og-800">{task.specReviewRound ?? 0}</span></span>
+          <span className="text-sm text-og-500">Round <span className="text-og-800">{task.reviewRound}</span></span>
+          <span className="text-sm text-og-500">Spec <span className="text-og-800">{task.specReviewRound ?? 0}</span></span>
         </div>
         <div className="mb-4 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
-        <div className="mb-4 text-xs text-og-500">
+        <div className="mb-4 text-sm text-og-500">
           Created at {formatTaskTimestamp(task.createdAt, false)}, Updated at {formatTaskTimestamp(task.updatedAt, false)}
         </div>
 
@@ -425,6 +427,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         terminalLoading={!agentsLoaded && !snapshot && !agentsErrorPayload}
         showTaskBinding={false}
         terminalMode="embedded-full"
+        active={activeAgentId === cfg.id}
+        onActivate={() => activateAgentCard(cfg.id)}
       />
     );
   }

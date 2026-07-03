@@ -2,28 +2,17 @@ import { it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { HostConfig } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: vi.fn() }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
-const listMock = vi.fn();
-const createMock = vi.fn();
-const updateMock = vi.fn();
-const deleteMock = vi.fn();
-const checkMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    hosts: {
-      list: (...a: unknown[]) => listMock(...a),
-      create: (...a: unknown[]) => createMock(...a),
-      update: (...a: unknown[]) => updateMock(...a),
-      delete: (...a: unknown[]) => deleteMock(...a),
-      check: (...a: unknown[]) => checkMock(...a),
-    },
-  },
-}));
-
+import { api } from '../../src/api.ts';
 import { HostManagementModal } from '../../src/components/host-management-modal.tsx';
+
+const listMock = vi.mocked(api.hosts.list);
+const createMock = vi.mocked(api.hosts.create);
+const updateMock = vi.mocked(api.hosts.update);
+const deleteMock = vi.mocked(api.hosts.delete);
+const checkMock = vi.mocked(api.hosts.check);
 
 const HOST: HostConfig = { id: 'box', hostname: 'h.example.com', port: 2222, alias: 'Prod', user: 'agent', password: '***' };
 

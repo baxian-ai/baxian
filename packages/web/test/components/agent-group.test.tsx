@@ -3,25 +3,14 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { AgentConfig, AgentSnapshot, TaskState } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: vi.fn() }),
-}));
-
-vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
-  usePendingRestart: () => ({ flagDirty: vi.fn() }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
+vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
+vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
 vi.mock('../../src/hooks/use-pets.ts', () => ({
   usePets: () => ({ pets: [], loading: false, error: null, refresh: vi.fn() }),
   usePetSpritesheet: (petId?: string) => (petId ? 'blob:mock-sprite' : null),
-}));
-
-const tasksDispatchMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  UNAUTHORIZED_EVENT: 'baxian:unauthorized',
-  api: {
-    tasks: { dispatch: (...args: unknown[]) => tasksDispatchMock(...args) },
-  },
 }));
 
 const navigateMock = vi.fn();
@@ -30,20 +19,11 @@ vi.mock('react-router-dom', async (orig) => ({
   useNavigate: () => navigateMock,
 }));
 
-vi.mock('../../src/components/pane-terminal.tsx', () => ({
-  TERMINAL_BG: '#fdfdfd',
-  PaneTerminal: (props: { mode: string; interactive?: boolean; autoFocus?: boolean; deferFullUntilFocus?: boolean }) => (
-    <div
-      data-testid="pane-terminal"
-      data-mode={props.mode}
-      data-interactive={String(!!props.interactive)}
-      data-auto-focus={String(props.autoFocus)}
-      data-defer-full={String(!!props.deferFullUntilFocus)}
-    />
-  ),
-}));
-
+import { api } from '../../src/api.ts';
 import { AgentGroup } from '../../src/components/agent-group.tsx';
+import { makeAgent, makeTask } from '../helpers/fixtures.ts';
+
+const tasksDispatchMock = vi.mocked(api.tasks.dispatch);
 
 beforeEach(() => {
   tasksDispatchMock.mockReset();
@@ -58,31 +38,20 @@ const GROUP: AgentConfig[] = [
 const NOW = '2026-05-16T00:00:00.000Z';
 
 function agent(id: string): AgentSnapshot {
-  return {
-    id,
-    projectId: 'proj',
-    runtimeStatus: 'idle',
-    tmuxSessionStatus: 'present',
-    stale: false,
-  };
+  return makeAgent(id);
 }
 
 function task(overrides: Partial<TaskState> = {}): TaskState {
-  return {
-    id: 'task-001',
-    projectId: 'proj',
+  return makeTask({
     title: '梳理绑定逻辑',
     description: 'details',
-    preferredAgentId: 'dev-1',
-    agentId: 'dev-1',
     qaAgentId: 'qa-1',
-    reviewRound: 0,
     status: 'in_progress',
     branch: 'bx/task-001',
     createdAt: NOW,
     updatedAt: NOW,
     ...overrides,
-  };
+  });
 }
 
 function activate(cardOrId: HTMLElement | string): void {
@@ -398,7 +367,7 @@ describe('AgentGroup', () => {
   });
 
   it('claimable list: clicking Start calls api.tasks.dispatch with agentId=dev-1', async () => {
-    tasksDispatchMock.mockResolvedValue({});
+    tasksDispatchMock.mockResolvedValue(makeTask({ id: 'task-d' }));
     renderGroup([task({ id: 'task-d', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
 
     const startBtn = screen.getByRole('button', { name: 'Start' });

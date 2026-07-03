@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { useState, type FormEvent } from 'react';
 import { Modal } from '../../src/components/modal.tsx';
@@ -194,5 +194,85 @@ describe('Modal', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     expect(onSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it('Tab with no visible focusable element inside is swallowed so focus cannot escape the dialog', () => {
+    render(
+      <Modal open onClose={() => {}} title="t">
+        <p>read-only body</p>
+      </Modal>,
+    );
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    const notCancelled = fireEvent.keyDown(document, { key: 'Tab' });
+    expect(notCancelled).toBe(false);
+    expect(document.activeElement).toBe(document.body);
+  });
+});
+
+describe('Modal focus trap (visible elements)', () => {
+  // jsdom 不做布局，offsetParent 恒为 null；垫一个 getter 让可见性过滤通过
+  const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetParent');
+  beforeAll(() => {
+    Object.defineProperty(HTMLElement.prototype, 'offsetParent', {
+      configurable: true,
+      get(this: HTMLElement) { return this.parentElement; },
+    });
+  });
+  afterAll(() => {
+    if (original) Object.defineProperty(HTMLElement.prototype, 'offsetParent', original);
+    else Reflect.deleteProperty(HTMLElement.prototype, 'offsetParent');
+  });
+
+  function renderTrap() {
+    render(
+      <Modal open onClose={() => {}} title="t">
+        <input data-testid="input-1" />
+        <input data-testid="input-2" />
+      </Modal>,
+    );
+    return {
+      closeBtn: screen.getByRole('button', { name: 'Close' }),
+      lastInput: screen.getByTestId('input-2'),
+    };
+  }
+
+  it('Tab on the last focusable wraps to the first (the close button in header order)', () => {
+    const { closeBtn, lastInput } = renderTrap();
+    lastInput.focus();
+    const notCancelled = fireEvent.keyDown(document, { key: 'Tab' });
+    expect(notCancelled).toBe(false);
+    expect(document.activeElement).toBe(closeBtn);
+  });
+
+  it('Shift+Tab on the first focusable wraps to the last', () => {
+    const { closeBtn, lastInput } = renderTrap();
+    closeBtn.focus();
+    const notCancelled = fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+    expect(notCancelled).toBe(false);
+    expect(document.activeElement).toBe(lastInput);
+  });
+
+  it('Tab pressed while focus sits outside the dialog pulls focus back to the first focusable', () => {
+    const { closeBtn } = renderTrap();
+    (document.activeElement as HTMLElement | null)?.blur();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(document.activeElement).toBe(closeBtn);
+  });
+
+  it('Shift+Tab pressed while focus sits outside the dialog pulls focus back to the last focusable', () => {
+    const { lastInput } = renderTrap();
+    (document.activeElement as HTMLElement | null)?.blur();
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(lastInput);
+  });
+
+  it('Tab between interior focusables is left to the browser (not swallowed by the trap)', () => {
+    const { closeBtn } = renderTrap();
+    closeBtn.focus();
+    const notCancelled = fireEvent.keyDown(document, { key: 'Tab' });
+    expect(notCancelled).toBe(true);
   });
 });

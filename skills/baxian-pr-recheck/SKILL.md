@@ -22,10 +22,11 @@ gh api --paginate repos/OWNER/REPO/issues/N/comments
 
 ## Decision Path
 
-- Head changed: review increment, verify all prior findings closed, new behavior has tests.
+- Head changed: review the increment since your prior review; verify all prior findings closed and new behavior has tests.
 - Head unchanged + dev replied: judge reply against code. No "fixed" without evidence.
 - Neither changed: report unchanged, keep prior findings.
-- Post to PR with concrete evidence for unresolved issues.
+
+Whatever the path, post unresolved issues to the PR with concrete evidence.
 
 ## Verdict
 
@@ -38,7 +39,7 @@ Submit via `gh pr review N` with a per-pass stamp — substitute `N` = `pr:`, `T
 
 Multi-line: `--body-file -`, stamp at end.
 
-No pane signal on success. **422 fallback** (same identity) — emit the matching signal instead (wire format: baxian-signals skill):
+No pane signal on success. **422 fallback**: when dev and QA share one GitHub identity, `gh pr review` rejects the verdict with HTTP 422 — emit the matching signal instead (wire format: baxian-signals skill):
 - request-changes: `gh pr review N --comment --body 'FINDINGS'`, then emit `pr-changes-requested` with `token:`.
 - approve: emit `pr-approved` with `token:`.
 

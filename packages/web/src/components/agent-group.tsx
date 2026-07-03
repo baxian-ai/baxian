@@ -1,9 +1,10 @@
 import type { AgentConfig, AgentSnapshot, TaskState } from '../shared/index.js';
 import { TASK_ACTIVE_STATUS_SET } from '../shared/index.js';
-import { useEffect, useId, useState } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AgentCard, type TerminalMode } from './agent-card.tsx';
 import { api } from '../api.ts';
+import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useToast } from './toast.tsx';
 import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath } from './task-status.tsx';
 
@@ -16,12 +17,6 @@ interface AgentGroupProps {
   tasks: TaskState[];
   onDeleted?: () => void;
   terminalMode?: TerminalMode;
-}
-
-const TERMINAL_ACTIVATED_EVENT = 'baxian:terminal-activated';
-
-interface TerminalActivatedDetail {
-  groupId: string;
 }
 
 export function AgentGroup({
@@ -53,42 +48,9 @@ export function AgentGroup({
   const navigate = useNavigate();
 
   const selectableTerminals = terminalMode === 'embedded-full';
-  const groupId = useId();
-  const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!selectableTerminals) return;
-    const onDocClick = (e: MouseEvent) => {
-      const path = e.composedPath();
-      const insideCard = path.some(node => node instanceof Element && node.hasAttribute('data-agent-card'));
-      if (!insideCard) setActiveAgentId(null);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      const focused = document.activeElement;
-      if (focused instanceof Element && focused.closest('[data-agent-card]')) return;
-      setActiveAgentId(null);
-    };
-    const onOtherActivated = (e: Event) => {
-      const detail = (e as CustomEvent<TerminalActivatedDetail>).detail;
-      if (detail?.groupId !== groupId) setActiveAgentId(null);
-    };
-    document.addEventListener('click', onDocClick);
-    document.addEventListener('keydown', onKey);
-    document.addEventListener(TERMINAL_ACTIVATED_EVENT, onOtherActivated as EventListener);
-    return () => {
-      document.removeEventListener('click', onDocClick);
-      document.removeEventListener('keydown', onKey);
-      document.removeEventListener(TERMINAL_ACTIVATED_EVENT, onOtherActivated as EventListener);
-    };
-  }, [selectableTerminals, groupId]);
-
-  const activate = (agentId: string) => {
-    setActiveAgentId(agentId);
-    document.dispatchEvent(new CustomEvent<TerminalActivatedDetail>(TERMINAL_ACTIVATED_EVENT, {
-      detail: { groupId },
-    }));
-  };
+  const { activeAgentId, activateAgentCard } = useActiveAgentCard({
+    coordinateAcrossInstances: selectableTerminals,
+  });
 
   const agentGridCols = terminalMode === 'embedded-full'
     ? group.length <= 1
@@ -167,7 +129,7 @@ export function AgentGroup({
               showTaskBinding={false}
               terminalMode={terminalMode}
               {...(selectableTerminals
-                ? { active: activeAgentId === cfg.id, onActivate: () => activate(cfg.id) }
+                ? { active: activeAgentId === cfg.id, onActivate: () => activateAgentCard(cfg.id) }
                 : {})}
             />
           );

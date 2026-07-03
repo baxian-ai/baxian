@@ -366,13 +366,6 @@ describe('prepareConfig type guards', () => {
     })).toThrow(/project\[0\]\.review\.mode/);
   });
 
-  it('rejects legacy top-level "codereview" with a clear rename message (no silent fallback to default rounds)', () => {
-    expect(() => prepareConfig({
-      codereview: { rounds: 5 },
-      project: [PROJECT],
-    })).toThrow(/codereview was renamed to review/);
-  });
-
   it('rejects partial server.https (missing certFile) instead of silently dropping to plain HTTP', () => {
     expect(() => prepareConfig({
       review: { rounds: 10 },

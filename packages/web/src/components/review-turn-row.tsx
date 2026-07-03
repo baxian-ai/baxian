@@ -17,7 +17,7 @@ export function TurnRow({
     <button
       type="button"
       onClick={onClick}
-      className="card flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:border-accent"
+      className="card flex w-full items-center gap-2 px-3 py-2 text-left text-sm"
     >
       <span
         className={`shrink-0 min-w-[1.75rem] text-xs uppercase tracking-wide ${role === 'qa' ? 'text-[#c2410c]' : 'text-accent'}`}

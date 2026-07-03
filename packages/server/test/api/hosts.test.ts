@@ -1,10 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { createTestContext } from '../helpers/context.js';
 import { hostRoutes } from '../../src/api/hosts.js';
+import * as loader from '../../src/config/loader.js';
+import { ConfigValidationError } from '../../src/config/loader.js';
 import type { AppContext } from '../../src/app.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
 import type { ProjectConfig } from '../../src/shared/index.js';
@@ -108,6 +110,56 @@ describe('POST /api/hosts', () => {
     expect(res.statusCode).toBe(201);
     expect(ctx.config.host[0].port).toBeUndefined();
     expect(calls[0].cmd).not.toContain('-p ');
+  });
+});
+
+describe('POST /api/hosts id generation', () => {
+  it('appends a numeric suffix when the slug collides with an existing host id', async () => {
+    const { app } = await makeApp(true);
+    const first = await app.inject({
+      method: 'POST', url: '/api/hosts',
+      payload: { hostname: 'h1.example', alias: 'box' },
+    });
+    const second = await app.inject({
+      method: 'POST', url: '/api/hosts',
+      payload: { hostname: 'h2.example', alias: 'box' },
+    });
+    expect(first.statusCode).toBe(201);
+    expect(second.statusCode).toBe(201);
+    expect(JSON.parse(first.body).host.id).toBe('box');
+    expect(JSON.parse(second.body).host.id).toBe('box-2');
+    expect(ctx.config.host.map(h => h.id)).toEqual(['box', 'box-2']);
+  });
+
+  it('falls back to host-<n> when every suffixed candidate is taken', async () => {
+    ctx.config.host = [
+      { id: 'box', hostname: 'seed.example' },
+      ...Array.from({ length: 998 }, (_, i) => ({ id: `box-${i + 2}`, hostname: 'seed.example' })),
+    ];
+    const { app } = await makeApp(true);
+    const res = await app.inject({
+      method: 'POST', url: '/api/hosts',
+      payload: { hostname: 'h.example', alias: 'box' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(JSON.parse(res.body).host.id).toBe('host-1000');
+  });
+});
+
+describe('host routes without a configPath', () => {
+  it('POST / PATCH / DELETE return 500 before any connectivity check', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h' }];
+    ctx.configPath = undefined;
+    const { app, calls } = await makeApp(true);
+    const post = await app.inject({ method: 'POST', url: '/api/hosts', payload: { hostname: 'h.example' } });
+    const patch = await app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'x' } });
+    const del = await app.inject({ method: 'DELETE', url: '/api/hosts/box' });
+    for (const res of [post, patch, del]) {
+      expect.soft(res.statusCode).toBe(500);
+      expect.soft(JSON.parse(res.body).error).toMatch(/No config path/);
+    }
+    expect(calls).toHaveLength(0);
+    expect(ctx.config.host).toHaveLength(1);
   });
 });
 
@@ -236,6 +288,146 @@ describe('PATCH /api/hosts/:id', () => {
     expect(res.statusCode).toBe(200);
     expect(ctx.config.host[0].port).toBeUndefined();
   });
+
+  it('returns 404 for an unknown host id', async () => {
+    const { app } = await makeApp(true);
+    const res = await app.inject({ method: 'PATCH', url: '/api/hosts/nope', payload: { alias: 'x' } });
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body).error).toMatch(/not found/);
+  });
+
+  it('rejects with 400 and keeps the config when the connectivity check fails', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    const { app } = await makeApp(false);
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box',
+      payload: { alias: 'renamed' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/SSH 不通/);
+    expect(ctx.config.host[0].alias).toBeUndefined();
+  });
+});
+
+describe('PATCH /api/hosts/:id revalidation inside the config lock', () => {
+  function gatedApp(execAfterGate: (cmd: string) => { stdout: string; stderr: string; exitCode: number }) {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let first = true;
+    const runner: CommandRunner = {
+      exec: async (cmd) => {
+        if (first) {
+          first = false;
+          await gate;
+        }
+        return execAfterGate(cmd);
+      },
+      writeFile: async () => undefined,
+      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    };
+    return { runner, release: () => release() };
+  }
+
+  it('404 when the host is deleted while the connectivity check is in flight', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    const { runner, release } = gatedApp(() => ({ stdout: 'ok', stderr: '', exitCode: 0 }));
+    const app = await buildHostApp(runner);
+    const pending = app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'renamed' } });
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.config.host = [];
+    release();
+    const res = await pending;
+    expect(res.statusCode).toBe(404);
+    expect(ctx.config.host).toHaveLength(0);
+  });
+
+  it('409 when a referencing agent goes live while the connectivity check is in flight', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    ctx.config.project = [remoteAgentProject()];
+    const { runner, release } = gatedApp(() => ({ stdout: 'ok', stderr: '', exitCode: 0 }));
+    const app = await buildHostApp(runner);
+    const pending = app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { hostname: 'moved.example' } });
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' });
+    release();
+    const res = await pending;
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).error).toMatch(/rdev/);
+    expect(ctx.config.host[0].hostname).toBe('h');
+  });
+
+  it('re-checks connectivity when the host row changed under the probe, and rejects the unchecked combo', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    let calls = 0;
+    const { runner, release } = gatedApp((cmd) => {
+      calls += 1;
+      return cmd.includes('h2')
+        ? { stdout: '', stderr: 'no route to h2', exitCode: 1 }
+        : { stdout: 'ok', stderr: '', exitCode: 0 };
+    });
+    const app = await buildHostApp(runner);
+    const pending = app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'renamed' } });
+    await new Promise((r) => setTimeout(r, 20));
+    ctx.config.host = [{ id: 'box', hostname: 'h2', user: 'u' }];
+    release();
+    const res = await pending;
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/SSH 不通/);
+    expect(calls).toBe(2);
+    expect(ctx.config.host[0].alias).toBeUndefined();
+  });
+});
+
+describe('host persist validation failures', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('POST maps ConfigValidationError to 400 Invalid host and persists nothing', async () => {
+    const { app } = await makeApp(true);
+    vi.spyOn(loader, 'prepareConfig').mockImplementation(() => {
+      throw new ConfigValidationError([{ path: 'host.0.hostname', message: 'bad hostname' }]);
+    });
+    const res = await app.inject({ method: 'POST', url: '/api/hosts', payload: { hostname: 'h.example' } });
+    expect(res.statusCode).toBe(400);
+    const body = JSON.parse(res.body);
+    expect(body.error).toBe('Invalid host');
+    expect(body.details).toEqual([{ path: 'host.0.hostname', message: 'bad hostname' }]);
+    expect(ctx.config.host).toHaveLength(0);
+  });
+
+  it('POST rethrows unknown persist errors as 500', async () => {
+    const { app } = await makeApp(true);
+    vi.spyOn(loader, 'prepareConfig').mockImplementation(() => {
+      throw new Error('disk full');
+    });
+    const res = await app.inject({ method: 'POST', url: '/api/hosts', payload: { hostname: 'h.example' } });
+    expect(res.statusCode).toBe(500);
+    expect(ctx.config.host).toHaveLength(0);
+  });
+
+  it('PATCH maps ConfigValidationError to 400 Invalid host and keeps the stored host', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    const { app } = await makeApp(true);
+    vi.spyOn(loader, 'prepareConfig').mockImplementation(() => {
+      throw new ConfigValidationError([{ path: 'host.0.port', message: 'bad port' }]);
+    });
+    const res = await app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'renamed' } });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('Invalid host');
+    expect(ctx.config.host[0].alias).toBeUndefined();
+  });
+
+  it('PATCH rethrows unknown persist errors as 500', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    const { app } = await makeApp(true);
+    vi.spyOn(loader, 'prepareConfig').mockImplementation(() => {
+      throw new Error('disk full');
+    });
+    const res = await app.inject({ method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'renamed' } });
+    expect(res.statusCode).toBe(500);
+    expect(ctx.config.host[0].alias).toBeUndefined();
+  });
 });
 
 describe('DELETE /api/hosts/:id', () => {
@@ -254,6 +446,13 @@ describe('DELETE /api/hosts/:id', () => {
     const res = await app.inject({ method: 'DELETE', url: '/api/hosts/box' });
     expect(res.statusCode).toBe(200);
     expect(ctx.config.host).toHaveLength(0);
+  });
+
+  it('returns 404 for an unknown host id', async () => {
+    const { app } = await makeApp(true);
+    const res = await app.inject({ method: 'DELETE', url: '/api/hosts/nope' });
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.body).error).toMatch(/not found/);
   });
 });
 

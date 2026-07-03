@@ -3,16 +3,14 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { ReviewRound } from '../../src/shared/index.js';
 
-const reviewsMock = vi.fn();
-const useTaskMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { reviews: (...args: unknown[]) => reviewsMock(...args) } },
-}));
-vi.mock('../../src/hooks/use-events.ts', () => ({
-  useTask: (...args: unknown[]) => useTaskMock(...args),
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
+vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
+import { api } from '../../src/api.ts';
+import { useTaskMock } from '../helpers/events-mock.ts';
 import { ReviewRoundPage } from '../../src/pages/review-round.tsx';
+
+const reviewsMock = vi.mocked(api.tasks.reviews);
 
 function renderAt(path: string) {
   render(

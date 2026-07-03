@@ -3,19 +3,15 @@ import { renderHook, act } from '@testing-library/react';
 import { __resetProjectsCacheForTests, refreshProjects, useProjects } from '../../src/hooks/use-projects.ts';
 import type { ProjectConfig } from '../../src/shared/index.js';
 
-const listMock = vi.fn();
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    projects: {
-      list: () => listMock(),
-    },
-  },
-  UNAUTHORIZED_EVENT: 'baxian:unauthorized',
-}));
+import { api } from '../../src/api.ts';
+import { makeProject as makeProjectFixture } from '../helpers/fixtures.ts';
+
+const listMock = vi.mocked(api.projects.list);
 
 function makeProject(id: string): ProjectConfig {
-  return { id, repo: `me/${id}`, merge: { strategy: 'squash' }, agent: [] } as unknown as ProjectConfig;
+  return makeProjectFixture({ id, repo: `me/${id}` });
 }
 
 describe('useProjects', () => {

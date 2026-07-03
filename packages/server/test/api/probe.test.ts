@@ -228,6 +228,121 @@ describe('POST /api/agents/probe', () => {
     }
   });
 
+  it('runner exec failure per binary: timeout errors map to "probe timed out"', async () => {
+    const probeApp = await buildProbeApp({
+      localRunnerFactory: () => makeStubRunner(async () => {
+        throw new Error('command timed out after 5000ms');
+      }),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/probe',
+        payload: { mode: 'local' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.tmux).toEqual({ ok: false, message: 'tmux probe timed out' });
+      expect(body.runtimes['claude-code']).toEqual({ ok: false, message: 'claude probe timed out' });
+      expect(body.runtimes['codex']).toEqual({ ok: false, message: 'codex probe timed out' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('non-timeout / non-Error runner failures map to generic "probe failed"', async () => {
+    const probeApp = await buildProbeApp({
+      // non-Error throw exercises the String(err) fallback
+      localRunnerFactory: () => makeStubRunner(async () => {
+        throw 'spawn EPERM';
+      }),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/probe',
+        payload: { mode: 'local' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.tmux).toEqual({ ok: false, message: 'tmux probe failed' });
+      expect(body.runtimes['claude-code']).toEqual({ ok: false, message: 'claude probe failed' });
+      expect(body.runtimes['codex']).toEqual({ ok: false, message: 'codex probe failed' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('returns 400 for an unknown hostId', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/agents/probe',
+      payload: { mode: 'remote', hostId: 'nope' },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toContain('unknown host id "nope"');
+  });
+
+  it('resolves a known hostId from config.host and probes that endpoint', async () => {
+    let sshCmd = '';
+    const probeApp = Fastify({ logger: false });
+    probeApp.decorate('ctx', {
+      config: { host: [{ id: 'box', hostname: 'stored.example', user: 'agent', port: 2200 }] },
+    } as never);
+    await probeApp.register(probeRoutes, {
+      prefix: '/api',
+      localRunnerFactory: () => makeStubRunner(async (cmd) => {
+        if (cmd.includes('echo ok')) {
+          sshCmd = cmd;
+          return { stdout: 'ok', stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      remoteRunnerFactory: () => makeStubRunner(async () => ({ stdout: '/usr/bin/x\n', stderr: '', exitCode: 0 })),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/probe',
+        payload: { mode: 'remote', hostId: 'box' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ssh.ok).toBe(true);
+      expect(body.tmux.ok).toBe(true);
+      expect(sshCmd).toContain('agent@stored.example');
+      expect(sshCmd).toContain('-p 2200');
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('local ssh runner throwing is treated as SSH unreachable (short-circuit, no crash)', async () => {
+    const probeApp = await buildProbeApp({
+      localRunnerFactory: () => makeStubRunner(async () => {
+        throw new Error('spawn ssh ENOENT');
+      }),
+      remoteRunnerFactory: () => makeStubRunner(async () => {
+        throw new Error('remote runner should not be called when ssh throws');
+      }),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/probe',
+        payload: { mode: 'remote', host: { hostname: 'h.example' } },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ssh.ok).toBe(false);
+      expect(body.tmux).toEqual({ ok: false, message: 'SSH 不通，无法探测' });
+      expect(body.runtimes['claude-code']).toEqual({ ok: false, message: 'SSH 不通，无法探测' });
+      expect(body.runtimes['codex']).toEqual({ ok: false, message: 'SSH 不通，无法探测' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
   it('rejects an invalid inline host port with 400 (does not reach the ssh runner)', async () => {
     const probeApp = await buildProbeApp({
       localRunnerFactory: () => makeStubRunner(async () => {

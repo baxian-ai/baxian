@@ -1,27 +1,25 @@
 import { it, expect, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: vi.fn() }),
-}));
-vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
-  usePendingRestart: () => ({ flagDirty: vi.fn() }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
+vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
-const configGetMock = vi.fn();
-const createMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    config: { get: (...a: unknown[]) => configGetMock(...a) },
-    projects: { create: (...a: unknown[]) => createMock(...a) },
-  },
-}));
-
+import { api } from '../../src/api.ts';
 import { CreateProjectModal } from '../../src/components/create-project-modal.tsx';
+import { makeProject } from '../helpers/fixtures.ts';
+
+const configGetMock = vi.mocked(api.config.get);
+const createMock = vi.mocked(api.projects.create);
 
 beforeEach(() => {
-  configGetMock.mockReset().mockResolvedValue({ project: [] });
-  createMock.mockReset().mockResolvedValue({ project: { id: 'p' }, restartRequired: false });
+  configGetMock.mockReset().mockResolvedValue({
+    review: { rounds: 2 },
+    server: { port: 7080 },
+    host: [],
+    project: [],
+  });
+  createMock.mockReset().mockResolvedValue({ project: makeProject({ id: 'p' }), restartRequired: false });
 });
 
 async function renderAndFill(repoValue: string) {

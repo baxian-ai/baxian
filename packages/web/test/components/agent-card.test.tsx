@@ -3,59 +3,32 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { AgentBindingFacts, AgentRole, AgentRuntime, AgentSnapshot } from '../../src/shared/index.js';
 
-const showMock = vi.hoisted(() => vi.fn());
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: showMock }),
-}));
-
-vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
-  usePendingRestart: () => ({ flagDirty: vi.fn() }),
-}));
-
-const deleteAgentMock = vi.fn();
-const compactMock = vi.fn();
-const clearMock = vi.fn();
-const reviewMock = vi.fn();
-const resumeAgentMock = vi.fn();
-const restartReplMock = vi.fn();
-const retryAgentMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    agents: {
-      compact: (...args: unknown[]) => compactMock(...args),
-      clear: (...args: unknown[]) => clearMock(...args),
-    },
-    projects: {
-      deleteAgent: (...args: unknown[]) => deleteAgentMock(...args),
-      resumeAgent: (...args: unknown[]) => resumeAgentMock(...args),
-      restartRepl: (...args: unknown[]) => restartReplMock(...args),
-      retryAgent: (...args: unknown[]) => retryAgentMock(...args),
-    },
-    tasks: {
-      review: (...args: unknown[]) => reviewMock(...args),
-    },
-  },
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
+vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
+vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
 vi.mock('../../src/hooks/use-pets.ts', () => ({
   usePets: () => ({ pets: [], loading: false, error: null, refresh: vi.fn() }),
   usePetSpritesheet: (petId?: string) => (petId ? 'blob:mock-sprite' : null),
 }));
 
-vi.mock('../../src/components/pane-terminal.tsx', () => ({
-  TERMINAL_BG: '#fdfdfd',
-  PaneTerminal: (props: { mode: string; interactive?: boolean; autoFocus?: boolean; deferFullUntilFocus?: boolean }) => (
-    <div
-      data-testid="pane-terminal"
-      data-mode={props.mode}
-      data-interactive={String(!!props.interactive)}
-      data-auto-focus={String(props.autoFocus)}
-      data-defer-full={String(!!props.deferFullUntilFocus)}
-    />
-  ),
-}));
-
+import { api } from '../../src/api.ts';
 import { AgentCard, type TerminalMode } from '../../src/components/agent-card.tsx';
+import { makeTask } from '../helpers/fixtures.ts';
+import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
+import { toastShowMock } from '../helpers/toast-mock.tsx';
+
+const showMock = toastShowMock;
+const deleteAgentMock = vi.mocked(api.projects.deleteAgent);
+const compactMock = vi.mocked(api.agents.compact);
+const clearMock = vi.mocked(api.agents.clear);
+const stopMock = vi.mocked(api.agents.stop);
+const reviewMock = vi.mocked(api.tasks.review);
+const resumeAgentMock = vi.mocked(api.projects.resumeAgent);
+const restartReplMock = vi.mocked(api.projects.restartRepl);
+const retryAgentMock = vi.mocked(api.projects.retryAgent);
+const bootstrapMock = vi.mocked(api.projects.bootstrap);
 
 type RenderCardOptions = {
   runtime?: AgentRuntime;
@@ -130,10 +103,13 @@ describe('AgentCard', () => {
     deleteAgentMock.mockReset();
     compactMock.mockReset();
     clearMock.mockReset();
+    stopMock.mockReset();
     reviewMock.mockReset();
     resumeAgentMock.mockReset();
     restartReplMock.mockReset();
     retryAgentMock.mockReset();
+    bootstrapMock.mockReset();
+    flagDirtyMock.mockReset();
     showMock.mockReset();
   });
 
@@ -196,6 +172,28 @@ describe('AgentCard', () => {
     it('gives the greeting_failed Resume button a distinct tooltip from the plain hold', () => {
       heldCard('dev-greet', 'greeting_failed');
       expect(resumeButton().getAttribute('title')).toMatch(/握手|greeting|Restart REPL/i);
+    });
+
+    it('surfaces a Resume failure as an error toast and re-enables the button', async () => {
+      resumeAgentMock.mockRejectedValue(new Error('binding busy'));
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      heldCard('dev-hold', 'cancel-interrupt-failed');
+
+      await act(async () => { fireEvent.click(resumeButton()); });
+
+      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Resume 失败', body: 'binding busy' });
+      expect((resumeButton() as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it('does not call any resume endpoint when the confirm dialog is cancelled', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(false);
+      heldCard('dev-hold', 'cancel-interrupt-failed');
+
+      await act(async () => { fireEvent.click(resumeButton()); });
+
+      expect(resumeAgentMock).not.toHaveBeenCalled();
+      expect(restartReplMock).not.toHaveBeenCalled();
+      expect(retryAgentMock).not.toHaveBeenCalled();
     });
   });
 
@@ -766,5 +764,171 @@ describe('AgentCard', () => {
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
     expect(screen.getByText('Agent 状态加载中')).toBeTruthy();
+  });
+
+  describe('Stop button', () => {
+    it('stops a working agent through the session endpoint', async () => {
+      stopMock.mockResolvedValue(undefined);
+      renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
+
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Stop' })); });
+
+      expect(stopMock).toHaveBeenCalledWith('dev-stop');
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy();
+    });
+
+    it('shows Stopping… while in flight and renders a failure below the actions', async () => {
+      let rejectStop: ((err: Error) => void) | undefined;
+      stopMock.mockReturnValue(new Promise((_resolve, reject) => { rejectStop = reject; }));
+      renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+      expect((screen.getByRole('button', { name: 'Stopping…' }) as HTMLButtonElement).disabled).toBe(true);
+
+      await act(async () => { rejectStop?.(new Error('no live pane')); });
+
+      expect(screen.getByText('no live pane')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy();
+    });
+  });
+
+  describe('Call review dispatch', () => {
+    function renderDevWithTask(): void {
+      renderCard(makeSnapshot({
+        id: 'dev-review',
+        binding: makeBinding('dev-review', { taskId: 'task-9' }),
+      }));
+    }
+
+    async function clickCallReview(): Promise<void> {
+      openMenu();
+      await act(async () => {
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Call review' }));
+      });
+    }
+
+    it('confirms and dispatches a QA review, reporting the new round', async () => {
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      reviewMock.mockResolvedValue(makeTask({ id: 'task-9', reviewRound: 4 }));
+      renderDevWithTask();
+
+      await clickCallReview();
+
+      expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('task-9'));
+      expect(reviewMock).toHaveBeenCalledWith('task-9');
+      expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: '已派 QA 重审 (round 4)' });
+      confirmSpy.mockRestore();
+    });
+
+    it('does nothing when the confirm dialog is cancelled', async () => {
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+      renderDevWithTask();
+
+      await clickCallReview();
+
+      expect(reviewMock).not.toHaveBeenCalled();
+      expect(showMock).not.toHaveBeenCalled();
+      confirmSpy.mockRestore();
+    });
+
+    it('shows an error toast when the dispatch fails', async () => {
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      reviewMock.mockRejectedValue(new Error('task has no PR'));
+      renderDevWithTask();
+
+      await clickCallReview();
+
+      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Review 派发失败', body: 'task has no PR' });
+      confirmSpy.mockRestore();
+    });
+  });
+
+  describe('bootstrap error card', () => {
+    function renderBootstrapError(): void {
+      renderCard(makeSnapshot({
+        id: 'dev-boot',
+        latestBootstrapError: {
+          id: 'err-1',
+          reason: 'CLONE_FAILED',
+          message: 'git clone failed',
+          occurredAt: '2026-06-01T00:00:00.000Z',
+          recommendation: '检查 deploy key 权限',
+        },
+      }));
+    }
+
+    it('renders the message, recommendation and reason metadata', () => {
+      renderBootstrapError();
+
+      expect(screen.getByText('git clone failed')).toBeTruthy();
+      expect(screen.getByText('检查 deploy key 权限')).toBeTruthy();
+      expect(screen.getByText('CLONE_FAILED · 2026-06-01T00:00:00.000Z')).toBeTruthy();
+    });
+
+    it('Retry bootstrap reruns project bootstrap and reports success', async () => {
+      bootstrapMock.mockResolvedValue({ ok: true, ran: 1 });
+      renderBootstrapError();
+
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
+
+      expect(bootstrapMock).toHaveBeenCalledWith('proj');
+      expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Bootstrap retry 完成' }));
+    });
+
+    it('reports a still-failing bootstrap as a warning', async () => {
+      bootstrapMock.mockResolvedValue({ ok: false, ran: 1 });
+      renderBootstrapError();
+
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
+
+      expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'warn', title: 'Bootstrap retry 仍失败' }));
+    });
+
+    it('reports a thrown bootstrap retry error as an error toast', async () => {
+      bootstrapMock.mockRejectedValue(new Error('ssh unreachable'));
+      renderBootstrapError();
+
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
+
+      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Bootstrap retry 失败', body: 'ssh unreachable' });
+      expect(screen.getByRole('button', { name: 'Retry bootstrap' })).toBeTruthy();
+    });
+  });
+
+  it('renders the latest runtime error with its reason metadata', () => {
+    renderCard(makeSnapshot({
+      id: 'dev-err',
+      latestError: {
+        id: 'err-9',
+        reason: 'REPL_CRASH',
+        message: 'runtime crashed hard',
+        occurredAt: '2026-06-02T03:04:05.000Z',
+      },
+    }));
+
+    expect(screen.getByText('runtime crashed hard')).toBeTruthy();
+    expect(screen.getByText('REPL_CRASH · 2026-06-02T03:04:05.000Z')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Retry bootstrap' })).toBeNull();
+  });
+
+  describe('paired deletion', () => {
+    it('warns that the paired QA agent was removed together and flags the restart', async () => {
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      deleteAgentMock.mockResolvedValue({ removed: ['dev-actions', 'qa-actions'], restartRequired: true });
+      renderCard(makeSnapshot({ id: 'dev-actions' }));
+
+      openMenu();
+      await act(async () => {
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
+      });
+
+      expect(flagDirtyMock).toHaveBeenCalled();
+      expect(showMock).toHaveBeenCalledWith({
+        kind: 'warn',
+        title: '已删除 Agent dev-actions',
+        body: '配对的 QA Agent qa-actions 也被一并移除。',
+      });
+      confirmSpy.mockRestore();
+    });
   });
 });

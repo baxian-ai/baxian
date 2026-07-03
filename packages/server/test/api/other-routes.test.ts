@@ -204,17 +204,6 @@ describe('PATCH /api/config', () => {
     expect(app.ctx.config.server.githubPollIntervalMs).toBe(60000);
   });
 
-  it('rejects legacy "codereview" payload with 400 (silent ignore was a migration foot-gun)', async () => {
-    await seedConfigPath(app, tempDir);
-    const originalRounds = app.ctx.config.review.rounds;
-
-    const response = await patch('/api/config', { codereview: { rounds: 99 } }, { headers: JSON_HEADERS });
-    expect(response.statusCode).toBe(400);
-    const body = JSON.parse(response.body) as { details?: Array<{ path: string }> };
-    expect(body.details?.some(e => e.path === 'codereview')).toBe(true);
-    expect(app.ctx.config.review.rounds).toBe(originalRounds);
-  });
-
   it('rejects non-object JSON bodies (primitive / array) with 400, not 500', async () => {
     await seedConfigPath(app, tempDir);
 

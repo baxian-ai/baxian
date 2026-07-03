@@ -231,6 +231,7 @@ describe('buildPromptInline', () => {
     expect(body).toContain('## Post-Approve');
     expect(body).toContain('T_self');
     expect(body).toContain('EVERY non-self comment');
+    expect(body).toContain('redispatch:');
     expect(body).toContain('do NOT emit `pr-merge-ready` when you pushed code');
     expect(body).toContain('re-fetch all sources before signaling');
     expect(body).toContain('Do not merge the PR yourself from this phase');
@@ -363,6 +364,27 @@ describe('buildPromptInline', () => {
     expect(body).toContain('## Specification-Driven Development (SDD)');
     expect(body).toContain('.baxian/spec.md');
     expect(body).toContain('Do NOT commit or push it');
+  });
+
+  it('baxian-task-check names the inline dispatch as the only task source, without phantom task files', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('the authoritative task source');
+    expect(body).not.toContain('task.md');
+  });
+
+  it('baxian-task-check skill delivers both exchanges through one shared procedure', async () => {
+    const body = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(body).toContain('## Deliver');
+    expect(body).toContain('Emit `pr-created`');
+    expect(body).toContain('Emit `code-done`');
+    expect(body).toContain('do NOT push, no PR');
+    expect(body.match(/gh pr create/g) ?? []).toHaveLength(1);
   });
 
   it.each([

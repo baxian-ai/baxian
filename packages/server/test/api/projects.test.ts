@@ -5,6 +5,11 @@ import { tmpdir } from 'node:os';
 import type { FastifyInstance } from 'fastify';
 import type { BaxianConfig } from '../../src/shared/index.js';
 import { buildApp } from '../../src/app.js';
+import * as loaderModule from '../../src/config/loader.js';
+import { ConfigValidationError } from '../../src/config/loader.js';
+import * as preflight from '../../src/agent/preflight.js';
+import { CleanupFailedError, EnsureSessionError } from '../../src/agent/manager.js';
+import { TmuxManager } from '../../src/agent/tmux.js';
 import { createTestContext } from '../helpers/context.js';
 import { requesters } from './helpers.js';
 
@@ -205,6 +210,52 @@ describe('POST /api/projects', () => {
     const files = await readdir(tempDir);
     expect(files.some(f => /^baxian\.json\.\d{8}-\d{6}$/.test(f))).toBe(true);
   });
+
+  it('returns 500 when no config path is configured', async () => {
+    app.ctx.configPath = undefined;
+    const response = await post('/api/projects', { id: 'x', repo: 'a/b' });
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/No config path/);
+  });
+
+  it('returns 400 when repo is missing', async () => {
+    const response = await post('/api/projects', { id: 'norepo' });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/repo must be a non-empty string/);
+  });
+
+  it('rethrows non-validation prepareConfig failures as 500 and persists nothing', async () => {
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
+      throw new Error('kaboom');
+    });
+    const response = await post('/api/projects', { id: 'boom', repo: 'a/b' });
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('internal_error');
+    expect(app.ctx.config.project.some(p => p.id === 'boom')).toBe(false);
+  });
+});
+
+describe('POST /api/projects/:id/checks', () => {
+  it('returns 404 for an unknown project', async () => {
+    const response = await post('/api/projects/no-such/checks');
+    expect(response.statusCode).toBe(404);
+    expect(JSON.parse(response.body).error).toMatch(/not found/i);
+  });
+
+  it('runs preflight for every agent in the project and returns 201', async () => {
+    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'cli', ok: true, message: 'claude found' },
+    ]);
+    const response = await post('/api/projects/proj/checks');
+    expect(response.statusCode).toBe(201);
+    const body = JSON.parse(response.body);
+    expect(body.projectId).toBe('proj');
+    expect(body.agents).toEqual([
+      { agentId: 'dev-1', mode: 'local', results: [{ step: 'cli', ok: true, message: 'claude found' }] },
+      { agentId: 'qa-1', mode: 'local', results: [{ step: 'cli', ok: true, message: 'claude found' }] },
+    ]);
+    expect(runSpy).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('POST /api/projects/:projectId/agents', () => {
@@ -279,6 +330,82 @@ describe('POST /api/projects/:projectId/agents', () => {
     await createProject(projectId);
     const response = await addAgent(projectId, body);
     expect(response.statusCode).toBe(400);
+  });
+
+  it('returns 500 when no config path is configured', async () => {
+    app.ctx.configPath = undefined;
+    const response = await addAgent('proj', devAgent('nc-dev'));
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/No config path/);
+  });
+
+  it('returns 400 for a whitespace-only agent id', async () => {
+    await createProject('pid');
+    const response = await addAgent('pid', devAgent('   '));
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/agent id is required/);
+  });
+
+  it('returns 409 when pairWith dev is still being created (creationToken set)', async () => {
+    await projectWithDev('qc', 'qc-dev');
+    await seedAgent('qc-dev', 'qc', { creationToken: 'tok-mid-bootstrap' });
+    const response = await addAgent('qc', qaAgent('qc-qa', 'qc-dev'));
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/being created/);
+    expect(findProject('qc').agent[0]).toHaveLength(1);
+  });
+
+  it('returns 400 when role=dev is sent with pairWith', async () => {
+    await projectWithDev('pdp', 'pdp-dev');
+    const response = await addAgent('pdp', devAgent('pdp-dev2', { pairWith: 'pdp-dev' }));
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/pairWith only valid for role=qa/);
+  });
+
+  it('adding a qa leaves unrelated pairs untouched (multi-pair project)', async () => {
+    await createProject('mp');
+    await addAgent('mp', devAgent('mp-dev1'));
+    await addAgent('mp', devAgent('mp-dev2'));
+    const response = await addAgent('mp', qaAgent('mp-qa', 'mp-dev1'));
+    expect(response.statusCode).toBe(201);
+    const proj = findProject('mp');
+    expect(proj.agent).toEqual([
+      [expect.objectContaining({ id: 'mp-dev1' }), expect.objectContaining({ id: 'mp-qa' })],
+      [expect.objectContaining({ id: 'mp-dev2' })],
+    ]);
+  });
+
+  it('rethrows non-validation prepareConfig failures as 500 (agent not committed)', async () => {
+    await createProject('pboom');
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
+      throw new Error('kaboom');
+    });
+    const response = await addAgent('pboom', devAgent('pboom-dev'));
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('internal_error');
+    expect(findProject('pboom').agent).toEqual([]);
+    expect(await app.ctx.agentStore.get('pboom-dev')).toBeNull();
+  });
+
+  it('startBootstrapAsync rejection is logged as impossible; the 201 response is unaffected', async () => {
+    await createProject('sba');
+    const logSpy = vi.spyOn(app.log, 'error');
+    vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockImplementation(async (agentId) => {
+      const state = await app.ctx.agentStore.get(agentId);
+      if (state) await app.ctx.agentStore.set({ ...state, creationToken: undefined, updatedAt: now() });
+      throw new Error('impossible failure');
+    });
+
+    const response = await addAgent('sba', devAgent('sba-dev'));
+
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(response.body).runtimeStatus).toBe('pending');
+    await vi.waitFor(() => {
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: 'sba-dev' }),
+        expect.stringContaining('startBootstrapAsync threw'),
+      );
+    });
   });
 });
 
@@ -578,6 +705,229 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
     expect(await app.ctx.lockManager.isLocked('da-rb-dev')).toBe(false);
   });
+
+  it('returns 500 when no config path is configured', async () => {
+    app.ctx.configPath = undefined;
+    const response = await del('/api/projects/proj/agents/dev-1');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/No config path/);
+  });
+
+  it('refuses when an active task references the agent via agentId only (agent itself unbound)', async () => {
+    await projectWithDev('ref-a', 'ref-a-dev');
+    await seedAgent('ref-a-dev', 'ref-a', { status: 'idle' });
+    await seedTask('task-ref-a', 'ref-a', { preferredAgentId: '', agentId: 'ref-a-dev', status: 'in_progress' });
+
+    const response = await del('/api/projects/ref-a/agents/ref-a-dev');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-a/);
+    expect(findProject('ref-a').agent[0][0].id).toBe('ref-a-dev');
+  });
+
+  it('refuses deleting a qa referenced via qaAgentId by an active task', async () => {
+    await projectWithDev('ref-q', 'ref-q-dev');
+    await addAgent('ref-q', qaAgent('ref-q-qa', 'ref-q-dev'));
+    await seedTask('task-ref-q', 'ref-q', {
+      preferredAgentId: '', agentId: '', qaAgentId: 'ref-q-qa', status: 'review',
+    });
+
+    const response = await del('/api/projects/ref-q/agents/ref-q-qa');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-q/);
+    expect(findProject('ref-q').agent[0]).toHaveLength(2);
+  });
+
+  it('409 when a non-awaiting agent is locked by another op', async () => {
+    await projectWithDev('lk1', 'lk1-dev');
+    await seedAgent('lk1-dev', 'lk1', { status: 'idle' });
+    await app.ctx.lockManager.acquire('lk1-dev');
+
+    const response = await del('/api/projects/lk1/agents/lk1-dev');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
+    expect(findProject('lk1').agent[0][0].id).toBe('lk1-dev');
+    await app.ctx.lockManager.release('lk1-dev');
+  });
+
+  it('releases locks it already acquired when a later pair member is locked', async () => {
+    await projectWithDev('lk2', 'lk2-dev');
+    await addAgent('lk2', qaAgent('lk2-qa', 'lk2-dev'));
+    await seedAgent('lk2-qa', 'lk2', { status: 'idle' });
+    await app.ctx.lockManager.acquire('lk2-qa');
+
+    const response = await del('/api/projects/lk2/agents/lk2-dev');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
+    expect(await app.ctx.lockManager.isLocked('lk2-dev')).toBe(false);
+    expect(await app.ctx.lockManager.isLocked('lk2-qa')).toBe(true);
+    await app.ctx.lockManager.release('lk2-qa');
+  });
+
+  it('phase1 prepareConfig validation failure → 400 Invalid config + locks released', async () => {
+    await projectWithDev('v1', 'v1-dev');
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
+      throw new ConfigValidationError([{ path: 'project', message: 'bad' }]);
+    });
+
+    const response = await del('/api/projects/v1/agents/v1-dev');
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.error).toBe('Invalid config');
+    expect(body.details).toEqual([{ path: 'project', message: 'bad' }]);
+    expect(await app.ctx.lockManager.isLocked('v1-dev')).toBe(false);
+    expect(findProject('v1').agent.flat().map(a => a.id)).toEqual(['v1-dev']);
+  });
+
+  it('phase1 prepareConfig unknown failure → 500 internal_error + locks released', async () => {
+    await projectWithDev('v1b', 'v1b-dev');
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
+      throw new Error('kaboom');
+    });
+
+    const response = await del('/api/projects/v1b/agents/v1b-dev');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('internal_error');
+    expect(await app.ctx.lockManager.isLocked('v1b-dev')).toBe(false);
+    expect(findProject('v1b').agent.flat().map(a => a.id)).toEqual(['v1b-dev']);
+  });
+
+  it('phase3 prepareConfig validation failure → 400 + state rollback + lock released', async () => {
+    await projectWithDev('v3', 'v3-dev');
+    await seedAgent('v3-dev', 'v3', { paneId: '%9', repoPath: '/tmp/repo3' });
+    const realPrepare = loaderModule.prepareConfig;
+    let call = 0;
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation((raw) => {
+      call += 1;
+      if (call === 2) throw new ConfigValidationError([{ path: 'project', message: 'phase3 bad' }]);
+      return realPrepare(raw);
+    });
+
+    const response = await del('/api/projects/v3/agents/v3-dev');
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toBe('Invalid config');
+    const state = await app.ctx.agentStore.get('v3-dev');
+    expect(state?.paneId).toBeUndefined();
+    expect(state?.repoPath).toBe('/tmp/repo3');
+    expect(await app.ctx.lockManager.isLocked('v3-dev')).toBe(false);
+    expect(findProject('v3').agent.flat().map(a => a.id)).toEqual(['v3-dev']);
+  });
+
+  it('phase3 prepareConfig unknown failure → 500 internal_error after rollback', async () => {
+    await projectWithDev('v3b', 'v3b-dev');
+    const realPrepare = loaderModule.prepareConfig;
+    let call = 0;
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation((raw) => {
+      call += 1;
+      if (call === 2) throw new Error('phase3 kaboom');
+      return realPrepare(raw);
+    });
+
+    const response = await del('/api/projects/v3b/agents/v3b-dev');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('internal_error');
+    expect(await app.ctx.lockManager.isLocked('v3b-dev')).toBe(false);
+    expect(findProject('v3b').agent.flat().map(a => a.id)).toEqual(['v3b-dev']);
+  });
+
+  it('runtime cleanup CleanupFailedError → 502 + failures payload + state rollback, config intact', async () => {
+    await projectWithDev('cf1', 'cf1-dev');
+    await seedAgent('cf1-dev', 'cf1', { paneId: '%3', repoPath: '/tmp/r' });
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockRejectedValue(
+      new CleanupFailedError('cleanup failed', [
+        { agentId: 'cf1-dev', step: 'kill-session', error: new Error('ssh down') },
+        { agentId: 'cf1-dev', step: 'worktree', error: 'raw failure string' },
+      ]),
+    );
+
+    const response = await del('/api/projects/cf1/agents/cf1-dev');
+    expect(response.statusCode).toBe(502);
+    const body = JSON.parse(response.body);
+    expect(body.error).toMatch(/runtime cleanup failed for cf1-dev/);
+    expect(body.failures).toEqual([
+      { agentId: 'cf1-dev', step: 'kill-session', error: 'ssh down' },
+      { agentId: 'cf1-dev', step: 'worktree', error: 'raw failure string' },
+    ]);
+    expect(findProject('cf1').agent.flat().map(a => a.id)).toEqual(['cf1-dev']);
+    const state = await app.ctx.agentStore.get('cf1-dev');
+    expect(state?.paneId).toBeUndefined();
+    expect(state?.repoPath).toBe('/tmp/r');
+    expect(await app.ctx.lockManager.isLocked('cf1-dev')).toBe(false);
+  });
+
+  it('unrecognised runtime cleanup error → deletion proceeds and commits (200)', async () => {
+    await projectWithDev('cf2', 'cf2-dev');
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockRejectedValue(new Error('flaky ssh'));
+
+    const response = await del('/api/projects/cf2/agents/cf2-dev');
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).removed).toEqual(['cf2-dev']);
+    expect(findProject('cf2').agent).toEqual([]);
+  });
+
+  it('config changed during cleanup → phase3 recomputes the removal from the fresh config', async () => {
+    await projectWithDev('cc1', 'cc1-dev');
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => {
+      app.ctx.config = {
+        ...app.ctx.config,
+        project: [...app.ctx.config.project, { id: 'concurrent', repo: 'x/y', merge: null, agent: [] }],
+      };
+    });
+
+    const response = await del('/api/projects/cc1/agents/cc1-dev');
+    expect(response.statusCode).toBe(200);
+    expect(findProject('cc1').agent).toEqual([]);
+    expect(app.ctx.config.project.some(p => p.id === 'concurrent')).toBe(true);
+  });
+
+  it('post-commit best-effort cleanup failures (store delete / purge / pet unassign) do not block deletion', async () => {
+    await projectWithDev('be1', 'be1-dev');
+    app.ctx.errorRecordStore = { purgeAgent: vi.fn().mockRejectedValue(new Error('io')) } as never;
+    vi.spyOn(app.ctx.agentStore, 'delete').mockRejectedValue(new Error('io'));
+    vi.spyOn(app.ctx.petStore!, 'setAssignment').mockRejectedValue(new Error('io'));
+
+    const response = await del('/api/projects/be1/agents/be1-dev');
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).removed).toEqual(['be1-dev']);
+    expect(findProject('be1').agent).toEqual([]);
+    expect(await app.ctx.lockManager.isLocked('be1-dev')).toBe(false);
+  });
+
+  it('phase3 saveConfig failure with no prior agent state → rollback deletes the marker row', async () => {
+    await projectWithDev('rb0', 'rb0-dev');
+    await app.ctx.agentStore.delete('rb0-dev');
+    const realSave = loaderModule.saveConfig;
+    vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
+      const proj = config.project.find(p => p.id === 'rb0');
+      if (proj && !proj.agent.flat().some(a => a.id === 'rb0-dev')) {
+        throw new Error('disk full simulation');
+      }
+      return realSave(path, config);
+    });
+
+    const response = await del('/api/projects/rb0/agents/rb0-dev');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
+    expect(await app.ctx.agentStore.get('rb0-dev')).toBeNull();
+    expect(findProject('rb0').agent.flat().map(a => a.id)).toEqual(['rb0-dev']);
+  });
+
+  it('rollback agentStore.set failure is logged; DELETE still reports the persist failure (500)', async () => {
+    await projectWithDev('rb2', 'rb2-dev');
+    await seedAgent('rb2-dev', 'rb2', { paneId: '%1' });
+    const realSave = loaderModule.saveConfig;
+    vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
+      const proj = config.project.find(p => p.id === 'rb2');
+      if (proj && !proj.agent.flat().some(a => a.id === 'rb2-dev')) {
+        throw new Error('disk full simulation');
+      }
+      return realSave(path, config);
+    });
+    vi.spyOn(app.ctx.agentStore, 'set').mockRejectedValue(new Error('io broken'));
+
+    const response = await del('/api/projects/rb2/agents/rb2-dev');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
+  });
 });
 
 describe('POST /api/projects/:projectId/agents/:agentId/resume', () => {
@@ -761,6 +1111,48 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     const body = JSON.parse(response.body);
     expect(body.error).toMatch(/precondition failed/);
   });
+
+  it('qa bound to an active task (no takeover path) → 409, restart not attempted', async () => {
+    await seedTask('task-qa-live', 'proj', {
+      preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1', status: 'review',
+    });
+    await seedAgent('qa-1', 'proj', { taskId: 'task-qa-live' });
+    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/qa-1/restart-repl');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/bound to active task task-qa-live/);
+    expect(restartSpy).not.toHaveBeenCalled();
+  });
+
+  it('idle agent locked by another op → 409', async () => {
+    await seedAgent('dev-1', 'proj');
+    await app.ctx.lockManager.acquire('dev-1');
+    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
+    expect(restartSpy).not.toHaveBeenCalled();
+  });
+
+  it('greeting_failed without a task → regreetHeldAgent instead of clearAwaitingHuman', async () => {
+    await seedAgent('dev-1', 'proj', {
+      paneId: '%0', status: 'awaiting_human', awaitingPhase: 'greeting_failed',
+    });
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    const regreetSpy = vi.spyOn(app.ctx.agentManager, 'regreetHeldAgent').mockResolvedValue(true);
+    const clearSpy = vi.spyOn(app.ctx.agentManager, 'clearAwaitingHuman');
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    expect(regreetSpy).toHaveBeenCalledWith('dev-1');
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
 });
 
 describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
@@ -850,6 +1242,51 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
   it('returns 404 when agent is not in the project', async () => {
     const response = await post('/api/projects/no-such/agents/dev-1/retry');
     expect(response.statusCode).toBe(404);
+  });
+
+  it('locked by another op → 409', async () => {
+    await seedAgent('dev-1', 'proj');
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    await app.ctx.lockManager.acquire('dev-1');
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
+  });
+
+  it('ensureSession failure after creating a session → rollback killSession + 500 + lock released', async () => {
+    await seedAgent('dev-1', 'proj');
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'repl never became ready'),
+    );
+    vi.spyOn(app.ctx.agentManager, 'handleDialogPendingFromRuntime').mockResolvedValue(false);
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('repl never became ready');
+    expect(killSpy).toHaveBeenCalledWith('dev-1');
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('rollback killSession failure is swallowed with a warning; retry still returns 500', async () => {
+    await seedAgent('dev-1', 'proj');
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'repl never became ready'),
+    );
+    vi.spyOn(app.ctx.agentManager, 'handleDialogPendingFromRuntime').mockResolvedValue(false);
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession')
+      .mockRejectedValue(new Error('tmux server unreachable'));
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('repl never became ready');
+    expect(killSpy).toHaveBeenCalledWith('dev-1');
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
   });
 });
 
@@ -950,5 +1387,38 @@ describe('DELETE /api/projects/:id', () => {
     await del('/api/projects/recycle');
     const create = await createProject('recycle');
     expect(create.statusCode).toBe(201);
+  });
+
+  it('returns 500 when no config path is configured', async () => {
+    app.ctx.configPath = undefined;
+    const response = await del('/api/projects/proj');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/No config path/);
+  });
+
+  it('maps prepareConfig validation failure to 400 Invalid config and keeps the project', async () => {
+    await createProject('civ');
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
+      throw new ConfigValidationError([{ path: 'project', message: 'bad' }]);
+    });
+
+    const response = await del('/api/projects/civ');
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.error).toBe('Invalid config');
+    expect(body.details).toEqual([{ path: 'project', message: 'bad' }]);
+    expect(app.ctx.config.project.some(p => p.id === 'civ')).toBe(true);
+  });
+
+  it('rethrows unknown prepareConfig failures as 500 and keeps the project', async () => {
+    await createProject('cboom');
+    vi.spyOn(loaderModule, 'prepareConfig').mockImplementation(() => {
+      throw new Error('kaboom');
+    });
+
+    const response = await del('/api/projects/cboom');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toBe('internal_error');
+    expect(app.ctx.config.project.some(p => p.id === 'cboom')).toBe(true);
   });
 });

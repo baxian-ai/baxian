@@ -13,20 +13,24 @@ class MockWebSocket {
   readonly CLOSED = 3;
 
   url: string;
+  protocols?: string | string[];
   readyState = MockWebSocket.CONNECTING;
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((evt: { data: string }) => void) | null = null;
   sent: string[] = [];
+  failSends = false;
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = protocols;
     MockWebSocket.instances.push(this);
   }
 
   send(payload: string): void {
     if (this.readyState !== MockWebSocket.OPEN) throw new Error('not open');
+    if (this.failSends) throw new Error('send failed');
     this.sent.push(payload);
   }
 
@@ -54,6 +58,8 @@ class MockWebSocket {
   }
 }
 
+const originalWebSocket = globalThis.WebSocket;
+
 beforeEach(() => {
   MockWebSocket.instances = [];
   vi.useFakeTimers();
@@ -62,14 +68,16 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  globalThis.WebSocket = originalWebSocket;
 });
 
-function makeClient(): { client: EventsClient; lastWs: () => MockWebSocket } {
-  const factory = (url: string) => new MockWebSocket(url) as unknown as WebSocket;
+function makeClient(opts: { token?: string | null } = {}): { client: EventsClient; lastWs: () => MockWebSocket } {
+  const factory = (url: string, protocols?: string[]) =>
+    new MockWebSocket(url, protocols) as unknown as WebSocket;
   const client = new EventsClient({
     wsUrl: 'ws://test.local/api/realtime',
     wsFactory: factory,
-    tokenProvider: () => null,
+    tokenProvider: () => opts.token ?? null,
   });
   return {
     client,
@@ -231,5 +239,188 @@ describe('EventsClient', () => {
     const after = MockWebSocket.instances.length;
     vi.advanceTimersByTime(60_000);
     expect(MockWebSocket.instances.length).toBe(after);
+  });
+
+  it('encodes the auth token as a hex WebSocket subprotocol', () => {
+    const { client, lastWs } = makeClient({ token: 'ab' });
+    client.subscribe('agents', vi.fn());
+    expect(lastWs().protocols).toEqual(['baxian.token.6162']);
+  });
+
+  it('defaults: derives the ws URL from location and passes the token subprotocol to global WebSocket', () => {
+    const client = new EventsClient({ tokenProvider: () => 'ab' });
+    client.subscribe('agents', vi.fn());
+    const ws = MockWebSocket.instances[0];
+    const expectedProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    expect(ws.url).toBe(`${expectedProto}://${location.host}/api/realtime`);
+    expect(ws.protocols).toEqual(['baxian.token.6162']);
+    client.close();
+  });
+
+  it('defaults: without a token the global WebSocket is constructed with no subprotocols', () => {
+    const client = new EventsClient({ wsUrl: 'ws://test.local/api/realtime', tokenProvider: () => null });
+    client.subscribe('agents', vi.fn());
+    expect(MockWebSocket.instances[0].protocols).toBeUndefined();
+    client.close();
+  });
+
+  it('close() shuts the socket, clears all state, and blocks any later subscribe from reopening', () => {
+    const { client, lastWs } = makeClient();
+    const handler = vi.fn();
+    client.subscribe('agents', handler);
+    const ws = lastWs();
+    ws.open();
+    ws.push({ type: 'data', topic: 'agents', data: [{ id: 'dev-1' }] });
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    client.close();
+    expect(ws.readyState).toBe(MockWebSocket.CLOSED);
+
+    const countBefore = MockWebSocket.instances.length;
+    client.subscribe('agents', handler);
+    vi.advanceTimersByTime(60_000);
+    expect(MockWebSocket.instances.length).toBe(countBefore);
+  });
+
+  it('wsFactory throwing broadcasts connection_failed with the thrown message and schedules a reconnect', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let shouldThrow = true;
+    const client = new EventsClient({
+      wsUrl: 'ws://test.local/api/realtime',
+      wsFactory: (url) => {
+        if (shouldThrow) throw new Error('CSP blocked');
+        return new MockWebSocket(url) as unknown as WebSocket;
+      },
+      tokenProvider: () => null,
+    });
+    const onError = vi.fn();
+    client.subscribe('agents', vi.fn(), onError);
+    expect(onError).toHaveBeenCalledWith({ code: 'connection_failed', message: 'CSP blocked' });
+    expect(MockWebSocket.instances).toHaveLength(0);
+
+    shouldThrow = false;
+    vi.advanceTimersByTime(60_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    consoleWarn.mockRestore();
+  });
+
+  it('resubscribe send failure on reconnect is contained (warn, no throw)', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    client.subscribe('agents', vi.fn());
+    const ws = lastWs();
+    ws.failSends = true;
+    expect(() => ws.open()).not.toThrow();
+    expect(ws.sent).toHaveLength(0);
+    expect(consoleWarn).toHaveBeenCalledWith('[events-client] resubscribe send failed:', expect.any(Error));
+    consoleWarn.mockRestore();
+  });
+
+  it('malformed server frames are ignored and later valid frames still dispatch', () => {
+    const { client, lastWs } = makeClient();
+    const handler = vi.fn();
+    client.subscribe('agents', handler);
+    const ws = lastWs();
+    ws.open();
+    expect(() => ws.onmessage?.({ data: 'not json {' })).not.toThrow();
+    expect(handler).not.toHaveBeenCalled();
+    ws.push({ type: 'data', topic: 'agents', data: [{ id: 'dev-1' }] });
+    expect(handler).toHaveBeenCalledWith([{ id: 'dev-1' }]);
+  });
+
+  it('a throwing error handler does not stop the connection error from reaching other topics', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const bad = vi.fn(() => { throw new Error('handler boom'); });
+    const good = vi.fn();
+    client.subscribe('agents', vi.fn(), bad);
+    client.subscribe('task:t1', vi.fn(), good);
+    lastWs().closeFromServer();
+    expect(bad).toHaveBeenCalled();
+    expect(good).toHaveBeenCalledWith(expect.objectContaining({ code: 'connection_failed' }));
+    expect(consoleError).toHaveBeenCalledWith(
+      '[events-client] error handler threw on connection error:',
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
+  });
+
+  it('send failure on an OPEN socket queues the op instead of losing it, and reconnect restores both topics', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    client.subscribe('agents', vi.fn());
+    const ws1 = lastWs();
+    ws1.open();
+
+    ws1.failSends = true;
+    expect(() => client.subscribe('task:t1', vi.fn())).not.toThrow();
+    expect(consoleWarn).toHaveBeenCalledWith('[events-client] send failed, will queue:', expect.any(Error));
+
+    ws1.closeFromServer();
+    vi.advanceTimersByTime(500);
+    const ws2 = lastWs();
+    expect(ws2).not.toBe(ws1);
+    ws2.open();
+    const topics = ws2.sentParsed().filter((m) => m.op === 'subscribe').map((m) => m.topic);
+    expect(topics).toEqual(expect.arrayContaining(['agents', 'task:t1']));
+    consoleWarn.mockRestore();
+  });
+
+  it('a throwing data handler does not block other subscribers of the same topic', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const bad = vi.fn(() => { throw new Error('render boom'); });
+    const good = vi.fn();
+    client.subscribe('agents', bad);
+    client.subscribe('agents', good);
+    const ws = lastWs();
+    ws.open();
+    ws.push({ type: 'data', topic: 'agents', data: [{ id: 'dev-1' }] });
+    expect(good).toHaveBeenCalledWith([{ id: 'dev-1' }]);
+    expect(consoleError).toHaveBeenCalledWith('[events-client] handler threw on agents:', expect.any(Error));
+    consoleError.mockRestore();
+  });
+
+  it('a throwing topic error handler does not block other error handlers of the same topic', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const bad = vi.fn(() => { throw new Error('err boom'); });
+    const good = vi.fn();
+    client.subscribe('task:t1', vi.fn(), bad);
+    client.subscribe('task:t1', vi.fn(), good);
+    const ws = lastWs();
+    ws.open();
+    ws.push({ type: 'error', topic: 'task:t1', code: 'snapshot_failed', message: 'boom' });
+    expect(good).toHaveBeenCalledWith({ code: 'snapshot_failed', message: 'boom' });
+    expect(consoleError).toHaveBeenCalledWith(
+      '[events-client] error handler threw on task:t1:',
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
+  });
+
+  it('a connection-level error frame (no topic) is logged, not routed to topic handlers', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const onError = vi.fn();
+    client.subscribe('agents', vi.fn(), onError);
+    const ws = lastWs();
+    ws.open();
+    ws.push({ type: 'error', code: 'unauthorized', message: 'bad token' });
+    expect(onError).not.toHaveBeenCalled();
+    expect(consoleWarn).toHaveBeenCalledWith('[events-client] connection-level error:', 'unauthorized', 'bad token');
+    consoleWarn.mockRestore();
+  });
+
+  it('pong frames are silently accepted', () => {
+    const { client, lastWs } = makeClient();
+    const handler = vi.fn();
+    const onError = vi.fn();
+    client.subscribe('agents', handler, onError);
+    const ws = lastWs();
+    ws.open();
+    expect(() => ws.push({ type: 'pong' })).not.toThrow();
+    expect(handler).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
   });
 });

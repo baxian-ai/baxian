@@ -2,28 +2,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { PetMeta } from '../../src/shared/index.js';
 
-const showMock = vi.hoisted(() => vi.fn());
-vi.mock('../../src/components/toast.tsx', () => ({ useToast: () => ({ show: showMock }) }));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
-const listMock = vi.fn();
-const removeMock = vi.fn();
-const createMock = vi.fn();
-const setPetMock = vi.fn();
-const fetchSpritesheetMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  ApiError: class ApiError extends Error {},
-  api: {
-    pets: {
-      list: (...a: unknown[]) => listMock(...a),
-      remove: (...a: unknown[]) => removeMock(...a),
-      create: (...a: unknown[]) => createMock(...a),
-      fetchSpritesheet: (...a: unknown[]) => fetchSpritesheetMock(...a),
-    },
-    agents: { setPet: (...a: unknown[]) => setPetMock(...a) },
-  },
-}));
-
+import { api } from '../../src/api.ts';
 import { AgentPetConfigModal, parsePetPackage, PetPackageError } from '../../src/components/agent-pet-config-modal.tsx';
+import { toastShowMock } from '../helpers/toast-mock.tsx';
+
+const showMock = toastShowMock;
+const listMock = vi.mocked(api.pets.list);
+const removeMock = vi.mocked(api.pets.remove);
+const createMock = vi.mocked(api.pets.create);
+const setPetMock = vi.mocked(api.agents.setPet);
+const fetchSpritesheetMock = vi.mocked(api.pets.fetchSpritesheet);
 
 const PETS: PetMeta[] = [
   { id: 'pet-1', displayName: 'Foxy', description: 'a fox', ext: 'webp', createdAt: '1' },
@@ -33,7 +24,7 @@ const PETS: PetMeta[] = [
 beforeEach(() => {
   listMock.mockReset().mockResolvedValue(PETS);
   removeMock.mockReset().mockResolvedValue(undefined);
-  createMock.mockReset().mockResolvedValue({});
+  createMock.mockReset().mockResolvedValue(PETS[0]);
   setPetMock.mockReset().mockResolvedValue({ petId: null });
   fetchSpritesheetMock.mockReset().mockResolvedValue(new Blob(['x']));
   showMock.mockReset();
@@ -129,5 +120,149 @@ describe('AgentPetConfigModal', () => {
     expect(removeMock).toHaveBeenCalledWith('pet-2');
     await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
     confirmSpy.mockRestore();
+  });
+
+  it('shows the empty-library hint when no pet has been uploaded yet', async () => {
+    listMock.mockResolvedValue([]);
+    renderModal('pet-1');
+    expect(await screen.findByText('还没有上传过 Pet，点击上方按钮上传。')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Foxy' })).toBeNull();
+  });
+
+  it('re-checks the toggle and shows an error toast when clearing the pet fails', async () => {
+    setPetMock.mockRejectedValue(new Error('server down'));
+    renderModal('pet-1');
+    const toggle = screen.getByLabelText('启用 Agent Pet') as HTMLInputElement;
+
+    await act(async () => { fireEvent.click(toggle); });
+
+    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '关闭失败', body: 'server down' });
+    expect(toggle.checked).toBe(true);
+    expect(await screen.findByText('（当前）')).toBeTruthy();
+  });
+
+  it('keeps the previous assignment and shows an error toast when selecting a pet fails', async () => {
+    setPetMock.mockRejectedValue(new Error('pet missing'));
+    renderModal('pet-1');
+    const catBtn = await screen.findByRole('button', { name: 'Cat' });
+
+    await act(async () => { fireEvent.click(catBtn); });
+
+    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '选择失败', body: 'pet missing' });
+    expect(screen.getByText('（当前）').closest('button')?.textContent).toContain('Foxy');
+  });
+
+  it('shows an error toast and skips the refresh when deleting a pet fails', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    removeMock.mockRejectedValue(new Error('pet in use'));
+    renderModal('pet-1');
+    const delBtn = await screen.findByRole('button', { name: '删除 Cat' });
+
+    await act(async () => { fireEvent.click(delBtn); });
+
+    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '删除失败', body: 'pet in use' });
+    expect(listMock).toHaveBeenCalledTimes(1);
+    confirmSpy.mockRestore();
+  });
+
+  describe('pet package upload', () => {
+    function uploadInput(): HTMLInputElement {
+      return screen.getByLabelText('上传 Codex Pet 文件包') as HTMLInputElement;
+    }
+
+    function changeFiles(files: File[]): void {
+      fireEvent.change(uploadInput(), { target: { files } });
+    }
+
+    it('parses the package, creates the pet, refreshes the library and resets the input', async () => {
+      renderModal('pet-1');
+      await screen.findByText('Foxy');
+      const manifest = new File([JSON.stringify({ displayName: 'New', spritesheetPath: 'sprite.webp' })], 'pet.json');
+      const sprite = new File(['IMG'], 'sprite.webp');
+
+      changeFiles([manifest, sprite]);
+
+      await waitFor(() =>
+        expect(createMock).toHaveBeenCalledWith({ displayName: 'New', spritesheetPath: 'sprite.webp' }, sprite));
+      await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: 'Pet 上传成功' }));
+      expect(uploadInput().value).toBe('');
+    });
+
+    it('reports a broken package (missing pet.json) without calling the API', async () => {
+      renderModal('pet-1');
+      await screen.findByText('Foxy');
+
+      changeFiles([new File(['IMG'], 'sprite.webp')]);
+
+      await waitFor(() =>
+        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Pet 上传失败', body: '文件包中未找到 pet.json' }));
+      expect(createMock).not.toHaveBeenCalled();
+    });
+
+    it('reports an upload API failure as a toast', async () => {
+      createMock.mockRejectedValue(new Error('payload too large'));
+      renderModal('pet-1');
+      await screen.findByText('Foxy');
+
+      changeFiles([
+        new File([JSON.stringify({ displayName: 'New' })], 'pet.json'),
+        new File(['IMG'], 'art.png'),
+      ]);
+
+      await waitFor(() =>
+        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Pet 上传失败', body: 'payload too large' }));
+      expect(listMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores an empty file selection', async () => {
+      renderModal('pet-1');
+      await screen.findByText('Foxy');
+
+      changeFiles([]);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(createMock).not.toHaveBeenCalled();
+      expect(showMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('defers pet previews until they intersect the viewport', async () => {
+    const observers: Array<{
+      cb: (entries: { isIntersecting: boolean }[]) => void;
+      disconnect: ReturnType<typeof vi.fn>;
+      observed: Element[];
+    }> = [];
+    class MockIntersectionObserver {
+      readonly disconnect = vi.fn();
+      readonly observed: Element[] = [];
+      constructor(cb: (entries: { isIntersecting: boolean }[]) => void) {
+        observers.push({ cb, disconnect: this.disconnect, observed: this.observed });
+      }
+      observe(el: Element): void { this.observed.push(el); }
+      unobserve(): void {}
+      takeRecords(): never[] { return []; }
+    }
+    vi.stubGlobal('IntersectionObserver', MockIntersectionObserver);
+    try {
+      renderModal('pet-1');
+      await screen.findByText('Foxy');
+
+      expect(screen.queryByTitle('Foxy')).toBeNull();
+      expect(observers).toHaveLength(2);
+      expect(observers[0].observed).toHaveLength(1);
+
+      await act(async () => {
+        observers[0].cb([{ isIntersecting: true }]);
+      });
+
+      expect(screen.getByTitle('Foxy')).toBeTruthy();
+      expect(observers[0].disconnect).toHaveBeenCalled();
+      expect(screen.queryByTitle('Cat')).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

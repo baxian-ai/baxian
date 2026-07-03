@@ -2,12 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, waitFor, cleanup } from '@testing-library/react';
 import type { ReviewRound } from '../../src/shared/index.js';
 
-const reviewsMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { reviews: (...args: unknown[]) => reviewsMock(...args) } },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
+import { api } from '../../src/api.ts';
 import { useReviewRounds } from '../../src/hooks/use-review-rounds.ts';
+
+const reviewsMock = vi.mocked(api.tasks.reviews);
 
 function round(n: number, content: string): ReviewRound {
   return { round: n, phase: 'code', content, startedAt: 'now' };

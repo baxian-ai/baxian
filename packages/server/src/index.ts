@@ -221,13 +221,6 @@ export async function startServer(configPath?: string): Promise<void> {
       onAgentAffected: onBootstrapAgentAffected,
     });
 
-    const migrationResult = await taskStore.migrateLegacyFiles();
-    if (migrationResult.migrated > 0 || migrationResult.failed > 0) {
-      console.log(
-        `[startup] task-store migration: ${migrationResult.migrated} migrated, ${migrationResult.failed} failed`,
-      );
-    }
-
     try {
       const result = await errorRecordStore.sweepStaleBootstrapErrors(autoBootstrapAgentIds(config));
       if (result.removed > 0) {

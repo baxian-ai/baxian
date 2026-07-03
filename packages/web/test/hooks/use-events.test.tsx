@@ -5,11 +5,13 @@ import {
   _resetEventsClientForTest,
 } from '../../src/stores/events-store.ts';
 
-const { apiTasksList } = vi.hoisted(() => ({ apiTasksList: vi.fn() }));
-vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { list: apiTasksList } },
-  getAuthToken: () => null,
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
+
+import { api, getAuthToken } from '../../src/api.ts';
+import type { TaskState } from '../../src/shared/index.js';
+import { makeTask } from '../helpers/fixtures.ts';
+
+const apiTasksList = vi.mocked(api.tasks.list);
 
 class MockWebSocket {
   static OPEN = 1;
@@ -54,6 +56,7 @@ class MockWebSocket {
 beforeEach(() => {
   MockWebSocket.lastInstance = undefined;
   apiTasksList.mockReset();
+  vi.mocked(getAuthToken).mockReturnValue(null);
   (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = MockWebSocket;
   _resetEventsClientForTest(
     new EventsClient({
@@ -67,6 +70,100 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   _resetEventsClientForTest(null);
+});
+
+describe('useAgents', () => {
+  it('subscribes to the agents topic and flips loaded once the first list frame lands', async () => {
+    const { useAgents } = await import('../../src/hooks/use-events.ts');
+    const { result } = renderHook(() => useAgents());
+
+    expect(result.current.loaded).toBe(false);
+    expect(result.current.data).toBe(null);
+    expect(result.current.error).toBe(null);
+
+    const ws = MockWebSocket.lastInstance!;
+    act(() => { ws.open(); });
+    expect(ws.sent.some(s => s.includes('"topic":"agents"'))).toBe(true);
+
+    act(() => {
+      ws.push({ type: 'data', topic: 'agents', data: [{ id: 'dev-1' }, { id: 'qa-1' }] });
+    });
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.data?.map(a => a.id)).toEqual(['dev-1', 'qa-1']);
+  });
+
+  it('surfaces a topic error, then clears it when a later data frame lands (recovery is visible)', async () => {
+    const { useAgents } = await import('../../src/hooks/use-events.ts');
+    const { result } = renderHook(() => useAgents());
+
+    const ws = MockWebSocket.lastInstance!;
+    act(() => { ws.open(); });
+    act(() => {
+      ws.push({ type: 'error', topic: 'agents', code: 'snapshot_failed', message: 'boom' });
+    });
+    expect(result.current.error).toEqual({ code: 'snapshot_failed', message: 'boom' });
+    expect(result.current.loaded).toBe(false);
+
+    act(() => {
+      ws.push({ type: 'data', topic: 'agents', data: [{ id: 'dev-1' }] });
+    });
+    expect(result.current.error).toBe(null);
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.data?.map(a => a.id)).toEqual(['dev-1']);
+  });
+});
+
+describe('useAgent', () => {
+  it('distinguishes "not yet loaded" from "loaded with null" for a missing agent', async () => {
+    const { useAgent } = await import('../../src/hooks/use-events.ts');
+    const { result } = renderHook(() => useAgent('ghost'));
+
+    expect(result.current.loaded).toBe(false);
+    const ws = MockWebSocket.lastInstance!;
+    act(() => { ws.open(); });
+    expect(ws.sent.some(s => s.includes('"topic":"agent:ghost"'))).toBe(true);
+
+    act(() => {
+      ws.push({ type: 'data', topic: 'agent:ghost', data: null });
+    });
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.data).toBe(null);
+  });
+
+  it('resets data/loaded/error and resubscribes when agentId changes (no stale snapshot flash)', async () => {
+    const { useAgent } = await import('../../src/hooks/use-events.ts');
+    const { result, rerender } = renderHook(({ id }) => useAgent(id), {
+      initialProps: { id: 'dev-1' },
+    });
+
+    const ws1 = MockWebSocket.lastInstance!;
+    act(() => { ws1.open(); });
+    act(() => {
+      ws1.push({ type: 'error', topic: 'agent:dev-1', code: 'forbidden', message: 'nope' });
+    });
+    expect(result.current.error).toEqual({ code: 'forbidden', message: 'nope' });
+    act(() => {
+      ws1.push({ type: 'data', topic: 'agent:dev-1', data: { id: 'dev-1', runtimeStatus: 'idle' } });
+    });
+    expect(result.current.error).toBe(null);
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.data?.id).toBe('dev-1');
+
+    rerender({ id: 'qa-1' });
+    expect(result.current.data).toBe(null);
+    expect(result.current.loaded).toBe(false);
+    expect(result.current.error).toBe(null);
+
+    const ws2 = MockWebSocket.lastInstance!;
+    expect(ws2).not.toBe(ws1);
+    act(() => { ws2.open(); });
+    expect(ws2.sent.some(s => s.includes('"topic":"agent:qa-1"'))).toBe(true);
+    act(() => {
+      ws2.push({ type: 'data', topic: 'agent:qa-1', data: { id: 'qa-1', runtimeStatus: 'busy' } });
+    });
+    expect(result.current.data?.id).toBe('qa-1');
+    expect(result.current.loaded).toBe(true);
+  });
 });
 
 describe('useTask', () => {
@@ -153,8 +250,8 @@ describe('useProjectTasks', () => {
 
   it('falls back to REST when realtime fails on connect so users still see tasks instead of an empty page', async () => {
     apiTasksList.mockResolvedValue([
-      { id: 't1', status: 'in_progress' },
-      { id: 't2', status: 'pending' },
+      makeTask({ id: 't1', status: 'in_progress' }),
+      makeTask({ id: 't2', status: 'pending' }),
     ]);
     const { useProjectTasks } = await import('../../src/hooks/use-events.ts');
     const { result } = renderHook(() => useProjectTasks('proj-1'));
@@ -209,7 +306,7 @@ describe('useProjectTasks', () => {
   it('drops the REST result when WS reconnects with a fresher snapshot in between (no stale-overwrite race)', async () => {
     vi.useFakeTimers();
     try {
-      let resolveRest!: (tasks: { id: string; status: string }[]) => void;
+      let resolveRest!: (tasks: TaskState[]) => void;
       apiTasksList.mockImplementation(() => new Promise((res) => { resolveRest = res; }));
       const { useProjectTasks } = await import('../../src/hooks/use-events.ts');
       const { result } = renderHook(() => useProjectTasks('proj-1'));
@@ -232,7 +329,7 @@ describe('useProjectTasks', () => {
       expect(result.current.data?.map(t => t.id)).toEqual(['t-fresh']);
 
       await act(async () => {
-        resolveRest([{ id: 't-stale', status: 'pending' }]);
+        resolveRest([makeTask({ id: 't-stale', status: 'pending' })]);
         await Promise.resolve();
       });
       expect(result.current.data?.map(t => t.id)).toEqual(['t-fresh']);

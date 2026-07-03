@@ -4480,7 +4480,7 @@ export class AgentManager {
       const task = await this.taskStore.get(taskId);
       if (!task) throw new ApiError(404, `Task ${taskId} not found`);
       if (task.reviewMode === 'server') {
-        throw new ApiError(409, `Task ${taskId} uses server review mode; legacy Call review is not applicable`);
+        throw new ApiError(409, `Task ${taskId} uses server review mode; Call review applies only to github-mode tasks`);
       }
       if (task.phase === 'spec' && task.status === 'max_rounds') {
         throw new ApiError(409, `Call review is not supported for spec-phase max_rounds tasks (use Retry or Cancel)`);

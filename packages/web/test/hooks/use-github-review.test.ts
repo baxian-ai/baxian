@@ -3,12 +3,12 @@ import { StrictMode, createElement, type ReactNode } from 'react';
 import { renderHook, waitFor, cleanup } from '@testing-library/react';
 import type { GithubReviewConversation } from '../../src/shared/index.js';
 
-const ghMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { githubReview: (...args: unknown[]) => ghMock(...args) } },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
+import { api } from '../../src/api.ts';
 import { useGithubReview } from '../../src/hooks/use-github-review.ts';
+
+const ghMock = vi.mocked(api.tasks.githubReview);
 
 function convo(items: number): GithubReviewConversation {
   return {

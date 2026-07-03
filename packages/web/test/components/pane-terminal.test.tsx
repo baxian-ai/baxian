@@ -82,7 +82,7 @@ class FakeFitAddon {
 vi.mock('@xterm/xterm', () => ({ Terminal: FakeTerminal }));
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: FakeFitAddon }));
-vi.mock('../../src/components/toast.tsx', () => ({ useToast: () => ({ show: vi.fn() }) }));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
 class MockWebSocket {
   static OPEN = 1;

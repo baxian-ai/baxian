@@ -5,7 +5,8 @@ import tailwindConfig from '../tailwind.config.js';
 const radius = (tailwindConfig.theme?.borderRadius ?? {}) as Record<string, string>;
 const px = (token: string) => Number.parseInt(radius[token], 10);
 type FontSizeToken = string | [string, { lineHeight: string }];
-const fontSize = (tailwindConfig.theme?.fontSize ?? {}) as Record<string, FontSizeToken>;
+const fontSize = (tailwindConfig.theme?.fontSize ?? {}) as unknown as Record<string, FontSizeToken>;
+const extend = (tailwindConfig.theme?.extend ?? {}) as Record<string, unknown>;
 const fontPx = (token: string) => {
   const value = fontSize[token];
   return Number.parseInt(Array.isArray(value) ? value[0] : value, 10);
@@ -36,7 +37,7 @@ describe('border-radius design tokens', () => {
 
   it('replaces the scale at theme top-level (not under extend) so Tailwind drops its oversized rounded-xl/2xl/3xl utilities', () => {
     expect(tailwindConfig.theme?.borderRadius).toBeDefined();
-    expect(tailwindConfig.theme?.extend?.borderRadius).toBeUndefined();
+    expect(extend.borderRadius).toBeUndefined();
     for (const oversized of ['xl', '2xl', '3xl']) {
       expect(radius[oversized]).toBeUndefined();
     }
@@ -58,7 +59,7 @@ describe('font-size design tokens', () => {
 
   it('replaces the default font scale so no third UI size utility exists', () => {
     expect(Object.keys(fontSize).sort()).toEqual(['sm', 'xs']);
-    expect(tailwindConfig.theme?.extend?.fontSize).toBeUndefined();
+    expect(extend.fontSize).toBeUndefined();
     for (const dropped of ['base', 'lg', 'xl', '2xl', '3xl']) {
       expect(fontSize[dropped]).toBeUndefined();
     }

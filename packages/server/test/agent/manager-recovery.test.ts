@@ -9,6 +9,7 @@ import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 import { buildPhaseSignal } from '../../src/agent/phase-signal.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
 import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
+import { TmuxManager } from '../../src/agent/tmux.js';
 import { WorktreeManager } from '../../src/agent/worktree.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
@@ -694,5 +695,122 @@ describe('setupRecoveredSpecSignals()', () => {
       && (e.data.phase as string) === 'spec-signal-setup-during-recovery',
     );
     expect(setupInterventions).toHaveLength(0);
+  });
+});
+
+describe('recover() deferred branches', () => {
+  it('skips the post-merge redrive when the binding refresh does not land', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
+    await seedTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
+    mockEnsureSessionOk();
+    vi.spyOn(agentStore, 'update').mockImplementationOnce(async () => {});
+    const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
+    vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
+
+    await manager.recover();
+
+    expect(cleanupSpy).not.toHaveBeenCalled();
+  });
+
+  it('falls through to the release path when the post-merge redrive throws', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
+    await seedTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
+    await lockManager.acquire('dev-1');
+    mockEnsureSessionOk();
+    vi.spyOn(manager, 'dispatchPostMergeCleanup').mockRejectedValue(new Error('cleanup exploded'));
+    vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await manager.recover();
+
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('dispatchPostMergeCleanup'))).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    warnSpy.mockRestore();
+  });
+
+  it('removes the reserved worktree when releasing a binding to a terminal task', async () => {
+    const { removeSpy } = await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-dead', paneId: '%0',
+        worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      }],
+      tasks: [{ id: 'task-dead', status: 'cancelled' }],
+      locks: ['dev-1'],
+    });
+
+    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/wt');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('still releases the binding when the worktree removal fails', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await runRecovery({
+      agents: [{
+        id: 'dev-1', taskId: 'task-dead', paneId: '%0',
+        worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      }],
+      tasks: [{ id: 'task-dead', status: 'cancelled' }],
+      locks: ['dev-1'],
+      removeImpl: async () => { throw new Error('worktree locked'); },
+    });
+
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('worktree.remove failed'))).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    warnSpy.mockRestore();
+  });
+
+  it('marks the agent dialog-pending and survives a crashing slow poll', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(
+      manager as unknown as { slowPollDialogPending: () => Promise<void> },
+      'slowPollDialogPending',
+    ).mockRejectedValue(new Error('poll crashed'));
+
+    await runRecovery({
+      agents: [{ id: 'dev-1', paneId: '%0' }],
+      ensureSession: {
+        reject: new EnsureSessionError(
+          { createdSession: false, agentId: 'dev-1', dialogPending: true, lastScreen: 'Press enter to continue' },
+          'blocked on startup dialog',
+        ),
+      },
+    });
+
+    const state = await agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('agent_dialog_pending');
+    await new Promise(r => setTimeout(r, 10));
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('slowPoll'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  it('rolls back an orphan session on recovery failure even when killSession fails, then fails the bound task', async () => {
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockRejectedValue(new Error('kill refused'));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-1', paneId: '%0' }],
+      tasks: [{ id: 'task-1' }],
+      locks: ['dev-1'],
+      ensureSession: {
+        reject: new EnsureSessionError(
+          { createdSession: true, agentId: 'dev-1' },
+          'boot exploded mid-recovery',
+        ),
+      },
+    });
+
+    expect(killSpy).toHaveBeenCalledWith('dev-1');
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('killSession rollback failed'))).toBe(true);
+    const state = await agentStore.get('dev-1');
+    expect(state?.paneId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect((await taskStore.get('task-1'))?.status).toBe('failed');
+    expect(events.some(e => e.type === 'human.intervention'
+      && (e.data as { phase?: string }).phase === 'recovery-failed')).toBe(true);
+    warnSpy.mockRestore();
   });
 });

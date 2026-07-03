@@ -8,22 +8,7 @@ vi.mock('../../src/hooks/use-projects.ts', () => ({
   useProjects: useProjectsMock,
 }));
 
-vi.mock('../../src/components/pane-terminal.tsx', () => ({
-  PaneTerminal: (props: {
-    agentId: string;
-    mode: string;
-    interactive?: boolean;
-    arrowKeys?: boolean;
-  }) => (
-    <div
-      data-testid="pane-terminal"
-      data-agent-id={props.agentId}
-      data-mode={props.mode}
-      data-interactive={String(!!props.interactive)}
-      data-arrow-keys={String(!!props.arrowKeys)}
-    />
-  ),
-}));
+vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
 import { Terminal } from '../../src/pages/terminal.tsx';
 

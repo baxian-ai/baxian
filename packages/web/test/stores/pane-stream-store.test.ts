@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PaneStreamClient } from '../../src/stores/pane-stream-store.ts';
 
 class MockWebSocket {
@@ -20,6 +20,7 @@ class MockWebSocket {
   onerror: (() => void) | null = null;
   onmessage: ((evt: { data: string }) => void) | null = null;
   sent: string[] = [];
+  failSends = false;
 
   constructor(url: string, protocols?: string | string[]) {
     this.url = url;
@@ -31,6 +32,7 @@ class MockWebSocket {
     if (this.readyState !== MockWebSocket.OPEN) {
       throw new Error('not open');
     }
+    if (this.failSends) throw new Error('send failed');
     this.sent.push(payload);
   }
 
@@ -75,10 +77,17 @@ function makeClient(opts: { wsUrl?: string } = {}): { client: PaneStreamClient; 
   };
 }
 
+const originalWebSocket = globalThis.WebSocket;
+
 beforeEach(() => {
   MockWebSocket.instances = [];
   vi.useFakeTimers();
   (globalThis as unknown as { WebSocket: typeof MockWebSocket }).WebSocket = MockWebSocket;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  globalThis.WebSocket = originalWebSocket;
 });
 
 describe('PaneStreamClient', () => {
@@ -322,5 +331,191 @@ describe('PaneStreamClient', () => {
     const inputs = ws2.sentParsed().filter((m) => m.op === 'input');
     expect(inputs).toHaveLength(1);
     expect(inputs[0]).toMatchObject({ subscriberId: h.subscriberId, data: 'typed-while-down' });
+  });
+
+  it('defaults: passes the auth token as a hex subprotocol to the global WebSocket', () => {
+    const client = new PaneStreamClient({
+      wsUrl: 'ws://test.local/api/stream',
+      tokenProvider: () => 'ab',
+    });
+    client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    expect(MockWebSocket.instances[0].protocols).toEqual(['baxian.token.6162']);
+    client.close();
+  });
+
+  it('ping is sent over an OPEN socket', () => {
+    const { client, lastWs } = makeClient();
+    const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws = lastWs();
+    ws.open();
+    ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
+    client.ping();
+    expect(ws.sentParsed().some((m) => m.op === 'ping')).toBe(true);
+  });
+
+  it('ping queued while disconnected is flushed on reconnect (not gated on any sub ack)', () => {
+    const { client, lastWs } = makeClient();
+    const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws1 = lastWs();
+    ws1.open();
+    ackSubscribe(ws1, h.subscriberId, { data: '', seq: 0 });
+    ws1.closeFromServer();
+
+    client.ping();
+    vi.advanceTimersByTime(500);
+    const ws2 = lastWs();
+    expect(ws2).not.toBe(ws1);
+    ws2.open();
+    const sent = ws2.sentParsed();
+    expect(sent.some((m) => m.op === 'ping')).toBe(true);
+    expect(sent.some((m) => m.op === 'subscribe' && m.subscriberId === h.subscriberId)).toBe(true);
+  });
+
+  it('wsFactory throwing schedules a reconnect instead of crashing', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let shouldThrow = true;
+    const client = new PaneStreamClient({
+      wsUrl: 'ws://test.local/api/stream',
+      wsFactory: (url, protocols) => {
+        if (shouldThrow) throw new Error('CSP blocked');
+        return new MockWebSocket(url, protocols) as unknown as WebSocket;
+      },
+      tokenProvider: () => null,
+    });
+    client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect(consoleWarn).toHaveBeenCalledWith('[pane-stream] WebSocket constructor threw:', expect.any(Error));
+
+    shouldThrow = false;
+    vi.advanceTimersByTime(60_000);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    consoleWarn.mockRestore();
+  });
+
+  it('resubscribe send failure on open is contained (warn, no throw)', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws = lastWs();
+    ws.failSends = true;
+    expect(() => ws.open()).not.toThrow();
+    expect(consoleWarn).toHaveBeenCalledWith('[pane-stream] resubscribe send failed:', expect.any(Error));
+    consoleWarn.mockRestore();
+  });
+
+  it('outbox flush failure on reconnect is contained (warn, no throw)', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws1 = lastWs();
+    ws1.open();
+    ackSubscribe(ws1, h.subscriberId, { data: '', seq: 0 });
+    ws1.closeFromServer();
+    client.ping();
+    vi.advanceTimersByTime(500);
+    const ws2 = lastWs();
+    ws2.failSends = true;
+    expect(() => ws2.open()).not.toThrow();
+    expect(consoleWarn).toHaveBeenCalledWith('[pane-stream] outbox flush failed:', expect.any(Error));
+    consoleWarn.mockRestore();
+  });
+
+  it('malformed server frames are ignored and later valid frames still dispatch', () => {
+    const { client, lastWs } = makeClient();
+    const onData = vi.fn();
+    const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData });
+    const ws = lastWs();
+    ws.open();
+    ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 });
+    expect(() => ws.onmessage?.({ data: 'not json {' })).not.toThrow();
+    ws.push({ type: 'data', agentId: 'dev-1', data: 'still-alive', seq: 1 });
+    expect(onData).toHaveBeenCalledWith('still-alive');
+  });
+
+  it('send failure on an OPEN socket queues the input and re-delivers it after reconnect + ack', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws1 = lastWs();
+    ws1.open();
+    ackSubscribe(ws1, h.subscriberId, { data: '', seq: 0 });
+
+    ws1.failSends = true;
+    expect(() => client.send(h.subscriberId, 'flaky-keystroke')).not.toThrow();
+    expect(consoleWarn).toHaveBeenCalledWith('[pane-stream] send failed, will queue:', expect.any(Error));
+
+    ws1.closeFromServer();
+    vi.advanceTimersByTime(500);
+    const ws2 = lastWs();
+    ws2.open();
+    ackSubscribe(ws2, h.subscriberId, { data: '', seq: 0 });
+    const inputs = ws2.sentParsed().filter((m) => m.op === 'input');
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toMatchObject({ subscriberId: h.subscriberId, data: 'flaky-keystroke' });
+    consoleWarn.mockRestore();
+  });
+
+  it('a connection-level error frame (no subscriberId) is logged, not routed to sub onError', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const onError = vi.fn();
+    client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn(), onError });
+    const ws = lastWs();
+    ws.open();
+    ws.push({ type: 'error', code: 'unauthorized', message: 'bad token' });
+    expect(onError).not.toHaveBeenCalled();
+    expect(consoleWarn).toHaveBeenCalledWith('[pane-stream] connection-level error:', 'unauthorized', 'bad token');
+    consoleWarn.mockRestore();
+  });
+
+  it('pong frames are silently accepted', () => {
+    const { client, lastWs } = makeClient();
+    const onData = vi.fn();
+    const onError = vi.fn();
+    client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData, onError });
+    const ws = lastWs();
+    ws.open();
+    expect(() => ws.push({ type: 'pong' })).not.toThrow();
+    expect(onData).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('flush-on-ack send failure drops the parked input without corrupting the outbox', () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { client, lastWs } = makeClient();
+    const h = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws = lastWs();
+    ws.open();
+    client.send(h.subscriberId, 'parked');
+    ws.failSends = true;
+    expect(() => ackSubscribe(ws, h.subscriberId, { data: '', seq: 0 })).not.toThrow();
+    expect(consoleWarn).toHaveBeenCalledWith('[pane-stream] flushOutboxForSub send failed:', expect.any(Error));
+
+    ws.failSends = false;
+    client.send(h.subscriberId, 'after');
+    const inputs = ws.sentParsed().filter((m) => m.op === 'input').map((m) => m.data);
+    expect(inputs).toEqual(['after']);
+    consoleWarn.mockRestore();
+  });
+
+  it('acking one sub flushes only its parked messages; the other pending sub keeps its queue', () => {
+    const { client, lastWs } = makeClient();
+    const hA = client.subscribe({ agentId: 'dev-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const hB = client.subscribe({ agentId: 'qa-1', mode: 'preview', onSnapshot: vi.fn(), onData: vi.fn() });
+    const ws = lastWs();
+    ws.open();
+    client.send(hA.subscriberId, 'for-A');
+    client.send(hB.subscriberId, 'for-B');
+
+    ackSubscribe(ws, hA.subscriberId, { data: '', seq: 0 });
+    let inputs = ws.sentParsed().filter((m) => m.op === 'input');
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toMatchObject({ subscriberId: hA.subscriberId, data: 'for-A' });
+
+    ws.push({ type: 'snapshot', subscriberId: hB.subscriberId, cols: 80, rows: 24, data: '', snapshotSeq: 0 });
+    ws.push({ type: 'subscribed', subscriberId: hB.subscriberId, agentId: 'qa-1', cols: 80, rows: 24, snapshotSeq: 0 });
+    inputs = ws.sentParsed().filter((m) => m.op === 'input');
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toMatchObject({ subscriberId: hB.subscriberId, data: 'for-B' });
   });
 });

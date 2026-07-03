@@ -37,16 +37,6 @@ export function prepareConfig(raw: unknown): BaxianConfig {
     ]);
   }
   const normalized = normalizeConfig(raw);
-  const legacyErrors: Array<{ path: string; message: string }> = [];
-  if ('codereview' in normalized) {
-    legacyErrors.push({
-      path: 'codereview',
-      message: 'codereview was renamed to review — rename the top-level key in baxian.json',
-    });
-  }
-  if (legacyErrors.length > 0) {
-    throw new ConfigValidationError(legacyErrors);
-  }
   if ('project' in normalized && normalized.project !== undefined && !Array.isArray(normalized.project)) {
     throw new ConfigValidationError([
       { path: 'project', message: 'project must be an array' },

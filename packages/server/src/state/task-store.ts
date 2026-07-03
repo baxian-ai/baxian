@@ -15,14 +15,8 @@ const TASK_FIELDS = [
   'reviewMode', 'batchIndex', 'batchTotal', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
 ] as const;
 
-type LegacyTaskShape = Partial<TaskState> & {
-  issueNumber?: number;
-  issueUrl?: string;
-  specMarkerToken?: string;
-};
-
 function sanitizeTask(state: unknown): TaskState {
-  const raw = (state ?? {}) as LegacyTaskShape;
+  const raw = (state ?? {}) as Partial<TaskState> & { specMarkerToken?: string };
   const out: Partial<TaskState> = {};
   for (const k of TASK_FIELDS) {
     const value = raw[k];
@@ -30,21 +24,16 @@ function sanitizeTask(state: unknown): TaskState {
       (out as Record<string, unknown>)[k] = value;
     }
   }
+  // dormant pre-rename task files on disk still carry specMarkerToken; map it on read
   if (out.signalToken === undefined && typeof raw.specMarkerToken === 'string') {
     out.signalToken = raw.specMarkerToken;
   }
 
   if (typeof out.title !== 'string' || out.title.trim() === '') {
-    const legacyIssue = raw.issueNumber;
-    out.title = legacyIssue
-      ? `(legacy) Issue #${legacyIssue}`
-      : `(legacy) ${typeof out.id === 'string' ? out.id : 'unknown'}`;
+    out.title = typeof out.id === 'string' ? out.id : 'unknown';
   }
   if (typeof out.description !== 'string') {
-    const legacyUrl = raw.issueUrl;
-    out.description = legacyUrl
-      ? `Migrated from ${legacyUrl}.`
-      : '';
+    out.description = '';
   }
   if (typeof out.preferredAgentId !== 'string' || out.preferredAgentId.trim() === '') {
     const fallback = typeof out.agentId === 'string' ? out.agentId.trim() : '';
@@ -75,7 +64,8 @@ export class TaskStore {
       if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null;
       throw err;
     }
-    return sanitizeTask(JSON.parse(content));
+    // the filename is the store key; it overrides whatever id the file body carries
+    return sanitizeTask({ ...(JSON.parse(content) as Record<string, unknown>), id });
   }
 
   async set(state: TaskState): Promise<void> {
@@ -100,8 +90,8 @@ export class TaskStore {
       let task: TaskState;
       try {
         const content = await readFile(join(this.dir, file), 'utf-8');
-        const raw = JSON.parse(content);
-        task = sanitizeTask(raw);
+        const raw = JSON.parse(content) as Record<string, unknown>;
+        task = sanitizeTask({ ...raw, id: file.slice(0, -'.json'.length) });
       } catch (err) {
         console.warn(`[TaskStore] skipping unreadable file ${file}:`, err);
         continue;
@@ -143,41 +133,6 @@ export class TaskStore {
         console.error(`[TaskStore] listener threw on ${kind} ${id}:`, err);
       }
     }
-  }
-
-  async migrateLegacyFiles(): Promise<{ migrated: number; failed: number }> {
-    let migrated = 0;
-    let failed = 0;
-    let files: string[];
-    try {
-      files = await readdir(this.dir);
-    } catch {
-      return { migrated, failed };
-    }
-    for (const file of files) {
-      if (!file.endsWith('.json')) continue;
-      const fileId = file.slice(0, -'.json'.length);
-      try {
-        const content = await readFile(join(this.dir, file), 'utf-8');
-        const raw = JSON.parse(content) as Record<string, unknown>;
-        const needsMigration =
-          'issueNumber' in raw
-          || 'issueUrl' in raw
-          || raw.id !== fileId
-          || typeof raw.title !== 'string' || raw.title.trim() === ''
-          || typeof raw.description !== 'string'
-          || typeof raw.preferredAgentId !== 'string' || raw.preferredAgentId.trim() === '';
-        if (needsMigration) {
-          raw.id = fileId;
-          await this.set(sanitizeTask(raw));
-          migrated += 1;
-        }
-      } catch (err) {
-        console.warn(`[TaskStore] migrateLegacyFiles skip ${file}:`, err);
-        failed += 1;
-      }
-    }
-    return { migrated, failed };
   }
 
   private path(id: string): string {

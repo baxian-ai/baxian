@@ -121,6 +121,72 @@ async function waitOpen(ws: WebSocket): Promise<void> {
   await new Promise<void>((r) => ws.on('open', () => r()));
 }
 
+async function waitFor(cond: () => boolean, timeoutMs = 1500): Promise<void> {
+  const started = Date.now();
+  while (!cond() && Date.now() - started < timeoutMs) {
+    await flushAsyncWork();
+  }
+  expect(cond()).toBe(true);
+}
+
+interface FakeStreamerCallbacks {
+  onLive?: (data: string, seq: number) => void;
+  onSessionGone?: () => void;
+}
+
+function makeFakeStreamer(): {
+  streamer: {
+    subscribeAtomic: ReturnType<typeof vi.fn>;
+    getSnapshotAtomic: ReturnType<typeof vi.fn>;
+    resize: ReturnType<typeof vi.fn>;
+  };
+  callbacks: FakeStreamerCallbacks;
+  unsubscribe: ReturnType<typeof vi.fn>;
+} {
+  const callbacks: FakeStreamerCallbacks = {};
+  const unsubscribe = vi.fn();
+  const streamer = {
+    subscribeAtomic: vi.fn(async (cbs: FakeStreamerCallbacks) => {
+      Object.assign(callbacks, cbs);
+      return { snapshot: { cols: 80, rows: 24, data: 'SNAP-LIVE' }, snapshotSeq: 7, unsubscribe };
+    }),
+    getSnapshotAtomic: vi.fn(async () => ({
+      snapshot: { cols: 80, rows: 24, data: 'SNAP-ONLY' },
+      snapshotSeq: 8,
+    })),
+    resize: vi.fn(async () => undefined),
+  };
+  return { streamer, callbacks, unsubscribe };
+}
+
+function fakePsm(
+  streamer: ReturnType<typeof makeFakeStreamer>['streamer'],
+  opts: { has?: boolean } = {},
+): PaneStreamerManager {
+  return {
+    ensure: vi.fn(() => streamer),
+    has: vi.fn(() => opts.has ?? true),
+    enqueueInput: vi.fn(async () => undefined),
+    destroyAll: vi.fn(async () => undefined),
+  } as unknown as PaneStreamerManager;
+}
+
+async function subscribeActive(
+  ws: WebSocket,
+  reader: ReturnType<typeof attachMessageReader>,
+  subscriberId: string,
+  mode: 'preview' | 'full',
+): Promise<void> {
+  send(ws, { op: 'subscribe', subscriberId, agentId: 'dev-1', mode });
+  expect((await reader.next()).type).toBe('snapshot');
+  expect((await reader.next()).type).toBe('subscribed');
+}
+
+async function pingBarrier(ws: WebSocket, reader: ReturnType<typeof attachMessageReader>): Promise<StreamServerMsg> {
+  send(ws, { op: 'ping' });
+  return reader.next();
+}
+
 describe('streamWsPlugin /api/stream — preValidation', () => {
   it('rejects with 403 when Origin host does not match Host', async () => {
     const { app, port: p } = await startApp();
@@ -393,6 +459,500 @@ describe('streamWsPlugin /api/stream — transport error handling', () => {
       ws2.close();
     } finally {
       warnSpy.mockRestore();
+    }
+  });
+});
+
+describe('streamWsPlugin /api/stream — streamer unavailable & subscribe failures', () => {
+  it('subscribe without a PaneStreamerManager returns streamer_unavailable and releases the sub', async () => {
+    const { app, port: p } = await startApp();
+    runningApp = app;
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('streamer_unavailable');
+      expect(m.subscriberId).toBe('sub-1');
+    }
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    const m2 = await reader.next();
+    if (m2.type === 'error') expect(m2.code).toBe('streamer_unavailable');
+    ws.close();
+  });
+
+  it('psm.ensure throwing maps to subscribe_failed with the error message', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    ctx.paneStreamerManager = {
+      ensure: () => { throw new Error('kaboom'); },
+      has: () => false,
+      enqueueInput: vi.fn(),
+      destroyAll: vi.fn(async () => undefined),
+    } as unknown as PaneStreamerManager;
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('subscribe_failed');
+      expect(m.message).toBe('kaboom');
+    }
+    ws.close();
+  });
+
+  it('tmux_too_old errors surface the dedicated error code', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    streamer.subscribeAtomic.mockRejectedValue(new Error('TMUX_TOO_OLD: need >= 3.2'));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'preview' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('tmux_too_old');
+    ws.close();
+  });
+
+  it('session-not-found errors map to session_not_found', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    streamer.subscribeAtomic.mockRejectedValue(new Error("can't find session: dev-1"));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('session_not_found');
+    ws.close();
+  });
+});
+
+describe('streamWsPlugin /api/stream — shared agent streams (refcount)', () => {
+  it('second subscriber reuses the live stream: snapshot-only path, no second subscribeAtomic', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    const snap1 = await reader.next();
+    expect(snap1).toMatchObject({ type: 'snapshot', subscriberId: 'sub-1', data: 'SNAP-LIVE', snapshotSeq: 7 });
+    expect((await reader.next()).type).toBe('subscribed');
+
+    send(ws, { op: 'subscribe', subscriberId: 'sub-2', agentId: 'dev-1', mode: 'preview' });
+    const snap2 = await reader.next();
+    expect(snap2).toMatchObject({ type: 'snapshot', subscriberId: 'sub-2', data: 'SNAP-ONLY', snapshotSeq: 8 });
+    expect((await reader.next()).type).toBe('subscribed');
+
+    expect(streamer.subscribeAtomic).toHaveBeenCalledTimes(1);
+    expect(streamer.getSnapshotAtomic).toHaveBeenCalledTimes(1);
+    ws.close();
+  });
+
+  it('live pane data is forwarded to the socket with agentId and seq', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, callbacks } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+
+    callbacks.onLive!('hello from pane', 42);
+    const m = await reader.next();
+    expect(m).toEqual({ type: 'data', agentId: 'dev-1', data: 'hello from pane', seq: 42 });
+    ws.close();
+  });
+
+  it('session_gone releases every subscriber of that agent and tears the stream down once', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, callbacks, unsubscribe } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+    await subscribeActive(ws, reader, 'sub-2', 'preview');
+
+    callbacks.onSessionGone!();
+    const m = await reader.next();
+    expect(m).toEqual({ type: 'session_gone', agentId: 'dev-1' });
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+
+    send(ws, { op: 'input', subscriberId: 'sub-1', data: 'hi' });
+    const m2 = await reader.next();
+    expect(m2.type).toBe('error');
+    if (m2.type === 'error') expect(m2.code).toBe('unknown_subscriber');
+    ws.close();
+  });
+
+  it('streamer is unsubscribed only when the last subscriber of the agent leaves', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, unsubscribe } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+    await subscribeActive(ws, reader, 'sub-2', 'preview');
+
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-2' });
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+    expect(unsubscribe).not.toHaveBeenCalled();
+
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-1' });
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+    await waitFor(() => unsubscribe.mock.calls.length === 1);
+    ws.close();
+  });
+
+  it('a throwing streamer unsubscribe is contained and the agent can be re-subscribed', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, unsubscribe } = makeFakeStreamer();
+    unsubscribe.mockImplementationOnce(() => { throw new Error('teardown boom'); });
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'preview');
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      send(ws, { op: 'unsubscribe', subscriberId: 'sub-1' });
+      expect((await pingBarrier(ws, reader)).type).toBe('pong');
+      expect(warnSpy.mock.calls.some(
+        (c) => String(c[0]).includes('[stream-ws] streamer.unsubscribe failed:'),
+      )).toBe(true);
+
+      await subscribeActive(ws, reader, 'sub-1', 'preview');
+      expect(streamer.subscribeAtomic).toHaveBeenCalledTimes(2);
+    } finally {
+      warnSpy.mockRestore();
+    }
+    ws.close();
+  });
+});
+
+describe('streamWsPlugin /api/stream — cancel during pending subscribe', () => {
+  it('cancelling the creator mid-subscribe hands the unsub to surviving subscribers', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, unsubscribe } = makeFakeStreamer();
+    let resolveSub!: (v: unknown) => void;
+    streamer.subscribeAtomic.mockImplementation(() => new Promise((r) => { resolveSub = r; }));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    await waitFor(() => streamer.subscribeAtomic.mock.calls.length === 1);
+
+    await subscribeActive(ws, reader, 'sub-2', 'preview');
+
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-1' });
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+
+    resolveSub({ snapshot: { cols: 80, rows: 24, data: 'SNAP-LIVE' }, snapshotSeq: 7, unsubscribe });
+    await flushAsyncWork();
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+    expect(unsubscribe).not.toHaveBeenCalled();
+
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-2' });
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+    await waitFor(() => unsubscribe.mock.calls.length === 1);
+    ws.close();
+  });
+
+  it('cancelling the sole pending subscribe invokes and contains the post-cancel unsub', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    const lateUnsub = vi.fn(() => { throw new Error('late unsub boom'); });
+    let resolveSub!: (v: unknown) => void;
+    streamer.subscribeAtomic.mockImplementation(() => new Promise((r) => { resolveSub = r; }));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    await waitFor(() => streamer.subscribeAtomic.mock.calls.length === 1);
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-1' });
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      resolveSub({ snapshot: { cols: 80, rows: 24, data: 'SNAP-LIVE' }, snapshotSeq: 7, unsubscribe: lateUnsub });
+      await waitFor(() => lateUnsub.mock.calls.length === 1);
+      expect(warnSpy.mock.calls.some(
+        (c) => String(c[0]).includes('[stream-ws] post-cancel unsub failed:'),
+      )).toBe(true);
+      expect((await pingBarrier(ws, reader)).type).toBe('pong');
+    } finally {
+      warnSpy.mockRestore();
+    }
+    ws.close();
+  });
+});
+
+describe('streamWsPlugin /api/stream — pending-phase and mode guards', () => {
+  it('input before the subscribed ack returns subscriber_not_ready', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, unsubscribe } = makeFakeStreamer();
+    let resolveSub!: (v: unknown) => void;
+    streamer.subscribeAtomic.mockImplementation(() => new Promise((r) => { resolveSub = r; }));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    await waitFor(() => streamer.subscribeAtomic.mock.calls.length === 1);
+    send(ws, { op: 'input', subscriberId: 'sub-1', data: 'hi' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('subscriber_not_ready');
+      expect(m.message).toContain('pending');
+    }
+    resolveSub({ snapshot: { cols: 80, rows: 24, data: '' }, snapshotSeq: 1, unsubscribe });
+    ws.close();
+  });
+
+  it('resize before the subscribed ack returns subscriber_not_ready', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer, unsubscribe } = makeFakeStreamer();
+    let resolveSub!: (v: unknown) => void;
+    streamer.subscribeAtomic.mockImplementation(() => new Promise((r) => { resolveSub = r; }));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    await waitFor(() => streamer.subscribeAtomic.mock.calls.length === 1);
+    send(ws, { op: 'resize', subscriberId: 'sub-1', cols: 80, rows: 24 });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('subscriber_not_ready');
+    resolveSub({ snapshot: { cols: 80, rows: 24, data: '' }, snapshotSeq: 1, unsubscribe });
+    ws.close();
+  });
+
+  it('resize in preview mode returns resize_not_allowed_in_preview', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'preview');
+    send(ws, { op: 'resize', subscriberId: 'sub-1', cols: 80, rows: 24 });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('resize_not_allowed_in_preview');
+    ws.close();
+  });
+
+  it('resize with no active streamer for the agent returns streamer_unavailable', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer, { has: false });
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+    send(ws, { op: 'resize', subscriberId: 'sub-1', cols: 80, rows: 24 });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('streamer_unavailable');
+      expect(m.agentId).toBe('dev-1');
+    }
+    ws.close();
+  });
+
+  it('resize forwards the sanitized size to the streamer without error frames', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+    send(ws, { op: 'resize', subscriberId: 'sub-1', cols: 120, rows: 40 });
+    await waitFor(() => streamer.resize.mock.calls.length === 1);
+    expect(streamer.resize).toHaveBeenCalledWith(120, 40);
+    expect((await pingBarrier(ws, reader)).type).toBe('pong');
+    ws.close();
+  });
+
+  it('a rejecting streamer.resize surfaces resize_failed', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    streamer.resize.mockRejectedValue(new Error('resize boom'));
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+    send(ws, { op: 'resize', subscriberId: 'sub-1', cols: 100, rows: 30 });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('resize_failed');
+      expect(m.message).toContain('resize boom');
+    }
+    ws.close();
+  });
+
+  it('input after the manager disappears returns streamer_unavailable', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    await subscribeActive(ws, reader, 'sub-1', 'full');
+
+    ctx.paneStreamerManager = undefined;
+    send(ws, { op: 'input', subscriberId: 'sub-1', data: 'hi' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('streamer_unavailable');
+    ws.close();
+  });
+});
+
+describe('streamWsPlugin /api/stream — malformed frames', () => {
+  it('non-JSON payloads return invalid_message (failed to parse JSON)', async () => {
+    const { app, port: p } = await startApp({ withPaneStreamerManager: true });
+    runningApp = app;
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    ws.send('not-json{');
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('invalid_message');
+      expect(m.message).toBe('failed to parse JSON');
+    }
+    ws.close();
+  });
+
+  it('unsubscribe without subscriberId returns invalid_message', async () => {
+    const { app, port: p } = await startApp({ withPaneStreamerManager: true });
+    runningApp = app;
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'unsubscribe' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('invalid_message');
+    ws.close();
+  });
+
+  it('resize with non-numeric cols returns invalid_message', async () => {
+    const { app, port: p } = await startApp({ withPaneStreamerManager: true });
+    runningApp = app;
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'resize', subscriberId: 'sub-1', cols: '80', rows: 24 });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') expect(m.code).toBe('invalid_message');
+    ws.close();
+  });
+
+  it('unknown op returns unknown_op with the op echoed', async () => {
+    const { app, port: p } = await startApp({ withPaneStreamerManager: true });
+    runningApp = app;
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'launch' });
+    const m = await reader.next();
+    expect(m.type).toBe('error');
+    if (m.type === 'error') {
+      expect(m.code).toBe('unknown_op');
+      expect(m.message).toBe('unknown op: launch');
+    }
+    ws.close();
+  });
+});
+
+describe('streamWsPlugin /api/stream — intervention emit failure', () => {
+  it('a failing eventBus.emit on attach is logged and the stream stays usable', async () => {
+    const { app, port: p, ctx } = await startApp();
+    runningApp = app;
+    const { streamer } = makeFakeStreamer();
+    ctx.paneStreamerManager = fakePsm(streamer);
+    const emitSpy = vi.spyOn(ctx.eventBus, 'emit').mockRejectedValue(new Error('bus down'));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      const ws = openWs(p);
+      const reader = attachMessageReader(ws);
+      await waitOpen(ws);
+      await subscribeActive(ws, reader, 'sub-1', 'full');
+      await waitFor(() => errorSpy.mock.calls.some(
+        (c) => String(c[0]).includes('[stream-ws] failed to emit human.intervention'),
+      ));
+      expect((await pingBarrier(ws, reader)).type).toBe('pong');
+      emitSpy.mockRestore();
+      ws.close();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe('streamWsPlugin /api/stream — pty unavailable', () => {
+  it('returns 503 pty_unavailable when node-pty cannot be loaded', async () => {
+    vi.resetModules();
+    vi.doMock('node-pty', () => { throw new Error('pty missing'); });
+    try {
+      const { buildApp: freshBuildApp } = await import('../../src/app.js');
+      const ctx = await createTestContext(tempDir);
+      const app = await freshBuildApp(ctx as unknown as Parameters<typeof freshBuildApp>[0]);
+      runningApp = app;
+      await app.listen({ port: 0, host: '127.0.0.1' });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('failed to bind test server');
+      const ws = openWs(address.port);
+      const r = await waitForOpenOrError(ws);
+      expect(r).toEqual({ kind: 'error', status: 503 });
+    } finally {
+      vi.doUnmock('node-pty');
+      vi.resetModules();
     }
   });
 });

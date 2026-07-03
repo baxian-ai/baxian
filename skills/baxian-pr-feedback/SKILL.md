@@ -42,6 +42,6 @@ QA already approved. Before merge, re-process PR feedback idempotently — handl
 - If no code change is needed: re-fetch all sources before signaling. The server suppresses redispatches while you run, so new comments only reach you via this re-fetch. If unhandled items remain, process and re-fetch again. Emit your `signal:` (`pr-merge-ready`) with `token:` only when clean.
 - Do not merge the PR yourself from this phase.
 
-When a `redispatch:` field is present, new feedback arrived while you were running: re-read the three sources, handle any non-self item with `created_at` > `T_self`, re-fetch once more, and emit only when no unhandled items remain.
+A `redispatch:` field means new feedback arrived while your previous pass ran — run this same §Post-Approve procedure again in full.
 
 Signal wire format and emit rules: see the baxian-signals skill.

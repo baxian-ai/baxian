@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { AgentBindingFacts, AgentSnapshot, TaskState } from '../../src/shared/index.js';
+import type { AgentBindingFacts, AgentSnapshot, PollerSnapshot, TaskState } from '../../src/shared/index.js';
 import type { AgentSnapshotCtx } from '../../src/state/snapshot.js';
 import { EventBroker } from '../../src/event/broker.js';
 import { EventPublisher } from '../../src/event/publish.js';
@@ -354,6 +354,274 @@ describe('EventPublisher', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(count).toBe(1);
+  });
+});
+
+describe('EventPublisher — deletes, failures and auxiliary channels', () => {
+  async function flush(): Promise<void> {
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  function spyConsoleError(): ReturnType<typeof vi.spyOn> {
+    return vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  }
+
+  it('agent delete publishes null to agent:<id> subscribers', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const broker = new EventBroker();
+    const received: unknown[] = [];
+    broker.subscribe('agent:dev-1', (d) => received.push(d));
+    const publisher = new EventPublisher(broker, ctx, taskStore, { agentsDebounceMs: 0 });
+
+    publisher.publishAgentChange('delete', 'dev-1');
+    await flush();
+
+    expect(received).toEqual([null]);
+  });
+
+  it('agent snapshot build failure is logged and the topic chain stays usable', async () => {
+    const { ctx, taskStore, states } = makeFakes();
+    const broker = new EventBroker();
+    const received: Array<{ id: string }> = [];
+    broker.subscribe('agent:dev-1', (d) => received.push(d as { id: string }));
+    const publisher = new EventPublisher(broker, ctx, taskStore, { agentsDebounceMs: 0 });
+
+    const errSpy = spyConsoleError();
+    try {
+      ctx.agentStore.get = vi.fn(async () => { throw new Error('store down'); });
+      publisher.publishAgentChange('set', 'dev-1');
+      await flush();
+      expect(received).toEqual([]);
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('agent:dev-1 (set) failed:'),
+        expect.any(Error),
+      );
+
+      states.set('dev-1', baseAgentState('dev-1'));
+      ctx.agentStore.get = vi.fn(async (id: string) => states.get(id) ?? null);
+      publisher.publishAgentChange('set', 'dev-1');
+      await flush();
+      expect(received.map((s) => s.id)).toEqual(['dev-1']);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('set for a task that vanished before the read publishes null and refreshes every subscribed project', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const broker = new EventBroker();
+    const taskFrames: unknown[] = [];
+    let projA = 0;
+    let projB = 0;
+    broker.subscribe('task:ghost', (d) => taskFrames.push(d));
+    broker.subscribe('project-tasks:proj-a', () => { projA += 1; });
+    broker.subscribe('project-tasks:proj-b', () => { projB += 1; });
+    const publisher = new EventPublisher(broker, ctx, taskStore, {
+      agentsDebounceMs: 0,
+      projectTasksDebounceMs: 0,
+    });
+
+    publisher.publishTaskChange('set', 'ghost');
+    await flush();
+
+    expect(taskFrames).toEqual([null]);
+    expect(projA).toBe(1);
+    expect(projB).toBe(1);
+  });
+
+  it('taskStore.get failure is logged and later publishes on the topic still flow', async () => {
+    const { ctx, taskStore, tasks } = makeFakes();
+    const broker = new EventBroker();
+    const received: Array<TaskState | null> = [];
+    broker.subscribe('task:t1', (d) => received.push(d as TaskState | null));
+    const publisher = new EventPublisher(broker, ctx, taskStore, { agentsDebounceMs: 0 });
+
+    const errSpy = spyConsoleError();
+    try {
+      taskStore.get.mockRejectedValueOnce(new Error('disk gone'));
+      publisher.publishTaskChange('set', 't1');
+      await flush();
+      expect(received).toEqual([]);
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('task:t1 (set) failed:'),
+        expect.any(Error),
+      );
+
+      tasks.set('t1', { ...baseTask('t1'), status: 'review' });
+      publisher.publishTaskChange('set', 't1');
+      await flush();
+      expect(received.map((t) => t?.status)).toEqual(['review']);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('enqueue runs jobs on the same topic strictly in submission order', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const publisher = new EventPublisher(new EventBroker(), ctx, taskStore, { agentsDebounceMs: 0 });
+
+    const order: number[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const p1 = publisher.enqueue('task:t1', async () => { await gate; order.push(1); });
+    const p2 = publisher.enqueue('task:t1', async () => { order.push(2); });
+
+    release();
+    await p1;
+    await p2;
+    expect(order).toEqual([1, 2]);
+  });
+
+  it('a rejecting enqueue job is contained and later jobs on the topic still run', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const publisher = new EventPublisher(new EventBroker(), ctx, taskStore, { agentsDebounceMs: 0 });
+
+    const errSpy = spyConsoleError();
+    try {
+      await publisher.enqueue('task:t1', async () => { throw new Error('job boom'); });
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('chain on task:t1 threw:'),
+        expect.any(Error),
+      );
+
+      const ran = vi.fn();
+      await publisher.enqueue('task:t1', async () => { ran(); });
+      expect(ran).toHaveBeenCalledTimes(1);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('publishPollersChange broadcasts the latest snapshots to pollers subscribers after the debounce', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const broker = new EventBroker();
+    const frames: unknown[] = [];
+    broker.subscribe('pollers', (d) => frames.push(d));
+    const publisher = new EventPublisher(broker, ctx, taskStore, { pollersDebounceMs: 10 });
+
+    const snapshots: PollerSnapshot[] = [{
+      repo: 'user/repo',
+      projectId: 'proj',
+      intervalMs: 1000,
+      isPolling: false,
+      consecutiveFailures: 0,
+      health: 'healthy',
+    }];
+    publisher.publishPollersChange(() => snapshots);
+    expect(frames).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(frames).toEqual([snapshots]);
+  });
+
+  it('pollers broadcast with no subscribers never invokes the snapshot getter', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const publisher = new EventPublisher(new EventBroker(), ctx, taskStore, { pollersDebounceMs: 0 });
+
+    const getter = vi.fn(() => [] as PollerSnapshot[]);
+    publisher.publishPollersChange(getter);
+    await flush();
+
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('a throwing pollers getter is logged without crashing the publisher', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const broker = new EventBroker();
+    broker.subscribe('pollers', () => undefined);
+    const publisher = new EventPublisher(broker, ctx, taskStore, { pollersDebounceMs: 0 });
+
+    const errSpy = spyConsoleError();
+    try {
+      publisher.publishPollersChange(() => { throw new Error('poller boom'); });
+      await flush();
+      expect(errSpy).toHaveBeenCalledWith('[event/publish] pollers broadcast failed:', expect.any(Error));
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('agents broadcast failure (buildAllAgentSnapshots throws) is logged', async () => {
+    const { ctx, taskStore } = makeFakes();
+    const broker = new EventBroker();
+    broker.subscribe('agents', () => undefined);
+    const publisher = new EventPublisher(broker, ctx, taskStore, { agentsDebounceMs: 0 });
+
+    const errSpy = spyConsoleError();
+    try {
+      ctx.agentStore.list = vi.fn(async () => { throw new Error('list boom'); });
+      publisher.publishAgentChange('set', 'dev-1');
+      await flush();
+      expect(errSpy).toHaveBeenCalledWith('[event/publish] agents broadcast failed:', expect.any(Error));
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('project-tasks broadcast failure (taskStore.list throws) is logged', async () => {
+    const { ctx, taskStore, tasks } = makeFakes();
+    const broker = new EventBroker();
+    broker.subscribe('project-tasks:proj', () => undefined);
+    const publisher = new EventPublisher(broker, ctx, taskStore, {
+      agentsDebounceMs: 0,
+      projectTasksDebounceMs: 0,
+    });
+
+    const errSpy = spyConsoleError();
+    try {
+      taskStore.list.mockRejectedValue(new Error('scan boom'));
+      tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+      publisher.publishTaskChange('set', 't1');
+      await flush();
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringContaining('project-tasks:proj broadcast failed:'),
+        expect.any(Error),
+      );
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('dispose cancels every pending debounced broadcast', async () => {
+    const { ctx, taskStore, states, tasks } = makeFakes();
+    const broker = new EventBroker();
+    let agentsN = 0;
+    let pollersN = 0;
+    let projectN = 0;
+    broker.subscribe('agents', () => { agentsN += 1; });
+    broker.subscribe('pollers', () => { pollersN += 1; });
+    broker.subscribe('project-tasks:proj', () => { projectN += 1; });
+    const publisher = new EventPublisher(broker, ctx, taskStore, {
+      agentsDebounceMs: 50,
+      pollersDebounceMs: 50,
+      projectTasksDebounceMs: 50,
+    });
+
+    states.set('dev-1', baseAgentState('dev-1'));
+    publisher.publishAgentChange('set', 'dev-1');
+    publisher.publishPollersChange(() => []);
+    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    publisher.publishTaskChange('set', 't1');
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    publisher.dispose();
+    await vi.advanceTimersByTimeAsync(200);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(agentsN).toBe(0);
+    expect(pollersN).toBe(0);
+    expect(projectN).toBe(0);
+    const broadcasts = (publisher as unknown as { projectTasksBroadcasts: Map<string, unknown> })
+      .projectTasksBroadcasts;
+    expect(broadcasts.size).toBe(0);
   });
 });
 

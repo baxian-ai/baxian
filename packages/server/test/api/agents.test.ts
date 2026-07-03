@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { AgentBindingFacts, AgentSnapshot } from '../../src/shared/index.js';
+import * as imageInput from '../../src/agent/image-input.js';
 import { requesters, setupApiHarness, teardownApiHarness, type ApiHarness } from './helpers.js';
 
 const PNG_B64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString('base64');
@@ -128,6 +129,51 @@ describe('POST /api/agents/:id/images', () => {
     const res = await post('/api/agents/dev-1/images', { dataBase64: PNG_B64 });
     expect(res.statusCode).toBe(409);
   });
+
+  it('400 when dataBase64 is missing, empty, or not a string', async () => {
+    await setAgent({ id: 'dev-1', paneId: '%1' });
+    for (const payload of [{}, { dataBase64: '' }, { dataBase64: 123 }]) {
+      const res = await post('/api/agents/dev-1/images', payload);
+      expect.soft(res.statusCode, JSON.stringify(payload)).toBe(400);
+      expect.soft(JSON.parse(res.body).error, JSON.stringify(payload)).toMatch(/dataBase64/);
+    }
+  });
+
+  it('non-validation decode failure propagates as 500 (not masked as a 400)', async () => {
+    await setAgent({ id: 'dev-1', paneId: '%1' });
+    const spy = vi.spyOn(imageInput, 'decodeBase64Image').mockImplementation(() => {
+      throw new Error('tmpdir unwritable');
+    });
+    try {
+      const res = await post('/api/agents/dev-1/images', { dataBase64: PNG_B64 });
+      expect(res.statusCode).toBe(500);
+      expect(JSON.parse(res.body).error).toBe('internal_error');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('POST /api/agents/:id/compact', () => {
+  it('delegates to compactAgent and returns 200', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'compactAgent').mockResolvedValue(undefined);
+    const res = await post('/api/agents/dev-1/compact');
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ compacted: true });
+    expect(spy).toHaveBeenCalledWith('dev-1');
+    spy.mockRestore();
+  });
+
+  it('returns 404 for an unknown agent', async () => {
+    const res = await post('/api/agents/nope/compact');
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('returns 409 when the agent has no live session', async () => {
+    await setAgent({ id: 'dev-1' });
+    const res = await post('/api/agents/dev-1/compact');
+    expect(res.statusCode).toBe(409);
+  });
 });
 
 describe('POST /api/agents/:id/clear', () => {
@@ -181,5 +227,17 @@ describe('DELETE /api/agents/:id/session', () => {
     await setAgent({ id: 'dev-1' });
     const response = await del('/api/agents/dev-1/session');
     expect(response.statusCode).toBe(204);
+  });
+
+  it('cancelTask failure is logged and swallowed → still 204', async () => {
+    await setAgent({ id: 'dev-1', taskId: 'task-broken' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'cancelTask').mockRejectedValue(new Error('tmux gone'));
+    try {
+      const response = await del('/api/agents/dev-1/session');
+      expect(response.statusCode).toBe(204);
+      expect(spy).toHaveBeenCalledWith('task-broken');
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

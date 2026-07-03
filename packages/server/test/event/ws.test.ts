@@ -25,7 +25,7 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true });
 });
 
-async function startApp(opts: { configToken?: string } = {}): Promise<{
+async function startApp(opts: { configToken?: string; noBroker?: boolean } = {}): Promise<{
   app: FastifyInstance;
   port: number;
   ctx: AppContext;
@@ -36,17 +36,19 @@ async function startApp(opts: { configToken?: string } = {}): Promise<{
     ctx.config = { ...ctx.config, server: { ...ctx.config.server, token: opts.configToken } };
   }
   const broker = new EventBroker();
-  ctx.eventBroker = broker;
-  const snapshotCtx = {
-    agentManager: ctx.agentManager,
-    agentStore: ctx.agentStore,
-    taskStore: ctx.taskStore,
-    tmuxSessionStatusStore: ctx.tmuxSessionStatusStore,
-  };
-  const publisher = new EventPublisher(broker, snapshotCtx, ctx.taskStore, { agentsDebounceMs: 0 });
-  ctx.agentStore.onChange((kind, id) => publisher.publishAgentChange(kind, id));
-  ctx.tmuxSessionStatusStore.onChange((kind, id) => publisher.publishAgentChange(kind, id));
-  ctx.taskStore.onChange((kind, id) => publisher.publishTaskChange(kind, id));
+  if (!opts.noBroker) {
+    ctx.eventBroker = broker;
+    const snapshotCtx = {
+      agentManager: ctx.agentManager,
+      agentStore: ctx.agentStore,
+      taskStore: ctx.taskStore,
+      tmuxSessionStatusStore: ctx.tmuxSessionStatusStore,
+    };
+    const publisher = new EventPublisher(broker, snapshotCtx, ctx.taskStore, { agentsDebounceMs: 0 });
+    ctx.agentStore.onChange((kind, id) => publisher.publishAgentChange(kind, id));
+    ctx.tmuxSessionStatusStore.onChange((kind, id) => publisher.publishAgentChange(kind, id));
+    ctx.taskStore.onChange((kind, id) => publisher.publishTaskChange(kind, id));
+  }
   const app = await buildApp(ctx);
   runningApp = app;
   await app.listen({ port: 0, host: '127.0.0.1' });
@@ -410,5 +412,166 @@ describe('events ws plugin (/api/realtime)', () => {
     ws.close();
     await new Promise((r) => setTimeout(r, 50));
     expect(broker.hasSubscribers('agents')).toBe(false);
+  });
+
+  it('rejects with 403 when Origin host does not match Host', async () => {
+    const { port } = await startApp();
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/realtime`, undefined, {
+      headers: { origin: 'http://evil.example' },
+    });
+    const result = await waitOpen(ws);
+    expect(result).toEqual({ kind: 'error', status: 403 });
+  });
+
+  it('subscribe without a configured broker returns broker_unavailable', async () => {
+    const { port } = await startApp({ noBroker: true });
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send(JSON.stringify({ op: 'subscribe', topic: 'agents' }));
+    const reply = await nextMsg(ws);
+    expect(reply).toMatchObject({ type: 'error', topic: 'agents', code: 'broker_unavailable' });
+    ws.close();
+  });
+
+  it('snapshot fetch failure sends snapshot_failed but keeps the live subscription flowing', async () => {
+    const { port, ctx, broker } = await startApp();
+    ctx.taskStore.get = vi.fn(async () => { throw new Error('disk gone'); });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const ws = openWs(port);
+      expect((await waitOpen(ws)).kind).toBe('open');
+      const frames: EventsServerMsg[] = [];
+      ws.on('message', (raw) => frames.push(JSON.parse(String(raw)) as EventsServerMsg));
+
+      ws.send(JSON.stringify({ op: 'subscribe', topic: 'task:t9' }));
+      await waitForPredicate(() => frames.some((f) => f.type === 'error'));
+      expect(frames[0]).toMatchObject({ type: 'error', topic: 'task:t9', code: 'snapshot_failed', message: 'disk gone' });
+
+      broker.publish('task:t9', { id: 't9', status: 'pending' });
+      await waitForPredicate(() => frames.some((f) => f.type === 'data'));
+      expect(frames.filter((f) => f.type === 'data')).toEqual([
+        { type: 'data', topic: 'task:t9', data: { id: 't9', status: 'pending' } },
+      ]);
+      ws.close();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('a throwing broker unsubscribe is contained and the topic can be re-subscribed', async () => {
+    const { port, broker } = await startApp();
+    const subscribeSpy = vi.spyOn(broker, 'subscribe')
+      .mockReturnValueOnce(() => { throw new Error('unsub boom'); });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const ws = openWs(port);
+      expect((await waitOpen(ws)).kind).toBe('open');
+      const frames: EventsServerMsg[] = [];
+      ws.on('message', (raw) => frames.push(JSON.parse(String(raw)) as EventsServerMsg));
+
+      ws.send(JSON.stringify({ op: 'subscribe', topic: 'agents' }));
+      await waitForPredicate(() => frames.filter((f) => f.type === 'data').length === 1);
+
+      ws.send(JSON.stringify({ op: 'unsubscribe', topic: 'agents' }));
+      await waitForPredicate(() => warnSpy.mock.calls.some(
+        (c) => String(c[0]).includes('[events-ws] broker unsubscribe failed:'),
+      ));
+
+      ws.send(JSON.stringify({ op: 'subscribe', topic: 'agents' }));
+      await waitForPredicate(() => frames.filter((f) => f.type === 'data').length === 2);
+      expect(subscribeSpy).toHaveBeenCalledTimes(2);
+      ws.close();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('invalid JSON payload returns invalid_message', async () => {
+    const { port } = await startApp();
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send('{oops');
+    const reply = await nextMsg(ws);
+    expect(reply).toMatchObject({ type: 'error', code: 'invalid_message', message: 'failed to parse JSON' });
+    ws.close();
+  });
+
+  it('JSON without an op string returns invalid_message', async () => {
+    const { port } = await startApp();
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send(JSON.stringify({ foo: 1 }));
+    const reply = await nextMsg(ws);
+    expect(reply).toMatchObject({ type: 'error', code: 'invalid_message', message: 'message must have { op: string }' });
+    ws.close();
+  });
+
+  it('unknown op returns unknown_op with the offending op echoed', async () => {
+    const { port } = await startApp();
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send(JSON.stringify({ op: 'dance' }));
+    const reply = await nextMsg(ws);
+    expect(reply).toMatchObject({ type: 'error', code: 'unknown_op', message: 'unknown op: dance' });
+    ws.close();
+  });
+
+  it('a throwing unsubscribe during socket close does not take the server down', async () => {
+    const { port, broker } = await startApp();
+    vi.spyOn(broker, 'subscribe').mockReturnValueOnce(() => { throw new Error('unsub boom'); });
+
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send(JSON.stringify({ op: 'subscribe', topic: 'agents' }));
+    await nextMsg(ws);
+    ws.close();
+    await sleep(50);
+
+    const ws2 = openWs(port);
+    expect((await waitOpen(ws2)).kind).toBe('open');
+    ws2.send(JSON.stringify({ op: 'ping' }));
+    expect(await nextMsg(ws2)).toEqual({ type: 'pong' });
+    ws2.close();
+  });
+
+  it('transport-level socket errors are logged without crashing the server', async () => {
+    const { port } = await startApp();
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    const inner = (ws as unknown as { _socket: { write: (b: Buffer) => boolean } })._socket;
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      inner.write(Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+      await sleep(100);
+      const ws2 = openWs(port);
+      expect((await waitOpen(ws2)).kind).toBe('open');
+      ws2.close();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('subscribe to "agent:<id>" returns the single-agent snapshot', async () => {
+    const { port, ctx } = await startApp();
+    await ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      taskId: 'task-42',
+      updatedAt: new Date().toISOString(),
+    });
+
+    const ws = openWs(port);
+    expect((await waitOpen(ws)).kind).toBe('open');
+    ws.send(JSON.stringify({ op: 'subscribe', topic: 'agent:dev-1' }));
+    const initial = await nextMsg(ws);
+    expect(initial.type).toBe('data');
+    if (initial.type === 'data' && initial.topic === 'agent:dev-1') {
+      const snapshot = initial.data as AgentSnapshot | null;
+      expect(snapshot?.id).toBe('dev-1');
+      expect(snapshot?.binding?.taskId).toBe('task-42');
+    }
+    ws.close();
   });
 });

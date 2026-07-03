@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { AgentManager } from '../../src/agent/manager.js';
+import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -241,6 +241,76 @@ describe('dispatchPendingTask', () => {
     const task = await seedPending('task-007', '');
     const result = await manager.dispatchPendingTask(task.id, 'ghost-dev');
     expect(result.errorCode).toBe(400);
+  });
+
+  it('returns 400 when the requested agent is not dev role', async () => {
+    const task = await seedPending('task-role', '');
+    const result = await manager.dispatchPendingTask(task.id, 'qa-1');
+    expect(result.errorCode).toBe(400);
+    expect(result.error).toMatch(/not dev role/);
+  });
+
+  it('returns 400 when a known dev is requested for a task preferring another dev', async () => {
+    const task = await seedPending('task-preferred-other', 'dev-x');
+    const result = await manager.dispatchPendingTask(task.id, 'dev-1');
+    expect(result.errorCode).toBe(400);
+    expect(result.error).toMatch(/preferredAgentId=dev-x/);
+  });
+
+  it('returns 400 when the requested agent belongs to another project', async () => {
+    manager.replaceConfig({
+      ...manager.getConfig(),
+      project: [
+        ...manager.getConfig().project,
+        {
+          id: 'proj2', repo: 'user/other', merge: null,
+          agent: [[{ id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: tempDir }]],
+        },
+      ],
+    });
+    const task = await seedPending('task-cross-proj', '');
+    const result = await manager.dispatchPendingTask(task.id, 'dev-2');
+    expect(result.errorCode).toBe(400);
+    expect(result.error).toMatch(/not in project/);
+  });
+
+  it('returns 409 when the dev lock is already held by another task', async () => {
+    await lockManager.acquire('dev-1', 'foreign-task');
+    const task = await seedPending('task-lockheld', 'dev-1');
+    const result = await manager.dispatchPendingTask(task.id, 'dev-1');
+    expect(result.errorCode).toBe(409);
+    expect(result.error).toMatch(/lock acquisition failed/);
+  });
+
+  it('rolls the claim back and returns 500 when startSession throws a generic error', async () => {
+    vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('tmux exploded'));
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const task = await seedPending('task-hard-error', 'dev-1');
+
+    const result = await manager.dispatchPendingTask(task.id, 'dev-1');
+
+    expect(result.errorCode).toBe(500);
+    expect(result.error).toMatch(/tmux exploded/);
+    const rolled = await taskStore.get(task.id);
+    expect(rolled!.status).toBe('pending');
+    expect(rolled!.agentId).toBe('');
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    errSpy.mockRestore();
+  });
+
+  it('fails the task through failTaskForDispatchError on a DispatchTerminalError', async () => {
+    vi.spyOn(manager, 'startSession').mockRejectedValue(
+      new DispatchTerminalError('prompt_too_large', 'prompt too big'),
+    );
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const failSpy = vi.spyOn(manager, 'failTaskForDispatchError').mockResolvedValue();
+    const task = await seedPending('task-terminal-error', 'dev-1');
+
+    const result = await manager.dispatchPendingTask(task.id, 'dev-1');
+
+    expect(result.errorCode).toBe(500);
+    expect(failSpy).toHaveBeenCalledWith(task.id, 'develop', 'dev-1', expect.objectContaining({ reason: 'prompt_too_large' }));
+    errSpy.mockRestore();
   });
 
   it('on 409 from busy agent, taskStore.set is never called (atomicity guard)', async () => {

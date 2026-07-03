@@ -371,9 +371,7 @@ describe('POST /api/tasks', () => {
   });
 
   it.each([
-    ['title + issueNumber → 400 mutually exclusive', createPayload({ title: 'x', description: 'y', issueNumber: 5 }), 400, /mutually exclusive/],
-    ['only issueNumber → 400 (issue-bound unsupported)', { projectId: 'proj', issueNumber: 5 }, 400, undefined],
-    ['missing title → 400', { projectId: 'proj', description: 'y', preferredAgentId: 'dev-1' }, 400, undefined],
+    ['missing title → 400', { projectId: 'proj', description: 'y', preferredAgentId: 'dev-1' }, 400, /title is required/],
     ['missing projectId → 400', { title: 't', description: 'd', preferredAgentId: 'dev-1' }, 400, undefined],
     ['projectId not found → 404', createPayload({ projectId: 'no-such' }), 404, undefined],
     ['title all-whitespace → 400 1-200', createPayload({ title: '   ' }), 400, /1-200/],

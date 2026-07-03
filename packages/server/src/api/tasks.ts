@@ -83,7 +83,6 @@ interface CreateTaskBody {
   description?: string;
   preferredAgentId?: string;
   branch?: string;
-  issueNumber?: number;
   images?: unknown;
 }
 
@@ -133,17 +132,8 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
     const body = request.body ?? {};
 
-    if (body.title !== undefined && body.issueNumber !== undefined) {
-      return reply.status(400).send({ error: 'title and issueNumber are mutually exclusive' });
-    }
-
     if (body.title === undefined) {
-      if (body.issueNumber !== undefined) {
-        return reply
-          .status(400)
-          .send({ error: 'issue-bound tasks are no longer supported; use title' });
-      }
-      return reply.status(400).send({ error: 'title is required (manual task)' });
+      return reply.status(400).send({ error: 'title is required' });
     }
 
     const titleTrimmed = typeof body.title === 'string' ? body.title.trim() : '';

@@ -3,28 +3,13 @@ import { render, cleanup, screen, within, fireEvent, act, waitFor } from '@testi
 import { MemoryRouter } from 'react-router-dom';
 import type { ProjectConfig, AgentSnapshot, TaskState } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/pane-terminal.tsx', () => ({
-  TERMINAL_BG: '#fdfdfd',
-  PaneTerminal: () => <div data-testid="pane-terminal" />,
-}));
+vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: vi.fn() }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
-vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
-  usePendingRestart: () => ({ flagDirty: vi.fn() }),
-}));
+vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
 
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    projects: {
-      list: vi.fn(async () => []),
-      create: vi.fn(async () => ({ project: { id: 'newproj' }, restartRequired: false })),
-    },
-    config: { get: vi.fn(async () => ({ project: [] })) },
-  },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 vi.mock('../../src/components/create-agent-modal.tsx', () => ({
   CreateAgentModal: ({ open, projectId }: { open: boolean; projectId: string }) =>
@@ -53,12 +38,11 @@ const projectTasksHookState = {
   loaded: true,
   error: null as { code: string; message: string } | null,
 };
-vi.mock('../../src/hooks/use-events.ts', () => ({
-  useAgents: () => agentsHookState,
-  useProjectTasks: () => projectTasksHookState,
-  useTask: () => ({ data: null, loaded: true, error: null }),
-}));
+vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
+import { api } from '../../src/api.ts';
+import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
+import { makeProject } from '../helpers/fixtures.ts';
 import { Dashboard } from '../../src/pages/dashboard.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
@@ -79,6 +63,20 @@ function renderDashboard() {
 
 beforeEach(() => {
   cleanup();
+  useAgentsMock.mockImplementation(() => agentsHookState);
+  useProjectTasksMock.mockImplementation(() => projectTasksHookState);
+  useTaskMock.mockReturnValue({ data: null, loaded: true, error: null });
+  vi.mocked(api.projects.list).mockResolvedValue([]);
+  vi.mocked(api.projects.create).mockResolvedValue({
+    project: makeProject({ id: 'newproj' }),
+    restartRequired: false,
+  });
+  vi.mocked(api.config.get).mockResolvedValue({
+    review: { rounds: 3 },
+    server: { port: 0 },
+    host: [],
+    project: [],
+  });
   projectsHookState.projects = null;
   projectsHookState.error = null;
   agentsHookState.data = null;
@@ -100,7 +98,7 @@ describe('Dashboard layout', () => {
 
   it('renders each project\'s agent groups in a full-width vertical stack (no xl:grid-cols-2 split)', () => {
     seed([
-      {
+      makeProject({
         id: 'demo',
         repo: '/tmp/demo',
         agent: [
@@ -109,7 +107,7 @@ describe('Dashboard layout', () => {
             { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
           ],
         ],
-      } as ProjectConfig,
+      }),
     ]);
 
     const { container } = renderDashboard();
@@ -122,7 +120,7 @@ describe('Dashboard layout', () => {
   });
 
   it('project header row exposes two narrow click targets (project id + Details) and the surrounding row is not clickable, to avoid mis-taps', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const heading = screen.getByRole('heading', { level: 2, name: 'demo' });
@@ -141,8 +139,8 @@ describe('Dashboard layout', () => {
 
   it('multi-project Dashboard gives each Details link a unique accessible name so SR/voice-control users can distinguish destinations', () => {
     seed([
-      { id: 'alpha', repo: '/tmp/alpha', agent: [] } as ProjectConfig,
-      { id: 'beta', repo: '/tmp/beta', agent: [] } as ProjectConfig,
+      makeProject({ id: 'alpha', repo: '/tmp/alpha' }),
+      makeProject({ id: 'beta', repo: '/tmp/beta' }),
     ]);
     renderDashboard();
 
@@ -154,7 +152,7 @@ describe('Dashboard layout', () => {
   });
 
   it('hides the repo path on narrow viewports (mobile) — uses hidden sm:inline-block so 640px+ shows it', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo-repo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo-repo' })]);
     renderDashboard();
 
     const repoSpan = screen.getByText('/tmp/demo-repo');
@@ -164,7 +162,7 @@ describe('Dashboard layout', () => {
 
   it('row keeps a single-line layout via truncate + title so a long repo path can not blow up row height', () => {
     seed([
-      { id: 'very-long-project-id', repo: '/some/very/long/repo/path/that/should/not/wrap', agent: [] } as ProjectConfig,
+      makeProject({ id: 'very-long-project-id', repo: '/some/very/long/repo/path/that/should/not/wrap' }),
     ]);
     renderDashboard();
 
@@ -181,7 +179,7 @@ describe('Dashboard layout', () => {
 
   it('multi-group project lays groups out in a 2-column grid at xl so one row holds up to 2 task areas', () => {
     seed([
-      {
+      makeProject({
         id: 'demo',
         repo: '/tmp/demo',
         agent: [
@@ -194,7 +192,7 @@ describe('Dashboard layout', () => {
             { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local' },
           ],
         ],
-      } as ProjectConfig,
+      }),
     ]);
 
     const { container } = renderDashboard();
@@ -210,7 +208,7 @@ describe('Dashboard layout', () => {
   });
 
   it('renders "新建 Task" as a low-key text-style button and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const topbarActions = screen.getByTestId('topbar-actions');
@@ -251,7 +249,7 @@ describe('Dashboard layout', () => {
   });
 
   it('only sets aria-controls on the 更多 kebab while its menu is open', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
@@ -267,7 +265,7 @@ describe('Dashboard layout', () => {
   });
 
   it('opens the kebab menu on click and exposes a "新建项目" menuitem that opens the CreateProject modal', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
@@ -282,7 +280,7 @@ describe('Dashboard layout', () => {
   });
 
   it('kebab menuitem opens neutral (no default bg, no auto-focus) and only changes text color on hover', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
@@ -298,7 +296,7 @@ describe('Dashboard layout', () => {
   });
 
   it('closes the kebab menu when Escape is pressed or an outside click happens', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const moreTrigger = screen.getByRole('button', { name: '更多操作' });
@@ -315,7 +313,7 @@ describe('Dashboard layout', () => {
   });
 
   it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', () => {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     projectTasksHookState.data = null;
     projectTasksHookState.error = { code: 'connection_failed', message: 'realtime down' };
 
@@ -327,7 +325,7 @@ describe('Dashboard layout', () => {
   it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', () => {
     seed(
       [
-        {
+        makeProject({
           id: 'demo',
           repo: '/tmp/demo',
           agent: [
@@ -336,7 +334,7 @@ describe('Dashboard layout', () => {
               { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
             ],
           ],
-        } as ProjectConfig,
+        }),
       ],
       [
         { id: 'dev-1', projectId: 'demo', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
@@ -353,7 +351,7 @@ describe('Dashboard layout', () => {
 
 describe('Dashboard 项目已创建 follow-up modal', () => {
   async function reachContinueDialog(): Promise<HTMLElement> {
-    seed([{ id: 'demo', repo: '/tmp/demo', agent: [] } as ProjectConfig]);
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     fireEvent.click(screen.getByRole('button', { name: '更多操作' }));

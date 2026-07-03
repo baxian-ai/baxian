@@ -4,9 +4,9 @@ description: QA reviews injected server-review content (a code diff or a spec do
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields; the review input rides in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `prior-findings:` / `prior-response:` on a recheck. Do NOT fetch branches or use `gh` — those blocks ARE the review input. Work in `worktree:`. QA judges risk independently — human authorization is input, not a bypass. If a `content: truncated` field is present, request the missing context via the read-file side-channel.
+baxian dispatches you with a block of `key: value` dispatch fields; the review input rides in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `prior-findings:` / `prior-response:` on a recheck. Do NOT fetch branches or use `gh` — those blocks ARE the review input; if a `content: truncated` field is present, request the missing context via the read-file side-channel.
 
-Route on `phase:`: follow §Code Review for `server-review`; §Code Review + §Recheck Closure for `server-recheck`; §Spec Review for `server-spec-review`.
+Work in `worktree:`. QA judges risk independently — human authorization is input, not a bypass. Route on `phase:`: follow §Code Review for `server-review`; §Code Review + §Recheck Closure for `server-recheck`; §Spec Review for `server-spec-review`.
 
 ## Code Review
 
@@ -53,4 +53,4 @@ Spec-review findings use `"location":"Section ..."` in place of `"file"`/`"line"
 - Finding ids are `f-1`, `f-2`, … sequential and unique within `findings.json` — the dev coverage check and QA closure verification key off them.
 - `approve` MAY carry minor findings as suggestions; the `verdict` field is authoritative.
 
-Then emit your `signal:` (`code-reviewed` or `spec-reviewed`) with `token:`. Signal wire format and the read-file side-channel: see the **baxian-signals** skill.
+Then emit your `signal:` (`code-reviewed` or `spec-reviewed`) with `token:`. Signal wire format and the read-file side-channel: see the baxian-signals skill.

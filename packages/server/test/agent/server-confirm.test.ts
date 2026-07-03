@@ -393,7 +393,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
   });
 });
 
-describe('merge-ready cancel, legacy review guard, and confirm head guard', () => {
+describe('merge-ready cancel, Call review mode guard, and confirm head guard', () => {
   it('merge-ready cancel closes the published PR', async () => {
     const { manager, taskStore, execCalls } = await makeFixture('auto', null);
     await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 21 }));
@@ -401,7 +401,7 @@ describe('merge-ready cancel, legacy review guard, and confirm head guard', () =
     expect(execCalls.some(c => c.includes('gh pr close 21') && c.includes('--delete-branch'))).toBe(true);
   });
 
-  it('legacy Call review refuses server-mode tasks', async () => {
+  it('Call review refuses server-mode tasks', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'ready', prNumber: 5 }));
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toThrow(/server review mode/);
@@ -568,5 +568,104 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
 
     await expect(manager.continueDevRound('task-1')).rejects.toMatchObject({ status: 500 });
     expect((await taskStore.get('task-1'))?.maxRoundsContinues).toBe(1);
+  });
+});
+
+describe('ffMergeBranch failure branches (via confirm gate)', () => {
+  async function ffFixture(
+    execImpl: (cmd: string) => Partial<ExecResult>,
+    taskOverrides: Partial<TaskState> = {},
+  ): Promise<Fixture> {
+    const f = await makeFixture('auto', 'branch', execImpl);
+    await bindAgent(f.agentStore, 'dev-1', { repoPath: '/repo/dev' });
+    await f.taskStore.set(taskFixture({ latestHeadSha: 'head123', ...taskOverrides }));
+    return f;
+  }
+
+  it('fails the confirm when the default branch cannot be resolved', async () => {
+    const f = await ffFixture(cmd =>
+      cmd.includes('symbolic-ref') ? { exitCode: 1, stderr: 'no origin/HEAD' } : {});
+    await expect(f.manager.markTaskComplete('task-1')).rejects.toThrow(/cannot resolve default branch/);
+    expect((await f.taskStore.get('task-1'))?.status).toBe('ready');
+    expect(f.events.some(e => e.type === 'human.intervention'
+      && e.data?.phase === 'confirm-merge-failed')).toBe(true);
+  });
+
+  it('fails the confirm when git fetch fails', async () => {
+    const f = await ffFixture(cmd => {
+      if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n' };
+      if (cmd.includes('git fetch origin')) return { exitCode: 1, stderr: 'network down' };
+      return {};
+    });
+    await expect(f.manager.markTaskComplete('task-1')).rejects.toThrow(/git fetch/);
+    expect((await f.taskStore.get('task-1'))?.status).toBe('ready');
+  });
+
+  it('refuses to merge when the remote head drifted past the reviewed head', async () => {
+    const f = await ffFixture(cmd => {
+      if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n' };
+      if (cmd.includes('rev-parse')) return { stdout: 'driftedsha\n' };
+      return {};
+    });
+    await expect(f.manager.markTaskComplete('task-1')).rejects.toThrow(/refusing to merge un-reviewed commits/);
+    expect((await f.taskStore.get('task-1'))?.status).toBe('ready');
+  });
+
+  it('fails the confirm when the ff push is rejected', async () => {
+    const f = await ffFixture(cmd => {
+      if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n' };
+      if (cmd.includes('rev-parse')) return { stdout: 'head123\n' };
+      if (cmd.includes(`:'main'`)) return { exitCode: 1, stderr: 'remote rejected' };
+      return {};
+    });
+    await expect(f.manager.markTaskComplete('task-1')).rejects.toThrow(/push.*failed|Merge failed/);
+    expect((await f.taskStore.get('task-1'))?.status).toBe('ready');
+  });
+
+  it('a failing post-merge branch delete only warns; the task still lands merged', async () => {
+    const f = await ffFixture(cmd => {
+      if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n' };
+      if (cmd.includes('rev-parse')) return { stdout: 'head123\n' };
+      if (cmd.includes('--delete')) return { exitCode: 1, stderr: 'protected branch' };
+      return {};
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await f.manager.markTaskComplete('task-1');
+    expect(result.status).toBe('merged');
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('post-merge branch delete failed'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+});
+
+describe('cancel remote retirement failure tolerance', () => {
+  it('emits cleanup-failed (still cancelled) when gh pr close fails', async () => {
+    const { manager, taskStore, events } = await makeFixture('auto', 'pr', cmd =>
+      cmd.includes('gh pr close') ? { exitCode: 1, stderr: 'PR already closed upstream' } : {});
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    const failure = events.find(e => e.type === 'human.intervention'
+      && e.data?.phase === 'cancel-published-artifact-cleanup-failed');
+    expect(failure?.data).toMatchObject({ afterDone: 'pr', prNumber: 12, error: expect.stringContaining('already closed') });
+    warnSpy.mockRestore();
+  });
+
+  it('emits cleanup-failed when the remote branch delete fails', async () => {
+    const { manager, taskStore, agentStore, events } = await makeFixture('auto', 'branch', cmd =>
+      cmd.includes('--delete') ? { exitCode: 1, stderr: 'branch is protected' } : {});
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' });
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'branch', latestHeadSha: 'h1' }));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    const failure = events.find(e => e.type === 'human.intervention'
+      && e.data?.phase === 'cancel-published-artifact-cleanup-failed');
+    expect(failure?.data).toMatchObject({ afterDone: 'branch', error: expect.stringContaining('protected') });
+    warnSpy.mockRestore();
   });
 });

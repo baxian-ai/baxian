@@ -5,35 +5,29 @@ import { StrictMode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import type { AgentSnapshot, ProjectConfig, TaskState } from '../../src/shared/index.js';
 
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: vi.fn() }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
-const projectsListMock = vi.fn();
-const agentsListMock = vi.fn();
-const tasksCreateMock = vi.fn();
-const tasksUpdateMock = vi.fn();
-const fileToBase64Mock = vi.fn(async () => 'QkFTRTY0');
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    projects: { list: (...args: unknown[]) => projectsListMock(...args) },
-    agents: { list: (...args: unknown[]) => agentsListMock(...args) },
-    tasks: {
-      create: (...args: unknown[]) => tasksCreateMock(...args),
-      update: (...args: unknown[]) => tasksUpdateMock(...args),
-    },
-  },
-  fileToBase64: (...args: unknown[]) => fileToBase64Mock(...args),
-}));
-
+import { api, fileToBase64 } from '../../src/api.ts';
 import { CreateTaskModal } from '../../src/components/create-task-modal.tsx';
 import { TASK_IMAGE_MAX_COUNT } from '../../src/shared/index.ts';
+import {
+  makeAgent as makeAgentFixture,
+  makeProject as makeProjectFixture,
+  makeTask as makeTaskFixture,
+} from '../helpers/fixtures.ts';
+
+const projectsListMock = vi.mocked(api.projects.list);
+const agentsListMock = vi.mocked(api.agents.list);
+const tasksCreateMock = vi.mocked(api.tasks.create);
+const tasksUpdateMock = vi.mocked(api.tasks.update);
+const fileToBase64Mock = vi.mocked(fileToBase64);
 
 const DRAFT_KEY_GLOBAL = 'baxian.draft.createTask:*';
 const DRAFT_KEY_BAXIAN = 'baxian.draft.createTask:baxian';
 
 function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
-  return {
+  return makeProjectFixture({
     id: 'baxian',
     repo: 'baxian-ai/baxian',
     merge: 'auto',
@@ -42,22 +36,18 @@ function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
       { id: 'bx-qa', runtime: 'claude-code', role: 'qa', mode: 'local' },
     ]],
     ...overrides,
-  };
+  });
 }
 
 function makeAgent(id: string, overrides: Partial<AgentSnapshot> = {}): AgentSnapshot {
-  return {
-    id,
+  return makeAgentFixture(id, {
     projectId: 'baxian',
-    runtimeStatus: 'idle',
-    tmuxSessionStatus: 'present',
-    stale: false,
     ...overrides,
-  };
+  });
 }
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
-  return {
+  return makeTaskFixture({
     id: 'task-100',
     projectId: 'baxian',
     title: 'existing title',
@@ -69,7 +59,7 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     createdAt: '2026-05-26T00:00:00.000Z',
     updatedAt: '2026-05-26T00:00:00.000Z',
     ...overrides,
-  };
+  });
 }
 
 function flushApi(): Promise<void> {
@@ -79,7 +69,9 @@ function flushApi(): Promise<void> {
   });
 }
 
-type ModalProps = Partial<ComponentProps<typeof CreateTaskModal>>;
+type Props = ComponentProps<typeof CreateTaskModal>;
+type EditProps = Extract<Props, { mode: 'edit' }>;
+type ModalProps = Partial<Exclude<Props, EditProps>> | (Pick<EditProps, 'mode' | 'task'> & Partial<EditProps>);
 
 function renderModal(props: ModalProps = {}) {
   const result = render(
@@ -125,6 +117,7 @@ beforeEach(() => {
   agentsListMock.mockReset();
   tasksCreateMock.mockReset();
   tasksUpdateMock.mockReset();
+  fileToBase64Mock.mockResolvedValue('QkFTRTY0');
   projectsListMock.mockResolvedValue([makeProject()]);
   agentsListMock.mockResolvedValue([makeAgent('bx-dev'), makeAgent('bx-qa')]);
 });

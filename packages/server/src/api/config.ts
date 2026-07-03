@@ -102,17 +102,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       }
       const incoming = rawBody as Partial<BaxianConfig> & Record<string, unknown>;
 
-      const legacyErrors: Array<{ path: string; message: string }> = [];
-      if ('codereview' in incoming) {
-        legacyErrors.push({
-          path: 'codereview',
-          message: 'codereview was renamed to review — rename the top-level key in the request body',
-        });
-      }
-      if (legacyErrors.length > 0) {
-        return reply.status(400).send({ error: 'Invalid config', details: legacyErrors });
-      }
-
       if ('host' in incoming) {
         return reply.status(400).send({
           error: 'Invalid config',

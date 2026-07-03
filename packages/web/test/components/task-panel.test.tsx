@@ -4,26 +4,26 @@ import { MemoryRouter } from 'react-router-dom';
 import type { TaskState } from '../../src/shared/index.js';
 import { REVIEW_VERDICT_TIMEOUT_MS } from '../../src/shared/index.js';
 
-const { pageMock, navigateMock } = vi.hoisted(() => ({
-  pageMock: vi.fn(),
+const { navigateMock } = vi.hoisted(() => ({
   navigateMock: vi.fn(),
 }));
-vi.mock('../../src/api.ts', () => ({
-  UNAUTHORIZED_EVENT: 'baxian:unauthorized',
-  api: { tasks: { page: pageMock } },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 vi.mock('react-router-dom', async (orig) => ({
   ...(await orig<typeof import('react-router-dom')>()),
   useNavigate: () => navigateMock,
 }));
 
+import { api } from '../../src/api.ts';
 import { TaskPanel } from '../../src/components/task-panel.tsx';
+import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
+
+const pageMock = vi.mocked(api.tasks.page);
 
 const NOW = '2026-05-16T00:00:00.000Z';
 
 function task(overrides: Partial<TaskState> = {}): TaskState {
-  return {
+  return makeTaskFixture({
     id: 'task-001',
     projectId: 'proj',
     title: 'A task',
@@ -35,7 +35,7 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
     createdAt: NOW,
     updatedAt: NOW,
     ...overrides,
-  } as TaskState;
+  });
 }
 
 function emptyPage() {

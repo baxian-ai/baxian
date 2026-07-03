@@ -3,20 +3,21 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import type { GithubReviewConversation, TaskState } from '../../src/shared/index.js';
 
-const ghMock = vi.fn();
 const navigateMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { githubReview: (...args: unknown[]) => ghMock(...args) } },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 vi.mock('react-router-dom', async (orig) => ({
   ...(await orig<typeof import('react-router-dom')>()),
   useNavigate: () => navigateMock,
 }));
 
+import { api } from '../../src/api.ts';
 import { GithubReviewEntry } from '../../src/components/github-review-entry.tsx';
+import { makeTask } from '../helpers/fixtures.ts';
+
+const ghMock = vi.mocked(api.tasks.githubReview);
 
 function task(overrides: Partial<TaskState> = {}): TaskState {
-  return { id: 'task-9', reviewRound: 0, status: 'review', prNumber: 7, ...overrides } as TaskState;
+  return makeTask({ id: 'task-9', reviewRound: 0, status: 'review', prNumber: 7, ...overrides });
 }
 
 function renderEntry(t: TaskState) {

@@ -3,18 +3,14 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import type { ReviewRound, TaskState } from '../../src/shared/index.js';
 
-const reviewsMock = vi.fn();
-const githubReviewMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: {
-    tasks: {
-      reviews: (...args: unknown[]) => reviewsMock(...args),
-      githubReview: (...args: unknown[]) => githubReviewMock(...args),
-    },
-  },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
+import { api } from '../../src/api.ts';
 import { ReviewConversation } from '../../src/components/review-conversation.tsx';
+import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
+
+const reviewsMock = vi.mocked(api.tasks.reviews);
+const githubReviewMock = vi.mocked(api.tasks.githubReview);
 
 function LocationProbe() {
   const loc = useLocation();
@@ -23,12 +19,12 @@ function LocationProbe() {
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   const now = '2026-06-29T10:00:00Z';
-  return {
+  return makeTaskFixture({
     id: 'task-1', projectId: 'p', title: 't', description: 'd',
     preferredAgentId: 'dev', agentId: 'dev', reviewRound: 1,
     status: 'review', reviewMode: 'server', createdAt: now, updatedAt: now,
     ...overrides,
-  };
+  });
 }
 
 function codeRound(round: number, extra: Partial<ReviewRound> = {}): ReviewRound {
@@ -162,6 +158,16 @@ describe('ReviewConversation server mode', () => {
     const dev = screen.getByText('dev');
     expect(dev.className).toContain('text-accent');
     expect(dev.className).not.toContain('pill');
+  });
+
+  it('keeps review turn hover borders in the neutral card style', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1 }));
+    const row = (await screen.findByText('提交代码改动')).closest('button')!;
+    expect(row.className).toContain('card');
+    expect(row.className).not.toContain('hover:border-accent');
   });
 
   it('navigates to the round detail (with hash) on click', async () => {

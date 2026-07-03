@@ -4,39 +4,16 @@ import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { ProjectConfig, AgentSnapshot, TaskState } from '../../src/shared/index.js';
 import { __resetProjectsCacheForTests, useProjects } from '../../src/hooks/use-projects.ts';
 
-vi.mock('../../src/components/pane-terminal.tsx', () => ({
-  TERMINAL_BG: '#fdfdfd',
-  PaneTerminal: () => <div data-testid="pane-terminal" />,
-}));
+vi.mock('../../src/components/pane-terminal.tsx', async () => (await import('../helpers/pane-terminal-mock.tsx')).createPaneTerminalMock());
 
-const toastShow = vi.fn();
-vi.mock('../../src/components/toast.tsx', () => ({
-  useToast: () => ({ show: toastShow }),
-}));
+vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 
-vi.mock('../../src/hooks/use-pending-restart.tsx', () => ({
-  usePendingRestart: () => ({ flagDirty: vi.fn() }),
-}));
+vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
 
 let projectPayload: ProjectConfig;
 let projectsListPayload: ProjectConfig[];
-const projectsGet = vi.fn(async () => projectPayload);
-const projectsList = vi.fn(async () => projectsListPayload);
-const projectsDelete = vi.fn(async () => ({ removed: 'demo', restartRequired: false }));
 
-vi.mock('../../src/api.ts', () => ({
-  UNAUTHORIZED_EVENT: 'baxian:unauthorized',
-  api: {
-    projects: {
-      get: (...args: unknown[]) => projectsGet(...args),
-      list: (...args: unknown[]) => projectsList(...args),
-      delete: (...args: unknown[]) => projectsDelete(...args),
-    },
-    tasks: {
-      page: vi.fn(async () => ({ tasks: [], hasMore: false, nextOffset: 0 })),
-    },
-  },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 const agentsHookState = {
   data: [] as AgentSnapshot[] | null,
@@ -49,11 +26,7 @@ const projectTasksState = {
   error: null as { message: string } | null,
 };
 
-vi.mock('../../src/hooks/use-events.ts', () => ({
-  useAgents: () => agentsHookState,
-  useProjectTasks: () => projectTasksState,
-  useTask: () => ({ data: null, loaded: true, error: null }),
-}));
+vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
 vi.mock('../../src/components/create-task-modal.tsx', () => ({
   CreateTaskModal: ({ open }: { open: boolean }) => (open ? <div data-testid="create-task-modal" /> : null),
@@ -63,8 +36,16 @@ vi.mock('../../src/components/create-agent-modal.tsx', () => ({
   CreateAgentModal: ({ open }: { open: boolean }) => (open ? <div data-testid="create-agent-modal" /> : null),
 }));
 
+import { api } from '../../src/api.ts';
+import { toastShowMock as toastShow } from '../helpers/toast-mock.tsx';
+import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
+import { makeProject } from '../helpers/fixtures.ts';
 import { Project } from '../../src/pages/project.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
+
+const projectsGet = vi.mocked(api.projects.get);
+const projectsList = vi.mocked(api.projects.list);
+const projectsDelete = vi.mocked(api.projects.delete);
 
 function LocationProbe() {
   const loc = useLocation();
@@ -101,11 +82,14 @@ beforeEach(() => {
   projectsGet.mockClear();
   projectsList.mockClear();
   projectsDelete.mockClear();
-  projectPayload = {
-    id: 'demo',
-    repo: '/tmp/demo-repo',
-    agent: [],
-  } as ProjectConfig;
+  projectsGet.mockImplementation(async () => projectPayload);
+  projectsList.mockImplementation(async () => projectsListPayload);
+  projectsDelete.mockResolvedValue({ removed: 'demo', restartRequired: false });
+  vi.mocked(api.tasks.page).mockResolvedValue({ tasks: [], hasMore: false, nextOffset: 0 });
+  useAgentsMock.mockImplementation(() => agentsHookState);
+  useProjectTasksMock.mockImplementation(() => projectTasksState);
+  useTaskMock.mockReturnValue({ data: null, loaded: true, error: null });
+  projectPayload = makeProject({ id: 'demo', repo: '/tmp/demo-repo' });
   projectsListPayload = [];
   agentsHookState.data = [];
   agentsHookState.loaded = true;
@@ -255,11 +239,11 @@ describe('Project delete entry', () => {
   });
 
   it('disables the delete menuitem (with hint) when the project still has agents', async () => {
-    projectPayload = {
+    projectPayload = makeProject({
       id: 'demo',
       repo: '/tmp/demo-repo',
-      agent: [[{ id: 'demo-dev' } as never]],
-    } as ProjectConfig;
+      agent: [[{ id: 'demo-dev', runtime: 'claude-code', role: 'dev', mode: 'local' }]],
+    });
     renderProjectPage();
 
     await openProjectMenu();
@@ -291,7 +275,7 @@ describe('Project delete entry', () => {
   });
 
   it('confirming delete calls the API, refreshes cache, shows success, and navigates home', async () => {
-    projectsListPayload = [{ id: 'demo', repo: '/tmp/demo-repo', agent: [] } as ProjectConfig];
+    projectsListPayload = [makeProject({ id: 'demo', repo: '/tmp/demo-repo' })];
     function ProjectIdsProbe() {
       const { projects } = useProjects();
       return <div data-testid="cached-ids">{(projects ?? []).map(p => p.id).join(',')}</div>;

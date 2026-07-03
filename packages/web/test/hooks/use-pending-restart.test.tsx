@@ -282,6 +282,160 @@ describe('usePendingRestart', () => {
     expect(persisted.baselineStartedAt).toBe('STABLE');
   });
 
+  it('corrupt persisted JSON falls back to a clean idle state instead of crashing the app shell', () => {
+    localStorage.setItem(STORAGE_KEY, '{not json');
+    const { result } = renderHook(() => usePendingRestart(), { wrapper });
+    expect(result.current.phase).toBe('idle');
+    expect(result.current.count).toBe(0);
+  });
+
+  it('a throwing localStorage.setItem (quota/private mode) does not break in-memory dirty tracking', () => {
+    const setItemSpy = vi.spyOn(localStorage, 'setItem').mockImplementation(() => {
+      throw new Error('QuotaExceededError');
+    });
+    try {
+      const { result } = renderHook(() => usePendingRestart(), { wrapper });
+      act(() => { result.current.flagDirty(); });
+      expect(setItemSpy).toHaveBeenCalled();
+      expect(result.current.count).toBe(1);
+      expect(result.current.phase).toBe('pending');
+    } finally {
+      setItemSpy.mockRestore();
+    }
+  });
+
+  it('another tab clearing storage mid-restart keeps THIS tab\'s dirty-during-restart count', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    const { advance } = installRestartFetchMock({
+      startedAt: 'OLD',
+      restart: { status: 202, body: { acceptedAt: '2026' } },
+    });
+
+    const { result } = renderHook(() => usePendingRestart(), { wrapper });
+    act(() => { result.current.flagDirty(); });
+
+    let triggerPromise: Promise<void> | undefined;
+    await act(async () => {
+      triggerPromise = result.current.triggerRestart();
+      await flushMicrotasks();
+    });
+    expect(result.current.phase).toBe('restarting');
+
+    act(() => { result.current.flagDirty(); });
+    expect(result.current.count).toBe(2);
+
+    act(() => {
+      fireCrossTabStorage(JSON.stringify({ count: 2, baselineStartedAt: 'OLD' }), null);
+    });
+    expect(result.current.count).toBe(1);
+    expect(result.current.phase).toBe('restarting');
+
+    advance('NEW');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+      await triggerPromise;
+    });
+    expect(result.current.phase).toBe('pending');
+    expect(result.current.count).toBe(1);
+    vi.useRealTimers();
+  });
+
+  it('cross-tab count updates while NOT restarting drive phase pending↔idle, and a null baseline clears it', async () => {
+    const { result } = renderHook(() => usePendingRestart(), { wrapper });
+    expect(result.current.phase).toBe('idle');
+
+    act(() => {
+      fireCrossTabStorage(null, JSON.stringify({ count: 3, baselineStartedAt: 'STABLE' }));
+    });
+    expect(result.current.count).toBe(3);
+    expect(result.current.phase).toBe('pending');
+
+    act(() => {
+      fireCrossTabStorage(
+        JSON.stringify({ count: 3, baselineStartedAt: 'STABLE' }),
+        JSON.stringify({ count: 0, baselineStartedAt: null }),
+      );
+    });
+    expect(result.current.count).toBe(0);
+    expect(result.current.phase).toBe('idle');
+
+    await new Promise(r => setTimeout(r, 10));
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it('a garbage cross-tab storage payload is ignored without disturbing local state', () => {
+    const { result } = renderHook(() => usePendingRestart(), { wrapper });
+    act(() => { result.current.flagDirty(); });
+    expect(result.current.count).toBe(1);
+
+    act(() => {
+      fireCrossTabStorage(JSON.stringify({ count: 1, baselineStartedAt: null }), '{not json');
+    });
+    expect(result.current.count).toBe(1);
+    expect(result.current.phase).toBe('pending');
+  });
+
+  it('triggerRestart fails fast when the pre-restart /health probe is unreachable', async () => {
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('server unreachable'));
+
+    const { result } = renderHook(() => usePendingRestart(), { wrapper });
+    await act(async () => { await result.current.triggerRestart(); });
+
+    expect(result.current.phase).toBe('failed');
+    expect(result.current.error).toMatch(/获取重启前 startedAt 失败/);
+    expect(result.current.error).toMatch(/server unreachable/);
+  });
+
+  it('transient /health failures while the server reboots are tolerated until startedAt changes', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    let current = 'OLD';
+    let healthDown = false;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      const u = String(url);
+      if (u === '/health') {
+        if (healthDown) throw new Error('connection refused');
+        return healthResponse(current);
+      }
+      if (u.endsWith('/api/restart')) {
+        return new Response(JSON.stringify({ acceptedAt: '2026' }), { status: 202 });
+      }
+      throw new Error(`unexpected url ${u}`);
+    });
+
+    const { result } = renderHook(() => usePendingRestart(), { wrapper });
+    act(() => { result.current.flagDirty(); });
+
+    let triggerPromise: Promise<void> | undefined;
+    await act(async () => {
+      triggerPromise = result.current.triggerRestart();
+      await flushMicrotasks();
+    });
+    expect(result.current.phase).toBe('restarting');
+
+    healthDown = true;
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(result.current.phase).toBe('restarting');
+
+    healthDown = false;
+    current = 'NEW';
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+      await triggerPromise;
+    });
+    expect(result.current.phase).toBe('idle');
+    expect(result.current.count).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it('usePendingRestart outside the provider throws a descriptive error', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => renderHook(() => usePendingRestart())).toThrow(
+      /usePendingRestart must be used inside PendingRestartProvider/,
+    );
+    consoleError.mockRestore();
+  });
+
   it('triggerRestart 30s timeout switches to failed', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     installRestartFetchMock({

@@ -31,7 +31,7 @@ async function writeRawTask(id: string, raw: Record<string, unknown>): Promise<v
   await writeFile(join(tasksDir, `${id}.json`), JSON.stringify(raw, null, 2) + '\n');
 }
 
-async function writeLegacyTask(id: string, overrides: Record<string, unknown> = {}): Promise<void> {
+async function writeUnsanitizedTask(id: string, overrides: Record<string, unknown> = {}): Promise<void> {
   const raw: Record<string, unknown> = {
     id,
     projectId: 'proj',
@@ -168,39 +168,38 @@ describe('TaskStore', () => {
 });
 
 describe('TaskStore sanitize', () => {
-  it('strips legacy issueNumber/issueUrl on get', async () => {
-    await writeLegacyTask('task-100', {
+  it('strips schema-foreign fields on get', async () => {
+    await writeUnsanitizedTask('task-100', {
       title: 'Old task',
       description: 'desc',
-      issueNumber: 42,
-      issueUrl: 'https://github.com/foo/bar/issues/42',
+      strayField: 42,
+      anotherStray: 'https://example.com/x',
     });
 
     const loaded = await store.get('task-100');
     expect(loaded).not.toBeNull();
-    expect(loaded!).not.toHaveProperty('issueNumber');
-    expect(loaded!).not.toHaveProperty('issueUrl');
+    expect(loaded!).not.toHaveProperty('strayField');
+    expect(loaded!).not.toHaveProperty('anotherStray');
   });
 
   it('strips schema-foreign fields on set', async () => {
     const taskWithExtras = {
       ...makeTask('task-101'),
-      issueNumber: 7,
-      issueUrl: 'https://github.com/foo/bar/issues/7',
-    } as TaskState & { issueNumber: number; issueUrl: string };
+      strayField: 7,
+      anotherStray: 'https://example.com/y',
+    } as TaskState & { strayField: number; anotherStray: string };
 
     await store.set(taskWithExtras);
     const onDisk = await readRawTask('task-101');
-    expect(onDisk).not.toHaveProperty('issueNumber');
-    expect(onDisk).not.toHaveProperty('issueUrl');
+    expect(onDisk).not.toHaveProperty('strayField');
+    expect(onDisk).not.toHaveProperty('anotherStray');
   });
 
   it('double-sanitizes across get -> set -> get', async () => {
-    await writeLegacyTask('task-102', {
+    await writeUnsanitizedTask('task-102', {
       title: 'Round-trip',
       description: 'desc',
-      issueNumber: 99,
-      issueUrl: 'https://github.com/foo/bar/issues/99',
+      strayField: 99,
     });
 
     const first = await store.get('task-102');
@@ -208,60 +207,84 @@ describe('TaskStore sanitize', () => {
     await store.set(first!);
     const second = await store.get('task-102');
     expect(second).not.toBeNull();
-    expect(second!).not.toHaveProperty('issueNumber');
-    expect(second!).not.toHaveProperty('issueUrl');
+    expect(second!).not.toHaveProperty('strayField');
 
     const onDisk = await readRawTask('task-102');
-    expect(onDisk).not.toHaveProperty('issueNumber');
-    expect(onDisk).not.toHaveProperty('issueUrl');
+    expect(onDisk).not.toHaveProperty('strayField');
   });
 
-  it('list also sanitizes legacy entries', async () => {
-    await writeLegacyTask('task-103', {
-      issueNumber: 21,
-      issueUrl: 'https://github.com/foo/bar/issues/21',
+  it('list also sanitizes unsanitized entries', async () => {
+    await writeUnsanitizedTask('task-103', {
+      strayField: 21,
     });
     await store.set(makeTask('task-104'));
 
     const all = await store.list();
     expect(all).toHaveLength(2);
     for (const t of all) {
-      expect(t).not.toHaveProperty('issueNumber');
-      expect(t).not.toHaveProperty('issueUrl');
+      expect(t).not.toHaveProperty('strayField');
     }
-    const legacy = all.find((t) => t.id === 'task-103')!;
-    expect(legacy.title).toBe('(legacy) Issue #21');
+    const sanitized = all.find((t) => t.id === 'task-103')!;
+    expect(sanitized.title).toBe('task-103');
   });
 
-  it('falls back to (legacy) Issue #N title when issueNumber present', async () => {
-    await writeLegacyTask('task-200', { issueNumber: 42 });
-    const loaded = await store.get('task-200');
-    expect(loaded!.title).toBe('(legacy) Issue #42');
-  });
-
-  it('falls back to (legacy) ${id} title when issueNumber missing', async () => {
-    await writeLegacyTask('task-201');
+  it('falls back title to the task id when title missing', async () => {
+    await writeUnsanitizedTask('task-201');
     const loaded = await store.get('task-201');
-    expect(loaded!.title).toBe('(legacy) task-201');
+    expect(loaded!.title).toBe('task-201');
   });
 
-  it('falls back description to "Migrated from <issueUrl>." when issueUrl present', async () => {
-    await writeLegacyTask('task-202', {
-      title: 'has title',
-      issueUrl: 'https://github.com/foo/bar/issues/42',
-    });
-    const loaded = await store.get('task-202');
-    expect(loaded!.description).toContain('Migrated from https://github.com/foo/bar/issues/42');
-  });
-
-  it('falls back description to empty string when issueUrl missing', async () => {
-    await writeLegacyTask('task-203', { title: 'has title' });
+  it('falls back description to empty string when missing', async () => {
+    await writeUnsanitizedTask('task-203', { title: 'has title' });
     const loaded = await store.get('task-203');
     expect(loaded!.description).toBe('');
   });
 
+  it('maps on-disk specMarkerToken to signalToken on read', async () => {
+    await writeUnsanitizedTask('task-smt', {
+      title: 'dormant pre-rename task',
+      description: '',
+      specMarkerToken: 'tok-123',
+    });
+    const loaded = await store.get('task-smt');
+    expect(loaded!.signalToken).toBe('tok-123');
+    expect(loaded!).not.toHaveProperty('specMarkerToken');
+  });
+
+  it('keeps signalToken when both signalToken and specMarkerToken are on disk', async () => {
+    await writeUnsanitizedTask('task-smt2', {
+      title: 'dormant pre-rename task',
+      description: '',
+      signalToken: 'new-tok',
+      specMarkerToken: 'old-tok',
+    });
+    const loaded = await store.get('task-smt2');
+    expect(loaded!.signalToken).toBe('new-tok');
+  });
+
+  it('get treats the filename as the authoritative id when the file body omits it', async () => {
+    await writeUnsanitizedTask('task-noid', { id: undefined, title: '' });
+    const loaded = await store.get('task-noid');
+    expect(loaded!.id).toBe('task-noid');
+    expect(loaded!.title).toBe('task-noid');
+  });
+
+  it('get overrides a mismatching id in the file body with the filename id', async () => {
+    await writeUnsanitizedTask('task-fixed-id', { id: 'wrong-id', title: 'has title' });
+    const loaded = await store.get('task-fixed-id');
+    expect(loaded!.id).toBe('task-fixed-id');
+  });
+
+  it('list carries the filename id for entries whose body omits it, and nextId survives non-numeric ids', async () => {
+    await writeUnsanitizedTask('task-noid2', { id: undefined, title: 'x' });
+    await store.set(makeTask('task-007'));
+    const all = await store.list();
+    expect(all.map((t) => t.id)).toContain('task-noid2');
+    expect(await store.nextId()).toBe('task-008');
+  });
+
   it('falls back preferredAgentId to agentId when preferredAgentId missing', async () => {
-    await writeLegacyTask('task-204', {
+    await writeUnsanitizedTask('task-204', {
       title: 'has title',
       description: 'desc',
       preferredAgentId: undefined,
@@ -273,30 +296,30 @@ describe('TaskStore sanitize', () => {
   });
 
   it('coerces whitespace-only title/preferredAgentId via fallback', async () => {
-    await writeLegacyTask('task-ws', {
+    await writeUnsanitizedTask('task-ws', {
       title: '   ',
       description: '',
       preferredAgentId: '   ',
     });
     const loaded = await store.get('task-ws');
-    expect(loaded!.title).toBe('(legacy) task-ws');
+    expect(loaded!.title).toBe('task-ws');
     expect(loaded!.preferredAgentId).toBe('dev-1');
   });
 
   it('coerces null/wrong-typed fields via fallback (hand-edit corruption)', async () => {
-    await writeLegacyTask('task-corrupt', {
+    await writeUnsanitizedTask('task-corrupt', {
       title: null,
       description: 42,
       preferredAgentId: null,
     });
     const loaded = await store.get('task-corrupt');
-    expect(loaded!.title).toBe('(legacy) task-corrupt');
+    expect(loaded!.title).toBe('task-corrupt');
     expect(loaded!.description).toBe('');
     expect(loaded!.preferredAgentId).toBe('dev-1');
   });
 
   it('falls back preferredAgentId to empty when both preferredAgentId and agentId empty', async () => {
-    await writeLegacyTask('task-205', {
+    await writeUnsanitizedTask('task-205', {
       title: 'has title',
       description: 'desc',
       preferredAgentId: undefined,
@@ -331,116 +354,5 @@ describe('TaskStore sanitize', () => {
     await store.set(task);
     const onDisk = await readRawTask('task-300');
     expect(onDisk).toEqual(task);
-  });
-});
-
-describe('TaskStore.migrateLegacyFiles', () => {
-  it('rewrites files containing issueNumber/issueUrl to clean shape', async () => {
-    await writeLegacyTask('task-leg-1', {
-      issueNumber: 42,
-      issueUrl: 'https://github.com/foo/bar/issues/42',
-      preferredAgentId: undefined,
-      status: 'in_progress',
-    });
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(1);
-    expect(result.failed).toBe(0);
-
-    const onDisk = await readRawTask('task-leg-1');
-    expect(onDisk).not.toHaveProperty('issueNumber');
-    expect(onDisk).not.toHaveProperty('issueUrl');
-    expect(onDisk.title).toBe('(legacy) Issue #42');
-    expect(onDisk.description).toBe('Migrated from https://github.com/foo/bar/issues/42.');
-    expect(onDisk.preferredAgentId).toBe('dev-1');
-  });
-
-  it('skips clean files (no rewrite, no IO churn)', async () => {
-    await store.set(makeTask('task-clean', { branch: 'feat/x' }));
-    const beforeMtime = (await readRawTask('task-clean')).updatedAt;
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(0);
-
-    const after = await readRawTask('task-clean');
-    expect(after.updatedAt).toBe(beforeMtime);
-  });
-
-  it('counts failed migrations without aborting the rest', async () => {
-    await writeFile(join(tasksDir, 'task-bad.json'), '{ this is not valid json');
-    await writeLegacyTask('task-leg-2', {
-      issueNumber: 7,
-      preferredAgentId: undefined,
-      agentId: undefined,
-    });
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(1);
-    expect(result.failed).toBe(1);
-
-    const migrated = await readRawTask('task-leg-2');
-    expect(migrated).not.toHaveProperty('issueNumber');
-  });
-
-  it('returns zero counts on empty directory', async () => {
-    const result = await store.migrateLegacyFiles();
-    expect(result).toEqual({ migrated: 0, failed: 0 });
-  });
-
-  it('raw missing id: title fallback uses filename id, not "(legacy) unknown"', async () => {
-    await writeLegacyTask('task-noid', { id: undefined, preferredAgentId: undefined });
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(1);
-
-    const onDisk = await readRawTask('task-noid');
-    expect(onDisk.id).toBe('task-noid');
-    expect(onDisk.title).toBe('(legacy) task-noid');
-  });
-
-  it('uses filename as authoritative id; rewrites raw.id mismatch instead of writing to undefined.json', async () => {
-    await writeLegacyTask('task-fix', {
-      id: 'wrong-id',
-      issueNumber: 5,
-      preferredAgentId: undefined,
-      agentId: undefined,
-    });
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(1);
-    const onDisk = await readRawTask('task-fix');
-    expect(onDisk.id).toBe('task-fix');
-    expect(onDisk).not.toHaveProperty('issueNumber');
-    await expect(readRawTask('wrong-id')).rejects.toThrow();
-  });
-
-  it('migrates files with null/whitespace fields (predicate aligned with sanitize)', async () => {
-    await writeLegacyTask('task-corrupt-disk', {
-      title: null,
-      description: 42,
-      preferredAgentId: '   ',
-    });
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(1);
-
-    const onDisk = await readRawTask('task-corrupt-disk');
-    expect(typeof onDisk.title).toBe('string');
-    expect(onDisk.title).toBe('(legacy) task-corrupt-disk');
-    expect(typeof onDisk.description).toBe('string');
-    expect(onDisk.preferredAgentId).toBe('dev-1');
-  });
-
-  it('migrates partial-migration files missing required fields (no longer has issue keys)', async () => {
-    await writeLegacyTask('task-partial', { preferredAgentId: undefined });
-
-    const result = await store.migrateLegacyFiles();
-    expect(result.migrated).toBe(1);
-    expect(result.failed).toBe(0);
-
-    const onDisk = await readRawTask('task-partial');
-    expect(onDisk.title).toBe('(legacy) task-partial');
-    expect(onDisk.description).toBe('');
-    expect(onDisk.preferredAgentId).toBe('dev-1');
   });
 });

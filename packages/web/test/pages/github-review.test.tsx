@@ -3,16 +3,14 @@ import { render, screen, cleanup } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { GithubReviewConversation } from '../../src/shared/index.js';
 
-const ghMock = vi.fn();
-const useTaskMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: { tasks: { githubReview: (...args: unknown[]) => ghMock(...args) } },
-}));
-vi.mock('../../src/hooks/use-events.ts', () => ({
-  useTask: (...args: unknown[]) => useTaskMock(...args),
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
+vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/events-mock.ts')).createEventsMock());
 
+import { api } from '../../src/api.ts';
+import { useTaskMock } from '../helpers/events-mock.ts';
 import { GithubReviewPage } from '../../src/pages/github-review.tsx';
+
+const ghMock = vi.mocked(api.tasks.githubReview);
 
 function renderAt(path: string) {
   render(

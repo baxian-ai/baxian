@@ -10,38 +10,40 @@ If an `images:` list is present, read each path (baxian downloaded the user's up
 
 ## Analyze
 
-1. Read `title:` and the description — the authoritative task source (no `.baxian/task.md` file).
+1. Read `title:` and the description — the authoritative task source.
 2. Identify acceptance criteria, explicit vs implied requirements, edge cases, file/function references, linked docs/specs.
 3. Plan the files to modify and the tests to write.
 
 ## Conventions
 
-Your `exchange:` field selects the cross-agent medium:
-- `github-pr` — communicate via the GitHub PR (description, commits, reviews, comments). Commit on the branch already checked out in your `worktree:` — do NOT create or push a differently-named branch, or baxian can't match the PR to your task. Stay in scope — out-of-scope work goes to a new GitHub Issue.
-- `server-files` — baxian reads your worktree directly; do NOT push or open a PR (the publish phase does that). Stay in scope.
+Stay in scope — out-of-scope work goes to a new GitHub Issue. Your `exchange:` field selects the cross-agent medium:
 
-A PR you open MUST be ready for review (not Draft): do NOT use `--draft`; if it is draft after creation, run `gh pr ready` before signaling.
+- `github-pr`: communicate via the GitHub PR (description, commits, reviews, comments). Commit on the branch already checked out in your `worktree:` — do NOT create or push a differently-named branch, or baxian can't match the PR to your task.
+- `server-files`: baxian reads your worktree directly; do NOT push or open a PR (the publish phase does that).
 
 ## Develop
 
-Analyze the task's complexity before coding: a simple task goes Direct (just implement it); a complex one goes SDD (write a spec for QA review).
+Gauge the task's complexity, then pick ONE of two mutually-exclusive routes and emit only its signal:
 
-Two mutually-exclusive routes — pick ONE and emit only its signal:
-
-- **Direct** — implement the change, then emit `signal:` with `token:`: for `exchange: github-pr`, after `gh pr create` (ready for review) emit `pr-created`; for `exchange: server-files`, after a local commit (do NOT push) emit `code-done`.
-- **SDD** — available only when the dispatch carries a `spec-signal:` field (a QA partner exists); without it, Direct is your only route. Follow §Specification-Driven Development to get your design reviewed first, then emit `spec-signal:` (`spec-done`) with `token:`. Do NOT emit the default `signal:` on this route — that would skip spec review and push an unimplemented task forward. After QA approves the spec, baxian dispatches the code phase.
+- **Direct** (simple task): implement it, then follow §Deliver.
+- **SDD** (complex task): follow §Specification-Driven Development to get your design reviewed before you code. Available only when the dispatch carries a `spec-signal:` field (a QA partner exists); without it, Direct is your only route.
 
 ## Code
 
-The spec is approved at `.baxian/spec.md`. Implement it, then emit your `signal:` with `token:`:
-- `exchange: github-pr`: commit + push, `gh pr create` (ready for review), emit `pr-created`.
-- `exchange: server-files`: local commit only (do NOT push, no PR), emit `code-done`.
+The approved spec is at `.baxian/spec.md`. Implement it, then follow §Deliver.
+
+## Deliver
+
+Emit your `signal:` with `token:` once the completion for your `exchange:` is done:
+
+- `github-pr`: commit + push, `gh pr create` ready for review — do NOT use `--draft`; if the PR is draft after creation, run `gh pr ready` before signaling. Emit `pr-created`.
+- `server-files`: local commit only (do NOT push, no PR). Emit `code-done`.
 
 ## Specification-Driven Development (SDD)
 
-Use it to have QA review your design before you write code.
+1. Write the spec to `.baxian/spec.md` in your worktree. Do NOT commit or push it — baxian reads the file directly for QA review.
+2. Emit `spec-signal:` (`spec-done`) with `token:` — NOT the default `signal:`, which would skip spec review and push an unimplemented task forward.
 
-- Write the spec to `.baxian/spec.md` in your worktree. Do NOT commit or push it — baxian reads the file directly for QA review.
-- Then emit the `spec-signal:` (`spec-done`) with `token:`.
+After QA approves the spec, baxian dispatches the code phase back to you.
 
 Signal wire format and emit rules: see the baxian-signals skill.

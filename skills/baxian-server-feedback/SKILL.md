@@ -8,7 +8,7 @@ baxian dispatches you with a block of `key: value` dispatch fields. Work in `wor
 
 ## Feedback
 
-QA's findings ride in the `findings:` block. Judge each finding independently — QA can be wrong; fix only what is actually correct, otherwise reject. Handle EVERY finding by id. The `feedback:` field is `code` or `spec`.
+QA's findings ride in the `findings:` block; the `feedback:` field says what they target — `code` or `spec`. Judge each finding independently — QA can be wrong; fix only what is actually correct, otherwise reject. Handle EVERY finding by id.
 
 Do NOT push to any remote and do NOT open a PR in this phase — baxian reads your worktree directly; publishing is deferred to the `server-after-done` phase.
 
@@ -35,4 +35,4 @@ Publish the reviewed `branch:`:
 - `publish: pr` — `git push -u origin <branch>`, open a managed PR (`gh pr create`; ready for review, not Draft). Emit `code-ready` carrying the new PR number: `[bx:code-ready:<pr_number>:<token>]`.
 - `publish: branch` — `git push -u origin <branch>`, then emit `code-ready` with `token:`.
 
-Signal wire format and emit rules: see the **baxian-signals** skill.
+Signal wire format and emit rules: see the baxian-signals skill.

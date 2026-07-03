@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 
-const fetchSpritesheetMock = vi.fn();
-vi.mock('../../src/api.ts', () => ({
-  api: { pets: { fetchSpritesheet: (...args: unknown[]) => fetchSpritesheetMock(...args) } },
-}));
+vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
+import { api } from '../../src/api.ts';
 import { usePetSpritesheet } from '../../src/hooks/use-pets.ts';
+
+const fetchSpritesheetMock = vi.mocked(api.pets.fetchSpritesheet);
 
 beforeEach(() => {
   fetchSpritesheetMock.mockReset();

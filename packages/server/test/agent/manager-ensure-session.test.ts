@@ -6,9 +6,11 @@ import type { BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import {
   AgentManager,
+  CleanupFailedError,
   EnsureSessionError,
 } from '../../src/agent/manager.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { WorktreeManager } from '../../src/agent/worktree.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -254,6 +256,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await rm(tempDir, { recursive: true, force: true });
   });
 
@@ -605,5 +608,322 @@ describe('AgentManager.ensureSession', () => {
     expect(tagSpy).not.toHaveBeenCalled();
     expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
     warnSpy.mockRestore();
+  });
+
+  function classifyOutput(proc: string, screen: string): string {
+    return `${proc}\n___bx-classify-sep___\n${screen}`;
+  }
+
+  async function expectAdoptError(pattern: RegExp): Promise<EnsureSessionError> {
+    try {
+      await manager.ensureSession('dev-1', 'runtime');
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(EnsureSessionError);
+      expect((err as EnsureSessionError).message).toMatch(pattern);
+      return err as EnsureSessionError;
+    }
+  }
+
+  describe('adoptOrRestartSession probe failures & pane states', () => {
+    beforeEach(() => {
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    });
+
+    it('surfaces a @baxian-agent-id probe failure without adopting', async () => {
+      overrideExec(
+        c => c.includes('show-option') && c.includes('@baxian-agent-id'),
+        { stderr: 'tmux option probe boom', exitCode: 2 },
+      );
+      const err = await expectAdoptError(/getOption\(@baxian-agent-id\) failed/);
+      expect(err.partial.createdSession).toBe(false);
+    });
+
+    it('refuses a session with more than one pane (getSinglePaneId failure)', async () => {
+      overrideExec(
+        c => c.includes('list-panes'),
+        { stdout: '%0 zsh\n%1 zsh\n' },
+      );
+      await expectAdoptError(/getSinglePaneId failed/);
+    });
+
+    it('surfaces a classifyPaneForAdopt probe failure', async () => {
+      overrideExec(
+        c => c.includes('display-message') && c.includes('capture-pane'),
+        { stderr: 'probe boom', exitCode: 1 },
+      );
+      await expectAdoptError(/classifyPaneForAdopt failed/);
+    });
+
+    it('classifies a runtime stuck on a startup dialog as dialogPending', async () => {
+      overrideExec(
+        c => c.includes('display-message') && c.includes('capture-pane'),
+        { stdout: classifyOutput('claude', '✨ Update available!\nPress enter to continue\n') },
+      );
+      const err = await expectAdoptError(/blocked on startup dialog/);
+      expect(err.partial.dialogPending).toBe(true);
+      expect(err.partial.lastScreen).toContain('Press enter to continue');
+    });
+
+    it('refuses to send launch keys into a foreign foreground process', async () => {
+      overrideExec(
+        c => c.includes('display-message') && c.includes('capture-pane'),
+        { stdout: classifyOutput('vim', 'editing something\n') },
+      );
+      const err = await expectAdoptError(/pane foreground "vim" is neither runtime/);
+      expect(err.partial.dialogPending).toBeFalsy();
+    });
+
+    const TRUST_SCREEN = 'Quick safety check\nDo you trust this folder?\n› Yes, I trust this folder\n';
+
+    it('auto-answers a trust dialog and adopts the pane as a fresh runtime', async () => {
+      let enterSent = false;
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+          return { stdout: classifyOutput('claude', TRUST_SCREEN), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('send-keys') && cmd.includes("'Enter'")) {
+          enterSent = true;
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return {
+            stdout: enterSent ? '⏵⏵ bypass permissions on\n' : TRUST_SCREEN,
+            stderr: '', exitCode: 0,
+          };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      const result = await manager.ensureSession('dev-1', 'runtime');
+
+      expect(result.createdSession).toBe(false);
+      expect(result.freshRuntime).toBe(true);
+      expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
+    });
+
+    it('reports dialogPending when a startup dialog appears after the trust auto-answer', async () => {
+      let enterSent = false;
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+          return { stdout: classifyOutput('claude', TRUST_SCREEN), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('send-keys') && cmd.includes("'Enter'")) {
+          enterSent = true;
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return {
+            stdout: enterSent ? 'Press enter to continue\n' : TRUST_SCREEN,
+            stderr: '', exitCode: 0,
+          };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      const err = await expectAdoptError(/blocked on startup dialog after trust auto-answer/);
+      expect(err.partial.dialogPending).toBe(true);
+    });
+
+    it('wraps a trust-dialog handling crash as EnsureSessionError', async () => {
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+          return { stdout: classifyOutput('claude', TRUST_SCREEN), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: '', stderr: 'capture blew up', exitCode: 1 };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      await expectAdoptError(/trust dialog handling failed/);
+    });
+
+    it('shell relaunch blocked on a startup dialog reports dialogPending', async () => {
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+          return { stdout: classifyOutput('zsh', '$ \n'), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: 'Press enter to continue\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('display-message')) {
+          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      const err = await expectAdoptError(/relaunch blocked on startup dialog/);
+      expect(err.partial.dialogPending).toBe(true);
+    });
+
+    it('shell relaunch that never becomes ready fails as REPL relaunch failed', async () => {
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+          return { stdout: classifyOutput('zsh', '$ \n'), stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: 'still booting...\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('display-message')) {
+          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      const err = await expectAdoptError(/REPL relaunch failed/);
+      expect(err.partial.dialogPending).toBeFalsy();
+    });
+  });
+
+  describe('ensureSession pre-flight failures', () => {
+    it('wraps an ensureWorkdir failure', async () => {
+      vi.spyOn(
+        manager as unknown as { ensureWorkdir: () => Promise<unknown> },
+        'ensureWorkdir',
+      ).mockRejectedValue(new Error('clone failed'));
+      await expect(manager.ensureSession('dev-1', 'runtime'))
+        .rejects.toThrow(/ensureWorkdir failed: clone failed/);
+    });
+
+    it('records the auto-managed repo path on the binding when a repoStore resolves the workdir', async () => {
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      await manager['agentStore'].set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
+      vi.spyOn(
+        manager as unknown as { ensureWorkdir: () => Promise<unknown> },
+        'ensureWorkdir',
+      ).mockResolvedValue({ workdir: '/tmp/auto-repo', repoStore: {} });
+
+      await manager.ensureSession('dev-1', 'runtime');
+
+      expect((await manager['agentStore'].get('dev-1'))?.repoPath).toBe('/tmp/auto-repo');
+    });
+
+    it('wraps a skill provisioning failure', async () => {
+      runner.writeFile.mockRejectedValue(new Error('remote write refused'));
+      await expect(manager.ensureSession('dev-1', 'runtime'))
+        .rejects.toThrow(/skill provisioning failed/);
+    });
+
+    it('wraps a tmux has-session probe failure', async () => {
+      overrideExec(
+        c => c.includes('has-session'),
+        { stderr: 'tmux socket weirdness', exitCode: 2 },
+      );
+      await expect(manager.ensureSession('dev-1', 'runtime'))
+        .rejects.toThrow(/tmux probe failed/);
+    });
+  });
+
+  describe('restartReplOnly preconditions & relaunch', () => {
+    it('throws when the tmux session does not exist', async () => {
+      await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/does not exist/);
+    });
+
+    it('refuses a foreign session claim', async () => {
+      tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true });
+      await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/claim mismatch/);
+    });
+
+    it('exits a live runtime before relaunching and refreshes the binding paneId', async () => {
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      await manager['agentStore'].set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
+      let exited = false;
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('send-keys')) {
+          if (cmd.includes("'exit'")) exited = true;
+          if (cmd.includes('permission-mode')) exited = false;
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('display-message') && !cmd.includes('capture-pane')) {
+          return { stdout: exited ? 'zsh\n' : 'claude\n', stderr: '', exitCode: 0 };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      await manager.restartReplOnly('dev-1');
+
+      expect(execCmds().some(c => c.includes('send-keys') && c.includes("'exit'"))).toBe(true);
+      expect(execCmds().some(c => c.includes('permission-mode'))).toBe(true);
+      expect((await manager['agentStore'].get('dev-1'))?.paneId).toBe('%0');
+    });
+
+    it('throws on an unexpected foreground process instead of relaunching over it', async () => {
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      overrideExec(
+        c => c.includes('display-message') && !c.includes('capture-pane'),
+        { stdout: 'vim\n' },
+      );
+      await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/unexpected pane state "vim"/);
+    });
+
+    it('relaunches without the skill-dir lock when the workdir cannot be resolved', async () => {
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      const m = manager as unknown as {
+        pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
+        ensureWorkdir: (...a: unknown[]) => Promise<unknown>;
+      };
+      vi.spyOn(m, 'pollPaneCommandStable').mockResolvedValue('zsh');
+      vi.spyOn(m, 'ensureWorkdir').mockRejectedValue(new Error('repo store down'));
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await manager.restartReplOnly('dev-1');
+
+      expect(execCmds().some(c => c.includes('permission-mode'))).toBe(true);
+      expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
+      expect(warnSpy.mock.calls.some(c => String(c[0]).includes('skill re-provision failed'))).toBe(true);
+      warnSpy.mockRestore();
+    });
+  });
+
+  describe('cleanupRemovedAgentRuntime failure aggregation', () => {
+    it('skips the kill (warn only) when the session claim belongs to someone else', async () => {
+      tmuxSessions.set('dev-1', { claim: 'foreign-owner', readyOnce: true });
+      let killed = false;
+      mockCleanupExec(() => { killed = true; });
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      await manager.cleanupRemovedAgentRuntime(['dev-1']);
+
+      expect(killed).toBe(false);
+      expect(warnSpy.mock.calls.some(c => String(c[0]).includes('not baxian-managed'))).toBe(true);
+      warnSpy.mockRestore();
+    });
+
+    it('aggregates a tmux probe failure into CleanupFailedError', async () => {
+      overrideExec(
+        c => c.includes('has-session'),
+        { stderr: 'socket exploded', exitCode: 2 },
+      );
+      try {
+        await manager.cleanupRemovedAgentRuntime(['dev-1']);
+        throw new Error('expected throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(CleanupFailedError);
+        expect((err as CleanupFailedError).failures).toEqual([
+          expect.objectContaining({ agentId: 'dev-1', step: 'tmux' }),
+        ]);
+      }
+    });
+
+    it('aggregates a worktree removal failure into CleanupFailedError', async () => {
+      await manager['agentStore'].set({
+        id: 'dev-1', projectId: 'proj',
+        worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+        updatedAt: new Date().toISOString(),
+      });
+      vi.spyOn(WorktreeManager.prototype, 'remove').mockRejectedValue(new Error('worktree locked'));
+
+      try {
+        await manager.cleanupRemovedAgentRuntime(['dev-1']);
+        throw new Error('expected throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(CleanupFailedError);
+        expect((err as CleanupFailedError).failures).toEqual([
+          expect.objectContaining({ agentId: 'dev-1', step: 'worktree.remove' }),
+        ]);
+        expect((err as CleanupFailedError).message).toContain('worktree locked');
+      }
+    });
   });
 });
