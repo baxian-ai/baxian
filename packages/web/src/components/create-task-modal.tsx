@@ -219,14 +219,14 @@ export function CreateTaskModal(props: Props) {
 
   const noDevHint = (() => {
     if (editPreferredInPendingRestart) {
-      return `当前 dev "${preferredAgentId}" 在 baxian.json 中存在但 runtime 未加载，可能是手动编辑过配置文件；重启 server 可拉起`;
+      return `当前 Dev agent "${preferredAgentId}" 在 baxian.json 中存在但 runtime 未加载，可能是手动编辑过配置文件；重启 server 可拉起`;
     }
     if (editPreferredPending) {
-      return `当前 dev "${preferredAgentId}" 不在 runtime（可能已从 project 配置移除）；保存可能失败，请确认或选择新 dev`;
+      return `当前 Dev agent "${preferredAgentId}" 不在 runtime（可能已从 project 配置移除）；保存可能失败，请确认或选择新 Dev agent`;
     }
     if (!selectedProjectId) return null;
     if (visibleDevs.length > 0) return null;
-    if (pendingRestartDevs.length > 0) return 'baxian.json 里有 dev agent 但 runtime 未加载（可能是手动编辑过配置）；重启 server 后生效';
+    if (pendingRestartDevs.length > 0) return 'baxian.json 里有 Dev agent 但 runtime 未加载（可能是手动编辑过配置）；重启 server 后生效';
     return null;
   })();
 
@@ -314,7 +314,7 @@ export function CreateTaskModal(props: Props) {
 
   const removeImage = (idx: number) => setImages((prev) => prev.filter((_, i) => i !== idx));
 
-  const modalTitle = isEdit ? '编辑 Task' : '新建 Task';
+  const modalTitle = isEdit ? '编辑任务' : '新建任务';
   const submitLabel = isEdit
     ? (submitting ? '保存中…' : '保存')
     : (submitting ? '创建中…' : '创建');
@@ -352,7 +352,7 @@ export function CreateTaskModal(props: Props) {
           </div>
         )}
         {error && (
-          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-sm text-danger">
+          <div className="rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
             {error}
           </div>
         )}
@@ -377,7 +377,7 @@ export function CreateTaskModal(props: Props) {
         )}
 
         <div>
-          <label className={labelCls} htmlFor="task-dev">Dev Agent</label>
+          <label className={labelCls} htmlFor="task-dev">Dev agent</label>
           <select
             id="task-dev"
             value={preferredAgentId}
@@ -395,7 +395,7 @@ export function CreateTaskModal(props: Props) {
               <option key={d.id} value={d.id}>{d.id}</option>
             ))}
           </select>
-          {noDevHint && <div className="mt-1 text-xs text-warn">{noDevHint}</div>}
+          {noDevHint && <div className="mt-1 text-xs text-accent">{noDevHint}</div>}
         </div>
 
         <div>
@@ -461,7 +461,7 @@ export function CreateTaskModal(props: Props) {
                       aria-label={`移除图片 ${f.name}`}
                       onClick={() => removeImage(i)}
                       disabled={submitting}
-                      className="ml-2 shrink-0 text-og-400 transition-colors hover:text-danger"
+                      className="ml-2 shrink-0 text-og-400 transition-colors"
                     >
                       ✕
                     </button>

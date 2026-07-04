@@ -105,7 +105,7 @@ function descriptionInput(): HTMLTextAreaElement {
 }
 
 function devSelect(): HTMLSelectElement {
-  return screen.getByLabelText('Dev Agent') as HTMLSelectElement;
+  return screen.getByLabelText('Dev agent') as HTMLSelectElement;
 }
 
 function restoreHint(): HTMLElement | null {
@@ -518,7 +518,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
     await flushApi();
     expect(select.value).toBe('');
 
-    fireEvent.change(titleInput(), { target: { value: '未指派任务' } });
+    fireEvent.change(titleInput(), { target: { value: '未指定任务' } });
     fireEvent.change(descriptionInput(), { target: { value: '稍后再选 dev' } });
     fireEvent.click(screen.getByRole('button', { name: '创建' }));
     await flushApi();

@@ -37,9 +37,11 @@ export default {
         page: '#fafafa',
         surface: '#ffffff',
         hairline: '#e8e9ec',
-        success: '#15803d',
-        warn: '#b45309',
-        danger: '#b91c1c',
+        term: '#fdfdfd',
+        'diff-add': '#e6f4ec',
+        'diff-del': '#fdecea',
+        'diff-add-ink': '#15803d',
+        'diff-del-ink': '#b91c1c',
       },
       fontFamily: {
         sans: [

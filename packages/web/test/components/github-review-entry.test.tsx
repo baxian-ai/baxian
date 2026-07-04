@@ -69,10 +69,10 @@ describe('GithubReviewEntry', () => {
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     const qa = await screen.findByText('QA');
-    expect(qa.className).toContain('text-[#c2410c]');
+    expect(qa.className).toContain('text-og-600');
     expect(qa.className).not.toContain('pill');
-    const dev = screen.getByText('dev');
-    expect(dev.className).toContain('text-accent');
+    const dev = screen.getByText('Dev');
+    expect(dev.className).toContain('text-og-600');
     expect(dev.className).not.toContain('pill');
   });
 
@@ -85,7 +85,7 @@ describe('GithubReviewEntry', () => {
     expect(await screen.findByText('进行中')).toBeTruthy();
     expect(screen.getByText('评论')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · please recheck/)).toBeTruthy();
-    expect(screen.getByText('dev')).toBeTruthy();
+    expect(screen.getByText('Dev')).toBeTruthy();
     expect(screen.queryByText('QA')).toBeNull();
   });
 
@@ -107,7 +107,7 @@ describe('GithubReviewEntry', () => {
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText('反馈')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · src\/a\.ts:42 · please recheck this line/)).toBeTruthy();
-    expect(screen.getByText('dev')).toBeTruthy();
+    expect(screen.getByText('Dev')).toBeTruthy();
   });
 
   it('styles the 代码评审 title and QA marker like 第 x 轮: compact and non-bold', async () => {

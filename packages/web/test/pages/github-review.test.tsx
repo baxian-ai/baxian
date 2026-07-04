@@ -46,7 +46,7 @@ describe('GithubReviewPage', () => {
     renderAt('/tasks/task-1/github-review');
 
     expect(await screen.findByText('My Task')).toBeTruthy();
-    expect(screen.getByText('Open PR #7')).toBeTruthy();
+    expect(screen.getByText('查看 PR #7')).toBeTruthy();
     expect(screen.getByText('第 1 轮')).toBeTruthy();
     expect(screen.getByText('第 2 轮')).toBeTruthy();
     expect(screen.getByText('a.ts:12')).toBeTruthy();

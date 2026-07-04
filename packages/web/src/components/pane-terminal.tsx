@@ -435,10 +435,10 @@ export function PaneTerminal({
       : undefined;
 
   return (
-    <div className={className ?? 'flex flex-col h-full w-full min-h-0 bg-[#fdfdfd]'}>
+    <div className={className ?? 'flex flex-col h-full w-full min-h-0 bg-term'}>
       {(error || sessionGone) && (
-        <div className="border-b border-[#fecaca] bg-[#fef2f2] px-3 py-1 font-mono text-xs text-danger">
-          {sessionGone ? 'session ended' : error}
+        <div className="border-b border-accent/25 bg-accent-soft px-3 py-1 font-mono text-xs text-accent">
+          {sessionGone ? '会话已结束' : error}
         </div>
       )}
       <div className="flex flex-1 min-h-0 px-2 py-1.5" style={containerStyle}>
@@ -459,6 +459,7 @@ export function PaneTerminal({
               const appCursor = !!termRef.current?.modes?.applicationCursorKeysMode;
               forwardInput(arrowKeyToSequence(key, appCursor));
             }}
+            onEscape={() => forwardInput('\x1b')}
           />
         </div>
       )}

@@ -178,18 +178,18 @@ describe('TaskDetail page — header & info', () => {
     expect(within(heading).getByText('task-010').className).toContain('text-og-400');
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
-    expect(within(container.querySelector('section')!).getByText('approved').className).toContain('pill');
-    expect(container.textContent).toContain('Created at 2026-05-10 20:00, Updated at 2026-05-10 21:00');
+    expect(within(container.querySelector('section')!).getByText('已通过').className).toContain('pill');
+    expect(container.textContent).toContain('创建于 2026-05-10 20:00 · 更新于 2026-05-10 21:00');
     expect(container.textContent).toContain('Task body here');
-    expect(container.textContent).toContain('Round 1');
-    expect(container.textContent).toContain('Spec 0');
+    expect(container.textContent).toContain('评审 1 轮');
+    expect(container.textContent).toContain('Spec 0 轮');
     expect(container.textContent).toContain('Branch:');
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
   });
 
   it('shows regular-weight Round/Spec counts beside the status pill', () => {
     const { container } = open({ reviewRound: 3, specReviewRound: 2 });
-    const status = within(container.querySelector('section')!).getByText('approved').parentElement!;
+    const status = within(container.querySelector('section')!).getByText('已通过').parentElement!;
     expect(within(status).getByText('3').className).not.toContain('font-semibold');
     expect(within(status).getByText('2').className).not.toContain('font-semibold');
   });
@@ -197,12 +197,12 @@ describe('TaskDetail page — header & info', () => {
   it('keeps status, review rounds, and timestamps at body size', () => {
     const { container } = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
     const section = container.querySelector('section')!;
-    const row = within(section).getByText('max_rounds').parentElement!;
-    const round = within(row).getByText((_, el) => el?.textContent === 'Round 10');
-    const spec = within(row).getByText((_, el) => el?.textContent === 'Spec 0');
-    const timestamps = within(section).getByText('Created at 2026-05-10 20:00, Updated at 2026-05-10 21:00');
+    const row = within(section).getByText('轮次达上限').parentElement!;
+    const round = within(row).getByText((_, el) => el?.textContent === '评审 10 轮');
+    const spec = within(row).getByText((_, el) => el?.textContent === 'Spec 0 轮');
+    const timestamps = within(section).getByText('创建于 2026-05-10 20:00 · 更新于 2026-05-10 21:00');
 
-    expect(within(row).getByText('max_rounds').className).toContain('text-sm');
+    expect(within(row).getByText('轮次达上限').className).toContain('text-sm');
     expect(round.className).toContain('text-sm');
     expect(spec.className).toContain('text-sm');
     expect(timestamps.className).toContain('text-sm');
@@ -223,21 +223,21 @@ describe('TaskDetail page — header & info', () => {
 
   it('renders timestamps at minute precision and tolerates empty values', () => {
     open({ createdAt: '2026-05-10T12:00:00.000Z', updatedAt: null as unknown as string });
-    expect(screen.getByText('Created at 2026-05-10 20:00, Updated at')).toBeTruthy();
+    expect(screen.getByText('创建于 2026-05-10 20:00 · 更新于')).toBeTruthy();
   });
 
   it('places the action buttons on their own row below the status capsule, not in the title', () => {
     const { container } = open({ status: 'pending' });
     const section = container.querySelector('section')!;
-    const actionsRow = screen.getByRole('button', { name: 'Edit' }).parentElement!;
+    const actionsRow = screen.getByRole('button', { name: '编辑' }).parentElement!;
     expect(container.querySelector('h1')!.contains(actionsRow)).toBe(false);
     expect(section.contains(actionsRow)).toBe(true);
-    const capsuleRow = within(section).getByText('pending').parentElement!;
+    const capsuleRow = within(section).getByText('待处理').parentElement!;
     expect(capsuleRow.compareDocumentPosition(actionsRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  const QA_BANNER = 'QA approved · verifying feedback';
-  const MERGE_BANNER = '✅ PR ready · 等待人工确认';
+  const QA_BANNER = 'QA agent 已通过 · 正在核对反馈';
+  const MERGE_BANNER = 'PR 就绪 · 等你确认';
   it.each([
     { status: 'approved', shown: QA_BANNER, hidden: MERGE_BANNER },
     { status: 'merge-ready', shown: MERGE_BANNER, hidden: QA_BANNER },
@@ -245,7 +245,7 @@ describe('TaskDetail page — header & info', () => {
     open({ status: status as TaskState['status'] });
     expect(screen.getByText(shown)).toBeTruthy();
     expect(screen.queryByText(hidden)).toBeNull();
-    expect(screen.getByRole('link', { name: 'Open PR #55' }).getAttribute('href'))
+    expect(screen.getByRole('link', { name: '查看 PR #55' }).getAttribute('href'))
       .toBe('https://github.com/baxian-ai/baxian/pull/55');
   });
 });
@@ -362,12 +362,12 @@ describe('TaskDetail page — actions & states', () => {
 
     setTask(null, { loaded: true });
     const r2 = renderPage();
-    expect(screen.getByText('Task not found: task-010')).toBeTruthy();
+    expect(screen.getByText('任务不存在：task-010')).toBeTruthy();
     r2.unmount();
 
     setTask(null, { loaded: true, error: { code: 'x', message: 'boom' } });
     renderPage();
-    expect(screen.getByText('Error: boom')).toBeTruthy();
+    expect(screen.getByText('加载失败：boom')).toBeTruthy();
   });
 
   it('the back button navigates to the previous history entry', () => {
@@ -379,7 +379,7 @@ describe('TaskDetail page — actions & states', () => {
 
   it('Edit opens the edit modal overlay', () => {
     open({ status: 'pending' });
-    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
     expect(screen.getByTestId('edit-modal')).toBeTruthy();
   });
 
@@ -393,7 +393,7 @@ describe('TaskDetail page — actions & states', () => {
     renderPage('task-010');
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      fireEvent.click(screen.getByRole('button', { name: '重试' }));
     });
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
@@ -406,7 +406,7 @@ describe('TaskDetail page — actions & states', () => {
     open({ status: 'in_progress' });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      fireEvent.click(screen.getByRole('button', { name: '取消' }));
     });
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
@@ -425,7 +425,7 @@ describe('TaskDetail page — actions & states', () => {
     renderPage('task-010', { extra: <GoTo to="/project/baxian/task/task-011" /> });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      fireEvent.click(screen.getByRole('button', { name: '取消' }));
     });
     expect(screen.getByText('AAA')).toBeTruthy();
 
@@ -445,9 +445,9 @@ describe('TaskDetail page — actions & states', () => {
       openMaxRounds();
       expect(screen.getByRole('button', { name: '标记完成' })).toBeTruthy();
       expect(screen.getByRole('button', { name: '继续一轮' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: 'Call review' })).toBeTruthy();
-      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
-      expect(screen.getByText(/已达 review 轮次上限/)).toBeTruthy();
+      expect(screen.getByRole('button', { name: '发起评审' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
+      expect(screen.getByText(/评审已达 10 轮上限/)).toBeTruthy();
     });
 
     it.each([
@@ -466,10 +466,10 @@ describe('TaskDetail page — actions & states', () => {
 
     it('spec-phase shows Retry, hides the code actions, disables Call review', () => {
       openMaxRounds({ phase: 'spec' });
-      expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
       expect(screen.queryByRole('button', { name: '标记完成' })).toBeNull();
-      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(true);
-      expect(screen.getByText(/已达 spec review 轮次上限/)).toBeTruthy();
+      expect((screen.getByRole('button', { name: '发起评审' }) as HTMLButtonElement).disabled).toBe(true);
+      expect(screen.getByText(/Spec 评审已达 0 轮上限/)).toBeTruthy();
     });
   });
 
@@ -486,7 +486,7 @@ describe('TaskDetail page — actions & states', () => {
       expect(reject.disabled).toBe(true);
       fireEvent.change(screen.getByPlaceholderText(/打回意见/), { target: { value: '补充回滚方案' } });
       expect((screen.getByRole('button', { name: '打回 Spec' }) as HTMLButtonElement).disabled).toBe(false);
-      expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name: '取消' }) as HTMLButtonElement).disabled).toBe(false);
     });
 
     it('通过 Spec confirms and submits an approve verdict', async () => {
@@ -499,7 +499,7 @@ describe('TaskDetail page — actions & states', () => {
       });
 
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已通过，已派发编码' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已通过，已发起编码' });
     });
 
     it('打回 Spec submits request-changes with the comments', async () => {
@@ -512,7 +512,7 @@ describe('TaskDetail page — actions & states', () => {
       });
 
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '边界场景没有覆盖' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已打回，dev 开始修订' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已打回，Dev agent 开始修订' });
     });
 
     it('verdict failure surfaces an error toast', async () => {
@@ -536,21 +536,21 @@ describe('TaskDetail page — call review', () => {
     open({ status: 'review' });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+      fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
     });
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('请 QA 重审 task task-010'));
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('请 QA agent 重审任务 task-010'));
     expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已派 QA 重审 (round 2)' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已发起 QA 重审（第 2 轮）' });
   });
 
   it('warns that re-reviewing a terminal task will not feed back into the state machine', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     open({ status: 'merged' });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+    fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('已是 merged 状态'));
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('已是「已合并」状态'));
     expect(tasksReviewMock).not.toHaveBeenCalled();
     expect(toastShowMock).not.toHaveBeenCalled();
   });
@@ -561,10 +561,10 @@ describe('TaskDetail page — call review', () => {
     open({ status: 'review' });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+      fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
     });
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Review 派发失败', body: 'qa is busy' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '发起评审失败', body: 'qa is busy' });
   });
 });
 
@@ -575,11 +575,11 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     open({ status: 'in_progress' });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      fireEvent.click(screen.getByRole('button', { name: '取消' }));
     });
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '取消失败', body: 'cancel nope' });
-    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: '取消' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('Retry on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
@@ -588,11 +588,11 @@ describe('TaskDetail page — action failures surface error toasts', () => {
     open({ status: 'cancelled' });
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      fireEvent.click(screen.getByRole('button', { name: '重试' }));
     });
 
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('这会新建一个 task 从头开始'));
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Retry 失败', body: 'retry nope' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '重试失败', body: 'retry nope' });
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
   });
 
@@ -654,8 +654,8 @@ describe('TaskDetail page — human confirmation gates', () => {
     tasksCompleteMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
     const { container } = open({ status: 'ready' });
 
-    expect(screen.getByText('✅ 评审通过 · 等待人工确认')).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Open PR #55' })).toBeTruthy();
+    expect(screen.getByText('评审通过 · 等你确认')).toBeTruthy();
+    expect(screen.getByRole('link', { name: '查看 PR #55' })).toBeTruthy();
     await waitFor(() => expect(container.textContent).toContain('Review 2 轮'));
     expect(container.textContent).toContain('最终 verdict approve');
     expect(container.textContent).toContain('findings 共 3 条');
@@ -705,13 +705,13 @@ describe('TaskDetail page — review verdict watchdog', () => {
   it('flags a review dispatched over 10 minutes ago with the missing-verdict banner', () => {
     open({ status: 'review', reviewDispatchedAt: '2026-05-10T12:00:00.000Z' });
 
-    expect(screen.getByText('Review verdict missing')).toBeTruthy();
-    expect(screen.getByText(/超过 10 分钟未提交 verdict/)).toBeTruthy();
+    expect(screen.getByText('评审逾期未交')).toBeTruthy();
+    expect(screen.getByText(/超过 10 分钟未提交结论/)).toBeTruthy();
   });
 
   it('keeps the banner hidden for a freshly dispatched review', () => {
     open({ status: 'review', reviewDispatchedAt: new Date().toISOString() });
-    expect(screen.queryByText('Review verdict missing')).toBeNull();
+    expect(screen.queryByText('评审逾期未交')).toBeNull();
   });
 });
 
@@ -719,15 +719,15 @@ describe('TaskDetail page — legacy tasks', () => {
   it('pending legacy task explains how to assign a dev', () => {
     setTask(makeTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText(/This task has no dev assigned yet/)).toBeTruthy();
+    expect(screen.getByText(/任务还没有指定 Dev agent/)).toBeTruthy();
   });
 
   it('terminal legacy task disables Retry with the legacy tooltip', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
+    const retry = screen.getByRole('button', { name: '重试' }) as HTMLButtonElement;
     expect(retry.disabled).toBe(true);
-    expect(retry.title).toBe('Legacy task has no preferred dev to retry against');
+    expect(retry.title).toBe('历史任务没有指定 Dev agent，无法重试');
   });
 });
 
@@ -772,7 +772,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][0]]] }]);
     setTask(makeTask({ qaAgentId: undefined }));
     const { container } = renderPage();
-    expect(screen.getByText('暂无 QA Agent')).toBeTruthy();
+    expect(screen.getByText('暂无 QA agent')).toBeTruthy();
     expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
   });
 
@@ -780,7 +780,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
     setTask(makeTask({ agentId: 'ghost-dev', preferredAgentId: 'ghost-dev', qaAgentId: 'bx-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('暂无 Dev Agent')).toBeTruthy();
+    expect(screen.getByText('暂无 Dev agent')).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-qa']);
   });

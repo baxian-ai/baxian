@@ -6,7 +6,7 @@ import { AgentCard, type TerminalMode } from './agent-card.tsx';
 import { api } from '../api.ts';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useToast } from './toast.tsx';
-import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath } from './task-status.tsx';
+import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath, taskStatusLabel } from './task-status.tsx';
 
 interface AgentGroupProps {
   group: AgentConfig[];
@@ -90,8 +90,8 @@ export function AgentGroup({
                   <span className="truncate text-og-1000">{task.title}</span>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <span className="shrink-0 text-xs text-og-500">Round {round}</span>
-                  <span className={`${STATUS_BADGE_COLORS[task.status]} shrink-0`}>{task.status}</span>
+                  <span className="shrink-0 text-xs text-og-500">第 {round} 轮</span>
+                  <span className={`${STATUS_BADGE_COLORS[task.status]} shrink-0`} title={task.status}>{taskStatusLabel(task.status)}</span>
                 </div>
               </button>
             );
@@ -155,11 +155,11 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
     setBusyTaskId(taskId);
     try {
       await api.tasks.dispatch(taskId, { agentId: devId });
-      show({ kind: 'success', title: `Task ${taskId} 已派给 ${devId}` });
+      show({ kind: 'success', title: `任务 ${taskId} 已交给 ${devId}` });
     } catch (err) {
       show({
         kind: 'error',
-        title: '派遣失败',
+        title: '发起失败',
         body: err instanceof Error ? err.message : String(err),
       });
     } finally {
@@ -194,10 +194,10 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
               type="button"
               onClick={() => void handleDispatch(task.id)}
               disabled={!dispatchReady || busy}
-              title={dispatchReady ? `派给 ${devId} 并立即开始` : 'Dev 当前不可派遣'}
+              title={dispatchReady ? `交给 ${devId} 并立即开始` : 'Dev agent 当前不可用'}
               className="shrink-0 text-sm font-medium text-accent transition-colors hover:text-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {busyTaskId === task.id ? 'Starting…' : 'Start'}
+              {busyTaskId === task.id ? '发起中…' : '发起'}
             </button>
           </div>
         );

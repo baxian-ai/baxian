@@ -168,10 +168,10 @@ describe('ReviewConversation server mode', () => {
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewRound: 1 }));
     const qa = await screen.findByText('QA');
-    expect(qa.className).toContain('text-[#c2410c]');
+    expect(qa.className).toContain('text-og-600');
     expect(qa.className).not.toContain('pill');
-    const dev = screen.getByText('dev');
-    expect(dev.className).toContain('text-accent');
+    const dev = screen.getByText('Dev');
+    expect(dev.className).toContain('text-og-600');
     expect(dev.className).not.toContain('pill');
   });
 

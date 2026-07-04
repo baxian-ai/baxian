@@ -266,9 +266,9 @@ describe('TaskPanel', () => {
     expect(screen.queryByRole('region', { name: '正在处理' })).toBeNull();
     expect(screen.queryByRole('region', { name: '待处理' })).toBeNull();
     expect(screen.queryByRole('button', { name: '刷新 Task 列表' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '+ 新建 Task' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '+ 新建任务' })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '关闭 Task 面板' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '关闭 任务面板' })).toBeNull();
   });
 
   it('renders the section titles in normal weight, not bold', () => {
@@ -293,10 +293,10 @@ describe('TaskPanel', () => {
       task({ id: 'task-005', status: 'pending' }),
     ]);
     expect(screen.queryByText('in_progress')).toBeNull();
-    expect(screen.getByRole('img', { name: 'in_progress' }).className).toContain('bg-success');
-    expect(screen.getByRole('img', { name: 'review' }).className).toContain('bg-accent');
-    expect(screen.getByRole('img', { name: 'fixing' }).className).toContain('bg-warn');
-    expect(screen.getByRole('img', { name: 'approved' }).className).toContain('bg-success');
+    expect(screen.getByRole('img', { name: 'in_progress' }).className).toContain('bg-og-1000');
+    expect(screen.getByRole('img', { name: 'review' }).className).toContain('bg-og-400');
+    expect(screen.getByRole('img', { name: 'fixing' }).className).toContain('bg-og-1000');
+    expect(screen.getByRole('img', { name: 'approved' }).className).toContain('bg-og-400');
     const pendingDot = screen.getByRole('img', { name: 'pending' });
     expect(pendingDot.className).toContain('bg-og-300');
     expect(pendingDot.getAttribute('title')).toBe('pending');
@@ -311,9 +311,9 @@ describe('TaskPanel', () => {
     ]));
     renderPanel([]);
     clickDone();
-    expect((await screen.findByRole('img', { name: 'merged' })).className).toContain('bg-success');
-    expect(screen.getByRole('img', { name: 'max_rounds' }).className).toContain('bg-warn');
-    expect(screen.getByRole('img', { name: 'failed' }).className).toContain('bg-warn');
+    expect((await screen.findByRole('img', { name: 'merged' })).className).toContain('bg-og-1000');
+    expect(screen.getByRole('img', { name: 'max_rounds' }).className).toContain('bg-accent');
+    expect(screen.getByRole('img', { name: 'failed' }).className).toContain('bg-accent');
     expect(screen.getByRole('img', { name: 'cancelled' }).className).toContain('bg-og-300');
   });
 
@@ -328,7 +328,7 @@ describe('TaskPanel', () => {
 
   it('grows with content instead of painting its own vertical scrollbar', () => {
     const panel = renderPanel([task({ id: 'task-001', status: 'in_progress' })])
-      .getByRole('complementary', { name: 'Task 面板' });
+      .getByRole('complementary', { name: '任务面板' });
     expect(panel.className).not.toContain('overflow-y-auto');
     expect(panel.className).not.toContain('max-h-');
     expect(panel.querySelector('.overflow-y-auto')).toBeNull();

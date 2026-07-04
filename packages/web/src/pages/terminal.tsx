@@ -18,12 +18,12 @@ export function Terminal() {
     return undefined;
   }, [agentId, projects]);
 
-  if (!agentId) return <div className="text-sm text-danger">No agent specified</div>;
+  if (!agentId) return <div className="text-sm text-accent">No agent specified</div>;
 
   return (
     <div data-testid="terminal-page-container" className="flex min-h-0 flex-1 flex-col overflow-hidden border border-hairline bg-surface">
       <div className="flex h-8 flex-none select-none items-center gap-3 border-b border-hairline bg-page px-3 font-mono text-xs text-og-500">
-        <span aria-hidden className="block h-1.5 w-1.5 rounded-full bg-success" />
+        <span aria-hidden className="block h-1.5 w-1.5 rounded-full bg-og-1000" />
         <span className="text-og-700" title={agentRuntimeTitle(agentId, runtime)}>{agentId}</span>
       </div>
       <div className="min-h-0 flex-1">

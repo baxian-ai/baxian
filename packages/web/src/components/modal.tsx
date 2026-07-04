@@ -99,7 +99,7 @@ export function Modal({ open, onClose, title, titleContent, children, footer, si
             type="button"
             onClick={() => onCloseRef.current()}
             className="-mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-og-400 transition-colors hover:bg-og-50 hover:text-og-800"
-            aria-label="Close"
+            aria-label="关闭"
           >
             ✕
           </button>

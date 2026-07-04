@@ -269,7 +269,7 @@ describe('PaneTerminal', () => {
     expect(ZED_LIGHT_THEME.foreground).toBe('#474c55');
     expect(ZED_LIGHT_THEME.blue).toBe('#1348dc');
     expect(ZED_LIGHT_THEME.cursor).toBe('#1348dc');
-    expect(container.querySelector(`[class*="bg-[#fdfdfd]"]`)).not.toBeNull();
+    expect(container.querySelector(`[class*="bg-term"]`)).not.toBeNull();
   });
 
   it('forwards Ctrl+Q as terminal input', async () => {
@@ -668,7 +668,7 @@ describe('PaneTerminal', () => {
 
   it('arrowKeys prop defaults off — no virtual key pad rendered', async () => {
     await renderPane({ mode: 'full', interactive: true });
-    expect(screen.queryByRole('group', { name: /终端方向键/ })).toBeNull();
+    expect(screen.queryByRole('group', { name: /终端按键/ })).toBeNull();
   });
 
   it('arrowKeys prop renders the key pad and clicking an arrow forwards its CSI sequence as terminal input', async () => {
@@ -784,11 +784,11 @@ describe('PaneTerminal', () => {
     await act(async () => {
       ws.deliver({ type: 'session_gone', agentId: 'dev-1' });
     });
-    expect(container.textContent).toContain('session ended');
+    expect(container.textContent).toContain('会话已结束');
     await act(async () => {
       rerender(<PaneTerminal agentId="dev-2" mode="full" interactive />);
     });
-    expect(container.textContent).not.toContain('session ended');
+    expect(container.textContent).not.toContain('会话已结束');
   });
 });
 
@@ -815,7 +815,7 @@ describe('PaneTerminal control bar layout', () => {
     await renderPane({ mode: 'full', interactive: true, arrowKeys: true });
     await flushMacrotask();
 
-    const keypad = screen.getByRole('group', { name: /终端方向键/ });
+    const keypad = screen.getByRole('group', { name: /终端按键/ });
     const bar = keypad.parentElement!;
     expect(bar.className).toContain('grid');
     expect(bar.className).toContain('grid-cols-[1fr_auto_1fr]');
@@ -828,7 +828,7 @@ describe('PaneTerminal control bar layout', () => {
     await renderPane({ mode: 'full', interactive: true });
     await flushMacrotask();
     expect(screen.queryByRole('button', { name: /上传图片/ })).toBeNull();
-    expect(screen.queryByRole('group', { name: /终端方向键/ })).toBeNull();
+    expect(screen.queryByRole('group', { name: /终端按键/ })).toBeNull();
   });
 });
 

@@ -150,7 +150,7 @@ function LoginForm({
           disabled={submitting}
         />
         {displayError && (
-          <p role="alert" className="mt-2 text-xs text-danger">{displayError}</p>
+          <p role="alert" className="mt-2 text-xs text-accent">{displayError}</p>
         )}
         <button type="submit" disabled={submitting} className="btn-primary mt-4 w-full">
           {submitting ? '登录中…' : '登录'}

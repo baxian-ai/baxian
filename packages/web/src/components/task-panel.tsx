@@ -135,7 +135,7 @@ export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelPro
 
   return (
     <aside
-      aria-label="Task 面板"
+      aria-label="任务面板"
       className={`flex flex-col rounded-lg border border-hairline bg-surface ${className}`}
     >
       <div>
@@ -198,7 +198,7 @@ function DoneBody({ state }: { state: DoneState }) {
   return (
     <div className="divide-y divide-hairline">
       {state.items.map((task) => <TaskRow key={task.id} task={task} />)}
-      {state.error && <div className="px-3 py-2 text-xs text-danger">加载失败：{state.error}</div>}
+      {state.error && <div className="px-3 py-2 text-xs text-accent">加载失败：{state.error}</div>}
       {showEmpty && <div className="px-3 pb-3 pt-1 text-xs text-og-400">暂无已处理的任务</div>}
       {state.loading && state.items.length === 0 && (
         <div className="px-3 py-3 text-center text-xs text-og-400">加载中…</div>
@@ -248,7 +248,7 @@ function TaskRow({ task }: { task: TaskState }) {
       <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
       {task.phase === 'spec' && <span className="pill pill-review shrink-0">spec</span>}
       {overdue && <span className="pill pill-warn shrink-0" title="Review verdict missing">!</span>}
-      <span aria-label={`Round ${round}`} className="shrink-0 text-xs text-og-400">R{round}</span>
+      <span aria-label={`第 ${round} 轮`} className="shrink-0 text-xs text-og-400">R{round}</span>
       <TaskStatusDot status={task.status} />
     </button>
   );

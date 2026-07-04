@@ -57,27 +57,27 @@ export function GithubReviewPage() {
         <span className="pill">代码评审</span>
         {prUrl && prNumber !== undefined && (
           <a href={prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
-            Open PR #{prNumber}
+            查看 PR #{prNumber}
           </a>
         )}
       </div>
 
       {!loaded && <div className="text-sm text-og-500">加载中…</div>}
-      {loaded && error && <div className="text-sm text-danger">加载评审记录失败：{error}</div>}
+      {loaded && error && <div className="text-sm text-accent">加载评审记录失败：{error}</div>}
       {loaded && !error && data && !data.available && (
         <div className="text-sm text-og-500">{REASON_TEXT[reasonOf(data.reason) ?? 'no-pr']}</div>
       )}
       {loaded && !error && data?.available &&
         (data.items.length === 0 ? (
           data.error ? (
-            <div className="text-sm text-warn">评审记录拉取失败：{data.error}</div>
+            <div className="text-sm text-accent">评审记录拉取失败：{data.error}</div>
           ) : (
             <div className="text-sm text-og-400">评审尚未开始</div>
           )
         ) : (
           <>
             {data.error && (
-              <div className="mb-3 text-xs text-warn">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
+              <div className="mb-3 text-xs text-accent">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
             )}
             <div className="space-y-5">
               {rounds.map((round, i) => (
@@ -143,7 +143,7 @@ function ReviewBlock({ item }: { item: GithubReviewItem }) {
   return (
     <div className="card p-3 text-sm">
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className="shrink-0 min-w-[1.75rem] text-xs font-semibold uppercase tracking-wide text-[#c2410c]">
+        <span className="shrink-0 min-w-[1.75rem] text-xs font-semibold tracking-wide text-og-600">
           QA
         </span>
         <span className={GITHUB_REVIEW_VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
@@ -164,7 +164,7 @@ function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: str
       ) : placeholder ? (
         <div className="text-og-400">{placeholder}</div>
       ) : null}
-      {item.bodyTruncated && <div className="mt-1 text-xs text-warn">内容较大，已截断。</div>}
+      {item.bodyTruncated && <div className="mt-1 text-xs text-accent">内容较大，已截断。</div>}
     </>
   );
 }

@@ -10,6 +10,7 @@ import { taskDetailPath } from '../components/task-status.tsx';
 import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
+import { useTaskNotifications } from '../hooks/use-task-notifications.tsx';
 import type { AgentSnapshot, ProjectConfig } from '../shared/index.js';
 
 type ContinueState =
@@ -69,7 +70,7 @@ export function Dashboard() {
       aria-describedby={createTaskDisabled ? 'create-task-hint' : undefined}
       className="btn-ghost"
     >
-      + 新建 Task
+      + 新建任务
     </button>
   );
 
@@ -137,12 +138,13 @@ export function Dashboard() {
               >
                 Host 管理
               </button>
+              <TaskNotificationsMenuItem onAction={() => setMoreMenuOpen(false)} />
             </div>
           )}
         </div>
       </TopbarActions>
       <h1 className="sr-only">Dashboard</h1>
-      {error && <div className="mb-4 text-sm text-danger">Error: {error}</div>}
+      {error && <div className="mb-4 text-sm text-accent">加载失败：{error}</div>}
       {projectsLoaded && projects.length === 0 && !projectsError && (
         <div className="rounded-lg border border-hairline bg-surface py-12 text-center text-sm text-og-500">
           还没有项目。点击右上角"更多"菜单 → "新建项目"开始。
@@ -220,6 +222,38 @@ export function Dashboard() {
   );
 }
 
+function TaskNotificationsMenuItem({ onAction }: { onAction: () => void }) {
+  const { permission, enabled, requesting, enable, disable } = useTaskNotifications();
+  if (permission === 'unsupported') return null;
+  if (permission === 'denied') {
+    return (
+      <button
+        type="button"
+        role="menuitem"
+        disabled
+        className="block w-full cursor-default px-3 py-1.5 text-left text-sm text-og-500"
+      >
+        浏览器已拒绝任务完成通知
+      </button>
+    );
+  }
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      disabled={requesting}
+      onClick={() => {
+        onAction();
+        if (enabled) disable();
+        else enable();
+      }}
+      className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:text-og-1000 disabled:cursor-default disabled:opacity-60"
+    >
+      {enabled ? '关闭任务完成通知' : '开启任务完成通知'}
+    </button>
+  );
+}
+
 interface DashboardProjectProps {
   project: ProjectConfig;
   agentsById: Map<string, AgentSnapshot>;
@@ -249,13 +283,13 @@ function DashboardProject({
         <Link
           to={`/project/${project.id}`}
           className="ml-auto text-sm text-accent hover:text-accent-hover"
-          aria-label={`Details — ${project.id}`}
+          aria-label={`详情 — ${project.id}`}
         >
-          Details →
+          详情 →
         </Link>
       </div>
       {tasksError && (
-        <div className="mb-2 text-xs text-danger">任务列表加载失败：{tasksError}</div>
+        <div className="mb-2 text-xs text-accent">任务列表加载失败：{tasksError}</div>
       )}
       {project.agent.flat().length === 0 ? (
         <div className="rounded-lg border border-hairline bg-surface py-6 text-center text-sm text-og-500">

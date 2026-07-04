@@ -80,22 +80,28 @@
     @apply inline-block h-1.5 w-1.5 rounded-full bg-og-300;
   }
   .pill-live {
-    @apply bg-[#e6f4ec] text-success;
+    @apply bg-og-50 text-og-800;
   }
   .pill-live::before {
-    @apply bg-success;
+    @apply bg-og-1000;
   }
   .pill-warn {
-    @apply bg-[#fef3c7] text-warn;
-  }
-  .pill-warn::before {
-    @apply bg-warn;
-  }
-  .pill-review {
     @apply bg-accent-soft text-accent;
   }
-  .pill-review::before {
+  .pill-warn::before {
     @apply bg-accent;
+  }
+  .pill-review {
+    @apply bg-og-50 text-og-600;
+  }
+  .pill-review::before {
+    @apply bg-og-400;
+  }
+  .pill-idle {
+    @apply bg-og-50 text-og-500;
+  }
+  .pill-idle::before {
+    @apply bg-og-200;
   }
 
   .card {
@@ -105,17 +111,18 @@
   .status-dot {
     @apply inline-block h-[0.725rem] w-[0.725rem] shrink-0 rounded-full bg-og-50;
   }
+  /* Attention dots pulse twice then hold steady: WCAG 2.2.2 forbids >5s of looping motion. */
   .status-dot--warn {
-    @apply bg-[#fef3c7];
-    animation: breathe 1.8s ease-in-out infinite;
+    @apply bg-accent-soft;
+    animation: breathe 1.8s ease-in-out 2;
   }
   .status-dot--danger {
-    @apply bg-[#fef2f2];
-    animation: breathe 1.8s ease-in-out infinite;
+    @apply bg-accent-soft;
+    animation: breathe 1.8s ease-in-out 2;
   }
   .status-dot--info {
     @apply bg-accent-soft;
-    animation: breathe 1.8s ease-in-out infinite;
+    animation: breathe 1.8s ease-in-out 2;
   }
 }
 

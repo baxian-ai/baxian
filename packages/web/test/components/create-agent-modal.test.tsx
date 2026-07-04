@@ -173,8 +173,8 @@ it('submits a QA agent paired with an unpaired dev, with trimmed advanced option
   await renderReady(cfgWithAgents([[dev]]));
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'qa-a' } });
-  fireEvent.click(screen.getByRole('radio', { name: 'QA' }));
-  fireEvent.change(await screen.findByLabelText('配对 Dev Agent'), { target: { value: 'dev-a' } });
+  fireEvent.click(screen.getByRole('radio', { name: 'QA agent' }));
+  fireEvent.change(await screen.findByLabelText('配对 Dev agent'), { target: { value: 'dev-a' } });
   fireEvent.click(screen.getByRole('radio', { name: /Codex/ }));
   fireEvent.click(screen.getByRole('button', { name: /高级选项/ }));
   fireEvent.change(screen.getByLabelText(/Workdir/), { target: { value: '/tmp/qa-wd' } });
@@ -202,8 +202,8 @@ it('submits a QA agent paired with an unpaired dev, with trimmed advanced option
 
 it('keeps the QA radio disabled when the project has no unpaired dev', async () => {
   await renderReady();
-  expect((screen.getByRole('radio', { name: 'QA' }) as HTMLInputElement).disabled).toBe(true);
-  expect(screen.queryByLabelText('配对 Dev Agent')).toBeNull();
+  expect((screen.getByRole('radio', { name: 'QA agent' }) as HTMLInputElement).disabled).toBe(true);
+  expect(screen.queryByLabelText('配对 Dev agent')).toBeNull();
 });
 
 it('surfaces an addAgent failure inline and keeps the modal open', async () => {

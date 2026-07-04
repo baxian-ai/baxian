@@ -250,7 +250,7 @@ export function HostManagementModal({ open, onClose }: Props) {
       footer={view === 'list' ? listFooter : formFooter}
     >
       {error && (
-        <div className="mb-3 rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-sm text-danger">
+        <div className="mb-3 rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
           {error}
         </div>
       )}
@@ -279,7 +279,7 @@ export function HostManagementModal({ open, onClose }: Props) {
                       编辑
                     </button>
                     <button type="button" onClick={() => handleDelete(h)}
-                      className="text-xs text-danger transition-colors hover:opacity-80">
+                      className="text-xs text-accent transition-colors hover:opacity-80">
                       删除
                     </button>
                   </div>
@@ -303,7 +303,7 @@ export function HostManagementModal({ open, onClose }: Props) {
               onChange={e => setForm({ ...form, port: e.target.value })}
               className={inputCls} placeholder="22" disabled={submitting} />
             {form.port.trim() !== '' && !portValid && (
-              <div className="mt-1 text-xs text-danger">端口需为 1–65535 的整数</div>
+              <div className="mt-1 text-xs text-accent">端口需为 1–65535 的整数</div>
             )}
           </div>
           <div>
@@ -327,14 +327,14 @@ export function HostManagementModal({ open, onClose }: Props) {
               disabled={submitting || clearPassword} autoComplete="new-password" />
             {editingId && hadPassword && (
               <label className="mt-1.5 flex items-center gap-2 text-xs text-og-700">
-                <input type="checkbox" className="h-3.5 w-3.5 accent-[#1348dc]" checked={clearPassword}
+                <input type="checkbox" className="h-3.5 w-3.5 accent-accent" checked={clearPassword}
                   onChange={e => setClearPassword(e.target.checked)} disabled={submitting} />
                 清除已保存的密码（改用 key 登录）
               </label>
             )}
           </div>
 
-          <div className="rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5 text-xs text-warn">
+          <div className="rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
             建议为该 Host 配置好<strong className="font-semibold">免密码登入（SSH key）</strong>。
             否则填写的密码将以<strong className="font-semibold">明文</strong>保存到 baxian.json 中。
           </div>
@@ -345,19 +345,19 @@ export function HostManagementModal({ open, onClose }: Props) {
               {probing ? '测试中…' : '测试连接'}
             </button>
             {probeResult?.ssh && (
-              <div className={`text-xs ${probeResult.ssh.ok ? 'text-success' : 'text-danger'}`}>
+              <div className={`text-xs ${probeResult.ssh.ok ? 'text-og-800' : 'text-accent'}`}>
                 SSH: {probeResult.ssh.ok ? '✓' : '⨯'} {probeResult.ssh.message}
               </div>
             )}
             {probeResult && (
               probeResult.tmux.ok ? (
-                <div className="text-xs text-success">tmux: ✓ {probeResult.tmux.path ?? ''}</div>
+                <div className="text-xs text-og-800">tmux: ✓ {probeResult.tmux.path ?? ''}</div>
               ) : (
-                <div className="text-xs text-danger">
+                <div className="text-xs text-accent">
                   tmux: ⨯ {probeResult.tmux.message}
                   {probeResult.ssh?.ok && (
                     <button type="button" onClick={handleInstallTmux} disabled={installingTmux || submitting}
-                      className="ml-2 text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
+                      className="ml-2 text-accent underline transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
                       {installingTmux ? '安装中…' : '一键安装'}
                     </button>
                   )}
@@ -368,7 +368,7 @@ export function HostManagementModal({ open, onClose }: Props) {
               <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
             )}
             {!installingTmux && tmuxInstall && (
-              <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-success' : 'text-danger'}`}>
+              <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-og-800' : 'text-accent'}`}>
                 {tmuxInstall.ok ? '✓ ' : '⨯ '}{tmuxInstall.message}
               </div>
             )}

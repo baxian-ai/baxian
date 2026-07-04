@@ -132,14 +132,14 @@ export function Project() {
   };
 
   if (!project) {
-    if (projectError) return <div className="text-sm text-danger">Error: {projectError}</div>;
+    if (projectError) return <div className="text-sm text-accent">Error: {projectError}</div>;
     return <div className="text-sm text-og-500">Loading…</div>;
   }
 
   return (
     <div>
       <TopbarActions>
-        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-ghost">+ 新建 Task</button>
+        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-ghost">+ 新建任务</button>
         <div className="relative">
           <button
             ref={menuButtonRef}
@@ -184,7 +184,7 @@ export function Project() {
                   onClick={() => { setMenuOpen(false); setTaskPanelOpen(true); menuButtonRef.current?.focus(); }}
                   className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:bg-og-50 hover:text-og-1000"
                 >
-                  显示 Task 面板
+                  显示 任务面板
                 </button>
               )}
               <button
@@ -202,7 +202,7 @@ export function Project() {
                 onClick={() => { setMenuOpen(false); setDeleteOpen(true); }}
                 disabled={!canDelete}
                 title={canDelete ? undefined : `请先删除项目下的 ${agentCount} 个 Agent`}
-                className="block w-full px-3 py-1.5 text-left text-sm text-danger hover:bg-[#fef2f2] disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
+                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
               >
                 删除项目…
               </button>
@@ -210,7 +210,7 @@ export function Project() {
           )}
         </div>
       </TopbarActions>
-      {error && <div className="mb-4 text-sm text-danger">Error: {error}</div>}
+      {error && <div className="mb-4 text-sm text-accent">Error: {error}</div>}
       <div className="mb-6 flex items-baseline gap-x-3">
         <h1 className="min-w-0 truncate font-display text-sm font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
         <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
@@ -250,7 +250,7 @@ export function Project() {
               <button
                 type="button"
                 onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
-                aria-label="关闭 Task 面板"
+                aria-label="关闭 任务面板"
                 className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -297,7 +297,7 @@ export function Project() {
               type="button"
               onClick={() => void handleDeleteProject()}
               disabled={!deleteConfirmed || deleting}
-              className="btn-secondary !text-danger hover:!bg-[#fef2f2] hover:!text-danger disabled:!text-og-300"
+              className="btn-primary"
             >
               {deleting ? '删除中…' : '确认删除'}
             </button>
@@ -325,7 +325,7 @@ export function Project() {
             className="w-full rounded border border-hairline bg-surface px-3 py-2 font-mono text-sm text-og-1000 focus:border-accent focus:outline-none"
           />
           {deleteError && (
-            <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-xs text-danger">
+            <div className="rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-xs text-accent">
               {deleteError}
             </div>
           )}

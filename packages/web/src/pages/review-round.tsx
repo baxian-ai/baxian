@@ -6,14 +6,14 @@ import { useReviewRounds } from '../hooks/use-review-rounds.ts';
 import { DiffView } from '../components/diff-view.tsx';
 
 const SEVERITY_CLASS: Record<FindingSeverity, string> = {
-  critical: 'pill !bg-[#fdecea] !text-danger',
+  critical: 'pill pill-warn font-semibold',
   major: 'pill pill-warn',
   minor: 'pill',
 };
 
 const ACTION_CLASS: Record<FindingResponse['action'], string> = {
   fix: 'pill pill-live',
-  reject: 'pill pill-warn',
+  reject: 'pill pill-review',
   'out-of-scope': 'pill',
 };
 
@@ -75,10 +75,10 @@ export function ReviewRoundPage() {
 
       {!loaded && <div className="text-sm text-og-500">加载中…</div>}
       {loaded && error && (
-        <div className="text-sm text-danger">加载评审记录失败：{error}</div>
+        <div className="text-sm text-accent">加载评审记录失败：{error}</div>
       )}
       {loaded && !error && !data && (
-        <div className="text-sm text-danger">未找到该轮评审（{phase} 第 {round} 轮）。</div>
+        <div className="text-sm text-accent">未找到该轮评审（{phase} 第 {round} 轮）。</div>
       )}
       {data && <RoundDetail round={data} />}
     </div>
@@ -97,7 +97,7 @@ function RoundDetail({ round }: { round: ReviewRound }) {
           {round.phase === 'spec' ? '规格稿' : '代码改动'}
         </h2>
         {round.contentTruncated && (
-          <div className="mb-2 text-xs text-warn">内容较大，展示的是截断后的片段。</div>
+          <div className="mb-2 text-xs text-accent">内容较大，展示的是截断后的片段。</div>
         )}
         {round.content ? (
           round.phase === 'spec' ? (

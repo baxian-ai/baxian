@@ -94,7 +94,7 @@ function ReviewRounds({ task }: Props) {
     navigate(`/tasks/${encodeURIComponent(task.id)}/rounds/${phase}/${round}${hash}`);
   }
 
-  if (error) return <div className="text-sm text-danger">加载评审记录失败：{error}</div>;
+  if (error) return <div className="text-sm text-accent">加载评审记录失败：{error}</div>;
   if (!loaded) return <div className="text-sm text-og-400">加载评审记录…</div>;
   if ((rounds?.length ?? 0) === 0) return <div className="text-sm text-og-400">评审尚未开始</div>;
 

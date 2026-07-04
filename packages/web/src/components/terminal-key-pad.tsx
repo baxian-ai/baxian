@@ -52,19 +52,32 @@ function ArrowButton({ arrow, onPress }: ArrowButtonProps) {
 
 export interface TerminalKeyPadProps {
   onKey: (key: ArrowKey) => void;
+  onEscape?: () => void;
   className?: string;
 }
 
-export function TerminalKeyPad({ onKey, className }: TerminalKeyPadProps) {
+export function TerminalKeyPad({ onKey, onEscape, className }: TerminalKeyPadProps) {
   return (
     <div
       role="group"
-      aria-label="终端方向键"
+      aria-label="终端按键"
       className={
         className ??
         'flex flex-none items-center justify-center gap-1 border-t border-hairline bg-page px-3 py-2'
       }
     >
+      {onEscape && (
+        <button
+          type="button"
+          aria-label="Esc 键"
+          data-key="escape"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={onEscape}
+          className="mr-2 flex h-8 items-center justify-center rounded border border-hairline bg-surface px-2.5 font-mono text-xs text-og-700 transition-colors hover:bg-og-50 hover:text-og-1000 active:bg-og-200"
+        >
+          ESC
+        </button>
+      )}
       <ArrowButton arrow={ARROW_BY_KEY.left} onPress={onKey} />
       <ArrowButton arrow={ARROW_BY_KEY.up} onPress={onKey} />
       <ArrowButton arrow={ARROW_BY_KEY.down} onPress={onKey} />

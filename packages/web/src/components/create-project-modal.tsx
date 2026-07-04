@@ -22,7 +22,7 @@ const REPO_URL_PATTERNS = [
 const inputCls =
   'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
 const labelCls = 'mb-1.5 block text-xs font-medium text-og-700';
-const fieldErrCls = 'mt-1 text-xs text-danger';
+const fieldErrCls = 'mt-1 text-xs text-accent';
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [id, setId] = useState('');
@@ -125,7 +125,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     >
       <form id="create-project-form" onSubmit={handleSubmit} className="space-y-3">
         {error && (
-          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-sm text-danger">
+          <div className="rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
             {error}
           </div>
         )}
@@ -167,7 +167,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               checked={merge === null}
               onChange={() => setMerge(null)}
               disabled={submitting}
-              className="h-3.5 w-3.5 accent-[#1348dc]"
+              className="h-3.5 w-3.5 accent-accent"
             />
             <span className="text-sm text-og-800">人类合并（默认）</span>
           </label>
@@ -178,7 +178,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               checked={merge === 'auto'}
               onChange={() => setMerge('auto')}
               disabled={submitting}
-              className="h-3.5 w-3.5 accent-[#1348dc]"
+              className="h-3.5 w-3.5 accent-accent"
             />
             <span className="text-sm text-og-800">QA Approve 后自动合并</span>
           </label>
@@ -192,12 +192,12 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               checked={specApproval === 'human'}
               onChange={e => setSpecApproval(e.target.checked ? 'human' : null)}
               disabled={submitting}
-              className="h-3.5 w-3.5 accent-[#1348dc]"
+              className="h-3.5 w-3.5 accent-accent"
             />
             <span className="text-sm text-og-800">Spec 需由人类审核</span>
           </label>
           <div className="mt-1 text-xs text-og-500">
-            勾选后，走 SDD 的任务在 QA 通过 Spec 后停驻，等你在任务页通过或打回；是否走 SDD 仍由 dev agent 按任务复杂度判定。
+            勾选后，走 SDD 的任务在 QA agent 通过 Spec 后停驻，等你在任务页通过或打回；是否走 SDD 仍由 Dev agent 按任务复杂度判定。
           </div>
         </div>
 
@@ -210,7 +210,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               checked={reviewMode === ''}
               onChange={() => setReviewMode('')}
               disabled={submitting}
-              className="h-3.5 w-3.5 accent-[#1348dc]"
+              className="h-3.5 w-3.5 accent-accent"
             />
             <span className="text-sm text-og-800">跟随全局</span>
           </label>
@@ -221,7 +221,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               checked={reviewMode === 'github'}
               onChange={() => setReviewMode('github')}
               disabled={submitting}
-              className="h-3.5 w-3.5 accent-[#1348dc]"
+              className="h-3.5 w-3.5 accent-accent"
             />
             <span className="text-sm text-og-800">GitHub PR</span>
           </label>
@@ -232,7 +232,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               checked={reviewMode === 'server'}
               onChange={() => setReviewMode('server')}
               disabled={submitting}
-              className="h-3.5 w-3.5 accent-[#1348dc]"
+              className="h-3.5 w-3.5 accent-accent"
             />
             <span className="text-sm text-og-800">Server</span>
           </label>

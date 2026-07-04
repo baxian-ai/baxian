@@ -228,7 +228,7 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
                         aria-label={`删除 ${pet.displayName}`}
                         onClick={() => void handleDelete(pet.id, pet.displayName)}
                         disabled={busy}
-                        className="shrink-0 text-xs text-danger hover:underline disabled:opacity-50"
+                        className="shrink-0 text-xs text-accent hover:underline disabled:opacity-50"
                       >
                         删除
                       </button>

@@ -46,11 +46,13 @@ export function parseUnifiedDiff(content: string): DiffLine[] {
   return out;
 }
 
+// Diff add/del keep the universal red/green convention: they are content, not chrome,
+// so they sit outside the ink+accent color budget (same rationale as terminal ANSI colors).
 const LINE_CLASS: Record<DiffLineType, string> = {
   file: 'bg-og-50 font-semibold text-og-700',
   hunk: 'bg-accent-soft text-accent',
-  add: 'bg-[#e6f4ec] text-success',
-  del: 'bg-[#fdecea] text-danger',
+  add: 'bg-diff-add text-diff-add-ink',
+  del: 'bg-diff-del text-diff-del-ink',
   context: 'text-og-700',
   meta: 'text-og-400',
 };

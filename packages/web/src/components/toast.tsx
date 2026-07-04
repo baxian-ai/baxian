@@ -1,4 +1,5 @@
-import { createContext, useCallback, useContext, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useState, type ComponentType, type ReactNode, type SVGProps } from 'react';
+import { AlertTriangleIcon, CheckCircleIcon, XCircleIcon } from './icons.tsx';
 
 export type ToastKind = 'success' | 'warn' | 'error';
 
@@ -20,15 +21,15 @@ interface ToastContextValue {
 const ToastContext = createContext<ToastContextValue | null>(null);
 
 const KIND_CLASS: Record<ToastKind, string> = {
-  success: 'border-[#bbf7d0] bg-[#f0fdf4] text-success',
-  warn: 'border-[#fde68a] bg-[#fef3c7] text-warn',
-  error: 'border-[#fecaca] bg-[#fef2f2] text-danger',
+  success: 'border-hairline bg-surface text-og-800',
+  warn: 'border-accent/25 bg-accent-soft text-accent',
+  error: 'border-accent/25 bg-accent-soft text-accent',
 };
 
-const KIND_ICON: Record<ToastKind, string> = {
-  success: '✅',
-  warn: '⚠️',
-  error: '❌',
+const KIND_ICON: Record<ToastKind, ComponentType<SVGProps<SVGSVGElement>>> = {
+  success: CheckCircleIcon,
+  warn: AlertTriangleIcon,
+  error: XCircleIcon,
 };
 
 let nextId = 1;
@@ -58,7 +59,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             role="status"
           >
             <div className="flex items-start gap-2">
-              <span aria-hidden className="text-sm">{KIND_ICON[t.kind]}</span>
+              {(() => { const Icon = KIND_ICON[t.kind]; return <Icon className="mt-0.5 shrink-0" width={14} height={14} />; })()}
               <div className="flex-1">
                 <div className="text-sm font-semibold">{t.title}</div>
                 {t.body && <div className="mt-1 whitespace-pre-line text-xs text-og-700">{t.body}</div>}
@@ -67,7 +68,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 type="button"
                 onClick={() => dismiss(t.id)}
                 className="text-current opacity-50 transition-opacity hover:opacity-100"
-                aria-label="Dismiss"
+                aria-label="关闭通知"
               >
                 ✕
               </button>

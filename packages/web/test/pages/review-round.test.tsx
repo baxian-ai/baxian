@@ -50,7 +50,7 @@ describe('ReviewRoundPage', () => {
     expect(screen.getByText('fixed it')).toBeTruthy();
     expect(screen.getByText('abcdef123')).toBeTruthy();
     const added = Array.from(document.querySelectorAll('div')).find((d) => d.textContent === '+new');
-    expect(added?.className).toContain('text-success');
+    expect(added?.className).toContain('text-diff-add-ink');
   });
 
   it('renders spec content as text and uses location for spec findings', async () => {

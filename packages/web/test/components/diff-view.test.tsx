@@ -80,7 +80,7 @@ describe('DiffView', () => {
     const rows = Array.from(container.querySelectorAll('div'));
     const added = rows.find((d) => d.textContent === '+new');
     const removed = rows.find((d) => d.textContent === '-old');
-    expect(added?.className).toContain('text-success');
-    expect(removed?.className).toContain('text-danger');
+    expect(added?.className).toContain('text-diff-add-ink');
+    expect(removed?.className).toContain('text-diff-del-ink');
   });
 });

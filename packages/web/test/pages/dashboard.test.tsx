@@ -44,6 +44,7 @@ import { api } from '../../src/api.ts';
 import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
 import { makeProject } from '../helpers/fixtures.ts';
 import { Dashboard } from '../../src/pages/dashboard.tsx';
+import { TaskNotificationsProvider } from '../../src/hooks/use-task-notifications.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
 function seed(projects: ProjectConfig[], agents: AgentSnapshot[] = []): void {
@@ -55,10 +56,34 @@ function seed(projects: ProjectConfig[], agents: AgentSnapshot[] = []): void {
 function renderDashboard() {
   return render(
     <MemoryRouter>
-      <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-      <Dashboard />
+      <TaskNotificationsProvider>
+        <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
+        <Dashboard />
+      </TaskNotificationsProvider>
     </MemoryRouter>,
   );
+}
+
+const originalNotification = window.Notification;
+
+function installNotificationMock(permission: NotificationPermission) {
+  const requestPermission = vi.fn<() => Promise<NotificationPermission>>();
+  class MockNotification {
+    static permission = permission;
+    static requestPermission = requestPermission;
+  }
+  Object.defineProperty(window, 'Notification', {
+    configurable: true,
+    value: MockNotification,
+  });
+  return { requestPermission, MockNotification };
+}
+
+function restoreNotification(): void {
+  Object.defineProperty(window, 'Notification', {
+    configurable: true,
+    value: originalNotification,
+  });
 }
 
 beforeEach(() => {
@@ -85,6 +110,8 @@ beforeEach(() => {
   projectTasksHookState.data = [];
   projectTasksHookState.loaded = true;
   projectTasksHookState.error = null;
+  localStorage.clear();
+  restoreNotification();
 });
 
 describe('Dashboard layout', () => {
@@ -127,7 +154,7 @@ describe('Dashboard layout', () => {
     const idLink = within(heading).getByRole('link', { name: 'demo' });
     expect(idLink.getAttribute('href')).toBe('/project/demo');
 
-    const detailsLink = screen.getByRole('link', { name: /Details/ });
+    const detailsLink = screen.getByRole('link', { name: /详情/ });
     expect(detailsLink.getAttribute('href')).toBe('/project/demo');
     expect(detailsLink.getAttribute('aria-label')).toMatch(/demo/);
 
@@ -144,8 +171,8 @@ describe('Dashboard layout', () => {
     ]);
     renderDashboard();
 
-    const alphaDetails = screen.getByRole('link', { name: /Details.*alpha/ });
-    const betaDetails = screen.getByRole('link', { name: /Details.*beta/ });
+    const alphaDetails = screen.getByRole('link', { name: /详情.*alpha/ });
+    const betaDetails = screen.getByRole('link', { name: /详情.*beta/ });
     expect(alphaDetails.getAttribute('href')).toBe('/project/alpha');
     expect(betaDetails.getAttribute('href')).toBe('/project/beta');
     expect(alphaDetails).not.toBe(betaDetails);
@@ -207,12 +234,12 @@ describe('Dashboard layout', () => {
     expect(groupWrapper.className).not.toContain('space-y-3');
   });
 
-  it('renders "新建 Task" as a low-key text-style button and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
+  it('renders "新建任务" as a low-key text-style button and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = screen.getByRole('button', { name: '+ 新建 Task' });
+    const taskBtn = screen.getByRole('button', { name: '+ 新建任务' });
     expect(taskBtn.className).toContain('btn-ghost');
     expect(taskBtn.className).not.toContain('btn-primary');
     expect(topbarActions.contains(taskBtn)).toBe(true);
@@ -233,12 +260,12 @@ describe('Dashboard layout', () => {
     expect(toolbar.lastElementChild).toBe(triggerWrapper);
   });
 
-  it('keeps the disabled Dashboard "新建 Task" action in the topbar when there is no project yet', () => {
+  it('keeps the disabled Dashboard "新建任务" action in the topbar when there is no project yet', () => {
     seed([]);
     renderDashboard();
 
     const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建 Task' }) as HTMLButtonElement;
+    const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建任务' }) as HTMLButtonElement;
     expect(taskBtn.disabled).toBe(true);
     expect(taskBtn.getAttribute('title')).toBeNull();
     expect(taskBtn.parentElement?.getAttribute('title')).toBe('请先创建项目');
@@ -388,5 +415,280 @@ describe('Dashboard 项目已创建 follow-up modal', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog', { name: '项目已创建' })).toBeNull());
     expect(screen.queryByTestId('agent-modal')).toBeNull();
+  });
+});
+
+describe('Dashboard kebab menu 任务完成通知 entry', () => {
+  const STORAGE_KEY = 'baxian.taskNotifications.enabled';
+
+  function openMoreMenu(): void {
+    fireEvent.click(screen.getByRole('button', { name: '更多操作' }));
+  }
+
+  it('hides the notification entry when the browser has no Notification API', () => {
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '新建项目' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'Host 管理' })).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: /任务完成通知/ })).toBeNull();
+  });
+
+  it('permission not asked yet: "开启任务完成通知" requests permission, closes the menu, then flips to "关闭"', async () => {
+    const notification = installNotificationMock('default');
+    notification.requestPermission.mockImplementation(async () => {
+      notification.MockNotification.permission = 'granted';
+      return 'granted';
+    });
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+
+    expect(screen.queryByRole('menu')).toBeNull();
+    await waitFor(() => expect(notification.requestPermission).toHaveBeenCalledTimes(1));
+    await act(async () => { await Promise.resolve(); });
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('permission granted: toggles the stored preference between off and on without re-requesting permission', async () => {
+    const notification = installNotificationMock('granted');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '关闭任务完成通知' }));
+    expect(screen.queryByRole('menu')).toBeNull();
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('0');
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
+    expect(notification.requestPermission).not.toHaveBeenCalled();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('starts as "开启任务完成通知" when the stored preference is off', () => {
+    installNotificationMock('granted');
+    localStorage.setItem(STORAGE_KEY, '0');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
+  });
+
+  it('permission denied: shows a disabled hint instead of a toggle', () => {
+    const notification = installNotificationMock('denied');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    const item = screen.getByRole('menuitem', { name: '浏览器已拒绝任务完成通知' }) as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+
+    fireEvent.click(item);
+    expect(notification.requestPermission).not.toHaveBeenCalled();
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it('persists the enable preference only after the permission request settles', async () => {
+    const notification = installNotificationMock('default');
+    let resolveRequest: (permission: NotificationPermission) => void = () => {};
+    notification.requestPermission.mockImplementation(
+      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
+    );
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+    expect(notification.requestPermission).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+
+    await act(async () => {
+      notification.MockNotification.permission = 'granted';
+      resolveRequest('granted');
+      await Promise.resolve();
+    });
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('a disable from another tab during the pending permission request is not overwritten when it settles', async () => {
+    const notification = installNotificationMock('default');
+    let resolveRequest: (permission: NotificationPermission) => void = () => {};
+    notification.requestPermission.mockImplementation(
+      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
+    );
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+
+    act(() => {
+      localStorage.setItem(STORAGE_KEY, '0');
+      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '0' }));
+    });
+
+    await act(async () => {
+      notification.MockNotification.permission = 'granted';
+      resolveRequest('granted');
+      await Promise.resolve();
+    });
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('0');
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
+  });
+
+  it('a focus event during the pending permission request does not clobber the enable intent', async () => {
+    const notification = installNotificationMock('default');
+    localStorage.setItem(STORAGE_KEY, '0');
+    let resolveRequest: (permission: NotificationPermission) => void = () => {};
+    notification.requestPermission.mockImplementation(
+      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
+    );
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    await act(async () => {
+      notification.MockNotification.permission = 'granted';
+      resolveRequest('granted');
+      await Promise.resolve();
+    });
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('clicking 开启 after the permission was granted elsewhere syncs state instead of dead-ending', async () => {
+    const notification = installNotificationMock('default');
+    seed([]);
+    renderDashboard();
+
+    notification.MockNotification.permission = 'granted';
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+    expect(notification.requestPermission).not.toHaveBeenCalled();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('a storage event also re-reads the real notification permission', () => {
+    const notification = installNotificationMock('default');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
+
+    notification.MockNotification.permission = 'granted';
+    act(() => {
+      localStorage.setItem(STORAGE_KEY, '1');
+      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '1' }));
+    });
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('a queued stale disable event drives the entry by its newValue, not by re-reading current storage', () => {
+    installNotificationMock('granted');
+    localStorage.setItem(STORAGE_KEY, '1');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '0' }));
+    });
+    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
+
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '1' }));
+    });
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('follows a storage event from another tab so the entry flips without a reload', () => {
+    installNotificationMock('granted');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+
+    act(() => {
+      localStorage.setItem(STORAGE_KEY, '0');
+      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '0' }));
+    });
+    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
+
+    act(() => {
+      localStorage.setItem(STORAGE_KEY, '1');
+      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '1' }));
+    });
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+  });
+
+  it('re-reads the stored preference on window focus', () => {
+    installNotificationMock('granted');
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
+
+    act(() => {
+      localStorage.setItem(STORAGE_KEY, '0');
+      window.dispatchEvent(new Event('focus'));
+    });
+    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
+  });
+
+  it('disables the entry while the permission request is still pending', async () => {
+    const notification = installNotificationMock('default');
+    let resolveRequest: (permission: NotificationPermission) => void = () => {};
+    notification.requestPermission.mockImplementation(
+      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
+    );
+    seed([]);
+    renderDashboard();
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
+
+    openMoreMenu();
+    const pendingItem = screen.getByRole('menuitem', { name: '开启任务完成通知' }) as HTMLButtonElement;
+    expect(pendingItem.disabled).toBe(true);
+
+    await act(async () => {
+      notification.MockNotification.permission = 'granted';
+      resolveRequest('granted');
+      await Promise.resolve();
+    });
+    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
   });
 });

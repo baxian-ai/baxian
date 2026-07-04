@@ -12,12 +12,12 @@ import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
 export type TerminalMode = 'activity-preview' | 'embedded-full';
 
 const RUNTIME_BADGES: Record<AgentSnapshot['runtimeStatus'], { label: string; cls: string }> = {
-  unknown: { label: 'Unknown', cls: 'pill pill-idle' },
-  idle: { label: 'Idle', cls: 'pill pill-idle' },
-  pending: { label: 'Pending user', cls: 'pill pill-warn' },
-  working: { label: 'Working', cls: 'pill pill-live' },
-  waiting: { label: 'Waiting', cls: 'pill pill-review' },
-  error: { label: 'Error', cls: 'pill pill-warn' },
+  unknown: { label: '未知', cls: 'pill pill-idle' },
+  idle: { label: '空闲', cls: 'pill pill-idle' },
+  pending: { label: '待人工', cls: 'pill pill-warn' },
+  working: { label: '工作中', cls: 'pill pill-live' },
+  waiting: { label: '等待中', cls: 'pill pill-review' },
+  error: { label: '异常', cls: 'pill pill-warn' },
 };
 
 const AGENT_CARD_PET_HEIGHT = 72;
@@ -25,10 +25,10 @@ const AGENT_CARD_PET_HEIGHT = 72;
 type TmuxDotState = AgentSnapshot['tmuxSessionStatus'] | 'starting';
 
 const TMUX_DOTS: Record<Exclude<TmuxDotState, 'present'>, { label: string; modifier: string }> = {
-  absent: { label: 'No session', modifier: 'status-dot--warn' },
-  unreachable: { label: 'Host unreachable', modifier: 'status-dot--danger' },
-  unknown: { label: 'Session unknown', modifier: 'status-dot--warn' },
-  starting: { label: 'Starting session', modifier: 'status-dot--info' },
+  absent: { label: '无会话', modifier: 'status-dot--warn' },
+  unreachable: { label: '主机不可达', modifier: 'status-dot--danger' },
+  unknown: { label: '会话状态未知', modifier: 'status-dot--warn' },
+  starting: { label: '会话启动中', modifier: 'status-dot--info' },
 };
 
 function StatusDot({ state }: { state: TmuxDotState }) {
@@ -126,7 +126,7 @@ export function AgentCard({
     && agent.reason !== 'PENDING_HUMAN';
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const runtimeBadge = isBootstrapping
-    ? { label: 'Starting', cls: 'pill pill-review' }
+    ? { label: '启动中', cls: 'pill pill-review' }
     : RUNTIME_BADGES[agent.runtimeStatus];
   const tmuxDotState: TmuxDotState = isBootstrapping ? 'starting' : agent.tmuxSessionStatus;
   const showTerminalPreview = terminalMode === 'activity-preview' &&
@@ -156,15 +156,15 @@ export function AgentCard({
 
   const handleRequestReview = async () => {
     if (!taskId) return;
-    if (!window.confirm(`请 QA 对 task ${taskId} 重审？这会让 QA agent 立即开始新一轮 review（reviewRound +1）。`)) {
+    if (!window.confirm(`请 QA agent 对任务 ${taskId} 重审？这会立即开始新一轮 review（reviewRound +1）。`)) {
       return;
     }
     setReviewing(true);
     try {
       const updated = await api.tasks.review(taskId);
-      show({ kind: 'success', title: `已派 QA 重审 (round ${updated.reviewRound})` });
+      show({ kind: 'success', title: `已发起 QA 重审（第 ${updated.reviewRound} 轮）` });
     } catch (err) {
-      show({ kind: 'error', title: 'Review 派发失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: '发起评审失败', body: err instanceof Error ? err.message : String(err) });
     } finally {
       setReviewing(false);
     }
@@ -175,12 +175,12 @@ export function AgentCard({
     try {
       const result = await api.projects.bootstrap(projectId);
       if (result.ok) {
-        show({ kind: 'success', title: 'Bootstrap retry 完成', body: 'agent 状态将在下一次刷新生效。' });
+        show({ kind: 'success', title: '重试 bootstrap 完成', body: 'agent 状态将在下一次刷新生效。' });
       } else {
-        show({ kind: 'warn', title: 'Bootstrap retry 仍失败', body: '看一下红色错误卡的最新原因，按提示修复后再试。' });
+        show({ kind: 'warn', title: '重试 bootstrap 仍失败', body: '看一下红色错误卡的最新原因，按提示修复后再试。' });
       }
     } catch (err) {
-      show({ kind: 'error', title: 'Bootstrap retry 失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: '重试 bootstrap 失败', body: err instanceof Error ? err.message : String(err) });
     } finally {
       setRetryingBootstrap(false);
     }
@@ -189,7 +189,7 @@ export function AgentCard({
   const handleResume = async () => {
     const confirmMsg = needsRegreet
       ? `确认 Resume Agent ${agent.id}？greeting 能力未通过，baxian 会重跑能力握手（会话存活则重启 REPL，已丢失则重建）；握手通过才解除 Held。`
-      : `确认 Resume Agent ${agent.id}？baxian 会清除 awaiting_human 状态，agent 重新可派遣。`;
+      : `确认 Resume Agent ${agent.id}？baxian 会清除 awaiting_human 状态，agent 恢复可用。`;
     if (!window.confirm(confirmMsg)) return;
     setResuming(true);
     try {
@@ -227,7 +227,7 @@ export function AgentCard({
     } catch (err) {
       show({
         kind: 'error',
-        title: 'Compact 失败',
+        title: '压缩上下文失败',
         body: err instanceof Error ? err.message : String(err),
       });
     } finally {
@@ -244,7 +244,7 @@ export function AgentCard({
     } catch (err) {
       show({
         kind: 'error',
-        title: 'Clear 失败',
+        title: '清空上下文失败',
         body: err instanceof Error ? err.message : String(err),
       });
     } finally {
@@ -265,7 +265,7 @@ export function AgentCard({
         show({
           kind: 'warn',
           title: `已删除 Agent ${agent.id}`,
-          body: `配对的 QA Agent ${others} 也被一并移除。`,
+          body: `配对的 QA agent ${others} 也被一并移除。`,
         });
       } else {
         show({
@@ -320,7 +320,7 @@ export function AgentCard({
       )}
       <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-mono text-xs font-medium uppercase tracking-[0.05em] text-og-500">{role}</span>
+          <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">{role === 'qa' ? 'QA' : 'Dev'}</span>
           <span
             className="min-w-0 truncate whitespace-nowrap font-display text-sm font-semibold text-og-1000"
             title={agentRuntimeTitle(agent.id, runtime)}
@@ -338,14 +338,14 @@ export function AgentCard({
         </div>
         <div className="flex flex-wrap items-center justify-end gap-1">
           {isAwaitingHuman && (
-            <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? '需人工处理'}>Held</span>
+            <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? '需人工处理'}>挂起</span>
           )}
           {!agent.petId && (
             <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
           )}
           {agent.stale && (
             <span className="pill pill-warn" title={agent.observedAt ? `Last observed at ${agent.observedAt}` : undefined}>
-              Stale
+              失联
             </span>
           )}
           <StatusDot state={tmuxDotState} />
@@ -357,28 +357,27 @@ export function AgentCard({
         </div>
       )}
       {isAwaitingHuman && (
-        <div className="mb-2 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-2 text-xs text-warn">
+        <div className="mb-2 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
           <span className="font-mono">{agent.binding?.awaitingPhase}</span>
           {agent.binding?.awaitingReason && <span> · {agent.binding.awaitingReason}</span>}
         </div>
       )}
       {!isBootstrapping && agent.runtimeStatus === 'pending' && (
-        <div className="mb-2 space-y-1 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-2 text-xs text-warn">
+        <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
           <div className="font-medium">等待人工介入</div>
           <div>
-            Agent 正在等待人工输入。请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">Terminal</Link> 处理；
-            处理完后状态会随下一次观测刷新。
+            请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">终端</Link> 处理。
           </div>
         </div>
       )}
       {agent.latestError && (
-        <div className="mb-2 space-y-1 rounded-md border border-[#fecaca] bg-[#fef2f2] px-2.5 py-2 text-xs text-danger">
+        <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft px-2.5 py-2 text-xs text-accent">
           <div className="break-words font-medium">{agent.latestError.message}</div>
           <div className="font-mono text-xs opacity-80">{agent.latestError.reason} · {agent.latestError.occurredAt}</div>
         </div>
       )}
       {agent.latestBootstrapError && (
-        <div className="mb-2 space-y-1 rounded-md border border-[#fecaca] bg-[#fef2f2] px-2.5 py-2 text-xs text-danger">
+        <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft px-2.5 py-2 text-xs text-accent">
           <div className="break-words font-medium">{agent.latestBootstrapError.message}</div>
           {agent.latestBootstrapError.recommendation && (
             <div className="break-words">{agent.latestBootstrapError.recommendation}</div>
@@ -391,16 +390,16 @@ export function AgentCard({
               type="button"
               onClick={handleRetryBootstrap}
               disabled={retryingBootstrap}
-              className="btn-secondary shrink-0 !border-[#fecaca] !text-danger hover:!bg-[#fef2f2] hover:!border-danger hover:!text-danger"
+              className="btn-primary shrink-0"
             >
-              {retryingBootstrap ? 'Retrying…' : 'Retry bootstrap'}
+              {retryingBootstrap ? '重试中…' : '重试 bootstrap'}
             </button>
           </div>
         </div>
       )}
       {showTaskBinding && taskId && (
         <div className="mb-2 text-xs text-og-500">
-          Task: <span className="font-mono text-og-700">{taskId}</span>
+          任务：<span className="font-mono text-og-700">{taskId}</span>
         </div>
       )}
       {showTerminalPreview && (
@@ -433,26 +432,26 @@ export function AgentCard({
         </div>
       )}
       {pendingRestart && (
-        <div className="mb-2 rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-2.5 py-1.5 text-xs text-warn">
-          ⚠️ 重启 baxian server 后生效
+        <div className="mb-2 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-1.5 text-xs text-accent">
+          重启 baxian server 后生效
         </div>
       )}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-none">
           {terminalDisabled ? (
             <span className="shrink-0 cursor-not-allowed text-sm text-og-400" title={terminalDisabledMessage}>
-              Terminal
+              终端
             </span>
           ) : (
-            <Link to={`/terminal/${agent.id}`} className="btn-secondary shrink-0">Terminal</Link>
+            <Link to={`/terminal/${agent.id}`} className="btn-secondary shrink-0">终端</Link>
           )}
           {!pendingRestart && agent.runtimeStatus === 'working' && (
             <button
               onClick={handleStop}
               disabled={stopping}
-              className="btn-ghost shrink-0 !text-danger hover:!bg-[#fef2f2]"
+              className="btn-ghost shrink-0"
             >
-              {stopping ? 'Stopping…' : 'Stop'}
+              {stopping ? '停止中…' : '停止'}
             </button>
           )}
           {isAwaitingHuman && (
@@ -462,10 +461,10 @@ export function AgentCard({
               disabled={resuming}
               title={needsRegreet
                 ? '重跑 greeting 能力握手以恢复（会话存活则重启 REPL，已丢失则重建；greeting_failed 无法靠清状态解除）'
-                : '清除 awaiting_human 状态，让 agent 重新可派遣'}
-              className="btn-ghost shrink-0 !text-warn hover:!bg-[#fef3c7]/60"
+                : '清除 awaiting_human 状态，让 agent 恢复可用'}
+              className="btn-primary shrink-0"
             >
-              {resuming ? 'Resuming…' : 'Resume'}
+              {resuming ? '恢复中…' : '恢复'}
             </button>
           )}
         </div>
@@ -525,7 +524,7 @@ export function AgentCard({
                 title="向 agent runtime 发送 /compact 压缩上下文"
                 className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {compacting ? 'Compacting…' : 'Compact'}
+                {compacting ? '压缩中…' : '压缩上下文'}
               </button>
               <button
                 type="button"
@@ -535,7 +534,7 @@ export function AgentCard({
                 title="向 agent runtime 发送 /clear 清空上下文"
                 className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {clearing ? 'Clearing…' : 'Clear'}
+                {clearing ? '清空中…' : '清空上下文'}
               </button>
               {!pendingRestart && taskId && role === 'dev' && (
                 <button
@@ -543,10 +542,10 @@ export function AgentCard({
                   role="menuitem"
                   onClick={() => { setMenuOpen(false); void handleRequestReview(); }}
                   disabled={reviewing || deleting}
-                  title={`让 QA 立即对 task ${taskId} 跑一轮 review（需要该 task 已有 PR）`}
+                  title={`让 QA agent 立即对任务 ${taskId} 跑一轮 review（需要该任务已有 PR）`}
                   className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {reviewing ? 'Dispatching…' : 'Call review'}
+                  {reviewing ? '发起中…' : '发起评审'}
                 </button>
               )}
               <button
@@ -554,16 +553,16 @@ export function AgentCard({
                 role="menuitem"
                 onClick={() => { setMenuOpen(false); void handleDelete(); }}
                 disabled={deleting || compacting || clearing}
-                className="block w-full px-3 py-1.5 text-left text-sm text-danger hover:bg-[#fef2f2] disabled:opacity-50 disabled:cursor-not-allowed"
+                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {deleting ? 'Deleting…' : 'Delete'}
+                {deleting ? '删除中…' : '删除'}
               </button>
             </div>
           )}
         </div>
       </div>
-      {stopError && <div className="mt-1.5 break-words text-xs text-danger">{stopError}</div>}
-      {deleteError && <div className="mt-1.5 break-words text-xs text-danger">{deleteError}</div>}
+      {stopError && <div className="mt-1.5 break-words text-xs text-accent">{stopError}</div>}
+      {deleteError && <div className="mt-1.5 break-words text-xs text-accent">{deleteError}</div>}
       {petModalOpen && (
         <AgentPetConfigModal
           agentId={agent.id}

@@ -18,9 +18,9 @@ const PROBE_DEBOUNCE_MS = 500;
 const inputCls =
   'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
 const labelCls = 'mb-1.5 block text-xs font-medium text-og-700';
-const fieldErrCls = 'mt-1 text-xs text-danger';
+const fieldErrCls = 'mt-1 text-xs text-accent';
 const helpCls = 'mt-1 text-xs text-og-500';
-const radioCls = 'h-3.5 w-3.5 accent-[#1348dc]';
+const radioCls = 'h-3.5 w-3.5 accent-accent';
 
 interface FormState {
   id: string;
@@ -227,23 +227,23 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     if (probeLoading) return <span className="ml-2 text-xs text-og-400">…探测中</span>;
     if (!probe) return <span className="ml-2 text-xs text-og-400">?</span>;
     const status = probe.runtimes[rt];
-    if (status.ok) return <span className="ml-2 text-xs text-success">✓ {status.path ?? ''}</span>;
-    return <span className="ml-2 text-xs text-danger" title={status.message}>⨯ {status.message}</span>;
+    if (status.ok) return <span className="ml-2 text-xs text-og-800">✓ {status.path ?? ''}</span>;
+    return <span className="ml-2 text-xs text-accent" title={status.message}>⨯ {status.message}</span>;
   };
 
   const TmuxStatus = () => {
     if (form.mode === 'remote' && !form.host) return null;
     if (probeLoading && !installingTmux) return <div className="text-xs text-og-400">tmux: …探测中</div>;
     if (!probe) return null;
-    if (probe.tmux.ok) return <div className="text-xs text-success">tmux: ✓ {probe.tmux.path ?? ''}</div>;
+    if (probe.tmux.ok) return <div className="text-xs text-og-800">tmux: ✓ {probe.tmux.path ?? ''}</div>;
     const sshReady = form.mode === 'local' || !!probe.ssh?.ok;
     return (
       <div className="space-y-1">
-        <div className="text-xs text-danger">
+        <div className="text-xs text-accent">
           tmux: ⨯ {probe.tmux.message}
           {sshReady && (
             <button type="button" onClick={handleInstallTmux}
-              className="ml-2 text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              className="ml-2 text-accent underline transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
               disabled={installingTmux || submitting}>
               {installingTmux ? '安装中…' : '一键安装'}
             </button>
@@ -253,7 +253,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
         )}
         {!installingTmux && tmuxInstall && (
-          <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-success' : 'text-danger'}`}>
+          <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-og-800' : 'text-accent'}`}>
             {tmuxInstall.ok ? '✓ ' : '⨯ '}{tmuxInstall.message}
           </div>
         )}
@@ -263,8 +263,8 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const SshStatus = () => {
     if (form.mode !== 'remote' || !form.host || !probe?.ssh) return null;
-    if (probe.ssh.ok) return <div className="text-xs text-success">SSH: ✓ {probe.ssh.message}</div>;
-    return <div className="text-xs text-danger">SSH: ⨯ {probe.ssh.message}</div>;
+    if (probe.ssh.ok) return <div className="text-xs text-og-800">SSH: ✓ {probe.ssh.message}</div>;
+    return <div className="text-xs text-accent">SSH: ⨯ {probe.ssh.message}</div>;
   };
 
   return (
@@ -286,7 +286,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     >
       <form id="create-agent-form" onSubmit={handleSubmit} className="space-y-3">
         {error && (
-          <div className="rounded-md border border-[#fecaca] bg-[#fef2f2] px-3 py-2 text-sm text-danger">
+          <div className="rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
             {error}
           </div>
         )}
@@ -315,24 +315,24 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           <label className="mr-4 inline-flex items-center gap-2">
             <input type="radio" name="role" checked={form.role === 'dev'} className={radioCls}
               onChange={() => setForm({ ...form, role: 'dev', pairWith: '' })} disabled={submitting} />
-            <span className="text-sm text-og-800">Dev</span>
+            <span className="text-sm text-og-800">Dev agent</span>
           </label>
-          <label className="inline-flex items-center gap-2" title={!canSelectQa ? '请先创建一个 Dev Agent' : ''}>
+          <label className="inline-flex items-center gap-2" title={!canSelectQa ? '请先创建一个 Dev agent' : ''}>
             <input type="radio" name="role" checked={form.role === 'qa'} className={radioCls}
               onChange={() => setForm({ ...form, role: 'qa' })} disabled={submitting || !canSelectQa} />
-            <span className={`text-sm ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA</span>
+            <span className={`text-sm ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA agent</span>
           </label>
         </div>
 
         {form.role === 'qa' && (
           <div>
-            <label className={labelCls} htmlFor="pair-with">配对 Dev Agent</label>
+            <label className={labelCls} htmlFor="pair-with">配对 Dev agent</label>
             <select id="pair-with" value={form.pairWith}
               onChange={e => setForm({ ...form, pairWith: e.target.value })}
               className={inputCls} disabled={submitting}>
               <option value="">请选择</option>
               {unpairedDevs.map(d => (
-                <option key={d.id} value={d.id}>{d.id} (dev, {d.mode})</option>
+                <option key={d.id} value={d.id}>{d.id}（{d.mode}）</option>
               ))}
             </select>
           </div>
@@ -447,14 +447,14 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           )}
         </div>
 
-        <div className="rounded-md border border-[#fde68a] bg-[#fef3c7]/60 px-3 py-2.5">
+        <div className="rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5">
           <label className="flex cursor-pointer items-start gap-2">
-            <input type="checkbox" className="mt-1 h-3.5 w-3.5 accent-[#1348dc]" checked={form.yolo}
+            <input type="checkbox" className="mt-1 h-3.5 w-3.5 accent-accent" checked={form.yolo}
               onChange={e => setForm({ ...form, yolo: e.target.checked })}
               disabled={submitting} />
             <div className="text-sm text-og-800">
               <div className="font-medium">YOLO 模式（推荐开启）</div>
-              <div className="mt-1 text-xs text-warn">
+              <div className="mt-1 text-xs text-accent">
                 Agent 自主执行所有命令、文件改动，无需逐条确认。开启后体验更顺滑，
                 但<strong className="font-semibold">请确认在受控环境（容器、隔离 worktree）中运行</strong>。
               </div>

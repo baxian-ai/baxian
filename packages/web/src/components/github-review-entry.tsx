@@ -86,7 +86,7 @@ export function GithubReviewEntry({ task }: Props) {
   if (error) {
     return (
       <ReviewGroup>
-        <div className="text-sm text-danger">加载评审记录失败：{error}</div>
+        <div className="text-sm text-accent">加载评审记录失败：{error}</div>
       </ReviewGroup>
     );
   }
@@ -111,7 +111,7 @@ export function GithubReviewEntry({ task }: Props) {
     return (
       <ReviewGroup>
         {data.error ? (
-          <div className="text-sm text-warn">评审记录拉取失败：{data.error}</div>
+          <div className="text-sm text-accent">评审记录拉取失败：{data.error}</div>
         ) : (
           <div className="text-sm text-og-400">评审尚未开始</div>
         )}
@@ -124,7 +124,7 @@ export function GithubReviewEntry({ task }: Props) {
   return (
     <ReviewGroup>
       {data.error && (
-        <div className="text-xs text-warn">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
+        <div className="text-xs text-accent">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
       )}
       {rounds.map((round, index) => (
         <RoundBlock key={githubReviewRoundKey(round, String(index))} round={round} index={index} onOpen={open} />

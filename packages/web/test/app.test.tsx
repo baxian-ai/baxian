@@ -137,6 +137,7 @@ function restoreNotification(): void {
 
 beforeEach(() => {
   window.history.pushState({}, '', '/');
+  localStorage.clear();
   appMockState.projects = null;
   appMockState.refreshProjects.mockReset();
   appMockState.taskGet.mockReset();
@@ -261,21 +262,334 @@ describe('App shell layout', () => {
 });
 
 describe('Task completion notifications', () => {
-  it('requests browser notification permission from the topbar button click', async () => {
-    const notification = installNotificationMock('default');
-    notification.requestPermission.mockResolvedValue('granted');
+  it('renders no notification bell in the topbar — the entry lives in the Dashboard kebab menu', () => {
+    installNotificationMock('default');
+    appMockState.projects = [makeProject()];
+
+    const { container } = render(<App />);
+
+    expect(container.querySelector('nav button[aria-label*="任务完成通知"]')).toBeNull();
+    expect(screen.queryByRole('button', { name: '启用任务完成通知' })).toBeNull();
+    expect(appMockState.subscribe).not.toHaveBeenCalled();
+  });
+
+  it('does not subscribe to project task streams when notifications are turned off via the stored preference', async () => {
+    installNotificationMock('granted');
+    localStorage.setItem('baxian.taskNotifications.enabled', '0');
     appMockState.projects = [makeProject()];
 
     render(<App />);
 
+    await act(async () => { await Promise.resolve(); });
     expect(appMockState.subscribe).not.toHaveBeenCalled();
-    const button = screen.getByRole('button', { name: '启用任务完成通知' });
-    fireEvent.click(button);
+  });
 
-    await waitFor(() => expect(notification.requestPermission).toHaveBeenCalledTimes(1));
-    await waitFor(() => {
-      expect((screen.getByRole('button', { name: '任务完成通知已启用' }) as HTMLButtonElement).disabled).toBe(true);
+  it('drops an in-flight completion confirmation when notifications are disabled before it resolves', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    let resolveGet: (task: TaskState) => void = () => {};
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+
+    act(() => {
+      localStorage.setItem('baxian.taskNotifications.enabled', '0');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '0' }),
+      );
     });
+
+    await act(async () => {
+      resolveGet(makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(0);
+  });
+
+  it('keeps a pre-disable confirmation dead even when notifications are re-enabled before it resolves', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    let resolveGet: (task: TaskState) => void = () => {};
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+    const subscribeCallsBefore = appMockState.subscribe.mock.calls.length;
+
+    act(() => {
+      localStorage.setItem('baxian.taskNotifications.enabled', '0');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '0' }),
+      );
+    });
+    act(() => {
+      localStorage.setItem('baxian.taskNotifications.enabled', '1');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '1' }),
+      );
+    });
+    await waitFor(() => {
+      expect(appMockState.subscribe.mock.calls.length).toBeGreaterThan(subscribeCallsBefore);
+    });
+
+    await act(async () => {
+      resolveGet(makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(0);
+  });
+
+  it('keeps an in-flight completion confirmation alive across an unrelated project-list change', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    let resolveGet: (task: TaskState) => void = () => {};
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
+    );
+
+    const view = render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+
+    appMockState.projects = [makeProject(), makeProject({ id: 'other' })];
+    view.rerender(<App />);
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:other',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+
+    await act(async () => {
+      resolveGet(makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(1);
+    expect(notification.instances[0].options?.body).toContain('状态：已合并');
+  });
+
+  it('drops an in-flight completion confirmation when its own project is removed', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    let resolveGet: (task: TaskState) => void = () => {};
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
+    );
+
+    const view = render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+
+    appMockState.projects = [makeProject({ id: 'other' })];
+    view.rerender(<App />);
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:other',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+
+    await act(async () => {
+      resolveGet(makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(0);
+  });
+
+  it('keeps a removed project\'s pre-removal confirmation dead even when the project returns before it resolves', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    let resolveGet: (task: TaskState) => void = () => {};
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
+    );
+
+    const view = render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+
+    appMockState.projects = [makeProject({ id: 'other' })];
+    view.rerender(<App />);
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:other',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+
+    appMockState.projects = [makeProject(), makeProject({ id: 'other' })];
+    view.rerender(<App />);
+    await waitFor(() => {
+      const projSubscribes = appMockState.subscribe.mock.calls
+        .filter(call => call[0] === 'project-tasks:proj');
+      expect(projSubscribes.length).toBe(2);
+    });
+
+    await act(async () => {
+      resolveGet(makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(0);
+  });
+
+  it('re-confirms a new completion after remove/re-add instead of being starved by the stale in-flight key', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    const resolvers: Array<(task: TaskState) => void> = [];
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolvers.push(resolve); }),
+    );
+
+    const view = render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(1));
+
+    appMockState.projects = [makeProject({ id: 'other' })];
+    view.rerender(<App />);
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:other',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+
+    appMockState.projects = [makeProject(), makeProject({ id: 'other' })];
+    view.rerender(<App />);
+    await waitFor(() => {
+      const projSubscribes = appMockState.subscribe.mock.calls
+        .filter(call => call[0] === 'project-tasks:proj');
+      expect(projSubscribes.length).toBe(2);
+    });
+
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      resolvers[1](makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(1);
+    expect(notification.instances[0].options?.body).toContain('状态：已合并');
+
+    await act(async () => {
+      resolvers[0](makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(1);
+  });
+
+  it('a queued stale disable storage event still kills in-flight confirmations even when storage already reads enabled', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    let resolveGet: (task: TaskState) => void = () => {};
+    appMockState.taskGet.mockImplementation(
+      () => new Promise<TaskState>((resolve) => { resolveGet = resolve; }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+
+    act(() => {
+      localStorage.setItem('baxian.taskNotifications.enabled', '1');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '0' }),
+      );
+    });
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '1' }),
+      );
+    });
+    await waitFor(() => {
+      const projSubscribes = appMockState.subscribe.mock.calls
+        .filter(call => call[0] === 'project-tasks:proj');
+      expect(projSubscribes.length).toBe(2);
+    });
+
+    await act(async () => {
+      resolveGet(makeTask({ status: 'merged' }));
+      await Promise.resolve();
+    });
+    expect(notification.instances).toHaveLength(0);
+  });
+
+  it('subscribes without a focus event once another tab finishes granting and broadcasts the preference', async () => {
+    const notification = installNotificationMock('default');
+    appMockState.projects = [makeProject()];
+
+    render(<App />);
+
+    await act(async () => { await Promise.resolve(); });
+    expect(appMockState.subscribe).not.toHaveBeenCalled();
+
+    notification.MockNotification.permission = 'granted';
+    act(() => {
+      localStorage.setItem('baxian.taskNotifications.enabled', '1');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '1' }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:proj',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+  });
+
+  it('re-subscribes when another tab turns the preference back on', async () => {
+    installNotificationMock('granted');
+    localStorage.setItem('baxian.taskNotifications.enabled', '0');
+    appMockState.projects = [makeProject()];
+
+    render(<App />);
+
+    await act(async () => { await Promise.resolve(); });
+    expect(appMockState.subscribe).not.toHaveBeenCalled();
+
+    act(() => {
+      localStorage.setItem('baxian.taskNotifications.enabled', '1');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: 'baxian.taskNotifications.enabled', newValue: '1' }),
+      );
+    });
+
     await waitFor(() => {
       expect(appMockState.subscribe).toHaveBeenCalledWith(
         'project-tasks:proj',
@@ -308,10 +622,10 @@ describe('Task completion notifications', () => {
 
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
     await waitFor(() => expect(notification.instances).toHaveLength(1));
-    expect(notification.instances[0].title).toContain('Ship notifications');
+    expect(notification.instances[0].title).toContain('任务完成：Ship notifications');
     expect(notification.instances[0].options?.body).toContain('项目：proj · https://github.com/acme/demo.git');
-    expect(notification.instances[0].options?.body).toContain('Task：task-188 · Ship notifications');
-    expect(notification.instances[0].options?.body).toContain('状态：merged');
+    expect(notification.instances[0].options?.body).toContain('任务：task-188 · Ship notifications');
+    expect(notification.instances[0].options?.body).toContain('状态：已合并');
   });
 
   it('does not notify when the disappeared task is terminal but not completed', async () => {
@@ -357,7 +671,7 @@ describe('Task completion notifications', () => {
 
       await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(2));
       await waitFor(() => expect(notification.instances).toHaveLength(1));
-      expect(notification.instances[0].options?.body).toContain('状态：done');
+      expect(notification.instances[0].options?.body).toContain('状态：已完成');
     } finally {
       warn.mockRestore();
     }
