@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { HostConfig } from '../shared/index.js';
 import { Modal } from './modal.tsx';
-import { api, type HostInput } from '../api.ts';
+import { api, type HostInput, type ProbeResponse } from '../api.ts';
 import { useToast } from './toast.tsx';
 
 interface Props {
@@ -34,13 +34,18 @@ export function HostManagementModal({ open, onClose }: Props) {
   const [hosts, setHosts] = useState<HostConfig[]>([]);
   const [view, setView] = useState<'list' | 'form'>('list');
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingHost, setEditingHost] = useState<HostConfig | null>(null);
   const [hadPassword, setHadPassword] = useState(false);
   const [clearPassword, setClearPassword] = useState(false);
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<ProbeResponse | null>(null);
+  const [installingTmux, setInstallingTmux] = useState(false);
+  const [tmuxInstall, setTmuxInstall] = useState<{ ok: boolean; message: string } | null>(null);
+  const probeSeqRef = useRef(0);
+  const probeAbortRef = useRef<AbortController | null>(null);
   const { show } = useToast();
 
   const refresh = useCallback(() => {
@@ -50,27 +55,46 @@ export function HostManagementModal({ open, onClose }: Props) {
   }, []);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      if (probeAbortRef.current) probeAbortRef.current.abort();
+      return;
+    }
     setView('list');
     setEditingId(null);
+    setEditingHost(null);
     setForm(EMPTY_FORM);
     setError(null);
-    setTestResult(null);
     refresh();
   }, [open, refresh]);
 
+  useEffect(() => {
+    probeSeqRef.current += 1;
+    if (probeAbortRef.current) probeAbortRef.current.abort();
+    setProbing(false);
+    setProbeResult(null);
+    setInstallingTmux(false);
+    setTmuxInstall(null);
+  }, [form.hostname, form.user, form.port, form.password, clearPassword, view]);
+
+  useEffect(() => {
+    return () => {
+      if (probeAbortRef.current) probeAbortRef.current.abort();
+    };
+  }, []);
+
   const startAdd = () => {
     setEditingId(null);
+    setEditingHost(null);
     setHadPassword(false);
     setClearPassword(false);
     setForm(EMPTY_FORM);
     setError(null);
-    setTestResult(null);
     setView('form');
   };
 
   const startEdit = (h: HostConfig) => {
     setEditingId(h.id ?? null);
+    setEditingHost(h);
     setHadPassword(h.password === REDACTED);
     setClearPassword(false);
     setForm({
@@ -81,7 +105,6 @@ export function HostManagementModal({ open, onClose }: Props) {
       password: '',
     });
     setError(null);
-    setTestResult(null);
     setView('form');
   };
 
@@ -110,18 +133,64 @@ export function HostManagementModal({ open, onClose }: Props) {
   const portValid = portTrimmed === '' || (/^\d+$/.test(portTrimmed) && Number(portTrimmed) > 0 && Number(portTrimmed) <= 65535);
   const formValid = form.hostname.trim().length > 0 && portValid;
 
-  const handleTest = async () => {
-    if (!formValid) return;
-    setTesting(true);
-    setTestResult(null);
+  const structureUnchanged = !!editingHost
+    && form.hostname.trim() === editingHost.hostname
+    && form.user.trim() === (editingHost.user ?? '')
+    && form.port.trim() === (editingHost.port != null ? String(editingHost.port) : '');
+
+  // 结构未变且未改密码时按 hostId 探测，让服务端复用已存密码（表单里拿不到明文）
+  const probeTarget = (): { host?: HostConfig; hostId?: string } => {
+    if (editingId && structureUnchanged && !form.password && !clearPassword) {
+      return { hostId: editingId };
+    }
+    return {
+      host: {
+        hostname: form.hostname.trim(),
+        ...(form.user.trim() ? { user: form.user.trim() } : {}),
+        ...(portTrimmed ? { port: Number(portTrimmed) } : {}),
+        ...(!clearPassword && form.password ? { password: form.password } : {}),
+      },
+    };
+  };
+
+  const handleProbe = async () => {
+    if (!formValid || probing) return;
+    if (probeAbortRef.current) probeAbortRef.current.abort();
+    const controller = new AbortController();
+    probeAbortRef.current = controller;
+    const seq = probeSeqRef.current;
+    setProbing(true);
+    setProbeResult(null);
+    setTmuxInstall(null);
     setError(null);
     try {
-      const result = await api.hosts.check({ ...buildInput(), ...(editingId ? { id: editingId } : {}) });
-      setTestResult(result);
+      const result = await api.agents.probe('remote', probeTarget(), { signal: controller.signal });
+      if (controller.signal.aborted || probeSeqRef.current !== seq) return;
+      setProbeResult(result);
     } catch (err) {
+      if (controller.signal.aborted || probeSeqRef.current !== seq) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setTesting(false);
+      if (probeSeqRef.current === seq) setProbing(false);
+    }
+  };
+
+  const handleInstallTmux = async () => {
+    if (installingTmux) return;
+    const seq = probeSeqRef.current;
+    setInstallingTmux(true);
+    setTmuxInstall(null);
+    setError(null);
+    try {
+      const result = await api.agents.installTmux('remote', probeTarget());
+      if (probeSeqRef.current !== seq) return;
+      setTmuxInstall({ ok: result.ok, message: result.message });
+      setProbeResult(prev => (prev ? { ...prev, tmux: result.tmux } : prev));
+    } catch (err) {
+      if (probeSeqRef.current !== seq) return;
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (probeSeqRef.current === seq) setInstallingTmux(false);
     }
   };
 
@@ -270,15 +339,38 @@ export function HostManagementModal({ open, onClose }: Props) {
             否则填写的密码将以<strong className="font-semibold">明文</strong>保存到 baxian.json 中。
           </div>
 
-          <div className="flex items-center gap-3">
-            <button type="button" onClick={handleTest} disabled={!formValid || testing || submitting}
+          <div className="space-y-1.5">
+            <button type="button" onClick={handleProbe} disabled={!formValid || probing || submitting || installingTmux}
               className="text-xs text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
-              {testing ? '测试中…' : '测试连接'}
+              {probing ? '测试中…' : '测试连接'}
             </button>
-            {testResult && (
-              <span className={`text-xs ${testResult.ok ? 'text-success' : 'text-danger'}`}>
-                {testResult.ok ? '✓ ' : '⨯ '}{testResult.message}
-              </span>
+            {probeResult?.ssh && (
+              <div className={`text-xs ${probeResult.ssh.ok ? 'text-success' : 'text-danger'}`}>
+                SSH: {probeResult.ssh.ok ? '✓' : '⨯'} {probeResult.ssh.message}
+              </div>
+            )}
+            {probeResult && (
+              probeResult.tmux.ok ? (
+                <div className="text-xs text-success">tmux: ✓ {probeResult.tmux.path ?? ''}</div>
+              ) : (
+                <div className="text-xs text-danger">
+                  tmux: ⨯ {probeResult.tmux.message}
+                  {probeResult.ssh?.ok && (
+                    <button type="button" onClick={handleInstallTmux} disabled={installingTmux || submitting}
+                      className="ml-2 text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
+                      {installingTmux ? '安装中…' : '一键安装'}
+                    </button>
+                  )}
+                </div>
+              )
+            )}
+            {installingTmux && (
+              <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
+            )}
+            {!installingTmux && tmuxInstall && (
+              <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-success' : 'text-danger'}`}>
+                {tmuxInstall.ok ? '✓ ' : '⨯ '}{tmuxInstall.message}
+              </div>
             )}
           </div>
         </form>

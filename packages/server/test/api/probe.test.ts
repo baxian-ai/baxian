@@ -126,9 +126,9 @@ describe('POST /api/agents/probe', () => {
       }),
       remoteRunnerFactory: () => makeStubRunner(async (cmd) => {
         remoteCalls += 1;
-        if (cmd === 'which tmux') return { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 };
-        if (cmd === 'which claude') return { stdout: '/usr/bin/claude\n', stderr: '', exitCode: 0 };
-        if (cmd === 'which codex') return { stdout: '', stderr: '', exitCode: 1 };
+        if (cmd === 'command -v tmux') return { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 };
+        if (cmd === 'command -v claude') return { stdout: '/usr/bin/claude\n', stderr: '', exitCode: 0 };
+        if (cmd === 'command -v codex') return { stdout: '', stderr: '', exitCode: 1 };
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
     });
@@ -183,8 +183,8 @@ describe('POST /api/agents/probe', () => {
       }),
       remoteRunnerFactory: () => ({
         exec: async (cmd: string, opts?: { remoteShell?: string }) => {
-          if (cmd.startsWith('which ')) {
-            const binary = cmd.slice('which '.length);
+          if (cmd.startsWith('command -v ')) {
+            const binary = cmd.slice('command -v '.length);
             remoteOpts[binary] = opts;
           }
           return { stdout: '/usr/bin/x\n', stderr: '', exitCode: 0 };
@@ -356,6 +356,264 @@ describe('POST /api/agents/probe', () => {
         payload: { mode: 'remote', host: { hostname: 'h.example', port: '2222; touch x' } },
       });
       expect(response.statusCode).toBe(400);
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('carries an inline host password into the ssh check env and auth options', async () => {
+    let sshCmd = '';
+    let sshEnv: Record<string, string> | undefined;
+    const probeApp = await buildProbeApp({
+      localRunnerFactory: () => ({
+        exec: async (cmd: string, opts?: { env?: Record<string, string> }) => {
+          if (cmd.includes('echo ok')) {
+            sshCmd = cmd;
+            sshEnv = opts?.env;
+            return { stdout: 'ok', stderr: '', exitCode: 0 };
+          }
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+      }),
+      remoteRunnerFactory: () => makeStubRunner(async () => ({ stdout: '/usr/bin/x\n', stderr: '', exitCode: 0 })),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/probe',
+        payload: { mode: 'remote', host: { hostname: 'h.example', password: 'sekret' } },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(sshCmd).toContain('PreferredAuthentications=password');
+      expect(sshEnv?.BAXIAN_SSH_PASSWORD).toBe('sekret');
+    } finally {
+      await probeApp.close();
+    }
+  });
+});
+
+describe('POST /api/agents/install-tmux', () => {
+  interface LinuxState {
+    installed: boolean;
+    uid?: string;
+    sudoOk?: boolean;
+    installCalls?: { count: number };
+    gate?: Promise<void>;
+  }
+
+  function linuxAptRunner(state: LinuxState): CommandRunner {
+    return makeStubRunner(async (cmd) => {
+      if (cmd === 'command -v tmux') {
+        return state.installed
+          ? { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 }
+          : { stdout: '', stderr: '', exitCode: 1 };
+      }
+      if (cmd === 'uname -s') return { stdout: 'Linux\n', stderr: '', exitCode: 0 };
+      if (cmd === 'command -v apt-get') return { stdout: '/usr/bin/apt-get\n', stderr: '', exitCode: 0 };
+      if (cmd.startsWith('command -v ')) return { stdout: '', stderr: '', exitCode: 1 };
+      if (cmd === 'id -u') return { stdout: `${state.uid ?? '0'}\n`, stderr: '', exitCode: 0 };
+      if (cmd === 'sudo -n true') return { stdout: '', stderr: '', exitCode: state.sudoOk ? 0 : 1 };
+      if (cmd.includes('apt-get install -y tmux')) {
+        if (state.installCalls) state.installCalls.count += 1;
+        if (state.gate) await state.gate;
+        state.installed = true;
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (cmd === 'tmux -V') return { stdout: 'tmux 3.4\n', stderr: '', exitCode: 0 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+  }
+
+  it('rejects invalid mode / missing host / unknown hostId with 400', async () => {
+    for (const payload of [
+      { mode: 'cloud' },
+      { mode: 'remote' },
+      { mode: 'remote', hostId: 'nope' },
+    ]) {
+      const response = await app.inject({ method: 'POST', url: '/api/agents/install-tmux', payload });
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  it('local mode with tmux already present short-circuits and returns the fresh probe status', async () => {
+    const probeApp = await buildProbeApp({
+      localRunnerFactory: () => makeStubRunner(async (cmd) => {
+        if (cmd === 'command -v tmux') return { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/install-tmux',
+        payload: { mode: 'local' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ok).toBe(true);
+      expect(body.method).toBe('already-installed');
+      expect(body.tmux).toEqual({ ok: true, path: '/usr/bin/tmux', message: 'tmux found' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('local mode installs via the detected package manager and re-probes tmux', async () => {
+    const state: LinuxState = { installed: false, installCalls: { count: 0 } };
+    const probeApp = await buildProbeApp({ localRunnerFactory: () => linuxAptRunner(state) });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/install-tmux',
+        payload: { mode: 'local' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ok).toBe(true);
+      expect(body.method).toBe('apt-get');
+      expect(body.version).toBe('3.4');
+      expect(body.tmux).toEqual({ ok: true, path: '/usr/bin/tmux', message: 'tmux found' });
+      expect(state.installCalls!.count).toBe(1);
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('remote SSH unreachable returns ok:false without touching the remote runner', async () => {
+    const probeApp = await buildProbeApp({
+      localRunnerFactory: () => makeStubRunner(async (cmd) => {
+        if (cmd.startsWith('ssh ')) return { stdout: '', stderr: 'refused', exitCode: 255 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      remoteRunnerFactory: () => makeStubRunner(async () => {
+        throw new Error('remote runner should not be called when ssh fails');
+      }),
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/install-tmux',
+        payload: { mode: 'remote', host: { hostname: 'unreachable.example' } },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ok).toBe(false);
+      expect(body.message).toContain('SSH 不通');
+      expect(body.tmux).toEqual({ ok: false, message: 'SSH 不通，无法探测' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('surfaces the manual command when passwordless sudo is unavailable (no false success)', async () => {
+    const state: LinuxState = { installed: false, uid: '1000', sudoOk: false };
+    const probeApp = await buildProbeApp({ localRunnerFactory: () => linuxAptRunner(state) });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/install-tmux',
+        payload: { mode: 'local' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ok).toBe(false);
+      expect(body.method).toBe('apt-get');
+      expect(body.message).toContain('sudo apt-get install -y tmux');
+      expect(body.tmux).toEqual({ ok: false, message: '请安装 tmux' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('coalesces concurrent installs for the same target into a single run', async () => {
+    let release!: () => void;
+    const state: LinuxState = {
+      installed: false,
+      installCalls: { count: 0 },
+      gate: new Promise<void>((resolve) => { release = resolve; }),
+    };
+    const probeApp = await buildProbeApp({ localRunnerFactory: () => linuxAptRunner(state) });
+    try {
+      const inject = () => probeApp
+        .inject({ method: 'POST', url: '/api/agents/install-tmux', payload: { mode: 'local' } })
+        .then(r => r);
+      const first = inject();
+      while (state.installCalls!.count === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      const second = inject();
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      release();
+      const [r1, r2] = await Promise.all([first, second]);
+      expect(JSON.parse(r1.body).ok).toBe(true);
+      expect(JSON.parse(r2.body).ok).toBe(true);
+      expect(state.installCalls!.count).toBe(1);
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('resolves a hostId and installs through the remote runner for that host', async () => {
+    let remoteHost: unknown;
+    const probeApp = Fastify({ logger: false });
+    probeApp.decorate('ctx', {
+      config: { host: [{ id: 'box', hostname: 'stored.example', user: 'agent', password: 'pw' }] },
+    } as never);
+    await probeApp.register(probeRoutes, {
+      prefix: '/api',
+      localRunnerFactory: () => makeStubRunner(async (cmd) => {
+        if (cmd.includes('echo ok')) return { stdout: 'ok', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      remoteRunnerFactory: (host) => {
+        remoteHost = host;
+        return makeStubRunner(async (cmd) => {
+          if (cmd === 'command -v tmux') return { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 };
+          return { stdout: '', stderr: '', exitCode: 0 };
+        });
+      },
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/install-tmux',
+        payload: { mode: 'remote', hostId: 'box' },
+      });
+      expect(response.statusCode).toBe(200);
+      const body = JSON.parse(response.body);
+      expect(body.ok).toBe(true);
+      expect(body.method).toBe('already-installed');
+      expect(remoteHost).toMatchObject({ hostname: 'stored.example', user: 'agent', password: 'pw' });
+    } finally {
+      await probeApp.close();
+    }
+  });
+
+  it('passes an inline host password through to the remote runner', async () => {
+    let remoteHost: unknown;
+    const probeApp = await buildProbeApp({
+      localRunnerFactory: () => makeStubRunner(async (cmd) => {
+        if (cmd.includes('echo ok')) return { stdout: 'ok', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      remoteRunnerFactory: (host) => {
+        remoteHost = host;
+        return makeStubRunner(async (cmd) => {
+          if (cmd === 'command -v tmux') return { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 };
+          return { stdout: '', stderr: '', exitCode: 0 };
+        });
+      },
+    });
+    try {
+      const response = await probeApp.inject({
+        method: 'POST',
+        url: '/api/agents/install-tmux',
+        payload: { mode: 'remote', host: { hostname: 'h.example', password: 'sekret' } },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body).ok).toBe(true);
+      expect(remoteHost).toMatchObject({ hostname: 'h.example', password: 'sekret' });
     } finally {
       await probeApp.close();
     }

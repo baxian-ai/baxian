@@ -123,6 +123,13 @@ describe('request contract per endpoint', () => {
       body: { mode: 'local', hostId: 'h-1' },
     },
     {
+      name: 'agents.installTmux',
+      run: () => api.agents.installTmux('remote', { host }),
+      url: '/api/agents/install-tmux',
+      method: 'POST',
+      body: { mode: 'remote', host },
+    },
+    {
       name: 'agents.setPet',
       run: () => api.agents.setPet('dev-1', 'cat'),
       url: '/api/agents/dev-1/pet',

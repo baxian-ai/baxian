@@ -13,6 +13,7 @@ import { toastShowMock } from '../helpers/toast-mock.tsx';
 
 const configGetMock = vi.mocked(api.config.get);
 const probeMock = vi.mocked(api.agents.probe);
+const installTmuxMock = vi.mocked(api.agents.installTmux);
 const addAgentMock = vi.mocked(api.projects.addAgent);
 
 function cfg(hosts: BaxianConfig['host']): BaxianConfig {
@@ -30,6 +31,13 @@ beforeEach(() => {
     ssh: { ok: true, message: 'SSH OK' },
     tmux: { ok: true, message: 'tmux' },
     runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+  });
+  installTmuxMock.mockReset().mockResolvedValue({
+    ok: true,
+    method: 'apt-get',
+    version: '3.4',
+    message: 'tmux 3.4 installed via apt-get',
+    tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
   });
   addAgentMock.mockReset().mockResolvedValue({
     agent: { id: 'x', runtime: 'claude-code', role: 'dev', mode: 'local' },
@@ -313,6 +321,116 @@ it('重新探测 re-runs the probe on demand', async () => {
   });
 
   expect(probeMock).toHaveBeenCalledTimes(2);
+});
+
+const TMUX_MISSING = {
+  tmux: { ok: false, message: '请安装 tmux' },
+  runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+};
+
+it('offers 一键安装 when tmux is missing; success re-probes and flips the status to ✓', async () => {
+  probeMock
+    .mockResolvedValueOnce(TMUX_MISSING)
+    .mockResolvedValueOnce({
+      tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
+      runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+    });
+  await renderReady();
+
+  expect(await screen.findByText(/tmux: ⨯ 请安装 tmux/)).toBeTruthy();
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+  });
+
+  expect(installTmuxMock).toHaveBeenCalledWith('local', {});
+  await waitFor(() => expect(probeMock).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText('tmux: ✓ /usr/bin/tmux')).toBeTruthy();
+});
+
+it('does not render 一键安装 when tmux is already present', async () => {
+  await renderReady();
+  expect(await screen.findByText(/tmux: ✓/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '一键安装' })).toBeNull();
+});
+
+it('targets the selected host when installing from remote mode', async () => {
+  probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
+  await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
+
+  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
+  expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+  });
+
+  expect(installTmuxMock).toHaveBeenCalledWith('remote', { hostId: 'box' });
+});
+
+it('hides 一键安装 when remote SSH is unreachable (tmux state is unknowable)', async () => {
+  probeMock.mockResolvedValue({
+    ssh: { ok: false, message: 'SSH 不通，请检查地址 / 端口 / 密码或 key 认证' },
+    tmux: { ok: false, message: 'SSH 不通，无法探测' },
+    runtimes: {
+      'claude-code': { ok: false, message: 'SSH 不通，无法探测' },
+      codex: { ok: false, message: 'SSH 不通，无法探测' },
+    },
+  });
+  await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
+
+  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
+
+  expect(await screen.findByText(/tmux: ⨯ SSH 不通，无法探测/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: '一键安装' })).toBeNull();
+});
+
+it('shows the install failure message with the manual command and does not re-probe', async () => {
+  probeMock.mockResolvedValue(TMUX_MISSING);
+  installTmuxMock.mockResolvedValue({
+    ok: false,
+    method: 'apt-get',
+    message: 'cannot install automatically: not root and passwordless sudo is unavailable — run "sudo apt-get install -y tmux" on the host',
+    tmux: { ok: false, message: '请安装 tmux' },
+  });
+  await renderReady();
+
+  expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+  });
+
+  expect(await screen.findByText(/⨯ cannot install automatically.*sudo apt-get install -y tmux/)).toBeTruthy();
+  expect(probeMock).toHaveBeenCalledTimes(1);
+});
+
+it('shows a loading hint while installing and ignores repeated clicks', async () => {
+  probeMock.mockResolvedValueOnce(TMUX_MISSING);
+  let resolveInstall: ((value: Awaited<ReturnType<typeof api.agents.installTmux>>) => void) | undefined;
+  installTmuxMock.mockReturnValue(new Promise((resolve) => { resolveInstall = resolve; }));
+  await renderReady();
+
+  expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
+  const install = () => screen.getByRole('button', { name: /一键安装|安装中/ });
+  fireEvent.click(install());
+
+  expect(await screen.findByText(/正在安装 tmux，可能需要几分钟/)).toBeTruthy();
+  expect((install() as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(install());
+  fireEvent.click(install());
+  expect(installTmuxMock).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    resolveInstall?.({
+      ok: true,
+      method: 'brew',
+      version: '3.5',
+      message: 'tmux 3.5 installed via brew',
+      tmux: { ok: true, path: '/opt/homebrew/bin/tmux', message: 'tmux found' },
+    });
+  });
+  await waitFor(() => expect(probeMock).toHaveBeenCalledTimes(2));
 });
 
 it('aborts the in-flight probe controller when the modal closes', async () => {

@@ -165,6 +165,14 @@ export interface ProbeResponse {
   };
 }
 
+export interface TmuxInstallResponse {
+  ok: boolean;
+  method?: string;
+  version?: string;
+  message: string;
+  tmux: ProbeStatus;
+}
+
 export interface AddAgentBody extends AgentConfig {
   pairWith?: string;
 }
@@ -207,6 +215,8 @@ export const api = {
       options?: { signal?: AbortSignal },
     ) =>
       post<ProbeResponse>('/agents/probe', { mode, host: target.host, hostId: target.hostId }, options),
+    installTmux: (mode: AgentMode, target: { host?: HostConfig; hostId?: string } = {}) =>
+      post<TmuxInstallResponse>('/agents/install-tmux', { mode, host: target.host, hostId: target.hostId }),
     uploadImage: async (id: string, file: File) =>
       post<{ path: string }>(`/agents/${enc(id)}/images`, { dataBase64: await fileToBase64(file) }),
     setPet: (id: string, petId: string | null) =>

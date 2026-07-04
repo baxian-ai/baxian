@@ -30,6 +30,7 @@ export function createApiMock(): ApiModule {
         compact: vi.fn(),
         clear: vi.fn(),
         probe: vi.fn(),
+        installTmux: vi.fn(),
         uploadImage: vi.fn(),
         setPet: vi.fn(),
       },

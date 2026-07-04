@@ -54,11 +54,14 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
   const [allAgentIds, setAllAgentIds] = useState<Set<string>>(new Set());
   const [probe, setProbe] = useState<ProbeResponse | null>(null);
   const [probeLoading, setProbeLoading] = useState(false);
+  const [installingTmux, setInstallingTmux] = useState(false);
+  const [tmuxInstall, setTmuxInstall] = useState<{ ok: boolean; message: string } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const probeAbortRef = useRef<AbortController | null>(null);
   const probeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const installSeqRef = useRef(0);
   const sessionRef = useRef(0);
   const { show } = useToast();
   const { flagDirty } = usePendingRestart();
@@ -73,6 +76,9 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     setAllAgentIds(new Set());
     setProbe(null);
     setProbeLoading(false);
+    setInstallingTmux(false);
+    setTmuxInstall(null);
+    installSeqRef.current += 1;
     setError(null);
     setShowAdvanced(false);
 
@@ -118,6 +124,9 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
   useEffect(() => {
     if (!open) return;
     setProbe(null);
+    setTmuxInstall(null);
+    setInstallingTmux(false);
+    installSeqRef.current += 1;
     if (probeAbortRef.current) probeAbortRef.current.abort();
     if (form.mode === 'remote' && !form.host) return;
     if (probeDebounceRef.current) clearTimeout(probeDebounceRef.current);
@@ -138,6 +147,26 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       if (probeDebounceRef.current) clearTimeout(probeDebounceRef.current);
     };
   }, []);
+
+  const handleInstallTmux = () => {
+    if (installingTmux) return;
+    const seq = installSeqRef.current;
+    setInstallingTmux(true);
+    setTmuxInstall(null);
+    const target = form.mode === 'remote' ? { hostId: form.host } : {};
+    api.agents.installTmux(form.mode, target)
+      .then(result => {
+        if (installSeqRef.current !== seq) return;
+        setTmuxInstall({ ok: result.ok, message: result.message });
+        setInstallingTmux(false);
+        if (result.ok) runProbe();
+      })
+      .catch(err => {
+        if (installSeqRef.current !== seq) return;
+        setTmuxInstall({ ok: false, message: err instanceof Error ? err.message : String(err) });
+        setInstallingTmux(false);
+      });
+  };
 
   const unpairedDevs: AgentConfig[] = project?.agent
     .filter(pair => pair.length === 1 && pair[0].role === 'dev')
@@ -204,10 +233,32 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const TmuxStatus = () => {
     if (form.mode === 'remote' && !form.host) return null;
-    if (probeLoading) return <div className="text-xs text-og-400">tmux: …探测中</div>;
+    if (probeLoading && !installingTmux) return <div className="text-xs text-og-400">tmux: …探测中</div>;
     if (!probe) return null;
     if (probe.tmux.ok) return <div className="text-xs text-success">tmux: ✓ {probe.tmux.path ?? ''}</div>;
-    return <div className="text-xs text-danger">tmux: ⨯ {probe.tmux.message}</div>;
+    const sshReady = form.mode === 'local' || !!probe.ssh?.ok;
+    return (
+      <div className="space-y-1">
+        <div className="text-xs text-danger">
+          tmux: ⨯ {probe.tmux.message}
+          {sshReady && (
+            <button type="button" onClick={handleInstallTmux}
+              className="ml-2 text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={installingTmux || submitting}>
+              {installingTmux ? '安装中…' : '一键安装'}
+            </button>
+          )}
+        </div>
+        {installingTmux && (
+          <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
+        )}
+        {!installingTmux && tmuxInstall && (
+          <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-success' : 'text-danger'}`}>
+            {tmuxInstall.ok ? '✓ ' : '⨯ '}{tmuxInstall.message}
+          </div>
+        )}
+      </div>
+    );
   };
 
   const SshStatus = () => {
