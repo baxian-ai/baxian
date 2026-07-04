@@ -147,6 +147,21 @@ describe('ReviewConversation server mode', () => {
     expect(screen.getByText('反馈')).toBeTruthy();
   });
 
+  it('renders the 用户 turn when a spec round carries a userDecision', async () => {
+    reviewsMock.mockResolvedValue([
+      {
+        round: 1, phase: 'spec', content: 'spec body', startedAt: 'now',
+        findings: { round: 1, verdict: 'approve', findings: [] },
+        userDecision: { verdict: 'request-changes', comments: '边界场景没有覆盖', at: 'now' },
+      },
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
+    expect(await screen.findByText('用户')).toBeTruthy();
+    expect(screen.getByText('打回 Spec')).toBeTruthy();
+    expect(screen.getByText('边界场景没有覆盖')).toBeTruthy();
+    expect(screen.getByText('request-changes')).toBeTruthy();
+  });
+
   it('renders dev/QA role markers as colored text, not pills', async () => {
     reviewsMock.mockResolvedValue([
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),

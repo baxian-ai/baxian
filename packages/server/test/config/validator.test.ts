@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { validateConfig } from '../../src/config/validator.js';
-import type { BaxianConfig, AgentConfig, ProjectConfig, MergeStrategy } from '../../src/shared/index.js';
+import type { BaxianConfig, AgentConfig, ProjectConfig, MergeStrategy, SpecApprovalStrategy } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -384,6 +384,20 @@ describe('validateConfig', () => {
   it('rejects invalid project.merge value', () => {
     const cfg = withProject(devProject({ merge: 'manual' as unknown as MergeStrategy }));
     expect(hasPathEndingWith(cfg, '.merge')).toBe(true);
+  });
+
+  it('rejects invalid project.specApproval value', () => {
+    const cfg = withProject(devProject({ specApproval: 'qa' as unknown as SpecApprovalStrategy }));
+    expect(hasPathEndingWith(cfg, '.specApproval')).toBe(true);
+  });
+
+  it.each<[string, SpecApprovalStrategy | undefined]>([
+    ['human', 'human'],
+    ['null', null],
+    ['absent', undefined],
+  ])('accepts project.specApproval = %s', (_label, specApproval) => {
+    const cfg = withProject(devProject(specApproval === undefined ? {} : { specApproval }));
+    expect(hasPathEndingWith(cfg, '.specApproval')).toBe(false);
   });
 
   it.each<[string, AgentConfig['host'], string | null]>([

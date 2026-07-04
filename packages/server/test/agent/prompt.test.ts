@@ -223,20 +223,6 @@ describe('buildPromptInline', () => {
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
-  it('baxian-pr-feedback skill carries the migrated post-approve idempotency rules', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-pr-feedback/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('## Post-Approve');
-    expect(body).toContain('T_self');
-    expect(body).toContain('EVERY non-self comment');
-    expect(body).toContain('redispatch:');
-    expect(body).toContain('do NOT emit `pr-merge-ready` when you pushed code');
-    expect(body).toContain('re-fetch all sources before signaling');
-    expect(body).toContain('Do not merge the PR yourself from this phase');
-  });
-
   it.each<[string, number, string[], string[]]>([
     ['redispatch #3 sets the redispatch field', 3,
       ['redispatch: 3', 'signal: pr-merge-ready', 'token: post-token-42'],
@@ -356,37 +342,6 @@ describe('buildPromptInline', () => {
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
-  it('baxian-task-check skill carries the migrated SDD mechanics (write .baxian/spec.md, do NOT commit)', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('## Specification-Driven Development (SDD)');
-    expect(body).toContain('.baxian/spec.md');
-    expect(body).toContain('Do NOT commit or push it');
-  });
-
-  it('baxian-task-check names the inline dispatch as the only task source, without phantom task files', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('the authoritative task source');
-    expect(body).not.toContain('task.md');
-  });
-
-  it('baxian-task-check skill delivers both exchanges through one shared procedure', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('## Deliver');
-    expect(body).toContain('Emit `pr-created`');
-    expect(body).toContain('Emit `code-done`');
-    expect(body).toContain('do NOT push, no PR');
-    expect(body.match(/gh pr create/g) ?? []).toHaveLength(1);
-  });
-
   it.each([
     ['github chain', undefined, 'pr-created' as const],
     ['server chain', 'server' as const, 'code-done' as const],
@@ -446,37 +401,6 @@ describe('buildPromptInline', () => {
     expect(prompt.startsWith('/baxian-pr-review\n')).toBe(true);
     for (const f of contains) expect(prompt).toContain(f);
     for (const f of notContains) expect(prompt).not.toContain(f);
-  });
-
-  it('baxian-pr-review skill carries the verdict + verification procedure keyed on descriptor fields', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-pr-review/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('## Verdict');
-    expect(body).toContain('gh pr review N');
-    expect(body).toContain('## Verdict Verification');
-    expect(body).toContain('422 fallback');
-    expect(body).toContain('`anchor-sha:`');
-    expect(body).toContain('skip this check when `anchor-sha:` is absent');
-  });
-
-  it('QA review skills treat the author narrative as material under review and read the diff before it', async () => {
-    for (const name of ['baxian-pr-review', 'baxian-pr-recheck']) {
-      const body = await readFile(
-        fileURLToPath(new URL(`../../../../skills/${name}/SKILL.md`, import.meta.url)),
-        'utf-8',
-      );
-      expect(body).toContain('not a bypass and not steering');
-      expect(body).toContain('Read the diff first');
-      expect(body.indexOf('gh pr diff N')).toBeGreaterThan(-1);
-      expect(body.indexOf('gh pr diff N')).toBeLessThan(body.indexOf('gh pr view N'));
-    }
-    const review = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-pr-review/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(review).toContain('a claim the code does not back is itself a finding');
   });
 
   it('recheck descriptor carries pr + anchor-sha; verdict procedure lives in the skill', async () => {
@@ -606,41 +530,6 @@ describe('server review mode prompt builders', () => {
     expect(specPrompt).toContain('feedback: spec');
   });
 
-  it('baxian-server-review skill carries the migrated review criteria, closure rules, and findings schema', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-server-review/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('correctness, tests, edge cases, security, regressions');
-    expect(body).toContain('broken/unsafe');
-    expect(body).toContain('batch: i/n');
-    expect(body).toContain('their absence is not a finding');
-    expect(body).toContain('ONLY when every prior finding is closed');
-    expect(body).toContain('ORIGINAL id');
-    expect(body).toContain('base-branch worktree');
-    expect(body).toContain('sequential and unique within');
-    expect(body).toContain('completeness');
-    expect(body).toContain('ambiguity');
-    expect(body).toContain('findings.json.tmp');
-    expect(body).toContain('"location"');
-  });
-
-  it('baxian-server-feedback skill carries the migrated fix/reject semantics, response schema, and publish constraint', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('Judge each finding independently');
-    expect(body).toContain('QA can be wrong');
-    expect(body).toContain('Never reject just to save effort');
-    expect(body).toContain('commitSha');
-    expect(body).toContain('Do NOT commit or push it');
-    expect(body).toContain('response.json.tmp');
-    expect(body).toContain('Do NOT push to any remote');
-    expect(body).toContain('publishing is deferred to the `server-after-done` phase');
-    expect(body).toContain('exactly one response item');
-  });
-
   it('phases outside develop/code omit the exchange field', () => {
     const review = build('server-review', QA_AGENT, { serverContent: 'diff x' });
     expect(review).not.toContain('exchange:');
@@ -664,6 +553,7 @@ describe('server review mode prompt builders', () => {
     expect(merge).not.toContain('exchange:');
   });
 
+  // machine-readable invocation policy (frontmatter + openai.yaml), not SKILL.md prose — no other test covers it
   it('every baxian skill disables implicit model-invocation (Claude frontmatter + Codex policy) so only baxian explicitly invokes the per-phase skill', async () => {
     const skillsRoot = fileURLToPath(new URL('../../../../skills', import.meta.url));
     for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-server-review', 'baxian-server-feedback']) {
@@ -689,15 +579,6 @@ describe('server review mode prompt builders', () => {
 describe('server-phase prompt builders (findings compaction)', () => {
   const getRegistry = useServerPhaseRegistry('baxian-r8-');
   const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
-
-  it('baxian-server-feedback §Publish emits the PR-number signal', async () => {
-    const body = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(body).toContain('## Publish');
-    expect(body).toContain('[bx:code-ready:<pr_number>:<token>]');
-  });
 
   it('oversized findings injection keeps every finding id (messages compacted)', async () => {
     const findings = {

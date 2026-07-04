@@ -17,7 +17,7 @@ const CLI_BINARY: Record<AgentRuntime, string> = {
 
 const PREFLIGHT_PROBE_TIMEOUT_MS = 5000;
 
-function lastNonEmptyLine(s: string): string {
+export function lastNonEmptyLine(s: string): string {
   const lines = s.split(/\r?\n/);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
@@ -35,7 +35,9 @@ async function probeBinary(
   options: { remoteShell?: RemoteShellMode } = {},
 ): Promise<PreflightResult> {
   try {
-    const result = await runner.exec(`which ${binary}`, {
+    // command -v over which: it must match installTmux's verification, or a --fix
+    // success on a which-less minimal host would still re-probe as FAIL.
+    const result = await runner.exec(`command -v ${binary}`, {
       ...options,
       timeout: PREFLIGHT_PROBE_TIMEOUT_MS,
     });
@@ -56,11 +58,26 @@ async function probeBinary(
   }
 }
 
+export function tmuxInstallHint(projectId?: string): string {
+  return `run "baxian check ${projectId ?? '<project>'} --fix" to install it automatically`;
+}
+
+export function probeTmux(runner: CommandRunner, projectId?: string): Promise<PreflightResult> {
+  return probeBinary(
+    runner,
+    'tmux',
+    'tmux',
+    (path) => `tmux found at ${path}`,
+    `Please install tmux on the agent host, or ${tmuxInstallHint(projectId)}`,
+  );
+}
+
 export async function runPreflight(
   runner: CommandRunner,
   agent: AgentConfig,
   repo: string,
   host?: HostConfig,
+  projectId?: string,
 ): Promise<PreflightResult[]> {
   repo = repo.trim();
   const results: PreflightResult[] = [];
@@ -97,15 +114,7 @@ export async function runPreflight(
     ),
   );
 
-  results.push(
-    await probeBinary(
-      runner,
-      'tmux',
-      'tmux',
-      (path) => `tmux found at ${path}`,
-      'Please install tmux on the agent host',
-    ),
-  );
+  results.push(await probeTmux(runner, projectId));
 
   if (agent.mode === 'remote') {
     results.push(

@@ -165,6 +165,18 @@ describe('TaskStore', () => {
     await store.delete('task-stuck');
     expect(fired).toEqual([]);
   });
+
+  it('get/delete reject path-like ids so a store key cannot escape its dir', async () => {
+    await store.set(makeTask('task-001'));
+    for (const bad of ['../../../secret', '../task-001', 'a/b', '..', 'task 001', '中文']) {
+      expect(await store.get(bad)).toBeNull();
+    }
+    const fired: Array<['set' | 'delete', string]> = [];
+    store.onChange((kind, id) => fired.push([kind, id]));
+    await store.delete('../../../secret');
+    expect(fired).toEqual([]);
+    expect(await store.get('task-001')).not.toBeNull();
+  });
 });
 
 describe('TaskStore sanitize', () => {

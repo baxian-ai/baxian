@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, detectRuntimePendingPrompt, detectRuntimeOverlay, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, hasOscTitleIdle, runtimeBusyCheck } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
@@ -947,6 +947,213 @@ describe('TmuxManager', () => {
       const captureCmd = runner.exec.mock.calls[1][0] as string;
       expect(captureCmd).toMatch(pattern);
     });
+
+    describe('titleIdleFastPath (width-independent OSC title idle signal)', () => {
+      const NARROW_IDLE_SCREEN =
+        '合并门），合并动作留给你。\n' +
+        '你合并后我再做本地清理（删\n' +
+        'feat/spec-human-approval\n' +
+        '分支、切回 main），或者你直\n' +
+        '接说一声我来跑 gh pr\n' +
+        'merge。\n' +
+        '\n' +
+        '✻ Churned for 56s\n';
+
+      function mockPaneState(procTitle: string, screen: string, title: string): void {
+        runner.exec.mockImplementation(async (cmd: string) => {
+          if (cmd.includes('pane_current_command')) return { stdout: `${procTitle}\n`, stderr: '', exitCode: 0 };
+          if (cmd.includes('pane_title')) return { stdout: `${title}\n`, stderr: '', exitCode: 0 };
+          return { stdout: screen, stderr: '', exitCode: 0 };
+        });
+      }
+
+      it('claude-code: narrow-pane reflowed idle screen (no anchor, no ❯) + "✳ " title → ready', async () => {
+        mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+        ).resolves.toBeUndefined();
+      });
+
+      it('claude-code: same narrow screen + braille working title → keeps polling to timeout', async () => {
+        mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '⠹ 分析 baxian 服务 DEV agent 不遵照指示问题');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut an actively busy screen (esc to interrupt in tail)', async () => {
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '✳ 部署服务');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut a trust dialog', async () => {
+        mockPaneState(
+          'claude',
+          'Quick safety check\nDo you trust the files in this folder?\n1. Yes, I trust this folder\n',
+          '✳ Claude Code',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('fast path is opt-in: narrow idle screen + "✳ " title still times out without the flag', async () => {
+        mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30 }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('codex: cwd-shaped title is not an idle signal (fast path is claude-code only)', async () => {
+        mockPaneState('node', 'Still working on the request...\n', 'baxian');
+        await expect(
+          tmux.waitReplReady('%6', 'codex', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('timeout error carries the last observed pane title for diagnosis', async () => {
+        mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '⠹ 分析 baxian');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/paneTitle=/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut a visible permission prompt (do you want to proceed?)', async () => {
+        mockPaneState(
+          '2.1.199',
+          'Bash command\n  rm -rf build\nDo you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently (esc)\n',
+          '✳ 清理构建产物',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut a narrow-wrapped select-option form (AskUserQuestion)', async () => {
+        mockPaneState(
+          '2.1.199',
+          '选择合并策略：\n❯ 1. squash\n  2. rebase\n\nEnter to select ·\nEsc to cancel · Tab/arrow\nkeys to navigate\n',
+          '✳ 等待合并策略选择',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: a pending-prompt phrase far above the tail does not veto an idle bottom screen', async () => {
+        const history = '…上文引用：do you want to proceed? 的行为分析\n' + '正文\n'.repeat(16);
+        mockPaneState('2.1.199', history + NARROW_IDLE_SCREEN, '✳ 分析报告');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+        ).resolves.toBeUndefined();
+      });
+
+      it('does not read the pane title while the screen is visibly busy (sync short-circuit first)', async () => {
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '✳ 部署服务');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+        const titleReads = runner.exec.mock.calls.filter(c => String(c[0]).includes('pane_title'));
+        expect(titleReads.length).toBe(1);
+      });
+
+      it('timeout on a busy screen still reports the pane title via the failure-path fallback read', async () => {
+        mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '⠹ 部署服务');
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/paneTitle="⠹ 部署服务"/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut a legacy offer prompt (would you like to + Yes option)', async () => {
+        mockPaneState(
+          '2.1.199',
+          'Would you like to create the release tag now?\n❯ 1. Yes\n  2. No\n',
+          '✳ 发布 1.2.37',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut the transcript viewer overlay', async () => {
+        mockPaneState(
+          '2.1.199',
+          'transcript content line\n\nctrl+o to toggle · esc to close\n',
+          '✳ 分析日志',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: an offer phrase in plain prose above an idle tail does not veto the fast path', async () => {
+        mockPaneState(
+          '2.1.199',
+          `Would you like me to run gh pr merge?\n${NARROW_IDLE_SCREEN}`,
+          '✳ 收尾合并',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+        ).resolves.toBeUndefined();
+      });
+
+      it('claude-code: a quoted permission phrase in a finished narrow reply does not veto the fast path', async () => {
+        mockPaneState(
+          '2.1.199',
+          `检测覆盖了 Do you want to\nproceed? 这类权限提示。\n${NARROW_IDLE_SCREEN}`,
+          '✳ 补充权限检测',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+        ).resolves.toBeUndefined();
+      });
+
+      it('claude-code: "✳ " title does not shortcut a narrow-wrapped confirm dialog (enter to confirm)', async () => {
+        mockPaneState(
+          '2.1.199',
+          '确认重置会话？\nEnter to confirm ·\nEsc to cancel\n',
+          '✳ 会话管理',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: a leftover composer draft below a quoted offer phrase does not veto the fast path', async () => {
+        mockPaneState(
+          '2.1.199',
+          `表单文案 "would you like to" 已覆盖。\n${NARROW_IDLE_SCREEN}\n❯ run tests\n`,
+          '✳ 跑测试收尾',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+        ).resolves.toBeUndefined();
+      });
+
+      it('claude-code: "✳ " title does not shortcut a permission prompt with bare unnumbered Yes options', async () => {
+        mockPaneState(
+          '2.1.199',
+          'Do you want to proceed?\nYes\nNo\n',
+          '✳ 执行构建脚本',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+
+      it('claude-code: "✳ " title does not shortcut a tall pending form whose offer sits above the tail window', async () => {
+        mockPaneState(
+          '2.1.199',
+          '─'.repeat(40) + '\nWould you like to apply this plan?\n' + 'plan detail\n'.repeat(16) + '❯ 1. Yes\n  2. No\n',
+          '✳ 制定实施计划',
+        );
+        await expect(
+          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+        ).rejects.toThrow(/repl not ready/);
+      });
+    });
   });
 
   describe('readPaneTitle', () => {
@@ -1372,6 +1579,80 @@ describe('hasRuntimeReadyView', () => {
 
   it('does not treat the backtrack hint as ready for claude-code', () => {
     expect(hasRuntimeReadyView('  esc again to edit previous message\n', 'claude-code')).toBe(false);
+  });
+});
+
+describe('hasOscTitleIdle', () => {
+  it.each([
+    ['claude-code idle title with task summary', '✳ 分析 baxian 服务', 'claude-code' as const, true],
+    ['claude-code idle title without a task yet', '✳ Claude Code', 'claude-code' as const, true],
+    ['braille spinner prefix means working, not idle', '⠹ 分析 baxian 服务', 'claude-code' as const, false],
+    ['empty title (pane_title unavailable)', '', 'claude-code' as const, false],
+    ['✳ without the following space is not the idle contract', '✳分析', 'claude-code' as const, false],
+    ['codex cwd-shaped title has no idle contract', 'baxian', 'codex' as const, false],
+    ['codex: even a ✳-prefixed title is not an idle signal', '✳ x', 'codex' as const, false],
+  ])('%s → %s', (_label, title, runtime, expected) => {
+    expect(hasOscTitleIdle(title, runtime)).toBe(expected);
+  });
+});
+
+describe('detectRuntimePendingPrompt', () => {
+  it.each([
+    ['bash permission prompt', 'Do you want to proceed?\n❯ 1. Yes\n  2. No\n', true],
+    ['legacy waiting-for-permission', 'Waiting for permission…\n', true],
+    ['connection allow prompt', 'Do you want to allow this connection?\n1. Yes\n', true],
+    ['select-option footer, narrow-wrapped', 'Enter to select ·\nEsc to cancel\n', true],
+    ['dynamic workflow prompt', 'Run a dynamic workflow?\nEnter to run · Esc to cancel\n', true],
+    ['bash amend footer with option lines', 'Do you want to proceed?\n❯ 1. Yes\n  2. No\ntab to amend · esc to cancel\n', true],
+    ['explain footer with option lines', 'rm -rf build\n❯ 1. Yes\nctrl+e to explain this command\n', true],
+    ['offer with a numbered Yes option line', 'Would you like to create a plan?\n❯ 1. Yes\n  2. No\n', true],
+    ['offer with a selected non-yes option line', 'Do you want to continue?\n❯ 2. No, cancel\n', true],
+    ['offer with bare unnumbered Yes options (inverse-video selection, no ❯ after stripAnsi)', 'Do you want to proceed?\nYes\nNo\n', true],
+    ['offer with a bare Yes-and-dont-ask variant', "Do you want to proceed?\nYes, and don't ask again\nNo\n", true],
+    ['offer with only a numbered No option visible', 'Do you want to proceed?\n  2. No\n', true],
+    ['bare yes at line start in prose without an offer phrase', 'yes 分支的判定已经覆盖。\n', false],
+    ['plan-mode review prompt', 'Review your answers\n', true],
+    ['skip-interview prompt', 'Skip interview and plan immediately\n', true],
+    ['narrow-wrapped confirm footer (enter to confirm)', '确认删除分支？\nEnter to confirm ·\nEsc to cancel\n', true],
+    ['narrow-wrapped skip-interview blocker', 'Skip interview and plan\nimmediately\n', true],
+    ['narrow-wrapped offer phrase with a Yes option', 'Would you like\nto apply this plan?\n❯ 1. Yes\n  2. No\n', true],
+    ['composer draft after a quoted offer phrase is not a prompt option', '表单文案是 "Would you like to apply?"。\n❯ run tests\n', false],
+    ['offer phrase alone in prose (no option line)', 'Would you like me to proceed with the merge?\n', false],
+    ['proceed question quoted in prose (no option line)', '日志里出现 Do you want to proceed? 即为权限提示。\n', false],
+    ['amend hotkey explained in prose (no option line)', '权限表单支持 tab to amend 快捷键。\n', false],
+    ['dynamic workflow phrase in prose (no esc to cancel)', '我加了 run a dynamic workflow? 的检测。\n', false],
+    ['enter-to-select alone in prose (no esc to cancel)', '在 TUI 里 enter to select 表示确认当前项。\n', false],
+    ['plain idle composer tail', '✻ Worked for 31s\n\n❯ \n⏵⏵ bypass permissions on\n', false],
+    ['phrase outside the 15-line tail window (no rule on screen)', 'do you want to proceed?\n' + 'x\n'.repeat(16) + '❯ \n', false],
+    [
+      'tall permission form: offer above the 15-line tail but inside the active form region',
+      '正文历史\n' + '─'.repeat(40) + '\nWould you like to apply this plan?\n' + 'plan detail\n'.repeat(16) + '❯ 1. Yes\n  2. No\n',
+      true,
+    ],
+    [
+      'prose mention above the composer box rule is outside the active form region',
+      'Do you want to proceed? 的检测已补充。\n' + '─'.repeat(40) + '\n❯ \n' + '─'.repeat(40) + '\n  ⏵⏵ bypass permissions on\n',
+      false,
+    ],
+  ])('%s → %s', (_label, screen, expected) => {
+    expect(detectRuntimePendingPrompt(screen)).toBe(expected);
+  });
+});
+
+describe('detectRuntimeOverlay', () => {
+  it.each([
+    ['transcript viewer footer (ctrl+o)', '  transcript line\n\nctrl+o to toggle · esc to close\n', true],
+    ['narrow-wrapped transcript viewer footer (close on its own line)', 'transcript line\nctrl+o to toggle · esc to\nclose\n', true],
+    ['narrow-wrapped detailed-transcript header', 'Showing detailed\ntranscript\n', true],
+    ['transcript viewer detailed header as last line', 'Showing detailed transcript\n', true],
+    ['transcript viewer scroll hint', 'some output\n↑↓ scroll · q quit\n', true],
+    ['transcript viewer collapse hint', 'ctrl+e collapse view\n', true],
+    ['model picker menu', 'Select model\n❯ 1. Fable\n  2. Opus\nenter to set as default\n', true],
+    ['normal idle footer', '✻ Worked for 31s\n\n❯ \n⏵⏵ bypass permissions on (shift+tab to cycle)\n', false],
+    ['ctrl+o mentioned mid-text, above the 2-line footer window', 'ctrl+o to toggle 是转录视图快捷键。\n正文继续。\n结论：已覆盖。\n', false],
+    ['select model mentioned without the set-as-default footer', '我用 /model 打开 select model 菜单做了对比。\n', false],
+  ])('%s → %s', (_label, screen, expected) => {
+    expect(detectRuntimeOverlay(screen)).toBe(expected);
   });
 });
 

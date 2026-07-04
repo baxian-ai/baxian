@@ -492,6 +492,50 @@ describe('POST /api/tasks/:id/complete', () => {
   });
 });
 
+describe('POST /api/tasks/:id/spec', () => {
+  it('202 approve; manager.submitSpecVerdict invoked with verdict and no comments', async () => {
+    const updated = makeTask({ id: 'task-001', status: 'in_progress', phase: 'code' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict').mockResolvedValue(updated);
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
+
+    expect(response.statusCode).toBe(202);
+    expect(spy).toHaveBeenCalledWith('task-001', 'approve', undefined);
+  });
+
+  it('202 request-changes passes comments through', async () => {
+    const updated = makeTask({ id: 'task-001', status: 'fixing' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict').mockResolvedValue(updated);
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '补充回滚方案' });
+
+    expect(response.statusCode).toBe(202);
+    expect(spy).toHaveBeenCalledWith('task-001', 'request-changes', '补充回滚方案');
+  });
+
+  it('invalid verdict → 400 without touching the manager', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict');
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'reject' });
+    expect(response.statusCode).toBe(400);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('non-string comments → 400 without touching the manager', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict');
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: 123 });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/comments must be a string/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('wrong status → 409 pass-through', async () => {
+    vi.spyOn(app.ctx.agentManager, 'submitSpecVerdict')
+      .mockRejectedValue(new ApiError(409, 'Task task-001 is review; spec verdict requires spec-ready'));
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
+    expect(response.statusCode).toBe(409);
+  });
+});
+
 describe('POST /api/tasks/:id/continue', () => {
   it('202 with updated task; manager.continueDevRound invoked with the id', async () => {
     const updated = makeTask({ id: 'task-001', status: 'fixing', reviewRound: 3 });

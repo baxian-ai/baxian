@@ -68,6 +68,7 @@ const tasksUpdateMock = vi.mocked(api.tasks.update);
 const tasksReviewMock = vi.mocked(api.tasks.review);
 const tasksCompleteMock = vi.mocked(api.tasks.complete);
 const tasksContinueMock = vi.mocked(api.tasks.continue);
+const tasksSpecMock = vi.mocked(api.tasks.spec);
 const tasksReviewsMock = vi.mocked(api.tasks.reviews);
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
@@ -159,6 +160,7 @@ beforeEach(() => {
   tasksReviewMock.mockReset();
   tasksCompleteMock.mockReset();
   tasksContinueMock.mockReset();
+  tasksSpecMock.mockReset();
   tasksReviewsMock.mockReset();
   tasksReviewsMock.mockResolvedValue([]);
   toastShowMock.mockReset();
@@ -468,6 +470,61 @@ describe('TaskDetail page — actions & states', () => {
       expect(screen.queryByRole('button', { name: '标记完成' })).toBeNull();
       expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(true);
       expect(screen.getByText(/已达 spec review 轮次上限/)).toBeTruthy();
+    });
+  });
+
+  describe('spec-ready actions', () => {
+    function openSpecReady(overrides: Partial<TaskState> = {}) {
+      open({ status: 'spec-ready', phase: 'spec', specReviewRound: 1, prNumber: undefined, prUrl: undefined, ...overrides });
+    }
+
+    it('shows the Spec 需由人类审核 card with both actions; 打回 disabled until comments filled', () => {
+      openSpecReady();
+      expect(screen.getByText('Spec 需由人类审核')).toBeTruthy();
+      expect(screen.getByRole('button', { name: '通过 Spec，开始编码' })).toBeTruthy();
+      const reject = screen.getByRole('button', { name: '打回 Spec' }) as HTMLButtonElement;
+      expect(reject.disabled).toBe(true);
+      fireEvent.change(screen.getByPlaceholderText(/打回意见/), { target: { value: '补充回滚方案' } });
+      expect((screen.getByRole('button', { name: '打回 Spec' }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it('通过 Spec confirms and submits an approve verdict', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      tasksSpecMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
+      openSpecReady();
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
+      });
+
+      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已通过，已派发编码' });
+    });
+
+    it('打回 Spec submits request-changes with the comments', async () => {
+      tasksSpecMock.mockResolvedValue(makeTask({ status: 'fixing' }));
+      openSpecReady();
+
+      fireEvent.change(screen.getByPlaceholderText(/打回意见/), { target: { value: ' 边界场景没有覆盖 ' } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: '打回 Spec' }));
+      });
+
+      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '边界场景没有覆盖' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已打回，dev 开始修订' });
+    });
+
+    it('verdict failure surfaces an error toast', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      tasksSpecMock.mockRejectedValue(new Error('task-010 is fixing'));
+      openSpecReady();
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
+      });
+
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Spec 通过失败', body: 'task-010 is fixing' });
     });
   });
 });

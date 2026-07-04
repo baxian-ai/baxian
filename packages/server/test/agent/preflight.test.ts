@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { runPreflight } from '../../src/agent/preflight.js';
+import { probeTmux, runPreflight } from '../../src/agent/preflight.js';
 import { LocalRunner } from '../../src/agent/runner.js';
 import * as runnerModule from '../../src/agent/runner.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
@@ -17,7 +17,7 @@ function mockRunner(responses: Record<string, ExecResult>): CommandRunner {
         if (cmd.includes(pattern)) return result;
       }
       if (cmd.includes('rev-parse --is-inside-work-tree')) return OK_TRUE;
-      if (cmd.startsWith('which')) return OK_PATH;
+      if (cmd.startsWith('command -v')) return OK_PATH;
       return OK_EMPTY;
     }),
   };
@@ -42,7 +42,7 @@ describe('runPreflight', () => {
   });
 
   it('detects missing CLI', async () => {
-    const runner = mockRunner({ 'which claude': FAIL });
+    const runner = mockRunner({ 'command -v claude': FAIL });
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
     const cli = results.find(r => r.step === 'cli');
     expect(cli?.ok).toBe(false);
@@ -50,13 +50,47 @@ describe('runPreflight', () => {
   });
 
   it('detects missing tmux', async () => {
-    const runner = mockRunner({ 'which tmux': FAIL });
+    const runner = mockRunner({ 'command -v tmux': FAIL });
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
     expect(results.find(r => r.step === 'tmux')?.ok).toBe(false);
   });
 
+  it('points a missing-tmux failure at "baxian check <id> --fix" when the project id is known', async () => {
+    const runner = mockRunner({ 'command -v tmux': FAIL });
+    const results = await runPreflight(runner, makeAgent(), 'user/repo', undefined, 'proj-9');
+    const tmux = results.find(r => r.step === 'tmux');
+    expect(tmux?.ok).toBe(false);
+    expect(tmux?.message).toContain('baxian check proj-9 --fix');
+  });
+
+  it('falls back to a <project> placeholder in the missing-tmux hint without a project id', async () => {
+    const runner = mockRunner({ 'command -v tmux': FAIL });
+    const results = await runPreflight(runner, makeAgent(), 'user/repo');
+    expect(results.find(r => r.step === 'tmux')?.message).toContain('baxian check <project> --fix');
+  });
+
+  it('probes via POSIX command -v, never which, so a which-less minimal host still passes', async () => {
+    const noWhich: ExecResult = { stdout: '', stderr: 'sh: which: not found', exitCode: 127 };
+    const runner = mockRunner({ 'which ': noWhich });
+    const results = await runPreflight(runner, makeAgent(), 'user/repo', undefined, 'proj-1');
+    expect(results.find(r => r.step === 'tmux')?.ok).toBe(true);
+    expect(results.find(r => r.step === 'cli')?.ok).toBe(true);
+    expect(execCmds(runner).some(c => c.startsWith('which '))).toBe(false);
+  });
+
+  it('probeTmux (the --fix reprobe) matches installTmux verification on a which-less host', async () => {
+    const noWhich: ExecResult = { stdout: '', stderr: 'sh: which: not found', exitCode: 127 };
+    const runner = mockRunner({
+      'which ': noWhich,
+      'command -v tmux': { stdout: '/usr/bin/tmux\n', stderr: '', exitCode: 0 },
+    });
+    const result = await probeTmux(runner, 'proj-1');
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain('/usr/bin/tmux');
+  });
+
   it('skips openssl check for local agents (LocalRunner.writeFile uses fs)', async () => {
-    const runner = mockRunner({ 'which openssl': FAIL });
+    const runner = mockRunner({ 'command -v openssl': FAIL });
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
     expect(results.find(r => r.step === 'openssl')).toBeUndefined();
   });
@@ -67,7 +101,7 @@ describe('runPreflight', () => {
       mode: 'remote',
       host: { hostname: 'remote.example.com', user: 'agent' },
     });
-    const runner = mockRunner({ 'which openssl': FAIL });
+    const runner = mockRunner({ 'command -v openssl': FAIL });
     const results = await runPreflight(runner, remoteAgent, 'user/repo', { hostname: 'remote.example.com', user: 'agent' });
     const openssl = results.find(r => r.step === 'openssl');
     expect(openssl?.ok).toBe(false);
@@ -119,7 +153,7 @@ describe('runPreflight', () => {
   it('checks for codex CLI when runtime is codex', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAgent({ runtime: 'codex' }), 'user/repo');
-    expect(execCmds(runner).some(c => c.includes('which codex'))).toBe(true);
+    expect(execCmds(runner).some(c => c.includes('command -v codex'))).toBe(true);
   });
 
   it('detects git access failure', async () => {
@@ -140,7 +174,7 @@ describe('runPreflight', () => {
     expect(results.find(r => r.step === 'gh-repo')?.ok).toBe(false);
   });
 
-  it('which probes match the runtime mode of each binary: claude/codex use login-interactive (tmux pane); tmux/openssl + other ops stay on default login (-lc)', async () => {
+  it('binary probes match the runtime mode of each binary: claude/codex use login-interactive (tmux pane); tmux/openssl + other ops stay on default login (-lc)', async () => {
     vi.spyOn(LocalRunner.prototype, 'exec').mockResolvedValue({ stdout: 'ok\n', stderr: '', exitCode: 0 });
 
     const calls: Array<{ cmd: string; opts?: { remoteShell?: string } }> = [];
@@ -148,19 +182,19 @@ describe('runPreflight', () => {
       exec: vi.fn(async (cmd: string, opts?: { remoteShell?: string }) => {
         calls.push({ cmd, opts });
         if (cmd.includes('rev-parse --is-inside-work-tree')) return OK_TRUE;
-        if (cmd.startsWith('which')) return OK_PATH;
+        if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };
     await runPreflight(runner, makeAgent({ mode: 'remote', host: { hostname: 'box', user: 'rock' } }), 'user/repo', { hostname: 'box', user: 'rock' });
 
-    const cliWhich = calls.find(c => c.cmd === 'which claude');
+    const cliWhich = calls.find(c => c.cmd === 'command -v claude');
     expect(cliWhich?.opts?.remoteShell).toBe('login-interactive');
 
-    const tmuxWhich = calls.find(c => c.cmd === 'which tmux');
+    const tmuxWhich = calls.find(c => c.cmd === 'command -v tmux');
     expect(tmuxWhich?.opts?.remoteShell).toBeUndefined();
 
-    const opensslWhich = calls.find(c => c.cmd === 'which openssl');
+    const opensslWhich = calls.find(c => c.cmd === 'command -v openssl');
     expect(opensslWhich?.opts?.remoteShell).toBeUndefined();
 
     const otherCalls = calls.filter(c => /^(git |gh |mkdir |test )/.test(c.cmd));
@@ -175,8 +209,8 @@ describe('runPreflight', () => {
 
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd === 'which tmux') return { stdout: '', stderr: '', exitCode: 0 };
-        if (cmd.startsWith('which')) return OK_PATH;
+        if (cmd === 'command -v tmux') return { stdout: '', stderr: '', exitCode: 0 };
+        if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };
@@ -198,16 +232,16 @@ describe('runPreflight', () => {
 
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd === 'which claude') {
+        if (cmd === 'command -v claude') {
           throw new Error('Command timed out after 5000ms');
         }
-        if (cmd === 'which tmux') {
+        if (cmd === 'command -v tmux') {
           throw new Error('Command timed out after 5000ms');
         }
-        if (cmd === 'which openssl') {
+        if (cmd === 'command -v openssl') {
           throw new Error('spawn ssh ENOENT');
         }
-        if (cmd.startsWith('which')) return OK_PATH;
+        if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };
@@ -292,7 +326,7 @@ describe('runPreflight — auto mode', () => {
         if (cmd.startsWith('mkdir -p') && cmd.includes('.baxian/repos &&')) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo/.git`) return FAIL;
-        if (cmd.startsWith('which')) return OK_PATH;
+        if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };
@@ -308,7 +342,7 @@ describe('runPreflight — auto mode', () => {
         if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo/.git`) return OK_EMPTY;
-        if (cmd.startsWith('which')) return OK_PATH;
+        if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };
@@ -322,7 +356,7 @@ describe('runPreflight — auto mode', () => {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo`) return FAIL;
-        if (cmd.startsWith('which')) return OK_PATH;
+        if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };

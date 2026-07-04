@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
 import { shellQuote, SshRunner } from './runner.js';
+import { isHorizontalRule } from './detect/region.js';
 
 const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<ExecResult> =>
   runner['exec'](cmd, opts);
@@ -29,6 +30,9 @@ export interface WaitReplReadyOpts extends WaitOpts {
   failFastOnShell?: boolean;
   scrollback?: number;
   perCommandTimeoutMs?: number;
+  // 宽度无关的 idle 信号兜底：窄 pane 下 Ink 硬折行会打断 anchor/composer 的屏幕正则，
+  // 仅供"对运行中 REPL 等 idle"的路径开启；bootstrap 禁用（pane_title 会残留上一进程的值）。
+  titleIdleFastPath?: boolean;
 }
 
 export interface WaitSubmitAckOpts extends WaitOpts {
@@ -108,6 +112,16 @@ export function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind):
 const OSC_TITLE_WORKING_RE = /^[⠀-⣿] /;
 export function hasOscTitleWorking(paneTitle: string): boolean {
   return OSC_TITLE_WORKING_RE.test(paneTitle);
+}
+
+// claude-code 独有契约（poller manifest osc_title_idle 同源）：idle 恒为 "✳ <摘要>"，working 为 braille 帧前缀。
+// codex 的 title 是 cwd 之类的弱信号，不构成 idle 契约。
+const OSC_TITLE_IDLE_RES: Partial<Record<AgentRuntimeKind, RegExp>> = {
+  'claude-code': /^✳ /,
+};
+
+export function hasOscTitleIdle(paneTitle: string, runtime: AgentRuntimeKind): boolean {
+  return OSC_TITLE_IDLE_RES[runtime]?.test(paneTitle) ?? false;
 }
 
 export function hasReplProcTitle(current: string, runtime: AgentRuntimeKind): boolean {
@@ -209,14 +223,94 @@ export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRun
   return false;
 }
 
+export function screenBlocksReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
+  return runtimeBusyCheck(stripped, runtime)
+    || detectRuntimeMenu(stripped)
+    || detectStartupDialog(stripped, runtime)
+    || TRUST_DIALOGS[runtime].test(stripped);
+}
+
+// manifest blocker 规则（bash/generic permission、live_blocked_form、dynamic workflow、legacy）的文本指纹。
+// 这些 prompt 挂起时 OSC 标题仍是 ✳ idle 形态（manifest 里 blocker 优先级压过 osc_title_idle 即此语义），
+// 单短语 ≤22 字符，29 列窄 pane 下不折行。仅供 title fast path 消费：并入 hasRuntimeReadyView 会让
+// 历史输出里的这些短语误伤 bootstrap 等既有调用方。误拦仅退化为超时 409（fail-closed），
+// 但可能出现在回复正文的短语一律走组合判定（与选单形态同现）——裸判会把常态 idle 输出当 prompt。
+// 指纹一律用 \s+ 连接词间：Ink 在词边界硬折行，长短语（skip interview…35 字符）窄屏必断行
+const PENDING_PROMPT_SIGNALS: readonly RegExp[] = [
+  /waiting\s+for\s+permission/i,
+  /review\s+your\s+answers/i,
+  /skip\s+interview\s+and\s+plan\s+immediately/i,
+];
+const PENDING_OFFER_RE = /do\s+you\s+want\s+to|would\s+you\s+like\s+to|tab\s+to\s+amend|ctrl\+e\s+to\s+explain/i;
+// manifest bash/generic permission 的选项行形态并集：裸 Yes（反色选中无 ❯）、编号 Yes/No。
+// 不收 `❯ <任意文本>`（legacy manifest 形态）：clear 的 pre-clear wait 发生在清残稿之前，
+// composer 残稿正是 ❯+文本，收了会把修复目标场景 veto 成死锁。
+const PENDING_OPTION_LINE_RE = /^\s*(?:❯\s*)?(?:\d+\.\s*)?yes\b|^\s*(?:❯\s*)?\d+\.\s*no\b/im;
+const SELECT_FORM_ENTER_RE = /enter\s+to\s+(?:select|confirm)/i;
+const DYNAMIC_WORKFLOW_RE = /run\s+a\s+dynamic\s+workflow\?/i;
+const FORM_ESC_CANCEL_RE = /esc\s+to\s+cancel/i;
+const PENDING_PROMPT_TAIL_LINES = 15;
+
+// 活动 form 区域：最后一条水平线（form/composer box 边界）之后；无水平线（如极窄 pane 不渲染
+// box）时退回 tail 15。不学 extractRegion 的"无线取整屏"——这里误拦即 409，整屏会把正文引用扫进来。
+function pendingPromptRegion(stripped: string): string {
+  const lines = stripped.split('\n');
+  let lastRule = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (isHorizontalRule(lines[i])) lastRule = i;
+  }
+  if (lastRule >= 0) return lines.slice(lastRule + 1).join('\n');
+  return tail(stripped, PENDING_PROMPT_TAIL_LINES);
+}
+
+export function detectRuntimePendingPrompt(stripped: string): boolean {
+  const t = pendingPromptRegion(stripped);
+  if (PENDING_PROMPT_SIGNALS.some(re => re.test(t))) return true;
+  if (PENDING_OFFER_RE.test(t) && PENDING_OPTION_LINE_RE.test(t)) return true;
+  if (DYNAMIC_WORKFLOW_RE.test(t) && FORM_ESC_CANCEL_RE.test(t)) return true;
+  return SELECT_FORM_ENTER_RE.test(t) && FORM_ESC_CANCEL_RE.test(t);
+}
+
+// transcript viewer / model picker 挂起时按键落 overlay 而非 composer；与 manifest skipStateUpdate 规则同源。
+// footer（ctrl+o to toggle · esc to close，31 字符）窄屏会折两行，故看最后 2 个非空行而非 manifest 的 1 行。
+const OVERLAY_FOOTER_SIGNALS: readonly RegExp[] = [
+  /ctrl\+o[^\n]{0,60}to\s+toggle/i,
+  /ctrl\+e[^\n]{0,60}show\s+all/i,
+  /ctrl\+e[^\n]{0,60}collapse/i,
+  /showing\s+detailed\s+transcript/i,
+  /↑↓\s+scroll/,
+  /\?\s+for\s+shortcuts/,
+];
+const OVERLAY_FOOTER_NONBLANK_LINES = 2;
+const MODEL_PICKER_TITLE_RE = /select\s+model/i;
+const MODEL_PICKER_FOOTER_RE = /enter\s+to\s+set\s+as\s+default/i;
+
+function lastNonBlankLines(stripped: string, count: number): string {
+  const kept: string[] = [];
+  const lines = stripped.split('\n');
+  for (let i = lines.length - 1; i >= 0 && kept.length < count; i--) {
+    if (lines[i].trim() !== '') kept.unshift(lines[i]);
+  }
+  return kept.join('\n');
+}
+
+export function detectRuntimeOverlay(stripped: string): boolean {
+  const footer = lastNonBlankLines(stripped, OVERLAY_FOOTER_NONBLANK_LINES);
+  if (OVERLAY_FOOTER_SIGNALS.some(re => re.test(footer))) return true;
+  const t = tail(stripped, PENDING_PROMPT_TAIL_LINES);
+  return MODEL_PICKER_TITLE_RE.test(t) && MODEL_PICKER_FOOTER_RE.test(t);
+}
+
+export function screenAllowsTitleIdle(stripped: string, runtime: AgentRuntimeKind): boolean {
+  return !screenBlocksReadyView(stripped, runtime)
+    && !detectRuntimePendingPrompt(stripped)
+    && !detectRuntimeOverlay(stripped);
+}
+
 export function hasRuntimeReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (hasReplReadyAnchor(stripped, runtime)) return true;
   if (!hasRuntimeIdleComposerPrompt(stripped, runtime)) return false;
-  if (runtimeBusyCheck(stripped, runtime)) return false;
-  if (detectRuntimeMenu(stripped)) return false;
-  if (detectStartupDialog(stripped, runtime)) return false;
-  if (TRUST_DIALOGS[runtime].test(stripped)) return false;
-  return true;
+  return !screenBlocksReadyView(stripped, runtime);
 }
 
 export function runtimeBusyCheck(stripped: string, runtime: AgentRuntimeKind): boolean {
@@ -701,6 +795,7 @@ export class TmuxManager {
     const procTitle = REPL_PROC_TITLES[runtime];
     const cmdOpts = opts.perCommandTimeoutMs ? { timeout: opts.perCommandTimeoutMs } : undefined;
     let lastStripped = '';
+    let lastTitle: string | undefined;
     while (Date.now() < deadline) {
       const current = await this.displayMessage(paneId, '#{pane_current_command}', cmdOpts);
       if (failFastOnShell && SHELL_PROC_TITLES.test(current)) {
@@ -714,10 +809,24 @@ export class TmuxManager {
       const cap = await this.capturePaneById(paneId, { ansi: true, scrollback, timeoutMs: opts.perCommandTimeoutMs });
       const stripped = stripAnsi(cap);
       lastStripped = stripped;
-      if (procTitle.test(current) && hasRuntimeReadyView(stripped, runtime)) return;
+      if (procTitle.test(current)) {
+        if (hasRuntimeReadyView(stripped, runtime)) return;
+        if (opts.titleIdleFastPath && screenAllowsTitleIdle(stripped, runtime)) {
+          lastTitle = await this.readPaneTitle(paneId, cmdOpts);
+          if (hasOscTitleIdle(lastTitle, runtime)) return;
+        }
+      }
       await sleep(interval);
     }
-    throw new ReplNotReadyError(paneId, runtime, lastStripped);
+    if (opts.titleIdleFastPath && lastTitle === undefined) {
+      lastTitle = await this.readPaneTitle(paneId, cmdOpts);
+    }
+    throw new ReplNotReadyError(
+      paneId,
+      runtime,
+      lastStripped,
+      lastTitle === undefined ? undefined : `paneTitle=${JSON.stringify(lastTitle)}`,
+    );
   }
 }
 

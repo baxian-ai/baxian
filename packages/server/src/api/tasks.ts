@@ -290,6 +290,21 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(202).send(updated);
   });
 
+  app.post<{ Params: { id: string }; Body: { verdict?: string; comments?: string } }>(
+    '/tasks/:id/spec',
+    async (request, reply) => {
+      const { verdict, comments } = request.body ?? {};
+      if (verdict !== 'approve' && verdict !== 'request-changes') {
+        return reply.status(400).send({ error: 'verdict must be "approve" or "request-changes"' });
+      }
+      if (comments !== undefined && typeof comments !== 'string') {
+        return reply.status(400).send({ error: 'comments must be a string' });
+      }
+      const updated = await app.ctx.agentManager.submitSpecVerdict(request.params.id, verdict, comments);
+      return reply.status(202).send(updated);
+    },
+  );
+
   app.patch<{ Params: { id: string }; Body: UpdateTaskBody }>(
     '/tasks/:id',
     async (request, reply) => {

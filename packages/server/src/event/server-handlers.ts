@@ -203,6 +203,26 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     await manager.dispatchServerAfterDone(task.id, afterDone);
   }
 
+  function specApprovalIsHuman(task: TaskState): boolean {
+    return manager.getProjectConfig(task.projectId)?.specApproval === 'human';
+  }
+
+  async function advanceApprovedSpec(task: TaskState, failurePhase: string): Promise<void> {
+    try {
+      const result = specApprovalIsHuman(task)
+        ? await manager.parkTaskAtSpecReady(task.id)
+        : await manager.transitionToCodePhase(task.id);
+      if (!result) {
+        await emitIntervention(bus, task, { phase: failurePhase });
+      }
+    } catch (err) {
+      await emitIntervention(bus, task, {
+        phase: failurePhase,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async function autoApproveSpec(task: TaskState): Promise<void> {
     try {
       const result = await manager.transitionToCodePhase(task.id);
@@ -635,10 +655,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     if (!gated) return;
     const { task } = gated;
     const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
-    if (!hasQa) {
+    if (!hasQa && !specApprovalIsHuman(task)) {
       await autoApproveSpec(task);
       return;
     }
+    // 无 QA 但需人类审核：仍走 dispatchSpecReview 存 spec 内容，再由其停驻
     await dispatchSpecReview(task);
   });
 
@@ -689,6 +710,17 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
       await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
+      return;
+    }
+    const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
+    if (!hasQa) {
+      if (specApprovalIsHuman(task)) {
+        const parked = await manager.parkTaskAtSpecReady(task.id, { specReviewRound: nextRound });
+        if (!parked) await emitIntervention(bus, task, { phase: 'server-spec-park-transition-failed' });
+      } else {
+        // 循环中途配置被关闭：退回无 QA 的自动通过
+        await autoApproveSpec(task);
+      }
       return;
     }
     const sized = truncateUtf8(content.content, MAX_INLINE_CONTENT_BYTES);
@@ -759,14 +791,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
 
     if (effective.verdict === 'approve') {
-      try {
-        await manager.transitionToCodePhase(task.id);
-      } catch (err) {
-        await emitIntervention(bus, task, {
-          phase: 'server-spec-approve-transition-failed',
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      await advanceApprovedSpec(task, 'server-spec-approve-transition-failed');
       return;
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);

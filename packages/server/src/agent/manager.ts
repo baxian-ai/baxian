@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSignalToken, type ReadFileSignal } from './phase-signal.js';
+import { tmuxInstallHint } from './preflight.js';
 import type {
   AfterDone,
   BaxianConfig,
@@ -10,7 +11,9 @@ import type {
   BaxianEvent,
   HostConfig,
   ProjectConfig,
+  ReviewFindings,
   ReviewMode,
+  ReviewRound,
   TaskPhase,
   TaskState,
   TaskStatus,
@@ -45,6 +48,8 @@ import {
   hasRuntimeReadyView,
   hasReplProcTitle,
   hasOscTitleWorking,
+  hasOscTitleIdle,
+  screenAllowsTitleIdle,
   type AdoptPaneState,
   type AgentRuntimeKind,
 } from './tmux.js';
@@ -298,6 +303,7 @@ export class AgentManager {
   protected postMergeBranchTimeoutMs = 10_000;
   private manualReviewInFlight = new Set<string>();
   private markCompleteInFlight = new Set<string>();
+  private specVerdictInFlight = new Set<string>();
   // 引用计数：cancelTask 与 startCreatedTaskSession 的清理段可合法并存（启动期 Stop），先完成者不得清掉后者的 guard。
   private cancelCleanupInFlight = new Map<string, number>();
   private deletionInFlight = new Set<string>();
@@ -489,7 +495,8 @@ export class AgentManager {
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
-        `tmux probe failed: ${err instanceof Error ? err.message : String(err)}`,
+        `tmux probe failed: ${err instanceof Error ? err.message : String(err)}; ` +
+          `if tmux is missing, ${tmuxInstallHint(agent.projectId)}`,
       );
     }
 
@@ -1922,7 +1929,7 @@ export class AgentManager {
     timeoutMs: number,
   ): Promise<boolean> {
     try {
-      await tmux.waitReplReady(paneId, runtime, { timeoutMs, scrollback: 0 });
+      await tmux.waitReplReady(paneId, runtime, { timeoutMs, scrollback: 0, titleIdleFastPath: true });
       return true;
     } catch (err) {
       console.warn(
@@ -2036,6 +2043,7 @@ export class AgentManager {
       const out: TaskState[] = [];
       for (const t of tasks) {
         const bound = t.agentId === agentId || t.qaAgentId === agentId;
+        // spec-ready 不豁免：approve/打回都依赖 dev worktree，dev 丢失后停驻只是假活
         if (t.status === 'ready' || t.status === 'merge-ready') continue;
         if (ACTIVE_TASK_STATUSES.has(t.status) && bound) {
           t.status = 'failed';
@@ -4340,6 +4348,9 @@ export class AgentManager {
       return task;
     });
 
+    // stop again post-write: a rollback may have re-armed between the pre-lock stop() and the cancelled write
+    if (cleanupClaimed) this.phaseSignalWatcher?.stop(taskId);
+
     let devStopConfirmed = false;
     // 两阶段：先中断全部 pane 再释放任一 binding，避免 dev 先空闲、被派新任务时旧任务的 qa prompt 仍在跑。
     try {
@@ -4773,6 +4784,8 @@ export class AgentManager {
     await this.withTaskLock(async () => {
       const fresh = await this.taskStore.get(taskId);
       if (!fresh) return;
+      // only a concurrent cancel/fail into terminal drops the write; a terminal-at-claim recheck still restores snapshot fields
+      if (!isTerminalAtClaim && TERMINAL_STATUSES.includes(fresh.status)) return;
       const next: TaskState = {
         ...fresh,
         reviewRound: Math.max(0, fresh.reviewRound - 1),
@@ -4790,6 +4803,13 @@ export class AgentManager {
 
     if (!this.phaseSignalWatcher) return;
 
+    // a terminal task keeps no watcher: tear down one this dispatch armed before failing, then skip re-arming
+    const afterRollback = await this.taskStore.get(taskId);
+    if (afterRollback && TERMINAL_STATUSES.includes(afterRollback.status)) {
+      this.phaseSignalWatcher.stop(taskId);
+      return;
+    }
+
     if (originalStatus === 'approved') {
       const completion = await this.postApproveStore.get(taskId);
       const task = await this.taskStore.get(taskId);
@@ -4802,6 +4822,7 @@ export class AgentManager {
             expectedKinds: 'pr-merge-ready',
             token: completion.token,
           });
+          await this.tearDownWatcherIfTaskTerminal(taskId);
         } catch (err) {
           console.warn(
             `[AgentManager] rollback: re-establish pr-merge-ready failed for task=${taskId}:`,
@@ -4824,11 +4845,20 @@ export class AgentManager {
         expectedKinds: mapped.expectedKinds,
         token: restored.signalToken,
       });
+      await this.tearDownWatcherIfTaskTerminal(taskId);
     } catch (err) {
       console.warn(
         `[AgentManager] rollback: re-establish ${mapped.expectedKinds.join(',')} failed for task=${taskId}:`,
         err,
       );
+    }
+  }
+
+  // a cancel between our start() and the terminal write leaves a watcher on a dead task; re-check and drop it
+  private async tearDownWatcherIfTaskTerminal(taskId: string): Promise<void> {
+    const now = await this.taskStore.get(taskId);
+    if (now && TERMINAL_STATUSES.includes(now.status)) {
+      this.phaseSignalWatcher?.stop(taskId);
     }
   }
 
@@ -5435,6 +5465,7 @@ export class AgentManager {
     await tmux.waitReplReady(paneId, runtime, {
       timeoutMs,
       intervalMs: this.compactIdlePollMs,
+      titleIdleFastPath: true,
     });
     await new Promise(r => setTimeout(r, this.compactIdlePollMs));
     while (true) {
@@ -5443,7 +5474,8 @@ export class AgentManager {
         throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
       }
       const cap = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
-      const ready = hasRuntimeReadyView(cap, runtime);
+      const ready = hasRuntimeReadyView(cap, runtime)
+        || (screenAllowsTitleIdle(cap, runtime) && hasOscTitleIdle(await tmux.readPaneTitle(paneId), runtime));
       if (detectRuntimeMenu(cap) || (!ready && detectStartupDialog(cap, runtime))) {
         throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
       }
@@ -5547,6 +5579,7 @@ export class AgentManager {
     await this.withTaskLock(async () => {
       const fresh = await this.taskStore.get(taskId);
       if (!fresh) return;
+      if (TERMINAL_STATUSES.includes(fresh.status)) return;
       await this.taskStore.set({
         ...fresh,
         status: restore.status,
@@ -5560,8 +5593,137 @@ export class AgentManager {
     if (!this.phaseSignalWatcher) return;
     const restored = await this.taskStore.get(taskId);
     if (!restored?.signalToken) return;
+    if (TERMINAL_STATUSES.includes(restored.status)) return;
     const mapped = this.mapTaskStateToExpectedWatcher(restored);
-    if (mapped) await this.setupPhaseSignal(taskId, mapped.agentId, mapped.expectedKinds);
+    if (mapped) {
+      await this.setupPhaseSignal(taskId, mapped.agentId, mapped.expectedKinds);
+      await this.tearDownWatcherIfTaskTerminal(taskId);
+    }
+  }
+
+  async parkTaskAtSpecReady(taskId: string, opts: { specReviewRound?: number } = {}): Promise<TaskState | null> {
+    const task = await this.taskStore.get(taskId);
+    if (!task) return null;
+    const transition = await this.transitionTaskStatus(
+      taskId,
+      'spec-ready',
+      { fromStatus: ['review', 'in_progress', 'fixing'] },
+      // QA 在停驻期解绑，残留 qaAgentId 会让后续 approve/打回误发释放；复审经 findQaPartner 回绑
+      {
+        phase: 'spec',
+        qaAgentId: undefined,
+        ...(opts.specReviewRound !== undefined ? { specReviewRound: opts.specReviewRound } : {}),
+      },
+    );
+    if (!transition) return null;
+    this.stopPhaseSignalWatcher(taskId);
+    if (task.agentId) {
+      const devOk = await this.markAgentWaiting(task.agentId, taskId).catch(() => false);
+      if (!devOk) {
+        await this.safeEmit({
+          id: '',
+          type: 'human.intervention',
+          timestamp: new Date().toISOString(),
+          projectId: task.projectId,
+          agentId: task.agentId,
+          taskId,
+          data: { phase: 'spec-ready-dev-park-failed', devAgentId: task.agentId },
+        });
+      }
+    }
+    if (task.qaAgentId) {
+      const released = await this.releaseAgentForTask(task.qaAgentId, taskId, 'idle')
+        .catch(() => false);
+      if (!released) {
+        await this.safeEmit({
+          id: '',
+          type: 'human.intervention',
+          timestamp: new Date().toISOString(),
+          projectId: task.projectId,
+          agentId: task.qaAgentId,
+          taskId,
+          data: { phase: 'spec-ready-qa-release-failed', qaAgentId: task.qaAgentId },
+        });
+      }
+    }
+    return transition.task;
+  }
+
+  async submitSpecVerdict(
+    taskId: string,
+    verdict: 'approve' | 'request-changes',
+    comments?: string,
+  ): Promise<TaskState> {
+    const trimmed = comments?.trim();
+    if (verdict === 'request-changes' && !trimmed) {
+      throw new ApiError(400, 'comments is required for request-changes');
+    }
+    const task = await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh) throw new ApiError(404, `Task ${taskId} not found`);
+      if (fresh.status !== 'spec-ready') {
+        throw new ApiError(409, `Task ${taskId} is ${fresh.status}; spec verdict requires spec-ready`);
+      }
+      if (this.specVerdictInFlight.has(taskId)) {
+        throw new ApiError(409, `Task ${taskId} spec verdict is already being processed`);
+      }
+      this.specVerdictInFlight.add(taskId);
+      return fresh;
+    });
+    try {
+      return await this.executeSpecVerdict(task, verdict, trimmed);
+    } finally {
+      this.specVerdictInFlight.delete(taskId);
+    }
+  }
+
+  private async executeSpecVerdict(
+    task: TaskState,
+    verdict: 'approve' | 'request-changes',
+    trimmed: string | undefined,
+  ): Promise<TaskState> {
+    const taskId = task.id;
+    const store = this.getReviewStore();
+    if (!store) throw new ApiError(500, 'Review store unavailable');
+    const round = task.specReviewRound ?? 1;
+    const at = new Date().toISOString();
+    const roundData = await store.getRound(taskId, 'spec', round);
+
+    // 停驻路径必然已存轮次；缺失时补一条空轮次，保证 userDecision 留痕与 fix 闭环
+    const base: ReviewRound = roundData ?? { round, phase: 'spec', content: '', startedAt: at };
+
+    if (verdict === 'approve') {
+      await store.putRound(taskId, 'spec', { ...base, userDecision: { verdict, at } });
+      const result = await this.transitionToCodePhase(taskId);
+      if (!result) throw new ApiError(500, `Failed to dispatch code phase for task ${taskId}`);
+      return result;
+    }
+
+    // 打回消耗一轮修订；到达上限时拒绝而非派发注定进 max_rounds 的修订，让用户当场决策
+    const cap = this.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
+    if (round >= cap) {
+      throw new ApiError(
+        409,
+        `Task ${taskId} has reached the spec review round cap (${cap}); `
+        + 'approve the spec, or cancel the task and retry with a refined description',
+      );
+    }
+    if (!trimmed) throw new ApiError(400, 'comments is required for request-changes');
+    const priorFindings = base.findings?.findings ?? [];
+    const nextUserId = `u-${priorFindings.filter(f => f.id.startsWith('u-')).length + 1}`;
+    const mergedFindings: ReviewFindings = {
+      round,
+      verdict: 'request-changes',
+      findings: [...priorFindings, { id: nextUserId, severity: 'major', message: trimmed }],
+    };
+    await store.putRound(taskId, 'spec', {
+      ...base,
+      findings: mergedFindings,
+      userDecision: { verdict, comments: trimmed, at },
+    });
+    const dispatched = await this.dispatchServerFixToDev(taskId, JSON.stringify(mergedFindings));
+    if (!dispatched) throw new ApiError(500, `Failed to dispatch spec fix for task ${taskId}`);
+    return dispatched;
   }
 
   async transitionToCodePhase(taskId: string): Promise<TaskState | null> {
@@ -5573,7 +5735,7 @@ export class AgentManager {
     const transition = await this.transitionTaskStatus(
       taskId,
       'in_progress',
-      { fromStatus: ['review', 'fixing', 'in_progress'] },
+      { fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready'] },
       { phase: 'code', signalToken: newToken },
     );
     if (!transition) return null;
@@ -5952,7 +6114,7 @@ export class AgentManager {
     const transition = await this.transitionTaskStatus(
       taskId,
       'fixing',
-      { fromStatus: ['review', 'max_rounds'] },
+      { fromStatus: ['review', 'max_rounds', 'spec-ready'] },
       { signalToken: newToken, fixDispatchedAt: new Date().toISOString() },
     );
     if (!transition) {

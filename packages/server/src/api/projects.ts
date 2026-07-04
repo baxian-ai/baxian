@@ -6,11 +6,13 @@ import type {
   BaxianConfig,
   ProjectConfig,
   MergeStrategy,
+  SpecApprovalStrategy,
   AgentConfig,
 } from '../shared/index.js';
 import { TASK_ACTIVE_STATUS_SET, TASK_TERMINAL_STATUS_SET } from '../shared/index.js';
-import { runPreflight, type PreflightResult } from '../agent/preflight.js';
-import { createRunner, resolveAgentHost } from '../agent/runner.js';
+import { probeTmux, runPreflight, type PreflightResult } from '../agent/preflight.js';
+import { installTmux } from '../agent/tmux-install.js';
+import { createRunner, hostGroupKey, resolveAgentHost, type CommandRunner } from '../agent/runner.js';
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
 import { redactProjects } from './config.js';
@@ -22,6 +24,56 @@ interface CheckRun {
   agentId: string;
   mode: AgentMode;
   results: PreflightResult[];
+}
+
+interface CheckEntry {
+  agent: AgentConfig;
+  hostGroup: string;
+  runner: CommandRunner;
+}
+
+interface TmuxFix {
+  hostGroup: string;
+  ok: boolean;
+  method?: string;
+  version?: string;
+  message: string;
+}
+
+async function fixMissingTmux(
+  projectId: string,
+  entries: CheckEntry[],
+  agents: CheckRun[],
+): Promise<TmuxFix[]> {
+  const runsById = new Map(agents.map(run => [run.agentId, run]));
+  const groups = new Map<string, { runner: CommandRunner; agentIds: string[] }>();
+  for (const { agent, hostGroup, runner } of entries) {
+    const tmuxCheck = runsById.get(agent.id)?.results.find(r => r.step === 'tmux');
+    if (!tmuxCheck || tmuxCheck.ok) continue;
+    const group = groups.get(hostGroup);
+    if (group) group.agentIds.push(agent.id);
+    else groups.set(hostGroup, { runner, agentIds: [agent.id] });
+  }
+
+  const fixes: TmuxFix[] = [];
+  for (const [hostGroup, group] of groups) {
+    const install = await installTmux(group.runner);
+    fixes.push({
+      hostGroup,
+      ok: install.ok,
+      method: install.method,
+      version: install.version,
+      message: install.message,
+    });
+    if (!install.ok) continue;
+    const reprobe = await probeTmux(group.runner, projectId);
+    for (const agentId of group.agentIds) {
+      const run = runsById.get(agentId);
+      const index = run ? run.results.findIndex(r => r.step === 'tmux') : -1;
+      if (run && index >= 0) run.results[index] = reprobe;
+    }
+  }
+  return fixes;
 }
 
 function configHash(config: BaxianConfig): string {
@@ -73,29 +125,38 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ok: result.ok, ran: result.ran });
   });
 
-  app.post<{ Params: { id: string } }>('/projects/:id/checks', async (request, reply) => {
-    const project = app.ctx.config.project.find(p => p.id === request.params.id);
-    if (!project) {
-      return reply.status(404).send({ error: 'Project not found' });
-    }
-
-    const checks: Promise<CheckRun>[] = [];
-    for (const pair of project.agent) {
-      for (const agent of pair) {
-        const host = resolveAgentHost(app.ctx.config.host, agent.host);
-        const runner = createRunner(agent.mode, host);
-        checks.push(
-          runPreflight(runner, agent, project.repo, host).then(results => ({
-            agentId: agent.id,
-            mode: agent.mode,
-            results,
-          })),
-        );
+  app.post<{ Params: { id: string }; Body: { fix?: boolean } | null }>(
+    '/projects/:id/checks',
+    async (request, reply) => {
+      const project = app.ctx.config.project.find(p => p.id === request.params.id);
+      if (!project) {
+        return reply.status(404).send({ error: 'Project not found' });
       }
-    }
-    const agents = await Promise.all(checks);
-    return reply.status(201).send({ projectId: project.id, agents });
-  });
+
+      const entries: CheckEntry[] = [];
+      const checks: Promise<CheckRun>[] = [];
+      for (const pair of project.agent) {
+        for (const agent of pair) {
+          const host = resolveAgentHost(app.ctx.config.host, agent.host);
+          const runner = createRunner(agent.mode, host);
+          entries.push({ agent, hostGroup: hostGroupKey(agent.mode, host), runner });
+          checks.push(
+            runPreflight(runner, agent, project.repo, host, project.id).then(results => ({
+              agentId: agent.id,
+              mode: agent.mode,
+              results,
+            })),
+          );
+        }
+      }
+      const agents = await Promise.all(checks);
+      if (request.body?.fix !== true) {
+        return reply.status(201).send({ projectId: project.id, agents });
+      }
+      const fixes = await fixMissingTmux(project.id, entries, agents);
+      return reply.status(201).send({ projectId: project.id, agents, fixes });
+    },
+  );
 
   app.delete<{ Params: { id: string } }>('/projects/:id', async (request, reply) => {
     if (!app.ctx.configPath) {
@@ -139,7 +200,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; review?: ProjectConfig['review'] } }>(
+  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectConfig['review'] } }>(
     '/projects',
     async (request, reply) => {
       if (!app.ctx.configPath) {
@@ -147,7 +208,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       return withConfigLock(async () => {
-        const { id, repo, merge, review } = request.body ?? {};
+        const { id, repo, merge, specApproval, review } = request.body ?? {};
         if (!id || typeof id !== 'string') {
           return reply.status(400).send({ error: 'id must be a non-empty string' });
         }
@@ -162,6 +223,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           id,
           repo,
           merge: merge ?? null,
+          ...(specApproval !== undefined ? { specApproval } : {}),
           ...(review !== undefined ? { review } : {}),
           agent: [],
         };

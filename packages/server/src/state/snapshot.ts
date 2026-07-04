@@ -29,7 +29,7 @@ export interface AgentSnapshotCtx {
 }
 
 const WORKING_TASK_STATUSES = new Set<TaskState['status']>(['in_progress', 'fixing']);
-const WAITING_TASK_STATUSES = new Set<TaskState['status']>(['review', 'approved', 'merge-ready', 'ready', 'max_rounds']);
+const WAITING_TASK_STATUSES = new Set<TaskState['status']>(['review', 'spec-ready', 'approved', 'merge-ready', 'ready', 'max_rounds']);
 const ERROR_TASK_STATUSES = new Set<TaskState['status']>(['failed']);
 const UNREACHABLE_ACTIVE_TASK_GRACE_MS = 30_000;
 

@@ -161,6 +161,15 @@ function RoundBlock({
             onClick={() => onOpen(round.phase, round.round, '#response')}
           />
         )}
+        {round.userDecision && (
+          <TurnRow
+            role="user"
+            label={round.userDecision.verdict === 'approve' ? '通过 Spec' : '打回 Spec'}
+            badge={<span className={VERDICT_CLASS[round.userDecision.verdict]}>{round.userDecision.verdict}</span>}
+            summary={round.userDecision.comments ?? ''}
+            onClick={() => onOpen(round.phase, round.round, '#review')}
+          />
+        )}
       </div>
     </div>
   );

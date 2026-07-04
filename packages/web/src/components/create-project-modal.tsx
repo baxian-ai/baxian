@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { MergeStrategy, ReviewMode } from '../shared/index.js';
+import type { MergeStrategy, ReviewMode, SpecApprovalStrategy } from '../shared/index.js';
 import { Modal } from './modal.tsx';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
@@ -28,6 +28,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [id, setId] = useState('');
   const [repo, setRepo] = useState('');
   const [merge, setMerge] = useState<MergeStrategy>(null);
+  const [specApproval, setSpecApproval] = useState<SpecApprovalStrategy>(null);
   const [reviewMode, setReviewMode] = useState<ReviewMode | ''>('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -44,6 +45,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setId('');
     setRepo('');
     setMerge(null);
+    setSpecApproval(null);
     setReviewMode('');
     setError(null);
     setFieldErrors({});
@@ -88,6 +90,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
         id,
         repo: repo.trim(),
         merge,
+        ...(specApproval ? { specApproval } : {}),
         ...(reviewMode ? { review: { mode: reviewMode } } : {}),
       });
       if (result.restartRequired) flagDirty();
@@ -179,6 +182,23 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
             />
             <span className="text-sm text-og-800">QA Approve 后自动合并</span>
           </label>
+        </div>
+
+        <div>
+          <span className={labelCls}>Spec 审核</span>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={specApproval === 'human'}
+              onChange={e => setSpecApproval(e.target.checked ? 'human' : null)}
+              disabled={submitting}
+              className="h-3.5 w-3.5 accent-[#1348dc]"
+            />
+            <span className="text-sm text-og-800">Spec 需由人类审核</span>
+          </label>
+          <div className="mt-1 text-xs text-og-500">
+            勾选后，走 SDD 的任务在 QA 通过 Spec 后停驻，等你在任务页通过或打回；是否走 SDD 仍由 dev agent 按任务复杂度判定。
+          </div>
         </div>
 
         <div>

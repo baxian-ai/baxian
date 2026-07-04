@@ -72,7 +72,7 @@ describe('readContent (code)', () => {
       { match: c => c.includes('symbolic-ref'), result: { stdout: 'origin/main\n' } },
       { match: c => c.includes('merge-base'), result: { stdout: 'basesha123\n' } },
       { match: c => c.includes('--stat'), result: { stdout: ' a.ts | 2 +-\n' } },
-      { match: c => c.includes('git diff') && !c.includes('--stat'), result: { stdout: 'diff --git a/a.ts b/a.ts\n+x' } },
+      { match: c => / diff\b/.test(c) && !c.includes('--stat'), result: { stdout: 'diff --git a/a.ts b/a.ts\n+x' } },
     ]);
     const result = await transport.readContent(task(), DEV, 'code');
     expect(result.content).toContain('diff --git');
@@ -80,13 +80,26 @@ describe('readContent (code)', () => {
     expect(result.defaultBranch).toBe('main');
     expect(result.diffstat).toContain('a.ts');
     expect(calls.some(c => c.includes('git fetch origin'))).toBe(true);
-    expect(calls.some(c => c.includes("'origin/main'...HEAD"))).toBe(true);
+    expect(calls.some(c => c.includes("'origin/main...HEAD'"))).toBe(true);
+  });
+
+  it('runs diff and diffstat with core.quotepath=false so non-ascii paths stay verbatim', async () => {
+    const { transport, calls } = makeTransport([
+      { match: c => c.includes('symbolic-ref'), result: { stdout: 'origin/main\n' } },
+      { match: c => c.includes('merge-base'), result: { stdout: 'basesha123\n' } },
+      { match: c => c.includes('--stat'), result: { stdout: ' x | 1 +\n' } },
+      { match: c => / diff\b/.test(c) && !c.includes('--stat'), result: { stdout: 'diff --git a/x b/x' } },
+    ]);
+    await transport.readContent(task(), DEV, 'code');
+    const diffCalls = calls.filter(c => / diff\b/.test(c));
+    expect(diffCalls).toHaveLength(2);
+    for (const c of diffCalls) expect(c).toContain('-c core.quotepath=false');
   });
 
   it('throws ReviewExchangeError when diff fails', async () => {
     const { transport } = makeTransport([
       { match: c => c.includes('symbolic-ref'), result: { stdout: 'origin/main\n' } },
-      { match: c => c.includes('git diff') && !c.includes('--stat'), result: { exitCode: 128, stderr: 'fatal' } },
+      { match: c => / diff\b/.test(c) && !c.includes('--stat'), result: { exitCode: 128, stderr: 'fatal' } },
     ]);
     await expect(transport.readContent(task(), DEV, 'code')).rejects.toThrow(ReviewExchangeError);
   });

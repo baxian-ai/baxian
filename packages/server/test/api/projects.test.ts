@@ -8,6 +8,7 @@ import { buildApp } from '../../src/app.js';
 import * as loaderModule from '../../src/config/loader.js';
 import { ConfigValidationError } from '../../src/config/loader.js';
 import * as preflight from '../../src/agent/preflight.js';
+import * as tmuxInstall from '../../src/agent/tmux-install.js';
 import { CleanupFailedError, EnsureSessionError } from '../../src/agent/manager.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
 import { createTestContext } from '../helpers/context.js';
@@ -151,6 +152,20 @@ describe('POST /api/projects', () => {
     expect(body.project.merge).toBeNull();
   });
 
+  it('persists specApproval when provided and rejects invalid values', async () => {
+    const ok = await post('/api/projects', { id: 'specproj', repo: 'a/spec', specApproval: 'human' });
+    expect(ok.statusCode).toBe(201);
+    expect(JSON.parse(ok.body).project.specApproval).toBe('human');
+    expect(app.ctx.config.project.find(p => p.id === 'specproj')?.specApproval).toBe('human');
+
+    const omitted = await post('/api/projects', { id: 'specless', repo: 'a/specless' });
+    expect(omitted.statusCode).toBe(201);
+    expect(JSON.parse(omitted.body).project.specApproval).toBeUndefined();
+
+    const bad = await post('/api/projects', { id: 'specbad', repo: 'a/specbad', specApproval: 'qa' });
+    expect(bad.statusCode).toBe(400);
+  });
+
   it('persists project review mode when provided', async () => {
     const response = await post('/api/projects', { id: 'serverproj', repo: 'a/server', review: { mode: 'server' } });
     expect(response.statusCode).toBe(201);
@@ -255,6 +270,75 @@ describe('POST /api/projects/:id/checks', () => {
       { agentId: 'qa-1', mode: 'local', results: [{ step: 'cli', ok: true, message: 'claude found' }] },
     ]);
     expect(runSpy).toHaveBeenCalledTimes(2);
+    expect(body.fixes).toBeUndefined();
+  });
+
+  it('does not attempt a tmux install without fix:true even when the tmux check fails', async () => {
+    vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'tmux', ok: false, message: 'Please install tmux' },
+    ]);
+    const installSpy = vi.spyOn(tmuxInstall, 'installTmux');
+    const response = await post('/api/projects/proj/checks');
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(response.body).fixes).toBeUndefined();
+    expect(installSpy).not.toHaveBeenCalled();
+  });
+
+  it('installs tmux once per host group with fix:true and re-probes the affected agents', async () => {
+    vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'tmux', ok: false, message: 'Please install tmux' },
+    ]);
+    const installSpy = vi.spyOn(tmuxInstall, 'installTmux').mockResolvedValue({
+      ok: true, method: 'brew', version: '3.5', message: 'tmux 3.5 installed via brew',
+    });
+    const reprobeSpy = vi.spyOn(preflight, 'probeTmux').mockResolvedValue({
+      step: 'tmux', ok: true, message: 'tmux found at /opt/homebrew/bin/tmux',
+    });
+
+    const response = await post('/api/projects/proj/checks', { fix: true });
+    expect(response.statusCode).toBe(201);
+    const body = JSON.parse(response.body);
+    expect(installSpy).toHaveBeenCalledTimes(1);
+    expect(reprobeSpy).toHaveBeenCalledWith(expect.anything(), 'proj');
+    expect(body.fixes).toEqual([
+      { hostGroup: 'local', ok: true, method: 'brew', version: '3.5', message: 'tmux 3.5 installed via brew' },
+    ]);
+    for (const agent of body.agents) {
+      expect(agent.results).toEqual([
+        { step: 'tmux', ok: true, message: 'tmux found at /opt/homebrew/bin/tmux' },
+      ]);
+    }
+  });
+
+  it('keeps the failed tmux results and reports the failure when the install does not succeed', async () => {
+    vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'tmux', ok: false, message: 'Please install tmux' },
+    ]);
+    vi.spyOn(tmuxInstall, 'installTmux').mockResolvedValue({
+      ok: false, message: 'cannot install automatically: not root and passwordless sudo is unavailable — run "sudo apt-get install -y tmux" on the host',
+    });
+    const reprobeSpy = vi.spyOn(preflight, 'probeTmux');
+
+    const response = await post('/api/projects/proj/checks', { fix: true });
+    const body = JSON.parse(response.body);
+    expect(body.fixes).toHaveLength(1);
+    expect(body.fixes[0].ok).toBe(false);
+    expect(body.fixes[0].message).toContain('sudo apt-get install -y tmux');
+    expect(reprobeSpy).not.toHaveBeenCalled();
+    for (const agent of body.agents) {
+      expect(agent.results[0].ok).toBe(false);
+    }
+  });
+
+  it('reports an empty fixes list with fix:true when tmux is present everywhere', async () => {
+    vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'tmux', ok: true, message: 'tmux found at /usr/bin/tmux' },
+    ]);
+    const installSpy = vi.spyOn(tmuxInstall, 'installTmux');
+    const response = await post('/api/projects/proj/checks', { fix: true });
+    const body = JSON.parse(response.body);
+    expect(body.fixes).toEqual([]);
+    expect(installSpy).not.toHaveBeenCalled();
   });
 });
 

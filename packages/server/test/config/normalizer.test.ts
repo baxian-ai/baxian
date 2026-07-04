@@ -46,6 +46,18 @@ describe('normalizeConfig', () => {
       expect(result).toHaveProperty('review');
       expect(result).toHaveProperty('server');
     });
+
+    it.each(['specApproval', 'specapproval', 'SpecApproval'])(
+      'restores canonical camelCase for project key %s',
+      (key) => {
+        const result = normalizeConfig({
+          project: [{ id: 'p', repo: 'u/r', [key]: 'human' }],
+        });
+        const proj = (result.project as Record<string, unknown>[])[0];
+        expect(proj.specApproval).toBe('human');
+        expect(proj).not.toHaveProperty('specapproval');
+      },
+    );
   });
 
   describe('passthrough', () => {

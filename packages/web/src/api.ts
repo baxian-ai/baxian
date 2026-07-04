@@ -7,6 +7,7 @@ import type {
   AgentMode,
   HostConfig,
   MergeStrategy,
+  SpecApprovalStrategy,
   ProjectReviewConfig,
   ReviewRound,
   GithubReviewConversation,
@@ -266,6 +267,8 @@ export const api = {
     review: (id: string) => post<TaskState>(`/tasks/${enc(id)}/review`),
     complete: (id: string) => post<TaskState>(`/tasks/${enc(id)}/complete`),
     continue: (id: string) => post<TaskState>(`/tasks/${enc(id)}/continue`),
+    spec: (id: string, body: { verdict: 'approve' | 'request-changes'; comments?: string }) =>
+      post<TaskState>(`/tasks/${enc(id)}/spec`, body),
     reviews: (id: string) => get<ReviewRound[]>(`/tasks/${enc(id)}/reviews`),
     githubReview: (id: string) =>
       get<GithubReviewConversation>(`/tasks/${enc(id)}/github-review`),
@@ -275,7 +278,7 @@ export const api = {
   projects: {
     list: () => get<ProjectConfig[]>('/projects'),
     get: (id: string) => get<ProjectConfig>(`/projects/${enc(id)}`),
-    create: (body: { id: string; repo: string; merge?: MergeStrategy; review?: ProjectReviewConfig }) =>
+    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectReviewConfig }) =>
       post<{ project: ProjectConfig; restartRequired: boolean }>('/projects', body),
     delete: (id: string) =>
       del<{ removed: string; restartRequired: boolean }>(`/projects/${enc(id)}`),

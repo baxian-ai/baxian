@@ -111,7 +111,10 @@ async function apiPost<T = unknown>(
 ): Promise<T> {
   const res = await fetch(`${resolveApiBase(opts)}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    // Fastify 400s on an empty body with a JSON content-type, so only send the header with a body.
+    headers: body
+      ? { 'Content-Type': 'application/json', ...authHeaders(opts) }
+      : authHeaders(opts),
     body: body ? JSON.stringify(body) : undefined,
   });
   return readResponse<T>(res, 'POST', path);
@@ -359,6 +362,7 @@ export function buildCli(): Command {
   program
     .command('check <project>')
     .description('Run preflight checks for all agents in a project')
+    .option('--fix', 'Install tmux on hosts where the tmux check fails')
     .action(async (project, opts) => {
       type CheckResult = {
         error?: string;
@@ -367,10 +371,11 @@ export function buildCli(): Command {
           mode: string;
           results: Array<{ ok: boolean; step: string; message: string }>;
         }>;
+        fixes?: Array<{ hostGroup: string; ok: boolean; message: string }>;
       };
       const result = await apiPost<CheckResult>(
         `/projects/${encodeURIComponent(project)}/checks`,
-        undefined,
+        opts.fix ? { fix: true } : undefined,
         ctxOf(opts),
       );
       if (!result || result.error) {
@@ -382,6 +387,16 @@ export function buildCli(): Command {
         for (const r of agentResult.results) {
           const mark = r.ok ? 'PASS' : 'FAIL';
           console.log(`  ${mark}  ${r.step}: ${r.message}`);
+        }
+      }
+      if (opts.fix) {
+        console.log('\ntmux install:');
+        if (!result.fixes || result.fixes.length === 0) {
+          console.log('  nothing to fix — tmux is present on every host');
+        }
+        for (const f of result.fixes ?? []) {
+          const mark = f.ok ? 'PASS' : 'FAIL';
+          console.log(`  ${mark}  ${f.hostGroup}: ${f.message}`);
         }
       }
     });

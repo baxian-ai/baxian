@@ -809,3 +809,41 @@ describe('clearAgent', () => {
     await drainHolderAndRelease(gates, compact, 'dev-1');
   });
 });
+
+describe('waitForReplPromptReady (narrow-pane width-independent idle detection)', () => {
+  const NARROW_IDLE_SCREEN =
+    '合并门），合并动作留给你。\n' +
+    '你合并后我再做本地清理（删\n' +
+    'feat/spec-human-approval\n' +
+    '分支、切回 main），或者你直\n' +
+    '接说一声我来跑 gh pr\n' +
+    'merge。\n' +
+    '\n' +
+    '✻ Churned for 56s\n';
+
+  function mockPaneState(procTitle: string, screen: string, title: string): void {
+    (mockRunner.exec as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
+      if (cmd.includes('pane_current_command')) return { stdout: `${procTitle}\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('pane_title')) return { stdout: `${title}\n`, stderr: '', exitCode: 0 };
+      return { stdout: screen, stderr: '', exitCode: 0 };
+    });
+  }
+
+  it('claude-code: narrow-pane reflowed idle screen (no anchor, no ❯) + "✳ " title → ready', async () => {
+    setPollMs(5);
+    mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
+    const tmux = new TmuxManager(mockRunner);
+    await expect(
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, '%6', 'claude-code', 1000),
+    ).resolves.toBeUndefined();
+  });
+
+  it('claude-code: same narrow screen without the ✳ idle title still fails closed', async () => {
+    setPollMs(5);
+    mockPaneState('2.1.199', NARROW_IDLE_SCREEN, 'baxian');
+    const tmux = new TmuxManager(mockRunner);
+    await expect(
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, '%6', 'claude-code', 200),
+    ).rejects.toThrow(/repl not ready/);
+  });
+});

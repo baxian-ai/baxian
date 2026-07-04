@@ -1,7 +1,7 @@
 import { isAbsolute } from 'node:path';
 import {
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoSlug,
-  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode,
+  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
 } from '../shared/index.js';
 
 export interface ValidationError {
@@ -13,6 +13,7 @@ const VALID_RUNTIMES: AgentRuntime[] = ['claude-code', 'codex'];
 const VALID_ROLES: AgentRole[] = ['dev', 'qa'];
 const VALID_MODES: AgentMode[] = ['local', 'remote'];
 const VALID_MERGE: MergeStrategy[] = ['auto', null];
+const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', null, undefined];
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const REPO_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
@@ -225,6 +226,9 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
     }
     if (!VALID_MERGE.includes(project.merge)) {
       errors.push({ path: `${path}.merge`, message: 'project.merge must be "auto" or null' });
+    }
+    if (!VALID_SPEC_APPROVAL.includes(project.specApproval)) {
+      errors.push({ path: `${path}.specApproval`, message: 'project.specApproval must be "human" or null' });
     }
     if (!Array.isArray(project.agent)) {
       errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of pairs' });

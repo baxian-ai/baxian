@@ -8,6 +8,9 @@ export type AgentStoreListener = (kind: AgentStoreChangeKind, agentId: string) =
 export const AGENT_STORE_NOOP = Symbol.for('@baxian/agent-store-noop');
 export type AgentStoreUpdateResult = AgentBindingFacts | null | typeof AGENT_STORE_NOOP;
 
+// a store id becomes a filename; constrain it so a path-like id can't escape the store dir
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
 export class AgentStore {
   private listeners = new Set<AgentStoreListener>();
   private mutex = new Map<string, Promise<unknown>>();
@@ -20,6 +23,7 @@ export class AgentStore {
   }
 
   async get(id: string): Promise<AgentBindingFacts | null> {
+    if (!SAFE_ID.test(id)) return null;
     let content: string;
     try {
       content = await readFile(this.path(id), 'utf-8');
@@ -82,6 +86,7 @@ export class AgentStore {
   }
 
   async delete(id: string): Promise<void> {
+    if (!SAFE_ID.test(id)) return;
     try {
       await unlink(this.path(id));
     } catch (err) {

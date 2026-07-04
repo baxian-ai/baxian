@@ -123,6 +123,17 @@ describe('AgentStore', () => {
     await store.delete('stuck');
     expect(fired).toEqual([]);
   });
+
+  it('get/delete reject path-like ids so a store key cannot escape its dir', async () => {
+    await store.set(makeState('dev-1'));
+    for (const bad of ['../../../secret', '../dev-1', 'a/b', '..', 'dev 1']) {
+      expect(await store.get(bad)).toBeNull();
+    }
+    const fired = captureChanges();
+    await store.delete('../../../secret');
+    expect(fired).toEqual([]);
+    expect(await store.get('dev-1')).not.toBeNull();
+  });
 });
 
 describe('AgentStore.update', () => {

@@ -18,6 +18,18 @@ describe('splitDiffByFile', () => {
   it('returns [] for empty diff', () => {
     expect(splitDiffByFile('')).toEqual([]);
   });
+
+  it('splits a diff whose paths are verbatim utf-8 (core.quotepath=false)', () => {
+    const diff = [
+      'diff --git a/中文.ts b/中文.ts',
+      'index 000..111 100644',
+      '--- a/中文.ts',
+      '+++ b/中文.ts',
+      '@@ -0,0 +1 @@',
+      '+x',
+    ].join('\n');
+    expect(splitDiffByFile(diff).map(f => f.path)).toEqual(['中文.ts']);
+  });
 });
 
 describe('topDir', () => {

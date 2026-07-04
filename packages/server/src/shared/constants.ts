@@ -140,6 +140,7 @@ export const TASK_ACTIVE_STATUSES: readonly TaskStatus[] = [
   'in_progress',
   'review',
   'fixing',
+  'spec-ready',
   'approved',
   'merge-ready',
   'ready',

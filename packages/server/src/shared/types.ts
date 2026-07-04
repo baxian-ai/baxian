@@ -2,6 +2,7 @@ export type AgentRuntime = 'claude-code' | 'codex';
 export type AgentRole = 'dev' | 'qa';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
+export type SpecApprovalStrategy = 'human' | null;
 export type ReviewMode = 'github' | 'server';
 export type AfterDone = 'pr' | 'branch' | null;
 
@@ -30,6 +31,7 @@ export interface ProjectConfig {
   id: string;
   repo: string;
   merge: MergeStrategy;
+  specApproval?: SpecApprovalStrategy;
   review?: ProjectReviewConfig;
   agent: AgentConfig[][];
 }
@@ -88,6 +90,7 @@ export type TaskStatus =
   | 'in_progress'
   | 'review'
   | 'fixing'
+  | 'spec-ready'
   | 'approved'
   | 'merge-ready'
   | 'ready'
@@ -215,6 +218,12 @@ export interface ReviewResponse {
   responses: FindingResponse[];
 }
 
+export interface SpecUserDecision {
+  verdict: 'approve' | 'request-changes';
+  comments?: string;
+  at: string;
+}
+
 export interface ReviewRound {
   round: number;
   phase: TaskPhase;
@@ -225,6 +234,7 @@ export interface ReviewRound {
   findings?: ReviewFindings;
   response?: ReviewResponse;
   batchFindings?: ReviewFindings[];
+  userDecision?: SpecUserDecision;
   startedAt: string;
   completedAt?: string;
 }

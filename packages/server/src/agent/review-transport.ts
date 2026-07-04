@@ -149,11 +149,11 @@ export class ReviewTransport {
     if (sha.exitCode !== 0) {
       throw new ReviewExchangeError('merge-base-failed', `git merge-base failed: ${sha.stderr.trim()}`);
     }
-    const stat = await runner.exec(`${cd}git diff --stat ${shellQuote(base)}...HEAD`);
+    const stat = await runner.exec(`${cd}git -c core.quotepath=false diff --stat ${shellQuote(`${base}...HEAD`)}`);
     if (stat.exitCode !== 0) {
       throw new ReviewExchangeError('diffstat-failed', `git diff --stat failed: ${stat.stderr.trim()}`);
     }
-    const diff = await runner.exec(`${cd}git diff ${shellQuote(base)}...HEAD`);
+    const diff = await runner.exec(`${cd}git -c core.quotepath=false diff ${shellQuote(`${base}...HEAD`)}`);
     if (diff.exitCode !== 0) {
       throw new ReviewExchangeError('diff-failed', `git diff failed: ${diff.stderr.trim()}`);
     }

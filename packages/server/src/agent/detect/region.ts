@@ -3,7 +3,7 @@ export interface DetectionInput {
   oscTitle: string;
 }
 
-function isHorizontalRule(line: string): boolean {
+export function isHorizontalRule(line: string): boolean {
   const trimmed = line.trim();
   if (trimmed.length === 0) return false;
   let dashCount = 0;

@@ -2,6 +2,9 @@ import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { TaskState, TaskStatus } from '../shared/index.js';
 
+// a store id becomes a filename; constrain it so a path-like id can't escape the store dir
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
 export interface TaskFilter {
   projectId?: string;
   status?: TaskStatus;
@@ -57,6 +60,7 @@ export class TaskStore {
   }
 
   async get(id: string): Promise<TaskState | null> {
+    if (!SAFE_ID.test(id)) return null;
     let content: string;
     try {
       content = await readFile(this.path(id), 'utf-8');
@@ -113,6 +117,7 @@ export class TaskStore {
   }
 
   async delete(id: string): Promise<void> {
+    if (!SAFE_ID.test(id)) return;
     try {
       await unlink(this.path(id));
     } catch (err) {

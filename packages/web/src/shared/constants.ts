@@ -25,6 +25,7 @@ export const TASK_ACTIVE_STATUS_SET: ReadonlySet<TaskStatus> = new Set<TaskStatu
   'in_progress',
   'review',
   'fixing',
+  'spec-ready',
   'approved',
   'merge-ready',
   'ready',

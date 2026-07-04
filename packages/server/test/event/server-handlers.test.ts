@@ -60,7 +60,7 @@ interface Fixture {
   emit: (type: string, data: Record<string, unknown>) => Promise<void>;
 }
 
-function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: number; afterDone?: 'pr' | 'branch' | null; verifyPr?: boolean } = {}): Fixture {
+function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: number; afterDone?: 'pr' | 'branch' | null; verifyPr?: boolean; specApproval?: 'human' | null } = {}): Fixture {
   const emitted: BaxianEvent[] = [];
   const bus = new EventBus({ append: async (e: BaxianEvent) => { emitted.push(e); } } as unknown as EventLog);
   const store = new ReviewStore();
@@ -72,6 +72,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     transitionTaskStatus: [],
     updateTask: [],
     transitionToCodePhase: [],
+    parkTaskAtSpecReady: [],
     setupPhaseSignal: [],
     holdAgentForUnarmedSignal: [],
     releaseAgentForTask: [],
@@ -106,8 +107,22 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     calls.transitionToCodePhase.push([id]);
     return task;
   });
+  const parkTaskAtSpecReady = vi.fn(async (id: string, opts?: { specReviewRound?: number }) => {
+    calls.parkTaskAtSpecReady.push(opts === undefined ? [id] : [id, opts]);
+    task.status = 'spec-ready';
+    task.qaAgentId = undefined;
+    if (opts?.specReviewRound !== undefined) task.specReviewRound = opts.specReviewRound;
+    return task;
+  });
+  const projectConfig = {
+    id: 'proj', repo: 'u/r', merge: null,
+    ...(config.specApproval !== undefined ? { specApproval: config.specApproval } : {}),
+    agent: [],
+  };
   const manager = {
     getReviewStore: () => store,
+    getProjectConfig: (id: string) => (id === 'proj' ? projectConfig : undefined),
+    parkTaskAtSpecReady,
     getReviewTransport: () => transport,
     getTask: async () => task,
     getAgentConfig: (id: string) => (id === DEV.id ? DEV : id === QA.id ? QA : undefined),
@@ -116,7 +131,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
       review: { rounds: config.rounds ?? 10, mode: 'server', afterDone: config.afterDone ?? null },
       server: DEFAULT_SERVER_CONFIG,
       host: [],
-      project: [{ id: 'proj', repo: 'u/r', merge: null, agent: [] }],
+      project: [projectConfig],
     }),
     refreshWorktreeCacheFor: async () => '/wt',
     transitionTaskStatus,
@@ -453,6 +468,67 @@ describe('server.spec flow', () => {
     fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
+  });
+
+  it('spec-reviewed approve + specApproval human → parks at spec-ready, no code phase', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 }, { specApproval: 'human' });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    expect(fx.calls.parkTaskAtSpecReady).toContainEqual(['t1']);
+    expect(fx.calls.transitionToCodePhase).toHaveLength(0);
+  });
+
+  it('spec-reviewed approve + specApproval null → code phase as before', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 }, { specApproval: null });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+    expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
+    expect(fx.calls.parkTaskAtSpecReady).toHaveLength(0);
+  });
+
+  it('spec-done without QA partner + specApproval human → stores the spec round then parks', async () => {
+    const fx = makeFixture({ phase: undefined, status: 'in_progress', qaAgentId: undefined }, { specApproval: 'human' });
+    fx.transport.readContent.mockResolvedValue({ content: '# Spec no-QA' });
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+    const round = await fx.store.getRound('t1', 'spec', 1);
+    expect(round?.content).toBe('# Spec no-QA');
+    expect(fx.calls.parkTaskAtSpecReady).toContainEqual(['t1', { specReviewRound: 1 }]);
+    expect(fx.calls.transitionToCodePhase).toHaveLength(0);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('spec-fixed without QA partner + specApproval human → stores the new round and parks again', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1, qaAgentId: undefined }, { specApproval: 'human' });
+    await putRound(fx.store, 'spec', 1, {
+      findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'u-1', severity: 'major', message: '补充回滚方案' }] },
+    });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'u-1', action: 'fix', rationale: 'added' }],
+    });
+    fx.transport.readContent.mockResolvedValue({ content: '# Spec v2' });
+    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
+    const round2 = await fx.store.getRound('t1', 'spec', 2);
+    expect(round2?.content).toBe('# Spec v2');
+    expect(fx.calls.parkTaskAtSpecReady).toContainEqual(['t1', { specReviewRound: 2 }]);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('spec-fixed without QA partner + specApproval turned off mid-loop → auto-approves to code phase', async () => {
+    const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1, qaAgentId: undefined }, { specApproval: null });
+    await putRound(fx.store, 'spec', 1, {
+      findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'u-1', severity: 'major', message: '补充回滚方案' }] },
+    });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'u-1', action: 'fix', rationale: 'added' }],
+    });
+    fx.transport.readContent.mockResolvedValue({ content: '# Spec v2' });
+    await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
+    expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
+    expect(fx.calls.parkTaskAtSpecReady).toHaveLength(0);
   });
 
   it('spec-fixed with full coverage → new spec review round dispatched', async () => {

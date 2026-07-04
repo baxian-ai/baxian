@@ -62,6 +62,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const [reviewing, setReviewing] = useState(false);
   const [completing, setCompleting] = useState(false);
   const [continuing, setContinuing] = useState(false);
+  const [specSubmitting, setSpecSubmitting] = useState(false);
+  const [specComments, setSpecComments] = useState('');
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
@@ -167,6 +169,39 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     }
   };
 
+  const handleSpecApprove = async () => {
+    if (!task) return;
+    if (!confirm(`通过 task ${task.id} 的 Spec 并开始编码？`)) return;
+    setSpecSubmitting(true);
+    try {
+      const updated = await api.tasks.spec(task.id, { verdict: 'approve' });
+      commitTaskExternal(updated);
+      setSpecComments('');
+      show({ kind: 'success', title: 'Spec 已通过，已派发编码' });
+    } catch (err) {
+      show({ kind: 'error', title: 'Spec 通过失败', body: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setSpecSubmitting(false);
+    }
+  };
+
+  const handleSpecReject = async () => {
+    if (!task) return;
+    const comments = specComments.trim();
+    if (!comments) return;
+    setSpecSubmitting(true);
+    try {
+      const updated = await api.tasks.spec(task.id, { verdict: 'request-changes', comments });
+      commitTaskExternal(updated);
+      setSpecComments('');
+      show({ kind: 'success', title: 'Spec 已打回，dev 开始修订' });
+    } catch (err) {
+      show({ kind: 'error', title: 'Spec 打回失败', body: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setSpecSubmitting(false);
+    }
+  };
+
   const handleConfirmGate = async () => {
     if (!task) return;
     if (!confirm(`确认完成 task ${task.id}？project.merge 为 auto 时由 baxian 自动执行合并。`)) return;
@@ -224,6 +259,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const isLegacy = task.preferredAgentId === '';
     const showApprovedAction = task.status === 'approved' && task.prNumber !== undefined;
     const showMergeReadyAction = task.status === 'merge-ready' && task.prNumber !== undefined;
+    const showSpecReadyAction = task.status === 'spec-ready';
     const showReadyGate = task.status === 'ready';
     const showCodeMaxRounds = task.status === 'max_rounds' && task.phase !== 'spec';
     const showSpecMaxRounds = task.status === 'max_rounds' && task.phase === 'spec';
@@ -319,6 +355,45 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 Open PR #{task.prNumber}
               </a>
             )}
+          </div>
+        )}
+
+        {showSpecReadyAction && (
+          <div className="mb-4 rounded-lg border border-accent-soft bg-accent-soft/40 p-4 text-sm text-accent">
+            <div className="font-semibold">Spec 需由人类审核</div>
+            <div className="mt-1 text-og-700">
+              QA 已通过 Spec（round {task.specReviewRound ?? 0}），全文见下方「Spec 评审」记录。
+              通过后开始编码；打回时意见会作为 findings 交 dev 修订，QA 复审后再回到这里。
+            </div>
+            <div className="mt-3 flex flex-col gap-2">
+              <textarea
+                value={specComments}
+                onChange={e => setSpecComments(e.target.value)}
+                placeholder="打回意见（打回时必填）"
+                rows={3}
+                disabled={specSubmitting}
+                className="w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={specSubmitting}
+                  onClick={handleSpecApprove}
+                  className="btn-secondary !border-[#bbf7d0] !text-success hover:!bg-[#dcfce7] hover:!border-success"
+                >
+                  {specSubmitting ? '提交中…' : '通过 Spec，开始编码'}
+                </button>
+                <button
+                  type="button"
+                  disabled={specSubmitting || specComments.trim() === ''}
+                  onClick={handleSpecReject}
+                  title={specComments.trim() === '' ? '先填写打回意见' : '意见将作为 findings 交 dev 修订'}
+                  className="btn-secondary !border-[#fecaca] !text-danger hover:!bg-[#fef2f2] hover:!border-danger"
+                >
+                  {specSubmitting ? '提交中…' : '打回 Spec'}
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
@@ -441,7 +516,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const isServerApprovedGate = task.reviewMode === 'server' && task.status === 'approved';
     const editEnabled = task.status === 'pending';
     const cancelEnabled = task.status === 'pending' || task.status === 'in_progress'
-      || isMaxRounds || isGate || isServerApprovedGate;
+      || task.status === 'spec-ready' || isMaxRounds || isGate || isServerApprovedGate;
     const retryEnabled =
       (RETRYABLE_STATUSES.has(task.status) || isSpecMaxRounds) && !!task.preferredAgentId;
     const reviewEnabled = !!task.prNumber && !isSpecMaxRounds && task.reviewMode !== 'server';

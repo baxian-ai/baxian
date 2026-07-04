@@ -18,6 +18,7 @@ import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
+import { ReviewStore } from '../../src/state/review-store.js';
 import { initStateDir } from '../../src/state/init.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
@@ -472,6 +473,22 @@ describe('AgentManager task binding flow', () => {
     expect(cancelled.status).toBe('cancelled');
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
+  });
+
+  it('cancelTask stops the watcher again after the cancelled write (closes rollback re-arm race)', async () => {
+    const stop = vi.fn();
+    const m = makeManager({ phaseSignalWatcher: { start: vi.fn(), stop } as never });
+    const t = await seedTask({ qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
+    mockInterruptPane(m, true);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await m.cancelTask(t.id);
+
+    // pre-lock stop() + post-cancelled-write stop(): the second closes the window where a concurrent
+    // dispatchReview rollback re-armed a watcher after our first stop() but before 'cancelled' landed
+    expect(stop.mock.calls.filter(c => c[0] === t.id)).toHaveLength(2);
   });
 
   it('cancelTask releases a bound dev through the real release path without task-lock deadlock', async () => {
@@ -1183,6 +1200,96 @@ describe('AgentManager dispatchReviewToQa', () => {
     expect(startSpy).not.toHaveBeenCalled();
   });
 
+  it('rollbackVerdictArmFailure does not revive a task cancelled mid-dispatch', async () => {
+    await taskStore.set(reviewable({ status: 'cancelled', signalToken: 'live' }));
+    await manager.rollbackVerdictArmFailure('task-review', {
+      status: 'fixing', signalToken: 'old', reviewDispatchedAt: NOW,
+    });
+    const after = await taskStore.get('task-review');
+    expect(after?.status).toBe('cancelled');
+    expect(after?.signalToken).toBe('live');
+  });
+
+  it('rollbackVerdictArmFailure restores status while the task is still active', async () => {
+    await taskStore.set(reviewable({ status: 'review', signalToken: 'live' }));
+    await manager.rollbackVerdictArmFailure('task-review', {
+      status: 'fixing', signalToken: 'old', reviewDispatchedAt: NOW,
+    });
+    expect((await taskStore.get('task-review'))?.status).toBe('fixing');
+  });
+
+  it('rolls back without reviving when the task goes terminal before the verdict arm', async () => {
+    await seedReviewable();
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'cancelled' });
+      return { token: 'tok', armed: false };
+    });
+
+    await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
+
+    // terminal task must be left fully alone: neither status revived nor reviewRound/fields written back
+    const after = await taskStore.get('task-review');
+    expect(after?.status).toBe('cancelled');
+    expect(after?.reviewRound).toBe(2);
+  });
+
+  it('terminal-at-claim recheck failure restores snapshot fields (status stays terminal)', async () => {
+    await seedReviewable({ status: 'merged', reviewRound: 3 }, null);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'rotated', armed: false });
+
+    await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
+
+    // the recheck never fired, so its bumped fields roll back — but a terminal task keeps terminal status
+    const after = await taskStore.get('task-review');
+    expect(after?.status).toBe('merged');
+    expect(after?.reviewRound).toBe(3);
+  });
+
+  it('terminal-at-claim recheck: successful arm then failed startSession tears the armed watcher back down', async () => {
+    const stop = vi.fn();
+    const m = makeManager({ phaseSignalWatcher: { start: vi.fn().mockResolvedValue(true), stop } as never });
+    await taskStore.set(reviewable({ status: 'merged', reviewRound: 3 }));
+    await seedAgent({ id: 'qa-1' });
+    vi.spyOn(m, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(m, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: true });
+    vi.spyOn(m, 'startSession').mockResolvedValue(false);
+
+    await expect(m.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
+
+    // rollback restores fields but skips re-arm on the terminal task; the watcher arm succeeded, so drop it
+    expect(stop).toHaveBeenCalledWith('task-review');
+  });
+
+  it('rollbackVerdictArmFailure tears the watcher down when a cancel lands after the terminal pre-check', async () => {
+    const stop = vi.fn();
+    const m = makeManager({ phaseSignalWatcher: { start: vi.fn().mockResolvedValue(true), stop } as never });
+    await taskStore.set(reviewable({ status: 'review', signalToken: 'live' }));
+    vi.spyOn(
+      m as unknown as { mapTaskStateToExpectedWatcher: (t: unknown) => unknown },
+      'mapTaskStateToExpectedWatcher',
+    ).mockReturnValue({ agentId: 'dev-1', expectedKinds: ['pr-fixed'] });
+    // arm succeeds, then a racing cancel writes 'cancelled' before the post-arm re-check
+    vi.spyOn(m, 'setupPhaseSignal').mockImplementation(async () => {
+      await taskStore.set(reviewable({ status: 'cancelled', signalToken: 'live' }));
+      return true;
+    });
+
+    await m.rollbackVerdictArmFailure('task-review', { status: 'review', signalToken: 'live', reviewDispatchedAt: NOW });
+
+    expect(stop).toHaveBeenCalledWith('task-review');
+  });
+
   it('rejects spec-phase max_rounds with 409 (Call review uses the code protocol, inert for spec)', async () => {
     await taskStore.set(reviewable({ status: 'max_rounds', phase: 'spec' }));
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
@@ -1417,6 +1524,218 @@ describe('transitionToCodePhase qa release fail-loud', () => {
       e.type === 'human.intervention'
       && (e.data.phase as string) === 'code-phase-qa-release-failed',
     )).toBe(true);
+  });
+});
+
+describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
+  const watcherStub = () => ({ start: vi.fn(async () => true), stop: vi.fn(), has: vi.fn(() => false) });
+
+  function specManager(reviewStore: ReviewStore): AgentManager {
+    return makeManager({
+      skillRegistry: freshRegistry(),
+      reviewStore,
+      phaseSignalWatcher: watcherStub() as never,
+    });
+  }
+
+  async function seedSpecReady(store: ReviewStore, roundOverrides: Record<string, unknown> = {}): Promise<void> {
+    // 停驻后的真实形态：qaAgentId 已被 parkTaskAtSpecReady 清除
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'spec-ready', phase: 'spec', specReviewRound: 1, qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await store.putRound('task-spec-1', 'spec', {
+      round: 1, phase: 'spec', content: '# Spec', startedAt: NOW,
+      findings: { round: 1, verdict: 'approve', findings: [{ id: 'f-1', severity: 'minor', message: 'nit' }] },
+      ...roundOverrides,
+    });
+  }
+
+  it('parks a review task at spec-ready, clears qaAgentId, marks dev waiting, releases QA', async () => {
+    const m = specManager(new ReviewStore());
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'review', phase: 'spec', specReviewRound: 1, qaAgentId: 'qa-1',
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
+    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    const waitingSpy = vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
+
+    const result = await m.parkTaskAtSpecReady('task-spec-1');
+    expect(result?.status).toBe('spec-ready');
+    expect(result?.phase).toBe('spec');
+    expect(result?.qaAgentId).toBeUndefined();
+    expect((await taskStore.get('task-spec-1'))?.qaAgentId).toBeUndefined();
+    expect(waitingSpy).toHaveBeenCalledWith('dev-1', 'task-spec-1');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-spec-1', 'idle');
+  });
+
+  it('parks from fixing with an explicit specReviewRound patch (no-QA revision loop)', async () => {
+    const m = specManager(new ReviewStore());
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'fixing', phase: 'spec', specReviewRound: 1, qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
+
+    const result = await m.parkTaskAtSpecReady('task-spec-1', { specReviewRound: 2 });
+    expect(result?.status).toBe('spec-ready');
+    expect(result?.specReviewRound).toBe(2);
+  });
+
+  it('request-changes works end-to-end on a task parked by parkTaskAtSpecReady (QA already released)', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'review', phase: 'spec', specReviewRound: 1, qaAgentId: 'qa-1',
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
+    await store.putRound('task-spec-1', 'spec', {
+      round: 1, phase: 'spec', content: '# Spec', startedAt: NOW,
+      findings: { round: 1, verdict: 'approve', findings: [] },
+    });
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    const parked = await m.parkTaskAtSpecReady('task-spec-1');
+    expect(parked?.status).toBe('spec-ready');
+
+    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '补充回滚方案');
+    expect(result.status).toBe('fixing');
+  });
+
+  it('rejects a verdict when the task is not spec-ready', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedTask({ id: 'task-spec-1', status: 'review', phase: 'spec' });
+    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('approve records userDecision and dispatches the code phase', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedSpecReady(store);
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
+    expect(result.status).toBe('in_progress');
+    expect(result.phase).toBe('code');
+    const round = await store.getRound('task-spec-1', 'spec', 1);
+    expect(round?.userDecision?.verdict).toBe('approve');
+  });
+
+  it('request-changes without comments is a 400', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedSpecReady(store);
+    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '  '))
+      .rejects.toMatchObject({ status: 400 });
+    expect((await taskStore.get('task-spec-1'))?.status).toBe('spec-ready');
+  });
+
+  it('request-changes merges a user finding, flips the verdict, and dispatches the fix', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedSpecReady(store);
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '边界场景没有覆盖');
+    expect(result.status).toBe('fixing');
+    const round = await store.getRound('task-spec-1', 'spec', 1);
+    expect(round?.findings?.verdict).toBe('request-changes');
+    expect(round?.findings?.findings).toContainEqual(
+      { id: 'u-1', severity: 'major', message: '边界场景没有覆盖' },
+    );
+    expect(round?.findings?.findings.some(f => f.id === 'f-1')).toBe(true);
+    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes', comments: '边界场景没有覆盖' });
+  });
+
+  it('approve on a parked task without a round record still records the userDecision', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'spec-ready', phase: 'spec', qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
+    expect(result.status).toBe('in_progress');
+    const round = await store.getRound('task-spec-1', 'spec', 1);
+    expect(round?.userDecision?.verdict).toBe('approve');
+  });
+
+  it('request-changes at the spec round cap is refused with 409 while approve still works', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    // CONFIG.review.rounds = 2：specReviewRound 已到上限
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'spec-ready', phase: 'spec', specReviewRound: 2, qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    await store.putRound('task-spec-1', 'spec', {
+      round: 2, phase: 'spec', content: '# Spec v2', startedAt: NOW,
+      findings: { round: 2, verdict: 'approve', findings: [] },
+    });
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '还差回滚方案'))
+      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('round cap') });
+    expect((await taskStore.get('task-spec-1'))?.status).toBe('spec-ready');
+    expect((await store.getRound('task-spec-1', 'spec', 2))?.userDecision).toBeUndefined();
+
+    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
+    expect(result.status).toBe('in_progress');
+  });
+
+  it('concurrent verdicts on the same spec-ready task: exactly one wins, the other gets 409', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedSpecReady(store);
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    const results = await Promise.allSettled([
+      m.submitSpecVerdict('task-spec-1', 'approve'),
+      m.submitSpecVerdict('task-spec-1', 'approve'),
+    ]);
+    const fulfilled = results.filter(r => r.status === 'fulfilled');
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toMatchObject({ status: 409 });
+  });
+
+  it('request-changes on a parked task without a round record synthesizes one', async () => {
+    const store = new ReviewStore();
+    const m = specManager(store);
+    await seedTask({
+      id: 'task-spec-1', branch: 'bx/task-spec-1',
+      status: 'spec-ready', phase: 'spec', qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+
+    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '先补充回滚方案');
+    expect(result.status).toBe('fixing');
+    const round = await store.getRound('task-spec-1', 'spec', 1);
+    expect(round?.findings?.findings).toEqual([
+      { id: 'u-1', severity: 'major', message: '先补充回滚方案' },
+    ]);
   });
 });
 
@@ -4737,6 +5056,16 @@ describe('AgentManager max_rounds manual actions', () => {
     const { failedTaskIds } = await manager.failTasksForAgent('qa-1', 'tmux-absent');
     expect(failedTaskIds).not.toContain('task-mr');
     expect((await taskStore.get('task-mr'))?.status).toBe('max_rounds');
+  });
+
+  it('failTasksForAgent fails a spec-ready task when its dev dies (approve/reject both need the dev worktree)', async () => {
+    await taskStore.set(task({
+      id: 'task-sr', status: 'spec-ready', phase: 'spec', agentId: 'dev-1', qaAgentId: undefined,
+    }));
+    await seedAgent({ id: 'dev-1', status: 'waiting', taskId: 'task-sr' });
+    const { failedTaskIds } = await manager.failTasksForAgent('dev-1', 'tmux-absent');
+    expect(failedTaskIds).toContain('task-sr');
+    expect((await taskStore.get('task-sr'))?.status).toBe('failed');
   });
 
   describe('retryTask phase gate', () => {

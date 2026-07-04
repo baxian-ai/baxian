@@ -5,6 +5,11 @@ const PLURAL_SINGULAR: Record<string, string> = {
   hosts: 'host',
 };
 
+// normalizeKeys 靠 lowercase 实现大小写不敏感，camelCase 键需映射回规范形
+const CANONICAL_CASE: Record<string, string> = {
+  specapproval: 'specApproval',
+};
+
 export function normalizeConfig(raw: unknown): Record<string, unknown> {
   if (typeof raw !== 'object' || raw === null) {
     return {};
@@ -31,8 +36,8 @@ function normalizeKeys(obj: Record<string, unknown>): Record<string, unknown> {
 
   for (const [key, value] of Object.entries(obj)) {
     const lower = key.toLowerCase();
-    const singular = PLURAL_SINGULAR[lower] ?? lower;
-    const isExplicitSingular = lower === singular;
+    const singular = CANONICAL_CASE[PLURAL_SINGULAR[lower] ?? lower] ?? PLURAL_SINGULAR[lower] ?? lower;
+    const isExplicitSingular = lower === singular.toLowerCase();
 
     if (!(singular in result)) {
       result[singular] = value;

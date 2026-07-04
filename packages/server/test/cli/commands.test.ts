@@ -193,6 +193,47 @@ describe('CLI command actions', () => {
       expect(out).toContain('[dev-1] (local)');
       expect(out).toContain('PASS  tmux: tmux 3.4');
       expect(out).toContain('FAIL  runtime: claude not found');
+      expect(calls[0].init.body).toBeUndefined();
+      expect((calls[0].init.headers as Record<string, string>)['Content-Type']).toBeUndefined();
+    });
+
+    it('posts fix:true and prints install results with --fix', async () => {
+      const { fn, calls } = mockFetch([
+        {
+          body: {
+            agents: [
+              {
+                agentId: 'dev-1',
+                mode: 'local',
+                results: [{ ok: true, step: 'tmux', message: 'tmux found at /opt/homebrew/bin/tmux' }],
+              },
+            ],
+            fixes: [
+              { hostGroup: 'local', ok: true, message: 'tmux 3.5 installed via brew' },
+              { hostGroup: 'remote:mini@mac:22', ok: false, message: 'Homebrew not found' },
+            ],
+          },
+        },
+      ]);
+      globalThis.fetch = fn as unknown as typeof globalThis.fetch;
+
+      await buildCli().parseAsync(['node', 'cli', 'check', 'proj-1', '--fix']);
+
+      expect(calls[0].init.body).toBe(JSON.stringify({ fix: true }));
+      const out = logs.join('\n');
+      expect(out).toContain('tmux install:');
+      expect(out).toContain('PASS  local: tmux 3.5 installed via brew');
+      expect(out).toContain('FAIL  remote:mini@mac:22: Homebrew not found');
+    });
+
+    it('prints nothing-to-fix when --fix finds tmux everywhere', async () => {
+      const { fn } = mockFetch([
+        { body: { agents: [], fixes: [] } },
+      ]);
+      globalThis.fetch = fn as unknown as typeof globalThis.fetch;
+
+      await buildCli().parseAsync(['node', 'cli', 'check', 'proj-1', '--fix']);
+      expect(logs.join('\n')).toContain('nothing to fix — tmux is present on every host');
     });
 
     it('exits 1 when the server reports an error', async () => {
