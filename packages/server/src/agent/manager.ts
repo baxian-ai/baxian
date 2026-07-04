@@ -4480,7 +4480,10 @@ export class AgentManager {
     }
   }
 
-  async dispatchReviewToQa(taskId: string): Promise<TaskState> {
+  async dispatchReviewToQa(
+    taskId: string,
+    opts: { fromStatus?: TaskStatus[]; bumpRound?: boolean; expectSignalToken?: string } = {},
+  ): Promise<TaskState> {
     const claim = await this.withTaskLock(async () => {
       if (this.manualReviewInFlight.has(taskId)) {
         throw new ApiError(409, `Manual review already in progress for task ${taskId}`);
@@ -4490,6 +4493,18 @@ export class AgentManager {
       }
       const task = await this.taskStore.get(taskId);
       if (!task) throw new ApiError(404, `Task ${taskId} not found`);
+      if (opts.fromStatus && !opts.fromStatus.includes(task.status)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} status is ${task.status}; review dispatch requires ${opts.fromStatus.join('/')}`,
+        );
+      }
+      if (opts.expectSignalToken !== undefined && task.signalToken !== opts.expectSignalToken) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} review pass changed during redispatch (signalToken rotated); aborting`,
+        );
+      }
       if (task.reviewMode === 'server') {
         throw new ApiError(409, `Task ${taskId} uses server review mode; Call review applies only to github-mode tasks`);
       }
@@ -4572,6 +4587,18 @@ export class AgentManager {
       };
 
       const isTerminalAtClaim = TERMINAL_STATUSES.includes(taskStatusAtClaim);
+      const bumpRound = opts.bumpRound !== false;
+      // 回滚在锁内判定 pass 是否已被并发接管并返回；仅未被接管时才释放本次 acquire 的 QA，
+      // 否则会误清接管方 re-acquire 的同一 QA 绑定（同 task 同 agent，绕过 release 的 mismatch 保护）
+      const abortDispatch = async (dispatchToken: string | undefined): Promise<void> => {
+        const takenOver = await this.rollbackDispatchReviewPhase1(
+          taskId, taskStatusAtClaim, isTerminalAtClaim, snapshot, bumpRound, dispatchToken,
+        );
+        if (!takenOver) await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
+        if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
+      };
+
+      let transitionToken: string | undefined;
       if (!isTerminalAtClaim) {
         const reviewAnchor = await this.fetchPrHeadSha(taskId).catch(() => undefined);
         const preDispatched = await this.transitionTaskStatus(
@@ -4589,28 +4616,51 @@ export class AgentManager {
           if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
           throw new ApiError(409, `Task ${taskId} status changed during dispatch; cannot enter review`);
         }
+        transitionToken = preDispatched.task.signalToken;
       }
-      await this.withTaskLock(async () => {
+
+      const armedToken = createSignalToken();
+      // 合并锁段：复核本代 pass 未被并发接管（仍在 review 且持有 transition 写入的 token）
+      // 与写 qaAgentId + 轮换 token 原子完成。withTaskLock 全局串行，接管方的 rotate 无法插在复核与写入之间
+      const claim2 = await this.withTaskLock(async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
         const fresh = await this.taskStore.get(taskId);
-        if (!fresh) return;
+        if (!fresh) return { ok: false, reason: 'gone' };
+        if (!isTerminalAtClaim && (fresh.status !== 'review' || fresh.signalToken !== transitionToken)) {
+          return { ok: false, reason: fresh.status !== 'review' ? `status=${fresh.status}` : 'pass superseded' };
+        }
         await this.taskStore.set({
           ...fresh,
-          reviewRound: fresh.reviewRound + 1,
+          reviewRound: bumpRound ? fresh.reviewRound + 1 : fresh.reviewRound,
           qaAgentId: qaId,
+          signalToken: armedToken,
           updatedAt: new Date().toISOString(),
         });
+        return { ok: true };
       });
+      if (!claim2.ok) {
+        // 未写入 armedToken：task 仍持 transitionToken，或已被接管方 rotate/漂移 → 用 transitionToken 判 takeover
+        await abortDispatch(transitionToken);
+        throw new ApiError(409, `Task ${taskId} left its review pass during dispatch (${claim2.reason})`);
+      }
 
-      const { armed } = await this.rotateAndSetupPhaseSignal(
-        taskId,
-        qaId,
-        ['pr-approved', 'pr-changes-requested'] as const,
+      const armed = await this.setupPhaseSignalWatcher(
+        taskId, qaId, ['pr-approved', 'pr-changes-requested'] as const, armedToken,
       );
       if (!armed) {
-        await this.rollbackDispatchReviewPhase1(taskId, taskStatusAtClaim, isTerminalAtClaim, snapshot);
-        await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
-        if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
+        await abortDispatch(armedToken);
         throw new ApiError(500, `Failed to arm review verdict watcher for ${taskId}`);
+      }
+
+      if (opts.fromStatus) {
+        // arm 到 startSession 之间的漂移复核：status 漂移或 token 被插队 rotate 都放弃本次派发
+        const preStart = await this.taskStore.get(taskId);
+        if (!preStart || !opts.fromStatus.includes(preStart.status) || preStart.signalToken !== armedToken) {
+          await abortDispatch(armedToken);
+          throw new ApiError(
+            409,
+            `Task ${taskId} left ${opts.fromStatus.join('/')} during dispatch (now ${preStart?.status ?? 'gone'})`,
+          );
+        }
       }
 
       let started = false;
@@ -4623,18 +4673,12 @@ export class AgentManager {
         if (await this.markAwaitingIfAckUnknown(qaId, err, taskId)) {
         } else if (err instanceof EnsureSessionError && err.partial.handled) {
         } else {
-          await this.rollbackDispatchReviewPhase1(taskId, taskStatusAtClaim, isTerminalAtClaim, snapshot);
-          await this.releaseAgentForTask(qaId, taskId, 'idle')
-            .catch(() => undefined);
-          if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
+          await abortDispatch(armedToken);
         }
         throw err;
       }
       if (!started) {
-        await this.rollbackDispatchReviewPhase1(taskId, taskStatusAtClaim, isTerminalAtClaim, snapshot);
-        await this.releaseAgentForTask(qaId, taskId, 'idle')
-          .catch(() => undefined);
-        if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
+        await abortDispatch(armedToken);
         throw new ApiError(500, `Failed to start QA review session for ${taskId}`);
       }
 
@@ -4775,42 +4819,58 @@ export class AgentManager {
     return fresh!;
   }
 
+  // 返回 qaTakenOverInReview：仍在 review 但 token 已换代 = 另一 dispatcher 已 release+acquire 同一 QA
+  // （同 task 同 agent，releaseAgentForTask 的 mismatch 保护不设防），此时调用方不得再 release QA。
+  // 判定在回滚同一锁段内基于 fresh 完成，是那一刻的权威结论——不受本函数随后恢复 snapshot token 的影响。
   private async rollbackDispatchReviewPhase1(
     taskId: string,
     originalStatus: TaskStatus,
     isTerminalAtClaim: boolean,
     snapshot: DispatchReviewSnapshot,
-  ): Promise<void> {
+    roundBumped: boolean,
+    dispatchToken?: string,
+  ): Promise<boolean> {
+    let qaTakenOverInReview = false;
     await this.withTaskLock(async () => {
       const fresh = await this.taskStore.get(taskId);
       if (!fresh) return;
       // only a concurrent cancel/fail into terminal drops the write; a terminal-at-claim recheck still restores snapshot fields
       if (!isTerminalAtClaim && TERMINAL_STATUSES.includes(fresh.status)) return;
-      const next: TaskState = {
-        ...fresh,
-        reviewRound: Math.max(0, fresh.reviewRound - 1),
-        qaAgentId: snapshot.qaAgentId,
-        signalToken: snapshot.signalToken,
-        reviewDispatchedAt: snapshot.reviewDispatchedAt,
-        updatedAt: new Date().toISOString(),
-      };
-      if (!isTerminalAtClaim) {
+      // transition 后的中间态恒为 review 且持有本次 dispatch 的 token；status 漂移（如 REQUEST_CHANGES→fixing）
+      // 或 review 内 token 换代（push recheck 接管）都表示 pass 已归并发推进方所有，只撤本次 dispatch 的轮次残留
+      const passTakenOver = dispatchToken !== undefined && fresh.signalToken !== dispatchToken;
+      qaTakenOverInReview = !isTerminalAtClaim && fresh.status === 'review' && passTakenOver;
+      const drifted = !isTerminalAtClaim && (fresh.status !== 'review' || passTakenOver);
+      // 只在本次 dispatch 仍拥有该 pass（未 drift）且确实 bump 过时才撤回 +1；
+      // drift 后 reviewRound 归接管方所有（它可能基于此再 bump），一律不减
+      const rolledRound = (!drifted && roundBumped) ? Math.max(0, fresh.reviewRound - 1) : fresh.reviewRound;
+      const next: TaskState = drifted
+        ? { ...fresh, reviewRound: rolledRound, updatedAt: new Date().toISOString() }
+        : {
+          ...fresh,
+          reviewRound: rolledRound,
+          qaAgentId: snapshot.qaAgentId,
+          signalToken: snapshot.signalToken,
+          reviewDispatchedAt: snapshot.reviewDispatchedAt,
+          updatedAt: new Date().toISOString(),
+        };
+      if (!isTerminalAtClaim && !drifted) {
         next.status = originalStatus;
         next.reviewHeadAnchorSha = snapshot.reviewHeadAnchorSha;
       }
       await this.taskStore.set(next);
     });
 
-    if (!this.phaseSignalWatcher) return;
+    if (!this.phaseSignalWatcher) return qaTakenOverInReview;
 
     // a terminal task keeps no watcher: tear down one this dispatch armed before failing, then skip re-arming
     const afterRollback = await this.taskStore.get(taskId);
     if (afterRollback && TERMINAL_STATUSES.includes(afterRollback.status)) {
       this.phaseSignalWatcher.stop(taskId);
-      return;
+      return qaTakenOverInReview;
     }
 
-    if (originalStatus === 'approved') {
+    if (afterRollback?.status === 'approved') {
       const completion = await this.postApproveStore.get(taskId);
       const task = await this.taskStore.get(taskId);
       if (completion && task) {
@@ -4829,14 +4889,14 @@ export class AgentManager {
             err,
           );
         }
-        return;
+        return qaTakenOverInReview;
       }
     }
 
     const restored = await this.taskStore.get(taskId);
-    if (!restored || !restored.signalToken) return;
+    if (!restored || !restored.signalToken) return qaTakenOverInReview;
     const mapped = this.mapTaskStateToExpectedWatcher(restored);
-    if (!mapped) return;
+    if (!mapped) return qaTakenOverInReview;
     try {
       await this.phaseSignalWatcher.start({
         taskId,
@@ -4852,6 +4912,7 @@ export class AgentManager {
         err,
       );
     }
+    return qaTakenOverInReview;
   }
 
   // a cancel between our start() and the terminal write leaves a watcher on a dead task; re-check and drop it

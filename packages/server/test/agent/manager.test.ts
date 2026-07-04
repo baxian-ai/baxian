@@ -1112,7 +1112,8 @@ describe('AgentManager dispatchReviewToQa', () => {
     await seedReviewable();
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: false });
+    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
+      .mockResolvedValue(false);
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -1200,6 +1201,252 @@ describe('AgentManager dispatchReviewToQa', () => {
     expect(startSpy).not.toHaveBeenCalled();
   });
 
+  it('fromStatus guard rejects dispatch when the current status is outside the allowed set', async () => {
+    await seedReviewable({ status: 'approved' });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'] })).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('approved'),
+    });
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'approved', reviewRound: 1 });
+  });
+
+  it('fromStatus guard admits dispatch when the current status matches', async () => {
+    await seedReviewable({ status: 'review' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    const result = await manager.dispatchReviewToQa('task-review', { fromStatus: ['review'] });
+
+    expect(startSpy).toHaveBeenCalledWith('task-review', 'qa-1', 'recheck', expect.objectContaining({ bypassTaskStatusGate: true }));
+    expect(result).toMatchObject({ status: 'review', qaAgentId: 'qa-1' });
+  });
+
+  it('bumpRound: false keeps reviewRound unchanged on a successful dispatch', async () => {
+    await seedReviewable({ status: 'review' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    const result = await manager.dispatchReviewToQa('task-review', { bumpRound: false });
+
+    expect(result).toMatchObject({ status: 'review', reviewRound: 1, qaAgentId: 'qa-1' });
+  });
+
+  it('expectSignalToken rejects dispatch when the review pass rotated before claim', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-b' });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('pass changed') });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'review', signalToken: 'pass-b', reviewRound: 1 });
+  });
+
+  it('pre-start re-check rejects when another dispatcher rotated the token after arm', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
+      .mockImplementation(async () => {
+        const fresh = await taskStore.get('task-review');
+        await taskStore.set({ ...fresh!, signalToken: 'intruder-tok' });
+        return true;
+      });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
+  it('pre-start rejection after a review→review takeover leaves the new pass and QA binding intact', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
+      .mockImplementation(async () => {
+        const fresh = await taskStore.get('task-review');
+        await taskStore.set({
+          ...fresh!,
+          signalToken: 'takeover-tok',
+          reviewDispatchedAt: '2026-07-04T07:00:00.000Z',
+          reviewHeadAnchorSha: 'c'.repeat(40),
+        });
+        return true;
+      });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-review')).toMatchObject({
+      status: 'review',
+      signalToken: 'takeover-tok',
+      reviewDispatchedAt: '2026-07-04T07:00:00.000Z',
+      reviewHeadAnchorSha: 'c'.repeat(40),
+    });
+    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+  });
+
+  it('drift-aware rollback keeps the signal fields rotated by a concurrent transition', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'fixing', signalToken: 'fix-tok', fixDispatchedAt: '2026-07-04T06:00:00.000Z' });
+      return false;
+    });
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 500 });
+
+    expect(await taskStore.get('task-review')).toMatchObject({
+      status: 'fixing',
+      signalToken: 'fix-tok',
+      fixDispatchedAt: '2026-07-04T06:00:00.000Z',
+      reviewRound: 1,
+    });
+  });
+
+  it('fromStatus re-check before startSession rejects a task that drifted after claim', async () => {
+    await seedReviewable({ status: 'review' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
+      .mockImplementation(async () => {
+        const fresh = await taskStore.get('task-review');
+        await taskStore.set({ ...fresh!, status: 'approved' });
+        return true;
+      });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], bumpRound: false }))
+      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('left review') });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'approved', reviewRound: 1 });
+  });
+
+  it('rollback preserves a concurrently advanced status after a startSession failure', async () => {
+    await seedReviewable();
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'approved' });
+      return false;
+    });
+
+    await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
+
+    // status drifted to approved during our dispatch: round now belongs to the concurrent owner, rollback must not decrement it
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'approved', reviewRound: 2 });
+  });
+
+  it('claim2-failure rollback does not decrement a reviewRound this dispatch never bumped', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a', reviewRound: 1 });
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    // 并发接管在 transition 之后把任务保持 review 但换成接管方 token 且推进了轮次
+    vi.spyOn(manager, 'transitionTaskStatus').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'review', signalToken: 'takeover-tok', reviewRound: 2 });
+      return { task: { ...fresh!, status: 'review', signalToken: 'trans-tok' }, previousStatus: 'review' } as never;
+    });
+
+    // 默认 bumpRound=true 的手动 Call review：claim2 失败时本次从未写入 bump
+    await expect(manager.dispatchReviewToQa('task-review', { expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-review'))?.reviewRound).toBe(2);
+  });
+
+  it('startSession-failure rollback under a concurrent fixing takeover preserves the takeover round', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a', reviewRound: 1 });
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    // claim2 成功（bump 1→2）后，startSession 期间并发 REQUEST_CHANGES 接管到 fixing 并 bump 到自己的轮次
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'fixing', signalToken: 'fix-tok', reviewRound: 3 });
+      return false;
+    });
+
+    await expect(manager.dispatchReviewToQa('task-review', { expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 500 });
+
+    // drift 到 fixing：round 归接管方，rollback 不得把它从 3 减到 2
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'fixing', signalToken: 'fix-tok', reviewRound: 3 });
+  });
+
+  it('bumpRound: false keeps reviewRound unchanged after a startSession-failure rollback', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+
+    await expect(manager.dispatchReviewToQa('task-review', { bumpRound: false })).rejects.toMatchObject({ status: 500 });
+
+    expect((await taskStore.get('task-review'))?.reviewRound).toBe(1);
+    // 无并发接管的普通失败回滚：QA 必须释放，不能被 takeover 守卫误判泄漏
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+  });
+
+  it('merge-lock re-check aborts without overwriting a concurrently rotated pass, and releases the orphan QA', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    // 并发 REQUEST_CHANGES 在我们 transition 之后把任务推进 fixing 并轮换 pr-fixed token
+    vi.spyOn(manager, 'transitionTaskStatus').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'fixing', signalToken: 'fix-tok', fixDispatchedAt: '2026-07-04T08:00:00.000Z' });
+      return { task: { ...fresh!, status: 'review', signalToken: 'trans-tok' }, previousStatus: 'review' } as never;
+    });
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-review')).toMatchObject({
+      status: 'fixing',
+      signalToken: 'fix-tok',
+      fixDispatchedAt: '2026-07-04T08:00:00.000Z',
+    });
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+  });
+
+  it('merge-lock re-check treats an in-review token rotation as takeover: keeps the new pass, spares the re-acquired QA', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'transitionTaskStatus').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-review');
+      await taskStore.set({ ...fresh!, status: 'review', signalToken: 'takeover-tok' });
+      return { task: { ...fresh!, status: 'review', signalToken: 'trans-tok' }, previousStatus: 'review' } as never;
+    });
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'pass-a' }))
+      .rejects.toMatchObject({ status: 409 });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'review', signalToken: 'takeover-tok' });
+    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+  });
+
   it('rollbackVerdictArmFailure does not revive a task cancelled mid-dispatch', async () => {
     await taskStore.set(reviewable({ status: 'cancelled', signalToken: 'live' }));
     await manager.rollbackVerdictArmFailure('task-review', {
@@ -1224,11 +1471,12 @@ describe('AgentManager dispatchReviewToQa', () => {
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async () => {
-      const fresh = await taskStore.get('task-review');
-      await taskStore.set({ ...fresh!, status: 'cancelled' });
-      return { token: 'tok', armed: false };
-    });
+    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
+      .mockImplementation(async () => {
+        const fresh = await taskStore.get('task-review');
+        await taskStore.set({ ...fresh!, status: 'cancelled' });
+        return false;
+      });
 
     await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
 
@@ -1244,7 +1492,8 @@ describe('AgentManager dispatchReviewToQa', () => {
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'rotated', armed: false });
+    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
+      .mockResolvedValue(false);
 
     await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
 

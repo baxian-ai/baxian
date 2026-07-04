@@ -557,6 +557,37 @@ async function handlePrCodePush(
   }
 }
 
+async function redispatchReviewForStaleVerdict(
+  manager: AgentManager,
+  task: TaskState,
+): Promise<boolean> {
+  if (task.status !== 'review') return false;
+  if (task.qaAgentId) {
+    // 当前 pass 的 QA 会话还在跑时，迟到的旧 verdict 只是噪音，不能重派打断
+    const qaState = await manager.getAgentState(task.qaAgentId);
+    if (qaState?.taskId === task.id) return false;
+  }
+  try {
+    // fromStatus/expectSignalToken 在 dispatch 锁内复核：本地快照到这里的窗口里任务可能已离开 review
+    // 或被并发 dispatcher 换代 pass，不能靠上面的预检
+    await manager.dispatchReviewToQa(task.id, {
+      fromStatus: ['review'],
+      bumpRound: false,
+      expectSignalToken: task.signalToken,
+    });
+  } catch (err) {
+    console.error(
+      `[EventHandler] stale-verdict auto-redispatch failed for task ${task.id}:`,
+      err,
+    );
+    return false;
+  }
+  console.warn(
+    `[EventHandler] stale verdict for task ${task.id} arrived with no active QA session; redispatched review`,
+  );
+  return true;
+}
+
 async function handleReviewApproval(
   bus: EventBus,
   manager: AgentManager,
@@ -1194,12 +1225,14 @@ export function registerEventHandlers(
         Number.isFinite(submittedMs) && Number.isFinite(dispatchedMs)
         && submittedMs < dispatchedMs - VERDICT_FRESHNESS_SKEW_MS
       ) {
-        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-          phase: 'stale-verdict-superseded-pass',
-          action,
-          submittedAt: verdictSubmittedAt,
-          reviewDispatchedAt: task.reviewDispatchedAt,
-        });
+        if (!(await redispatchReviewForStaleVerdict(manager, task))) {
+          await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+            phase: 'stale-verdict-superseded-pass',
+            action,
+            submittedAt: verdictSubmittedAt,
+            reviewDispatchedAt: task.reviewDispatchedAt,
+          });
+        }
         return;
       }
     }
@@ -1208,13 +1241,15 @@ export function registerEventHandlers(
       (typeof event.data.reviewPassToken === 'string' ? event.data.reviewPassToken : undefined)
       ?? (typeof event.data.token === 'string' ? event.data.token : undefined);
     if (verdictPassToken && task.signalToken && verdictPassToken !== task.signalToken) {
-      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-        phase: 'stale-verdict-wrong-pass',
-        action,
-        verdictPassToken,
-        currentToken: task.signalToken,
-        source: event.data.source === 'pane-signal' ? 'pane-signal' : 'poller',
-      });
+      if (!(await redispatchReviewForStaleVerdict(manager, task))) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'stale-verdict-wrong-pass',
+          action,
+          verdictPassToken,
+          currentToken: task.signalToken,
+          source: event.data.source === 'pane-signal' ? 'pane-signal' : 'poller',
+        });
+      }
       return;
     }
 

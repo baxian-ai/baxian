@@ -3,7 +3,51 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { useLayoutEffect } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react';
+import type { ProjectConfig, TaskState } from '../src/shared/index.js';
+
+const appMockState = vi.hoisted(() => {
+  const subscribers = new Map<string, Set<(data: unknown) => void>>();
+  return {
+    projects: null as unknown,
+    refreshProjects: vi.fn(),
+    taskGet: vi.fn(),
+    subscribers,
+    subscribe: vi.fn((topic: string, onData: (data: unknown) => void) => {
+      let handlers = subscribers.get(topic);
+      if (!handlers) {
+        handlers = new Set();
+        subscribers.set(topic, handlers);
+      }
+      handlers.add(onData);
+      return () => {
+        handlers?.delete(onData);
+      };
+    }),
+  };
+});
+
+vi.mock('../src/api.ts', () => ({
+  api: {
+    tasks: {
+      get: appMockState.taskGet,
+    },
+  },
+}));
+
+vi.mock('../src/hooks/use-projects.ts', () => ({
+  useProjects: () => ({
+    projects: appMockState.projects as ProjectConfig[] | null,
+    error: null,
+    refresh: appMockState.refreshProjects,
+  }),
+}));
+
+vi.mock('../src/stores/events-store.ts', () => ({
+  getEventsClient: () => ({
+    subscribe: appMockState.subscribe,
+  }),
+}));
 
 vi.mock('../src/pages/dashboard.tsx', () => ({
   Dashboard: () => <div data-testid="page-dashboard" />,
@@ -24,13 +68,87 @@ vi.mock('../src/components/pending-restart-banner.tsx', () => ({
 import { App } from '../src/app.tsx';
 import { TOPBAR_ACTIONS_ID, TopbarActions } from '../src/components/topbar-actions.tsx';
 
+const originalNotification = window.Notification;
+
+function makeTask(overrides: Partial<TaskState> = {}): TaskState {
+  const now = '2026-07-04T10:00:00Z';
+  return {
+    id: 'task-188',
+    projectId: 'proj',
+    title: 'Ship notifications',
+    description: '',
+    preferredAgentId: 'dev-1',
+    agentId: 'dev-1',
+    reviewRound: 0,
+    status: 'in_progress',
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
+}
+
+function makeProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
+  return {
+    id: 'proj',
+    repo: 'https://github.com/acme/demo.git',
+    merge: null,
+    agent: [],
+    ...overrides,
+  };
+}
+
+function emitProjectTasks(projectId: string, tasks: TaskState[]): void {
+  const handlers = appMockState.subscribers.get(`project-tasks:${projectId}`) ?? new Set();
+  act(() => {
+    for (const handler of handlers) handler(tasks);
+  });
+}
+
+function installNotificationMock(permission: NotificationPermission) {
+  const instances: Array<{ title: string; options?: NotificationOptions; close: ReturnType<typeof vi.fn> }> = [];
+  const requestPermission = vi.fn<() => Promise<NotificationPermission>>();
+  class MockNotification {
+    static permission = permission;
+    static requestPermission = requestPermission;
+    title: string;
+    options?: NotificationOptions;
+    onclick: (() => void) | null = null;
+    close = vi.fn();
+
+    constructor(title: string, options?: NotificationOptions) {
+      this.title = title;
+      this.options = options;
+      instances.push(this);
+    }
+  }
+  Object.defineProperty(window, 'Notification', {
+    configurable: true,
+    value: MockNotification,
+  });
+  return { instances, requestPermission, MockNotification };
+}
+
+function restoreNotification(): void {
+  Object.defineProperty(window, 'Notification', {
+    configurable: true,
+    value: originalNotification,
+  });
+}
+
 beforeEach(() => {
   window.history.pushState({}, '', '/');
+  appMockState.projects = null;
+  appMockState.refreshProjects.mockReset();
+  appMockState.taskGet.mockReset();
+  appMockState.subscribe.mockClear();
+  appMockState.subscribers.clear();
+  restoreNotification();
 });
 
 afterEach(() => {
   cleanup();
   document.body.innerHTML = '';
+  restoreNotification();
 });
 
 describe('App shell layout', () => {
@@ -139,6 +257,126 @@ describe('App shell layout', () => {
 
     expect(container.querySelector('footer')).toBeNull();
     expect(screen.getByTestId('page-terminal')).toBeTruthy();
+  });
+});
+
+describe('Task completion notifications', () => {
+  it('requests browser notification permission from the topbar button click', async () => {
+    const notification = installNotificationMock('default');
+    notification.requestPermission.mockResolvedValue('granted');
+    appMockState.projects = [makeProject()];
+
+    render(<App />);
+
+    expect(appMockState.subscribe).not.toHaveBeenCalled();
+    const button = screen.getByRole('button', { name: '启用任务完成通知' });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(notification.requestPermission).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      expect((screen.getByRole('button', { name: '任务完成通知已启用' }) as HTMLButtonElement).disabled).toBe(true);
+    });
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:proj',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+  });
+
+  it('shows a system notification when an observed task reaches merged', async () => {
+    const notification = installNotificationMock('granted');
+    const active = makeTask({ id: 'task-188', status: 'in_progress' });
+    const completed = makeTask({ id: 'task-188', status: 'merged' });
+    appMockState.projects = [makeProject()];
+    appMockState.taskGet.mockResolvedValue(completed);
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(appMockState.subscribe).toHaveBeenCalledWith(
+        'project-tasks:proj',
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
+    emitProjectTasks('proj', [active]);
+    expect(notification.instances).toHaveLength(0);
+
+    emitProjectTasks('proj', []);
+
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+    await waitFor(() => expect(notification.instances).toHaveLength(1));
+    expect(notification.instances[0].title).toContain('Ship notifications');
+    expect(notification.instances[0].options?.body).toContain('项目：proj · https://github.com/acme/demo.git');
+    expect(notification.instances[0].options?.body).toContain('Task：task-188 · Ship notifications');
+    expect(notification.instances[0].options?.body).toContain('状态：merged');
+  });
+
+  it('does not notify when the disappeared task is terminal but not completed', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    appMockState.taskGet.mockResolvedValue(makeTask({ status: 'failed' }));
+
+    render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+    await act(async () => { await Promise.resolve(); });
+    expect(notification.instances).toHaveLength(0);
+  });
+
+  it('retries completion confirmation on a later project task frame after a transient GET failure', async () => {
+    const notification = installNotificationMock('granted');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    appMockState.projects = [makeProject()];
+    appMockState.taskGet
+      .mockRejectedValueOnce(new Error('server restarting'))
+      .mockResolvedValueOnce(makeTask({ status: 'done' }));
+
+    try {
+      render(<App />);
+
+      await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+      emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+      emitProjectTasks('proj', []);
+
+      await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(1));
+      await act(async () => { await Promise.resolve(); });
+      expect(warn).toHaveBeenCalledWith(
+        '[task-notifications] failed to confirm completed task task-188:',
+        expect.any(Error),
+      );
+      expect(notification.instances).toHaveLength(0);
+
+      emitProjectTasks('proj', []);
+
+      await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(notification.instances).toHaveLength(1));
+      expect(notification.instances[0].options?.body).toContain('状态：done');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('ignores an empty task confirmation response without throwing or notifying', async () => {
+    const notification = installNotificationMock('granted');
+    appMockState.projects = [makeProject()];
+    appMockState.taskGet.mockResolvedValue(null);
+
+    render(<App />);
+
+    await waitFor(() => expect(appMockState.subscribe).toHaveBeenCalled());
+    emitProjectTasks('proj', [makeTask({ status: 'review' })]);
+    emitProjectTasks('proj', []);
+
+    await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
+    await act(async () => { await Promise.resolve(); });
+    expect(notification.instances).toHaveLength(0);
   });
 });
 

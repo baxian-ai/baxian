@@ -2353,6 +2353,7 @@ describe('review.submitted APPROVE', () => {
 describe('review.submitted freshness (superseded-pass guard)', () => {
   it('rejects a poller verdict submitted before the current review pass was dispatched', async () => {
     await seedReviewPass('task-stale-pass', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z' });
+    await seedDevAgent('task-stale-pass', 'qa-1');
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
@@ -2412,6 +2413,7 @@ describe('review.submitted freshness (superseded-pass guard)', () => {
 describe('review.submitted per-pass token gate (binds verdict to the dispatched pass)', () => {
   it('rejects a verdict whose review-pass token does not match the current signalToken', async () => {
     await seedReviewPass('task-wrongpass', { signalToken: 'current-token-22' });
+    await seedDevAgent('task-wrongpass', 'qa-1');
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
@@ -2465,6 +2467,7 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
 
   it('rejects a stale PANE-fallback verdict whose data.token no longer matches the rotated signalToken', async () => {
     await seedReviewPass('task-stale-pane', { signalToken: 'current-token-22' });
+    await seedDevAgent('task-stale-pane', 'qa-1');
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
 
@@ -2498,6 +2501,101 @@ describe('review.submitted per-pass token gate (binds verdict to the dispatched 
 
     const task = await taskStore.get('task-legit-pane');
     expect(task!.status).toBe('approved');
+  });
+});
+
+describe('review.submitted stale-verdict auto-redispatch (no active QA session)', () => {
+  it('wrong-pass token with no QA binding on the task → redispatches review instead of intervention', async () => {
+    await seedReviewPass('task-red-wrongpass', { signalToken: 'current-token-22', qaAgentId: undefined });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-wrongpass', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledWith('task-red-wrongpass', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'current-token-22' });
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeUndefined();
+  });
+
+  it('wrong-pass token while task.qaAgentId points at an agent bound to another task → redispatches', async () => {
+    await seedReviewPass('task-red-qa-elsewhere', { signalToken: 'current-token-22' });
+    await seedDevAgent('some-other-task', 'qa-1');
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-qa-elsewhere', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledWith('task-red-qa-elsewhere', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'current-token-22' });
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeUndefined();
+  });
+
+  it('wrong-pass token while the current-pass QA session is live → keeps intervention, no redispatch', async () => {
+    await seedReviewPass('task-red-live-qa', { signalToken: 'current-token-22' });
+    await seedDevAgent('task-red-live-qa', 'qa-1');
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-live-qa', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeDefined();
+  });
+
+  it('wrong-pass token on a task that left review status → keeps intervention, no redispatch', async () => {
+    await seedReviewPass('task-red-fixing', { signalToken: 'current-token-22', status: 'fixing', qaAgentId: undefined });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-fixing', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeDefined();
+  });
+
+  it('redispatch failure falls back to the wrong-pass intervention', async () => {
+    await seedReviewPass('task-red-fail', { signalToken: 'current-token-22', qaAgentId: undefined });
+    vi.spyOn(manager, 'dispatchReviewToQa').mockRejectedValue(new Error('QA agent qa-1 is busy or unavailable'));
+
+    await emitReview('task-red-fail', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeDefined();
+  });
+
+  it('superseded-pass verdict with no QA binding → redispatches instead of intervention', async () => {
+    await seedReviewPass('task-red-superseded', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z', qaAgentId: undefined });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-superseded', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      submittedAt: '2026-05-30T04:02:50Z',
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledWith('task-red-superseded', { fromStatus: ['review'], bumpRound: false, expectSignalToken: undefined });
+    expect(findInterventionByPhase('stale-verdict-superseded-pass')).toBeUndefined();
+  });
+
+  it('superseded-pass verdict while the QA session is live → keeps intervention, no redispatch', async () => {
+    await seedReviewPass('task-red-superseded-live', { reviewDispatchedAt: '2026-05-30T04:02:59.000Z' });
+    await seedDevAgent('task-red-superseded-live', 'qa-1');
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-superseded-live', {
+      action: 'REQUEST_CHANGES', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      submittedAt: '2026-05-30T04:02:50Z',
+    });
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(findInterventionByPhase('stale-verdict-superseded-pass')).toBeDefined();
   });
 });
 
