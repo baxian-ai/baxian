@@ -21,6 +21,7 @@ vi.mock('react-router-dom', async (orig) => ({
 
 import { api } from '../../src/api.ts';
 import { AgentGroup } from '../../src/components/agent-group.tsx';
+import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { makeAgent, makeTask } from '../helpers/fixtures.ts';
 
 const tasksDispatchMock = vi.mocked(api.tasks.dispatch);
@@ -91,15 +92,17 @@ function renderGroup(tasks: TaskState[], options: RenderGroupOptions = {}): void
   } = options;
   render(
     <MemoryRouter>
-      <AgentGroup
-        group={group}
-        projectId="proj"
-        agentsById={agentsById}
-        agentsLoaded={agentsLoaded}
-        agentsError={agentsError}
-        tasks={tasks}
-        terminalMode={terminalMode}
-      />
+      <ConfirmProvider>
+        <AgentGroup
+          group={group}
+          projectId="proj"
+          agentsById={agentsById}
+          agentsLoaded={agentsLoaded}
+          agentsError={agentsError}
+          tasks={tasks}
+          terminalMode={terminalMode}
+        />
+      </ConfirmProvider>
     </MemoryRouter>,
   );
 }
@@ -304,6 +307,7 @@ describe('AgentGroup', () => {
   it('activating a card in one group demotes the active card in another group', () => {
     render(
       <MemoryRouter>
+        <ConfirmProvider>
         <div>
           <AgentGroup
             group={GROUP}
@@ -331,6 +335,7 @@ describe('AgentGroup', () => {
             terminalMode="embedded-full"
           />
         </div>
+        </ConfirmProvider>
       </MemoryRouter>,
     );
 

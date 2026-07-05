@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { AgentMode, AgentRuntime, AgentRole, ProjectConfig, AgentConfig, HostConfig } from '../shared/index.js';
 import { Modal } from './modal.tsx';
+import { inputCls, labelCls, fieldErrCls, helpCls, radioCls } from './form-styles.ts';
 import { api, type ProbeResponse, type AddAgentBody } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
@@ -15,12 +16,6 @@ interface Props {
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const PROBE_DEBOUNCE_MS = 500;
 
-const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-xs font-medium text-og-700';
-const fieldErrCls = 'mt-1 text-xs text-accent';
-const helpCls = 'mt-1 text-xs text-og-500';
-const radioCls = 'h-3.5 w-3.5 accent-accent';
 
 interface FormState {
   id: string;

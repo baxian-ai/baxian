@@ -6,6 +6,7 @@ import {
   clearAuthToken,
   setAuthToken,
 } from '../api.ts';
+import { inputCls, labelCls } from './form-styles.ts';
 
 type GateState =
   | { kind: 'probing' }
@@ -135,7 +136,7 @@ function LoginForm({
     <CenteredCard title="登录 baxian">
       <p className="mb-4 text-sm text-og-600">服务器开启了访问鉴权，请输入访问令牌继续。</p>
       <form onSubmit={(e) => { void handleSubmit(e); }}>
-        <label className="mb-1.5 block text-xs font-medium text-og-700" htmlFor="baxian-token">
+        <label className={labelCls} htmlFor="baxian-token">
           访问令牌
         </label>
         <input
@@ -145,7 +146,7 @@ function LoginForm({
           autoFocus
           value={token}
           onChange={(e) => setToken(e.target.value)}
-          className="w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 font-mono text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
+          className={`${inputCls} font-mono`}
           placeholder="请输入服务器配置的 token"
           disabled={submitting}
         />

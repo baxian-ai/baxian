@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { App } from './app.tsx';
 import { AuthGate } from './components/auth-gate.tsx';
 import { ToastProvider } from './components/toast.tsx';
+import { ConfirmProvider } from './components/confirm-dialog.tsx';
 import { PendingRestartProvider } from './hooks/use-pending-restart.tsx';
 import './index.css';
 
@@ -10,9 +11,11 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <PendingRestartProvider>
       <ToastProvider>
-        <AuthGate>
-          <App />
-        </AuthGate>
+        <ConfirmProvider>
+          <AuthGate>
+            <App />
+          </AuthGate>
+        </ConfirmProvider>
       </ToastProvider>
     </PendingRestartProvider>
   </StrictMode>,

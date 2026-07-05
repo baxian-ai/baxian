@@ -43,6 +43,7 @@ vi.mock('../../src/hooks/use-events.ts', async () => (await import('../helpers/e
 import { api } from '../../src/api.ts';
 import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
 import { makeProject } from '../helpers/fixtures.ts';
+import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { Dashboard } from '../../src/pages/dashboard.tsx';
 import { TaskNotificationsProvider } from '../../src/hooks/use-task-notifications.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
@@ -57,8 +58,10 @@ function renderDashboard() {
   return render(
     <MemoryRouter>
       <TaskNotificationsProvider>
-        <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-        <Dashboard />
+        <ConfirmProvider>
+          <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
+          <Dashboard />
+        </ConfirmProvider>
       </TaskNotificationsProvider>
     </MemoryRouter>,
   );
@@ -306,7 +309,7 @@ describe('Dashboard layout', () => {
     expect(screen.getByRole('dialog', { name: /新建项目|Create/ })).toBeTruthy();
   });
 
-  it('kebab menuitem opens neutral (no default bg, no auto-focus) and only changes text color on hover', () => {
+  it('kebab menuitem opens without stealing focus and uses the shared MenuItem hover treatment', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
@@ -317,8 +320,7 @@ describe('Dashboard layout', () => {
     expect(item.textContent).toBe('新建项目');
     expect(item.className).not.toMatch(/(^|\s)bg-/);
     expect(item.className).not.toMatch(/focus:bg-/);
-    expect(item.className).not.toMatch(/hover:bg-/);
-    expect(item.className).toMatch(/hover:text-/);
+    expect(item.className).toMatch(/hover:bg-og-50/);
     expect(document.activeElement).not.toBe(item);
   });
 

@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useState, type ComponentType, type ReactNode, type SVGProps } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ComponentType, type ReactNode, type SVGProps } from 'react';
 import { AlertTriangleIcon, CheckCircleIcon, XCircleIcon } from './icons.tsx';
 
 export type ToastKind = 'success' | 'warn' | 'error';
@@ -10,9 +10,12 @@ interface ToastInput {
   durationMs?: number;
 }
 
-interface ToastItem extends ToastInput {
+interface ToastItem extends Omit<ToastInput, 'durationMs'> {
   id: number;
+  durationMs: number;
 }
+
+type HoldReason = 'hover' | 'focus';
 
 interface ToastContextValue {
   show: (toast: ToastInput) => void;
@@ -36,17 +39,56 @@ let nextId = 1;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<ToastItem[]>([]);
+  const timersRef = useRef(new Map<number, ReturnType<typeof setTimeout>>());
+  const holdsRef = useRef(new Map<number, Set<HoldReason>>());
+
+  useEffect(() => {
+    const timers = timersRef.current;
+    const holds = holdsRef.current;
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+      holds.clear();
+    };
+  }, []);
+
+  const clearTimer = useCallback((id: number) => {
+    const timer = timersRef.current.get(id);
+    if (timer) clearTimeout(timer);
+    timersRef.current.delete(id);
+  }, []);
 
   const dismiss = useCallback((id: number) => {
+    clearTimer(id);
+    holdsRef.current.delete(id);
     setItems(prev => prev.filter(t => t.id !== id));
-  }, []);
+  }, [clearTimer]);
+
+  const scheduleDismiss = useCallback((id: number, duration: number) => {
+    clearTimer(id);
+    timersRef.current.set(id, setTimeout(() => dismiss(id), duration));
+  }, [clearTimer, dismiss]);
+
+  // hover 与 focus 是相互独立的暂停原因：只有两者都释放后才恢复倒计时。
+  const hold = useCallback((id: number, reason: HoldReason) => {
+    const set = holdsRef.current.get(id) ?? new Set<HoldReason>();
+    set.add(reason);
+    holdsRef.current.set(id, set);
+    clearTimer(id);
+  }, [clearTimer]);
+
+  const release = useCallback((id: number, reason: HoldReason, duration: number) => {
+    const set = holdsRef.current.get(id);
+    set?.delete(reason);
+    if (!set || set.size === 0) scheduleDismiss(id, duration);
+  }, [scheduleDismiss]);
 
   const show = useCallback((input: ToastInput) => {
     const id = nextId++;
     const duration = input.durationMs ?? 3000;
-    setItems(prev => [...prev, { ...input, id }]);
-    setTimeout(() => dismiss(id), duration);
-  }, [dismiss]);
+    setItems(prev => [...prev, { ...input, id, durationMs: duration }]);
+    scheduleDismiss(id, duration);
+  }, [scheduleDismiss]);
 
   return (
     <ToastContext.Provider value={{ show }}>
@@ -57,6 +99,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             key={t.id}
             className={`pointer-events-auto w-full max-w-xs rounded-lg border px-4 py-3 shadow-toast ${KIND_CLASS[t.kind]}`}
             role="status"
+            onMouseEnter={() => hold(t.id, 'hover')}
+            onMouseLeave={() => release(t.id, 'hover', t.durationMs)}
+            onFocus={() => hold(t.id, 'focus')}
+            onBlur={(e) => {
+              if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+              release(t.id, 'focus', t.durationMs);
+            }}
           >
             <div className="flex items-start gap-2">
               {(() => { const Icon = KIND_ICON[t.kind]; return <Icon className="mt-0.5 shrink-0" width={14} height={14} />; })()}

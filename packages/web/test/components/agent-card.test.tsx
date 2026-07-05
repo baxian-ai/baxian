@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { AgentBindingFacts, AgentRole, AgentRuntime, AgentSnapshot } from '../../src/shared/index.js';
 
@@ -15,6 +15,7 @@ vi.mock('../../src/hooks/use-pets.ts', () => ({
 
 import { api } from '../../src/api.ts';
 import { AgentCard, type TerminalMode } from '../../src/components/agent-card.tsx';
+import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { makeTask } from '../helpers/fixtures.ts';
 import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
@@ -43,16 +44,18 @@ function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void
   const { runtime, role = 'dev', terminalMode, terminalLoading, active, onActivate } = options;
   render(
     <MemoryRouter>
-      <AgentCard
-        agent={agent}
-        projectId="proj"
-        role={role}
-        runtime={runtime}
-        terminalMode={terminalMode}
-        terminalLoading={terminalLoading}
-        active={active}
-        onActivate={onActivate}
-      />
+      <ConfirmProvider>
+        <AgentCard
+          agent={agent}
+          projectId="proj"
+          role={role}
+          runtime={runtime}
+          terminalMode={terminalMode}
+          terminalLoading={terminalLoading}
+          active={active}
+          onActivate={onActivate}
+        />
+      </ConfirmProvider>
     </MemoryRouter>,
   );
 }
@@ -98,6 +101,17 @@ function terminalHrefs(): (string | null)[] {
   return screen.getAllByRole('link', { name: '终端' }).map(link => link.getAttribute('href'));
 }
 
+async function findConfirmDialog(): Promise<HTMLElement> {
+  return screen.findByRole('dialog');
+}
+
+async function settleConfirmDialog(buttonName: string): Promise<void> {
+  const dialog = await findConfirmDialog();
+  await act(async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: buttonName }));
+  });
+}
+
 describe('AgentCard', () => {
   beforeEach(() => {
     deleteAgentMock.mockReset();
@@ -133,10 +147,13 @@ describe('AgentCard', () => {
 
     it('routes Resume to restart-repl (re-greet) for a greeting_failed hold with a live session', async () => {
       restartReplMock.mockResolvedValue({ ok: true, agentId: 'dev-greet' });
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       heldCard('dev-greet', 'greeting_failed', 'present');
 
-      await act(async () => { fireEvent.click(resumeButton()); });
+      fireEvent.click(resumeButton());
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText('恢复 Agent dev-greet？')).toBeTruthy();
+      expect(within(dialog).getByText(/重跑能力握手/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '恢复' })); });
 
       expect(restartReplMock).toHaveBeenCalledWith('proj', 'dev-greet');
       expect(retryAgentMock).not.toHaveBeenCalled();
@@ -147,10 +164,10 @@ describe('AgentCard', () => {
       'routes Resume to retry (rebuild) for a greeting_failed hold when the session is %s',
       async (sessionStatus) => {
         retryAgentMock.mockResolvedValue({ ok: true, agentId: 'dev-gone' });
-        vi.spyOn(window, 'confirm').mockReturnValue(true);
         heldCard('dev-gone', 'greeting_failed', sessionStatus);
 
-        await act(async () => { fireEvent.click(resumeButton()); });
+        fireEvent.click(resumeButton());
+        await settleConfirmDialog('恢复');
 
         expect(retryAgentMock).toHaveBeenCalledWith('proj', 'dev-gone');
         expect(restartReplMock).not.toHaveBeenCalled();
@@ -160,10 +177,12 @@ describe('AgentCard', () => {
 
     it('routes Resume to the resume endpoint for a non-greeting hold', async () => {
       resumeAgentMock.mockResolvedValue({ agentId: 'dev-hold', resumed: true, releasedBinding: true });
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
-      await act(async () => { fireEvent.click(resumeButton()); });
+      fireEvent.click(resumeButton());
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText(/baxian 会清除 awaiting_human 状态/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '恢复' })); });
 
       expect(resumeAgentMock).toHaveBeenCalledWith('proj', 'dev-hold');
       expect(restartReplMock).not.toHaveBeenCalled();
@@ -176,20 +195,20 @@ describe('AgentCard', () => {
 
     it('surfaces a Resume failure as an error toast and re-enables the button', async () => {
       resumeAgentMock.mockRejectedValue(new Error('binding busy'));
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
-      await act(async () => { fireEvent.click(resumeButton()); });
+      fireEvent.click(resumeButton());
+      await settleConfirmDialog('恢复');
 
       expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Resume 失败', body: 'binding busy' });
       expect((resumeButton() as HTMLButtonElement).disabled).toBe(false);
     });
 
     it('does not call any resume endpoint when the confirm dialog is cancelled', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(false);
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
-      await act(async () => { fireEvent.click(resumeButton()); });
+      fireEvent.click(resumeButton());
+      await settleConfirmDialog('取消');
 
       expect(resumeAgentMock).not.toHaveBeenCalled();
       expect(restartReplMock).not.toHaveBeenCalled();
@@ -526,36 +545,35 @@ describe('AgentCard', () => {
     });
 
     it('sends /clear via the Clear menu item after user confirms', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       clearMock.mockResolvedValue({ cleared: true });
       renderIdleCard();
 
       await clickMenuItem('清空上下文');
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText('清空 Agent dev-actions 的上下文？')).toBeTruthy();
+      expect(within(dialog).getByText(/将发送 \/clear/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '清空' })); });
 
-      expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('dev-actions'));
       expect(clearMock).toHaveBeenCalledWith('dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
       expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }));
-      confirmSpy.mockRestore();
     });
 
     it('does not send /clear when user cancels the confirmation', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
       renderIdleCard();
 
       await clickMenuItem('清空上下文');
+      await settleConfirmDialog('取消');
 
-      expect(confirmSpy).toHaveBeenCalled();
       expect(clearMock).not.toHaveBeenCalled();
-      confirmSpy.mockRestore();
     });
 
     it('shows an error toast when clear fails', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       clearMock.mockRejectedValue(new Error('Agent dev-actions has no live session'));
       renderIdleCard();
 
       await clickMenuItem('清空上下文');
+      await settleConfirmDialog('清空');
 
       expect(showMock).toHaveBeenCalledWith(expect.objectContaining({
         kind: 'error',
@@ -595,24 +613,25 @@ describe('AgentCard', () => {
     });
 
     it('invokes deleteAgent when the Delete menu item is chosen', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions'], restartRequired: false });
       renderIdleCard();
 
       await clickMenuItem('删除');
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText('删除 Agent dev-actions？')).toBeTruthy();
+      expect(within(dialog).getByText('此操作不可撤销。')).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '删除' })); });
 
-      expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('dev-actions'));
       expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
-      confirmSpy.mockRestore();
     });
 
     it('renders a delete error as a full-width block below the action row, not squeezed inside it', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       deleteAgentMock.mockRejectedValue(new Error('boom-delete-failed'));
       renderIdleCard();
 
       await clickMenuItem('删除');
+      await settleConfirmDialog('删除');
 
       const errorEl = await screen.findByText('boom-delete-failed');
       expect(errorEl.tagName).toBe('DIV');
@@ -620,7 +639,6 @@ describe('AgentCard', () => {
       const actionRow = screen.getByRole('link', { name: '终端' }).parentElement as HTMLElement;
       expect(actionRow.className).toContain('flex');
       expect(actionRow.contains(errorEl)).toBe(false);
-      confirmSpy.mockRestore();
     });
 
     it('closes the menu when clicking outside', () => {
@@ -653,13 +671,13 @@ describe('AgentCard', () => {
     });
 
     it('disables the menu trigger while a deletion is in flight', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       let resolveDelete: ((value: { removed: string[]; restartRequired: boolean }) => void) | undefined;
       deleteAgentMock.mockReturnValue(new Promise(resolve => { resolveDelete = resolve; }));
       renderIdleCard();
       const trigger = kebab();
 
       await clickMenuItem('删除');
+      await settleConfirmDialog('删除');
 
       expect((trigger as HTMLButtonElement).disabled).toBe(true);
       expect(trigger.className).toContain('disabled:opacity-50');
@@ -668,7 +686,6 @@ describe('AgentCard', () => {
       await act(async () => {
         resolveDelete?.({ removed: ['dev-actions'], restartRequired: false });
       });
-      confirmSpy.mockRestore();
     });
   });
 
@@ -808,38 +825,37 @@ describe('AgentCard', () => {
     }
 
     it('confirms and dispatches a QA review, reporting the new round', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       reviewMock.mockResolvedValue(makeTask({ id: 'task-9', reviewRound: 4 }));
       renderDevWithTask();
 
       await clickCallReview();
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText('发起 QA 重审？')).toBeTruthy();
+      expect(within(dialog).getByText(/task-9/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '发起重审' })); });
 
-      expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('task-9'));
       expect(reviewMock).toHaveBeenCalledWith('task-9');
       expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: '已发起 QA 重审（第 4 轮）' });
-      confirmSpy.mockRestore();
     });
 
     it('does nothing when the confirm dialog is cancelled', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
       renderDevWithTask();
 
       await clickCallReview();
+      await settleConfirmDialog('取消');
 
       expect(reviewMock).not.toHaveBeenCalled();
       expect(showMock).not.toHaveBeenCalled();
-      confirmSpy.mockRestore();
     });
 
     it('shows an error toast when the dispatch fails', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       reviewMock.mockRejectedValue(new Error('task has no PR'));
       renderDevWithTask();
 
       await clickCallReview();
+      await settleConfirmDialog('发起重审');
 
       expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '发起评审失败', body: 'task has no PR' });
-      confirmSpy.mockRestore();
     });
   });
 
@@ -913,7 +929,6 @@ describe('AgentCard', () => {
 
   describe('paired deletion', () => {
     it('warns that the paired QA agent was removed together and flags the restart', async () => {
-      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions', 'qa-actions'], restartRequired: true });
       renderCard(makeSnapshot({ id: 'dev-actions' }));
 
@@ -921,6 +936,7 @@ describe('AgentCard', () => {
       await act(async () => {
         fireEvent.click(screen.getByRole('menuitem', { name: '删除' }));
       });
+      await settleConfirmDialog('删除');
 
       expect(flagDirtyMock).toHaveBeenCalled();
       expect(showMock).toHaveBeenCalledWith({
@@ -928,7 +944,6 @@ describe('AgentCard', () => {
         title: '已删除 Agent dev-actions',
         body: '配对的 QA agent qa-actions 也被一并移除。',
       });
-      confirmSpy.mockRestore();
     });
   });
 });

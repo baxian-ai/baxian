@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api.ts';
 import { AgentCard } from '../components/agent-card.tsx';
+import { inputCls } from '../components/form-styles.ts';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
 import { useToast } from '../components/toast.tsx';
+import { useConfirm } from '../components/confirm-dialog.tsx';
 import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath, taskStatusLabel } from '../components/task-status.tsx';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useAgents, useTask } from '../hooks/use-events.ts';
@@ -56,6 +58,7 @@ export function TaskDetail() {
 function TaskDetailView({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
   const { show } = useToast();
+  const confirmDialog = useConfirm();
   const [editOpen, setEditOpen] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [retrying, setRetrying] = useState(false);
@@ -89,7 +92,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleCancel = async () => {
     if (!task) return;
-    if (!confirm(`确定取消 task ${task.id}？`)) return;
+    if (!(await confirmDialog({ title: `取消任务 ${task.id}？`, confirmLabel: '取消任务', cancelLabel: '返回' }))) return;
     setCancelling(true);
     try {
       const updated = await api.tasks.update(task.id, { status: 'cancelled' });
@@ -105,10 +108,18 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const handleReview = async () => {
     if (!task) return;
     const isTerminal = TASK_TERMINAL_STATUS_SET.has(task.status);
-    const prompt = isTerminal
-      ? `任务 ${task.id} 已是「${taskStatusLabel(task.status)}」状态。手动请 QA agent 重审会再跑一轮 review，但状态机不会把 QA agent 的结果带回主流程。继续？`
-      : `请 QA agent 重审任务 ${task.id}？这会立即开始新一轮 review（reviewRound +1）。`;
-    if (!confirm(prompt)) return;
+    const ok = await (isTerminal
+      ? confirmDialog({
+          title: '重审已结束的任务？',
+          body: `任务 ${task.id} 已是「${taskStatusLabel(task.status)}」状态。手动请 QA agent 重审会再跑一轮 review，但状态机不会把 QA agent 的结果带回主流程。`,
+          confirmLabel: '发起重审',
+        })
+      : confirmDialog({
+          title: `发起 QA 重审？`,
+          body: `QA agent 将对任务 ${task.id} 立即开始新一轮 review（reviewRound +1）。`,
+          confirmLabel: '发起重审',
+        }));
+    if (!ok) return;
     setReviewing(true);
     try {
       const updated = await api.tasks.review(task.id);
@@ -123,10 +134,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleRetry = async () => {
     if (!task) return;
-    const prompt = task.status === 'merged'
-      ? `task ${task.id} 已 merged。Retry 会用同样的标题/描述新建一个 task 从头跑，确定继续？`
-      : `Retry task ${task.id}？这会新建一个 task 从头开始，旧 task 保留为历史。`;
-    if (!confirm(prompt)) return;
+    const ok = await confirmDialog({
+      title: `重试任务 ${task.id}？`,
+      body: task.status === 'merged'
+        ? '任务已合并。重试会用同样的标题/描述新建一个任务从头跑。'
+        : '会新建一个任务从头开始，旧任务保留为历史。',
+      confirmLabel: '重试',
+    });
+    if (!ok) return;
     setRetrying(true);
     try {
       const fresh = await api.tasks.retry(task.id);
@@ -141,7 +156,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleComplete = async () => {
     if (!task) return;
-    if (!confirm(`将合并 PR #${task.prNumber} 并收尾（删本地分支 + 压缩 agent 上下文），确定？`)) return;
+    if (!(await confirmDialog({ title: '标记完成并合并？', body: `将合并 PR #${task.prNumber} 并收尾：删本地分支、压缩 agent 上下文。`, confirmLabel: '标记完成' }))) return;
     setCompleting(true);
     try {
       const updated = await api.tasks.complete(task.id);
@@ -156,7 +171,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleContinue = async () => {
     if (!task) return;
-    if (!confirm(`让 Dev agent 再修一轮（第 ${task.reviewRound + 1} 轮），完成后自动转 QA review？`)) return;
+    if (!(await confirmDialog({ title: '继续一轮？', body: `让 Dev agent 再修一轮（第 ${task.reviewRound + 1} 轮），完成后自动转 QA review。`, confirmLabel: '继续一轮' }))) return;
     setContinuing(true);
     try {
       const updated = await api.tasks.continue(task.id);
@@ -171,7 +186,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleSpecApprove = async () => {
     if (!task) return;
-    if (!confirm(`通过 task ${task.id} 的 Spec 并开始编码？`)) return;
+    if (!(await confirmDialog({ title: `通过 Spec 并开始编码？`, body: `任务 ${task.id} 将进入编码阶段。`, confirmLabel: '通过 Spec' }))) return;
     setSpecSubmitting(true);
     try {
       const updated = await api.tasks.spec(task.id, { verdict: 'approve' });
@@ -204,7 +219,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleConfirmGate = async () => {
     if (!task) return;
-    if (!confirm(`确认完成 task ${task.id}？project.merge 为 auto 时由 baxian 自动执行合并。`)) return;
+    if (!(await confirmDialog({ title: `确认完成任务 ${task.id}？`, body: 'project.merge 为 auto 时由 baxian 自动执行合并。', confirmLabel: '确认完成' }))) return;
     setCompleting(true);
     try {
       const updated = await api.tasks.complete(task.id);
@@ -368,7 +383,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 placeholder="打回意见（打回时必填）"
                 rows={3}
                 disabled={specSubmitting}
-                className="w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50"
+                className={inputCls}
               />
               <div className="flex flex-wrap gap-2">
                 <button

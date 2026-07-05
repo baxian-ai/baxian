@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { PetMeta } from '../../src/shared/index.js';
 
 vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
@@ -7,6 +7,7 @@ vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts'))
 
 import { api } from '../../src/api.ts';
 import { AgentPetConfigModal, parsePetPackage, PetPackageError } from '../../src/components/agent-pet-config-modal.tsx';
+import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
 
 const showMock = toastShowMock;
@@ -37,7 +38,16 @@ beforeEach(() => {
 });
 
 function renderModal(currentPetId: string | null) {
-  return render(<AgentPetConfigModal agentId="dev-1" currentPetId={currentPetId} onClose={vi.fn()} />);
+  return render(
+    <ConfirmProvider>
+      <AgentPetConfigModal agentId="dev-1" currentPetId={currentPetId} onClose={vi.fn()} />
+    </ConfirmProvider>,
+  );
+}
+
+async function findConfirmDialog(): Promise<HTMLElement> {
+  const dialogs = await screen.findAllByRole('dialog');
+  return dialogs[dialogs.length - 1];
 }
 
 describe('parsePetPackage', () => {
@@ -113,13 +123,15 @@ describe('AgentPetConfigModal', () => {
   });
 
   it('deletes a pet after confirmation and refreshes the list', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     renderModal('pet-1');
     const delBtn = await screen.findByRole('button', { name: '删除 Cat' });
     await act(async () => { fireEvent.click(delBtn); });
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('删除 Pet「Cat」？')).toBeTruthy();
+    expect(within(dialog).getByText('使用它的 Agent 会回到默认状态显示。')).toBeTruthy();
+    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '删除' })); });
     expect(removeMock).toHaveBeenCalledWith('pet-2');
     await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
-    confirmSpy.mockRestore();
   });
 
   it('shows the empty-library hint when no pet has been uploaded yet', async () => {
@@ -153,16 +165,16 @@ describe('AgentPetConfigModal', () => {
   });
 
   it('shows an error toast and skips the refresh when deleting a pet fails', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     removeMock.mockRejectedValue(new Error('pet in use'));
     renderModal('pet-1');
     const delBtn = await screen.findByRole('button', { name: '删除 Cat' });
 
     await act(async () => { fireEvent.click(delBtn); });
+    const dialog = await findConfirmDialog();
+    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '删除' })); });
 
     expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '删除失败', body: 'pet in use' });
     expect(listMock).toHaveBeenCalledTimes(1);
-    confirmSpy.mockRestore();
   });
 
   describe('pet package upload', () => {

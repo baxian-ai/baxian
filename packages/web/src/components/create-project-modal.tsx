@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { MergeStrategy, ReviewMode, SpecApprovalStrategy } from '../shared/index.js';
 import { Modal } from './modal.tsx';
+import { inputCls, labelCls, fieldErrCls } from './form-styles.ts';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
@@ -19,10 +20,6 @@ const REPO_URL_PATTERNS = [
   /^[^/\s:@]+\/[^/\s]+$/,
 ];
 
-const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-xs font-medium text-og-700';
-const fieldErrCls = 'mt-1 text-xs text-accent';
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [id, setId] = useState('');

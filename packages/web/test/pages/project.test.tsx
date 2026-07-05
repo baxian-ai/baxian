@@ -40,6 +40,7 @@ import { api } from '../../src/api.ts';
 import { toastShowMock as toastShow } from '../helpers/toast-mock.tsx';
 import { useAgentsMock, useProjectTasksMock, useTaskMock } from '../helpers/events-mock.ts';
 import { makeProject } from '../helpers/fixtures.ts';
+import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { Project } from '../../src/pages/project.tsx';
 import { TOPBAR_ACTIONS_ID } from '../../src/components/topbar-actions.tsx';
 
@@ -55,11 +56,13 @@ function LocationProbe() {
 function renderProjectPage() {
   return render(
     <MemoryRouter initialEntries={['/project/demo']}>
-      <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-      <Routes>
-        <Route path="/project/:id" element={<Project />} />
-        <Route path="/" element={<LocationProbe />} />
-      </Routes>
+      <ConfirmProvider>
+        <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
+        <Routes>
+          <Route path="/project/:id" element={<Project />} />
+          <Route path="/" element={<LocationProbe />} />
+        </Routes>
+      </ConfirmProvider>
     </MemoryRouter>,
   );
 }
@@ -181,11 +184,11 @@ describe('Project Task panel', () => {
     const panel = await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }));
     const heading = screen.getByRole('heading', { name: 'Tasks' });
     const agentsHeading = screen.getByRole('heading', { name: 'Agents' });
-    const closeBtn = screen.getByRole('button', { name: '关闭 任务面板' });
+    const closeBtn = screen.getByRole('button', { name: '关闭任务面板' });
     expect(panel.contains(heading)).toBe(false);
     expect(panel.contains(closeBtn)).toBe(false);
     expect(heading.className).toBe(agentsHeading.className);
-    expect(screen.queryByRole('menuitem', { name: '显示 任务面板' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: '显示任务面板' })).toBeNull();
   });
 
   it('closes via the header button and reopens from the three-dot menu', async () => {
@@ -193,23 +196,23 @@ describe('Project Task panel', () => {
     await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }));
     const menuBtn = screen.getByRole('button', { name: /项目 demo 操作菜单/ });
 
-    fireEvent.click(screen.getByRole('button', { name: '关闭 任务面板' }));
+    fireEvent.click(screen.getByRole('button', { name: '关闭任务面板' }));
     await waitFor(() => expect(screen.queryByRole('complementary', { name: '任务面板' })).toBeNull());
     expect(document.activeElement).toBe(menuBtn);
 
     await openProjectMenu();
-    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: '显示 任务面板' }));
+    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: '显示任务面板' }));
     fireEvent.click(reopen);
 
     expect(await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }))).toBeTruthy();
     expect(document.activeElement).toBe(menuBtn);
     await openProjectMenu();
-    expect(screen.queryByRole('menuitem', { name: '显示 任务面板' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: '显示任务面板' })).toBeNull();
   });
 
   it('persists and restores the Task panel closed state', async () => {
     renderProjectPage();
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: '关闭 任务面板' })));
+    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: '关闭任务面板' })));
     await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('0'));
 
     cleanup();
@@ -218,7 +221,7 @@ describe('Project Task panel', () => {
     expect(screen.queryByRole('complementary', { name: '任务面板' })).toBeNull();
 
     await openProjectMenu();
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '显示 任务面板' })));
+    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '显示任务面板' })));
     await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('1'));
     expect(await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }))).toBeTruthy();
   });
@@ -282,11 +285,13 @@ describe('Project delete entry', () => {
     }
     render(
       <MemoryRouter initialEntries={['/project/demo']}>
-        <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
-        <Routes>
-          <Route path="/project/:id" element={<Project />} />
-          <Route path="/" element={<><LocationProbe /><ProjectIdsProbe /></>} />
-        </Routes>
+        <ConfirmProvider>
+          <div id={TOPBAR_ACTIONS_ID} data-testid="topbar-actions" />
+          <Routes>
+            <Route path="/project/:id" element={<Project />} />
+            <Route path="/" element={<><LocationProbe /><ProjectIdsProbe /></>} />
+          </Routes>
+        </ConfirmProvider>
       </MemoryRouter>,
     );
 

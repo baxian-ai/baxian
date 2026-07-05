@@ -20,8 +20,13 @@ const SIZE_CLASS: Record<NonNullable<Props['size']>, string> = {
 const FOCUSABLE_SELECTOR =
   'input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
+// 嵌套弹窗（如弹窗内再弹确认框）时，Escape/Tab/背板点击只由栈顶实例响应。
+const modalStack: symbol[] = [];
+
 export function Modal({ open, onClose, title, titleContent, children, footer, size = 'md', dismissOnBackdrop = true }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const instanceRef = useRef<symbol>();
+  if (!instanceRef.current) instanceRef.current = Symbol('modal');
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
   const pointerDownOnBackdropRef = useRef(false);
   const onCloseRef = useRef(onClose);
@@ -30,9 +35,14 @@ export function Modal({ open, onClose, title, titleContent, children, footer, si
   useEffect(() => {
     if (!open) return;
 
+    const instance = instanceRef.current!;
+    modalStack.push(instance);
+    const isTop = () => modalStack[modalStack.length - 1] === instance;
+
     previouslyFocusedRef.current = document.activeElement as HTMLElement | null;
 
     const handleKey = (e: KeyboardEvent) => {
+      if (!isTop()) return;
       if (e.key === 'Escape') {
         onCloseRef.current();
         return;
@@ -68,6 +78,8 @@ export function Modal({ open, onClose, title, titleContent, children, footer, si
     }
 
     return () => {
+      const idx = modalStack.indexOf(instance);
+      if (idx >= 0) modalStack.splice(idx, 1);
       document.removeEventListener('keydown', handleKey);
       document.body.style.overflow = prevOverflow;
       previouslyFocusedRef.current?.focus?.();
@@ -79,7 +91,7 @@ export function Modal({ open, onClose, title, titleContent, children, footer, si
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-og-1000/45 px-3 sm:px-4"
-      onMouseDown={dismissOnBackdrop ? e => { pointerDownOnBackdropRef.current = e.target === e.currentTarget; } : undefined}
+      onMouseDown={dismissOnBackdrop ? e => { pointerDownOnBackdropRef.current = e.target === e.currentTarget && modalStack[modalStack.length - 1] === instanceRef.current; } : undefined}
       onClick={dismissOnBackdrop ? e => { if (e.target === e.currentTarget && pointerDownOnBackdropRef.current) onCloseRef.current(); } : undefined}
       role="presentation"
     >

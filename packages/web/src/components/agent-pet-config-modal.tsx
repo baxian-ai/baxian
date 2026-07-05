@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ChangeEvent, type ReactNode } from 'r
 import { api, ApiError } from '../api.ts';
 import { Modal } from './modal.tsx';
 import { useToast } from './toast.tsx';
+import { useConfirm } from './confirm-dialog.tsx';
 import { usePets } from '../hooks/use-pets.ts';
 import { AgentPet, PET_DISPLAY_HEIGHT, PET_DISPLAY_WIDTH } from './agent-pet.tsx';
 
@@ -74,6 +75,7 @@ export interface AgentPetConfigModalProps {
 
 export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPetConfigModalProps) {
   const { show } = useToast();
+  const confirmDialog = useConfirm();
   const { pets, loading, refresh } = usePets();
   const [enabled, setEnabled] = useState(!!currentPetId);
   const [assignedPetId, setAssignedPetId] = useState<string | null>(currentPetId);
@@ -126,7 +128,7 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
   };
 
   const handleDelete = async (petId: string, name: string) => {
-    if (!window.confirm(`确认删除 Pet「${name}」？使用它的 Agent 会回到默认状态显示。`)) return;
+    if (!(await confirmDialog({ title: `删除 Pet「${name}」？`, body: '使用它的 Agent 会回到默认状态显示。', confirmLabel: '删除' }))) return;
     setBusy(true);
     try {
       await api.pets.remove(petId);

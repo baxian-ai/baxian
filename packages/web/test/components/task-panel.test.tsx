@@ -268,7 +268,7 @@ describe('TaskPanel', () => {
     expect(screen.queryByRole('button', { name: '刷新 Task 列表' })).toBeNull();
     expect(screen.queryByRole('button', { name: '+ 新建任务' })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '关闭 任务面板' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '关闭任务面板' })).toBeNull();
   });
 
   it('renders the section titles in normal weight, not bold', () => {

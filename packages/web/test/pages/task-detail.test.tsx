@@ -61,6 +61,7 @@ import { api } from '../../src/api.ts';
 import { useTaskMock, useAgentsMock } from '../helpers/events-mock.ts';
 import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { TaskDetail } from '../../src/pages/task-detail.tsx';
 
 const tasksRetryMock = vi.mocked(api.tasks.retry);
@@ -126,14 +127,27 @@ function GoTo({ to }: { to: string }) {
 function renderPage(taskId = 'task-010', opts: { entries?: string[]; index?: number; extra?: ReactNode } = {}) {
   return render(
     <MemoryRouter initialEntries={opts.entries ?? [`/project/baxian/task/${taskId}`]} initialIndex={opts.index}>
-      {opts.extra}
-      <Routes>
-        <Route path="/project/:id/task/:taskId" element={<TaskDetail />} />
-        <Route path="*" element={null} />
-      </Routes>
-      <LocationProbe />
+      <ConfirmProvider>
+        {opts.extra}
+        <Routes>
+          <Route path="/project/:id/task/:taskId" element={<TaskDetail />} />
+          <Route path="*" element={null} />
+        </Routes>
+        <LocationProbe />
+      </ConfirmProvider>
     </MemoryRouter>,
   );
+}
+
+async function findConfirmDialog(): Promise<HTMLElement> {
+  return screen.findByRole('dialog');
+}
+
+async function settleConfirmDialog(buttonName: string): Promise<void> {
+  const dialog = await findConfirmDialog();
+  await act(async () => {
+    fireEvent.click(within(dialog).getByRole('button', { name: buttonName }));
+  });
 }
 
 function open(overrides: Partial<TaskState> = {}) {
@@ -384,7 +398,6 @@ describe('TaskDetail page — actions & states', () => {
   });
 
   it('Retry creates a fresh task and navigates to its detail page', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     setTasks({
       'task-010': makeTask({ id: 'task-010', status: 'merged' }),
       'task-011': makeTask({ id: 'task-011', status: 'pending' }),
@@ -392,8 +405,12 @@ describe('TaskDetail page — actions & states', () => {
     tasksRetryMock.mockResolvedValue(makeTask({ id: 'task-011', projectId: 'baxian', status: 'pending' }));
     renderPage('task-010');
 
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('重试任务 task-010？')).toBeTruthy();
+    expect(within(dialog).getByText(/任务已合并。重试会用同样的标题\/描述新建一个任务从头跑。/)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '重试' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: '重试' }));
     });
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
@@ -401,18 +418,19 @@ describe('TaskDetail page — actions & states', () => {
   });
 
   it('Cancel confirms and calls the update api', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
     open({ status: 'in_progress' });
 
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('取消任务 task-010？')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '取消' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: '取消任务' }));
     });
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
 
   it('does not leak an optimistic override when switching tasks on the same route', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     // Cancel resolves to a NEWER updatedAt than task-011 — the stale-override guard
     // by updatedAt alone would keep showing task-010 on the new URL; remount must win.
     tasksUpdateMock.mockResolvedValue(
@@ -424,9 +442,8 @@ describe('TaskDetail page — actions & states', () => {
     });
     renderPage('task-010', { extra: <GoTo to="/project/baxian/task/task-011" /> });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '取消' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await settleConfirmDialog('取消任务');
     expect(screen.getByText('AAA')).toBeTruthy();
 
     await act(async () => {
@@ -454,13 +471,11 @@ describe('TaskDetail page — actions & states', () => {
       { button: '继续一轮', mock: tasksContinueMock, resolved: makeTask({ status: 'fixing', reviewRound: 11 }) },
       { button: '标记完成', mock: tasksCompleteMock, resolved: makeTask({ status: 'merged' }) },
     ])('$button confirms and calls its api', async ({ button, mock, resolved }) => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       mock.mockResolvedValue(resolved);
       openMaxRounds();
 
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: button }));
-      });
+      fireEvent.click(screen.getByRole('button', { name: button }));
+      await settleConfirmDialog(button);
       expect(mock).toHaveBeenCalledWith('task-010');
     });
 
@@ -490,12 +505,15 @@ describe('TaskDetail page — actions & states', () => {
     });
 
     it('通过 Spec confirms and submits an approve verdict', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       tasksSpecMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openSpecReady();
 
+      fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText('通过 Spec 并开始编码？')).toBeTruthy();
+      expect(within(dialog).getByText('任务 task-010 将进入编码阶段。')).toBeTruthy();
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
+        fireEvent.click(within(dialog).getByRole('button', { name: '通过 Spec' }));
       });
 
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
@@ -516,13 +534,11 @@ describe('TaskDetail page — actions & states', () => {
     });
 
     it('verdict failure surfaces an error toast', async () => {
-      vi.spyOn(window, 'confirm').mockReturnValue(true);
       tasksSpecMock.mockRejectedValue(new Error('task-010 is fixing'));
       openSpecReady();
 
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
-      });
+      fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
+      await settleConfirmDialog('通过 Spec');
 
       expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Spec 通过失败', body: 'task-010 is fixing' });
     });
@@ -531,38 +547,42 @@ describe('TaskDetail page — actions & states', () => {
 
 describe('TaskDetail page — call review', () => {
   it('confirms with the active-task prompt, dispatches, and reports the new round', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksReviewMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2, updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'review' });
 
+    fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('发起 QA 重审？')).toBeTruthy();
+    expect(within(dialog).getByText(/QA agent 将对任务 task-010 立即开始新一轮 review/)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: '发起重审' }));
     });
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('请 QA agent 重审任务 task-010'));
     expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已发起 QA 重审（第 2 轮）' });
   });
 
-  it('warns that re-reviewing a terminal task will not feed back into the state machine', () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+  it('warns that re-reviewing a terminal task will not feed back into the state machine', async () => {
     open({ status: 'merged' });
 
     fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('重审已结束的任务？')).toBeTruthy();
+    expect(within(dialog).getByText(/已是「已合并」状态/)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    });
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('已是「已合并」状态'));
     expect(tasksReviewMock).not.toHaveBeenCalled();
     expect(toastShowMock).not.toHaveBeenCalled();
   });
 
   it('shows an error toast when review dispatch fails', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksReviewMock.mockRejectedValue(new Error('qa is busy'));
     open({ status: 'review' });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
+    await settleConfirmDialog('发起重审');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '发起评审失败', body: 'qa is busy' });
   });
@@ -570,52 +590,48 @@ describe('TaskDetail page — call review', () => {
 
 describe('TaskDetail page — action failures surface error toasts', () => {
   it('Cancel failure shows 取消失败 and re-enables the button', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksUpdateMock.mockRejectedValue(new Error('cancel nope'));
     open({ status: 'in_progress' });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '取消' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    await settleConfirmDialog('取消任务');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '取消失败', body: 'cancel nope' });
     expect((screen.getByRole('button', { name: '取消' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('Retry on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksRetryMock.mockRejectedValue(new Error('retry nope'));
     open({ status: 'cancelled' });
 
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('重试任务 task-010？')).toBeTruthy();
+    expect(within(dialog).getByText('会新建一个任务从头开始，旧任务保留为历史。')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '重试' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: '重试' }));
     });
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('这会新建一个 task 从头开始'));
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '重试失败', body: 'retry nope' });
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
   });
 
   it('标记完成 failure shows 标记完成失败', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksCompleteMock.mockRejectedValue(new Error('merge conflict'));
     open({ status: 'max_rounds' });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '标记完成' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '标记完成' }));
+    await settleConfirmDialog('标记完成');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '标记完成失败', body: 'merge conflict' });
   });
 
   it('继续一轮 failure shows 继续一轮失败', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksContinueMock.mockRejectedValue(new Error('dev is gone'));
     open({ status: 'max_rounds' });
 
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '继续一轮' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '继续一轮' }));
+    await settleConfirmDialog('继续一轮');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '继续一轮失败', body: 'dev is gone' });
   });
@@ -649,7 +665,6 @@ describe('TaskDetail page — human confirmation gates', () => {
   }
 
   it('ready gate renders the banner plus review summary, and 确认 completes the task', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksReviewsMock.mockResolvedValue(makeRounds());
     tasksCompleteMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
     const { container } = open({ status: 'ready' });
@@ -660,8 +675,11 @@ describe('TaskDetail page — human confirmation gates', () => {
     expect(container.textContent).toContain('最终 verdict approve');
     expect(container.textContent).toContain('findings 共 3 条');
 
+    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText('确认完成任务 task-010？')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '确认' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: '确认完成' }));
     });
 
     expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
@@ -669,32 +687,28 @@ describe('TaskDetail page — human confirmation gates', () => {
   });
 
   it('确认 is skipped when the confirm dialog is cancelled and reports failures', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     open({ status: 'merge-ready' });
 
     fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    await settleConfirmDialog('取消');
     expect(tasksCompleteMock).not.toHaveBeenCalled();
 
-    confirmSpy.mockReturnValue(true);
     tasksCompleteMock.mockRejectedValue(new Error('gate says no'));
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '确认' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    await settleConfirmDialog('确认完成');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '确认失败', body: 'gate says no' });
   });
 
   it('server-mode approved task offers 重试发布 which re-runs the publish step', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     tasksCompleteMock.mockResolvedValue(
       makeTask({ reviewMode: 'server', status: 'ready', updatedAt: '2026-05-11T00:00:00.000Z' }),
     );
     open({ reviewMode: 'server', status: 'approved' });
 
     expect(screen.queryByRole('button', { name: '确认' })).toBeNull();
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '重试发布' }));
-    });
+    fireEvent.click(screen.getByRole('button', { name: '重试发布' }));
+    await settleConfirmDialog('确认完成');
 
     expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已确认（ready）' });

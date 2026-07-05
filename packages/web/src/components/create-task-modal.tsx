@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent 
 import type { AgentSnapshot, ProjectConfig, TaskState } from '../shared/index.js';
 import { IMAGE_UPLOAD_MAX_BYTES, TASK_IMAGE_MAX_COUNT } from '../shared/index.js';
 import { Modal } from './modal.tsx';
+import { inputCls, labelCls } from './form-styles.ts';
 import { api, fileToBase64 } from '../api.ts';
 import { useToast } from './toast.tsx';
 
@@ -93,9 +94,6 @@ function loadDraftForContext(projectIdProp: string | undefined): CreateTaskDraft
   return useGlobal ? global : own;
 }
 
-const inputCls =
-  'w-full rounded-md border border-og-100 bg-surface px-2.5 py-1.5 text-sm text-og-800 placeholder:text-og-400 focus:border-accent focus:outline-none focus:ring-[3px] focus:ring-accent-soft disabled:cursor-not-allowed disabled:opacity-50';
-const labelCls = 'mb-1.5 block text-xs font-medium text-og-700';
 const counterCls = 'mt-1 text-right text-xs text-og-400';
 const MAX_IMAGE_MIB = Math.floor(IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024);
 

@@ -1,8 +1,10 @@
 import type { AgentRole, AgentRuntime, AgentSnapshot } from '../shared/index.js';
-import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useId, useRef, useState } from 'react';
+import { type KeyboardEvent as ReactKeyboardEvent, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { KebabMenu, MenuItem } from './kebab-menu.tsx';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
+import { useConfirm } from './confirm-dialog.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
 import { PaneTerminal } from './pane-terminal.tsx';
 import { AgentPet } from './agent-pet.tsx';
@@ -74,6 +76,7 @@ export function AgentCard({
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState<string | null>(null);
   const { show } = useToast();
+  const confirmDialog = useConfirm();
   const { flagDirty } = usePendingRestart();
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -82,41 +85,8 @@ export function AgentCard({
   const [reviewing, setReviewing] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [retryingBootstrap, setRetryingBootstrap] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [petModalOpen, setPetModalOpen] = useState(false);
-  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const menuId = useId();
-  const menuTriggerId = useId();
 
-  useEffect(() => {
-    if (!menuOpen) return;
-    const handlePointer = (e: MouseEvent) => {
-      const target = e.target as Node | null;
-      if (!target) return;
-      if (menuRef.current?.contains(target)) return;
-      if (menuButtonRef.current?.contains(target)) return;
-      setMenuOpen(false);
-    };
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setMenuOpen(false);
-        menuButtonRef.current?.focus();
-      }
-    };
-    document.addEventListener('mousedown', handlePointer);
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('mousedown', handlePointer);
-      document.removeEventListener('keydown', handleKey);
-    };
-  }, [menuOpen]);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const firstItem = menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]:not([disabled])');
-    firstItem?.focus();
-  }, [menuOpen]);
   const taskId = agent.binding?.taskId;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
@@ -156,9 +126,12 @@ export function AgentCard({
 
   const handleRequestReview = async () => {
     if (!taskId) return;
-    if (!window.confirm(`请 QA agent 对任务 ${taskId} 重审？这会立即开始新一轮 review（reviewRound +1）。`)) {
-      return;
-    }
+    const ok = await confirmDialog({
+      title: '发起 QA 重审？',
+      body: `QA agent 将对任务 ${taskId} 立即开始新一轮 review（reviewRound +1）。`,
+      confirmLabel: '发起重审',
+    });
+    if (!ok) return;
     setReviewing(true);
     try {
       const updated = await api.tasks.review(taskId);
@@ -187,10 +160,14 @@ export function AgentCard({
   };
 
   const handleResume = async () => {
-    const confirmMsg = needsRegreet
-      ? `确认 Resume Agent ${agent.id}？greeting 能力未通过，baxian 会重跑能力握手（会话存活则重启 REPL，已丢失则重建）；握手通过才解除 Held。`
-      : `确认 Resume Agent ${agent.id}？baxian 会清除 awaiting_human 状态，agent 恢复可用。`;
-    if (!window.confirm(confirmMsg)) return;
+    const ok = await confirmDialog({
+      title: `恢复 Agent ${agent.id}？`,
+      body: needsRegreet
+        ? 'greeting 能力未通过，baxian 会重跑能力握手（会话存活则重启 REPL，已丢失则重建）；握手通过才解除挂起。'
+        : 'baxian 会清除 awaiting_human 状态，agent 恢复可用。',
+      confirmLabel: '恢复',
+    });
+    if (!ok) return;
     setResuming(true);
     try {
       if (needsRegreet) {
@@ -236,7 +213,7 @@ export function AgentCard({
   };
 
   const handleClear = async () => {
-    if (!window.confirm(`确认向 Agent ${agent.id} 发送 /clear？这会清空整个会话上下文，不可恢复。`)) return;
+    if (!(await confirmDialog({ title: `清空 Agent ${agent.id} 的上下文？`, body: '将发送 /clear，整个会话上下文不可恢复。', confirmLabel: '清空' }))) return;
     setClearing(true);
     try {
       await api.agents.clear(agent.id);
@@ -253,7 +230,7 @@ export function AgentCard({
   };
 
   const handleDelete = async () => {
-    if (!window.confirm(`确认删除 Agent ${agent.id}？此操作不可撤销`)) return;
+    if (!(await confirmDialog({ title: `删除 Agent ${agent.id}？`, body: '此操作不可撤销。', confirmLabel: '删除' }))) return;
     setDeleting(true);
     setDeleteError(null);
     try {
@@ -468,98 +445,48 @@ export function AgentCard({
             </button>
           )}
         </div>
-        <div className="relative shrink-0">
-          <button
-            ref={menuButtonRef}
-            id={menuTriggerId}
-            type="button"
-            onClick={() => setMenuOpen(open => !open)}
-            disabled={deleting}
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            aria-controls={menuOpen ? menuId : undefined}
-            aria-label={`Agent ${agent.id} 操作菜单`}
-            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="1" />
-              <circle cx="12" cy="5" r="1" />
-              <circle cx="12" cy="19" r="1" />
-            </svg>
-          </button>
-          {menuOpen && (
-            <div
-              ref={menuRef}
-              id={menuId}
-              role="menu"
-              aria-labelledby={menuTriggerId}
-              className="absolute right-0 bottom-full z-10 mb-1 min-w-[140px] rounded-md border border-hairline bg-surface py-1 shadow-md"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); setPetModalOpen(true); }}
+        <KebabMenu ariaLabel={`Agent ${agent.id} 操作菜单`} className="shrink-0" placement="up" autoFocusFirstItem disabled={deleting}>
+          {close => (
+            <>
+              <MenuItem
+                onClick={() => { close(); setPetModalOpen(true); }}
                 disabled={compacting || clearing || deleting}
                 title="配置 Agent Pet（在状态位置显示动画宠物）"
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Agent Pet
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); void handleCompact(); }}
+              </MenuItem>
+              <MenuItem
+                onClick={() => { close(); void handleCompact(); }}
                 disabled={compacting || clearing || deleting}
                 title="向 agent runtime 发送 /compact 压缩上下文"
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {compacting ? '压缩中…' : '压缩上下文'}
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); void handleClear(); }}
+              </MenuItem>
+              <MenuItem
+                onClick={() => { close(); void handleClear(); }}
                 disabled={clearing || compacting || deleting}
                 title="向 agent runtime 发送 /clear 清空上下文"
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {clearing ? '清空中…' : '清空上下文'}
-              </button>
+              </MenuItem>
               {!pendingRestart && taskId && role === 'dev' && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { setMenuOpen(false); void handleRequestReview(); }}
+                <MenuItem
+                  onClick={() => { close(); void handleRequestReview(); }}
                   disabled={reviewing || deleting}
                   title={`让 QA agent 立即对任务 ${taskId} 跑一轮 review（需要该任务已有 PR）`}
-                  className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {reviewing ? '发起中…' : '发起评审'}
-                </button>
+                </MenuItem>
               )}
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); void handleDelete(); }}
+              <MenuItem
+                onClick={() => { close(); void handleDelete(); }}
                 disabled={deleting || compacting || clearing}
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {deleting ? '删除中…' : '删除'}
-              </button>
-            </div>
+              </MenuItem>
+            </>
           )}
-        </div>
+        </KebabMenu>
       </div>
       {stopError && <div className="mt-1.5 break-words text-xs text-accent">{stopError}</div>}
       {deleteError && <div className="mt-1.5 break-words text-xs text-accent">{deleteError}</div>}

@@ -1,5 +1,6 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import {useState} from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { KebabMenu, MenuItem } from '../components/kebab-menu.tsx';
 import { AgentGroup } from '../components/agent-group.tsx';
 import { CreateProjectModal } from '../components/create-project-modal.tsx';
 import { CreateAgentModal } from '../components/create-agent-modal.tsx';
@@ -32,35 +33,6 @@ export function Dashboard() {
   const agentsById = new Map((agents ?? []).map((agent) => [agent.id, agent]));
   const error = projectsError ?? agentsError;
 
-  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const moreButtonRef = useRef<HTMLButtonElement | null>(null);
-  const moreMenuRef = useRef<HTMLDivElement | null>(null);
-  const moreMenuId = useId();
-  const moreTriggerId = useId();
-
-  useEffect(() => {
-    if (!moreMenuOpen) return;
-    const handlePointer = (e: MouseEvent) => {
-      const target = e.target as Node | null;
-      if (!target) return;
-      if (moreMenuRef.current?.contains(target)) return;
-      if (moreButtonRef.current?.contains(target)) return;
-      setMoreMenuOpen(false);
-    };
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setMoreMenuOpen(false);
-        moreButtonRef.current?.focus();
-      }
-    };
-    document.addEventListener('mousedown', handlePointer);
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('mousedown', handlePointer);
-      document.removeEventListener('keydown', handleKey);
-    };
-  }, [moreMenuOpen]);
-
   const createTaskDisabled = projects.length === 0;
   const createTaskButton = (
     <button
@@ -85,63 +57,15 @@ export function Dashboard() {
         {createTaskDisabled && (
           <span id="create-task-hint" className="sr-only">请先创建项目</span>
         )}
-        <div className="relative">
-          <button
-            ref={moreButtonRef}
-            id={moreTriggerId}
-            type="button"
-            onClick={() => setMoreMenuOpen(open => !open)}
-            aria-haspopup="menu"
-            aria-expanded={moreMenuOpen}
-            aria-controls={moreMenuOpen ? moreMenuId : undefined}
-            aria-label="更多操作"
-            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="1" />
-              <circle cx="12" cy="5" r="1" />
-              <circle cx="12" cy="19" r="1" />
-            </svg>
-          </button>
-          {moreMenuOpen && (
-            <div
-              ref={moreMenuRef}
-              id={moreMenuId}
-              role="menu"
-              aria-labelledby={moreTriggerId}
-              className="absolute right-0 top-full z-10 mt-1 min-w-[140px] rounded-md border border-hairline bg-surface py-1 shadow-md"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMoreMenuOpen(false); setCreateOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:text-og-1000"
-              >
-                新建项目
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMoreMenuOpen(false); setHostMgmtOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:text-og-1000"
-              >
-                Host 管理
-              </button>
-              <TaskNotificationsMenuItem onAction={() => setMoreMenuOpen(false)} />
-            </div>
+        <KebabMenu ariaLabel="更多操作">
+          {close => (
+            <>
+              <MenuItem onClick={() => { close(); setCreateOpen(true); }}>新建项目</MenuItem>
+              <MenuItem onClick={() => { close(); setHostMgmtOpen(true); }}>Host 管理</MenuItem>
+              <TaskNotificationsMenuItem onAction={close} />
+            </>
           )}
-        </div>
+        </KebabMenu>
       </TopbarActions>
       <h1 className="sr-only">Dashboard</h1>
       {error && <div className="mb-4 text-sm text-accent">加载失败：{error}</div>}
@@ -226,31 +150,19 @@ function TaskNotificationsMenuItem({ onAction }: { onAction: () => void }) {
   const { permission, enabled, requesting, enable, disable } = useTaskNotifications();
   if (permission === 'unsupported') return null;
   if (permission === 'denied') {
-    return (
-      <button
-        type="button"
-        role="menuitem"
-        disabled
-        className="block w-full cursor-default px-3 py-1.5 text-left text-sm text-og-500"
-      >
-        浏览器已拒绝任务完成通知
-      </button>
-    );
+    return <MenuItem disabled>浏览器已拒绝任务完成通知</MenuItem>;
   }
   return (
-    <button
-      type="button"
-      role="menuitem"
+    <MenuItem
       disabled={requesting}
       onClick={() => {
         onAction();
         if (enabled) disable();
         else enable();
       }}
-      className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:text-og-1000 disabled:cursor-default disabled:opacity-60"
     >
       {enabled ? '关闭任务完成通知' : '开启任务完成通知'}
-    </button>
+    </MenuItem>
   );
 }
 

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import {useCallback, useEffect, useRef, useState} from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { KebabMenu, MenuItem } from '../components/kebab-menu.tsx';
 import { api } from '../api.ts';
 import { AgentGroup } from '../components/agent-group.tsx';
 import { TaskPanel } from '../components/task-panel.tsx';
@@ -34,16 +35,12 @@ export function Project() {
   const [projectError, setProjectError] = useState<string | null>(null);
   const [createAgentOpen, setCreateAgentOpen] = useState(false);
   const [createTaskOpen, setCreateTaskOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
   const [taskPanelOpen, setTaskPanelOpen] = useState(readTaskPanelOpen);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const menuId = useId();
-  const menuTriggerId = useId();
   const projectTokenRef = useRef(0);
   const { data: agents, loaded: agentsLoaded, error: agentsErrorPayload } = useAgents();
   const { data: tasksData, error: tasksErrorPayload } = useProjectTasks(id);
@@ -72,29 +69,6 @@ export function Project() {
     setProjectError(null);
     loadProject(id);
   }, [id, loadProject]);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const handlePointer = (e: MouseEvent) => {
-      const target = e.target as Node | null;
-      if (!target) return;
-      if (menuRef.current?.contains(target)) return;
-      if (menuButtonRef.current?.contains(target)) return;
-      setMenuOpen(false);
-    };
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setMenuOpen(false);
-        menuButtonRef.current?.focus();
-      }
-    };
-    document.addEventListener('mousedown', handlePointer);
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('mousedown', handlePointer);
-      document.removeEventListener('keydown', handleKey);
-    };
-  }, [menuOpen]);
 
   useEffect(() => {
     if (!deleteOpen) {
@@ -140,77 +114,30 @@ export function Project() {
     <div>
       <TopbarActions>
         <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-ghost">+ 新建任务</button>
-        <div className="relative">
-          <button
-            ref={menuButtonRef}
-            id={menuTriggerId}
-            type="button"
-            onClick={() => setMenuOpen(open => !open)}
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            aria-controls={menuOpen ? menuId : undefined}
-            aria-label={`项目 ${project.id} 操作菜单`}
-            className="flex h-8 w-8 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="1" />
-              <circle cx="12" cy="5" r="1" />
-              <circle cx="12" cy="19" r="1" />
-            </svg>
-          </button>
-          {menuOpen && (
-            <div
-              ref={menuRef}
-              id={menuId}
-              role="menu"
-              aria-labelledby={menuTriggerId}
-              className="absolute right-0 top-full z-10 mt-1 min-w-[180px] rounded-md border border-hairline bg-surface py-1 shadow-md"
-            >
+        <KebabMenu ariaLabel={`项目 ${project.id} 操作菜单`} menuClassName="min-w-[180px]" triggerRef={menuButtonRef}>
+          {close => (
+            <>
               {!taskPanelOpen && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => { setMenuOpen(false); setTaskPanelOpen(true); menuButtonRef.current?.focus(); }}
-                  className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:bg-og-50 hover:text-og-1000"
-                >
-                  显示 任务面板
-                </button>
+                <MenuItem onClick={() => { close(); setTaskPanelOpen(true); }}>
+                  显示任务面板
+                </MenuItem>
               )}
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); setCreateAgentOpen(true); }}
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-800 hover:bg-og-50 hover:text-og-1000"
-              >
+              <MenuItem onClick={() => { close(); setCreateAgentOpen(true); }}>
                 添加 Agent
-              </button>
+              </MenuItem>
               <div role="none" className="my-1 border-t border-hairline" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => { setMenuOpen(false); setDeleteOpen(true); }}
+              <MenuItem
+                onClick={() => { close(); setDeleteOpen(true); }}
                 disabled={!canDelete}
                 title={canDelete ? undefined : `请先删除项目下的 ${agentCount} 个 Agent`}
-                className="block w-full px-3 py-1.5 text-left text-sm text-og-1000 hover:bg-og-50 disabled:cursor-not-allowed disabled:text-og-400 disabled:hover:bg-transparent"
               >
                 删除项目…
-              </button>
-            </div>
+              </MenuItem>
+            </>
           )}
-        </div>
+        </KebabMenu>
       </TopbarActions>
-      {error && <div className="mb-4 text-sm text-accent">Error: {error}</div>}
+      {error && <div className="mb-4 text-sm text-accent">加载失败：{error}</div>}
       <div className="mb-6 flex items-baseline gap-x-3">
         <h1 className="min-w-0 truncate font-display text-sm font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
         <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
@@ -250,7 +177,7 @@ export function Project() {
               <button
                 type="button"
                 onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
-                aria-label="关闭 任务面板"
+                aria-label="关闭任务面板"
                 className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
