@@ -36,7 +36,7 @@ Judge the spec (the `spec:` block, or the `spec-file:` file):
 - correctness — internally consistent, no contradicting sections, feasible against the existing codebase.
 - ambiguity — any requirement readable two ways is a finding.
 
-Need a referenced file or codebase section to judge feasibility? Use the read-file side-channel. When prior findings / response inputs are present (block or file form), verify every finding is closed before judging the rest of the spec.
+Need a referenced file or codebase section to judge feasibility? Use the read-file side-channel. When `prior-findings:` / `prior-response:` inputs are present (block or file form), verify every finding is closed before judging the rest of the spec.
 
 ## Findings Output
 

@@ -317,22 +317,26 @@ describe('WorktreeManager', () => {
 });
 
 describe('git safety: inbox files are invisible to git (real git)', () => {
-  async function initOriginAndClone(): Promise<{ root: string; repo: string }> {
+  async function withRealGitRepo(run: (repo: string) => Promise<void>): Promise<void> {
     const root = await mkdtemp(join(tmpdir(), 'baxian-inbox-git-'));
-    const local = new LocalRunner();
-    const origin = join(root, 'origin.git');
-    const repo = join(root, 'repo');
-    const setup = await local.exec(
-      `git init -q --bare ${shellQuote(origin)} && ` +
-      `git clone -q ${shellQuote(origin)} ${shellQuote(repo)} && ` +
-      `cd ${shellQuote(repo)} && git config user.email t@t && git config user.name t && ` +
-      `git commit --allow-empty -qm init && git push -q origin HEAD && ` +
-      `b=$(git branch --show-current) && ` +
-      `git update-ref "refs/remotes/origin/$b" HEAD && ` +
-      `git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$b"`,
-    );
-    expect(setup.exitCode).toBe(0);
-    return { root, repo };
+    try {
+      const local = new LocalRunner();
+      const origin = join(root, 'origin.git');
+      const repo = join(root, 'repo');
+      const setup = await local.exec(
+        `git init -q --bare ${shellQuote(origin)} && ` +
+        `git clone -q ${shellQuote(origin)} ${shellQuote(repo)} && ` +
+        `cd ${shellQuote(repo)} && git config user.email t@t && git config user.name t && ` +
+        `git commit --allow-empty -qm init && git push -q origin HEAD && ` +
+        `b=$(git branch --show-current) && ` +
+        `git update-ref "refs/remotes/origin/$b" HEAD && ` +
+        `git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$b"`,
+      );
+      expect(setup.exitCode).toBe(0);
+      await run(repo);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 
   async function assertInboxInvisible(worktreePath: string): Promise<void> {
@@ -351,25 +355,15 @@ describe('git safety: inbox files are invisible to git (real git)', () => {
     expect(ignored.exitCode).toBe(0);
   }
 
-  it('create: an inbox file never appears in git status and is check-ignore matched', async () => {
-    const { root, repo } = await initOriginAndClone();
-    try {
+  it('create: an inbox file never appears in git status and is check-ignore matched', () =>
+    withRealGitRepo(async (repo) => {
       const wt = new WorktreeManager(new LocalRunner());
-      const worktreePath = await wt.create(repo, 'task-gs1');
-      await assertInboxInvisible(worktreePath);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  }, 20_000);
+      await assertInboxInvisible(await wt.create(repo, 'task-gs1'));
+    }), 20_000);
 
-  it('createDetachedAtBase: an inbox file never appears in git status and is check-ignore matched', async () => {
-    const { root, repo } = await initOriginAndClone();
-    try {
+  it('createDetachedAtBase: an inbox file never appears in git status and is check-ignore matched', () =>
+    withRealGitRepo(async (repo) => {
       const wt = new WorktreeManager(new LocalRunner());
-      const worktreePath = await wt.createDetachedAtBase(repo, 'task-gs2');
-      await assertInboxInvisible(worktreePath);
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  }, 20_000);
+      await assertInboxInvisible(await wt.createDetachedAtBase(repo, 'task-gs2'));
+    }), 20_000);
 });

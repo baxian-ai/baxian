@@ -653,6 +653,52 @@ describe('server review mode prompt builders', () => {
     })).toThrow(/mutually exclusive/);
   });
 
+  it('rejects prior-response passed in both inline and file form', async () => {
+    const registry = getRegistry();
+    expect(() => buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
+      phase: 'server-recheck',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'diff',
+      serverPriorResponse: '{"round":1,"responses":[]}',
+      serverPriorResponseFile: { path: '.baxian/review/inbox/prior-response-round-1.json', bytes: 1 },
+    })).toThrow(/mutually exclusive/);
+  });
+
+  it('server-recheck renders prior-response-file instead of the prior-response block', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
+      phase: 'server-recheck',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'diff',
+      serverPriorResponseFile: { path: '.baxian/review/inbox/prior-response-round-1.json', bytes: 12 * 1024 },
+    });
+    expect(prompt).toContain('prior-response-file: .baxian/review/inbox/prior-response-round-1.json (12KB)');
+    expect(prompt).not.toContain('prior-response:\n');
+  });
+
+  it('server-feedback floors the rendered round at 1, matching the delivery filename floor', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 0, phase: 'code' },
+      phase: 'server-feedback',
+      agent: DEV_AGENT,
+      worktreePath: '/wt/dev',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverPriorFindings: '{"round":1,"verdict":"request-changes","findings":[]}',
+    });
+    expect(prompt).toContain('round: 1');
+    expect(prompt).not.toContain('round: 0');
+  });
+
   it('sub-KB file refs round up to 1KB', async () => {
     const registry = getRegistry();
     const prompt = buildPromptInline({
@@ -665,7 +711,7 @@ describe('server review mode prompt builders', () => {
       currentSpecRound: 1,
       serverContentFile: { path: '.baxian/review/inbox/spec-round-1.md', bytes: 100 },
     });
-    expect(prompt).toContain('(1KB)');
+    expect(prompt).toContain('spec-file: .baxian/review/inbox/spec-round-1.md (1KB)');
   });
 });
 

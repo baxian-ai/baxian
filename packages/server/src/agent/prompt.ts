@@ -207,7 +207,7 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
   },
   'server-feedback': ({ task, currentSpecRound, serverPriorFindings, serverPriorFindingsFile }) => {
     const isSpec = task.phase === 'spec';
-    const round = isSpec ? (currentSpecRound ?? task.specReviewRound ?? 1) : task.reviewRound;
+    const round = isSpec ? (currentSpecRound ?? task.specReviewRound ?? 1) : Math.max(task.reviewRound, 1);
     return {
       fields: [
         `feedback: ${isSpec ? 'spec' : 'code'}`,

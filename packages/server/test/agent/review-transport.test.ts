@@ -350,6 +350,7 @@ describe('deliverToInbox', () => {
   it.each([
     ['sub/dir.md', 'has a path separator'],
     ['../escape.md', 'traverses upward'],
+    ['.secret.md', 'leads with a dot'],
     ['', 'is empty'],
   ])('rejects filename %s (%s)', async (filename) => {
     const { transport } = makeTransport([]);
@@ -474,6 +475,24 @@ describe('resolveServerPayloads', () => {
       phase: 'server-spec-review', reviewRound: 0, serverContent: big('s'),
     });
     expect(out.serverContentFile?.path).toBe('.baxian/review/inbox/spec-round-1.md');
+  });
+
+  it('non-spec round falls back to 1 when reviewRound is 0', async () => {
+    const { transport } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-review', reviewRound: 0, serverContent: big('d'),
+    });
+    expect(out.serverContentFile?.path).toBe('.baxian/review/inbox/diff-round-1.patch');
+  });
+
+  it('rejects serverContent under server-feedback (findings-only channel)', async () => {
+    const { transport, writes } = makeTransport([]);
+    await expect(resolveServerPayloads(transport, DEV, '/wt/dev', {
+      phase: 'server-feedback', taskPhase: 'code', reviewRound: 1,
+      serverContent: 'diff text',
+      serverPriorFindings: '{}',
+    })).rejects.toThrow(expect.objectContaining({ reason: 'unexpected-payload' }));
+    expect(writes).toHaveLength(0);
   });
 
   it('returns empty opts when no payloads are present (server-after-done)', async () => {

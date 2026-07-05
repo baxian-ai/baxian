@@ -332,6 +332,9 @@ export async function resolveServerPayloads(
   worktreePath: string,
   input: ServerPayloadInput,
 ): Promise<ServerPayloadPromptOpts> {
+  if (input.phase === 'server-feedback' && input.serverContent !== undefined) {
+    throw new ReviewExchangeError('unexpected-payload', 'server-feedback carries findings only');
+  }
   const round = serverPayloadRound(input);
   const out: ServerPayloadPromptOpts = {};
   const place = async (
