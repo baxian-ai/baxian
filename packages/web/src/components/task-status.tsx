@@ -21,36 +21,37 @@ export function taskStatusLabel(status: TaskStatus): string {
   return STATUS_LABELS[status] ?? status;
 }
 
-// Color budget: accent marks "needs a human" only; activity/completion is ink, waiting is gray.
+// Status hues: green = on track/done, blue = agent busy in review, amber = needs a human
+// (approval gates, rework, round cap), red = hard failure, gray = inert.
 export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {
   pending: 'pill',
   in_progress: 'pill pill-live',
   review: 'pill pill-review',
-  fixing: 'pill pill-live',
+  fixing: 'pill pill-warn',
   'spec-ready': 'pill pill-warn',
-  approved: 'pill pill-review',
+  approved: 'pill pill-live',
   'merge-ready': 'pill pill-warn',
   ready: 'pill pill-warn',
   merged: 'pill pill-live',
   done: 'pill pill-live',
-  failed: 'pill pill-warn',
+  failed: 'pill pill-danger',
   max_rounds: 'pill pill-warn',
   cancelled: 'pill',
 };
 
 const STATUS_DOT_COLORS: Record<TaskStatus, string> = {
   pending: 'bg-og-300',
-  in_progress: 'bg-og-1000',
-  review: 'bg-og-400',
-  fixing: 'bg-og-1000',
-  'spec-ready': 'bg-accent',
-  approved: 'bg-og-400',
-  'merge-ready': 'bg-accent',
-  ready: 'bg-accent',
-  merged: 'bg-og-1000',
-  done: 'bg-og-1000',
-  failed: 'bg-accent',
-  max_rounds: 'bg-accent',
+  in_progress: 'bg-success',
+  review: 'bg-accent',
+  fixing: 'bg-warn',
+  'spec-ready': 'bg-warn',
+  approved: 'bg-success',
+  'merge-ready': 'bg-warn',
+  ready: 'bg-warn',
+  merged: 'bg-success',
+  done: 'bg-success',
+  failed: 'bg-danger',
+  max_rounds: 'bg-warn',
   cancelled: 'bg-og-300',
 };
 

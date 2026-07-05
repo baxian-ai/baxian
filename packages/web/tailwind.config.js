@@ -34,6 +34,9 @@ export default {
           hover: '#0f3bb8',
           soft: '#eaf0ff',
         },
+        success: { DEFAULT: '#166534', soft: '#e6f4ec' },
+        warn: { DEFAULT: '#b45309', soft: '#fef3c7' },
+        danger: { DEFAULT: '#b91c1c', soft: '#fdecea' },
         page: '#fafafa',
         surface: '#ffffff',
         hairline: '#e8e9ec',
@@ -42,6 +45,7 @@ export default {
         'diff-del': '#fdecea',
         'diff-add-ink': '#15803d',
         'diff-del-ink': '#b91c1c',
+        'probe-ok': '#15803d',
       },
       fontFamily: {
         sans: [

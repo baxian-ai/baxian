@@ -25,31 +25,41 @@ function scan(pattern: RegExp): string[] {
   });
 }
 
-describe('color budget: ink neutrals + single accent', () => {
+describe('color budget: ink neutrals + accent chrome, semantic status colors via tokens', () => {
   it('bans arbitrary hex color utilities in classNames (colors must come from tokens)', () => {
     expect(
       scan(/(?:bg|text|border|accent|ring|fill|stroke|outline|decoration|divide|caret|placeholder|from|via|to)-\[#[0-9a-fA-F]+\]/g),
     ).toEqual([]);
   });
 
-  it('bans the retired red/green/amber semantic utilities', () => {
-    expect(scan(/!?(?:text|bg|border|ring)-(?:danger|success|warn)\b/g)).toEqual([]);
+  it('bans !important color utility overrides in classNames', () => {
+    expect(scan(/!(?:bg|text|border|ring)-/g)).toEqual([]);
   });
 
-  it('drops the retired status color tokens from the theme', () => {
+  it('keeps the semantic status colors as paired tokens (ink fg + soft bg)', () => {
     const colors = (tailwindConfig.theme?.extend?.colors ?? {}) as Record<string, unknown>;
-    for (const retired of ['success', 'warn', 'danger']) {
-      expect(colors[retired]).toBeUndefined();
-    }
+    expect(colors.success).toEqual({ DEFAULT: '#166534', soft: '#e6f4ec' });
+    expect(colors.warn).toEqual({ DEFAULT: '#b45309', soft: '#fef3c7' });
+    expect(colors.danger).toEqual({ DEFAULT: '#b91c1c', soft: '#fdecea' });
   });
 
-  it('keeps content-level exceptions as named tokens (terminal surface, diff add/del)', () => {
+  it('confines raw semantic color utilities to the status primitives (pills, status dots)', () => {
+    const allowed = new Set(['index.css', 'components/task-status.tsx']);
+    expect(
+      scan(/(?:bg|text|border|ring)-(?:success|warn|danger)\b/g).filter(
+        (hit) => !allowed.has(hit.slice(0, hit.indexOf(':'))),
+      ),
+    ).toEqual([]);
+  });
+
+  it('keeps content-level exceptions as named tokens (terminal surface, diff add/del, probe verdicts)', () => {
     const colors = (tailwindConfig.theme?.extend?.colors ?? {}) as Record<string, unknown>;
     expect(colors.term).toBe('#fdfdfd');
     expect(colors['diff-add']).toBe('#e6f4ec');
     expect(colors['diff-del']).toBe('#fdecea');
     expect(colors['diff-add-ink']).toBe('#15803d');
     expect(colors['diff-del-ink']).toBe('#b91c1c');
+    expect(colors['probe-ok']).toBe('#15803d');
   });
 
   it('keeps attention pulses finite (WCAG 2.2.2: no looping motion beyond 5s)', () => {

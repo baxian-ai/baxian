@@ -293,10 +293,10 @@ describe('TaskPanel', () => {
       task({ id: 'task-005', status: 'pending' }),
     ]);
     expect(screen.queryByText('in_progress')).toBeNull();
-    expect(screen.getByRole('img', { name: 'in_progress' }).className).toContain('bg-og-1000');
-    expect(screen.getByRole('img', { name: 'review' }).className).toContain('bg-og-400');
-    expect(screen.getByRole('img', { name: 'fixing' }).className).toContain('bg-og-1000');
-    expect(screen.getByRole('img', { name: 'approved' }).className).toContain('bg-og-400');
+    expect(screen.getByRole('img', { name: 'in_progress' }).className).toContain('bg-success');
+    expect(screen.getByRole('img', { name: 'review' }).className).toContain('bg-accent');
+    expect(screen.getByRole('img', { name: 'fixing' }).className).toContain('bg-warn');
+    expect(screen.getByRole('img', { name: 'approved' }).className).toContain('bg-success');
     const pendingDot = screen.getByRole('img', { name: 'pending' });
     expect(pendingDot.className).toContain('bg-og-300');
     expect(pendingDot.getAttribute('title')).toBe('pending');
@@ -311,9 +311,9 @@ describe('TaskPanel', () => {
     ]));
     renderPanel([]);
     clickDone();
-    expect((await screen.findByRole('img', { name: 'merged' })).className).toContain('bg-og-1000');
-    expect(screen.getByRole('img', { name: 'max_rounds' }).className).toContain('bg-accent');
-    expect(screen.getByRole('img', { name: 'failed' }).className).toContain('bg-accent');
+    expect((await screen.findByRole('img', { name: 'merged' })).className).toContain('bg-success');
+    expect(screen.getByRole('img', { name: 'max_rounds' }).className).toContain('bg-warn');
+    expect(screen.getByRole('img', { name: 'failed' }).className).toContain('bg-danger');
     expect(screen.getByRole('img', { name: 'cancelled' }).className).toContain('bg-og-300');
   });
 

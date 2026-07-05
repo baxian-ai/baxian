@@ -297,6 +297,58 @@ it('shows an SSH probe failure for remote hosts and clears it when switching bac
   await waitFor(() => expect(screen.queryByText('SSH: ⨯ auth failed')).toBeNull());
 });
 
+it('renders installed runtime and tmux probe results in green (text-probe-ok)', async () => {
+  probeMock.mockResolvedValue({
+    tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
+    runtimes: {
+      'claude-code': { ok: true, path: '/usr/local/bin/claude', message: '' },
+      codex: { ok: true, path: '/usr/local/bin/codex', message: '' },
+    },
+  });
+  await renderReady();
+
+  expect((await screen.findByText('✓ /usr/local/bin/claude')).className).toContain('text-probe-ok');
+  expect(screen.getByText('✓ /usr/local/bin/codex').className).toContain('text-probe-ok');
+  expect(screen.getByText('tmux: ✓ /usr/bin/tmux').className).toContain('text-probe-ok');
+});
+
+it('renders the SSH ✓ line and tmux install success in green (text-probe-ok)', async () => {
+  probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
+  await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
+
+  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
+  expect((await screen.findByText('SSH: ✓ SSH OK')).className).toContain('text-probe-ok');
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+  });
+
+  const installMsg = await screen.findByText(/tmux 3.4 installed via apt-get/);
+  expect(installMsg.className).toContain('text-probe-ok');
+});
+
+it('prefills the Agent ID placeholder as <project>-<role> and tracks role switches', async () => {
+  const dev: AgentConfig = { id: 'dev-a', runtime: 'claude-code', role: 'dev', mode: 'local' };
+  await renderReady(cfgWithAgents([[dev]]));
+  const input = screen.getByLabelText('Agent ID') as HTMLInputElement;
+  expect(input.placeholder).toBe('baxian-dev');
+
+  fireEvent.click(screen.getByRole('radio', { name: 'QA agent' }));
+  expect(input.placeholder).toBe('baxian-qa');
+
+  fireEvent.click(screen.getByRole('radio', { name: 'Dev agent' }));
+  expect(input.placeholder).toBe('baxian-dev');
+});
+
+it('describes YOLO by the real per-runtime launch flags instead of explaining the mode', async () => {
+  await renderReady();
+
+  expect(screen.getByText('--permission-mode bypassPermissions')).toBeTruthy();
+  expect(screen.getByText('--dangerously-bypass-approvals-and-sandbox')).toBeTruthy();
+  expect(screen.queryByText(/无需逐条确认|受控环境/)).toBeNull();
+});
+
 it('validates the agent id format and global uniqueness', async () => {
   const dev: AgentConfig = { id: 'dev-a', runtime: 'claude-code', role: 'dev', mode: 'local' };
   await renderReady(cfgWithAgents([[dev]]));

@@ -222,7 +222,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     if (probeLoading) return <span className="ml-2 text-xs text-og-400">…探测中</span>;
     if (!probe) return <span className="ml-2 text-xs text-og-400">?</span>;
     const status = probe.runtimes[rt];
-    if (status.ok) return <span className="ml-2 text-xs text-og-800">✓ {status.path ?? ''}</span>;
+    if (status.ok) return <span className="ml-2 text-xs text-probe-ok">✓ {status.path ?? ''}</span>;
     return <span className="ml-2 text-xs text-accent" title={status.message}>⨯ {status.message}</span>;
   };
 
@@ -230,7 +230,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     if (form.mode === 'remote' && !form.host) return null;
     if (probeLoading && !installingTmux) return <div className="text-xs text-og-400">tmux: …探测中</div>;
     if (!probe) return null;
-    if (probe.tmux.ok) return <div className="text-xs text-og-800">tmux: ✓ {probe.tmux.path ?? ''}</div>;
+    if (probe.tmux.ok) return <div className="text-xs text-probe-ok">tmux: ✓ {probe.tmux.path ?? ''}</div>;
     const sshReady = form.mode === 'local' || !!probe.ssh?.ok;
     return (
       <div className="space-y-1">
@@ -248,7 +248,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
         )}
         {!installingTmux && tmuxInstall && (
-          <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-og-800' : 'text-accent'}`}>
+          <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-probe-ok' : 'text-accent'}`}>
             {tmuxInstall.ok ? '✓ ' : '⨯ '}{tmuxInstall.message}
           </div>
         )}
@@ -258,7 +258,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const SshStatus = () => {
     if (form.mode !== 'remote' || !form.host || !probe?.ssh) return null;
-    if (probe.ssh.ok) return <div className="text-xs text-og-800">SSH: ✓ {probe.ssh.message}</div>;
+    if (probe.ssh.ok) return <div className="text-xs text-probe-ok">SSH: ✓ {probe.ssh.message}</div>;
     return <div className="text-xs text-accent">SSH: ⨯ {probe.ssh.message}</div>;
   };
 
@@ -294,7 +294,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             value={form.id}
             onChange={e => setForm({ ...form, id: e.target.value })}
             className={inputCls}
-            placeholder="kk-cc"
+            placeholder={`${projectId}-${form.role}`}
             disabled={submitting}
           />
           {form.id && !ID_PATTERN.test(form.id) && (
@@ -450,8 +450,8 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <div className="text-sm text-og-800">
               <div className="font-medium">YOLO 模式（推荐开启）</div>
               <div className="mt-1 text-xs text-accent">
-                Agent 自主执行所有命令、文件改动，无需逐条确认。开启后体验更顺滑，
-                但<strong className="font-semibold">请确认在受控环境（容器、隔离 worktree）中运行</strong>。
+                开启后 Claude Code 以 <code>--permission-mode bypassPermissions</code> 启动，
+                Codex 以 <code>--dangerously-bypass-approvals-and-sandbox</code> 启动。
               </div>
             </div>
           </label>

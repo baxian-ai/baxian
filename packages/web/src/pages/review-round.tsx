@@ -6,14 +6,14 @@ import { useReviewRounds } from '../hooks/use-review-rounds.ts';
 import { DiffView } from '../components/diff-view.tsx';
 
 const SEVERITY_CLASS: Record<FindingSeverity, string> = {
-  critical: 'pill pill-warn font-semibold',
+  critical: 'pill pill-danger font-semibold',
   major: 'pill pill-warn',
   minor: 'pill',
 };
 
 const ACTION_CLASS: Record<FindingResponse['action'], string> = {
   fix: 'pill pill-live',
-  reject: 'pill pill-review',
+  reject: 'pill pill-warn',
   'out-of-scope': 'pill',
 };
 

@@ -41,15 +41,17 @@ describe('TaskStatusDot', () => {
     const cases: Array<[Parameters<typeof TaskStatusDot>[0]['status'], string]> = [
       ['pending', 'bg-og-300'],
       ['cancelled', 'bg-og-300'],
-      ['in_progress', 'bg-og-1000'],
-      ['fixing', 'bg-og-1000'],
-      ['merged', 'bg-og-1000'],
-      ['review', 'bg-og-400'],
-      ['approved', 'bg-og-400'],
-      ['spec-ready', 'bg-accent'],
-      ['merge-ready', 'bg-accent'],
-      ['failed', 'bg-accent'],
-      ['max_rounds', 'bg-accent'],
+      ['in_progress', 'bg-success'],
+      ['fixing', 'bg-warn'],
+      ['merged', 'bg-success'],
+      ['done', 'bg-success'],
+      ['review', 'bg-accent'],
+      ['approved', 'bg-success'],
+      ['spec-ready', 'bg-warn'],
+      ['merge-ready', 'bg-warn'],
+      ['ready', 'bg-warn'],
+      ['failed', 'bg-danger'],
+      ['max_rounds', 'bg-warn'],
     ];
     for (const [status, cls] of cases) {
       cleanup();
