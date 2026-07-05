@@ -25,7 +25,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [id, setId] = useState('');
   const [repo, setRepo] = useState('');
   const [merge, setMerge] = useState<MergeStrategy>(null);
-  const [specApproval, setSpecApproval] = useState<SpecApprovalStrategy>(null);
+  const [specApproval, setSpecApproval] = useState<SpecApprovalStrategy>('human');
   const [reviewMode, setReviewMode] = useState<ReviewMode | ''>('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -42,7 +42,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setId('');
     setRepo('');
     setMerge(null);
-    setSpecApproval(null);
+    setSpecApproval('human');
     setReviewMode('');
     setError(null);
     setFieldErrors({});
@@ -135,7 +135,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
             value={id}
             onChange={e => setId(e.target.value)}
             className={inputCls}
-            placeholder="kongkong"
+            placeholder="baxian"
             disabled={submitting}
           />
           {fieldErrors.id && <div className={fieldErrCls}>{fieldErrors.id}</div>}
@@ -183,19 +183,28 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
 
         <div>
           <span className={labelCls}>Spec 审核</span>
-          <label className="flex items-center gap-2">
+          <label className="mb-1 flex items-center gap-2">
             <input
-              type="checkbox"
+              type="radio"
+              name="spec-approval"
               checked={specApproval === 'human'}
-              onChange={e => setSpecApproval(e.target.checked ? 'human' : null)}
+              onChange={() => setSpecApproval('human')}
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">Spec 需由人类审核</span>
+            <span className="text-sm text-og-800">人类审核（默认）</span>
           </label>
-          <div className="mt-1 text-xs text-og-500">
-            勾选后，走 SDD 的任务在 QA agent 通过 Spec 后停驻，等你在任务页通过或打回；是否走 SDD 仍由 Dev agent 按任务复杂度判定。
-          </div>
+          <label className="flex items-center gap-2">
+            <input
+              type="radio"
+              name="spec-approval"
+              checked={specApproval === null}
+              onChange={() => setSpecApproval(null)}
+              disabled={submitting}
+              className="h-3.5 w-3.5 accent-accent"
+            />
+            <span className="text-sm text-og-800">QA Approve 后自动开始编码</span>
+          </label>
         </div>
 
         <div>
