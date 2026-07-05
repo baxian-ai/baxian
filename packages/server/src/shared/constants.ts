@@ -53,11 +53,11 @@ export const PET_DESCRIPTION_MAX = 500;
 export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
 export const PET_UPLOAD_ROUTE_BODY_LIMIT = 12 * 1024 * 1024;
 
-export const DIFF_INLINE_THRESHOLD = 800;
 export const DIFF_LARGE_THRESHOLD = 2000;
 export const MAX_INLINE_CONTENT_BYTES = 10 * 1024;
 export const MAX_READ_FILE_BYTES = 50 * 1024;
 export const REVIEW_EXCHANGE_DIR = '.baxian/review';
+export const REVIEW_INBOX_DIR = '.baxian/review/inbox';
 export const SPEC_DOC_RELPATH = '.baxian/spec.md';
 
 export const USER_CONFIG_REL = '.baxian/config.json';

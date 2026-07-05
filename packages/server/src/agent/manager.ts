@@ -58,7 +58,7 @@ import { RepoStore, createRepoStoreCache, type RepoStoreCache } from './repo-sto
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import { PhaseSignalWatcher } from './phase-signal-watcher.js';
 import type { PhaseSignalKind } from './phase-signal.js';
-import { ReviewTransport } from './review-transport.js';
+import { ReviewTransport, resolveServerPayloads, type ServerPayloadPromptOpts } from './review-transport.js';
 import type { ReviewStore } from '../state/review-store.js';
 import {
   buildPromptInline,
@@ -209,7 +209,6 @@ export interface ContinueSessionOpts {
   serverPriorFindings?: string;
   serverPriorResponse?: string;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
-  contentTruncated?: boolean;
   armBeforeInject?: () => Promise<boolean>;
 }
 
@@ -3358,7 +3357,6 @@ export class AgentManager {
       serverBatch?: { index: number; total: number };
       serverPriorFindings?: string;
       serverPriorResponse?: string;
-      contentTruncated?: boolean;
       armBeforeInject?: () => Promise<boolean>;
     } = {},
   ): Promise<boolean> {
@@ -3465,6 +3463,19 @@ export class AgentManager {
     let prompt: string;
     try {
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
+      let payloadOpts: ServerPayloadPromptOpts = {};
+      if (opts.serverContent !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
+        payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, worktreePath, {
+          phase,
+          ...(task.phase ? { taskPhase: task.phase } : {}),
+          ...(promptSpecRound !== undefined ? { specRound: promptSpecRound } : {}),
+          reviewRound: task.reviewRound,
+          ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
+          ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
+          ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
+          ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
+        });
+      }
       prompt = buildPromptInline({
         task,
         phase,
@@ -3475,12 +3486,9 @@ export class AgentManager {
         ...(promptSignalToken ? { signalToken: promptSignalToken } : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
-        ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
         ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
         ...(opts.serverBatch ? { serverBatch: opts.serverBatch } : {}),
-        ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
-        ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
-        ...(opts.contentTruncated ? { contentTruncated: true } : {}),
+        ...payloadOpts,
       });
     } catch (err) {
       try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
@@ -3867,6 +3875,19 @@ export class AgentManager {
         && opts.postApproveRedispatchCount > 0
         && !ensure.freshRuntime;
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
+      let payloadOpts: ServerPayloadPromptOpts = {};
+      if (opts.serverContent !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
+        payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, worktreePath, {
+          phase,
+          ...(task.phase ? { taskPhase: task.phase } : {}),
+          ...(promptSpecRound !== undefined ? { specRound: promptSpecRound } : {}),
+          reviewRound: task.reviewRound,
+          ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
+          ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
+          ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
+          ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
+        });
+      }
       prompt = buildPromptInline({
         task,
         phase,
@@ -3879,13 +3900,10 @@ export class AgentManager {
           : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
-        ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
         ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
         ...(opts.serverBatch ? { serverBatch: opts.serverBatch } : {}),
-        ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
-        ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
         ...(opts.serverAfterDone ? { serverAfterDone: opts.serverAfterDone } : {}),
-        ...(opts.contentTruncated ? { contentTruncated: opts.contentTruncated } : {}),
+        ...payloadOpts,
       });
     } catch (err) {
       if (err instanceof PromptSizeError) {
@@ -5894,7 +5912,6 @@ export class AgentManager {
       continuation?: boolean;
       content: string;
       diffstat?: string;
-      contentTruncated?: boolean;
       batch?: { index: number; total: number };
       priorFindingsJson?: string;
       priorResponseJson?: string;
@@ -6044,7 +6061,6 @@ export class AgentManager {
       signalToken: newToken,
       serverContent: opts.content,
       ...(opts.diffstat !== undefined ? { serverDiffstat: opts.diffstat } : {}),
-      ...(opts.contentTruncated ? { contentTruncated: true } : {}),
       ...(opts.batch ? { serverBatch: opts.batch } : {}),
       ...(opts.priorFindingsJson ? { serverPriorFindings: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { serverPriorResponse: opts.priorResponseJson } : {}),

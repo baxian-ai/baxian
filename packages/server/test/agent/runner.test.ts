@@ -389,72 +389,49 @@ describe('LocalRunner.writeFile', () => {
   });
 });
 
-describe('SshRunner.writeFile', () => {
-  it('emits a single base64-decode heredoc command via exec', async () => {
+describe('SshRunner.writeFile (stdin streaming, no ARG_MAX ceiling)', () => {
+  it('streams a >200KB payload via stdin instead of embedding it in the command string', async () => {
     const { runner: local, calls } = captureLocal();
     const ssh = new SshRunner({ hostname: 'box', user: 'rock' }, local);
-    await ssh.writeFile('/tmp/baxian/foo.txt', 'hello');
-    expect(calls.length).toBe(1);
-    const cmd = calls[0].cmd;
-    expect(cmd).toContain('mkdir -p');
-    expect(cmd).toContain('openssl base64 -d -A > ');
-    expect(cmd).not.toContain('base64 --decode');
-    expect(cmd).not.toContain('base64 -d > ');
-    expect(cmd).toContain('sh -c');
-    expect(cmd).toContain('/tmp/baxian/foo.txt');
-    expect(cmd).toContain('/tmp/baxian');
+    const marker = 'BAXIAN_WRITE_FILE_PAYLOAD_';
+    const payload = Buffer.from(marker.repeat(Math.ceil((220 * 1024) / marker.length)), 'utf8');
+
+    await ssh.writeFile('/tmp/baxian/big.bin', payload);
+
+    expect(calls).toHaveLength(1);
+    const { cmd, stdin } = calls[0];
+    expect(cmd).not.toContain(marker);
+    expect(cmd).not.toContain(payload.toString('base64'));
+    expect(cmd.length).toBeLessThan(1024);
+    expect(stdin).toBeDefined();
+    expect(stdin!.equals(payload)).toBe(true);
   });
 
-  it('uses a heredoc marker with BAXIAN_EOF_ prefix and random suffix', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.writeFile('/tmp/x', 'data');
-    const cmd = calls[0].cmd;
-    const match = cmd.match(/BAXIAN_EOF_[0-9a-f]{8}/g);
-    expect(match).not.toBeNull();
-    expect((match ?? []).length).toBeGreaterThanOrEqual(2);
-  });
-
-  it('produces a different heredoc marker per call (random suffix)', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.writeFile('/tmp/x', 'data');
-    await ssh.writeFile('/tmp/y', 'data');
-    const m1 = calls[0].cmd.match(/BAXIAN_EOF_([0-9a-f]{8})/);
-    const m2 = calls[1].cmd.match(/BAXIAN_EOF_([0-9a-f]{8})/);
-    expect(m1?.[1]).toBeDefined();
-    expect(m2?.[1]).toBeDefined();
-    expect(m1?.[1]).not.toBe(m2?.[1]);
-  });
-
-  it.each<[string, string]>([
-    ['embeds base64 payload inside the heredoc body', 'hello world'],
-    ['treats string content as utf8 and base64-encodes the utf8 bytes', '中文 🚀'],
-  ])('%s', async (_name, text) => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    await ssh.writeFile('/tmp/x', text);
-    const expectedB64 = Buffer.from(text, 'utf8').toString('base64');
-    expect(calls[0].cmd).toContain(expectedB64);
-  });
-
-  it('encodes shell-special and binary bytes losslessly via base64 (decoded equals input)', async () => {
-    const { runner: local, calls } = captureLocal();
-    const ssh = new SshRunner({ hostname: 'box' }, local);
-    const payload = Buffer.from([0x27, 0x24, 0x60, 0x0a, 0x00, 0xff, 0x7f, 0x41]);
-    await ssh.writeFile('/tmp/x', payload);
-    const cmd = calls[0].cmd;
-    const expectedB64 = payload.toString('base64');
-    expect(cmd).toContain(expectedB64);
-    const decoded = Buffer.from(expectedB64, 'base64');
-    expect(decoded.equals(payload)).toBe(true);
-  });
-
-  it('runs mkdir -p on the parent directory of the target path', async () => {
+  it('sends mkdir -p + cat > against shell-quoted paths as the remote command', async () => {
     const { runner: local, calls } = captureLocal();
     const ssh = new SshRunner({ hostname: 'box' }, local);
     await ssh.writeFile('/srv/baxian/skills/foo/SKILL.md', 'x');
-    expect(calls[0].cmd).toContain(shellQuote('/srv/baxian/skills/foo'));
+    const cmd = calls[0].cmd;
+    expect(cmd).toContain('mkdir -p');
+    expect(cmd).toContain('/srv/baxian/skills/foo');
+    expect(cmd).toContain('cat >');
+    expect(cmd).toContain('/srv/baxian/skills/foo/SKILL.md');
+    expect(calls[0].stdin!.equals(Buffer.from('x', 'utf8'))).toBe(true);
+  });
+
+  it('treats string content as utf8 bytes on stdin', async () => {
+    const { runner: local, calls } = captureLocal();
+    const ssh = new SshRunner({ hostname: 'box' }, local);
+    const text = '中文 🚀';
+    await ssh.writeFile('/tmp/x', text);
+    expect(calls[0].stdin!.equals(Buffer.from(text, 'utf8'))).toBe(true);
+  });
+
+  it('does not wrap the remote command with a login shell (raw path, mirrors execRawRemoteWithStdin)', async () => {
+    const { runner: local, calls } = captureLocal();
+    const ssh = new SshRunner({ hostname: 'box' }, local);
+    await ssh.writeFile('/tmp/x', 'data');
+    expect(calls[0].cmd).not.toContain('exec "${SHELL');
   });
 
   it('throws including stderr when remote exec returns non-zero exit code', async () => {

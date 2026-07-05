@@ -1,6 +1,5 @@
 import {
   DIFF_LARGE_THRESHOLD,
-  MAX_INLINE_CONTENT_BYTES,
 } from '../shared/index.js';
 import type {
   BaxianEvent,
@@ -14,17 +13,6 @@ import type { AgentManager } from '../agent/manager.js';
 import { buildBatches, countLines, splitDiffByFile, type DiffFile } from '../agent/diff-split.js';
 import { ReviewExchangeError } from '../agent/review-transport.js';
 import type { PhaseSignalKind } from '../agent/phase-signal.js';
-
-
-const PROMPT_CONTENT_BYTE_BUDGET = 56 * 1024;
-
-function truncateUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
-  const buf = Buffer.from(text, 'utf8');
-  if (buf.byteLength <= maxBytes) return { text, truncated: false };
-  let cut = maxBytes;
-  while (cut > 0 && (buf[cut]! & 0xc0) === 0x80) cut--;
-  return { text: buf.subarray(0, cut).toString('utf8'), truncated: true };
-}
 
 function aggregateBatchFindings(batches: ReviewFindings[], round: number): ReviewFindings {
   const findings: Finding[] = [];
@@ -321,14 +309,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
 
     if (!(await putEntryRound(round))) return;
-    const sized = truncateUtf8(content.content, PROMPT_CONTENT_BYTE_BUDGET);
     await manager.dispatchServerReviewToQa(task.id, {
       phase: 'code',
       recheck: opts.recheck,
-      content: sized.text,
+      content: content.content,
       reviewHeadAnchorSha,
       ...(content.diffstat ? { diffstat: content.diffstat } : {}),
-      ...(sized.truncated ? { contentTruncated: true } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
     });
@@ -342,14 +328,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string; reviewHeadAnchorSha?: string },
   ): Promise<void> {
     const text = batches[index].map(f => f.text).join('\n');
-    const sized = truncateUtf8(text, PROMPT_CONTENT_BYTE_BUDGET);
     await manager.dispatchServerReviewToQa(taskId, {
       phase: 'code',
       recheck: opts.recheck,
       continuation: index > 0,
-      content: sized.text,
+      content: text,
       ...(diffstat ? { diffstat } : {}),
-      ...(sized.truncated ? { contentTruncated: true } : {}),
       batch: { index, total: batches.length },
       ...(index === 0 && opts.reviewHeadAnchorSha ? { reviewHeadAnchorSha: opts.reviewHeadAnchorSha } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
@@ -723,11 +707,9 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
       return;
     }
-    const sized = truncateUtf8(content.content, MAX_INLINE_CONTENT_BYTES);
     await manager.dispatchServerReviewToQa(task.id, {
       phase: 'spec',
-      content: sized.text,
-      ...(sized.truncated ? { contentTruncated: true } : {}),
+      content: content.content,
       ...(prior ? { priorFindingsJson: prior.findingsJson, priorResponseJson: prior.responseJson } : {}),
     });
   }

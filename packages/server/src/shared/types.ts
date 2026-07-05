@@ -218,6 +218,11 @@ export interface ReviewResponse {
   responses: FindingResponse[];
 }
 
+export interface ReviewContentFileRef {
+  path: string;
+  bytes: number;
+}
+
 export interface SpecUserDecision {
   verdict: 'approve' | 'request-changes';
   comments?: string;

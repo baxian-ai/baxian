@@ -1,11 +1,17 @@
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ReviewExchangeError,
   ReviewTransport,
+  resolveServerPayloads,
   shellQuote,
   validateReviewFindings,
   validateReviewResponse,
 } from '../../src/agent/review-transport.js';
+import { MAX_INLINE_CONTENT_BYTES } from '../../src/shared/index.js';
+import { LocalRunner } from '../../src/agent/runner.js';
 import type { ExecResult } from '../../src/agent/runner.js';
 import type { AgentConfig, TaskState } from '../../src/shared/index.js';
 
@@ -32,20 +38,23 @@ type Rule = { match: (cmd: string) => boolean; result: Partial<ExecResult> };
 
 function makeTransport(rules: Rule[], worktree = '/wt/dev') {
   const calls: string[] = [];
+  const writes: Array<{ path: string; content: string }> = [];
   const runner = {
     exec: async (cmd: string): Promise<ExecResult> => {
       calls.push(cmd);
       const rule = rules.find(r => r.match(cmd));
       return { stdout: '', stderr: '', exitCode: 0, ...(rule?.result ?? {}) };
     },
-    writeFile: async () => undefined,
+    writeFile: async (path: string, content: string | Buffer) => {
+      writes.push({ path, content: content.toString() });
+    },
     execWithStdin: async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
   };
   const transport = new ReviewTransport({
     createRunnerFor: () => runner,
     resolveWorktree: () => worktree,
   });
-  return { transport, calls };
+  return { transport, calls, writes };
 }
 
 const FINDINGS_JSON = JSON.stringify({
@@ -285,5 +294,201 @@ describe('response validators', () => {
         { findingId: 'f-1', action: 'reject', rationale: 'b' },
       ],
     })).toThrow(expect.objectContaining({ reason: 'schema' }));
+  });
+});
+
+describe('deliverToInbox', () => {
+  const QA_WT = '/wt/qa';
+
+  it('writes a temp sibling then renames to the final name, returns relative path and byte size', async () => {
+    const { transport, calls, writes } = makeTransport([]);
+    const content = '# spec\n内容';
+    const ref = await transport.deliverToInbox(QA, QA_WT, 'spec-round-2.md', content);
+    expect(ref).toEqual({
+      path: '.baxian/review/inbox/spec-round-2.md',
+      bytes: Buffer.byteLength(content, 'utf8'),
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0].path).toMatch(/^\/wt\/qa\/\.baxian\/review\/inbox\/\.tmp-[0-9a-f]{12}$/);
+    expect(writes[0].content).toBe(content);
+    const mv = calls.find(c => c.startsWith('mv -f'));
+    expect(mv).toBeDefined();
+    expect(mv).toContain(writes[0].path);
+    expect(mv).toContain("'/wt/qa/.baxian/review/inbox/spec-round-2.md'");
+  });
+
+  it('strips a trailing slash from the worktree path', async () => {
+    const { transport, writes } = makeTransport([]);
+    await transport.deliverToInbox(QA, '/wt/qa/', 'findings-round-1.json', '{}');
+    expect(writes[0].path.startsWith('/wt/qa/.baxian/')).toBe(true);
+  });
+
+  it('mv failure removes the temp file and throws deliver-failed, final name never targeted twice', async () => {
+    const { transport, calls } = makeTransport([
+      { match: c => c.startsWith('mv -f'), result: { exitCode: 1, stderr: 'disk full' } },
+    ]);
+    await expect(
+      transport.deliverToInbox(QA, QA_WT, 'diff-round-1.patch', 'x'),
+    ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+    expect(calls.some(c => c.startsWith('rm -f') && c.includes('.tmp-'))).toBe(true);
+  });
+
+  it('writeFile failure surfaces as deliver-failed', async () => {
+    const failing = new ReviewTransport({
+      createRunnerFor: () => ({
+        exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        writeFile: async () => { throw new Error('ssh down'); },
+        execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      }),
+      resolveWorktree: () => '/wt/qa',
+    });
+    await expect(
+      failing.deliverToInbox(QA, QA_WT, 'spec-round-1.md', 'x'),
+    ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+  });
+
+  it.each([
+    ['sub/dir.md', 'has a path separator'],
+    ['../escape.md', 'traverses upward'],
+    ['', 'is empty'],
+  ])('rejects filename %s (%s)', async (filename) => {
+    const { transport } = makeTransport([]);
+    await expect(
+      transport.deliverToInbox(QA, QA_WT, filename, 'x'),
+    ).rejects.toThrow(expect.objectContaining({ reason: 'bad-filename' }));
+  });
+});
+
+describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
+  it('delivers a >10KB multibyte payload byte-identical to the final file, with a clean inbox dir', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-e2e-'));
+    try {
+      const transport = new ReviewTransport({
+        createRunnerFor: () => new LocalRunner(),
+        resolveWorktree: () => worktree,
+      });
+      const content = `${'哈'.repeat(8000)}ascii-tail-${'x'.repeat(2000)}`;
+      expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(10 * 1024);
+
+      const ref = await transport.deliverToInbox(QA, worktree, 'findings-round-1.json', content);
+
+      expect(ref).toEqual({
+        path: '.baxian/review/inbox/findings-round-1.json',
+        bytes: Buffer.byteLength(content, 'utf8'),
+      });
+
+      const onDisk = await readFile(join(worktree, ref.path));
+      expect(onDisk.equals(Buffer.from(content, 'utf8'))).toBe(true);
+
+      const inboxDir = join(worktree, '.baxian', 'review', 'inbox');
+      const entries = await readdir(inboxDir);
+      expect(entries).toEqual(['findings-round-1.json']);
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveServerPayloads', () => {
+  const QA_WT = '/wt/qa';
+  const big = (seed: string) => seed.repeat(Math.ceil((MAX_INLINE_CONTENT_BYTES + 1) / seed.length));
+  const atCap = 'a'.repeat(MAX_INLINE_CONTENT_BYTES);
+
+  it('keeps content at exactly the split line inline, no delivery', async () => {
+    const { transport, writes } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-spec-review', specRound: 1, reviewRound: 0, serverContent: atCap,
+    });
+    expect(out).toEqual({ serverContent: atCap });
+    expect(writes).toHaveLength(0);
+  });
+
+  it('delivers spec content one byte over the line as spec-round-<specRound>.md', async () => {
+    const { transport, writes } = makeTransport([]);
+    const content = atCap + 'b';
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-spec-review', specRound: 3, reviewRound: 0, serverContent: content,
+    });
+    expect(out.serverContent).toBeUndefined();
+    expect(out.serverContentFile).toEqual({
+      path: '.baxian/review/inbox/spec-round-3.md',
+      bytes: MAX_INLINE_CONTENT_BYTES + 1,
+    });
+    expect(writes[0].content).toBe(content);
+  });
+
+  it('splits by byte length, not char length (multibyte content)', async () => {
+    const { transport } = makeTransport([]);
+    const multibyte = '哈'.repeat(4 * 1024); // 4096 chars, 12KB utf8
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-spec-review', specRound: 1, reviewRound: 0, serverContent: multibyte,
+    });
+    expect(out.serverContentFile?.bytes).toBe(Buffer.byteLength(multibyte, 'utf8'));
+  });
+
+  it('names oversized diff content by reviewRound and batch', async () => {
+    const { transport } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-recheck', reviewRound: 2, batch: { index: 1, total: 3 },
+      serverContent: big('d'),
+    });
+    expect(out.serverContentFile?.path).toBe('.baxian/review/inbox/diff-round-2-batch-2.patch');
+  });
+
+  it('review-side priors use prior-* names; each payload splits independently', async () => {
+    const { transport, writes } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-review', reviewRound: 4,
+      serverContent: 'small diff',
+      serverPriorFindings: big('f'),
+      serverPriorResponse: 'small response',
+    });
+    expect(out.serverContent).toBe('small diff');
+    expect(out.serverPriorFindingsFile?.path).toBe('.baxian/review/inbox/prior-findings-round-4.json');
+    expect(out.serverPriorResponse).toBe('small response');
+    expect(out.serverPriorResponseFile).toBeUndefined();
+    expect(writes).toHaveLength(1);
+  });
+
+  it('server-feedback code findings go to findings-round-<reviewRound>.json', async () => {
+    const { transport } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, DEV, '/wt/dev', {
+      phase: 'server-feedback', taskPhase: 'code', specRound: 9, reviewRound: 5,
+      serverPriorFindings: big('g'),
+    });
+    expect(out.serverPriorFindingsFile?.path).toBe('.baxian/review/inbox/findings-round-5.json');
+  });
+
+  it('server-feedback on a spec task rounds by specRound, not reviewRound', async () => {
+    const { transport } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, DEV, '/wt/dev', {
+      phase: 'server-feedback', taskPhase: 'spec', specRound: 7, reviewRound: 2,
+      serverPriorFindings: big('h'),
+    });
+    expect(out.serverPriorFindingsFile?.path).toBe('.baxian/review/inbox/findings-round-7.json');
+  });
+
+  it('spec-side round falls back to 1 when specRound is absent', async () => {
+    const { transport } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-spec-review', reviewRound: 0, serverContent: big('s'),
+    });
+    expect(out.serverContentFile?.path).toBe('.baxian/review/inbox/spec-round-1.md');
+  });
+
+  it('returns empty opts when no payloads are present (server-after-done)', async () => {
+    const { transport } = makeTransport([]);
+    expect(await resolveServerPayloads(transport, DEV, '/wt/dev', {
+      phase: 'server-after-done', reviewRound: 1,
+    })).toEqual({});
+  });
+
+  it('propagates deliver failure', async () => {
+    const { transport } = makeTransport([
+      { match: c => c.startsWith('mv -f'), result: { exitCode: 1, stderr: 'nope' } },
+    ]);
+    await expect(resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-spec-review', specRound: 1, reviewRound: 0, serverContent: big('s'),
+    })).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
   });
 });

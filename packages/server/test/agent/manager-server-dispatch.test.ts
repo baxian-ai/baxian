@@ -123,7 +123,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
       return false;
     });
 
-    await f.manager.dispatchServerReviewToQa('task-1', { phase: 'spec', content: 'spec text', contentTruncated: true })
+    await f.manager.dispatchServerReviewToQa('task-1', { phase: 'spec', content: 'spec text' })
       .catch(() => undefined);
 
     expect(startSpy).toHaveBeenCalled();
@@ -439,5 +439,108 @@ describe('dispatchServerAfterDone failure & success paths', () => {
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
       agentId: 'dev-1', expectedKinds: 'code-ready',
     }));
+  });
+});
+
+describe('dispatchServerReviewToQa forwards full content to startSession (split happens later)', () => {
+  it('passes oversized spec content through untruncated', async () => {
+    const f = await makeFixture('github');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'github', phase: undefined, status: 'in_progress',
+      signalToken: 'orig-token', specReviewRound: 0,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    const huge = '哈'.repeat(30000);
+    let captured: { serverContent?: string; contentTruncated?: boolean } | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      captured = opts as typeof captured;
+      return true;
+    });
+    await f.manager.dispatchServerReviewToQa('task-1', { phase: 'spec', content: huge });
+    expect(captured?.serverContent).toBe(huge);
+    expect(captured && 'contentTruncated' in captured).toBe(false);
+  });
+});
+
+describe('startSession/continueSession resolve server payloads before prompt build', () => {
+  type Fixture = Awaited<ReturnType<typeof makeFixture>>;
+
+  function stubSessionEnv(f: Fixture) {
+    vi.spyOn(f.manager, 'ensureSession').mockResolvedValue({
+      ok: true, createdSession: false, freshRuntime: true, paneId: '%1', workdir: tempDir,
+    });
+  }
+
+  function stubTransport(f: Fixture) {
+    const deliverToInbox = vi.fn(async (_agent: unknown, _wt: string, filename: string, content: string) => ({
+      path: `.baxian/review/inbox/${filename}`,
+      bytes: Buffer.byteLength(content, 'utf8'),
+    }));
+    vi.spyOn(f.manager, 'getReviewTransport').mockReturnValue({ deliverToInbox } as never);
+    return deliverToInbox;
+  }
+
+  it('startSession delivers oversized review content to the consumer inbox with round-derived naming', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'tok', reviewRound: 1,
+    }));
+    stubSessionEnv(f);
+    const deliver = stubTransport(f);
+    const huge = 'd'.repeat(10 * 1024 + 1);
+
+    await expect(f.manager.startSession('task-1', 'qa-1', 'server-review', {
+      bypassTaskStatusGate: true, signalToken: 'tok', serverContent: huge,
+    })).rejects.toMatchObject({ reason: 'required_skills_missing' });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const [agentArg, worktreeArg, filename, content] = deliver.mock.calls[0]!;
+    expect((agentArg as { id: string }).id).toBe('qa-1');
+    expect(worktreeArg).toContain('task-1-review_');
+    expect(filename).toBe('diff-round-1.patch');
+    expect(content).toBe(huge);
+  });
+
+  it('continueSession delivers oversized prior findings to the dev inbox for server-feedback', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'fixing', signalToken: 'tok', reviewRound: 2,
+    }));
+    const devWorktree = join(tempDir, 'wt-dev');
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1',
+      worktreePath: devWorktree, updatedAt: new Date().toISOString(),
+    }));
+    stubSessionEnv(f);
+    const deliver = stubTransport(f);
+    const findings = JSON.stringify({ pad: 'f'.repeat(10 * 1024 + 1) });
+
+    await expect(f.manager.continueSession('task-1', 'dev-1', 'server-feedback', {
+      signalToken: 'tok', serverPriorFindings: findings,
+    })).rejects.toMatchObject({ reason: 'required_skills_missing' });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const [agentArg, worktreeArg, filename, content] = deliver.mock.calls[0]!;
+    expect((agentArg as { id: string }).id).toBe('dev-1');
+    expect(worktreeArg).toBe(devWorktree);
+    expect(filename).toBe('findings-round-2.json');
+    expect(content).toBe(findings);
+  });
+
+  it('a within-threshold payload stays inline: prompt build is reached with zero inbox deliveries', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'tok', reviewRound: 1,
+    }));
+    stubSessionEnv(f);
+    const deliver = stubTransport(f);
+
+    await expect(f.manager.startSession('task-1', 'qa-1', 'server-review', {
+      bypassTaskStatusGate: true, signalToken: 'tok', serverContent: 'small diff',
+    })).rejects.toMatchObject({ reason: 'required_skills_missing' });
+
+    expect(deliver).not.toHaveBeenCalled();
   });
 });

@@ -4,22 +4,22 @@ description: QA reviews injected server-review content (a code diff or a spec do
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields; the review input rides in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `prior-findings:` / `prior-response:` on a recheck. Do NOT fetch branches or use `gh` — those blocks ARE the review input; if a `content: truncated` field is present, request the missing context via the read-file side-channel.
+baxian dispatches you with a block of `key: value` dispatch fields; the review input rides either in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `prior-findings:` / `prior-response:` on a recheck — or, when a payload is large, as a file reference field: `diff-file:` / `spec-file:` / `prior-findings-file:` / `prior-response-file:`, each `<path> (<size>)` relative to your worktree. Read a referenced file with your file tools; it carries the exact content the block otherwise would. If a referenced file cannot be read, state that in a finding and emit your signal as usual — never guess at missing content. Do NOT fetch branches or use `gh` — those blocks and files ARE the review input.
 
 Work in `worktree:`. QA judges risk independently — human authorization is input, not a bypass. Route on `phase:`: follow §Code Review for `server-review`; §Code Review + §Recheck Closure for `server-recheck`; §Spec Review for `server-spec-review`.
 
 ## Code Review
 
-Judge the `diff:` block against the task spec: correctness, tests, edge cases, security, regressions.
+Judge the diff (the `diff:` block, or the `diff-file:` file) against the task spec: correctness, tests, edge cases, security, regressions.
 
 - Severity: `critical` = broken/unsafe, `major` = must fix before merge, `minor` = improvement.
 - Reference file + line for every code finding.
 - For unchanged files, read them directly from your own base-branch worktree; use the read-file side-channel only for content not present locally.
-- A `batch: i/n` field means the `diff:` block carries one slice of a larger change reviewed batch by batch, while `diffstat:` still lists every file. Files in the diffstat but absent from your slice belong to other batches — their absence is not a finding; fetch cross-slice context via the read-file side-channel when a judgement needs it.
+- A `batch: i/n` field means the diff input carries one slice of a larger change reviewed batch by batch, while `diffstat:` still lists every file. Files in the diffstat but absent from your slice belong to other batches — their absence is not a finding; fetch cross-slice context via the read-file side-channel when a judgement needs it.
 
 ## Recheck Closure
 
-The `prior-findings:` and `prior-response:` blocks carry the earlier findings and the dev response. Close them out before judging anything new.
+The earlier findings and the dev response arrive as `prior-findings:` / `prior-response:` blocks, or as `prior-findings-file:` / `prior-response-file:` references when large. Close them out before judging anything new.
 
 - Resolve the status of EVERY prior finding first.
 - A finding the dev claims fixed: verify it in the new diff. No "fixed" without evidence.
@@ -30,13 +30,13 @@ The `prior-findings:` and `prior-response:` blocks carry the earlier findings an
 
 ## Spec Review
 
-Judge the `spec:` block:
+Judge the spec (the `spec:` block, or the `spec-file:` file):
 
 - completeness — every requirement covered, interfaces and data flows defined, error paths specified.
 - correctness — internally consistent, no contradicting sections, feasible against the existing codebase.
 - ambiguity — any requirement readable two ways is a finding.
 
-Need a referenced file or codebase section to judge feasibility? Use the read-file side-channel. When `prior-findings:` / `prior-response:` blocks are present, verify every finding is closed before judging the rest of the spec.
+Need a referenced file or codebase section to judge feasibility? Use the read-file side-channel. When prior findings / response inputs are present (block or file form), verify every finding is closed before judging the rest of the spec.
 
 ## Findings Output
 

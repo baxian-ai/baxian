@@ -1,10 +1,14 @@
+import { randomBytes } from 'node:crypto';
 import {
   isRecord,
+  MAX_INLINE_CONTENT_BYTES,
   MAX_READ_FILE_BYTES,
   REVIEW_EXCHANGE_DIR,
+  REVIEW_INBOX_DIR,
   SPEC_DOC_RELPATH,
   type AgentConfig,
   type Finding,
+  type ReviewContentFileRef,
   type ReviewFindings,
   type ReviewResponse,
   type TaskPhase,
@@ -229,6 +233,36 @@ export class ReviewTransport {
     return truncated ? `${text}\n[truncated]` : text;
   }
 
+  async deliverToInbox(
+    agent: AgentConfig,
+    worktreePath: string,
+    filename: string,
+    content: string,
+  ): Promise<ReviewContentFileRef> {
+    if (filename === '' || filename.includes('/') || filename.startsWith('.')) {
+      throw new ReviewExchangeError('bad-filename', JSON.stringify(filename));
+    }
+    const wt = worktreePath.endsWith('/') ? worktreePath.slice(0, -1) : worktreePath;
+    const dir = `${wt}/${REVIEW_INBOX_DIR}`;
+    const tmp = `${dir}/.tmp-${randomBytes(6).toString('hex')}`;
+    const final = `${dir}/${filename}`;
+    const runner = this.deps.createRunnerFor(agent);
+    try {
+      await runner.writeFile(tmp, content);
+    } catch (err) {
+      throw new ReviewExchangeError(
+        'deliver-failed',
+        `${filename}: write failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const mv = await runner.exec(`mv -f ${shellQuote(tmp)} ${shellQuote(final)}`);
+    if (mv.exitCode !== 0) {
+      await runner.exec(`rm -f ${shellQuote(tmp)}`).catch(() => undefined);
+      throw new ReviewExchangeError('deliver-failed', `${filename}: mv failed: ${mv.stderr.trim()}`);
+    }
+    return { path: `${REVIEW_INBOX_DIR}/${filename}`, bytes: Buffer.byteLength(content, 'utf8') };
+  }
+
   private async readExchangeFile(agent: AgentConfig, name: string): Promise<string | null> {
     const wt = this.requireWorktree(agent.id);
     const runner = this.deps.createRunnerFor(agent);
@@ -259,4 +293,65 @@ export class ReviewTransport {
     if (!wt) throw new ReviewExchangeError('no-worktree', `agent ${agentId} has no worktree`);
     return wt.endsWith('/') ? wt.slice(0, -1) : wt;
   }
+}
+
+export interface ServerPayloadInput {
+  phase: string;
+  taskPhase?: TaskPhase;
+  specRound?: number;
+  reviewRound: number;
+  batch?: { index: number; total: number };
+  serverContent?: string;
+  serverPriorFindings?: string;
+  serverPriorResponse?: string;
+}
+
+export interface ServerPayloadPromptOpts {
+  serverContent?: string;
+  serverContentFile?: ReviewContentFileRef;
+  serverPriorFindings?: string;
+  serverPriorFindingsFile?: ReviewContentFileRef;
+  serverPriorResponse?: string;
+  serverPriorResponseFile?: ReviewContentFileRef;
+}
+
+function serverPayloadRound(input: ServerPayloadInput): number {
+  const specSide = input.phase === 'server-spec-review'
+    || (input.phase === 'server-feedback' && input.taskPhase === 'spec');
+  return specSide ? Math.max(input.specRound ?? 1, 1) : Math.max(input.reviewRound, 1);
+}
+
+function contentFilename(phase: string, round: number, batch?: { index: number; total: number }): string {
+  if (phase === 'server-spec-review') return `spec-round-${round}.md`;
+  return batch ? `diff-round-${round}-batch-${batch.index + 1}.patch` : `diff-round-${round}.patch`;
+}
+
+export async function resolveServerPayloads(
+  transport: ReviewTransport,
+  agent: AgentConfig,
+  worktreePath: string,
+  input: ServerPayloadInput,
+): Promise<ServerPayloadPromptOpts> {
+  const round = serverPayloadRound(input);
+  const out: ServerPayloadPromptOpts = {};
+  const place = async (
+    value: string | undefined,
+    filename: string,
+    inlineKey: 'serverContent' | 'serverPriorFindings' | 'serverPriorResponse',
+    fileKey: 'serverContentFile' | 'serverPriorFindingsFile' | 'serverPriorResponseFile',
+  ): Promise<void> => {
+    if (value === undefined) return;
+    if (Buffer.byteLength(value, 'utf8') <= MAX_INLINE_CONTENT_BYTES) {
+      out[inlineKey] = value;
+      return;
+    }
+    out[fileKey] = await transport.deliverToInbox(agent, worktreePath, filename, value);
+  };
+  await place(input.serverContent, contentFilename(input.phase, round, input.batch), 'serverContent', 'serverContentFile');
+  const findingsName = input.phase === 'server-feedback'
+    ? `findings-round-${round}.json`
+    : `prior-findings-round-${round}.json`;
+  await place(input.serverPriorFindings, findingsName, 'serverPriorFindings', 'serverPriorFindingsFile');
+  await place(input.serverPriorResponse, `prior-response-round-${round}.json`, 'serverPriorResponse', 'serverPriorResponseFile');
+  return out;
 }

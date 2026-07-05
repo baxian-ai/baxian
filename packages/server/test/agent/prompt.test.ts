@@ -7,7 +7,6 @@ import {
   buildPromptInline,
   buildGreetingPrompt,
   MAX_PROMPT_BYTES,
-  MAX_INLINE_FINDINGS_BYTES,
   PromptSizeError,
   RequiredSkillsMissingError,
 } from '../../src/agent/prompt.js';
@@ -513,9 +512,6 @@ describe('server review mode prompt builders', () => {
     ['server-after-done branch variant: publish=branch', 'server-after-done', DEV_AGENT,
       { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } },
       { contains: ['publish: branch', 'signal: code-ready'], notContains: ['publish: pr', 'exchange:'] }],
-    ['contentTruncated adds the content: truncated field', 'server-review', QA_AGENT,
-      { serverContent: 'partial diff', contentTruncated: true },
-      { contains: ['content: truncated'] }],
   ])('%s', (_label, phase, agent, extra, expectations) => {
     assertFragments(build(phase, agent, extra), expectations);
   });
@@ -574,101 +570,102 @@ describe('server review mode prompt builders', () => {
       serverContent: 'diff',
     } as Parameters<typeof buildPromptInline>[0])).toThrow(/requires signalToken/);
   });
-});
 
-describe('server-phase prompt builders (findings compaction)', () => {
-  const getRegistry = useServerPhaseRegistry('baxian-r8-');
-  const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
-
-  it('oversized findings injection keeps every finding id (messages compacted)', async () => {
-    const findings = {
-      round: 1,
-      verdict: 'request-changes',
-      findings: Array.from({ length: 30 }, (_, i) => ({
-        id: `f-${i + 1}`,
-        severity: 'major',
-        message: 'x'.repeat(800),
-        file: `src/file-${i}.ts`,
-        line: i + 1,
-      })),
-    };
-    const json = JSON.stringify(findings);
-    expect(Buffer.byteLength(json, 'utf8')).toBeGreaterThan(MAX_INLINE_FINDINGS_BYTES);
+  it('server-spec-review renders a file reference field instead of the spec block', async () => {
+    const registry = getRegistry();
     const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
-      phase: 'server-feedback',
-      agent: DEV_AGENT,
-      worktreePath: '/wt/x',
-      skillRegistry: getRegistry(),
-      signalToken: 'srvtok123456',
-      serverPriorFindings: json,
-    } as Parameters<typeof buildPromptInline>[0]);
-    for (let i = 1; i <= 30; i++) {
-      expect(prompt).toContain(`"id":"f-${i}"`);
-    }
-    expect(prompt).not.toContain('x'.repeat(800));
-  });
-});
-
-describe('compactFindings ids-only tier', () => {
-  const getRegistry = useServerPhaseRegistry('baxian-r9-');
-  const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
-
-  it('pathological finding counts keep the full id set via the ids-only tier', async () => {
-    const findings = {
-      round: 1,
-      verdict: 'request-changes',
-      findings: Array.from({ length: 300 }, (_, i) => ({
-        id: `f-${i + 1}`,
-        severity: 'major',
-        message: 'm'.repeat(120),
-        file: `packages/server/src/some/deep/path/module-${i}.ts`,
-        line: i + 1,
-      })),
-    };
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
-      phase: 'server-feedback',
-      agent: DEV_AGENT,
-      worktreePath: '/wt/x',
-      skillRegistry: getRegistry(),
-      signalToken: 'srvtok123456',
-      serverPriorFindings: JSON.stringify(findings),
-    } as Parameters<typeof buildPromptInline>[0]);
-    expect(prompt).toContain('"id":"f-1"');
-    expect(prompt).toContain('"id":"f-300"');
-    expect(prompt).toContain('messages omitted');
-  });
-});
-
-describe('response compaction', () => {
-  const getRegistry = useServerPhaseRegistry('baxian-r14-');
-  const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' };
-
-  it('oversized prior responses keep every findingId/action (rationales compacted)', async () => {
-    const response = {
-      round: 1,
-      responses: Array.from({ length: 40 }, (_, i) => ({
-        findingId: `f-${i + 1}`,
-        action: 'fix',
-        rationale: 'r'.repeat(600),
-        commitSha: `sha${i}`,
-      })),
-    };
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
-      phase: 'server-recheck',
+      task: { ...TASK, reviewMode: 'server', phase: 'spec', specReviewRound: 2 },
+      phase: 'server-spec-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/x',
-      skillRegistry: getRegistry(),
-      signalToken: 'srvtok123456',
-      serverContent: 'diff x',
-      serverPriorResponse: JSON.stringify(response),
-    } as Parameters<typeof buildPromptInline>[0]);
-    for (let i = 1; i <= 40; i++) {
-      expect(prompt).toContain(`"findingId":"f-${i}"`);
-    }
-    expect(prompt).not.toContain('r'.repeat(600));
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      currentSpecRound: 2,
+      serverContentFile: { path: '.baxian/review/inbox/spec-round-2.md', bytes: 35 * 1024 },
+    });
+    expect(prompt).toContain('spec-file: .baxian/review/inbox/spec-round-2.md (35KB)');
+    expect(prompt).not.toContain('\nspec:\n');
+  });
+
+  it('server-review renders diff-file and prior-* file fields', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 4 },
+      phase: 'server-review',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverDiffstat: ' a.ts | 1 +',
+      serverContentFile: { path: '.baxian/review/inbox/diff-round-4.patch', bytes: 120 * 1024 },
+      serverPriorFindingsFile: { path: '.baxian/review/inbox/prior-findings-round-4.json', bytes: 11 * 1024 },
+      serverPriorResponse: '{"round":3,"responses":[]}',
+    });
+    expect(prompt).toContain('diff-file: .baxian/review/inbox/diff-round-4.patch (120KB)');
+    expect(prompt).toContain('prior-findings-file: .baxian/review/inbox/prior-findings-round-4.json (11KB)');
+    expect(prompt).toContain('prior-response:');
+    expect(prompt).toContain('diffstat:');
+    expect(prompt).not.toContain('\ndiff:\n');
+  });
+
+  it('server-feedback renders findings-file instead of the findings block', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 5, phase: 'code' },
+      phase: 'server-feedback',
+      agent: DEV_AGENT,
+      worktreePath: '/wt/dev',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverPriorFindingsFile: { path: '.baxian/review/inbox/findings-round-5.json', bytes: 20 * 1024 },
+    });
+    expect(prompt).toContain('findings-file: .baxian/review/inbox/findings-round-5.json (20KB)');
+    expect(prompt).not.toContain('\nfindings:\n');
+  });
+
+  it('inline server payloads render exactly as before (no truncation markers anywhere)', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
+      phase: 'server-review',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'diff --git a/a b/a\n+1',
+    });
+    expect(prompt).toContain('diff:\ndiff --git a/a b/a\n+1');
+    expect(prompt).not.toContain('truncated');
+    expect(prompt).not.toContain('-file:');
+  });
+
+  it('rejects a payload passed in both inline and file form', async () => {
+    const registry = getRegistry();
+    expect(() => buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
+      phase: 'server-review',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'x',
+      serverContentFile: { path: '.baxian/review/inbox/diff-round-1.patch', bytes: 1 },
+    })).toThrow(/mutually exclusive/);
+  });
+
+  it('sub-KB file refs round up to 1KB', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', phase: 'spec', specReviewRound: 1 },
+      phase: 'server-spec-review',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      currentSpecRound: 1,
+      serverContentFile: { path: '.baxian/review/inbox/spec-round-1.md', bytes: 100 },
+    });
+    expect(prompt).toContain('(1KB)');
   });
 });
 

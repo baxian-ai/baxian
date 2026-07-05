@@ -1,4 +1,4 @@
-import { AGENT_PHASES, type AgentConfig, type AgentRole, type AgentRuntime, type DispatchPhase, type TaskState } from '../shared/index.js';
+import { AGENT_PHASES, type AgentConfig, type AgentRole, type AgentRuntime, type DispatchPhase, type ReviewContentFileRef, type TaskState } from '../shared/index.js';
 import type { SkillRegistry } from '../skill/registry.js';
 import { scanPhaseSignals } from './phase-signal.js';
 
@@ -46,16 +46,16 @@ export interface BuildPromptOpts {
   currentSpecRound?: number;
   imagePaths?: string[];
   serverContent?: string;
+  serverContentFile?: ReviewContentFileRef;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
+  serverPriorFindingsFile?: ReviewContentFileRef;
   serverPriorResponse?: string;
+  serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
-  contentTruncated?: boolean;
   hasQaPartner?: boolean;
 }
-
-export const MAX_INLINE_FINDINGS_BYTES = 10 * 1024;
 
 export function buildPromptInline(opts: BuildPromptOpts): string {
   const required = [
@@ -73,12 +73,14 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     currentSpecRound: opts.currentSpecRound,
     imagePaths: opts.imagePaths,
     serverContent: opts.serverContent,
+    serverContentFile: opts.serverContentFile,
     serverDiffstat: opts.serverDiffstat,
     serverBatch: opts.serverBatch,
     serverPriorFindings: opts.serverPriorFindings,
+    serverPriorFindingsFile: opts.serverPriorFindingsFile,
     serverPriorResponse: opts.serverPriorResponse,
+    serverPriorResponseFile: opts.serverPriorResponseFile,
     serverAfterDone: opts.serverAfterDone,
-    contentTruncated: opts.contentTruncated,
     hasQaPartner: opts.hasQaPartner,
   });
   const primary = phasePrimarySkill(opts.agent.role, opts.phase);
@@ -105,12 +107,14 @@ interface TaskBodyArgs {
   currentSpecRound?: number;
   imagePaths?: string[];
   serverContent?: string;
+  serverContentFile?: ReviewContentFileRef;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
+  serverPriorFindingsFile?: ReviewContentFileRef;
   serverPriorResponse?: string;
+  serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
-  contentTruncated?: boolean;
   hasQaPartner?: boolean;
 }
 
@@ -120,12 +124,14 @@ interface PhasePromptCtx {
   currentSpecRound?: number;
   postApproveRedispatchCount?: number;
   serverContent?: string;
+  serverContentFile?: ReviewContentFileRef;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
+  serverPriorFindingsFile?: ReviewContentFileRef;
   serverPriorResponse?: string;
+  serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
-  contentTruncated?: boolean;
   hasQaPartner?: boolean;
 }
 interface PhasePrompt {
@@ -141,6 +147,10 @@ function reviewFields({ task }: PhasePromptCtx): PhasePrompt {
       ...(task.reviewHeadAnchorSha ? [`anchor-sha: ${task.reviewHeadAnchorSha}`] : []),
     ],
   };
+}
+
+function fileField(name: string, ref: ReviewContentFileRef): string {
+  return `${name}: ${ref.path} (${Math.max(1, Math.round(ref.bytes / 1024))}KB)`;
 }
 
 const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
@@ -178,35 +188,34 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
   recheck: (ctx) => reviewFields(ctx),
   'server-review': (ctx) => buildServerReviewInstructions(ctx),
   'server-recheck': (ctx) => buildServerReviewInstructions(ctx),
-  'server-spec-review': ({ task, contentTruncated, currentSpecRound, serverContent, serverPriorFindings, serverPriorResponse }) => {
+  'server-spec-review': ({ task, currentSpecRound, serverContent, serverContentFile, serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile }) => {
     const round = currentSpecRound ?? task.specReviewRound ?? 1;
-    const priorFindings = serverPriorFindings ? compactFindings(serverPriorFindings) : undefined;
-    const priorResponse = serverPriorResponse ? compactFindings(serverPriorResponse) : undefined;
     return {
       fields: [
         `round: ${round}`,
-        ...(contentTruncated ? ['content: truncated'] : []),
+        ...(serverContentFile ? [fileField('spec-file', serverContentFile)] : []),
+        ...(serverPriorFindingsFile ? [fileField('prior-findings-file', serverPriorFindingsFile)] : []),
+        ...(serverPriorResponseFile ? [fileField('prior-response-file', serverPriorResponseFile)] : []),
         'signal: spec-reviewed',
       ],
       blocks: [
-        ...(priorFindings ? [`prior-findings${priorFindings.truncated ? ' (truncated)' : ''}:`, priorFindings.text] : []),
-        ...(priorResponse ? [`prior-response${priorResponse.truncated ? ' (truncated)' : ''}:`, priorResponse.text] : []),
-        'spec:',
-        serverContent ?? '',
+        ...(serverPriorFindings ? ['prior-findings:', serverPriorFindings] : []),
+        ...(serverPriorResponse ? ['prior-response:', serverPriorResponse] : []),
+        ...(serverContent !== undefined ? ['spec:', serverContent] : []),
       ],
     };
   },
-  'server-feedback': ({ task, currentSpecRound, serverPriorFindings }) => {
+  'server-feedback': ({ task, currentSpecRound, serverPriorFindings, serverPriorFindingsFile }) => {
     const isSpec = task.phase === 'spec';
     const round = isSpec ? (currentSpecRound ?? task.specReviewRound ?? 1) : task.reviewRound;
-    const findings = serverPriorFindings ? compactFindings(serverPriorFindings) : undefined;
     return {
       fields: [
         `feedback: ${isSpec ? 'spec' : 'code'}`,
         `round: ${round}`,
+        ...(serverPriorFindingsFile ? [fileField('findings-file', serverPriorFindingsFile)] : []),
         `signal: ${isSpec ? 'spec-fixed' : 'code-fixed'}`,
       ],
-      blocks: findings ? [`findings${findings.truncated ? ' (truncated)' : ''}:`, findings.text] : undefined,
+      blocks: serverPriorFindings ? ['findings:', serverPriorFindings] : undefined,
     };
   },
   'server-after-done': ({ task, serverAfterDone }) => ({
@@ -219,24 +228,23 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
 };
 
 function buildServerReviewInstructions(
-  { task, serverContent, serverDiffstat, serverBatch, serverPriorFindings, serverPriorResponse, contentTruncated }: PhasePromptCtx,
+  { task, serverContent, serverContentFile, serverDiffstat, serverBatch, serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile }: PhasePromptCtx,
 ): PhasePrompt {
   const round = task.reviewRound || 1;
-  const priorFindings = serverPriorFindings ? compactFindings(serverPriorFindings) : undefined;
-  const priorResponse = serverPriorResponse ? compactFindings(serverPriorResponse) : undefined;
   return {
     fields: [
       `round: ${round}`,
       ...(serverBatch ? [`batch: ${serverBatch.index + 1}/${serverBatch.total}`] : []),
-      ...(contentTruncated ? ['content: truncated'] : []),
+      ...(serverContentFile ? [fileField('diff-file', serverContentFile)] : []),
+      ...(serverPriorFindingsFile ? [fileField('prior-findings-file', serverPriorFindingsFile)] : []),
+      ...(serverPriorResponseFile ? [fileField('prior-response-file', serverPriorResponseFile)] : []),
       'signal: code-reviewed',
     ],
     blocks: [
       ...(serverDiffstat ? ['diffstat:', serverDiffstat] : []),
-      ...(priorFindings ? [`prior-findings${priorFindings.truncated ? ' (truncated)' : ''}:`, priorFindings.text] : []),
-      ...(priorResponse ? [`prior-response${priorResponse.truncated ? ' (truncated)' : ''}:`, priorResponse.text] : []),
-      'diff:',
-      serverContent ?? '',
+      ...(serverPriorFindings ? ['prior-findings:', serverPriorFindings] : []),
+      ...(serverPriorResponse ? ['prior-response:', serverPriorResponse] : []),
+      ...(serverContent !== undefined ? ['diff:', serverContent] : []),
     ],
   };
 }
@@ -245,9 +253,9 @@ function buildTaskBody(args: TaskBodyArgs): string {
   const {
     task, phase, worktreePath, signalToken, postApproveRedispatchCount,
     currentSpecRound, imagePaths,
-    serverContent, serverDiffstat, serverBatch,
-    serverPriorFindings, serverPriorResponse, serverAfterDone, contentTruncated,
-    hasQaPartner,
+    serverContent, serverContentFile, serverDiffstat, serverBatch,
+    serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
+    serverAfterDone, hasQaPartner,
   } = args;
   if (phase === 'post-approve' && !signalToken) {
     throw new Error('post-approve prompt requires signalToken');
@@ -258,6 +266,11 @@ function buildTaskBody(args: TaskBodyArgs): string {
   if (phase.startsWith('server-') && !signalToken) {
     throw new Error(`${phase} prompt requires signalToken`);
   }
+  if ((serverContent !== undefined && serverContentFile)
+    || (serverPriorFindings !== undefined && serverPriorFindingsFile)
+    || (serverPriorResponse !== undefined && serverPriorResponseFile)) {
+    throw new Error(`${phase} prompt: inline and file payload forms are mutually exclusive`);
+  }
 
   const phaseBuilder = (PHASE_PROMPT_BUILDERS as Record<string, PhasePromptBuilder>)[phase];
   if (!phaseBuilder) {
@@ -265,9 +278,9 @@ function buildTaskBody(args: TaskBodyArgs): string {
   }
   const { fields, blocks } = phaseBuilder({
     task, signalToken, currentSpecRound, postApproveRedispatchCount,
-    serverContent, serverDiffstat, serverBatch,
-    serverPriorFindings, serverPriorResponse, serverAfterDone, contentTruncated,
-    hasQaPartner,
+    serverContent, serverContentFile, serverDiffstat, serverBatch,
+    serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
+    serverAfterDone, hasQaPartner,
   });
 
   // exchange 只有 baxian-task-check（develop/code）消费，其余 phase 不输出
@@ -295,83 +308,6 @@ function buildTaskBody(args: TaskBodyArgs): string {
     }
   }
   return body;
-}
-
-function compactFindings(text: string): { text: string; truncated: boolean } {
-  if (Buffer.byteLength(text, 'utf8') <= MAX_INLINE_FINDINGS_BYTES) {
-    return { text, truncated: false };
-  }
-  let parsed: { findings?: Array<Record<string, unknown>>; responses?: Array<Record<string, unknown>> };
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return truncateFindings(text);
-  }
-  if (Array.isArray(parsed.responses)) return compactResponses(parsed as { responses: Array<Record<string, unknown>> });
-  if (!Array.isArray(parsed.findings)) return truncateFindings(text);
-  for (const messageCap of [200, 80]) {
-    const compacted = {
-      ...parsed,
-      findings: parsed.findings.map(f => ({
-        ...f,
-        ...(typeof f.message === 'string' && f.message.length > messageCap
-          ? { message: `${f.message.slice(0, messageCap)}…` }
-          : {}),
-      })),
-    };
-    const out = JSON.stringify(compacted);
-    if (Buffer.byteLength(out, 'utf8') <= MAX_INLINE_FINDINGS_BYTES) {
-      return { text: out, truncated: true };
-    }
-  }
-  const idsOnly = JSON.stringify({
-    ...parsed,
-    note: 'messages omitted for size; respond to EVERY finding id below',
-    findings: parsed.findings.map(f => ({
-      id: f.id,
-      severity: f.severity,
-      ...(f.file !== undefined ? { file: f.file } : {}),
-      ...(f.line !== undefined ? { line: f.line } : {}),
-      ...(f.location !== undefined ? { location: f.location } : {}),
-    })),
-  });
-  return { text: idsOnly, truncated: true };
-}
-
-function compactResponses(parsed: { responses: Array<Record<string, unknown>> }): { text: string; truncated: boolean } {
-  for (const rationaleCap of [200, 80]) {
-    const compacted = {
-      ...parsed,
-      responses: parsed.responses.map(r => ({
-        ...r,
-        ...(typeof r.rationale === 'string' && r.rationale.length > rationaleCap
-          ? { rationale: `${r.rationale.slice(0, rationaleCap)}…` }
-          : {}),
-      })),
-    };
-    const out = JSON.stringify(compacted);
-    if (Buffer.byteLength(out, 'utf8') <= MAX_INLINE_FINDINGS_BYTES) {
-      return { text: out, truncated: true };
-    }
-  }
-  const skeleton = JSON.stringify({
-    ...parsed,
-    note: 'rationales omitted for size; every response id/action is listed below',
-    responses: parsed.responses.map(r => ({
-      findingId: r.findingId,
-      action: r.action,
-      ...(r.commitSha !== undefined ? { commitSha: r.commitSha } : {}),
-    })),
-  });
-  return { text: skeleton, truncated: true };
-}
-
-function truncateFindings(text: string): { text: string; truncated: boolean } {
-  const buf = Buffer.from(text, 'utf8');
-  if (buf.byteLength <= MAX_INLINE_FINDINGS_BYTES) return { text, truncated: false };
-  let cut = MAX_INLINE_FINDINGS_BYTES;
-  while (cut > 0 && (buf[cut]! & 0xc0) === 0x80) cut--;
-  return { text: buf.subarray(0, cut).toString('utf8'), truncated: true };
 }
 
 export interface PostMergeCleanupContext {

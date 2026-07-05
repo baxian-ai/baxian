@@ -1153,8 +1153,8 @@ describe('intervention emit failure containment', () => {
   });
 });
 
-describe('prompt content truncation', () => {
-  it('oversized single-batch diff is truncated at a utf8 boundary and flagged, stored round keeps the full diff', async () => {
+describe('prompt content passthrough', () => {
+  it('oversized single-batch diff reaches dispatch untruncated; stored round keeps the full diff', async () => {
     const fx = makeFixture();
     const hugeDiff = `diff --git a/a.ts b/a.ts\n+${'哈'.repeat(30000)}`;
     fx.transport.readContent.mockResolvedValue({ content: hugeDiff, baseSha: 'base123' });
@@ -1162,14 +1162,23 @@ describe('prompt content truncation', () => {
 
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { content: string; contentTruncated?: boolean }];
-    expect(opts.contentTruncated).toBe(true);
-    const bytes = Buffer.byteLength(opts.content, 'utf8');
-    expect(bytes).toBeLessThanOrEqual(56 * 1024);
-    expect(bytes).toBeGreaterThan(56 * 1024 - 4);
-    expect(opts.content.at(-1)).toBe('哈');
+    expect(opts.content).toBe(hugeDiff);
+    expect(opts.contentTruncated).toBeUndefined();
 
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.content).toBe(hugeDiff);
+  });
+
+  it('oversized spec reaches dispatch untruncated', async () => {
+    const fx = makeFixture({ phase: undefined, status: 'in_progress', specReviewRound: 0 });
+    const hugeSpec = `# spec\n${'内容'.repeat(20000)}`;
+    fx.transport.readContent.mockResolvedValue({ content: hugeSpec });
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { content: string; contentTruncated?: boolean }];
+    expect(opts.content).toBe(hugeSpec);
+    expect(opts.contentTruncated).toBeUndefined();
   });
 });
 

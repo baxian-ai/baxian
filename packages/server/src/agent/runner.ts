@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { mkdir, writeFile as fsWriteFile, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -353,13 +352,11 @@ export class SshRunner implements CommandRunner {
   }
 
   async writeFile(filePath: string, content: Buffer | string): Promise<void> {
+    // Content travels over ssh stdin, not the command argv: Linux MAX_ARG_STRLEN caps a single
+    // argv string at 128KB, so embedding base64 in the command (as before) hard-fails past ~95KB.
     const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
-    const b64 = buf.toString('base64');
-    const eof = `BAXIAN_EOF_${randomBytes(4).toString('hex')}`;
-    const inner =
-      `mkdir -p ${shellQuote(dirname(filePath))} && ` +
-      `openssl base64 -d -A > ${shellQuote(filePath)} <<'${eof}'\n${b64}\n${eof}`;
-    const r = await this.exec(`sh -c ${shellQuote(inner)}`);
+    const remoteCmd = `mkdir -p ${shellQuote(dirname(filePath))} && cat > ${shellQuote(filePath)}`;
+    const r = await this.execRawRemoteWithStdin(remoteCmd, buf);
     if (r.exitCode !== 0) {
       throw new Error(`writeFile remote failed (${filePath}): ${r.stderr}`);
     }
