@@ -292,6 +292,32 @@ describe('AgentCard', () => {
     expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
   });
 
+  it('shows the need-input badge and hint when binding.needInputAt is set', () => {
+    renderCard(makeSnapshot({
+      id: 'dev-asking',
+      runtimeStatus: 'working',
+      binding: makeBinding('dev-asking', {
+        taskId: 'task-9',
+        needInputAt: '2026-07-06T10:00:00Z',
+      }),
+    }));
+
+    expect(screen.getByText('等回答')).toBeTruthy();
+    expect(screen.getByText('Agent 在等你的回答')).toBeTruthy();
+    expect(terminalHrefs()).toContain('/terminal/dev-asking');
+  });
+
+  it('renders no need-input badge without binding.needInputAt', () => {
+    renderCard(makeSnapshot({
+      id: 'dev-quiet',
+      runtimeStatus: 'working',
+      binding: makeBinding('dev-quiet', { taskId: 'task-9' }),
+    }));
+
+    expect(screen.queryByText('等回答')).toBeNull();
+    expect(screen.queryByText('Agent 在等你的回答')).toBeNull();
+  });
+
   it('reveals the live terminal during in-flight bootstrap once the tmux session is present', () => {
     renderCard(makeSnapshot({
       id: 'dev-launching',

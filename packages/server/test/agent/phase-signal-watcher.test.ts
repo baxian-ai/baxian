@@ -413,6 +413,113 @@ describe('snapshot read-file suppression', () => {
   });
 });
 
+describe('need-input side-channel', () => {
+  const token = 'needtok12345';
+
+  it('fires onNeedInput(true) once per ask, not on tail rescans', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive(`question?\n[bx:need-input:${token}]\n`);
+    streamer.triggerLive('more output keeps the literal in the tail buffer');
+    expect(calls).toEqual([true]);
+  });
+
+  it('ignores a need-input literal with a foreign token', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive('[bx:need-input:othertok9999]\n');
+    expect(calls).toEqual([]);
+  });
+
+  it('ignores snapshot content: a pre-restart leftover neither fires nor swallows the next live ask', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    streamer.setSnapshot(`[bx:need-input:${token}]`);
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    expect(calls).toEqual([]);
+    streamer.triggerLive('agent resumes with plain output\n');
+    expect(calls).toEqual([]);
+    streamer.triggerLive(`follow-up question\n[bx:need-input:${token}]\n`);
+    expect(calls).toEqual([true]);
+  });
+
+  it('re-arms immediately: a prompt follow-up ask fires while the old literal is still in the tail window', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+    expect(calls).toEqual([true]);
+    watcher.rearmNeedInput(DEV_AGENT.id);
+    streamer.triggerLive('user answer echo\n');
+    expect(calls).toEqual([true]);
+    streamer.triggerLive(`follow-up question\n[bx:need-input:${token}]\n`);
+    expect(calls).toEqual([true, true]);
+  });
+
+  it('matches a need-input literal torn across chunks', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive('[bx:need-');
+    streamer.triggerLive(`input:${token}]\n`);
+    expect(calls).toEqual([true]);
+  });
+
+  it('clears the badge when the phase signal fires', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+    streamer.triggerLive('y'.repeat(2000));
+    streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
+    expect(captured).toHaveLength(1);
+    expect(calls).toEqual([true, false]);
+  });
+
+  it('clears unconditionally on phase signal: a recovered watch may hold the badge without fired state', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
+    expect(calls).toEqual([false]);
+  });
+
+  it('clears the badge on session-gone', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const calls: boolean[] = [];
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token,
+      onNeedInput: pending => calls.push(pending),
+    });
+    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+    streamer.triggerSessionGone();
+    expect(calls).toEqual([true, false]);
+  });
+});
+
 describe('PhaseSignalWatcher.awaitOnce (bootstrap greeting)', () => {
   beforeEach(() => {
     vi.clearAllMocks();

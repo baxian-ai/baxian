@@ -130,5 +130,6 @@ function normalizeBinding(raw: Record<string, unknown>, fallbackId: string): Age
   if (typeof raw.awaitingPhase === 'string') binding.awaitingPhase = raw.awaitingPhase;
   if (typeof raw.awaitingReason === 'string') binding.awaitingReason = raw.awaitingReason;
   if (typeof raw.awaitingSince === 'string') binding.awaitingSince = raw.awaitingSince;
+  if (typeof raw.needInputAt === 'string') binding.needInputAt = raw.needInputAt;
   return binding;
 }

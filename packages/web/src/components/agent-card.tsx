@@ -89,6 +89,10 @@ export function AgentCard({
 
   const taskId = agent.binding?.taskId;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
+  const needInputAt = agent.binding?.needInputAt;
+  const needInputTitle = needInputAt
+    ? `Agent 在等你的回答（${new Date(needInputAt).toLocaleString()}）`
+    : undefined;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
   const isBootstrapping = !!agent.binding?.creationToken
     && !agent.binding?.paneId
@@ -317,6 +321,9 @@ export function AgentCard({
           {isAwaitingHuman && (
             <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? '需人工处理'}>挂起</span>
           )}
+          {needInputAt && (
+            <span className="pill pill-warn" title={needInputTitle}>等回答</span>
+          )}
           {!agent.petId && (
             <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
           )}
@@ -344,6 +351,14 @@ export function AgentCard({
           <div className="font-medium">等待人工介入</div>
           <div>
             请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">终端</Link> 处理。
+          </div>
+        </div>
+      )}
+      {needInputAt && (
+        <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
+          <div className="font-medium">Agent 在等你的回答</div>
+          <div>
+            它提了一个问题，请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">终端</Link> 回复。
           </div>
         </div>
       )}

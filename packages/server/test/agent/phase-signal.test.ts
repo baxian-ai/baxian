@@ -4,6 +4,7 @@ import {
   buildPhaseSignalTemplate,
   createSignalToken,
   PHASE_SIGNAL_KINDS,
+  scanNeedInputSignals,
   scanPhaseSignals,
   scanReadFileSignals,
   stripSignalAnsi,
@@ -163,6 +164,31 @@ describe('phase signal protocol', () => {
   it('code-ready template echo does not fire the scanner', () => {
     expect(scanPhaseSignals('[bx:code-ready:<pr_number>:<token>]')).toEqual([]);
     expect(scanPhaseSignals('[bx:code-ready:<token>]')).toEqual([]);
+  });
+});
+
+describe('need-input signal', () => {
+  it('scans need-input with token', () => {
+    expect(scanNeedInputSignals('question?\n[bx:need-input:abcdef123456]\n')).toEqual([
+      { token: 'abcdef123456', raw: '[bx:need-input:abcdef123456]' },
+    ]);
+  });
+
+  it('survives ANSI noise and TUI soft-wrap whitespace', () => {
+    expect(scanNeedInputSignals('\x1b[31m[bx:need-\ninput:abcdef123456]\x1b[0m')).toEqual([
+      { token: 'abcdef123456', raw: '[bx:need-input:abcdef123456]' },
+    ]);
+  });
+
+  it('ignores the angle-bracket template and malformed tokens', () => {
+    expect(scanNeedInputSignals('[bx:need-input:<token>]')).toEqual([]);
+    expect(scanNeedInputSignals('[bx:need-input:short]')).toEqual([]);
+    expect(scanNeedInputSignals('[bx:need-input:]')).toEqual([]);
+  });
+
+  it('scans multiple occurrences', () => {
+    const text = '[bx:need-input:abcdef123456] later [bx:need-input:abcdef123456]';
+    expect(scanNeedInputSignals(text)).toHaveLength(2);
   });
 });
 

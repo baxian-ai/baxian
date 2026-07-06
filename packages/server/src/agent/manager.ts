@@ -56,7 +56,7 @@ import {
 import { WorktreeManager } from './worktree.js';
 import { RepoStore, createRepoStoreCache, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
-import { PhaseSignalWatcher } from './phase-signal-watcher.js';
+import { PhaseSignalWatcher, type PhaseSignalWatcherStartArgs } from './phase-signal-watcher.js';
 import type { PhaseSignalKind } from './phase-signal.js';
 import { ReviewTransport, resolveServerPayloads, type ServerPayloadPromptOpts } from './review-transport.js';
 import type { ReviewStore } from '../state/review-store.js';
@@ -1561,6 +1561,48 @@ export class AgentManager {
     });
   }
 
+  private async setAgentNeedInput(agentId: string, pending: boolean, opts: { taskId?: string } = {}): Promise<void> {
+    const now = new Date().toISOString();
+    try {
+      await this.agentStore.update(agentId, (existing) => {
+        if (!existing) return AGENT_STORE_NOOP;
+        // A stale watcher callback must not stamp a rebound agent: the badge belongs
+        // to the watch's task, so a taskId mismatch means the binding moved on.
+        if (opts.taskId !== undefined && existing.taskId !== opts.taskId) return AGENT_STORE_NOOP;
+        if (pending) {
+          if (existing.needInputAt !== undefined) return AGENT_STORE_NOOP;
+          return { ...existing, needInputAt: now, updatedAt: now };
+        }
+        if (existing.needInputAt === undefined) return AGENT_STORE_NOOP;
+        const { needInputAt: _needInputAt, ...rest } = existing;
+        return { ...rest, updatedAt: now };
+      });
+    } catch (err) {
+      console.warn(`[AgentManager] setAgentNeedInput(${agentId}, ${pending}) failed:`, err);
+    }
+  }
+
+  // Single entry for arming phase-signal watches: every path (dispatch, post-approve,
+  // recover, rollback) must carry the need-input callback, or that watch silently
+  // drops the side-channel and the badge never lights for its phase.
+  private startPhaseSignalWatch(
+    args: Omit<PhaseSignalWatcherStartArgs, 'onNeedInput'>,
+  ): Promise<boolean> {
+    if (!this.phaseSignalWatcher) return Promise.resolve(true);
+    return this.phaseSignalWatcher.start({
+      ...args,
+      onNeedInput: (pending) => {
+        void this.setAgentNeedInput(args.agentId, pending, { taskId: args.taskId });
+      },
+    });
+  }
+
+  // The user typed into the agent's terminal — its pending question is being answered.
+  async notifyHumanTerminalInput(agentId: string): Promise<void> {
+    this.phaseSignalWatcher?.rearmNeedInput(agentId);
+    await this.setAgentNeedInput(agentId, false);
+  }
+
   async clearAwaitingHuman(agentId: string): Promise<boolean> {
     const now = new Date().toISOString();
     let cleared = false;
@@ -2385,7 +2427,7 @@ export class AgentManager {
       if (!this.phaseSignalWatcher) return;
       const task = await this.taskStore.get(taskId);
       if (!task) return;
-      await this.phaseSignalWatcher.start({
+      await this.startPhaseSignalWatch({
         taskId,
         projectId: task.projectId,
         agentId: task.agentId,
@@ -2417,7 +2459,7 @@ export class AgentManager {
       const completion = await this.postApproveStore.get(task.id);
       if (!completion) continue;
       try {
-        await this.phaseSignalWatcher.start({
+        await this.startPhaseSignalWatch({
           taskId: task.id,
           projectId: task.projectId,
           agentId: task.agentId,
@@ -2454,7 +2496,7 @@ export class AgentManager {
         || (task.phase === undefined && task.status === 'in_progress')
         || (task.phase !== 'spec' && (task.status === 'review' || task.status === 'fixing'));
       try {
-        await this.phaseSignalWatcher.start({
+        await this.startPhaseSignalWatch({
           taskId: task.id,
           projectId: task.projectId,
           agentId,
@@ -3448,8 +3490,10 @@ export class AgentManager {
 
     await this.agentStore.update(agentId, (stateNow) => {
       if (!stateNow || stateNow.taskId !== taskId) return AGENT_STORE_NOOP;
+      // A fresh dispatch supersedes any question asked under the previous prompt.
+      const { needInputAt: _needInputAt, ...rest } = stateNow;
       return {
-        ...stateNow,
+        ...rest,
         paneId,
         worktreePath,
         repoPath: workdir,
@@ -3965,8 +4009,10 @@ export class AgentManager {
     const now = new Date().toISOString();
     await this.agentStore.update(agentId, (latest) => {
       if (!latest) return AGENT_STORE_NOOP;
+      // The continuation prompt supersedes any question asked under the previous one.
+      const { needInputAt: _needInputAt, ...rest } = latest;
       return {
-        ...latest,
+        ...rest,
         paneId,
         worktreePath,
         updatedAt: now,
@@ -4893,7 +4939,7 @@ export class AgentManager {
       const task = await this.taskStore.get(taskId);
       if (completion && task) {
         try {
-          await this.phaseSignalWatcher.start({
+          await this.startPhaseSignalWatch({
             taskId,
             projectId: task.projectId,
             agentId: task.agentId,
@@ -4916,7 +4962,7 @@ export class AgentManager {
     const mapped = this.mapTaskStateToExpectedWatcher(restored);
     if (!mapped) return qaTakenOverInReview;
     try {
-      await this.phaseSignalWatcher.start({
+      await this.startPhaseSignalWatch({
         taskId,
         projectId: restored.projectId,
         agentId: mapped.agentId,
@@ -5596,7 +5642,7 @@ export class AgentManager {
     const task = await this.taskStore.get(taskId);
     if (!task) return false;
     try {
-      return await this.phaseSignalWatcher.start({
+      return await this.startPhaseSignalWatch({
         taskId,
         projectId: task.projectId,
         agentId,

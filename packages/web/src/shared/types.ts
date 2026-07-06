@@ -118,6 +118,7 @@ export interface AgentBindingFacts {
   awaitingPhase?: string;
   awaitingReason?: string;
   awaitingSince?: string;
+  needInputAt?: string;
 }
 
 export interface AgentErrorSummary {

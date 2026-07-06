@@ -76,3 +76,13 @@ During server review you may request file context baxian did not inject:
 ```
 
 Own line, repo-relative path, ≤200 lines, then wait — baxian injects the content. This does NOT consume the phase-signal watch, so you may request several before emitting your phase signal.
+
+## Need-input side-channel
+
+When you ask your human partner a question and pause for their answer (see the baxian-task-check skill), also emit, on its own line, with the current `token:` value:
+
+```
+[bx:need-input:<token>]
+```
+
+baxian shows a waiting badge in its UI so the user knows to open your terminal. This does NOT consume the phase-signal watch and does not advance the task — emit it each time you ask. The badge clears when the user types into your terminal or when your next phase signal fires.

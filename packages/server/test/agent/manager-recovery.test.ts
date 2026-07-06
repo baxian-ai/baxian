@@ -471,6 +471,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
       token: 'tok',
       skipSnapshot: false,
       recovered: true,
+      onNeedInput: expect.any(Function),
     });
   });
 
@@ -577,13 +578,14 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-1', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-done', 'pr-created'], token: 'tok-ready',
-        skipSnapshot: false, recovered: true,
+        skipSnapshot: false, recovered: true, onNeedInput: expect.any(Function),
       }],
     ['sets up pr-created for code-phase tasks (dispatched after spec approval)',
       { id: 'task-code', phase: 'code', signalToken: 'tok-code' },
       {
         taskId: 'task-code', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['pr-created'], token: 'tok-code', skipSnapshot: true, recovered: true,
+        onNeedInput: expect.any(Function),
       }],
     ['sets up spec-reviewed for spec-phase review tasks',
       { id: 'task-2', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec', signalToken: 'tok-review', status: 'review' },
@@ -597,21 +599,21 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-3', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-fixed'], token: 'tok-fix',
-        skipSnapshot: false, recovered: true,
+        skipSnapshot: false, recovered: true, onNeedInput: expect.any(Function),
       }],
     ['sets up pr-fixed for code-phase fixing tasks',
       { id: 'task-code-fix', qaAgentId: 'qa-1', reviewRound: 1, phase: 'code', signalToken: 'tok-prfix', status: 'fixing', prNumber: 60 },
       {
         taskId: 'task-code-fix', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['pr-fixed'], token: 'tok-prfix',
-        skipSnapshot: false, recovered: true,
+        skipSnapshot: false, recovered: true, onNeedInput: expect.any(Function),
       }],
     ['sets up PR verdict-choice {pr-approved, pr-changes-requested} for review-phase tasks with qaAgentId',
       { id: 'task-pr-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review', signalToken: 'tok-verdict', prNumber: 50 },
       {
         taskId: 'task-pr-review', projectId: 'proj', agentId: 'qa-1',
         expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'tok-verdict',
-        skipSnapshot: false, recovered: true,
+        skipSnapshot: false, recovered: true, onNeedInput: expect.any(Function),
       }],
     ['sets up snapshot scan and read-file for github spec-review tasks',
       { id: 'task-gh-spec', qaAgentId: 'qa-1', specReviewRound: 1, status: 'review', phase: 'spec', reviewMode: 'github', signalToken: 'tok-spec' },

@@ -440,6 +440,72 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
     await waitForPhase('detach');
     ws.close();
   });
+
+  it('submitting input clears the agent need-input badge', async () => {
+    const { app, port: p, ctx } = await startApp({ withPaneStreamerManager: true });
+    runningApp = app;
+    await ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj-a',
+      taskId: 'task-1',
+      needInputAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    await reader.next();
+    await reader.next();
+
+    send(ws, { op: 'input', subscriberId: 'sub-1', data: 'my answer\r' });
+    const started = Date.now();
+    while (Date.now() - started < 1000) {
+      const binding = await ctx.agentStore.get('dev-1');
+      if (binding && binding.needInputAt === undefined) break;
+      await flushAsyncWork();
+    }
+    const binding = await ctx.agentStore.get('dev-1');
+    expect(binding?.needInputAt).toBeUndefined();
+    expect(binding?.taskId).toBe('task-1');
+
+    send(ws, { op: 'input', subscriberId: 'sub-1', data: 'plain keys no enter' });
+    await flushAsyncWork();
+    const after = await ctx.agentStore.get('dev-1');
+    expect(after?.needInputAt).toBeUndefined();
+    ws.close();
+  });
+
+  it('keeps the need-input badge when the pane write fails', async () => {
+    const { app, port: p, ctx } = await startApp({ withPaneStreamerManager: true });
+    runningApp = app;
+    const needInputAt = new Date().toISOString();
+    await ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj-a',
+      taskId: 'task-1',
+      needInputAt,
+      updatedAt: new Date().toISOString(),
+    });
+    vi.spyOn(ctx.paneStreamerManager!, 'enqueueInput').mockRejectedValue(new Error('pane gone'));
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+    send(ws, { op: 'subscribe', subscriberId: 'sub-1', agentId: 'dev-1', mode: 'full' });
+    await reader.next();
+    await reader.next();
+
+    send(ws, { op: 'input', subscriberId: 'sub-1', data: 'my answer\r' });
+    let sawInputFailed = false;
+    for (let i = 0; i < 5 && !sawInputFailed; i++) {
+      const msg = await reader.next();
+      if (msg.type === 'error' && msg.code === 'input_failed') sawInputFailed = true;
+    }
+    expect(sawInputFailed).toBe(true);
+    const binding = await ctx.agentStore.get('dev-1');
+    expect(binding?.needInputAt).toBe(needInputAt);
+    ws.close();
+  });
 });
 
 describe('streamWsPlugin /api/stream — transport error handling', () => {

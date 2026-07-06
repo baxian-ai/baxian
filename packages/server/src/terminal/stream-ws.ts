@@ -275,10 +275,18 @@ function handleConnection(
     }
     const safeData = sanitizeWebInput(data);
     if (safeData.length === 0) return;
-    if (safeData.includes('\r') || safeData.includes('\n')) {
+    const submitted = safeData.includes('\r') || safeData.includes('\n');
+    if (submitted) {
       void emitIntervention(app, sub.agentId, 'input');
     }
-    psm.enqueueInput(sub.agentId, safeData).catch((err) => {
+    psm.enqueueInput(sub.agentId, safeData).then(() => {
+      // Clear the need-input badge only once the answer actually reached the pane;
+      // a failed write must keep telling the user the question is still open.
+      if (!submitted) return;
+      app.ctx.agentManager.notifyHumanTerminalInput(sub.agentId).catch((err: unknown) => {
+        console.warn(`[stream-ws] notifyHumanTerminalInput(${sub.agentId}) failed:`, err);
+      });
+    }).catch((err) => {
       console.warn(
         `[stream-ws] enqueueInput(${sub.agentId}) failed:`,
         err,

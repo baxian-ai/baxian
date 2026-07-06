@@ -2,6 +2,7 @@ import type { AgentConfig, BaxianEvent, EventType } from '../shared/index.js';
 import type { EventBus } from '../event/bus.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
+  scanNeedInputSignals,
   scanPhaseSignals,
   scanReadFileSignals,
   type PhaseSignalKind,
@@ -33,6 +34,12 @@ interface WatchEntry {
   expectedToken: string;
   onReadFile?: (req: ReadFileSignal) => void;
   seenReadFile: Set<string>;
+  onNeedInput?: (pending: boolean) => void;
+  needInputFired: boolean;
+  // Separate tail window for need-input: rearmNeedInput() drops it so the
+  // already-consumed literal cannot re-fire, without touching the phase-signal
+  // buffer (clearing THAT could lose a phase signal torn across chunks).
+  needInputBuffer: string;
   recovered: boolean;
   buffer: string;
   unsubscribe: () => void;
@@ -52,6 +59,7 @@ export interface PhaseSignalWatcherStartArgs {
   expectedKinds: PhaseSignalKind | readonly PhaseSignalKind[] | ReadonlySet<PhaseSignalKind>;
   token: string;
   onReadFile?: (req: ReadFileSignal) => void;
+  onNeedInput?: (pending: boolean) => void;
   skipSnapshot?: boolean;
   recovered?: boolean;
 }
@@ -97,6 +105,9 @@ export class PhaseSignalWatcher {
       expectedToken: args.token,
       ...(args.onReadFile ? { onReadFile: args.onReadFile } : {}),
       seenReadFile: new Set(),
+      ...(args.onNeedInput ? { onNeedInput: args.onNeedInput } : {}),
+      needInputFired: false,
+      needInputBuffer: '',
       recovered: args.recovered ?? false,
       buffer: '',
       unsubscribe: () => undefined,
@@ -194,6 +205,33 @@ export class PhaseSignalWatcher {
     });
   }
 
+  // Re-arm takes effect immediately: dropping the need-input tail window means the
+  // consumed literal cannot re-fire off the echo of the user's answer, while a
+  // follow-up ask (arriving as new bytes) fires even when it comes right away.
+  rearmNeedInput(agentId: string): void {
+    for (const entry of this.entries.values()) {
+      if (entry.agentId !== agentId) continue;
+      if (!entry.needInputFired) continue;
+      entry.needInputFired = false;
+      entry.needInputBuffer = '';
+    }
+  }
+
+  private scanNeedInput(entry: WatchEntry, chunk: string, isSnapshot: boolean): void {
+    if (!entry.onNeedInput) return;
+    // Snapshot content is ignored entirely (not even buffered). The persisted binding
+    // flag alone carries pre-restart state: marking a scrollback literal as fired would
+    // permanently swallow the next same-token ask when the user had already answered
+    // before the restart, and a stale-but-still-open ask re-badges idempotently anyway.
+    if (isSnapshot) return;
+    const combined = entry.needInputBuffer + chunk;
+    entry.needInputBuffer = combined.slice(-MATCH_BUFFER_CHARS);
+    if (entry.needInputFired) return;
+    if (!scanNeedInputSignals(combined).some(s => s.token === entry.expectedToken)) return;
+    entry.needInputFired = true;
+    entry.onNeedInput(true);
+  }
+
   private onPaneData(entry: WatchEntry, chunk: string, isSnapshot = false): void {
     if (this.entries.get(entry.taskId) !== entry) return;
     if (entry.fired) return;
@@ -205,6 +243,7 @@ export class PhaseSignalWatcher {
         if (!isSnapshot) entry.onReadFile(req);
       }
     }
+    this.scanNeedInput(entry, chunk, isSnapshot);
     const signal = scanPhaseSignals(rawCombined).find(candidate =>
       entry.expectedKinds.has(candidate.kind) && candidate.token === entry.expectedToken,
     );
@@ -214,6 +253,9 @@ export class PhaseSignalWatcher {
     entry.fired = true;
     this.entries.delete(entry.taskId);
     try { entry.unsubscribe(); } catch {}
+    // Unconditional: a recovered watch may not have rebuilt needInputFired even though
+    // the persisted badge is set — the phase signal ends the dispatch either way.
+    entry.onNeedInput?.(false);
     const verdictAction: 'APPROVE' | 'REQUEST_CHANGES' | undefined =
       signal.kind === 'pr-approved' ? 'APPROVE'
       : signal.kind === 'pr-changes-requested' ? 'REQUEST_CHANGES'
@@ -262,6 +304,7 @@ export class PhaseSignalWatcher {
     if (this.entries.get(entry.taskId) !== entry) return;
     this.entries.delete(entry.taskId);
     if (entry.fired) return;
+    entry.onNeedInput?.(false);
     const kindsLabel = [...entry.expectedKinds].join(',');
     void this.emitInterventionFireAndForget({
       taskId: entry.taskId,

@@ -119,6 +119,9 @@ export interface AgentBindingFacts {
   awaitingPhase?: string;
   awaitingReason?: string;
   awaitingSince?: string;
+  // Display-only: agent asked its human partner and is waiting ([bx:need-input]).
+  // Never consulted by scheduling — that is what status/awaiting* are for.
+  needInputAt?: string;
 }
 
 export interface AgentErrorSummary {

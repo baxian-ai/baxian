@@ -1,6 +1,6 @@
 import { AGENT_PHASES, type AgentConfig, type AgentRole, type AgentRuntime, type DispatchPhase, type ReviewContentFileRef, type TaskState } from '../shared/index.js';
 import type { SkillRegistry } from '../skill/registry.js';
-import { scanPhaseSignals } from './phase-signal.js';
+import { scanNeedInputSignals, scanPhaseSignals } from './phase-signal.js';
 
 export const MAX_PROMPT_BYTES = 80 * 1024;
 export const MAX_PROMPT_BYTES_ROUTE_LIMIT = MAX_PROMPT_BYTES - 1024;
@@ -305,6 +305,9 @@ function buildTaskBody(args: TaskBodyArgs): string {
     const leaked = scanPhaseSignals(body).find(s => s.token === signalToken);
     if (leaked) {
       throw new Error(`${phase} prompt must not contain a filled ${leaked.kind} signal literal`);
+    }
+    if (scanNeedInputSignals(body).some(s => s.token === signalToken)) {
+      throw new Error(`${phase} prompt must not contain a filled need-input signal literal`);
     }
   }
   return body;

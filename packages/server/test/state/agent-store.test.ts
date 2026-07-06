@@ -51,6 +51,13 @@ describe('AgentStore', () => {
     expect(loaded).toEqual(state);
   });
 
+  it('round-trips needInputAt through the normalize whitelist', async () => {
+    const state = makeState('dev-1', { taskId: 'task-001', needInputAt: NOW });
+    await store.set(state);
+    const loaded = await store.get('dev-1');
+    expect(loaded?.needInputAt).toBe(NOW);
+  });
+
   it('overwrites existing binding facts', async () => {
     await store.set(makeState('dev-1', { taskId: 'task-a' }));
     await store.set(makeState('dev-1', { taskId: 'task-b' }));

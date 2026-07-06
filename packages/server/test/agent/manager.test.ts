@@ -5944,6 +5944,39 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   });
 });
 
+describe('AgentManager need-input badge lifecycle', () => {
+  it('a continuation dispatch clears the stale need-input badge', async () => {
+    const t = await seedTask({ status: 'fixing', signalToken: 'tok123456789' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      needInputAt: '2026-07-06T10:00:00.000Z',
+    });
+    stubEnsureSession(manager);
+    stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
+
+    await expect(manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
+    const binding = await agentStore.get('dev-1');
+    expect(binding?.needInputAt).toBeUndefined();
+  });
+
+  it('a stale watcher callback does not stamp a rebound agent', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'new-task' });
+
+    await manager['setAgentNeedInput']('dev-1', true, { taskId: 'old-task' });
+    expect((await agentStore.get('dev-1'))?.needInputAt).toBeUndefined();
+
+    await manager['setAgentNeedInput']('dev-1', true, { taskId: 'new-task' });
+    expect((await agentStore.get('dev-1'))?.needInputAt).toBeDefined();
+
+    await manager['setAgentNeedInput']('dev-1', false, { taskId: 'old-task' });
+    expect((await agentStore.get('dev-1'))?.needInputAt).toBeDefined();
+
+    await manager.notifyHumanTerminalInput('dev-1');
+    expect((await agentStore.get('dev-1'))?.needInputAt).toBeUndefined();
+  });
+});
+
 describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', () => {
   it('removes the reserved worktree when the release path runs', async () => {
     const t = await seedTask({ status: 'cancelled' });

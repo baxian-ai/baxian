@@ -137,6 +137,22 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
   return found.map(f => f.signal);
 }
 
+export interface NeedInputSignal {
+  token: string;
+  raw: string;
+}
+
+const NEED_INPUT_RE = new RegExp(`\\[bx:need-input:(${TOKEN_RANGE})\\]`, 'g');
+
+export function scanNeedInputSignals(text: string): NeedInputSignal[] {
+  const compact = stripSignalAnsi(text).replace(/\s+/g, '');
+  const out: NeedInputSignal[] = [];
+  for (const m of compact.matchAll(NEED_INPUT_RE)) {
+    out.push({ token: m[1], raw: m[0] });
+  }
+  return out;
+}
+
 export interface ReadFileSignal {
   file: string;
   startLine: number;
