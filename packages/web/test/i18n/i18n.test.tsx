@@ -147,4 +147,163 @@ describe('useLocaleConfigSync', () => {
 
     expect(getLocale()).toBe('zh-CN');
   });
+
+  it('ignores a stale focus refresh that resolves after a newer local locale switch', async () => {
+    let resolveGet!: (value: BaxianConfig) => void;
+    const pending = new Promise<BaxianConfig>((resolve) => { resolveGet = resolve; });
+    vi.mocked(api.config.get).mockReturnValueOnce(pending);
+    render(<SyncProbe />);
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    act(() => {
+      syncLocaleFromConfig('zh-CN');
+    });
+
+    await act(async () => {
+      resolveGet(cfg('en-US'));
+      await pending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('zh-CN');
+  });
+
+  it('ignores a stale refresh response when a newer refresh resolves first', async () => {
+    let resolveFirst!: (value: BaxianConfig) => void;
+    let resolveSecond!: (value: BaxianConfig) => void;
+    const firstPending = new Promise<BaxianConfig>((resolve) => { resolveFirst = resolve; });
+    const secondPending = new Promise<BaxianConfig>((resolve) => { resolveSecond = resolve; });
+
+    vi.mocked(api.config.get)
+      .mockReturnValueOnce(firstPending)
+      .mockReturnValueOnce(secondPending);
+
+    render(<SyncProbe />);
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    await act(async () => {
+      resolveSecond(cfg('zh-CN'));
+      await secondPending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('zh-CN');
+
+    await act(async () => {
+      resolveFirst(cfg('en-US'));
+      await firstPending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('zh-CN');
+  });
+
+  it('applies the newer refresh even when an older refresh already applied a different value', async () => {
+    syncLocaleFromConfig('zh-CN');
+
+    let resolveFirst!: (value: BaxianConfig) => void;
+    let resolveSecond!: (value: BaxianConfig) => void;
+    const firstPending = new Promise<BaxianConfig>((resolve) => { resolveFirst = resolve; });
+    const secondPending = new Promise<BaxianConfig>((resolve) => { resolveSecond = resolve; });
+
+    vi.mocked(api.config.get)
+      .mockReturnValueOnce(firstPending)
+      .mockReturnValueOnce(secondPending);
+
+    render(<SyncProbe />);
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    await act(async () => {
+      resolveFirst(cfg('en-US'));
+      await firstPending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('en-US');
+
+    await act(async () => {
+      resolveSecond(cfg('zh-CN'));
+      await secondPending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('zh-CN');
+  });
+
+  it('ignores a stale refresh response after a cross-tab storage locale switch', async () => {
+    let resolveGet!: (value: BaxianConfig) => void;
+    const pending = new Promise<BaxianConfig>((resolve) => { resolveGet = resolve; });
+    vi.mocked(api.config.get).mockReturnValueOnce(pending);
+    render(<I18nProvider><SyncProbe /></I18nProvider>);
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    act(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: 'baxian.language', newValue: 'zh-CN' }));
+    });
+
+    await act(async () => {
+      resolveGet(cfg('en-US'));
+      await pending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('zh-CN');
+  });
+
+  it('applies an earlier successful refresh even when a later refresh fails', async () => {
+    let resolveFirst!: (value: BaxianConfig) => void;
+    let rejectSecond!: (reason?: unknown) => void;
+    const firstPending = new Promise<BaxianConfig>((resolve) => { resolveFirst = resolve; });
+    const secondPending = new Promise<BaxianConfig>((_, reject) => { rejectSecond = reject; });
+
+    vi.mocked(api.config.get)
+      .mockReturnValueOnce(firstPending)
+      .mockReturnValueOnce(secondPending);
+
+    render(<SyncProbe />);
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+    });
+
+    await act(async () => {
+      rejectSecond(new Error('network error'));
+      await secondPending.catch(() => {});
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('en-US');
+
+    await act(async () => {
+      resolveFirst(cfg('zh-CN'));
+      await firstPending;
+      await Promise.resolve();
+    });
+
+    expect(getLocale()).toBe('zh-CN');
+  });
 });

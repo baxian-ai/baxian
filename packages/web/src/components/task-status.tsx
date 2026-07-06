@@ -1,8 +1,7 @@
 import type { TaskStatus } from '../shared/index.js';
 import { getMessages } from '../i18n/index.tsx';
 
-// 内部状态值仍是英文枚举（aria/title 保留原值供排查）；仅供非组件命令式代码调用，
-// 组件内一律 useT() 取 t.status[status]（订阅 locale 变化）。
+// 仅供非组件命令式代码调用；组件内一律 useT() 取 t.status[status]，以订阅 locale 变化。
 export function taskStatusLabel(status: TaskStatus): string {
   return getMessages().status[status] ?? status;
 }

@@ -233,7 +233,7 @@ export function HostManagementModal({ open, onClose }: Props) {
   const formFooter = (
     <>
       <button type="button" onClick={() => setView('list')} disabled={submitting} className="btn-secondary">
-        {t.hostMgmt.back}
+        {t.common.backText}
       </button>
       <button type="submit" form="host-form" disabled={!formValid || submitting} className="btn-primary">
         {submitting ? t.common.saving : t.common.save}
@@ -276,7 +276,7 @@ export function HostManagementModal({ open, onClose }: Props) {
                   <div className="flex shrink-0 gap-2">
                     <button type="button" onClick={() => startEdit(h)}
                       className="text-xs text-accent transition-colors hover:text-accent-hover">
-                      {t.hostMgmt.edit}
+                      {t.common.edit}
                     </button>
                     <button type="button" onClick={() => handleDelete(h)}
                       className="text-xs text-accent transition-colors hover:opacity-80">

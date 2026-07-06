@@ -63,7 +63,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const dismiss = useCallback((id: number) => {
     clearTimer(id);
     holdsRef.current.delete(id);
-    setItems(prev => prev.filter(t => t.id !== id));
+    setItems(prev => prev.filter(item => item.id !== id));
   }, [clearTimer]);
 
   const scheduleDismiss = useCallback((id: number, duration: number) => {

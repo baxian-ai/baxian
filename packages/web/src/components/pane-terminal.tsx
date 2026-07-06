@@ -133,10 +133,10 @@ export function PaneTerminal({
   const scrollPreviewToCursor = (): void => {
     if (!isStaticPreview) return;
     const el = containerRef.current;
-    const t = termRef.current;
-    if (!el || !t) return;
+    const term = termRef.current;
+    if (!el || !term) return;
     if (el.clientHeight <= 0) return;
-    const cursorY = t.buffer.active.cursorY;
+    const cursorY = term.buffer.active.cursorY;
     const cursorBottomPx = (cursorY + 1) * TERMINAL_LINE_HEIGHT_PX;
     el.scrollTop = Math.max(0, cursorBottomPx - el.clientHeight);
   };
@@ -154,11 +154,11 @@ export function PaneTerminal({
   const enqueueTerminalTask = (task: TerminalTask, generation: number): void => {
     writeChainRef.current = writeChainRef.current
       .then(async () => {
-        const t = termRef.current;
-        if (!t || generation !== writeGenerationRef.current) return;
+        const term = termRef.current;
+        if (!term || generation !== writeGenerationRef.current) return;
         try {
-          await task(t);
-          if (canResize) t.scrollToBottom();
+          await task(term);
+          if (canResize) term.scrollToBottom();
           schedulePreviewScrollToCursor();
         } catch (err) {
           console.warn('[pane-terminal] terminal task failed:', err);
@@ -219,8 +219,8 @@ export function PaneTerminal({
     agentId,
     mode: streamMode,
     onSnapshot: ({ cols, rows, data }) => {
-      const t = termRef.current;
-      if (!t) return;
+      const term = termRef.current;
+      if (!term) return;
       try {
         const generation = writeGenerationRef.current + 1;
         writeGenerationRef.current = generation;

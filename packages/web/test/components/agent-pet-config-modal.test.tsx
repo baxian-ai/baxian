@@ -139,7 +139,7 @@ describe('AgentPetConfigModal', () => {
     const delBtn = await screen.findByRole('button', { name: 'Delete Cat' });
     await act(async () => { fireEvent.click(delBtn); });
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Delete pet "Cat"?')).toBeTruthy();
+    expect(within(dialog).getByText('Delete Pet "Cat"?')).toBeTruthy();
     expect(within(dialog).getByText('Agents using it will fall back to the default status display.')).toBeTruthy();
     await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
     expect(removeMock).toHaveBeenCalledWith('pet-2');

@@ -103,7 +103,7 @@ export function AgentGroup({
       {showEmpty && (
         <div
           className="mb-2 rounded-lg border border-hairline bg-surface px-3 py-2 text-sm text-og-400"
-          aria-label={`${label} no active task`}
+          aria-label={t.agents.noActiveTaskAriaLabel(label)}
         >
           {t.agents.noActiveTask}
         </div>

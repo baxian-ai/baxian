@@ -675,7 +675,7 @@ describe('PaneTerminal', () => {
     const { ws, sid } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before = ws.sent.length;
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key up/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
     });
     expect(inputsSince(ws, before)).toContainEqual({ op: 'input', subscriberId: sid, data: '\x1b[A' });
   });
@@ -701,14 +701,14 @@ describe('PaneTerminal', () => {
     const { term, ws } = await mountWithHandshake({ mode: 'full', interactive: true, arrowKeys: true });
     const before1 = ws.sent.length;
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key up/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
     });
     expect(ws.sent.slice(before1).map((s) => JSON.parse(s).data)).toContain('\x1b[A');
 
     term.modes.applicationCursorKeysMode = true;
     const before2 = ws.sent.length;
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key up/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
     });
     expect(ws.sent.slice(before2).map((s) => JSON.parse(s).data)).toContain('\x1bOA');
   });
@@ -718,9 +718,9 @@ describe('PaneTerminal', () => {
     const previewSid = sentMessages(ws1).find((m) => m.op === 'subscribe' && m.mode === 'preview')!.subscriberId!;
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key up/ }));
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key down/ }));
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key right/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Down arrow key/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Right arrow key/ }));
       await flushMacrotask();
     });
     const { ws2, fullSid } = await activateFullSubscription();
@@ -736,7 +736,7 @@ describe('PaneTerminal', () => {
     const before = ws.sent.length;
     await act(async () => {
       term.onDataCallback!('\x1b[24;80Rhello');
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key up/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Up arrow key/ }));
     });
     const inputs = inputsSince(ws, before)
       .filter((m) => m.op === 'input')
@@ -749,7 +749,7 @@ describe('PaneTerminal', () => {
     expect(sentMessages(ws1).find((m) => m.op === 'subscribe')?.mode).toBe('preview');
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Arrow key down/ }));
+      fireEvent.click(screen.getByRole('button', { name: /Down arrow key/ }));
       await flushMacrotask();
     });
     expect(fakeTerminals.length).toBeGreaterThan(1);

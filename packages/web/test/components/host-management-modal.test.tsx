@@ -98,7 +98,7 @@ it('a provided port flows through; an out-of-range one blocks Save', async () =>
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h.example.com' } });
 
   fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '70000' } });
-  expect(screen.getByText(/Port must be an integer between 1 and 65535/)).toBeTruthy();
+  expect(screen.getByText(/Port must be 1–65535/)).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Save' }).hasAttribute('disabled')).toBe(true);
 
   fireEvent.change(screen.getByLabelText('Port (optional)'), { target: { value: '2200' } });

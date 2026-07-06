@@ -129,5 +129,5 @@ it.each([
 ])('rejects %s with the URL-format field error', async (_label, repo) => {
   await renderAndFill(repo);
   expect(createMock).not.toHaveBeenCalled();
-  expect(screen.getByText(/Must be a git URL/)).toBeTruthy();
+  expect(screen.getByText(/Must be a Git URL/)).toBeTruthy();
 });

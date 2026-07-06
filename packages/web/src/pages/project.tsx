@@ -228,7 +228,7 @@ export function Project() {
               disabled={!deleteConfirmed || deleting}
               className="btn-primary"
             >
-              {deleting ? t.projectPage.deleting : t.projectPage.confirmDeleteButton}
+              {deleting ? t.common.deleting : t.projectPage.confirmDeleteButton}
             </button>
           </>
         }

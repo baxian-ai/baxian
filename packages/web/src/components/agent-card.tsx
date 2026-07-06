@@ -390,7 +390,7 @@ export function AgentCard({
               disabled={retryingBootstrap}
               className="btn-primary shrink-0"
             >
-              {retryingBootstrap ? t.agents.retryingBootstrap : t.agents.retryBootstrap}
+              {retryingBootstrap ? t.common.retrying : t.agents.retryBootstrap}
             </button>
           </div>
         </div>
@@ -503,7 +503,7 @@ export function AgentCard({
                 onClick={() => { close(); void handleDelete(); }}
                 disabled={deleting || compacting || clearing}
               >
-                {deleting ? t.agents.deleting : t.common.delete}
+                {deleting ? t.common.deleting : t.common.delete}
               </MenuItem>
             </>
           )}

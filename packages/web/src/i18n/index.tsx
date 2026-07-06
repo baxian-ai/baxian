@@ -32,6 +32,10 @@ function cacheLocale(locale: SupportedLanguage): void {
 
 let currentLocale: SupportedLanguage = readCachedLocale();
 const localeListeners = new Set<(locale: SupportedLanguage) => void>();
+// epoch 只计有意切换（PATCH/跨标签/权威同步），refresh 排序由 appliedSeq 负责
+let localeEpoch = 0;
+let refreshSeq = 0;
+let refreshAppliedSeq = 0;
 
 function setCurrentLocale(locale: SupportedLanguage): void {
   if (locale === currentLocale) return;
@@ -40,6 +44,13 @@ function setCurrentLocale(locale: SupportedLanguage): void {
 }
 
 export function syncLocaleFromConfig(language: SupportedLanguage | undefined): void {
+  localeEpoch += 1;
+  const next = language ?? DEFAULT_LOCALE;
+  cacheLocale(next);
+  setCurrentLocale(next);
+}
+
+function applyRefreshedLocale(language: SupportedLanguage | undefined): void {
   const next = language ?? DEFAULT_LOCALE;
   cacheLocale(next);
   setCurrentLocale(next);
@@ -55,6 +66,9 @@ export function getLocale(): SupportedLanguage {
 
 export function __resetI18nForTests(): void {
   currentLocale = DEFAULT_LOCALE;
+  localeEpoch = 0;
+  refreshSeq = 0;
+  refreshAppliedSeq = 0;
   localeListeners.clear();
   try {
     localStorage.removeItem(STORAGE_KEY);
@@ -100,7 +114,10 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     const onStorage = (e: StorageEvent) => {
       if (e.key !== null && e.key !== STORAGE_KEY) return;
       const v = e.key === null ? readCachedLocale() : e.newValue;
-      if (isSupported(v)) setCurrentLocale(v);
+      if (isSupported(v)) {
+        localeEpoch += 1;
+        setCurrentLocale(v);
+      }
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
@@ -135,7 +152,14 @@ export function useT(): Messages {
 export function useLocaleConfigSync(): void {
   useEffect(() => {
     const refresh = () => {
-      void api.config.get().then((cfg) => syncLocaleFromConfig(cfg.language)).catch(() => {});
+      const epoch = localeEpoch;
+      const seq = ++refreshSeq;
+      void api.config.get().then((cfg) => {
+        if (epoch !== localeEpoch) return;
+        if (seq <= refreshAppliedSeq) return;
+        refreshAppliedSeq = seq;
+        applyRefreshedLocale(cfg.language);
+      }).catch(() => {});
     };
     const onVisibility = () => {
       if (document.visibilityState === 'visible') refresh();

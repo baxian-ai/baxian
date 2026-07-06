@@ -94,7 +94,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleCancel = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: t.taskDetail.cancelConfirmTitle(task.id), confirmLabel: t.taskDetail.cancelConfirmLabel, cancelLabel: t.taskDetail.cancelConfirmBackLabel }))) return;
+    if (!(await confirmDialog({ title: t.taskDetail.cancelConfirmTitle(task.id), confirmLabel: t.taskDetail.cancelConfirmLabel, cancelLabel: t.common.backText }))) return;
     setCancelling(true);
     try {
       const updated = await api.tasks.update(task.id, { status: 'cancelled' });
@@ -533,7 +533,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     return (
       <>
         <button type="button" disabled={!editEnabled} onClick={() => setEditOpen(true)} className="btn-secondary">
-          {t.taskDetail.edit}
+          {t.common.edit}
         </button>
         <button
           type="button"
@@ -557,7 +557,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             }
             className="btn-secondary"
           >
-            {retrying ? t.taskDetail.retrying : t.common.retry}
+            {retrying ? t.common.retrying : t.common.retry}
           </button>
         )}
         <button
@@ -605,7 +605,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             title={t.taskDetail.confirmButtonTitle}
             className="btn-primary"
           >
-            {completing ? t.taskDetail.confirming : t.taskDetail.confirm}
+            {completing ? t.taskDetail.confirming : t.common.confirm}
           </button>
         )}
         {serverPublishRetry && (
@@ -616,7 +616,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             title={t.taskDetail.retryPublishButtonTitle}
             className="btn-primary"
           >
-            {completing ? t.taskDetail.retrying : t.taskDetail.retryPublish}
+            {completing ? t.common.retrying : t.taskDetail.retryPublish}
           </button>
         )}
       </>
