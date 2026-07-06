@@ -4,6 +4,7 @@ import type { Finding, FindingResponse, FindingSeverity, ReviewRound } from '../
 import { useTask } from '../hooks/use-events.ts';
 import { useReviewRounds } from '../hooks/use-review-rounds.ts';
 import { DiffView } from '../components/diff-view.tsx';
+import { useT } from '../i18n/index.tsx';
 
 const SEVERITY_CLASS: Record<FindingSeverity, string> = {
   critical: 'pill pill-danger font-semibold',
@@ -29,6 +30,7 @@ function findingLocation(f: Finding): string {
 }
 
 export function ReviewRoundPage() {
+  const t = useT();
   const { taskId = '', phase = '', round = '' } = useParams();
   const navigate = useNavigate();
   const { hash } = useLocation();
@@ -51,7 +53,7 @@ export function ReviewRoundPage() {
   return (
     <div className="mx-auto w-full max-w-5xl">
       <button type="button" onClick={() => navigate(-1)} className="btn-ghost mb-3">
-        ← 返回
+        {t.common.back}
       </button>
       <div className="mb-1 flex flex-wrap items-baseline gap-2">
         <span className="font-mono text-og-400">{taskId}</span>
@@ -59,7 +61,7 @@ export function ReviewRoundPage() {
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
         <span className="pill">{phase}</span>
-        <span>第 {round} 轮</span>
+        <span>{t.agents.round(roundNum)}</span>
         {data?.findings && (
           <span className={data.findings.verdict === 'approve' ? 'pill pill-live' : 'pill pill-warn'}>
             {data.findings.verdict}
@@ -73,12 +75,12 @@ export function ReviewRoundPage() {
         )}
       </div>
 
-      {!loaded && <div className="text-sm text-og-500">加载中…</div>}
+      {!loaded && <div className="text-sm text-og-500">{t.common.loading}</div>}
       {loaded && error && (
-        <div className="text-sm text-accent">加载评审记录失败：{error}</div>
+        <div className="text-sm text-accent">{t.review.loadFailed(error)}</div>
       )}
       {loaded && !error && !data && (
-        <div className="text-sm text-accent">未找到该轮评审（{phase} 第 {round} 轮）。</div>
+        <div className="text-sm text-accent">{t.review.roundNotFound(phase, round)}</div>
       )}
       {data && <RoundDetail round={data} />}
     </div>
@@ -86,6 +88,7 @@ export function ReviewRoundPage() {
 }
 
 function RoundDetail({ round }: { round: ReviewRound }) {
+  const t = useT();
   const findings = round.findings?.findings ?? [];
   const responses = round.response?.responses ?? [];
   const findingById = new Map(findings.map((f) => [f.id, f]));
@@ -94,10 +97,10 @@ function RoundDetail({ round }: { round: ReviewRound }) {
     <div className="space-y-6">
       <section id="diff">
         <h2 className="mb-2 text-sm font-semibold text-og-800">
-          {round.phase === 'spec' ? '规格稿' : '代码改动'}
+          {round.phase === 'spec' ? t.review.specDraft : t.review.codeChanges}
         </h2>
         {round.contentTruncated && (
-          <div className="mb-2 text-xs text-accent">内容较大，展示的是截断后的片段。</div>
+          <div className="mb-2 text-xs text-accent">{t.review.contentTruncated}</div>
         )}
         {round.content ? (
           round.phase === 'spec' ? (
@@ -106,16 +109,16 @@ function RoundDetail({ round }: { round: ReviewRound }) {
             <DiffView content={round.content} diffstat={round.diffstat} />
           )
         ) : (
-          <div className="text-sm text-og-400">无内容</div>
+          <div className="text-sm text-og-400">{t.review.noContent}</div>
         )}
       </section>
 
       <section id="review">
-        <h2 className="mb-2 text-sm font-semibold text-og-800">QA 评审</h2>
+        <h2 className="mb-2 text-sm font-semibold text-og-800">{t.review.qaReviewHeading}</h2>
         {round.findings === undefined ? (
-          <div className="text-sm text-og-400">评审尚未提交。</div>
+          <div className="text-sm text-og-400">{t.review.notSubmitted}</div>
         ) : findings.length === 0 ? (
-          <div className="text-sm text-og-400">本轮无 findings。</div>
+          <div className="text-sm text-og-400">{t.review.noFindingsThisRound}</div>
         ) : (
           <div className="space-y-2">
             {findings.map((f) => (
@@ -136,7 +139,7 @@ function RoundDetail({ round }: { round: ReviewRound }) {
 
       {responses.length > 0 && (
         <section id="response">
-          <h2 className="mb-2 text-sm font-semibold text-og-800">Dev 反馈</h2>
+          <h2 className="mb-2 text-sm font-semibold text-og-800">{t.review.devResponsesHeading}</h2>
           <div className="space-y-2">
             {responses.map((r) => {
               const f = findingById.get(r.findingId);

@@ -11,7 +11,7 @@ describe('Modal', () => {
         <input data-testid="input-2" />
       </Modal>,
     );
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: '关闭' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Close' }));
   });
 
   it('does not steal focus when parent re-renders with a fresh inline onClose', () => {
@@ -61,7 +61,7 @@ describe('Modal', () => {
         <input />
       </Modal>,
     );
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
@@ -111,7 +111,7 @@ describe('Modal', () => {
     );
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(handler).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(handler).toHaveBeenCalledTimes(2);
   });
 
@@ -233,7 +233,7 @@ describe('Modal focus trap (visible elements)', () => {
       </Modal>,
     );
     return {
-      closeBtn: screen.getByRole('button', { name: '关闭' }),
+      closeBtn: screen.getByRole('button', { name: 'Close' }),
       lastInput: screen.getByTestId('input-2'),
     };
   }

@@ -24,7 +24,7 @@ afterEach(() => vi.restoreAllMocks());
 describe('ImageUploadButton', () => {
   it('renders an upload button', () => {
     renderButton();
-    expect(screen.getByRole('button', { name: /上传图片/ })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Upload image/ })).toBeTruthy();
   });
 
   it('uploads the chosen file and shows a success toast', async () => {
@@ -35,7 +35,7 @@ describe('ImageUploadButton', () => {
     fireEvent.change(fileInput(container), { target: { files: [file] } });
 
     await waitFor(() => expect(spy).toHaveBeenCalledWith('dev-1', file));
-    expect(await screen.findByText(/图片已插入/)).toBeTruthy();
+    expect(await screen.findByText(/Image inserted/)).toBeTruthy();
   });
 
   it('shows an error toast when upload fails (no silent failure)', async () => {
@@ -44,7 +44,7 @@ describe('ImageUploadButton', () => {
 
     fireEvent.change(fileInput(container), { target: { files: [pngFile()] } });
 
-    expect(await screen.findByText(/图片上传失败/)).toBeTruthy();
+    expect(await screen.findByText(/Failed to upload image/)).toBeTruthy();
   });
 
   it('rejects an oversized file client-side without calling the API', async () => {
@@ -55,7 +55,7 @@ describe('ImageUploadButton', () => {
 
     fireEvent.change(fileInput(container), { target: { files: [big] } });
 
-    expect(await screen.findByText(/图片过大/)).toBeTruthy();
+    expect(await screen.findByText(/Image too large/)).toBeTruthy();
     expect(spy).not.toHaveBeenCalled();
   });
 
@@ -69,7 +69,7 @@ describe('ImageUploadButton', () => {
     fireEvent.change(fileInput(container), { target: { files: [pngFile()] } });
 
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: /上传图片/ }) as HTMLButtonElement).disabled).toBe(true),
+      expect((screen.getByRole('button', { name: /Upload image/ }) as HTMLButtonElement).disabled).toBe(true),
     );
     resolveUpload({ path: '/tmp/baxian/upload/dev-1/x.png' });
   });

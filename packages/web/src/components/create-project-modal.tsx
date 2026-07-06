@@ -5,6 +5,7 @@ import { inputCls, labelCls, fieldErrCls } from './form-styles.ts';
 import { api } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
+import { useT } from '../i18n/index.tsx';
 
 interface Props {
   open: boolean;
@@ -22,6 +23,7 @@ const REPO_URL_PATTERNS = [
 
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
+  const t = useT();
   const [id, setId] = useState('');
   const [repo, setRepo] = useState('');
   const [merge, setMerge] = useState<MergeStrategy>(null);
@@ -63,13 +65,13 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
 
   const validate = (): boolean => {
     const errs: { id?: string; repo?: string } = {};
-    if (!id) errs.id = '必填';
-    else if (!ID_PATTERN.test(id)) errs.id = '小写字母开头，只含 a-z 0-9 -，长度 2-32';
-    else if (existingIds.has(id)) errs.id = '该 id 已被占用';
+    if (!id) errs.id = t.createProject.required;
+    else if (!ID_PATTERN.test(id)) errs.id = t.common.idFormatError;
+    else if (existingIds.has(id)) errs.id = t.createProject.idTakenError;
 
-    if (!repo) errs.repo = '必填';
+    if (!repo) errs.repo = t.createProject.required;
     else if (!REPO_URL_PATTERNS.some(re => re.test(repo.trim()))) {
-      errs.repo = '需为 git URL（https / ssh / scp，如 https://gitlab.example.com/group/proj.git）或 owner/repo';
+      errs.repo = t.createProject.repoFormatError;
     }
 
     setFieldErrors(errs);
@@ -93,7 +95,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
       if (result.restartRequired) flagDirty();
       show({
         kind: 'success',
-        title: `项目 ${result.project.id} 已创建`,
+        title: t.createProject.createdToastTitle(result.project.id),
       });
       onCreated(result.project.id);
     } catch (err) {
@@ -107,15 +109,15 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     <Modal
       open={open}
       onClose={handleDismiss}
-      title="新建项目"
+      title={t.createProject.title}
       size="md"
       footer={
         <>
           <button type="button" onClick={handleDismiss} disabled={submitting} className="btn-secondary">
-            取消
+            {t.common.cancel}
           </button>
           <button type="submit" form="create-project-form" disabled={submitting} className="btn-primary">
-            {submitting ? '创建中…' : '创建'}
+            {submitting ? t.common.creating : t.common.create}
           </button>
         </>
       }
@@ -128,7 +130,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
         )}
 
         <div>
-          <label className={labelCls} htmlFor="proj-id">项目 ID</label>
+          <label className={labelCls} htmlFor="proj-id">{t.createProject.idLabel}</label>
           <input
             id="proj-id"
             type="text"
@@ -142,7 +144,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
         </div>
 
         <div>
-          <label className={labelCls} htmlFor="proj-repo">Git 仓库地址</label>
+          <label className={labelCls} htmlFor="proj-repo">{t.createProject.repoLabel}</label>
           <input
             id="proj-repo"
             type="text"
@@ -156,7 +158,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
         </div>
 
         <div>
-          <span className={labelCls}>合并策略</span>
+          <span className={labelCls}>{t.createProject.mergeStrategyLabel}</span>
           <label className="mb-1 flex items-center gap-2">
             <input
               type="radio"
@@ -166,7 +168,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">人类合并（默认）</span>
+            <span className="text-sm text-og-800">{t.createProject.mergeHumanLabel}</span>
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -177,12 +179,12 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">QA Approve 后自动合并</span>
+            <span className="text-sm text-og-800">{t.createProject.mergeAutoLabel}</span>
           </label>
         </div>
 
         <div>
-          <span className={labelCls}>Spec 审核</span>
+          <span className={labelCls}>{t.createProject.specApprovalLabel}</span>
           <label className="mb-1 flex items-center gap-2">
             <input
               type="radio"
@@ -192,7 +194,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">人类审核（默认）</span>
+            <span className="text-sm text-og-800">{t.createProject.specApprovalHumanLabel}</span>
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -203,12 +205,12 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">QA Approve 后自动开始编码</span>
+            <span className="text-sm text-og-800">{t.createProject.specApprovalAutoLabel}</span>
           </label>
         </div>
 
         <div>
-          <span className={labelCls}>Review 模式</span>
+          <span className={labelCls}>{t.createProject.reviewModeLabel}</span>
           <label className="mb-1 flex items-center gap-2">
             <input
               type="radio"
@@ -218,7 +220,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">跟随全局</span>
+            <span className="text-sm text-og-800">{t.createProject.reviewModeFollowGlobalLabel}</span>
           </label>
           <label className="mb-1 flex items-center gap-2">
             <input

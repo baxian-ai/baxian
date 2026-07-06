@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
 import { TaskStatusDot, shortTaskId, taskDetailPath } from './task-status.tsx';
+import { useT } from '../i18n/index.tsx';
 import { TASK_ACTIVE_STATUS_SET, REVIEW_VERDICT_TIMEOUT_MS, TASK_LIST_PAGE_SIZE, type TaskState } from '../shared/index.js';
 
 interface TaskPanelProps {
@@ -107,6 +108,7 @@ function useDoneSection(projectId: string): DoneState {
 }
 
 export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelProps) {
+  const t = useT();
   const activeAll = useMemo(
     () => openTasks.filter((t) => TASK_ACTIVE_STATUS_SET.has(t.status)).sort(byUpdatedDesc),
     [openTasks],
@@ -135,12 +137,12 @@ export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelPro
 
   return (
     <aside
-      aria-label="任务面板"
+      aria-label={t.taskPanel.ariaLabel}
       className={`flex flex-col rounded-lg border border-hairline bg-surface ${className}`}
     >
       <div>
-        <LiveSection title="IN PROGRESS" section={active} emptyHint="暂无正在处理的任务" />
-        <LiveSection title="PENDING" section={pending} emptyHint="暂无待处理的任务" />
+        <LiveSection title="IN PROGRESS" section={active} emptyHint={t.taskPanel.emptyInProgress} />
+        <LiveSection title="PENDING" section={pending} emptyHint={t.taskPanel.emptyPending} />
 
         <div>
           <button
@@ -150,7 +152,7 @@ export function TaskPanel({ projectId, openTasks, className = '' }: TaskPanelPro
             className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-normal uppercase tracking-[0.05em] text-og-500 transition-colors hover:bg-og-50/40"
           >
             <span>DONE</span>
-            <span className="font-normal normal-case text-accent">{doneExpanded ? '收起' : '查看'}</span>
+            <span className="font-normal normal-case text-accent">{doneExpanded ? t.taskPanel.collapse : t.taskPanel.view}</span>
           </button>
           {doneExpanded && <DoneBody state={done} />}
         </div>
@@ -168,6 +170,7 @@ function LiveSection({
   section: { items: TaskState[]; hasMore: boolean; loadMore: () => void; total: number };
   emptyHint: string;
 }) {
+  const t = useT();
   return (
     <section aria-label={title} className="border-b border-hairline">
       <div className="px-3 py-2 text-xs font-normal uppercase tracking-[0.05em] text-og-500">
@@ -184,7 +187,7 @@ function LiveSection({
               onClick={section.loadMore}
               className="w-full px-3 py-2 text-center text-xs text-accent transition-colors hover:bg-og-50/40"
             >
-              加载更多
+              {t.taskPanel.loadMore}
             </button>
           )}
         </div>
@@ -194,14 +197,15 @@ function LiveSection({
 }
 
 function DoneBody({ state }: { state: DoneState }) {
+  const t = useT();
   const showEmpty = state.loaded && !state.error && state.items.length === 0;
   return (
     <div className="divide-y divide-hairline">
       {state.items.map((task) => <TaskRow key={task.id} task={task} />)}
-      {state.error && <div className="px-3 py-2 text-xs text-accent">加载失败：{state.error}</div>}
-      {showEmpty && <div className="px-3 pb-3 pt-1 text-xs text-og-400">暂无已处理的任务</div>}
+      {state.error && <div className="px-3 py-2 text-xs text-accent">{t.common.loadFailed(state.error)}</div>}
+      {showEmpty && <div className="px-3 pb-3 pt-1 text-xs text-og-400">{t.taskPanel.emptyDone}</div>}
       {state.loading && state.items.length === 0 && (
-        <div className="px-3 py-3 text-center text-xs text-og-400">加载中…</div>
+        <div className="px-3 py-3 text-center text-xs text-og-400">{t.common.loading}</div>
       )}
       {state.hasMore && (
         <button
@@ -210,7 +214,7 @@ function DoneBody({ state }: { state: DoneState }) {
           disabled={state.loading}
           className="w-full px-3 py-2 text-center text-xs text-accent transition-colors hover:bg-og-50/40 disabled:opacity-50"
         >
-          {state.loading ? '加载中…' : '加载更多'}
+          {state.loading ? t.common.loading : t.taskPanel.loadMore}
         </button>
       )}
     </div>
@@ -235,6 +239,7 @@ function useVerdictOverdue(task: TaskState): boolean {
 }
 
 function TaskRow({ task }: { task: TaskState }) {
+  const t = useT();
   const navigate = useNavigate();
   const round = task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
   const overdue = useVerdictOverdue(task);
@@ -248,7 +253,7 @@ function TaskRow({ task }: { task: TaskState }) {
       <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
       {task.phase === 'spec' && <span className="pill pill-review shrink-0">spec</span>}
       {overdue && <span className="pill pill-warn shrink-0" title="Review verdict missing">!</span>}
-      <span aria-label={`第 ${round} 轮`} className="shrink-0 text-xs text-og-400">R{round}</span>
+      <span aria-label={t.agents.round(round)} className="shrink-0 text-xs text-og-400">R{round}</span>
       <TaskStatusDot status={task.status} />
     </button>
   );

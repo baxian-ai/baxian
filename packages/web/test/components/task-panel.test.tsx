@@ -167,7 +167,7 @@ describe('TaskPanel', () => {
     expect(dot.nextElementSibling).toBeNull();
   });
 
-  it('client-paginates a long section: shows 20 + 加载更多, then reveals the rest', () => {
+  it('client-paginates a long section: shows 20 + Load more, then reveals the rest', () => {
     const many = Array.from({ length: 25 }, (_, i) =>
       task({ id: `task-${String(i + 1).padStart(3, '0')}`, status: 'pending' }),
     );
@@ -175,12 +175,12 @@ describe('TaskPanel', () => {
     const pending = screen.getByRole('region', { name: 'PENDING' });
     expect(within(pending).getAllByText(/^\d+$/).length).toBe(20);
 
-    fireEvent.click(within(pending).getByRole('button', { name: '加载更多' }));
+    fireEvent.click(within(pending).getByRole('button', { name: 'Load more' }));
     expect(within(pending).getAllByText(/^\d+$/).length).toBe(25);
-    expect(within(pending).queryByRole('button', { name: '加载更多' })).toBeNull();
+    expect(within(pending).queryByRole('button', { name: 'Load more' })).toBeNull();
   });
 
-  it('does NOT query 已处理 until expanded, then fetches and renders it', async () => {
+  it('does NOT query the DONE section until expanded, then fetches and renders it', async () => {
     mockDoneOnly(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
     renderPanel([task({ id: 'task-001', status: 'in_progress' })]);
     expect(pageMock).not.toHaveBeenCalled();
@@ -190,7 +190,7 @@ describe('TaskPanel', () => {
     expect(doneCalls().some((c) => (c[1]?.offset ?? 0) === 0)).toBe(true);
   });
 
-  it('paginates 已处理 via 加载更多 using the server nextOffset', async () => {
+  it('paginates the DONE section via Load more using the server nextOffset', async () => {
     pageMock.mockImplementation(async (_p: string, opts?: { category?: string; offset?: number }) => {
       if (opts?.category !== 'done') return emptyPage();
       return (opts.offset ?? 0) === 0
@@ -201,14 +201,14 @@ describe('TaskPanel', () => {
 
     clickDone();
     await screen.findByText('090');
-    fireEvent.click(screen.getByRole('button', { name: '加载更多' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
     expect(await screen.findByText('070')).toBeTruthy();
     await waitFor(() =>
       expect(doneCalls().some((c) => c[1]?.offset === 20)).toBe(true),
     );
   });
 
-  it('re-expanding 已处理 re-queries the first page (acts as a refresh)', async () => {
+  it('re-expanding DONE re-queries the first page (acts as a refresh)', async () => {
     pageMock.mockResolvedValue(donePage([task({ id: 'task-090', status: 'merged', title: 'shipped' })], { nextOffset: 1 }));
     renderPanel([]);
 
@@ -248,14 +248,14 @@ describe('TaskPanel', () => {
     expect(pageMock).not.toHaveBeenCalled();
   });
 
-  it('surfaces a 已处理 load error instead of failing silently', async () => {
+  it('surfaces a DONE section load error instead of failing silently', async () => {
     pageMock.mockImplementation(async (_p: string, opts?: { category?: string }) => {
       if (opts?.category === 'done') throw new Error('boom');
       return emptyPage();
     });
     renderPanel([]);
     clickDone();
-    expect(await screen.findByText(/加载失败：boom/)).toBeTruthy();
+    expect(await screen.findByText(/Failed to load: boom/)).toBeTruthy();
   });
 
   it('uses the compact panel chrome and keeps the header/close control outside the panel', () => {
@@ -263,12 +263,12 @@ describe('TaskPanel', () => {
     expect(screen.getByRole('region', { name: 'IN PROGRESS' })).toBeTruthy();
     expect(screen.getByRole('region', { name: 'PENDING' })).toBeTruthy();
     expect(screen.getByRole('button', { name: /DONE/ })).toBeTruthy();
-    expect(screen.queryByRole('region', { name: '正在处理' })).toBeNull();
-    expect(screen.queryByRole('region', { name: '待处理' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '刷新 Task 列表' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '+ 新建任务' })).toBeNull();
+    expect(screen.queryByRole('region', { name: 'In Progress' })).toBeNull();
+    expect(screen.queryByRole('region', { name: 'Pending' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Refresh task list' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '+ New task' })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Tasks' })).toBeNull();
-    expect(screen.queryByRole('button', { name: '关闭任务面板' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Close task panel' })).toBeNull();
   });
 
   it('renders the section titles in normal weight, not bold', () => {
@@ -328,7 +328,7 @@ describe('TaskPanel', () => {
 
   it('grows with content instead of painting its own vertical scrollbar', () => {
     const panel = renderPanel([task({ id: 'task-001', status: 'in_progress' })])
-      .getByRole('complementary', { name: '任务面板' });
+      .getByRole('complementary', { name: 'Task panel' });
     expect(panel.className).not.toContain('overflow-y-auto');
     expect(panel.className).not.toContain('max-h-');
     expect(panel.querySelector('.overflow-y-auto')).toBeNull();

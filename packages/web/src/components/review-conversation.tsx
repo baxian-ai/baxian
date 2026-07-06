@@ -10,15 +10,11 @@ import type {
 import { useReviewRounds } from '../hooks/use-review-rounds.ts';
 import { GithubReviewEntry } from './github-review-entry.tsx';
 import { TurnRow } from './review-turn-row.tsx';
+import { useT, type Messages } from '../i18n/index.tsx';
 
 interface Props {
   task: TaskState;
 }
-
-const PHASE_LABEL: Record<TaskPhase, string> = {
-  spec: 'Spec 评审',
-  code: '代码评审',
-};
 
 const VERDICT_CLASS: Record<ReviewFindings['verdict'], string> = {
   approve: 'pill pill-live',
@@ -31,19 +27,19 @@ function lineCount(content: string): number {
   return trimmed === '' ? 0 : trimmed.split('\n').length;
 }
 
-function devSummary(round: ReviewRound): string {
+function devSummary(t: Messages, round: ReviewRound): string {
   if (round.phase === 'code') {
     const stat = (round.diffstat ?? '')
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean)
       .pop();
-    return stat ?? `diff ${lineCount(round.content)} 行`;
+    return stat ?? t.review.diffLineCount(lineCount(round.content));
   }
-  return `规格文档 ${lineCount(round.content)} 行`;
+  return t.review.specDocLineCount(lineCount(round.content));
 }
 
-function findingsSummary(findings: ReviewFindings): string {
+function findingsSummary(t: Messages, findings: ReviewFindings): string {
   const by = { critical: 0, major: 0, minor: 0 };
   for (const f of findings.findings) {
     if (f.severity in by) by[f.severity]++;
@@ -53,10 +49,10 @@ function findingsSummary(findings: ReviewFindings): string {
   if (by.major) parts.push(`${by.major} major`);
   if (by.minor) parts.push(`${by.minor} minor`);
   const total = findings.findings.length;
-  return `${total} 条 findings${parts.length ? `（${parts.join(', ')}）` : ''}`;
+  return t.review.findingsSummary(total, parts.join(', '));
 }
 
-function responseSummary(response: ReviewResponse): string {
+function responseSummary(t: Messages, response: ReviewResponse): string {
   const by = { fix: 0, reject: 0, 'out-of-scope': 0 };
   for (const r of response.responses) {
     if (r.action in by) by[r.action]++;
@@ -65,17 +61,18 @@ function responseSummary(response: ReviewResponse): string {
   if (by.fix) parts.push(`${by.fix} fixed`);
   if (by.reject) parts.push(`${by.reject} rejected`);
   if (by['out-of-scope']) parts.push(`${by['out-of-scope']} out-of-scope`);
-  return parts.join(' · ') || `${response.responses.length} 条反馈`;
+  return parts.join(' · ') || t.review.responsesSummary(response.responses.length);
 }
 
 export function ReviewConversation({ task }: Props) {
+  const t = useT();
   const hasRoundRecords = task.reviewMode === 'server' || (task.specReviewRound ?? 0) > 0;
   const hasGithubReview = task.reviewMode !== 'server' && task.prNumber !== undefined;
   if (!hasRoundRecords && !hasGithubReview) return null;
   return (
-    <section className="mt-4" aria-label="评审记录">
+    <section className="mt-4" aria-label={t.review.sectionTitle}>
       <div className="mb-2 text-sm text-og-700">
-        评审记录
+        {t.review.sectionTitle}
       </div>
       <div className="space-y-4">
         {hasRoundRecords && <ReviewRounds task={task} />}
@@ -86,6 +83,7 @@ export function ReviewConversation({ task }: Props) {
 }
 
 function ReviewRounds({ task }: Props) {
+  const t = useT();
   const navigate = useNavigate();
   const revision = `${task.specReviewRound ?? 0}:${task.reviewRound}:${task.status}:${task.phase ?? 'code'}`;
   const { rounds, loaded, error } = useReviewRounds(task.id, revision);
@@ -94,9 +92,9 @@ function ReviewRounds({ task }: Props) {
     navigate(`/tasks/${encodeURIComponent(task.id)}/rounds/${phase}/${round}${hash}`);
   }
 
-  if (error) return <div className="text-sm text-accent">加载评审记录失败：{error}</div>;
-  if (!loaded) return <div className="text-sm text-og-400">加载评审记录…</div>;
-  if ((rounds?.length ?? 0) === 0) return <div className="text-sm text-og-400">评审尚未开始</div>;
+  if (error) return <div className="text-sm text-accent">{t.review.loadFailed(error)}</div>;
+  if (!loaded) return <div className="text-sm text-og-400">{t.review.loadingRecords}</div>;
+  if ((rounds?.length ?? 0) === 0) return <div className="text-sm text-og-400">{t.review.notStarted}</div>;
 
   return (
     <>
@@ -106,7 +104,7 @@ function ReviewRounds({ task }: Props) {
           .sort((a, b) => a.round - b.round);
         if (phaseRounds.length === 0) return null;
         return (
-          <ReviewGroup key={phase} title={PHASE_LABEL[phase]}>
+          <ReviewGroup key={phase} title={t.review.phaseLabel[phase]}>
             {phaseRounds.map((round) => (
               <RoundBlock key={`${phase}-${round.round}`} round={round} onOpen={openRound} />
             ))}
@@ -133,38 +131,39 @@ function RoundBlock({
   round: ReviewRound;
   onOpen: (phase: TaskPhase, round: number, hash: string) => void;
 }) {
+  const t = useT();
   const isSpec = round.phase === 'spec';
   return (
     <div>
-      <div className="mb-1 text-xs text-og-400">第 {round.round} 轮</div>
+      <div className="mb-1 text-xs text-og-400">{t.agents.round(round.round)}</div>
       <div className="space-y-1.5">
         <TurnRow
           role="dev"
-          label={isSpec ? '提交规格稿' : '提交代码改动'}
-          summary={devSummary(round)}
+          label={isSpec ? t.review.submitSpecDraft : t.review.submitCodeChanges}
+          summary={devSummary(t, round)}
           onClick={() => onOpen(round.phase, round.round, '')}
         />
         {round.findings && (
           <TurnRow
             role="qa"
-            label="评审"
+            label={t.review.reviewTurnLabel}
             badge={<span className={VERDICT_CLASS[round.findings.verdict]}>{round.findings.verdict}</span>}
-            summary={findingsSummary(round.findings)}
+            summary={findingsSummary(t, round.findings)}
             onClick={() => onOpen(round.phase, round.round, '#review')}
           />
         )}
         {round.response && (
           <TurnRow
             role="dev"
-            label="反馈"
-            summary={responseSummary(round.response)}
+            label={t.review.responseTurnLabel}
+            summary={responseSummary(t, round.response)}
             onClick={() => onOpen(round.phase, round.round, '#response')}
           />
         )}
         {round.userDecision && (
           <TurnRow
             role="user"
-            label={round.userDecision.verdict === 'approve' ? '通过 Spec' : '打回 Spec'}
+            label={round.userDecision.verdict === 'approve' ? t.taskDetail.specApprove : t.taskDetail.specReject}
             badge={<span className={VERDICT_CLASS[round.userDecision.verdict]}>{round.userDecision.verdict}</span>}
             summary={round.userDecision.comments ?? ''}
             onClick={() => onOpen(round.phase, round.round, '#review')}

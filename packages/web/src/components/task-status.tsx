@@ -1,24 +1,10 @@
 import type { TaskStatus } from '../shared/index.js';
+import { getMessages } from '../i18n/index.tsx';
 
-// 展示用中文标签；内部状态值仍是英文枚举（aria/title 保留原值供排查）。
-export const STATUS_LABELS: Record<TaskStatus, string> = {
-  pending: '待处理',
-  in_progress: '进行中',
-  review: '评审中',
-  fixing: '修订中',
-  'spec-ready': 'Spec 待批',
-  approved: '已通过',
-  'merge-ready': '待确认',
-  ready: '待确认',
-  merged: '已合并',
-  done: '已完成',
-  failed: '失败',
-  max_rounds: '轮次达上限',
-  cancelled: '已取消',
-};
-
+// 内部状态值仍是英文枚举（aria/title 保留原值供排查）；仅供非组件命令式代码调用，
+// 组件内一律 useT() 取 t.status[status]（订阅 locale 变化）。
 export function taskStatusLabel(status: TaskStatus): string {
-  return STATUS_LABELS[status] ?? status;
+  return getMessages().status[status] ?? status;
 }
 
 // Status hues: green = on track/done, blue = agent busy in review, amber = needs a human

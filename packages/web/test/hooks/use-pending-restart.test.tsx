@@ -383,7 +383,7 @@ describe('usePendingRestart', () => {
     await act(async () => { await result.current.triggerRestart(); });
 
     expect(result.current.phase).toBe('failed');
-    expect(result.current.error).toMatch(/获取重启前 startedAt 失败/);
+    expect(result.current.error).toMatch(/Failed to read startedAt before restart/);
     expect(result.current.error).toMatch(/server unreachable/);
   });
 

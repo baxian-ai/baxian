@@ -6,7 +6,8 @@ import { AgentCard, type TerminalMode } from './agent-card.tsx';
 import { api } from '../api.ts';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useToast } from './toast.tsx';
-import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath, taskStatusLabel } from './task-status.tsx';
+import { STATUS_BADGE_COLORS, shortTaskId, taskDetailPath } from './task-status.tsx';
+import { useT } from '../i18n/index.tsx';
 
 interface AgentGroupProps {
   group: AgentConfig[];
@@ -29,12 +30,13 @@ export function AgentGroup({
   onDeleted,
   terminalMode = 'activity-preview',
 }: AgentGroupProps) {
+  const t = useT();
   const dev = group.find(agent => agent.role === 'dev') ?? group[0];
   const qa = group.find(agent => agent.role === 'qa');
   const activeTasks = tasks.filter(task => taskBelongsToGroup(task, dev?.id, qa?.id));
   const claimableTasks = dev
     ? tasks
-        .filter(t => claimableForDev(t, projectId, dev.id))
+        .filter(task => claimableForDev(task, projectId, dev.id))
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     : [];
   const devSnapshot = dev ? agentsById.get(dev.id) : undefined;
@@ -90,8 +92,8 @@ export function AgentGroup({
                   <span className="truncate text-og-1000">{task.title}</span>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <span className="shrink-0 text-xs text-og-500">第 {round} 轮</span>
-                  <span className={`${STATUS_BADGE_COLORS[task.status]} shrink-0`} title={task.status}>{taskStatusLabel(task.status)}</span>
+                  <span className="shrink-0 text-xs text-og-500">{t.agents.round(round)}</span>
+                  <span className={`${STATUS_BADGE_COLORS[task.status]} shrink-0`} title={task.status}>{t.status[task.status] ?? task.status}</span>
                 </div>
               </button>
             );
@@ -103,7 +105,7 @@ export function AgentGroup({
           className="mb-2 rounded-lg border border-hairline bg-surface px-3 py-2 text-sm text-og-400"
           aria-label={`${label} no active task`}
         >
-          暂无任务
+          {t.agents.noActiveTask}
         </div>
       )}
       <div className={`grid grid-cols-1 ${agentGridCols} gap-4`}>
@@ -147,6 +149,7 @@ interface ClaimableListProps {
 }
 
 function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProps) {
+  const t = useT();
   const { show } = useToast();
   const navigate = useNavigate();
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
@@ -155,11 +158,11 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
     setBusyTaskId(taskId);
     try {
       await api.tasks.dispatch(taskId, { agentId: devId });
-      show({ kind: 'success', title: `任务 ${taskId} 已交给 ${devId}` });
+      show({ kind: 'success', title: t.agents.taskHandedTo(taskId, devId) });
     } catch (err) {
       show({
         kind: 'error',
-        title: '发起失败',
+        title: t.agents.startFailed,
         body: err instanceof Error ? err.message : String(err),
       });
     } finally {
@@ -188,16 +191,16 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
             >
               <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
               <span className="truncate text-og-1000" title={task.title}>{task.title}</span>
-              {unassigned && <span className="pill shrink-0">未分配</span>}
+              {unassigned && <span className="pill shrink-0">{t.agents.unassigned}</span>}
             </button>
             <button
               type="button"
               onClick={() => void handleDispatch(task.id)}
               disabled={!dispatchReady || busy}
-              title={dispatchReady ? `交给 ${devId} 并立即开始` : 'Dev agent 当前不可用'}
+              title={dispatchReady ? t.agents.handToAndStart(devId) : t.agents.devAgentUnavailable}
               className="shrink-0 text-sm font-medium text-accent transition-colors hover:text-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {busyTaskId === task.id ? '发起中…' : '发起'}
+              {busyTaskId === task.id ? t.agents.starting : t.agents.start}
             </button>
           </div>
         );

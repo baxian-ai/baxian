@@ -121,6 +121,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const merged: BaxianConfig = {
+        language: ('language' in incoming ? incoming.language : current.language) as BaxianConfig['language'],
         review: { ...current.review, ...(incoming.review ?? {}) },
         server: mergedServer,
         host: current.host,

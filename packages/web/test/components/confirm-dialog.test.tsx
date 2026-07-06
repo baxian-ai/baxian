@@ -14,7 +14,7 @@ function Harness({ body, confirmLabel }: { body?: string; confirmLabel?: string 
       <button
         type="button"
         onClick={() => {
-          void confirm({ title: '删除这一项？', body, confirmLabel }).then(ok => setResult(ok ? 'yes' : 'no'));
+          void confirm({ title: 'Delete this item?', body, confirmLabel }).then(ok => setResult(ok ? 'yes' : 'no'));
         }}
       >
         trigger
@@ -35,30 +35,30 @@ function renderHarness(props: Parameters<typeof Harness>[0] = {}) {
 
 describe('ConfirmProvider / useConfirm', () => {
   it('opens a dialog with the title and resolves true on confirm', async () => {
-    renderHarness({ body: '此操作不可撤销。' });
-    expect(screen.getByText('删除这一项？')).toBeTruthy();
-    expect(screen.getByText('此操作不可撤销。')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    renderHarness({ body: 'This action cannot be undone.' });
+    expect(screen.getByText('Delete this item?')).toBeTruthy();
+    expect(screen.getByText('This action cannot be undone.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
     await screen.findByText('yes');
-    expect(screen.queryByText('删除这一项？')).toBeNull();
+    expect(screen.queryByText('Delete this item?')).toBeNull();
   });
 
   it('resolves false on cancel and on Escape', async () => {
     renderHarness();
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     await screen.findByText('no');
 
     fireEvent.click(screen.getByRole('button', { name: 'trigger' }));
-    expect(screen.getByText('删除这一项？')).toBeTruthy();
+    expect(screen.getByText('Delete this item?')).toBeTruthy();
     fireEvent.keyDown(document, { key: 'Escape' });
     await screen.findByText('no');
-    expect(screen.queryByText('删除这一项？')).toBeNull();
+    expect(screen.queryByText('Delete this item?')).toBeNull();
   });
 
   it('uses a custom confirm label and initial focus stays on the safe side (close button)', async () => {
-    renderHarness({ confirmLabel: '删除' });
-    expect((document.activeElement as HTMLElement | null)?.getAttribute('aria-label')).toBe('关闭');
-    fireEvent.click(screen.getByRole('button', { name: '删除' }));
+    renderHarness({ confirmLabel: 'Delete' });
+    expect((document.activeElement as HTMLElement | null)?.getAttribute('aria-label')).toBe('Close');
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
     await screen.findByText('yes');
   });
 });
@@ -67,10 +67,10 @@ function NestedHost() {
   const confirm = useConfirm();
   const [outcome, setOutcome] = useState('');
   return (
-    <Modal open title="外层弹窗" onClose={() => setOutcome('outer-closed')}>
+    <Modal open title="Outer modal" onClose={() => setOutcome('outer-closed')}>
       <button
         type="button"
-        onClick={() => { void confirm({ title: '内层确认？' }).then(ok => setOutcome(ok ? 'inner-yes' : 'inner-no')); }}
+        onClick={() => { void confirm({ title: 'Inner confirm?' }).then(ok => setOutcome(ok ? 'inner-yes' : 'inner-no')); }}
       >
         open-inner
       </button>
@@ -87,12 +87,12 @@ describe('nested modal stack', () => {
       </ConfirmProvider>,
     );
     fireEvent.click(screen.getByRole('button', { name: 'open-inner' }));
-    expect(screen.getByText('内层确认？')).toBeTruthy();
+    expect(screen.getByText('Inner confirm?')).toBeTruthy();
 
     fireEvent.keyDown(document, { key: 'Escape' });
     await screen.findByText('inner-no');
-    expect(screen.queryByText('内层确认？')).toBeNull();
-    expect(screen.getByText('外层弹窗')).toBeTruthy();
+    expect(screen.queryByText('Inner confirm?')).toBeNull();
+    expect(screen.getByText('Outer modal')).toBeTruthy();
     expect(screen.queryByText('outer-closed')).toBeNull();
   });
 });

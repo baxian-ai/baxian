@@ -76,6 +76,7 @@ export function createApiMock(): ApiModule {
       },
       config: {
         get: vi.fn(),
+        patch: vi.fn(),
       },
       health: {
         get: vi.fn(),

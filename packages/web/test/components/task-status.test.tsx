@@ -6,9 +6,12 @@ import {
   formatTaskTimestamp,
   shortTaskId,
   taskDetailPath,
+  taskStatusLabel,
 } from '../../src/components/task-status.tsx';
+import { __resetI18nForTests, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
 
 afterEach(() => cleanup());
+afterEach(() => __resetI18nForTests());
 
 describe('shortTaskId', () => {
   it('strips the task- prefix down to the number, preserving zero padding', () => {
@@ -107,6 +110,17 @@ describe('formatTaskTimestamp', () => {
   it('still returns "" for empty values regardless of precision', () => {
     expect(formatTaskTimestamp(null, false)).toBe('');
     expect(formatTaskTimestamp('   ', false)).toBe('');
+  });
+});
+
+describe('taskStatusLabel', () => {
+  it('returns the English label by default (no I18nProvider / default locale)', () => {
+    expect(taskStatusLabel('pending')).toBe('Pending');
+  });
+
+  it('returns the Chinese label after syncLocaleFromConfig switches locale to zh-CN', () => {
+    syncLocaleFromConfig('zh-CN');
+    expect(taskStatusLabel('pending')).toBe('待处理');
   });
 });
 

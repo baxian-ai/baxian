@@ -331,6 +331,8 @@ export const api = {
   },
   config: {
     get: () => get<BaxianConfig>('/config'),
+    patch: (body: Partial<BaxianConfig>) =>
+      patch<{ config: BaxianConfig; restartRequired: boolean; note: string }>('/config', body),
   },
   health: {
     get: fetchHealth,

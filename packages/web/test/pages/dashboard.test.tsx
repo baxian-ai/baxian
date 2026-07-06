@@ -67,28 +67,6 @@ function renderDashboard() {
   );
 }
 
-const originalNotification = window.Notification;
-
-function installNotificationMock(permission: NotificationPermission) {
-  const requestPermission = vi.fn<() => Promise<NotificationPermission>>();
-  class MockNotification {
-    static permission = permission;
-    static requestPermission = requestPermission;
-  }
-  Object.defineProperty(window, 'Notification', {
-    configurable: true,
-    value: MockNotification,
-  });
-  return { requestPermission, MockNotification };
-}
-
-function restoreNotification(): void {
-  Object.defineProperty(window, 'Notification', {
-    configurable: true,
-    value: originalNotification,
-  });
-}
-
 beforeEach(() => {
   cleanup();
   useAgentsMock.mockImplementation(() => agentsHookState);
@@ -114,7 +92,6 @@ beforeEach(() => {
   projectTasksHookState.loaded = true;
   projectTasksHookState.error = null;
   localStorage.clear();
-  restoreNotification();
 });
 
 describe('Dashboard layout', () => {
@@ -157,7 +134,7 @@ describe('Dashboard layout', () => {
     const idLink = within(heading).getByRole('link', { name: 'demo' });
     expect(idLink.getAttribute('href')).toBe('/project/demo');
 
-    const detailsLink = screen.getByRole('link', { name: /详情/ });
+    const detailsLink = screen.getByRole('link', { name: /Details/ });
     expect(detailsLink.getAttribute('href')).toBe('/project/demo');
     expect(detailsLink.getAttribute('aria-label')).toMatch(/demo/);
 
@@ -174,8 +151,8 @@ describe('Dashboard layout', () => {
     ]);
     renderDashboard();
 
-    const alphaDetails = screen.getByRole('link', { name: /详情.*alpha/ });
-    const betaDetails = screen.getByRole('link', { name: /详情.*beta/ });
+    const alphaDetails = screen.getByRole('link', { name: /Details.*alpha/ });
+    const betaDetails = screen.getByRole('link', { name: /Details.*beta/ });
     expect(alphaDetails.getAttribute('href')).toBe('/project/alpha');
     expect(betaDetails.getAttribute('href')).toBe('/project/beta');
     expect(alphaDetails).not.toBe(betaDetails);
@@ -237,20 +214,20 @@ describe('Dashboard layout', () => {
     expect(groupWrapper.className).not.toContain('space-y-3');
   });
 
-  it('renders "新建任务" as a low-key text-style button and demotes "新建项目" into the right-edge "更多" kebab menu', () => {
+  it('renders "+ New task" as a low-key text-style button and demotes "New project" into the right-edge "More actions" kebab menu', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
     const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = screen.getByRole('button', { name: '+ 新建任务' });
+    const taskBtn = screen.getByRole('button', { name: '+ New task' });
     expect(taskBtn.className).toContain('btn-ghost');
     expect(taskBtn.className).not.toContain('btn-primary');
     expect(topbarActions.contains(taskBtn)).toBe(true);
 
-    expect(screen.queryByRole('button', { name: '新建项目' })).toBeNull();
-    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'New project' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
 
-    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
     expect(moreTrigger.getAttribute('aria-haspopup')).toBe('menu');
     expect(moreTrigger.getAttribute('aria-expanded')).toBe('false');
 
@@ -263,26 +240,26 @@ describe('Dashboard layout', () => {
     expect(toolbar.lastElementChild).toBe(triggerWrapper);
   });
 
-  it('keeps the disabled Dashboard "新建任务" action in the topbar when there is no project yet', () => {
+  it('keeps the disabled Dashboard "+ New task" action in the topbar when there is no project yet', () => {
     seed([]);
     renderDashboard();
 
     const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建任务' }) as HTMLButtonElement;
+    const taskBtn = within(topbarActions).getByRole('button', { name: '+ New task' }) as HTMLButtonElement;
     expect(taskBtn.disabled).toBe(true);
     expect(taskBtn.getAttribute('title')).toBeNull();
-    expect(taskBtn.parentElement?.getAttribute('title')).toBe('请先创建项目');
+    expect(taskBtn.parentElement?.getAttribute('title')).toBe('Create a project first');
     expect(taskBtn.parentElement?.className).toContain('inline-flex');
 
-    const hint = within(topbarActions).getByText('请先创建项目');
+    const hint = within(topbarActions).getByText('Create a project first');
     expect(hint.className).toContain('sr-only');
   });
 
-  it('only sets aria-controls on the 更多 kebab while its menu is open', () => {
+  it('only sets aria-controls on the More actions kebab while its menu is open', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
     expect(moreTrigger.getAttribute('aria-controls')).toBeNull();
 
     fireEvent.click(moreTrigger);
@@ -294,30 +271,30 @@ describe('Dashboard layout', () => {
     expect(moreTrigger.getAttribute('aria-controls')).toBeNull();
   });
 
-  it('opens the kebab menu on click and exposes a "新建项目" menuitem that opens the CreateProject modal', () => {
+  it('opens the kebab menu on click and exposes a "New project" menuitem that opens the CreateProject modal', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
     fireEvent.click(moreTrigger);
 
     expect(moreTrigger.getAttribute('aria-expanded')).toBe('true');
-    const createProjectItem = screen.getByRole('menuitem', { name: '新建项目' });
+    const createProjectItem = screen.getByRole('menuitem', { name: 'New project' });
     fireEvent.click(createProjectItem);
 
-    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
-    expect(screen.getByRole('dialog', { name: /新建项目|Create/ })).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'New project' })).toBeTruthy();
   });
 
   it('kebab menuitem opens without stealing focus and uses the shared MenuItem hover treatment', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
     fireEvent.click(moreTrigger);
 
-    const item = screen.getByRole('menuitem', { name: '新建项目' });
-    expect(item.textContent).toBe('新建项目');
+    const item = screen.getByRole('menuitem', { name: 'New project' });
+    expect(item.textContent).toBe('New project');
     expect(item.className).not.toMatch(/(^|\s)bg-/);
     expect(item.className).not.toMatch(/focus:bg-/);
     expect(item.className).toMatch(/hover:bg-og-50/);
@@ -328,17 +305,28 @@ describe('Dashboard layout', () => {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
-    const moreTrigger = screen.getByRole('button', { name: '更多操作' });
+    const moreTrigger = screen.getByRole('button', { name: 'More actions' });
     fireEvent.click(moreTrigger);
-    expect(screen.getByRole('menuitem', { name: '新建项目' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'New project' })).toBeTruthy();
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
     expect(document.activeElement).toBe(moreTrigger);
 
     fireEvent.click(moreTrigger);
-    expect(screen.getByRole('menuitem', { name: '新建项目' })).toBeTruthy();
+    expect(screen.getByRole('menuitem', { name: 'New project' })).toBeTruthy();
     fireEvent.mouseDown(document.body);
-    expect(screen.queryByRole('menuitem', { name: '新建项目' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: 'New project' })).toBeNull();
+  });
+
+  it('exposes a "Settings" menuitem that opens the SystemSettingsModal', () => {
+    seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
+    renderDashboard();
+
+    fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Settings' }));
+
+    expect(screen.queryByRole('menuitem', { name: 'Settings' })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
   });
 
   it('surfaces a per-project task-feed error so a broken realtime+REST feed is not silently empty', () => {
@@ -348,7 +336,7 @@ describe('Dashboard layout', () => {
 
     renderDashboard();
 
-    expect(screen.getByText(/任务列表加载失败：realtime down/)).toBeTruthy();
+    expect(screen.getByText(/Failed to load tasks: realtime down/)).toBeTruthy();
   });
 
   it('agent cards render the embedded terminal up front (no need to wait for the agent to start working)', () => {
@@ -378,29 +366,29 @@ describe('Dashboard layout', () => {
   });
 });
 
-describe('Dashboard 项目已创建 follow-up modal', () => {
+describe('Dashboard "Project created" follow-up modal', () => {
   async function reachContinueDialog(): Promise<HTMLElement> {
     seed([makeProject({ id: 'demo', repo: '/tmp/demo' })]);
     renderDashboard();
 
-    fireEvent.click(screen.getByRole('button', { name: '更多操作' }));
-    fireEvent.click(screen.getByRole('menuitem', { name: '新建项目' }));
+    fireEvent.click(screen.getByRole('button', { name: 'More actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: 'New project' }));
 
-    const createDialog = screen.getByRole('dialog', { name: /新建项目/ });
-    fireEvent.change(within(createDialog).getByLabelText('项目 ID'), { target: { value: 'newproj' } });
-    fireEvent.change(within(createDialog).getByLabelText('Git 仓库地址'), { target: { value: 'https://github.com/o/r.git' } });
+    const createDialog = screen.getByRole('dialog', { name: 'New project' });
+    fireEvent.change(within(createDialog).getByLabelText('Project ID'), { target: { value: 'newproj' } });
+    fireEvent.change(within(createDialog).getByLabelText('Git repository URL'), { target: { value: 'https://github.com/o/r.git' } });
     await act(async () => {
-      fireEvent.click(within(createDialog).getByRole('button', { name: '创建' }));
+      fireEvent.click(within(createDialog).getByRole('button', { name: 'Create' }));
     });
 
-    return screen.findByRole('dialog', { name: '项目已创建' });
+    return screen.findByRole('dialog', { name: 'Project created' });
   }
 
-  it('pins both follow-up buttons in the footer region and "继续添加 Agent" enters the add-agent flow', async () => {
+  it('pins both follow-up buttons in the footer region and "Continue adding an agent" enters the add-agent flow', async () => {
     const dialog = await reachContinueDialog();
 
-    const continueBtn = within(dialog).getByRole('button', { name: '继续添加 Agent' });
-    const laterBtn = within(dialog).getByRole('button', { name: '稍后再加' });
+    const continueBtn = within(dialog).getByRole('button', { name: 'Continue adding an agent' });
+    const laterBtn = within(dialog).getByRole('button', { name: 'Later' });
     const footer = continueBtn.parentElement!;
     expect(footer.className).toContain('border-t');
     expect(footer.className).toContain('shrink-0');
@@ -410,287 +398,12 @@ describe('Dashboard 项目已创建 follow-up modal', () => {
     expect(screen.getByTestId('agent-modal').textContent).toContain('newproj');
   });
 
-  it('"稍后再加" closes the follow-up modal without entering the add-agent flow', async () => {
+  it('"Later" closes the follow-up modal without entering the add-agent flow', async () => {
     const dialog = await reachContinueDialog();
 
-    fireEvent.click(within(dialog).getByRole('button', { name: '稍后再加' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Later' }));
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: '项目已创建' })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Project created' })).toBeNull());
     expect(screen.queryByTestId('agent-modal')).toBeNull();
-  });
-});
-
-describe('Dashboard kebab menu 任务完成通知 entry', () => {
-  const STORAGE_KEY = 'baxian.taskNotifications.enabled';
-
-  function openMoreMenu(): void {
-    fireEvent.click(screen.getByRole('button', { name: '更多操作' }));
-  }
-
-  it('hides the notification entry when the browser has no Notification API', () => {
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '新建项目' })).toBeTruthy();
-    expect(screen.getByRole('menuitem', { name: 'Host 管理' })).toBeTruthy();
-    expect(screen.queryByRole('menuitem', { name: /任务完成通知/ })).toBeNull();
-  });
-
-  it('permission not asked yet: "开启任务完成通知" requests permission, closes the menu, then flips to "关闭"', async () => {
-    const notification = installNotificationMock('default');
-    notification.requestPermission.mockImplementation(async () => {
-      notification.MockNotification.permission = 'granted';
-      return 'granted';
-    });
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-
-    expect(screen.queryByRole('menu')).toBeNull();
-    await waitFor(() => expect(notification.requestPermission).toHaveBeenCalledTimes(1));
-    await act(async () => { await Promise.resolve(); });
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('permission granted: toggles the stored preference between off and on without re-requesting permission', async () => {
-    const notification = installNotificationMock('granted');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '关闭任务完成通知' }));
-    expect(screen.queryByRole('menu')).toBeNull();
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('0');
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
-    expect(notification.requestPermission).not.toHaveBeenCalled();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('starts as "开启任务完成通知" when the stored preference is off', () => {
-    installNotificationMock('granted');
-    localStorage.setItem(STORAGE_KEY, '0');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
-  });
-
-  it('permission denied: shows a disabled hint instead of a toggle', () => {
-    const notification = installNotificationMock('denied');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    const item = screen.getByRole('menuitem', { name: '浏览器已拒绝任务完成通知' }) as HTMLButtonElement;
-    expect(item.disabled).toBe(true);
-
-    fireEvent.click(item);
-    expect(notification.requestPermission).not.toHaveBeenCalled();
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-  });
-
-  it('persists the enable preference only after the permission request settles', async () => {
-    const notification = installNotificationMock('default');
-    let resolveRequest: (permission: NotificationPermission) => void = () => {};
-    notification.requestPermission.mockImplementation(
-      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
-    );
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-    expect(notification.requestPermission).toHaveBeenCalledTimes(1);
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-
-    await act(async () => {
-      notification.MockNotification.permission = 'granted';
-      resolveRequest('granted');
-      await Promise.resolve();
-    });
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('a disable from another tab during the pending permission request is not overwritten when it settles', async () => {
-    const notification = installNotificationMock('default');
-    let resolveRequest: (permission: NotificationPermission) => void = () => {};
-    notification.requestPermission.mockImplementation(
-      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
-    );
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-
-    act(() => {
-      localStorage.setItem(STORAGE_KEY, '0');
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '0' }));
-    });
-
-    await act(async () => {
-      notification.MockNotification.permission = 'granted';
-      resolveRequest('granted');
-      await Promise.resolve();
-    });
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('0');
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
-  });
-
-  it('a focus event during the pending permission request does not clobber the enable intent', async () => {
-    const notification = installNotificationMock('default');
-    localStorage.setItem(STORAGE_KEY, '0');
-    let resolveRequest: (permission: NotificationPermission) => void = () => {};
-    notification.requestPermission.mockImplementation(
-      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
-    );
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-
-    act(() => {
-      window.dispatchEvent(new Event('focus'));
-    });
-
-    await act(async () => {
-      notification.MockNotification.permission = 'granted';
-      resolveRequest('granted');
-      await Promise.resolve();
-    });
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('1');
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('clicking 开启 after the permission was granted elsewhere syncs state instead of dead-ending', async () => {
-    const notification = installNotificationMock('default');
-    seed([]);
-    renderDashboard();
-
-    notification.MockNotification.permission = 'granted';
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-    expect(notification.requestPermission).not.toHaveBeenCalled();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('a storage event also re-reads the real notification permission', () => {
-    const notification = installNotificationMock('default');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
-
-    notification.MockNotification.permission = 'granted';
-    act(() => {
-      localStorage.setItem(STORAGE_KEY, '1');
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '1' }));
-    });
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('a queued stale disable event drives the entry by its newValue, not by re-reading current storage', () => {
-    installNotificationMock('granted');
-    localStorage.setItem(STORAGE_KEY, '1');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-
-    act(() => {
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '0' }));
-    });
-    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
-
-    act(() => {
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '1' }));
-    });
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('follows a storage event from another tab so the entry flips without a reload', () => {
-    installNotificationMock('granted');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-
-    act(() => {
-      localStorage.setItem(STORAGE_KEY, '0');
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '0' }));
-    });
-    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
-
-    act(() => {
-      localStorage.setItem(STORAGE_KEY, '1');
-      window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY, newValue: '1' }));
-    });
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-  });
-
-  it('re-reads the stored preference on window focus', () => {
-    installNotificationMock('granted');
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
-
-    act(() => {
-      localStorage.setItem(STORAGE_KEY, '0');
-      window.dispatchEvent(new Event('focus'));
-    });
-    expect(screen.getByRole('menuitem', { name: '开启任务完成通知' })).toBeTruthy();
-  });
-
-  it('disables the entry while the permission request is still pending', async () => {
-    const notification = installNotificationMock('default');
-    let resolveRequest: (permission: NotificationPermission) => void = () => {};
-    notification.requestPermission.mockImplementation(
-      () => new Promise<NotificationPermission>((resolve) => { resolveRequest = resolve; }),
-    );
-    seed([]);
-    renderDashboard();
-
-    openMoreMenu();
-    fireEvent.click(screen.getByRole('menuitem', { name: '开启任务完成通知' }));
-
-    openMoreMenu();
-    const pendingItem = screen.getByRole('menuitem', { name: '开启任务完成通知' }) as HTMLButtonElement;
-    expect(pendingItem.disabled).toBe(true);
-
-    await act(async () => {
-      notification.MockNotification.permission = 'granted';
-      resolveRequest('granted');
-      await Promise.resolve();
-    });
-    expect(screen.getByRole('menuitem', { name: '关闭任务完成通知' })).toBeTruthy();
   });
 });

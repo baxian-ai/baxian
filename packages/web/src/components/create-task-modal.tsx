@@ -5,6 +5,7 @@ import { Modal } from './modal.tsx';
 import { inputCls, labelCls } from './form-styles.ts';
 import { api, fileToBase64 } from '../api.ts';
 import { useToast } from './toast.tsx';
+import { useT } from '../i18n/index.tsx';
 
 interface CreateProps {
   mode?: 'create';
@@ -98,6 +99,7 @@ const counterCls = 'mt-1 text-right text-xs text-og-400';
 const MAX_IMAGE_MIB = Math.floor(IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024);
 
 export function CreateTaskModal(props: Props) {
+  const t = useT();
   const isEdit = props.mode === 'edit';
   const { show } = useToast();
 
@@ -217,14 +219,14 @@ export function CreateTaskModal(props: Props) {
 
   const noDevHint = (() => {
     if (editPreferredInPendingRestart) {
-      return `当前 Dev agent "${preferredAgentId}" 在 baxian.json 中存在但 runtime 未加载，可能是手动编辑过配置文件；重启 server 可拉起`;
+      return t.createTask.noDevPendingRestartHint(preferredAgentId);
     }
     if (editPreferredPending) {
-      return `当前 Dev agent "${preferredAgentId}" 不在 runtime（可能已从 project 配置移除）；保存可能失败，请确认或选择新 Dev agent`;
+      return t.createTask.noDevNotInRuntimeHint(preferredAgentId);
     }
     if (!selectedProjectId) return null;
     if (visibleDevs.length > 0) return null;
-    if (pendingRestartDevs.length > 0) return 'baxian.json 里有 Dev agent 但 runtime 未加载（可能是手动编辑过配置）；重启 server 后生效';
+    if (pendingRestartDevs.length > 0) return t.createTask.noDevGlobalPendingRestartHint;
     return null;
   })();
 
@@ -263,7 +265,7 @@ export function CreateTaskModal(props: Props) {
           description: descriptionTrimmed,
           preferredAgentId,
         });
-        show({ kind: 'success', title: '任务已更新' });
+        show({ kind: 'success', title: t.createTask.updatedToastTitle });
         props.onUpdated?.(updated);
         props.onClose();
       } else {
@@ -280,7 +282,7 @@ export function CreateTaskModal(props: Props) {
           ...(imagePayload ? { images: imagePayload } : {}),
         });
         if (draftKeyValue) clearDraft(draftKeyValue);
-        show({ kind: 'success', title: '任务已创建' });
+        show({ kind: 'success', title: t.createTask.createdToastTitle });
         props.onCreated?.(task);
         props.onClose();
       }
@@ -297,14 +299,14 @@ export function CreateTaskModal(props: Props) {
     if (picked.length === 0) return;
     const sized = picked.filter((f) => {
       if (f.size > IMAGE_UPLOAD_MAX_BYTES) {
-        show({ kind: 'error', title: '图片过大', body: `${f.name} 超过 ${MAX_IMAGE_MIB} MiB` });
+        show({ kind: 'error', title: t.createTask.imageTooLargeToastTitle, body: t.createTask.imageTooLargeToastBody(f.name, MAX_IMAGE_MIB) });
         return false;
       }
       return true;
     });
     setImages((prev) => {
       if (prev.length + sized.length > TASK_IMAGE_MAX_COUNT) {
-        show({ kind: 'warn', title: `最多 ${TASK_IMAGE_MAX_COUNT} 张图片` });
+        show({ kind: 'warn', title: t.createTask.tooManyImagesToastTitle(TASK_IMAGE_MAX_COUNT) });
       }
       return [...prev, ...sized].slice(0, TASK_IMAGE_MAX_COUNT);
     });
@@ -312,10 +314,10 @@ export function CreateTaskModal(props: Props) {
 
   const removeImage = (idx: number) => setImages((prev) => prev.filter((_, i) => i !== idx));
 
-  const modalTitle = isEdit ? '编辑任务' : '新建任务';
+  const modalTitle = isEdit ? t.createTask.titleEdit : t.createTask.titleCreate;
   const submitLabel = isEdit
-    ? (submitting ? '保存中…' : '保存')
-    : (submitting ? '创建中…' : '创建');
+    ? (submitting ? t.common.saving : t.common.save)
+    : (submitting ? t.common.creating : t.common.create);
   const showProjectSelect = !isEdit && !projectIdProp;
 
   return (
@@ -328,7 +330,7 @@ export function CreateTaskModal(props: Props) {
       footer={
         <>
           <button type="button" onClick={handleDismiss} disabled={submitting} className="btn-secondary">
-            取消
+            {t.common.cancel}
           </button>
           <button type="submit" form="create-task-form" disabled={!canSubmit} className="btn-primary">
             {submitLabel}
@@ -339,13 +341,13 @@ export function CreateTaskModal(props: Props) {
       <form id="create-task-form" onSubmit={handleSubmit} className="space-y-3">
         {!isEdit && draftRestored && (
           <div className="flex items-center justify-between gap-3 rounded-md border border-accent-soft bg-accent-soft/30 px-3 py-2 text-xs text-accent">
-            <span>已恢复上次未提交的草稿</span>
+            <span>{t.createTask.draftRestoredNotice}</span>
             <button
               type="button"
               onClick={handleDiscardDraft}
               className="shrink-0 underline hover:text-accent-hover"
             >
-              丢弃
+              {t.createTask.discardDraftButton}
             </button>
           </div>
         )}
@@ -366,7 +368,7 @@ export function CreateTaskModal(props: Props) {
               disabled={submitting}
               required
             >
-              <option value="" disabled>选择项目</option>
+              <option value="" disabled>{t.createTask.selectProjectPlaceholder}</option>
               {projects.map(p => (
                 <option key={p.id} value={p.id}>{p.id}</option>
               ))}
@@ -383,10 +385,10 @@ export function CreateTaskModal(props: Props) {
             className={inputCls}
             disabled={submitting}
           >
-            <option value="">暂不指定</option>
+            <option value="">{t.createTask.notAssignedOption}</option>
             {editPreferredPending && (
               <option value={preferredAgentId}>
-                {preferredAgentId} {editPreferredInPendingRestart ? '(待重启)' : '(不在 runtime)'}
+                {preferredAgentId} {editPreferredInPendingRestart ? t.createTask.pendingRestartSuffix : t.createTask.notInRuntimeSuffix}
               </option>
             )}
             {visibleDevs.map(d => (
@@ -405,7 +407,7 @@ export function CreateTaskModal(props: Props) {
             onChange={e => setTitle(e.target.value)}
             maxLength={TITLE_MAX}
             className={inputCls}
-            placeholder="一句话描述要做什么"
+            placeholder={t.createTask.titlePlaceholder}
             disabled={submitting}
             required
           />
@@ -413,7 +415,7 @@ export function CreateTaskModal(props: Props) {
         </div>
 
         <div>
-          <label className={labelCls} htmlFor="task-description">Description（可选）</label>
+          <label className={labelCls} htmlFor="task-description">{t.createTask.descriptionLabel}</label>
           <textarea
             id="task-description"
             value={description}
@@ -421,7 +423,7 @@ export function CreateTaskModal(props: Props) {
             maxLength={DESCRIPTION_MAX}
             rows={8}
             className={`${inputCls} font-mono text-xs`}
-            placeholder="详细描述任务，支持 markdown；简单任务可不填"
+            placeholder={t.createTask.descriptionPlaceholder}
             disabled={submitting}
           />
           <div className={counterCls}>{description.length} / {DESCRIPTION_MAX}</div>
@@ -429,14 +431,14 @@ export function CreateTaskModal(props: Props) {
 
         {!isEdit && (
           <div>
-            <label className={labelCls}>图片（可选）</label>
+            <label className={labelCls}>{t.createTask.imagesLabel}</label>
             <button
               type="button"
               onClick={() => imageInputRef.current?.click()}
               disabled={submitting || images.length >= TASK_IMAGE_MAX_COUNT}
               className="btn-secondary"
             >
-              添加图片
+              {t.createTask.addImagesButton}
             </button>
             <input
               ref={imageInputRef}
@@ -456,7 +458,7 @@ export function CreateTaskModal(props: Props) {
                     <span title={f.name} className="truncate text-xs text-og-700">{f.name}</span>
                     <button
                       type="button"
-                      aria-label={`移除图片 ${f.name}`}
+                      aria-label={t.createTask.removeImageAriaLabel(f.name)}
                       onClick={() => removeImage(i)}
                       disabled={submitting}
                       className="ml-2 shrink-0 text-og-400 transition-colors"

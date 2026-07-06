@@ -623,3 +623,25 @@ describe('remote agent host references', () => {
     check(remoteHostConfig(host, rest));
   });
 });
+
+describe('language', () => {
+  it('accepts zh-CN, en-US, and absent language', () => {
+    for (const language of ['zh-CN', 'en-US', undefined]) {
+      const config = makeConfig();
+      if (language !== undefined) (config as Record<string, unknown>).language = language;
+      expect(validateConfig(config)).toEqual([]);
+    }
+  });
+
+  it('rejects invalid language values with a clear path and message', () => {
+    for (const bad of ['zh-cn', 'fr-FR', 123, null]) {
+      const config = makeConfig();
+      (config as Record<string, unknown>).language = bad;
+      const errors = validateConfig(config);
+      expect(errors).toContainEqual({
+        path: 'language',
+        message: "language must be 'zh-CN' or 'en-US'",
+      });
+    }
+  });
+});

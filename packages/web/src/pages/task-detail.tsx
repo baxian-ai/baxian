@@ -7,10 +7,11 @@ import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
 import { useToast } from '../components/toast.tsx';
 import { useConfirm } from '../components/confirm-dialog.tsx';
-import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath, taskStatusLabel } from '../components/task-status.tsx';
+import { STATUS_BADGE_COLORS, formatTaskTimestamp, taskDetailPath } from '../components/task-status.tsx';
 import { useActiveAgentCard } from '../hooks/use-active-agent-card.ts';
 import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
+import { useT } from '../i18n/index.tsx';
 import {
   REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
@@ -57,6 +58,7 @@ export function TaskDetail() {
 
 function TaskDetailView({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
+  const t = useT();
   const { show } = useToast();
   const confirmDialog = useConfirm();
   const [editOpen, setEditOpen] = useState(false);
@@ -92,14 +94,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleCancel = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: `取消任务 ${task.id}？`, confirmLabel: '取消任务', cancelLabel: '返回' }))) return;
+    if (!(await confirmDialog({ title: t.taskDetail.cancelConfirmTitle(task.id), confirmLabel: t.taskDetail.cancelConfirmLabel, cancelLabel: t.taskDetail.cancelConfirmBackLabel }))) return;
     setCancelling(true);
     try {
       const updated = await api.tasks.update(task.id, { status: 'cancelled' });
       commitTaskExternal(updated);
-      show({ kind: 'success', title: '任务已取消' });
+      show({ kind: 'success', title: t.taskDetail.cancelledToastTitle });
     } catch (err) {
-      show({ kind: 'error', title: '取消失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.cancelFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setCancelling(false);
     }
@@ -110,23 +112,23 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const isTerminal = TASK_TERMINAL_STATUS_SET.has(task.status);
     const ok = await (isTerminal
       ? confirmDialog({
-          title: '重审已结束的任务？',
-          body: `任务 ${task.id} 已是「${taskStatusLabel(task.status)}」状态。手动请 QA agent 重审会再跑一轮 review，但状态机不会把 QA agent 的结果带回主流程。`,
-          confirmLabel: '发起重审',
+          title: t.taskDetail.reReviewTerminalConfirmTitle,
+          body: t.taskDetail.reReviewTerminalConfirmBody(task.id, t.status[task.status] ?? task.status),
+          confirmLabel: t.agents.confirmReReviewLabel,
         })
       : confirmDialog({
-          title: `发起 QA 重审？`,
-          body: `QA agent 将对任务 ${task.id} 立即开始新一轮 review（reviewRound +1）。`,
-          confirmLabel: '发起重审',
+          title: t.agents.confirmReReviewTitle,
+          body: t.agents.confirmReReviewBody(task.id),
+          confirmLabel: t.agents.confirmReReviewLabel,
         }));
     if (!ok) return;
     setReviewing(true);
     try {
       const updated = await api.tasks.review(task.id);
       commitTaskExternal(updated);
-      show({ kind: 'success', title: `已发起 QA 重审（第 ${updated.reviewRound} 轮）` });
+      show({ kind: 'success', title: t.agents.reReviewStarted(updated.reviewRound) });
     } catch (err) {
-      show({ kind: 'error', title: '发起评审失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.agents.reReviewStartFailed, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setReviewing(false);
     }
@@ -135,20 +137,20 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const handleRetry = async () => {
     if (!task) return;
     const ok = await confirmDialog({
-      title: `重试任务 ${task.id}？`,
+      title: t.taskDetail.retryConfirmTitle(task.id),
       body: task.status === 'merged'
-        ? '任务已合并。重试会用同样的标题/描述新建一个任务从头跑。'
-        : '会新建一个任务从头开始，旧任务保留为历史。',
-      confirmLabel: '重试',
+        ? t.taskDetail.retryConfirmBodyMerged
+        : t.taskDetail.retryConfirmBodyDefault,
+      confirmLabel: t.common.retry,
     });
     if (!ok) return;
     setRetrying(true);
     try {
       const fresh = await api.tasks.retry(task.id);
-      show({ kind: 'success', title: `已新建 task ${fresh.id}` });
+      show({ kind: 'success', title: t.taskDetail.retryCreatedToastTitle(fresh.id) });
       navigate(taskDetailPath(fresh.projectId, fresh.id));
     } catch (err) {
-      show({ kind: 'error', title: '重试失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.retryFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setRetrying(false);
     }
@@ -156,14 +158,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleComplete = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: '标记完成并合并？', body: `将合并 PR #${task.prNumber} 并收尾：删本地分支、压缩 agent 上下文。`, confirmLabel: '标记完成' }))) return;
+    if (!(await confirmDialog({ title: t.taskDetail.markCompleteConfirmTitle, body: t.taskDetail.markCompleteConfirmBody(task.prNumber ?? 0), confirmLabel: t.taskDetail.markComplete }))) return;
     setCompleting(true);
     try {
       const updated = await api.tasks.complete(task.id);
       commitTaskExternal(updated);
-      show({ kind: 'success', title: '已标记完成，开始收尾' });
+      show({ kind: 'success', title: t.taskDetail.markCompleteToastTitle });
     } catch (err) {
-      show({ kind: 'error', title: '标记完成失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.markCompleteFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setCompleting(false);
     }
@@ -171,14 +173,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleContinue = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: '继续一轮？', body: `让 Dev agent 再修一轮（第 ${task.reviewRound + 1} 轮），完成后自动转 QA review。`, confirmLabel: '继续一轮' }))) return;
+    if (!(await confirmDialog({ title: t.taskDetail.continueConfirmTitle, body: t.taskDetail.continueConfirmBody(task.reviewRound + 1), confirmLabel: t.taskDetail.continueRound }))) return;
     setContinuing(true);
     try {
       const updated = await api.tasks.continue(task.id);
       commitTaskExternal(updated);
-      show({ kind: 'success', title: `已继续一轮（第 ${updated.reviewRound} 轮）` });
+      show({ kind: 'success', title: t.taskDetail.continuedToastTitle(updated.reviewRound) });
     } catch (err) {
-      show({ kind: 'error', title: '继续一轮失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.continueFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setContinuing(false);
     }
@@ -186,15 +188,15 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleSpecApprove = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: `通过 Spec 并开始编码？`, body: `任务 ${task.id} 将进入编码阶段。`, confirmLabel: '通过 Spec' }))) return;
+    if (!(await confirmDialog({ title: t.taskDetail.specApproveConfirmTitle, body: t.taskDetail.specApproveConfirmBody(task.id), confirmLabel: t.taskDetail.specApprove }))) return;
     setSpecSubmitting(true);
     try {
       const updated = await api.tasks.spec(task.id, { verdict: 'approve' });
       commitTaskExternal(updated);
       setSpecComments('');
-      show({ kind: 'success', title: 'Spec 已通过，已发起编码' });
+      show({ kind: 'success', title: t.taskDetail.specApprovedToastTitle });
     } catch (err) {
-      show({ kind: 'error', title: 'Spec 通过失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.specApproveFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setSpecSubmitting(false);
     }
@@ -209,9 +211,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       const updated = await api.tasks.spec(task.id, { verdict: 'request-changes', comments });
       commitTaskExternal(updated);
       setSpecComments('');
-      show({ kind: 'success', title: 'Spec 已打回，Dev agent 开始修订' });
+      show({ kind: 'success', title: t.taskDetail.specRejectedToastTitle });
     } catch (err) {
-      show({ kind: 'error', title: 'Spec 打回失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.specRejectFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setSpecSubmitting(false);
     }
@@ -219,14 +221,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleConfirmGate = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: `确认完成任务 ${task.id}？`, body: 'project.merge 为 auto 时由 baxian 自动执行合并。', confirmLabel: '确认完成' }))) return;
+    if (!(await confirmDialog({ title: t.taskDetail.confirmGateConfirmTitle(task.id), body: t.taskDetail.confirmGateConfirmBody, confirmLabel: t.taskDetail.confirmComplete }))) return;
     setCompleting(true);
     try {
       const updated = await api.tasks.complete(task.id);
       commitTaskExternal(updated);
-      show({ kind: 'success', title: `已确认（${updated.status}）` });
+      show({ kind: 'success', title: t.taskDetail.confirmedToastTitle(updated.status) });
     } catch (err) {
-      show({ kind: 'error', title: '确认失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.taskDetail.confirmFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setCompleting(false);
     }
@@ -235,11 +237,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   return (
     <div>
       <button type="button" onClick={() => navigate(-1)} className="btn-ghost mb-3">
-        ← 返回
+        {t.common.back}
       </button>
-      {error && !task && <div className="text-sm text-accent">加载失败：{error}</div>}
-      {loaded && !task && !error && <div className="text-sm text-accent">任务不存在：{taskId}</div>}
-      {!task && !error && !loaded && <div className="text-sm text-og-500">Loading…</div>}
+      {error && !task && <div className="text-sm text-accent">{t.common.loadFailed(error)}</div>}
+      {loaded && !task && !error && <div className="text-sm text-accent">{t.taskDetail.taskNotFound(taskId)}</div>}
+      {!task && !error && !loaded && <div className="text-sm text-og-500">{t.common.loading}</div>}
       {task && (
         <>
           <div className="mb-4">
@@ -282,40 +284,39 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
     return (
       <div>
-        {error && <div className="mb-4 text-sm text-accent">加载失败：{error}</div>}
+        {error && <div className="mb-4 text-sm text-accent">{t.common.loadFailed(error)}</div>}
         {isLegacy && (
           <div className="mb-4 rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
             {task.status === 'pending'
-              ? <>任务还没有指定 Dev agent：点「编辑」选择，或在任一空闲 Dev agent 卡片上点「发起」。</>
-              : <>历史任务，无指定 Dev agent，当前状态 <b className="font-semibold">{taskStatusLabel(task.status)}</b>，只读。</>}
+              ? t.taskDetail.legacyPendingNotice
+              : t.taskDetail.legacyReadonlyNotice(t.status[task.status] ?? task.status)}
           </div>
         )}
 
         <div className="mb-3 flex flex-wrap items-center gap-3">
-          <span className={`${STATUS_BADGE_COLORS[task.status]} text-sm`} title={task.status}>{taskStatusLabel(task.status)}</span>
-          <span className="text-sm text-og-500">评审 <span className="text-og-800">{task.reviewRound}</span> 轮</span>
-          <span className="text-sm text-og-500">Spec <span className="text-og-800">{task.specReviewRound ?? 0}</span> 轮</span>
+          <span className={`${STATUS_BADGE_COLORS[task.status]} text-sm`} title={task.status}>{t.status[task.status] ?? task.status}</span>
+          <span className="text-sm text-og-500">{t.taskDetail.reviewRoundPrefix}<span className="text-og-800">{task.reviewRound}</span>{t.taskDetail.reviewRoundSuffix}</span>
+          <span className="text-sm text-og-500">{t.taskDetail.specRoundPrefix}<span className="text-og-800">{task.specReviewRound ?? 0}</span>{t.taskDetail.specRoundSuffix}</span>
         </div>
         <div className="mb-4 flex flex-wrap items-center gap-2">{renderActions(task)}</div>
         <div className="mb-4 text-sm text-og-500">
-          创建于 {formatTaskTimestamp(task.createdAt, false)} · 更新于 {formatTaskTimestamp(task.updatedAt, false)}
+          {t.taskDetail.createdAtPrefix}{formatTaskTimestamp(task.createdAt, false)}{t.taskDetail.updatedAtPrefix}{formatTaskTimestamp(task.updatedAt, false)}
         </div>
 
         {verdictOverdue && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
-            <div className="font-semibold">评审逾期未交</div>
+            <div className="font-semibold">{t.taskDetail.verdictOverdueTitle}</div>
             <div className="mt-1 text-og-700">
-              QA agent 于 {formatTaskTimestamp(task.reviewDispatchedAt)} 接单，超过 10 分钟未提交结论。
-              可打开 QA agent 终端查看，或点「发起评审」重新发起。
+              {t.taskDetail.verdictOverduePrefix}{formatTaskTimestamp(task.reviewDispatchedAt)}{t.taskDetail.verdictOverdueSuffix}
             </div>
           </div>
         )}
 
         {showApprovedAction && (
           <div className="mb-4 rounded-lg border border-hairline bg-og-25 p-4 text-sm text-og-800">
-            <div className="font-semibold">QA agent 已通过 · 正在核对反馈</div>
+            <div className="font-semibold">{t.taskDetail.approvedBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              Dev agent 正在确认所有评审反馈均已处理，完成后进入收尾。
+              {t.taskDetail.approvedBannerBody}
             </div>
             {task.prUrl && (
               <a
@@ -324,7 +325,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 rel="noopener noreferrer"
                 className="btn-secondary mt-3"
               >
-                查看 PR #{task.prNumber}
+                {t.taskDetail.viewPr(task.prNumber ?? 0)}
               </a>
             )}
           </div>
@@ -332,9 +333,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         {showReadyGate && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
-            <div className="font-semibold">评审通过 · 等你确认</div>
+            <div className="font-semibold">{t.taskDetail.readyGateBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              Server 评审通过，共 {task.reviewRound} 轮。点「确认」收尾，或「取消」丢弃。
+              {t.taskDetail.readyGateBannerBody(task.reviewRound)}
             </div>
             <ReviewSummary taskId={task.id} />
             {task.prUrl && (
@@ -344,7 +345,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 rel="noopener noreferrer"
                 className="btn-secondary mt-3"
               >
-                查看 PR #{task.prNumber}
+                {t.taskDetail.viewPr(task.prNumber ?? 0)}
               </a>
             )}
           </div>
@@ -352,9 +353,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         {showMergeReadyAction && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
-            <div className="font-semibold">PR 就绪 · 等你确认</div>
+            <div className="font-semibold">{t.taskDetail.mergeReadyBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              Dev agent 已完成收尾自检，点「确认」交由 baxian 收尾。
+              {t.taskDetail.mergeReadyBannerBody}
             </div>
             {task.prUrl && (
               <a
@@ -363,7 +364,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 rel="noopener noreferrer"
                 className="btn-secondary mt-3"
               >
-                查看 PR #{task.prNumber}
+                {t.taskDetail.viewPr(task.prNumber ?? 0)}
               </a>
             )}
           </div>
@@ -371,16 +372,15 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         {showSpecReadyAction && (
           <div className="mb-4 rounded-lg border border-accent-soft bg-accent-soft/40 p-4 text-sm text-accent">
-            <div className="font-semibold">Spec 需由人类审核</div>
+            <div className="font-semibold">{t.taskDetail.specReadyBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              QA agent 已通过第 {task.specReviewRound ?? 0} 轮 Spec，全文见下方评审记录。
-              通过即开始编码；打回意见将交 Dev agent 修订后复审。
+              {t.taskDetail.specReadyNotice(task.specReviewRound ?? 0)}
             </div>
             <div className="mt-3 flex flex-col gap-2">
               <textarea
                 value={specComments}
                 onChange={e => setSpecComments(e.target.value)}
-                placeholder="打回意见（打回时必填）"
+                placeholder={t.taskDetail.specCommentsPlaceholder}
                 rows={3}
                 disabled={specSubmitting}
                 className={inputCls}
@@ -392,16 +392,16 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                   onClick={handleSpecApprove}
                   className="btn-primary"
                 >
-                  {specSubmitting ? '提交中…' : '通过 Spec，开始编码'}
+                  {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specApproveButton}
                 </button>
                 <button
                   type="button"
                   disabled={specSubmitting || specComments.trim() === ''}
                   onClick={handleSpecReject}
-                  title={specComments.trim() === '' ? '先填写打回意见' : '意见将作为 findings 交 Dev agent 修订'}
+                  title={specComments.trim() === '' ? t.taskDetail.specRejectTitleEmpty : t.taskDetail.specRejectTitleReady}
                   className="btn-secondary"
                 >
-                  {specSubmitting ? '提交中…' : '打回 Spec'}
+                  {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specReject}
                 </button>
               </div>
             </div>
@@ -410,18 +410,18 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
         {showCodeMaxRounds && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft/60 p-4 text-sm text-accent">
-            <div className="font-semibold">评审已达 {task.reviewRound} 轮上限</div>
+            <div className="font-semibold">{t.taskDetail.codeMaxRoundsTitle(task.reviewRound)}</div>
             <div className="mt-1 text-og-700">
-              可「标记完成」先合并成果，或「继续一轮」再修订。剩余问题建议另开任务，轮次越多 agent 越容易偏题。
+              {t.taskDetail.codeMaxRoundsBody}
             </div>
           </div>
         )}
 
         {showSpecMaxRounds && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft/60 p-4 text-sm text-accent">
-            <div className="font-semibold">Spec 评审已达 {task.specReviewRound ?? 0} 轮上限</div>
+            <div className="font-semibold">{t.taskDetail.specMaxRoundsTitle(task.specReviewRound ?? 0)}</div>
             <div className="mt-1 text-og-700">
-              多轮未达成一致，任务已暂停。可「重试」新建任务从头跑，或「取消」。建议先看评审记录定位分歧、细化描述后再重试。
+              {t.taskDetail.specMaxRoundsBody}
             </div>
             <ReviewSummary taskId={task.id} />
           </div>
@@ -455,7 +455,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         </div>
 
         <pre className="card mb-4 whitespace-pre-wrap p-4 text-sm text-og-800">
-          {task.description || <span className="text-og-400">（无描述）</span>}
+          {task.description || <span className="text-og-400">{t.taskDetail.noDescription}</span>}
         </pre>
 
         <ReviewConversation task={task} />
@@ -465,7 +465,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   function renderAgents(task: TaskState) {
     if (projects === null) {
-      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">加载中…</div>;
+      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">{t.common.loading}</div>;
     }
     const project = projects.find((p) => p.id === task.projectId);
     const devId = task.agentId || task.preferredAgentId;
@@ -475,7 +475,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const qaConfig = group?.find((a) => a.role === 'qa');
 
     if (!devConfig && !qaConfig) {
-      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">暂无关联 Agent</div>;
+      return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">{t.taskDetail.noLinkedAgent}</div>;
     }
 
     return (
@@ -533,7 +533,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     return (
       <>
         <button type="button" disabled={!editEnabled} onClick={() => setEditOpen(true)} className="btn-secondary">
-          编辑
+          {t.taskDetail.edit}
         </button>
         <button
           type="button"
@@ -541,7 +541,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           onClick={handleCancel}
           className="btn-secondary"
         >
-          {cancelling ? '取消中…' : '取消'}
+          {cancelling ? t.taskDetail.cancelling : t.common.cancel}
         </button>
         {!isCodeMaxRounds && (
           <button
@@ -550,14 +550,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             onClick={handleRetry}
             title={
               !(RETRYABLE_STATUSES.has(task.status) || isSpecMaxRounds)
-                ? `当前状态「${taskStatusLabel(task.status)}」不可重试`
+                ? t.taskDetail.retryDisabledStatusTitle(t.status[task.status] ?? task.status)
                 : isLegacy
-                  ? '历史任务没有指定 Dev agent，无法重试'
-                  : '新建一个任务从头跑，丢弃当前 worktree/branch'
+                  ? t.taskDetail.retryDisabledLegacyTitle
+                  : t.taskDetail.retryEnabledTitle
             }
             className="btn-secondary"
           >
-            {retrying ? '重试中…' : '重试'}
+            {retrying ? t.taskDetail.retrying : t.common.retry}
           </button>
         )}
         <button
@@ -566,14 +566,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           onClick={handleReview}
           title={
             !task.prNumber
-              ? '该任务还没有 PR，无法发起评审'
+              ? t.taskDetail.reviewNoPrTitle
               : isSpecMaxRounds
-                ? 'spec 阶段达上限不支持 Call review'
-                : '让 QA agent 立即开始新一轮 review（reviewRound +1）'
+                ? t.taskDetail.reviewSpecMaxRoundsTitle
+                : t.taskDetail.reviewButtonTitle
           }
           className="btn-secondary"
         >
-          {reviewing ? '发起中…' : '发起评审'}
+          {reviewing ? t.agents.callingReview : t.agents.callReview}
         </button>
         {isCodeMaxRounds && (
           <>
@@ -581,19 +581,19 @@ function TaskDetailView({ taskId }: { taskId: string }) {
               type="button"
               disabled={!continueEnabled || continuing}
               onClick={handleContinue}
-              title="让 Dev agent 再修一轮，完成后自动转 QA review"
+              title={t.taskDetail.continueButtonTitle}
               className="btn-secondary"
             >
-              {continuing ? '继续中…' : '继续一轮'}
+              {continuing ? t.taskDetail.continuing : t.taskDetail.continueRound}
             </button>
             <button
               type="button"
               disabled={!completeEnabled || completing}
               onClick={handleComplete}
-              title="合并 PR 并收尾（删本地分支 + 压缩上下文）"
+              title={t.taskDetail.completeButtonTitle}
               className="btn-primary"
             >
-              {completing ? '完成中…' : '标记完成'}
+              {completing ? t.taskDetail.completing : t.taskDetail.markComplete}
             </button>
           </>
         )}
@@ -602,10 +602,10 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             type="button"
             disabled={completing}
             onClick={handleConfirmGate}
-            title="确认完成；merge:auto 时由 baxian 执行合并"
+            title={t.taskDetail.confirmButtonTitle}
             className="btn-primary"
           >
-            {completing ? '确认中…' : '确认'}
+            {completing ? t.taskDetail.confirming : t.taskDetail.confirm}
           </button>
         )}
         {serverPublishRetry && (
@@ -613,10 +613,10 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             type="button"
             disabled={completing}
             onClick={handleConfirmGate}
-            title="发布失败后重试 push/PR 步骤"
+            title={t.taskDetail.retryPublishButtonTitle}
             className="btn-primary"
           >
-            {completing ? '重试中…' : '重试发布'}
+            {completing ? t.taskDetail.retrying : t.taskDetail.retryPublish}
           </button>
         )}
       </>
@@ -625,14 +625,16 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 }
 
 function AgentSlotPlaceholder({ role }: { role: 'dev' | 'qa' }) {
+  const t = useT();
   return (
     <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">
-      暂无 {role === 'dev' ? 'Dev' : 'QA'} agent
+      {t.taskDetail.noAgentSlot(role === 'dev' ? 'Dev' : 'QA')}
     </div>
   );
 }
 
 function ReviewSummary({ taskId }: { taskId: string }) {
+  const t = useT();
   const [rounds, setRounds] = useState<ReviewRound[] | null>(null);
   useEffect(() => {
     let alive = true;
@@ -646,8 +648,8 @@ function ReviewSummary({ taskId }: { taskId: string }) {
   const findingsCount = rounds.reduce((n, r) => n + (r.findings?.findings.length ?? 0), 0);
   return (
     <div className="mt-2 text-xs text-og-700">
-      Review {rounds.length} 轮 · 最终 verdict <span className="font-mono">{last.findings?.verdict ?? '—'}</span>
-      {' '}· findings 共 {findingsCount} 条
+      {t.taskDetail.reviewSummaryPrefix}{rounds.length}{t.taskDetail.reviewSummaryMid}<span className="font-mono">{last.findings?.verdict ?? '—'}</span>
+      {t.taskDetail.reviewSummaryFindingsPrefix}{findingsCount}{t.taskDetail.reviewSummaryFindingsSuffix}
     </div>
   );
 }

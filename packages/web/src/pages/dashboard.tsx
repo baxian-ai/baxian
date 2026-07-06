@@ -7,11 +7,12 @@ import { CreateAgentModal } from '../components/create-agent-modal.tsx';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
 import { HostManagementModal } from '../components/host-management-modal.tsx';
 import { Modal } from '../components/modal.tsx';
+import { SystemSettingsModal } from '../components/system-settings-modal.tsx';
 import { taskDetailPath } from '../components/task-status.tsx';
 import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
-import { useTaskNotifications } from '../hooks/use-task-notifications.tsx';
+import { useT } from '../i18n/index.tsx';
 import type { AgentSnapshot, ProjectConfig } from '../shared/index.js';
 
 type ContinueState =
@@ -20,6 +21,7 @@ type ContinueState =
   | { kind: 'addingAgent'; projectId: string };
 
 export function Dashboard() {
+  const t = useT();
   const navigate = useNavigate();
   const { projects: projectsData, error: projectsError, refresh: refreshProjects } = useProjects();
   const projects = projectsData ?? [];
@@ -27,6 +29,7 @@ export function Dashboard() {
   const [createOpen, setCreateOpen] = useState(false);
   const [createTaskOpen, setCreateTaskOpen] = useState(false);
   const [hostMgmtOpen, setHostMgmtOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [continueState, setContinueState] = useState<ContinueState>({ kind: 'closed' });
   const { data: agents, loaded: agentsLoaded, error: agentsErrorPayload } = useAgents();
   const agentsError = agentsErrorPayload?.message ?? null;
@@ -42,7 +45,7 @@ export function Dashboard() {
       aria-describedby={createTaskDisabled ? 'create-task-hint' : undefined}
       className="btn-ghost"
     >
-      + 新建任务
+      {t.dashboard.newTask}
     </button>
   );
 
@@ -50,28 +53,28 @@ export function Dashboard() {
     <div>
       <TopbarActions>
         {createTaskDisabled ? (
-          <span className="inline-flex" title="请先创建项目">
+          <span className="inline-flex" title={t.dashboard.createProjectFirst}>
             {createTaskButton}
           </span>
         ) : createTaskButton}
         {createTaskDisabled && (
-          <span id="create-task-hint" className="sr-only">请先创建项目</span>
+          <span id="create-task-hint" className="sr-only">{t.dashboard.createProjectFirst}</span>
         )}
-        <KebabMenu ariaLabel="更多操作">
+        <KebabMenu ariaLabel={t.dashboard.moreActions}>
           {close => (
             <>
-              <MenuItem onClick={() => { close(); setCreateOpen(true); }}>新建项目</MenuItem>
-              <MenuItem onClick={() => { close(); setHostMgmtOpen(true); }}>Host 管理</MenuItem>
-              <TaskNotificationsMenuItem onAction={close} />
+              <MenuItem onClick={() => { close(); setCreateOpen(true); }}>{t.dashboard.newProject}</MenuItem>
+              <MenuItem onClick={() => { close(); setHostMgmtOpen(true); }}>{t.dashboard.manageHosts}</MenuItem>
+              <MenuItem onClick={() => { close(); setSettingsOpen(true); }}>{t.settings.entry}</MenuItem>
             </>
           )}
         </KebabMenu>
       </TopbarActions>
       <h1 className="sr-only">Dashboard</h1>
-      {error && <div className="mb-4 text-sm text-accent">加载失败：{error}</div>}
+      {error && <div className="mb-4 text-sm text-accent">{t.common.loadFailed(error)}</div>}
       {projectsLoaded && projects.length === 0 && !projectsError && (
         <div className="rounded-lg border border-hairline bg-surface py-12 text-center text-sm text-og-500">
-          还没有项目。点击右上角"更多"菜单 → "新建项目"开始。
+          {t.dashboard.emptyProjects}
         </div>
       )}
       {projects.map(project => (
@@ -100,7 +103,7 @@ export function Dashboard() {
       <Modal
         open={continueState.kind === 'asking'}
         onClose={() => setContinueState({ kind: 'closed' })}
-        title="项目已创建"
+        title={t.dashboard.projectCreatedTitle}
         size="sm"
         footer={
           <>
@@ -109,7 +112,7 @@ export function Dashboard() {
               onClick={() => setContinueState({ kind: 'closed' })}
               className="btn-secondary"
             >
-              稍后再加
+              {t.dashboard.later}
             </button>
             <button
               type="button"
@@ -120,12 +123,12 @@ export function Dashboard() {
               }}
               className="btn-primary"
             >
-              继续添加 Agent
+              {t.dashboard.continueAddingAgent}
             </button>
           </>
         }
       >
-        <p className="text-sm text-og-700">现在添加第一个 Agent，还是稍后再加？</p>
+        <p className="text-sm text-og-700">{t.dashboard.addAgentNowOrLater}</p>
       </Modal>
 
       {continueState.kind === 'addingAgent' && (
@@ -142,27 +145,9 @@ export function Dashboard() {
         onClose={() => setCreateTaskOpen(false)}
         onCreated={(task) => navigate(taskDetailPath(task.projectId, task.id))}
       />
-    </div>
-  );
-}
 
-function TaskNotificationsMenuItem({ onAction }: { onAction: () => void }) {
-  const { permission, enabled, requesting, enable, disable } = useTaskNotifications();
-  if (permission === 'unsupported') return null;
-  if (permission === 'denied') {
-    return <MenuItem disabled>浏览器已拒绝任务完成通知</MenuItem>;
-  }
-  return (
-    <MenuItem
-      disabled={requesting}
-      onClick={() => {
-        onAction();
-        if (enabled) disable();
-        else enable();
-      }}
-    >
-      {enabled ? '关闭任务完成通知' : '开启任务完成通知'}
-    </MenuItem>
+      <SystemSettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    </div>
   );
 }
 
@@ -181,6 +166,7 @@ function DashboardProject({
   agentsError,
   onAgentDeleted,
 }: DashboardProjectProps) {
+  const t = useT();
   const { data: tasksData, error: tasksErrorPayload } = useProjectTasks(project.id);
   const tasks = tasksData ?? [];
   const tasksError = tasksErrorPayload?.message ?? null;
@@ -195,17 +181,17 @@ function DashboardProject({
         <Link
           to={`/project/${project.id}`}
           className="ml-auto text-sm text-accent hover:text-accent-hover"
-          aria-label={`详情 — ${project.id}`}
+          aria-label={t.dashboard.detailsAriaLabel(project.id)}
         >
-          详情 →
+          {t.dashboard.detailsLink}
         </Link>
       </div>
       {tasksError && (
-        <div className="mb-2 text-xs text-accent">任务列表加载失败：{tasksError}</div>
+        <div className="mb-2 text-xs text-accent">{t.dashboard.tasksLoadFailed(tasksError)}</div>
       )}
       {project.agent.flat().length === 0 ? (
         <div className="rounded-lg border border-hairline bg-surface py-6 text-center text-sm text-og-500">
-          还没有 Agent。进入 Details 添加。
+          {t.dashboard.noAgentsYet}
         </div>
       ) : (
         <div

@@ -254,6 +254,57 @@ describe('PATCH /api/config', () => {
     expect(activeSet.has('becoming-manual')).toBe(false);
   });
 
+  it('accepts language and persists it across PATCH and GET', async () => {
+    await seedConfigPath(app, tempDir);
+    const response = await patch('/api/config', { language: 'zh-CN' }, { headers: JSON_HEADERS });
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body) as { config: BaxianConfig; restartRequired: boolean };
+    expect(body.config.language).toBe('zh-CN');
+
+    const followup = await patch('/api/config', { review: { rounds: 3 } }, { headers: JSON_HEADERS });
+    const followupBody = JSON.parse(followup.body) as { config: BaxianConfig };
+    expect(followupBody.config.language).toBe('zh-CN');
+
+    const got = await get('/api/config');
+    const gotBody = JSON.parse(got.body) as BaxianConfig;
+    expect(gotBody.language).toBe('zh-CN');
+  });
+
+  it('does not flag restartRequired for a language change', async () => {
+    await seedConfigPath(app, tempDir);
+    const response = await patch('/api/config', { language: 'en-US' }, { headers: JSON_HEADERS });
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body) as { restartRequired: boolean };
+    expect(body.restartRequired).toBe(false);
+  });
+
+  it('rejects an invalid language with 400', async () => {
+    await seedConfigPath(app, tempDir);
+    const response = await patch('/api/config', { language: 'zh-cn' }, { headers: JSON_HEADERS });
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body) as { details: Array<{ path: string; message: string }> };
+    expect(body.details).toContainEqual({
+      path: 'language',
+      message: "language must be 'zh-CN' or 'en-US'",
+    });
+  });
+
+  it('rejects an explicit null language with 400 instead of silently keeping the current value', async () => {
+    await seedConfigPath(app, tempDir);
+    const seeded = await patch('/api/config', { language: 'zh-CN' }, { headers: JSON_HEADERS });
+    expect(seeded.statusCode).toBe(200);
+    const response = await patch('/api/config', { language: null }, { headers: JSON_HEADERS });
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body) as { details: Array<{ path: string; message: string }> };
+    expect(body.details).toContainEqual({
+      path: 'language',
+      message: "language must be 'zh-CN' or 'en-US'",
+    });
+    const got = await get('/api/config');
+    const gotBody = JSON.parse(got.body) as BaxianConfig;
+    expect(gotBody.language).toBe('zh-CN');
+  });
+
   describe('restart-required diff', () => {
     async function patchAndRead(payload: unknown): Promise<{ statusCode: number; body: { restartRequired: boolean; note: string } }> {
       await seedConfigPath(app, tempDir);

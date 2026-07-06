@@ -5,6 +5,7 @@ export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
 export type ReviewMode = 'github' | 'server';
 export type AfterDone = 'pr' | 'branch' | null;
+export type SupportedLanguage = 'zh-CN' | 'en-US';
 
 export interface HostConfig {
   id?: string;
@@ -65,6 +66,7 @@ export interface ServerConfig {
 }
 
 export interface BaxianConfig {
+  language?: SupportedLanguage;
   review: ReviewConfig;
   server: ServerConfig;
   host: HostConfig[];

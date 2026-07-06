@@ -10,32 +10,35 @@ import { PaneTerminal } from './pane-terminal.tsx';
 import { AgentPet } from './agent-pet.tsx';
 import { AgentPetConfigModal } from './agent-pet-config-modal.tsx';
 import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
+import { useT } from '../i18n/index.tsx';
 
 export type TerminalMode = 'activity-preview' | 'embedded-full';
 
-const RUNTIME_BADGES: Record<AgentSnapshot['runtimeStatus'], { label: string; cls: string }> = {
-  unknown: { label: '未知', cls: 'pill pill-idle' },
-  idle: { label: '空闲', cls: 'pill pill-idle' },
-  pending: { label: '待人工', cls: 'pill pill-warn' },
-  working: { label: '工作中', cls: 'pill pill-live' },
-  waiting: { label: '等待中', cls: 'pill pill-review' },
-  error: { label: '异常', cls: 'pill pill-warn' },
+const RUNTIME_BADGE_CLASSES: Record<AgentSnapshot['runtimeStatus'], string> = {
+  unknown: 'pill pill-idle',
+  idle: 'pill pill-idle',
+  pending: 'pill pill-warn',
+  working: 'pill pill-live',
+  waiting: 'pill pill-review',
+  error: 'pill pill-warn',
 };
 
 const AGENT_CARD_PET_HEIGHT = 72;
 
 type TmuxDotState = AgentSnapshot['tmuxSessionStatus'] | 'starting';
 
-const TMUX_DOTS: Record<Exclude<TmuxDotState, 'present'>, { label: string; modifier: string }> = {
-  absent: { label: '无会话', modifier: 'status-dot--warn' },
-  unreachable: { label: '主机不可达', modifier: 'status-dot--danger' },
-  unknown: { label: '会话状态未知', modifier: 'status-dot--warn' },
-  starting: { label: '会话启动中', modifier: 'status-dot--info' },
+const TMUX_DOT_CLASSES: Record<Exclude<TmuxDotState, 'present'>, string> = {
+  absent: 'status-dot--warn',
+  unreachable: 'status-dot--danger',
+  unknown: 'status-dot--warn',
+  starting: 'status-dot--info',
 };
 
 function StatusDot({ state }: { state: TmuxDotState }) {
+  const t = useT();
   if (state === 'present') return null;
-  const { label, modifier } = TMUX_DOTS[state];
+  const label = t.agents.sessionStatus[state];
+  const modifier = TMUX_DOT_CLASSES[state];
   return (
     <span
       role="img"
@@ -73,6 +76,7 @@ export function AgentCard({
   active,
   onActivate,
 }: AgentCardProps) {
+  const t = useT();
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState<string | null>(null);
   const { show } = useToast();
@@ -91,7 +95,7 @@ export function AgentCard({
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
   const needInputAt = agent.binding?.needInputAt;
   const needInputTitle = needInputAt
-    ? `Agent 在等你的回答（${new Date(needInputAt).toLocaleString()}）`
+    ? t.agents.needInputTitle(new Date(needInputAt).toLocaleString())
     : undefined;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
   const isBootstrapping = !!agent.binding?.creationToken
@@ -100,8 +104,8 @@ export function AgentCard({
     && agent.reason !== 'PENDING_HUMAN';
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
   const runtimeBadge = isBootstrapping
-    ? { label: '启动中', cls: 'pill pill-review' }
-    : RUNTIME_BADGES[agent.runtimeStatus];
+    ? { label: t.agents.bootstrappingBadge, cls: 'pill pill-review' }
+    : { label: t.agents.runtimeStatus[agent.runtimeStatus], cls: RUNTIME_BADGE_CLASSES[agent.runtimeStatus] };
   const tmuxDotState: TmuxDotState = isBootstrapping ? 'starting' : agent.tmuxSessionStatus;
   const showTerminalPreview = terminalMode === 'activity-preview' &&
     !bootstrapBlocksTerminal && (agent.runtimeStatus === 'working' || agent.runtimeStatus === 'pending');
@@ -110,10 +114,10 @@ export function AgentCard({
   const isActiveSelected = isSelectableEmbedded && active === true;
   const terminalDisabled = terminalLoading || pendingRestart || bootstrapBlocksTerminal;
   const terminalDisabledMessage = terminalLoading
-    ? 'Agent 状态加载中'
+    ? t.agents.agentStatusLoading
     : pendingRestart
-      ? '重启 baxian server 后可用'
-      : 'Agent 正在启动';
+      ? t.agents.terminalNeedsRestart
+      : t.agents.bootstrappingTerminalDisabled;
   const runtimeTypeLabel = agentRuntimeLabel(runtime);
 
   const handleStop = async () => {
@@ -131,17 +135,17 @@ export function AgentCard({
   const handleRequestReview = async () => {
     if (!taskId) return;
     const ok = await confirmDialog({
-      title: '发起 QA 重审？',
-      body: `QA agent 将对任务 ${taskId} 立即开始新一轮 review（reviewRound +1）。`,
-      confirmLabel: '发起重审',
+      title: t.agents.confirmReReviewTitle,
+      body: t.agents.confirmReReviewBody(taskId),
+      confirmLabel: t.agents.confirmReReviewLabel,
     });
     if (!ok) return;
     setReviewing(true);
     try {
       const updated = await api.tasks.review(taskId);
-      show({ kind: 'success', title: `已发起 QA 重审（第 ${updated.reviewRound} 轮）` });
+      show({ kind: 'success', title: t.agents.reReviewStarted(updated.reviewRound) });
     } catch (err) {
-      show({ kind: 'error', title: '发起评审失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.agents.reReviewStartFailed, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setReviewing(false);
     }
@@ -152,12 +156,12 @@ export function AgentCard({
     try {
       const result = await api.projects.bootstrap(projectId);
       if (result.ok) {
-        show({ kind: 'success', title: '重试 bootstrap 完成', body: 'agent 状态将在下一次刷新生效。' });
+        show({ kind: 'success', title: t.agents.retryBootstrapSucceededTitle, body: t.agents.retryBootstrapSucceededBody });
       } else {
-        show({ kind: 'warn', title: '重试 bootstrap 仍失败', body: '看一下红色错误卡的最新原因，按提示修复后再试。' });
+        show({ kind: 'warn', title: t.agents.retryBootstrapStillFailingTitle, body: t.agents.retryBootstrapStillFailingBody });
       }
     } catch (err) {
-      show({ kind: 'error', title: '重试 bootstrap 失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.agents.retryBootstrapFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setRetryingBootstrap(false);
     }
@@ -165,11 +169,9 @@ export function AgentCard({
 
   const handleResume = async () => {
     const ok = await confirmDialog({
-      title: `恢复 Agent ${agent.id}？`,
-      body: needsRegreet
-        ? 'greeting 能力未通过，baxian 会重跑能力握手（会话存活则重启 REPL，已丢失则重建）；握手通过才解除挂起。'
-        : 'baxian 会清除 awaiting_human 状态，agent 恢复可用。',
-      confirmLabel: '恢复',
+      title: t.agents.resumeConfirmTitle(agent.id),
+      body: needsRegreet ? t.agents.resumeGreetingBody : t.agents.resumeDefaultBody,
+      confirmLabel: t.agents.resume,
     });
     if (!ok) return;
     setResuming(true);
@@ -182,19 +184,19 @@ export function AgentCard({
         }
         show({
           kind: 'success',
-          title: `Agent ${agent.id} 正在重跑能力握手`,
-          body: '握手通过后 Held 会在下一次刷新自动解除，仍失败则按提示修复 runtime 后再试。',
+          title: t.agents.regreetingStartedTitle(agent.id),
+          body: t.agents.regreetingStartedBody,
         });
         return;
       }
       const result = await api.projects.resumeAgent(projectId, agent.id);
       show({
         kind: 'success',
-        title: `Agent ${agent.id} 已 Resume`,
-        body: result.releasedBinding ? '原任务已释放，agent 可接新任务。' : '保留绑定（原任务仍 active）。',
+        title: t.agents.resumedTitle(agent.id),
+        body: result.releasedBinding ? t.agents.resumedReleasedBody : t.agents.resumedKeptBody,
       });
     } catch (err) {
-      show({ kind: 'error', title: 'Resume 失败', body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: t.agents.resumeFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setResuming(false);
     }
@@ -204,11 +206,11 @@ export function AgentCard({
     setCompacting(true);
     try {
       await api.agents.compact(agent.id);
-      show({ kind: 'success', title: `已向 Agent ${agent.id} 发送 /compact` });
+      show({ kind: 'success', title: t.agents.compactSentTitle(agent.id) });
     } catch (err) {
       show({
         kind: 'error',
-        title: '压缩上下文失败',
+        title: t.agents.compactFailedTitle,
         body: err instanceof Error ? err.message : String(err),
       });
     } finally {
@@ -217,15 +219,15 @@ export function AgentCard({
   };
 
   const handleClear = async () => {
-    if (!(await confirmDialog({ title: `清空 Agent ${agent.id} 的上下文？`, body: '将发送 /clear，整个会话上下文不可恢复。', confirmLabel: '清空' }))) return;
+    if (!(await confirmDialog({ title: t.agents.clearConfirmTitle(agent.id), body: t.agents.clearConfirmBody, confirmLabel: t.agents.clearConfirmLabel }))) return;
     setClearing(true);
     try {
       await api.agents.clear(agent.id);
-      show({ kind: 'success', title: `已向 Agent ${agent.id} 发送 /clear` });
+      show({ kind: 'success', title: t.agents.clearSentTitle(agent.id) });
     } catch (err) {
       show({
         kind: 'error',
-        title: '清空上下文失败',
+        title: t.agents.clearFailedTitle,
         body: err instanceof Error ? err.message : String(err),
       });
     } finally {
@@ -234,7 +236,7 @@ export function AgentCard({
   };
 
   const handleDelete = async () => {
-    if (!(await confirmDialog({ title: `删除 Agent ${agent.id}？`, body: '此操作不可撤销。', confirmLabel: '删除' }))) return;
+    if (!(await confirmDialog({ title: t.agents.deleteConfirmTitle(agent.id), body: t.agents.deleteConfirmBody, confirmLabel: t.common.delete }))) return;
     setDeleting(true);
     setDeleteError(null);
     try {
@@ -245,13 +247,13 @@ export function AgentCard({
         const others = removed.filter(id => id !== agent.id).join(', ');
         show({
           kind: 'warn',
-          title: `已删除 Agent ${agent.id}`,
-          body: `配对的 QA agent ${others} 也被一并移除。`,
+          title: t.agents.deletedWithPairTitle(agent.id),
+          body: t.agents.deletedWithPairBody(others),
         });
       } else {
         show({
           kind: 'success',
-          title: `Agent ${agent.id} 已删除`,
+          title: t.agents.deletedTitle(agent.id),
         });
       }
       onDeleted?.();
@@ -319,17 +321,17 @@ export function AgentCard({
         </div>
         <div className="flex flex-wrap items-center justify-end gap-1">
           {isAwaitingHuman && (
-            <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? '需人工处理'}>挂起</span>
+            <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? t.agents.heldDefaultReason}>{t.agents.heldBadge}</span>
           )}
           {needInputAt && (
-            <span className="pill pill-warn" title={needInputTitle}>等回答</span>
+            <span className="pill pill-warn" title={needInputTitle}>{t.agents.needInputBadge}</span>
           )}
           {!agent.petId && (
             <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
           )}
           {agent.stale && (
             <span className="pill pill-warn" title={agent.observedAt ? `Last observed at ${agent.observedAt}` : undefined}>
-              失联
+              {t.agents.staleBadge}
             </span>
           )}
           <StatusDot state={tmuxDotState} />
@@ -337,7 +339,7 @@ export function AgentCard({
       </div>
       {bootstrapBlocksTerminal && (
         <div className="mb-2 rounded-md border border-accent-soft bg-accent-soft/40 px-2.5 py-2 text-xs text-accent">
-          Agent 正在启动，终端可用后会自动刷新。
+          {t.agents.bootstrappingNotice}
         </div>
       )}
       {isAwaitingHuman && (
@@ -348,17 +350,21 @@ export function AgentCard({
       )}
       {!isBootstrapping && agent.runtimeStatus === 'pending' && (
         <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
-          <div className="font-medium">等待人工介入</div>
+          <div className="font-medium">{t.agents.awaitingHumanIntervention}</div>
           <div>
-            请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">终端</Link> 处理。
+            {t.agents.openTerminalPrefix}
+            <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">{t.agents.terminal}</Link>
+            {t.agents.openTerminalSuffix}
           </div>
         </div>
       )}
       {needInputAt && (
         <div className="mb-2 space-y-1 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-2 text-xs text-accent">
-          <div className="font-medium">Agent 在等你的回答</div>
+          <div className="font-medium">{t.agents.needInputNoticeTitle}</div>
           <div>
-            它提了一个问题，请打开 <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">终端</Link> 回复。
+            {t.agents.needInputPrefix}
+            <Link to={`/terminal/${agent.id}`} className="text-accent hover:text-accent-hover underline">{t.agents.terminal}</Link>
+            {t.agents.needInputSuffix}
           </div>
         </div>
       )}
@@ -384,14 +390,14 @@ export function AgentCard({
               disabled={retryingBootstrap}
               className="btn-primary shrink-0"
             >
-              {retryingBootstrap ? '重试中…' : '重试 bootstrap'}
+              {retryingBootstrap ? t.agents.retryingBootstrap : t.agents.retryBootstrap}
             </button>
           </div>
         </div>
       )}
       {showTaskBinding && taskId && (
         <div className="mb-2 text-xs text-og-500">
-          任务：<span className="font-mono text-og-700">{taskId}</span>
+          {t.agents.taskLabel}<span className="font-mono text-og-700">{taskId}</span>
         </div>
       )}
       {showTerminalPreview && (
@@ -404,7 +410,7 @@ export function AgentCard({
           className={terminalContainerClassName}
           role={allowSelection ? 'button' : undefined}
           tabIndex={allowSelection ? 0 : undefined}
-          aria-label={allowSelection ? `激活 ${agent.id} 终端` : undefined}
+          aria-label={allowSelection ? t.agents.activateTerminal(agent.id) : undefined}
           onClick={onTerminalContainerClick}
           onKeyDown={onTerminalContainerKeyDown}
         >
@@ -425,17 +431,17 @@ export function AgentCard({
       )}
       {pendingRestart && (
         <div className="mb-2 rounded-md border border-accent/25 bg-accent-soft/60 px-2.5 py-1.5 text-xs text-accent">
-          重启 baxian server 后生效
+          {t.agents.pendingRestartNotice}
         </div>
       )}
       <div className="mt-3 flex items-center gap-2">
         <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto scrollbar-none">
           {terminalDisabled ? (
             <span className="shrink-0 cursor-not-allowed text-sm text-og-400" title={terminalDisabledMessage}>
-              终端
+              {t.agents.terminal}
             </span>
           ) : (
-            <Link to={`/terminal/${agent.id}`} className="btn-secondary shrink-0">终端</Link>
+            <Link to={`/terminal/${agent.id}`} className="btn-secondary shrink-0">{t.agents.terminal}</Link>
           )}
           {!pendingRestart && agent.runtimeStatus === 'working' && (
             <button
@@ -443,7 +449,7 @@ export function AgentCard({
               disabled={stopping}
               className="btn-ghost shrink-0"
             >
-              {stopping ? '停止中…' : '停止'}
+              {stopping ? t.agents.stopping : t.agents.stop}
             </button>
           )}
           {isAwaitingHuman && (
@@ -452,52 +458,52 @@ export function AgentCard({
               onClick={handleResume}
               disabled={resuming}
               title={needsRegreet
-                ? '重跑 greeting 能力握手以恢复（会话存活则重启 REPL，已丢失则重建；greeting_failed 无法靠清状态解除）'
-                : '清除 awaiting_human 状态，让 agent 恢复可用'}
+                ? t.agents.resumeGreetingButtonTitle
+                : t.agents.resumeDefaultButtonTitle}
               className="btn-primary shrink-0"
             >
-              {resuming ? '恢复中…' : '恢复'}
+              {resuming ? t.agents.resuming : t.agents.resume}
             </button>
           )}
         </div>
-        <KebabMenu ariaLabel={`Agent ${agent.id} 操作菜单`} className="shrink-0" placement="up" autoFocusFirstItem disabled={deleting}>
+        <KebabMenu ariaLabel={t.agents.actionsMenu(agent.id)} className="shrink-0" placement="up" autoFocusFirstItem disabled={deleting}>
           {close => (
             <>
               <MenuItem
                 onClick={() => { close(); setPetModalOpen(true); }}
                 disabled={compacting || clearing || deleting}
-                title="配置 Agent Pet（在状态位置显示动画宠物）"
+                title={t.agents.agentPetMenuItemTitle}
               >
                 Agent Pet
               </MenuItem>
               <MenuItem
                 onClick={() => { close(); void handleCompact(); }}
                 disabled={compacting || clearing || deleting}
-                title="向 agent runtime 发送 /compact 压缩上下文"
+                title={t.agents.compactMenuItemTitle}
               >
-                {compacting ? '压缩中…' : '压缩上下文'}
+                {compacting ? t.agents.compacting : t.agents.compact}
               </MenuItem>
               <MenuItem
                 onClick={() => { close(); void handleClear(); }}
                 disabled={clearing || compacting || deleting}
-                title="向 agent runtime 发送 /clear 清空上下文"
+                title={t.agents.clearMenuItemTitle}
               >
-                {clearing ? '清空中…' : '清空上下文'}
+                {clearing ? t.agents.clearing : t.agents.clear}
               </MenuItem>
               {!pendingRestart && taskId && role === 'dev' && (
                 <MenuItem
                   onClick={() => { close(); void handleRequestReview(); }}
                   disabled={reviewing || deleting}
-                  title={`让 QA agent 立即对任务 ${taskId} 跑一轮 review（需要该任务已有 PR）`}
+                  title={t.agents.callReviewMenuItemTitle(taskId)}
                 >
-                  {reviewing ? '发起中…' : '发起评审'}
+                  {reviewing ? t.agents.callingReview : t.agents.callReview}
                 </MenuItem>
               )}
               <MenuItem
                 onClick={() => { close(); void handleDelete(); }}
                 disabled={deleting || compacting || clearing}
               >
-                {deleting ? '删除中…' : '删除'}
+                {deleting ? t.agents.deleting : t.common.delete}
               </MenuItem>
             </>
           )}

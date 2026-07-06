@@ -68,13 +68,13 @@ function renderProjectPage() {
 }
 
 async function openProjectMenu(): Promise<void> {
-  fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ })));
+  fireEvent.click(await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ })));
 }
 
 async function openDeleteDialog(): Promise<HTMLElement> {
   await openProjectMenu();
-  fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' })));
-  return waitFor(() => screen.getByRole('dialog', { name: '删除项目' }));
+  fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' })));
+  return waitFor(() => screen.getByRole('dialog', { name: 'Delete project' }));
 }
 
 beforeEach(() => {
@@ -132,14 +132,14 @@ describe('Project page header', () => {
 });
 
 describe('Project header actions', () => {
-  it('moves the top-level "新建任务" button into the topbar and opens the create-task modal', async () => {
+  it('moves the top-level "+ New task" button into the topbar and opens the create-task modal', async () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
     const topbarActions = screen.getByTestId('topbar-actions');
-    const taskBtn = within(topbarActions).getByRole('button', { name: '+ 新建任务' });
+    const taskBtn = within(topbarActions).getByRole('button', { name: '+ New task' });
     expect(taskBtn.className).toContain('btn-ghost');
-    expect(screen.getAllByRole('button', { name: '+ 新建任务' })).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: '+ New task' })).toHaveLength(1);
     expect(screen.queryByTestId('create-task-modal')).toBeNull();
     fireEvent.click(taskBtn);
     expect(await screen.findByTestId('create-task-modal')).toBeTruthy();
@@ -147,7 +147,7 @@ describe('Project header actions', () => {
 
   it('only sets aria-controls on the project three-dot menu while it is open', async () => {
     renderProjectPage();
-    const trigger = await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
+    const trigger = await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
     expect(trigger.getAttribute('aria-controls')).toBeNull();
 
     fireEvent.click(trigger);
@@ -160,16 +160,16 @@ describe('Project header actions', () => {
     expect(trigger.getAttribute('aria-controls')).toBeNull();
   });
 
-  it('moves the project three-dot menu into the topbar and keeps "添加 Agent" inside it', async () => {
+  it('moves the project three-dot menu into the topbar and keeps "Add agent" inside it', async () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
-    expect(screen.queryByRole('button', { name: /添加 Agent/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Add agent/ })).toBeNull();
     const topbarActions = screen.getByTestId('topbar-actions');
-    expect(within(topbarActions).getByRole('button', { name: /项目 demo 操作菜单/ })).toBeTruthy();
+    expect(within(topbarActions).getByRole('button', { name: /Project demo actions menu/ })).toBeTruthy();
 
     await openProjectMenu();
-    const item = await screen.findByRole('menuitem', { name: '添加 Agent' });
+    const item = await screen.findByRole('menuitem', { name: 'Add agent' });
     expect(item.className).not.toContain('text-danger');
 
     expect(screen.queryByTestId('create-agent-modal')).toBeNull();
@@ -181,62 +181,62 @@ describe('Project header actions', () => {
 describe('Project Task panel', () => {
   it('opens the Task panel by default and renders its title/close control outside the panel', async () => {
     renderProjectPage();
-    const panel = await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }));
+    const panel = await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }));
     const heading = screen.getByRole('heading', { name: 'Tasks' });
     const agentsHeading = screen.getByRole('heading', { name: 'Agents' });
-    const closeBtn = screen.getByRole('button', { name: '关闭任务面板' });
+    const closeBtn = screen.getByRole('button', { name: 'Close task panel' });
     expect(panel.contains(heading)).toBe(false);
     expect(panel.contains(closeBtn)).toBe(false);
     expect(heading.className).toBe(agentsHeading.className);
-    expect(screen.queryByRole('menuitem', { name: '显示任务面板' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: 'Show task panel' })).toBeNull();
   });
 
   it('closes via the header button and reopens from the three-dot menu', async () => {
     renderProjectPage();
-    await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }));
-    const menuBtn = screen.getByRole('button', { name: /项目 demo 操作菜单/ });
+    await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }));
+    const menuBtn = screen.getByRole('button', { name: /Project demo actions menu/ });
 
-    fireEvent.click(screen.getByRole('button', { name: '关闭任务面板' }));
-    await waitFor(() => expect(screen.queryByRole('complementary', { name: '任务面板' })).toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: 'Close task panel' }));
+    await waitFor(() => expect(screen.queryByRole('complementary', { name: 'Task panel' })).toBeNull());
     expect(document.activeElement).toBe(menuBtn);
 
     await openProjectMenu();
-    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: '显示任务面板' }));
+    const reopen = await waitFor(() => screen.getByRole('menuitem', { name: 'Show task panel' }));
     fireEvent.click(reopen);
 
-    expect(await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }))).toBeTruthy();
+    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }))).toBeTruthy();
     expect(document.activeElement).toBe(menuBtn);
     await openProjectMenu();
-    expect(screen.queryByRole('menuitem', { name: '显示任务面板' })).toBeNull();
+    expect(screen.queryByRole('menuitem', { name: 'Show task panel' })).toBeNull();
   });
 
   it('persists and restores the Task panel closed state', async () => {
     renderProjectPage();
-    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: '关闭任务面板' })));
+    fireEvent.click(await waitFor(() => screen.getByRole('button', { name: 'Close task panel' })));
     await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('0'));
 
     cleanup();
     renderProjectPage();
-    await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
-    expect(screen.queryByRole('complementary', { name: '任务面板' })).toBeNull();
+    await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
+    expect(screen.queryByRole('complementary', { name: 'Task panel' })).toBeNull();
 
     await openProjectMenu();
-    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: '显示任务面板' })));
+    fireEvent.click(await waitFor(() => screen.getByRole('menuitem', { name: 'Show task panel' })));
     await waitFor(() => expect(localStorage.getItem('baxian.taskPanel.open')).toBe('1'));
-    expect(await waitFor(() => screen.getByRole('complementary', { name: '任务面板' }))).toBeTruthy();
+    expect(await waitFor(() => screen.getByRole('complementary', { name: 'Task panel' }))).toBeTruthy();
   });
 });
 
 describe('Project delete entry', () => {
   it('keeps delete inside the project menu and marks it destructive', async () => {
     renderProjectPage();
-    const menuButton = await waitFor(() => screen.getByRole('button', { name: /项目 demo 操作菜单/ }));
+    const menuButton = await waitFor(() => screen.getByRole('button', { name: /Project demo actions menu/ }));
 
     expect(screen.queryByRole('menuitem')).toBeNull();
-    expect(screen.queryByText('删除项目…')).toBeNull();
+    expect(screen.queryByText('Delete project…')).toBeNull();
     fireEvent.click(menuButton);
 
-    const item = await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' }));
+    const item = await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' }));
     expect(item.className).toContain('text-og-1000');
     expect(item.hasAttribute('disabled')).toBe(false);
   });
@@ -250,30 +250,30 @@ describe('Project delete entry', () => {
     renderProjectPage();
 
     await openProjectMenu();
-    const item = await waitFor(() => screen.getByRole('menuitem', { name: '删除项目…' }));
+    const item = await waitFor(() => screen.getByRole('menuitem', { name: 'Delete project…' }));
     expect((item as HTMLButtonElement).disabled).toBe(true);
-    expect(item.getAttribute('title')).toMatch(/请先删除项目下的 1 个 Agent/);
+    expect(item.getAttribute('title')).toMatch(/Delete the project's 1 agent first/);
   });
 
   it('validates exact project id before delete and resets confirmation on cancel', async () => {
     renderProjectPage();
     const dialog = await openDeleteDialog();
-    const confirm = within(dialog).getByRole('button', { name: '确认删除' }) as HTMLButtonElement;
+    const confirm = within(dialog).getByRole('button', { name: 'Confirm delete' }) as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
 
-    const input = within(dialog).getByLabelText('输入项目 ID 以确认删除') as HTMLInputElement;
+    const input = within(dialog).getByLabelText('Enter the project ID to confirm deletion') as HTMLInputElement;
     fireEvent.change(input, { target: { value: 'wrong' } });
     expect(confirm.disabled).toBe(true);
 
     fireEvent.change(input, { target: { value: 'demo' } });
     expect(confirm.disabled).toBe(false);
 
-    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
 
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: '删除项目' })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Delete project' })).toBeNull());
 
     const reopened = await openDeleteDialog();
-    const reopenedInput = within(reopened).getByLabelText('输入项目 ID 以确认删除') as HTMLInputElement;
+    const reopenedInput = within(reopened).getByLabelText('Enter the project ID to confirm deletion') as HTMLInputElement;
     expect(reopenedInput.value).toBe('');
   });
 
@@ -296,16 +296,16 @@ describe('Project delete entry', () => {
     );
 
     const dialog = await openDeleteDialog();
-    fireEvent.change(within(dialog).getByLabelText('输入项目 ID 以确认删除'), {
+    fireEvent.change(within(dialog).getByLabelText('Enter the project ID to confirm deletion'), {
       target: { value: 'demo' },
     });
     projectsListPayload = [];
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认删除' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delete' }));
 
     await waitFor(() => expect(projectsDelete).toHaveBeenCalledWith('demo'));
     await waitFor(() => expect(projectsList).toHaveBeenCalled());
     await waitFor(() => expect(toastShow).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'success', title: expect.stringContaining('已删除') }),
+      expect.objectContaining({ kind: 'success', title: expect.stringContaining('deleted') }),
     ));
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/'));
     expect(screen.getByTestId('cached-ids').textContent).toBe('');
@@ -315,10 +315,10 @@ describe('Project delete entry', () => {
     projectsDelete.mockRejectedValueOnce(new Error('boom — config locked'));
     renderProjectPage();
     const dialog = await openDeleteDialog();
-    fireEvent.change(within(dialog).getByLabelText('输入项目 ID 以确认删除'), {
+    fireEvent.change(within(dialog).getByLabelText('Enter the project ID to confirm deletion'), {
       target: { value: 'demo' },
     });
-    fireEvent.click(within(dialog).getByRole('button', { name: '确认删除' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm delete' }));
 
     await waitFor(() => expect(within(dialog).getByText(/boom — config locked/)).toBeTruthy());
     expect(screen.queryByTestId('location')).toBeNull();

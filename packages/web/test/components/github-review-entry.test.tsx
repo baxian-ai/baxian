@@ -35,7 +35,7 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe('GithubReviewEntry', () => {
-  it('renders the 代码评审 process split into rounds and turns', async () => {
+  it('renders the Code review process split into rounds and turns', async () => {
     ghMock.mockResolvedValue({
       available: true,
       prNumber: 7,
@@ -47,12 +47,12 @@ describe('GithubReviewEntry', () => {
       ],
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(screen.getByText('代码评审')).toBeTruthy();
-    expect(await screen.findByText('第 1 轮')).toBeTruthy();
-    expect(screen.getByText('第 2 轮')).toBeTruthy();
-    expect(screen.getByText('行内评论')).toBeTruthy();
-    expect(screen.getByText('提交代码改动')).toBeTruthy();
-    expect(screen.getAllByText('评审')).toHaveLength(2);
+    expect(screen.getByText('Code review')).toBeTruthy();
+    expect(await screen.findByText('Round 1')).toBeTruthy();
+    expect(screen.getByText('Round 2')).toBeTruthy();
+    expect(screen.getByText('Inline comment')).toBeTruthy();
+    expect(screen.getByText('Submit code changes')).toBeTruthy();
+    expect(screen.getAllByText('Review')).toHaveLength(2);
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
     expect(screen.getByText(/a.ts:12 · nit here/)).toBeTruthy();
@@ -82,8 +82,8 @@ describe('GithubReviewEntry', () => {
       items: [{ kind: 'issue-comment', id: 'i1', author: 'human-reviewer', body: 'please recheck' }],
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText('进行中')).toBeTruthy();
-    expect(screen.getByText('评论')).toBeTruthy();
+    expect(await screen.findByText('In progress')).toBeTruthy();
+    expect(screen.getByText('Comment')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · please recheck/)).toBeTruthy();
     expect(screen.getByText('Dev')).toBeTruthy();
     expect(screen.queryByText('QA')).toBeNull();
@@ -105,18 +105,18 @@ describe('GithubReviewEntry', () => {
       ],
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText('反馈')).toBeTruthy();
+    expect(await screen.findByText('Response')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · src\/a\.ts:42 · please recheck this line/)).toBeTruthy();
     expect(screen.getByText('Dev')).toBeTruthy();
   });
 
-  it('styles the 代码评审 title and QA marker like 第 x 轮: compact and non-bold', async () => {
+  it('styles the Code review title and QA marker like Round x: compact and non-bold', async () => {
     ghMock.mockResolvedValue({
       available: true,
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    const title = screen.getByText('代码评审');
+    const title = screen.getByText('Code review');
     expect(title.className).toContain('text-xs');
     expect(title.className).not.toContain('font-medium');
     expect(title.className).not.toContain('font-semibold');
@@ -132,7 +132,7 @@ describe('GithubReviewEntry', () => {
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
     } as GithubReviewConversation);
     renderEntry(task({ id: 'task-42', reviewMode: 'github' }));
-    const row = await screen.findByText('评审');
+    const row = await screen.findByText('Review');
     fireEvent.click(row.closest('button')!);
     expect(navigateMock).toHaveBeenCalledWith('/tasks/task-42/github-review');
   });
@@ -140,7 +140,7 @@ describe('GithubReviewEntry', () => {
   it('shows an empty hint when the PR has no review items', async () => {
     ghMock.mockResolvedValue({ available: true, items: [] } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText('评审尚未开始')).toBeTruthy();
+    expect(await screen.findByText('Review has not started')).toBeTruthy();
   });
 
   it('renders an ongoing bucket when items arrive after the latest review', async () => {
@@ -152,8 +152,8 @@ describe('GithubReviewEntry', () => {
       ],
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText('第 1 轮')).toBeTruthy();
-    expect(screen.getByText('进行中')).toBeTruthy();
+    expect(await screen.findByText('Round 1')).toBeTruthy();
+    expect(screen.getByText('In progress')).toBeTruthy();
     expect(screen.getByText(/fix: follow-up/)).toBeTruthy();
   });
 
@@ -164,7 +164,7 @@ describe('GithubReviewEntry', () => {
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
     } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText(/部分评审记录拉取失败：reviews: rate limited/)).toBeTruthy();
+    expect(await screen.findByText(/Some review records failed to fetch: reviews: rate limited/)).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
   });
 
@@ -229,17 +229,17 @@ describe('GithubReviewEntry', () => {
   it('shows unavailable reasons and falls back unknown reasons to no-pr', async () => {
     ghMock.mockResolvedValueOnce({ available: false, reason: 'not-github', items: [] } as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText(/不是 GitHub 仓库/)).toBeTruthy();
+    expect(await screen.findByText(/not a GitHub repository/)).toBeTruthy();
 
     cleanup();
     ghMock.mockResolvedValueOnce({ available: false, reason: 'unexpected', items: [] } as unknown as GithubReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText(/还没有 PR/)).toBeTruthy();
+    expect(await screen.findByText(/has no PR yet/)).toBeTruthy();
   });
 
   it('shows a fetch failure when github review loading fails', async () => {
     ghMock.mockRejectedValue(new Error('gh failed'));
     renderEntry(task({ reviewMode: 'github' }));
-    expect(await screen.findByText(/加载评审记录失败：gh failed/)).toBeTruthy();
+    expect(await screen.findByText(/Failed to load review records: gh failed/)).toBeTruthy();
   });
 });

@@ -420,6 +420,23 @@ describe('prepareConfig type guards', () => {
       project: [PROJECT],
     })).toThrow(/server\.allowedHosts/);
   });
+
+  describe('prepareConfig language passthrough', () => {
+    it('keeps a valid language field', () => {
+      const config = prepareConfig({ ...{ project: [] }, language: 'zh-CN' });
+      expect(config.language).toBe('zh-CN');
+    });
+
+    it('omits the language key entirely when absent (default = en-US is a client-side meaning)', () => {
+      const config = prepareConfig({ project: [] });
+      expect('language' in config).toBe(false);
+    });
+
+    it('rejects an invalid language via validation', () => {
+      expect(() => prepareConfig({ ...{ project: [] }, language: 'zh-cn' }))
+        .toThrow(ConfigValidationError);
+    });
+  });
 });
 
 describe('saveConfig', () => {

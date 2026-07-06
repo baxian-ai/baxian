@@ -57,6 +57,10 @@ function projectReviewMode(config: BaxianConfig, project: ProjectConfig): Review
 }
 
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {
+  const language = config.language as unknown;
+  if (language !== undefined && language !== 'zh-CN' && language !== 'en-US') {
+    errors.push({ path: 'language', message: "language must be 'zh-CN' or 'en-US'" });
+  }
   if (!Number.isInteger(config.server.port) || config.server.port <= 0 || config.server.port > 65535) {
     errors.push({ path: 'server.port', message: 'server.port must be a positive integer ≤ 65535' });
   }

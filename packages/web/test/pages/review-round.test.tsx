@@ -43,7 +43,7 @@ describe('ReviewRoundPage', () => {
     renderAt('/tasks/task-1/rounds/code/1');
 
     expect(await screen.findByText('My Task')).toBeTruthy();
-    expect(screen.getByText('代码改动')).toBeTruthy();
+    expect(screen.getByText('Code changes')).toBeTruthy();
     expect(screen.getByText('a.ts:12')).toBeTruthy();
     expect(screen.getByText('fix this')).toBeTruthy();
     expect(screen.getByText('↳ fix this')).toBeTruthy();
@@ -62,7 +62,7 @@ describe('ReviewRoundPage', () => {
     ] as ReviewRound[]);
     renderAt('/tasks/task-1/rounds/spec/1');
 
-    expect(await screen.findByText('规格稿')).toBeTruthy();
+    expect(await screen.findByText('Spec draft')).toBeTruthy();
     expect(screen.getByText(/# Spec/)).toBeTruthy();
     expect(screen.getByText('Section 2')).toBeTruthy();
   });
@@ -70,14 +70,14 @@ describe('ReviewRoundPage', () => {
   it('shows a not-found message when the round is missing', async () => {
     reviewsMock.mockResolvedValue([] as ReviewRound[]);
     renderAt('/tasks/task-1/rounds/code/9');
-    expect(await screen.findByText(/未找到该轮评审/)).toBeTruthy();
+    expect(await screen.findByText(/Review round not found/)).toBeTruthy();
   });
 
   it('surfaces a load error instead of "not found" when the fetch fails', async () => {
     reviewsMock.mockRejectedValue(new Error('boom 500'));
     renderAt('/tasks/task-1/rounds/code/1');
-    expect(await screen.findByText(/加载评审记录失败/)).toBeTruthy();
-    expect(screen.queryByText(/未找到该轮评审/)).toBeNull();
+    expect(await screen.findByText(/Failed to load review records/)).toBeTruthy();
+    expect(screen.queryByText(/Review round not found/)).toBeNull();
   });
 
   it('distinguishes "review not submitted" (findings undefined) from "no findings"', async () => {
@@ -85,8 +85,8 @@ describe('ReviewRoundPage', () => {
       { round: 1, phase: 'code', content: '@@ -1 +1 @@\n+x', startedAt: 'now' },
     ] as ReviewRound[]);
     renderAt('/tasks/task-1/rounds/code/1');
-    expect(await screen.findByText('评审尚未提交。')).toBeTruthy();
-    expect(screen.queryByText('本轮无 findings。')).toBeNull();
+    expect(await screen.findByText('Review not submitted yet.')).toBeTruthy();
+    expect(screen.queryByText('No findings this round.')).toBeNull();
   });
 
   it('shows "no findings" when QA submitted an empty findings array', async () => {
@@ -94,8 +94,8 @@ describe('ReviewRoundPage', () => {
       { round: 1, phase: 'code', content: 'x', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
     renderAt('/tasks/task-1/rounds/code/1');
-    expect(await screen.findByText('本轮无 findings。')).toBeTruthy();
-    expect(screen.queryByText('评审尚未提交。')).toBeNull();
+    expect(await screen.findByText('No findings this round.')).toBeTruthy();
+    expect(screen.queryByText('Review not submitted yet.')).toBeNull();
   });
 
   it('refetches the round as the task advances (in-progress round updates)', async () => {
@@ -126,7 +126,7 @@ describe('ReviewRoundPage', () => {
       },
     ] as ReviewRound[]);
     renderAt('/tasks/task-1/rounds/code/1#review');
-    await screen.findByText('QA 评审');
+    await screen.findByText('QA review');
     await waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled());
   });
 });

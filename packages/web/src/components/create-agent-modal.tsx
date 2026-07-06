@@ -5,6 +5,7 @@ import { inputCls, labelCls, fieldErrCls, helpCls, radioCls } from './form-style
 import { api, type ProbeResponse, type AddAgentBody } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
+import { useT } from '../i18n/index.tsx';
 
 interface Props {
   open: boolean;
@@ -43,6 +44,7 @@ function hostLabel(h: HostConfig): string {
 }
 
 export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props) {
+  const t = useT();
   const [form, setForm] = useState<FormState>(INITIAL_FORM);
   const [project, setProject] = useState<ProjectConfig | null>(null);
   const [hosts, setHosts] = useState<HostConfig[]>([]);
@@ -205,7 +207,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       if (result.restartRequired) flagDirty();
       show({
         kind: 'success',
-        title: `Agent ${result.agent.id} 已添加到 ${projectId}`,
+        title: t.createAgent.addedToastTitle(result.agent.id, projectId),
       });
       onCreated();
       onClose();
@@ -218,8 +220,8 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const RuntimeStatus = ({ rt }: { rt: AgentRuntime }) => {
     const isRemoteNoHost = form.mode === 'remote' && !form.host;
-    if (isRemoteNoHost) return <span className="ml-2 text-xs text-og-400">（请先选择 Host）</span>;
-    if (probeLoading) return <span className="ml-2 text-xs text-og-400">…探测中</span>;
+    if (isRemoteNoHost) return <span className="ml-2 text-xs text-og-400">{t.createAgent.selectHostFirstHint}</span>;
+    if (probeLoading) return <span className="ml-2 text-xs text-og-400">{t.createAgent.probingLabel}</span>;
     if (!probe) return <span className="ml-2 text-xs text-og-400">?</span>;
     const status = probe.runtimes[rt];
     if (status.ok) return <span className="ml-2 text-xs text-probe-ok">✓ {status.path ?? ''}</span>;
@@ -228,7 +230,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const TmuxStatus = () => {
     if (form.mode === 'remote' && !form.host) return null;
-    if (probeLoading && !installingTmux) return <div className="text-xs text-og-400">tmux: …探测中</div>;
+    if (probeLoading && !installingTmux) return <div className="text-xs text-og-400">{t.createAgent.tmuxProbingLabel}</div>;
     if (!probe) return null;
     if (probe.tmux.ok) return <div className="text-xs text-probe-ok">tmux: ✓ {probe.tmux.path ?? ''}</div>;
     const sshReady = form.mode === 'local' || !!probe.ssh?.ok;
@@ -240,12 +242,12 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <button type="button" onClick={handleInstallTmux}
               className="ml-2 text-accent underline transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
               disabled={installingTmux || submitting}>
-              {installingTmux ? '安装中…' : '一键安装'}
+              {installingTmux ? t.common.installing : t.common.oneClickInstall}
             </button>
           )}
         </div>
         {installingTmux && (
-          <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
+          <div className="text-xs text-og-500">{t.common.installingTmuxNotice}</div>
         )}
         {!installingTmux && tmuxInstall && (
           <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-probe-ok' : 'text-accent'}`}>
@@ -266,15 +268,15 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     <Modal
       open={open}
       onClose={handleDismiss}
-      title={`添加 Agent 到 ${projectId}`}
+      title={t.createAgent.modalTitle(projectId)}
       size="lg"
       footer={
         <>
           <button type="button" onClick={handleDismiss} disabled={submitting} className="btn-secondary">
-            取消
+            {t.common.cancel}
           </button>
           <button type="submit" form="create-agent-form" disabled={!canSubmit} className="btn-primary">
-            {submitting ? '添加中…' : '添加 Agent'}
+            {submitting ? t.createAgent.submitting : t.createAgent.submitLabel}
           </button>
         </>
       }
@@ -294,25 +296,25 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             value={form.id}
             onChange={e => setForm({ ...form, id: e.target.value })}
             className={inputCls}
-            placeholder={`${projectId}-${form.role}`}
+            placeholder={t.createAgent.idPlaceholder(projectId, form.role)}
             disabled={submitting}
           />
           {form.id && !ID_PATTERN.test(form.id) && (
-            <div className={fieldErrCls}>小写字母开头，只含 a-z 0-9 -，长度 2-32</div>
+            <div className={fieldErrCls}>{t.common.idFormatError}</div>
           )}
           {form.id && allAgentIds.has(form.id) && (
-            <div className={fieldErrCls}>该 id 已被占用（全局唯一）</div>
+            <div className={fieldErrCls}>{t.createAgent.idTakenGlobalError}</div>
           )}
         </div>
 
         <div>
-          <span className={labelCls}>角色</span>
+          <span className={labelCls}>{t.createAgent.roleLabel}</span>
           <label className="mr-4 inline-flex items-center gap-2">
             <input type="radio" name="role" checked={form.role === 'dev'} className={radioCls}
               onChange={() => setForm({ ...form, role: 'dev', pairWith: '' })} disabled={submitting} />
             <span className="text-sm text-og-800">Dev agent</span>
           </label>
-          <label className="inline-flex items-center gap-2" title={!canSelectQa ? '请先创建一个 Dev agent' : ''}>
+          <label className="inline-flex items-center gap-2" title={!canSelectQa ? t.createAgent.createDevFirstHint : ''}>
             <input type="radio" name="role" checked={form.role === 'qa'} className={radioCls}
               onChange={() => setForm({ ...form, role: 'qa' })} disabled={submitting || !canSelectQa} />
             <span className={`text-sm ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA agent</span>
@@ -321,30 +323,30 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
         {form.role === 'qa' && (
           <div>
-            <label className={labelCls} htmlFor="pair-with">配对 Dev agent</label>
+            <label className={labelCls} htmlFor="pair-with">{t.createAgent.pairWithLabel}</label>
             <select id="pair-with" value={form.pairWith}
               onChange={e => setForm({ ...form, pairWith: e.target.value })}
               className={inputCls} disabled={submitting}>
-              <option value="">请选择</option>
+              <option value="">{t.createAgent.pairWithPlaceholder}</option>
               {unpairedDevs.map(d => (
-                <option key={d.id} value={d.id}>{d.id}（{d.mode}）</option>
+                <option key={d.id} value={d.id}>{t.createAgent.pairOptionLabel(d.id, d.mode)}</option>
               ))}
             </select>
           </div>
         )}
 
         <div>
-          <span className={labelCls}>运行模式</span>
+          <span className={labelCls}>{t.createAgent.modeLabel}</span>
           <label className="mr-4 inline-flex items-center gap-2">
             <input type="radio" name="mode" checked={form.mode === 'local'} className={radioCls}
               onChange={() => setForm({ ...form, mode: 'local', host: '' })}
               disabled={submitting} />
-            <span className="text-sm text-og-800">本机</span>
+            <span className="text-sm text-og-800">{t.createAgent.localModeLabel}</span>
           </label>
           <label className="inline-flex items-center gap-2">
             <input type="radio" name="mode" checked={form.mode === 'remote'} className={radioCls}
               onChange={() => setForm({ ...form, mode: 'remote' })} disabled={submitting} />
-            <span className="text-sm text-og-800">远程 (SSH)</span>
+            <span className="text-sm text-og-800">{t.createAgent.remoteModeLabel}</span>
           </label>
         </div>
 
@@ -353,29 +355,29 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <label className={labelCls} htmlFor="host">Host</label>
             {hosts.length === 0 ? (
               <div className="rounded-md border border-og-100 bg-og-50/40 px-3 py-2 text-xs text-og-600">
-                还没有配置 Host。请先在右上角菜单的「Host 管理」中添加。
+                {t.createAgent.noHostsHint}
               </div>
             ) : (
               <select id="host" value={form.host}
                 onChange={e => setForm({ ...form, host: e.target.value })}
                 className={inputCls} disabled={submitting}>
-                <option value="">请选择 Host</option>
+                <option value="">{t.createAgent.selectHostPlaceholder}</option>
                 {hosts.map(h => (
                   <option key={h.id} value={h.id}>{hostLabel(h)}</option>
                 ))}
               </select>
             )}
-            <div className={helpCls}>私钥/跳板机仍可在 ~/.ssh/config 配置；端口/密码在「Host 管理」里设置。</div>
+            <div className={helpCls}>{t.createAgent.sshConfigHint}</div>
           </div>
         )}
 
         <div>
           <div className="mb-1.5 flex items-center justify-between">
-            <span className="text-xs font-medium text-og-700">运行时</span>
+            <span className="text-xs font-medium text-og-700">{t.createAgent.runtimeLabel}</span>
             <button type="button" onClick={runProbe}
               className="text-xs text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
               disabled={submitting || probeLoading || (form.mode === 'remote' && !form.host)}>
-              ↻ 重新探测
+              {t.createAgent.reprobeButton}
             </button>
           </div>
           <label className="flex items-center gap-2">
@@ -404,39 +406,39 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             aria-controls={showAdvanced ? 'advanced-options' : undefined}
             className="flex w-full items-center justify-between rounded-md px-1 py-1.5 text-left text-xs font-medium text-og-700 transition-colors hover:bg-og-50"
           >
-            <span>高级选项</span>
-            <span className="text-og-400">{showAdvanced ? '收起' : '展开'}</span>
+            <span>{t.createAgent.advancedOptionsLabel}</span>
+            <span className="text-og-400">{showAdvanced ? t.createAgent.collapseLabel : t.createAgent.expandLabel}</span>
           </button>
           {showAdvanced && (
             <div id="advanced-options" className="mt-3 space-y-3">
               <div>
-                <label className={labelCls} htmlFor="workdir">Workdir（可选）</label>
+                <label className={labelCls} htmlFor="workdir">{t.createAgent.workdirLabel}</label>
                 <input id="workdir" type="text" value={form.workdir}
                   onChange={e => setForm({ ...form, workdir: e.target.value })}
                   className={inputCls}
-                  placeholder="留空时自动 clone 到 ~/.baxian/repos/<owner>/<repo>"
+                  placeholder={t.createAgent.workdirPlaceholder}
                   disabled={submitting} />
               </div>
 
               <div>
-                <label className={labelCls} htmlFor="model">Model（可选）</label>
+                <label className={labelCls} htmlFor="model">{t.createAgent.modelLabel}</label>
                 <input id="model" type="text" value={form.model}
                   onChange={e => setForm({ ...form, model: e.target.value })}
                   className={inputCls}
-                  placeholder={form.runtime === 'codex' ? '例: o3 / gpt-4o（留空走 default）' : '例: sonnet / opus / claude-sonnet-4-6（留空走 default）'}
+                  placeholder={form.runtime === 'codex' ? t.createAgent.modelPlaceholderCodex : t.createAgent.modelPlaceholderOther}
                   disabled={submitting} />
-                <div className={helpCls}>透传到 launch 命令的 --model 参数；留空跟随 CLI 默认。</div>
+                <div className={helpCls}>{t.createAgent.modelHint}</div>
               </div>
 
               <div>
-                <label className={labelCls} htmlFor="addDirs">Additional Dirs（可选）</label>
+                <label className={labelCls} htmlFor="addDirs">{t.createAgent.addDirsLabel}</label>
                 <textarea id="addDirs" value={form.addDirs}
                   onChange={e => setForm({ ...form, addDirs: e.target.value })}
                   className={`${inputCls} font-mono text-xs`}
                   rows={3}
-                  placeholder={'每行一个绝对路径，例:\n/Users/me/shared-libs\n/Users/me/extra-repo'}
+                  placeholder={t.createAgent.addDirsPlaceholder}
                   disabled={submitting} />
-                <div className={helpCls}>透传到 --add-dir。当前 YOLO 模式下不影响权限拦截，主要用于让 CLI 把额外目录纳入工作根。</div>
+                <div className={helpCls}>{t.createAgent.addDirsHint}</div>
               </div>
             </div>
           )}
@@ -448,10 +450,9 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
               onChange={e => setForm({ ...form, yolo: e.target.checked })}
               disabled={submitting} />
             <div className="text-sm text-og-800">
-              <div className="font-medium">YOLO 模式（推荐开启）</div>
+              <div className="font-medium">{t.createAgent.yoloTitle}</div>
               <div className="mt-1 text-xs text-accent">
-                开启后 Claude Code 以 <code>--permission-mode bypassPermissions</code> 启动，
-                Codex 以 <code>--dangerously-bypass-approvals-and-sandbox</code> 启动。
+                {t.createAgent.yoloBodyLead}<code>--permission-mode bypassPermissions</code>{t.createAgent.yoloBodyMid}<code>--dangerously-bypass-approvals-and-sandbox</code>{t.createAgent.yoloBodyTrail}
               </div>
             </div>
           </label>

@@ -5,6 +5,7 @@ import { useToast } from './toast.tsx';
 import { useConfirm } from './confirm-dialog.tsx';
 import { usePets } from '../hooks/use-pets.ts';
 import { AgentPet, PET_DISPLAY_HEIGHT, PET_DISPLAY_WIDTH } from './agent-pet.tsx';
+import { getMessages, useT } from '../i18n/index.tsx';
 
 export class PetPackageError extends Error {
   constructor(message: string) {
@@ -26,15 +27,16 @@ function readFileText(file: File): Promise<string> {
 }
 
 export async function parsePetPackage(files: File[]): Promise<{ manifest: unknown; spritesheet: File }> {
+  const t = getMessages();
   const petJsonFile = files.find(
     (f) => baseName(f.name) === 'pet.json' || baseName(f.webkitRelativePath || '') === 'pet.json',
   );
-  if (!petJsonFile) throw new PetPackageError('文件包中未找到 pet.json');
+  if (!petJsonFile) throw new PetPackageError(t.pet.missingManifest);
   let manifest: unknown;
   try {
     manifest = JSON.parse(await readFileText(petJsonFile));
   } catch {
-    throw new PetPackageError('pet.json 解析失败');
+    throw new PetPackageError(t.pet.manifestParseFailed);
   }
   const spritePath =
     manifest && typeof manifest === 'object' && typeof (manifest as { spritesheetPath?: unknown }).spritesheetPath === 'string'
@@ -44,7 +46,7 @@ export async function parsePetPackage(files: File[]): Promise<{ manifest: unknow
   const spritesheet =
     (spriteBase ? files.find((f) => baseName(f.name) === spriteBase) : undefined) ??
     files.find((f) => /\.(png|webp)$/i.test(f.name));
-  if (!spritesheet) throw new PetPackageError('文件包中未找到精灵图（png/webp）');
+  if (!spritesheet) throw new PetPackageError(t.pet.missingSpritesheet);
   return { manifest, spritesheet };
 }
 
@@ -74,6 +76,7 @@ export interface AgentPetConfigModalProps {
 }
 
 export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPetConfigModalProps) {
+  const t = useT();
   const { show } = useToast();
   const confirmDialog = useConfirm();
   const { pets, loading, refresh } = usePets();
@@ -104,9 +107,9 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
       try {
         await api.agents.setPet(agentId, null);
         setAssignedPetId(null);
-        show({ kind: 'success', title: '已关闭 Agent Pet' });
+        show({ kind: 'success', title: t.pet.disabledTitle });
       } catch (err) {
-        show({ kind: 'error', title: '关闭失败', body: toErr(err) });
+        show({ kind: 'error', title: t.pet.disableFailedTitle, body: toErr(err) });
         setEnabled(true);
       } finally {
         setBusy(false);
@@ -119,23 +122,23 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
     try {
       await api.agents.setPet(agentId, petId);
       setAssignedPetId(petId);
-      show({ kind: 'success', title: '已选择 Pet' });
+      show({ kind: 'success', title: t.pet.selectedTitle });
     } catch (err) {
-      show({ kind: 'error', title: '选择失败', body: toErr(err) });
+      show({ kind: 'error', title: t.pet.selectFailedTitle, body: toErr(err) });
     } finally {
       setBusy(false);
     }
   };
 
   const handleDelete = async (petId: string, name: string) => {
-    if (!(await confirmDialog({ title: `删除 Pet「${name}」？`, body: '使用它的 Agent 会回到默认状态显示。', confirmLabel: '删除' }))) return;
+    if (!(await confirmDialog({ title: t.pet.deleteConfirmTitle(name), body: t.pet.deleteConfirmBody, confirmLabel: t.common.delete }))) return;
     setBusy(true);
     try {
       await api.pets.remove(petId);
       await refresh();
-      show({ kind: 'success', title: `Pet「${name}」已删除` });
+      show({ kind: 'success', title: t.pet.deletedTitle(name) });
     } catch (err) {
-      show({ kind: 'error', title: '删除失败', body: toErr(err) });
+      show({ kind: 'error', title: t.pet.deleteFailedTitle, body: toErr(err) });
     } finally {
       setBusy(false);
     }
@@ -150,10 +153,10 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
       const { manifest, spritesheet } = await parsePetPackage(files);
       await api.pets.create(manifest, spritesheet);
       await refresh();
-      show({ kind: 'success', title: 'Pet 上传成功' });
+      show({ kind: 'success', title: t.pet.uploadedTitle });
     } catch (err) {
       const body = err instanceof PetPackageError ? err.message : toErr(err);
-      show({ kind: 'error', title: 'Pet 上传失败', body });
+      show({ kind: 'error', title: t.pet.uploadFailedTitle, body });
     } finally {
       setBusy(false);
     }
@@ -169,12 +172,12 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
             disabled={busy}
             onChange={(e) => void handleToggle(e.target.checked)}
           />
-          启用 Agent Pet
+          {t.pet.enableLabel}
         </label>
 
         {!enabled ? (
           <p className="text-xs text-og-500">
-            开启后可上传 Codex Pet 文件包，或选择已上传过的 Pet 替换 Agent 卡片上的状态显示。
+            {t.pet.enableHint}
           </p>
         ) : (
           <>
@@ -185,22 +188,22 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
                 disabled={busy}
                 className="btn-secondary"
               >
-                上传 Pet 文件包
+                {t.pet.uploadButton}
               </button>
               <input
                 ref={dirInputRef}
                 type="file"
-                aria-label="上传 Codex Pet 文件包"
+                aria-label={t.pet.uploadInputAriaLabel}
                 className="hidden"
                 onChange={(e) => void handleUpload(e)}
               />
-              <p className="mt-1 text-xs text-og-400">选择 Codex Pet 目录（含 pet.json 与精灵图）。</p>
+              <p className="mt-1 text-xs text-og-400">{t.pet.uploadDirHint}</p>
             </div>
 
             {loading ? (
-              <p className="text-sm text-og-500">加载中…</p>
+              <p className="text-sm text-og-500">{t.common.loading}</p>
             ) : pets.length === 0 ? (
-              <p className="text-sm text-og-500">还没有上传过 Pet，点击上方按钮上传。</p>
+              <p className="text-sm text-og-500">{t.pet.emptyState}</p>
             ) : (
               <ul className="grid grid-cols-2 gap-2">
                 {pets.map((pet) => {
@@ -223,16 +226,16 @@ export function AgentPetConfigModal({ agentId, currentPetId, onClose }: AgentPet
                         className="min-w-0 flex-1 truncate text-left text-sm text-og-1000 hover:text-accent-hover disabled:cursor-default"
                       >
                         {pet.displayName}
-                        {selected && <span className="ml-1 text-xs text-accent">（当前）</span>}
+                        {selected && <span className="ml-1 text-xs text-accent">{t.pet.currentMarker}</span>}
                       </button>
                       <button
                         type="button"
-                        aria-label={`删除 ${pet.displayName}`}
+                        aria-label={t.pet.deleteAriaLabel(pet.displayName)}
                         onClick={() => void handleDelete(pet.id, pet.displayName)}
                         disabled={busy}
                         className="shrink-0 text-xs text-accent hover:underline disabled:opacity-50"
                       >
-                        删除
+                        {t.common.delete}
                       </button>
                     </li>
                   );

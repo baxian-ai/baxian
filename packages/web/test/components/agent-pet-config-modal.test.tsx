@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { PetMeta } from '../../src/shared/index.js';
 
@@ -9,6 +9,7 @@ import { api } from '../../src/api.ts';
 import { AgentPetConfigModal, parsePetPackage, PetPackageError } from '../../src/components/agent-pet-config-modal.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { __resetI18nForTests, syncLocaleFromConfig } from '../../src/i18n/index.tsx';
 
 const showMock = toastShowMock;
 const listMock = vi.mocked(api.pets.list);
@@ -71,30 +72,41 @@ describe('parsePetPackage', () => {
   });
 
   it('throws on invalid pet.json', async () => {
-    await expect(parsePetPackage([file('pet.json', 'not json'), file('a.png', 'IMG')])).rejects.toThrow(/解析失败/);
+    await expect(parsePetPackage([file('pet.json', 'not json'), file('a.png', 'IMG')])).rejects.toThrow(/Failed to parse pet.json/);
   });
 
   it('throws when no spritesheet image is present', async () => {
-    await expect(parsePetPackage([file('pet.json', JSON.stringify({ displayName: 'F' }))])).rejects.toThrow(/精灵图/);
+    await expect(parsePetPackage([file('pet.json', JSON.stringify({ displayName: 'F' }))])).rejects.toThrow(/Spritesheet/);
+  });
+
+  describe('error messages follow the active locale', () => {
+    afterEach(() => __resetI18nForTests());
+
+    it('renders zh-CN error messages after syncLocaleFromConfig switches locale', async () => {
+      syncLocaleFromConfig('zh-CN');
+      await expect(parsePetPackage([file('spritesheet.webp', 'IMG')])).rejects.toThrow(/未找到 pet\.json/);
+      await expect(parsePetPackage([file('pet.json', 'not json'), file('a.png', 'IMG')])).rejects.toThrow(/解析失败/);
+      await expect(parsePetPackage([file('pet.json', JSON.stringify({ displayName: 'F' }))])).rejects.toThrow(/精灵图/);
+    });
   });
 });
 
 describe('AgentPetConfigModal', () => {
   it('is disabled by default with no pet and shows the hint, no library', async () => {
     renderModal(null);
-    const toggle = screen.getByLabelText('启用 Agent Pet') as HTMLInputElement;
+    const toggle = screen.getByLabelText('Enable Agent Pet') as HTMLInputElement;
     expect(toggle.checked).toBe(false);
-    expect(screen.getByText(/开启后可上传/)).toBeTruthy();
+    expect(screen.getByText(/Once enabled, you can upload/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Foxy' })).toBeNull();
   });
 
   it('reveals the library when enabled and marks the current pet', async () => {
     renderModal('pet-1');
-    const toggle = screen.getByLabelText('启用 Agent Pet') as HTMLInputElement;
+    const toggle = screen.getByLabelText('Enable Agent Pet') as HTMLInputElement;
     expect(toggle.checked).toBe(true);
     expect(await screen.findByText('Foxy')).toBeTruthy();
     expect(screen.getByText('Cat')).toBeTruthy();
-    expect(screen.getByText('（当前）')).toBeTruthy();
+    expect(screen.getByText('(current)')).toBeTruthy();
   });
 
   it('assigns a pet on select', async () => {
@@ -106,30 +118,30 @@ describe('AgentPetConfigModal', () => {
 
   it('clears the assignment when toggled off', async () => {
     renderModal('pet-1');
-    const toggle = screen.getByLabelText('启用 Agent Pet');
+    const toggle = screen.getByLabelText('Enable Agent Pet');
     await act(async () => { fireEvent.click(toggle); });
     expect(setPetMock).toHaveBeenCalledWith('dev-1', null);
   });
 
   it('toggle-off clears even when opened with no pet (select before the snapshot lands)', async () => {
     renderModal(null);
-    await act(async () => { fireEvent.click(screen.getByLabelText('启用 Agent Pet')); });
+    await act(async () => { fireEvent.click(screen.getByLabelText('Enable Agent Pet')); });
     const fox = await screen.findByRole('button', { name: 'Foxy' });
     await act(async () => { fireEvent.click(fox); });
     expect(setPetMock).toHaveBeenCalledWith('dev-1', 'pet-1');
     setPetMock.mockClear();
-    await act(async () => { fireEvent.click(screen.getByLabelText('启用 Agent Pet')); });
+    await act(async () => { fireEvent.click(screen.getByLabelText('Enable Agent Pet')); });
     expect(setPetMock).toHaveBeenCalledWith('dev-1', null);
   });
 
   it('deletes a pet after confirmation and refreshes the list', async () => {
     renderModal('pet-1');
-    const delBtn = await screen.findByRole('button', { name: '删除 Cat' });
+    const delBtn = await screen.findByRole('button', { name: 'Delete Cat' });
     await act(async () => { fireEvent.click(delBtn); });
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('删除 Pet「Cat」？')).toBeTruthy();
-    expect(within(dialog).getByText('使用它的 Agent 会回到默认状态显示。')).toBeTruthy();
-    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '删除' })); });
+    expect(within(dialog).getByText('Delete pet "Cat"?')).toBeTruthy();
+    expect(within(dialog).getByText('Agents using it will fall back to the default status display.')).toBeTruthy();
+    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
     expect(removeMock).toHaveBeenCalledWith('pet-2');
     await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
   });
@@ -137,20 +149,20 @@ describe('AgentPetConfigModal', () => {
   it('shows the empty-library hint when no pet has been uploaded yet', async () => {
     listMock.mockResolvedValue([]);
     renderModal('pet-1');
-    expect(await screen.findByText('还没有上传过 Pet，点击上方按钮上传。')).toBeTruthy();
+    expect(await screen.findByText('No pets uploaded yet — click the button above to upload one.')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Foxy' })).toBeNull();
   });
 
   it('re-checks the toggle and shows an error toast when clearing the pet fails', async () => {
     setPetMock.mockRejectedValue(new Error('server down'));
     renderModal('pet-1');
-    const toggle = screen.getByLabelText('启用 Agent Pet') as HTMLInputElement;
+    const toggle = screen.getByLabelText('Enable Agent Pet') as HTMLInputElement;
 
     await act(async () => { fireEvent.click(toggle); });
 
-    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '关闭失败', body: 'server down' });
+    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to disable', body: 'server down' });
     expect(toggle.checked).toBe(true);
-    expect(await screen.findByText('（当前）')).toBeTruthy();
+    expect(await screen.findByText('(current)')).toBeTruthy();
   });
 
   it('keeps the previous assignment and shows an error toast when selecting a pet fails', async () => {
@@ -160,26 +172,26 @@ describe('AgentPetConfigModal', () => {
 
     await act(async () => { fireEvent.click(catBtn); });
 
-    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '选择失败', body: 'pet missing' });
-    expect(screen.getByText('（当前）').closest('button')?.textContent).toContain('Foxy');
+    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to select', body: 'pet missing' });
+    expect(screen.getByText('(current)').closest('button')?.textContent).toContain('Foxy');
   });
 
   it('shows an error toast and skips the refresh when deleting a pet fails', async () => {
     removeMock.mockRejectedValue(new Error('pet in use'));
     renderModal('pet-1');
-    const delBtn = await screen.findByRole('button', { name: '删除 Cat' });
+    const delBtn = await screen.findByRole('button', { name: 'Delete Cat' });
 
     await act(async () => { fireEvent.click(delBtn); });
     const dialog = await findConfirmDialog();
-    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '删除' })); });
+    await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
 
-    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '删除失败', body: 'pet in use' });
+    expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to delete', body: 'pet in use' });
     expect(listMock).toHaveBeenCalledTimes(1);
   });
 
   describe('pet package upload', () => {
     function uploadInput(): HTMLInputElement {
-      return screen.getByLabelText('上传 Codex Pet 文件包') as HTMLInputElement;
+      return screen.getByLabelText('Upload Codex Pet package') as HTMLInputElement;
     }
 
     function changeFiles(files: File[]): void {
@@ -197,7 +209,7 @@ describe('AgentPetConfigModal', () => {
       await waitFor(() =>
         expect(createMock).toHaveBeenCalledWith({ displayName: 'New', spritesheetPath: 'sprite.webp' }, sprite));
       await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
-      await waitFor(() => expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: 'Pet 上传成功' }));
+      await waitFor(() => expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: 'Pet uploaded' }));
       expect(uploadInput().value).toBe('');
     });
 
@@ -208,7 +220,7 @@ describe('AgentPetConfigModal', () => {
       changeFiles([new File(['IMG'], 'sprite.webp')]);
 
       await waitFor(() =>
-        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Pet 上传失败', body: '文件包中未找到 pet.json' }));
+        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to upload pet', body: 'pet.json not found in the file package' }));
       expect(createMock).not.toHaveBeenCalled();
     });
 
@@ -223,7 +235,7 @@ describe('AgentPetConfigModal', () => {
       ]);
 
       await waitFor(() =>
-        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Pet 上传失败', body: 'payload too large' }));
+        expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to upload pet', body: 'payload too large' }));
       expect(listMock).toHaveBeenCalledTimes(1);
     });
 

@@ -57,7 +57,7 @@ function cfgWithAgents(agent: ProjectConfig['agent']): BaxianConfig {
 }
 
 function submitButton(): HTMLButtonElement {
-  return screen.getByRole('button', { name: /添加 Agent|添加中/ }) as HTMLButtonElement;
+  return screen.getByRole('button', { name: /Add agent|Adding/ }) as HTMLButtonElement;
 }
 
 async function renderReady(config?: BaxianConfig): Promise<{ onClose: ReturnType<typeof vi.fn>; onCreated: ReturnType<typeof vi.fn> }> {
@@ -80,37 +80,37 @@ it('remote mode shows a host picker (not a raw hostname input)', async () => {
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
 
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
 
   expect(await screen.findByLabelText('Host')).toBeTruthy();
   expect(screen.getByText('Prod')).toBeTruthy();
   expect(screen.queryByLabelText('Hostname')).toBeNull();
 });
 
-it('guides the user to Host 管理 when no hosts are configured', async () => {
+it('guides the user to manage hosts when no hosts are configured', async () => {
   configGetMock.mockResolvedValue(cfg([]));
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
-  expect(await screen.findByText(/还没有配置 Host/)).toBeTruthy();
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
+  expect(await screen.findByText(/No hosts configured yet/)).toBeTruthy();
 });
 
 it('probes by host id (resolved server-side) once a host is selected', async () => {
   configGetMock.mockResolvedValue(cfg([{ id: 'box', hostname: 'h.example.com', port: 22, user: 'agent' }]));
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
 
   await waitFor(() => expect(probeMock).toHaveBeenCalledWith('remote', { hostId: 'box' }, expect.anything()));
 });
 
-it('hides Workdir/Model/Additional Dirs behind a collapsed 高级选项 toggle', async () => {
+it('hides Workdir/Model/Additional Dirs behind a collapsed Advanced options toggle', async () => {
   configGetMock.mockResolvedValue(cfg([]));
   render(<CreateAgentModal open projectId="baxian" onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
 
-  const toggle = screen.getByRole('button', { name: /高级选项/ });
+  const toggle = screen.getByRole('button', { name: /Advanced options/ });
   expect(toggle.getAttribute('aria-expanded')).toBe('false');
   expect(toggle.getAttribute('aria-controls')).toBeNull();
   expect(document.getElementById('advanced-options')).toBeNull();
@@ -147,7 +147,7 @@ it('submits a minimal local dev agent and closes on success', async () => {
     mode: 'local',
     yolo: true,
   });
-  expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Agent x 已添加到 baxian' });
+  expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Agent x added to baxian' });
   expect(onCreated).toHaveBeenCalledTimes(1);
   expect(onClose).toHaveBeenCalledTimes(1);
   expect(flagDirtyMock).not.toHaveBeenCalled();
@@ -174,9 +174,9 @@ it('submits a QA agent paired with an unpaired dev, with trimmed advanced option
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'qa-a' } });
   fireEvent.click(screen.getByRole('radio', { name: 'QA agent' }));
-  fireEvent.change(await screen.findByLabelText('配对 Dev agent'), { target: { value: 'dev-a' } });
+  fireEvent.change(await screen.findByLabelText('Paired Dev agent'), { target: { value: 'dev-a' } });
   fireEvent.click(screen.getByRole('radio', { name: /Codex/ }));
-  fireEvent.click(screen.getByRole('button', { name: /高级选项/ }));
+  fireEvent.click(screen.getByRole('button', { name: /Advanced options/ }));
   fireEvent.change(screen.getByLabelText(/Workdir/), { target: { value: '/tmp/qa-wd' } });
   fireEvent.change(screen.getByLabelText(/Model/), { target: { value: '  o3  ' } });
   fireEvent.change(screen.getByLabelText(/Additional Dirs/), { target: { value: ' /a \n\n/b\n   ' } });
@@ -203,7 +203,7 @@ it('submits a QA agent paired with an unpaired dev, with trimmed advanced option
 it('keeps the QA radio disabled when the project has no unpaired dev', async () => {
   await renderReady();
   expect((screen.getByRole('radio', { name: 'QA agent' }) as HTMLInputElement).disabled).toBe(true);
-  expect(screen.queryByLabelText('配对 Dev agent')).toBeNull();
+  expect(screen.queryByLabelText('Paired Dev agent')).toBeNull();
 });
 
 it('surfaces an addAgent failure inline and keeps the modal open', async () => {
@@ -218,22 +218,22 @@ it('surfaces an addAgent failure inline and keeps the modal open', async () => {
   expect(screen.getByText('id already used somewhere')).toBeTruthy();
   expect(onClose).not.toHaveBeenCalled();
   expect(onCreated).not.toHaveBeenCalled();
-  expect(submitButton().textContent).toBe('添加 Agent');
+  expect(submitButton().textContent).toBe('Add agent');
 });
 
-it('取消 closes the modal, but dismissal is blocked while a submit is in flight', async () => {
+it('Cancel closes the modal, but dismissal is blocked while a submit is in flight', async () => {
   let resolveAdd: ((value: { agent: AgentConfig; restartRequired: boolean }) => void) | undefined;
   addAgentMock.mockReturnValue(new Promise((resolve) => { resolveAdd = resolve; }));
   const { onClose } = await renderReady();
   await fillValidDevForm();
 
-  fireEvent.click(screen.getByRole('button', { name: '取消' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
   expect(onClose).toHaveBeenCalledTimes(1);
 
   await act(async () => {
     fireEvent.click(submitButton());
   });
-  expect(submitButton().textContent).toBe('添加中…');
+  expect(submitButton().textContent).toBe('Adding…');
   fireEvent.keyDown(document, { key: 'Escape' });
   expect(onClose).toHaveBeenCalledTimes(1);
 
@@ -281,7 +281,7 @@ it('shows a tmux probe failure', async () => {
   expect(await screen.findByText('tmux: ⨯ tmux missing')).toBeTruthy();
 });
 
-it('shows an SSH probe failure for remote hosts and clears it when switching back to 本机', async () => {
+it('shows an SSH probe failure for remote hosts and clears it when switching back to Local', async () => {
   probeMock.mockResolvedValue({
     ssh: { ok: false, message: 'auth failed' },
     tmux: { ok: true, message: '' },
@@ -289,11 +289,11 @@ it('shows an SSH probe failure for remote hosts and clears it when switching bac
   });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
   expect(await screen.findByText('SSH: ⨯ auth failed')).toBeTruthy();
 
-  fireEvent.click(screen.getByRole('radio', { name: '本机' }));
+  fireEvent.click(screen.getByRole('radio', { name: 'Local' }));
   await waitFor(() => expect(screen.queryByText('SSH: ⨯ auth failed')).toBeNull());
 });
 
@@ -316,12 +316,12 @@ it('renders the SSH ✓ line and tmux install success in green (text-probe-ok)',
   probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
   expect((await screen.findByText('SSH: ✓ SSH OK')).className).toContain('text-probe-ok');
 
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
   });
 
   const installMsg = await screen.findByText(/tmux 3.4 installed via apt-get/);
@@ -346,7 +346,7 @@ it('describes YOLO by the real per-runtime launch flags instead of explaining th
 
   expect(screen.getByText('--permission-mode bypassPermissions')).toBeTruthy();
   expect(screen.getByText('--dangerously-bypass-approvals-and-sandbox')).toBeTruthy();
-  expect(screen.queryByText(/无需逐条确认|受控环境/)).toBeNull();
+  expect(screen.queryByText(/without asking for confirmation|controlled environment/)).toBeNull();
 });
 
 it('validates the agent id format and global uniqueness', async () => {
@@ -356,20 +356,20 @@ it('validates the agent id format and global uniqueness', async () => {
   await waitFor(() => expect(probeMock).toHaveBeenCalled());
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: '1bad' } });
-  expect(screen.getByText(/小写字母开头/)).toBeTruthy();
+  expect(screen.getByText(/Must start with a lowercase letter/)).toBeTruthy();
   await waitFor(() => expect(submitButton().disabled).toBe(true));
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'dev-a' } });
-  expect(screen.getByText('该 id 已被占用（全局唯一）')).toBeTruthy();
+  expect(screen.getByText('This ID is already in use (must be globally unique)')).toBeTruthy();
   expect(submitButton().disabled).toBe(true);
 });
 
-it('重新探测 re-runs the probe on demand', async () => {
+it('Re-probe re-runs the probe on demand', async () => {
   await renderReady();
   await waitFor(() => expect(probeMock).toHaveBeenCalledTimes(1));
 
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '↻ 重新探测' }));
+    fireEvent.click(screen.getByRole('button', { name: '↻ Re-probe' }));
   });
 
   expect(probeMock).toHaveBeenCalledTimes(2);
@@ -380,7 +380,7 @@ const TMUX_MISSING = {
   runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
 };
 
-it('offers 一键安装 when tmux is missing; success re-probes and flips the status to ✓', async () => {
+it('offers a one-click install when tmux is missing; success re-probes and flips the status to ✓', async () => {
   probeMock
     .mockResolvedValueOnce(TMUX_MISSING)
     .mockResolvedValueOnce({
@@ -391,7 +391,7 @@ it('offers 一键安装 when tmux is missing; success re-probes and flips the st
 
   expect(await screen.findByText(/tmux: ⨯ 请安装 tmux/)).toBeTruthy();
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
   });
 
   expect(installTmuxMock).toHaveBeenCalledWith('local', {});
@@ -399,28 +399,28 @@ it('offers 一键安装 when tmux is missing; success re-probes and flips the st
   expect(await screen.findByText('tmux: ✓ /usr/bin/tmux')).toBeTruthy();
 });
 
-it('does not render 一键安装 when tmux is already present', async () => {
+it('does not render the one-click install button when tmux is already present', async () => {
   await renderReady();
   expect(await screen.findByText(/tmux: ✓/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: '一键安装' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Install with one click' })).toBeNull();
 });
 
 it('targets the selected host when installing from remote mode', async () => {
   probeMock.mockResolvedValue({ ssh: { ok: true, message: 'SSH OK' }, ...TMUX_MISSING });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
 
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
   });
 
   expect(installTmuxMock).toHaveBeenCalledWith('remote', { hostId: 'box' });
 });
 
-it('hides 一键安装 when remote SSH is unreachable (tmux state is unknowable)', async () => {
+it('hides the one-click install button when remote SSH is unreachable (tmux state is unknowable)', async () => {
   probeMock.mockResolvedValue({
     ssh: { ok: false, message: 'SSH 不通，请检查地址 / 端口 / 密码或 key 认证' },
     tmux: { ok: false, message: 'SSH 不通，无法探测' },
@@ -431,11 +431,11 @@ it('hides 一键安装 when remote SSH is unreachable (tmux state is unknowable)
   });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
-  fireEvent.click(screen.getByRole('radio', { name: /远程/ }));
+  fireEvent.click(screen.getByRole('radio', { name: /Remote/ }));
   fireEvent.change(await screen.findByLabelText('Host'), { target: { value: 'box' } });
 
   expect(await screen.findByText(/tmux: ⨯ SSH 不通，无法探测/)).toBeTruthy();
-  expect(screen.queryByRole('button', { name: '一键安装' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Install with one click' })).toBeNull();
 });
 
 it('shows the install failure message with the manual command and does not re-probe', async () => {
@@ -450,7 +450,7 @@ it('shows the install failure message with the manual command and does not re-pr
 
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '一键安装' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install with one click' }));
   });
 
   expect(await screen.findByText(/⨯ cannot install automatically.*sudo apt-get install -y tmux/)).toBeTruthy();
@@ -464,10 +464,10 @@ it('shows a loading hint while installing and ignores repeated clicks', async ()
   await renderReady();
 
   expect(await screen.findByText(/tmux: ⨯/)).toBeTruthy();
-  const install = () => screen.getByRole('button', { name: /一键安装|安装中/ });
+  const install = () => screen.getByRole('button', { name: /Install with one click|Installing/ });
   fireEvent.click(install());
 
-  expect(await screen.findByText(/正在安装 tmux，可能需要几分钟/)).toBeTruthy();
+  expect(await screen.findByText(/Installing tmux — this can take a few minutes/)).toBeTruthy();
   expect((install() as HTMLButtonElement).disabled).toBe(true);
   fireEvent.click(install());
   fireEvent.click(install());

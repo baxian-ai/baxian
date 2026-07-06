@@ -10,7 +10,7 @@ describe('BrandToggle', () => {
     expect(img.getAttribute('src')).toBe('/baxian-logo.png');
     expect(img.getAttribute('height')).toBe('24');
 
-    expect(screen.getByRole('button').getAttribute('aria-label')).toBe('切换为 Logo 文字');
+    expect(screen.getByRole('button').getAttribute('aria-label')).toBe('Switch to logo text');
   });
 
   it('renders the logo at fixed h-6 with width auto so non-square brand assets keep their aspect ratio, and declares intrinsic width=20 (height=24 * 213/256) so the browser reserves the right box pre-load and avoids CLS', () => {
@@ -28,7 +28,7 @@ describe('BrandToggle', () => {
 
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.getByText('baxian')).not.toBeNull();
-    expect(screen.getByRole('button').getAttribute('aria-label')).toBe('切换为 Logo 图标');
+    expect(screen.getByRole('button').getAttribute('aria-label')).toBe('Switch to logo icon');
   });
 
   it('button reserves only ~60px min-width so the brand area stays compact', () => {
@@ -71,6 +71,6 @@ describe('BrandToggle', () => {
     fireEvent.click(btn);
 
     expect(screen.getByRole('img', { name: 'baxian' }).getAttribute('src')).toBe('/baxian-logo.png');
-    expect(btn.getAttribute('aria-label')).toBe('切换为 Logo 文字');
+    expect(btn.getAttribute('aria-label')).toBe('Switch to logo text');
   });
 });

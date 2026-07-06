@@ -173,7 +173,7 @@ describe('App shell layout', () => {
     expect(screen.queryByRole('link', { name: 'Dashboard' })).toBeNull();
     expect(screen.queryByRole('link', { name: 'Tasks' })).toBeNull();
     expect(container.querySelector('a[href="/tasks"]')).toBeNull();
-    expect(nav.querySelector('button[aria-label^="切换为 Logo"]')).toBeNull();
+    expect(nav.querySelector('button[aria-label^="Switch to logo"]')).toBeNull();
 
     const actions = nav.querySelector(`#${TOPBAR_ACTIONS_ID}`);
     expect(actions).toBeTruthy();
@@ -230,16 +230,16 @@ describe('App shell layout', () => {
     expect(footer!.className).toContain('pt-24');
     expect(footer!.className).toContain('pb-4');
 
-    const toggleBtn = footer!.querySelector('button[aria-label^="切换为 Logo"]') as HTMLButtonElement | null;
+    const toggleBtn = footer!.querySelector('button[aria-label^="Switch to logo"]') as HTMLButtonElement | null;
     expect(toggleBtn).toBeTruthy();
-    expect(toggleBtn!.getAttribute('aria-label')).toBe('切换为 Logo 文字');
+    expect(toggleBtn!.getAttribute('aria-label')).toBe('Switch to logo text');
 
     expect(footer!.querySelector('img')?.getAttribute('src')).toBe('/baxian-logo.png');
 
     fireEvent.click(toggleBtn!);
     expect(footer!.querySelector('img')).toBeNull();
     expect(footer!.textContent).toContain('baxian');
-    expect(toggleBtn!.getAttribute('aria-label')).toBe('切换为 Logo 图标');
+    expect(toggleBtn!.getAttribute('aria-label')).toBe('Switch to logo icon');
 
     fireEvent.click(toggleBtn!);
     expect(footer!.querySelector('img')?.getAttribute('src')).toBe('/baxian-logo.png');
@@ -249,7 +249,7 @@ describe('App shell layout', () => {
     const projectRoute = render(<App />);
     const projectFooter = projectRoute.container.querySelector('footer');
     expect(projectFooter).toBeTruthy();
-    expect(projectFooter!.querySelector('button[aria-label^="切换为 Logo"]')).toBeTruthy();
+    expect(projectFooter!.querySelector('button[aria-label^="Switch to logo"]')).toBeTruthy();
   });
 
   it('hides the bottom BrandToggle footer on /terminal/:agentId so the full-height terminal pane is not pushed up by the footer', () => {
@@ -262,14 +262,14 @@ describe('App shell layout', () => {
 });
 
 describe('Task completion notifications', () => {
-  it('renders no notification bell in the topbar — the entry lives in the Dashboard kebab menu', () => {
+  it('renders no notification toggle in the topbar — the entry lives in the Settings modal', () => {
     installNotificationMock('default');
     appMockState.projects = [makeProject()];
 
-    const { container } = render(<App />);
+    render(<App />);
 
-    expect(container.querySelector('nav button[aria-label*="任务完成通知"]')).toBeNull();
-    expect(screen.queryByRole('button', { name: '启用任务完成通知' })).toBeNull();
+    expect(screen.queryByText('Task completion notifications')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Task completion notifications' })).toBeNull();
     expect(appMockState.subscribe).not.toHaveBeenCalled();
   });
 
@@ -382,7 +382,7 @@ describe('Task completion notifications', () => {
       await Promise.resolve();
     });
     expect(notification.instances).toHaveLength(1);
-    expect(notification.instances[0].options?.body).toContain('状态：已合并');
+    expect(notification.instances[0].options?.body).toContain('Status: Merged');
   });
 
   it('drops an in-flight completion confirmation when its own project is removed', async () => {
@@ -499,7 +499,7 @@ describe('Task completion notifications', () => {
       await Promise.resolve();
     });
     expect(notification.instances).toHaveLength(1);
-    expect(notification.instances[0].options?.body).toContain('状态：已合并');
+    expect(notification.instances[0].options?.body).toContain('Status: Merged');
 
     await act(async () => {
       resolvers[0](makeTask({ status: 'merged' }));
@@ -622,10 +622,10 @@ describe('Task completion notifications', () => {
 
     await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledWith('task-188'));
     await waitFor(() => expect(notification.instances).toHaveLength(1));
-    expect(notification.instances[0].title).toContain('任务完成：Ship notifications');
-    expect(notification.instances[0].options?.body).toContain('项目：proj · https://github.com/acme/demo.git');
-    expect(notification.instances[0].options?.body).toContain('任务：task-188 · Ship notifications');
-    expect(notification.instances[0].options?.body).toContain('状态：已合并');
+    expect(notification.instances[0].title).toContain('Task completed: Ship notifications');
+    expect(notification.instances[0].options?.body).toContain('Project: proj · https://github.com/acme/demo.git');
+    expect(notification.instances[0].options?.body).toContain('Task: task-188 · Ship notifications');
+    expect(notification.instances[0].options?.body).toContain('Status: Merged');
   });
 
   it('does not notify when the disappeared task is terminal but not completed', async () => {
@@ -671,7 +671,7 @@ describe('Task completion notifications', () => {
 
       await waitFor(() => expect(appMockState.taskGet).toHaveBeenCalledTimes(2));
       await waitFor(() => expect(notification.instances).toHaveLength(1));
-      expect(notification.instances[0].options?.body).toContain('状态：已完成');
+      expect(notification.instances[0].options?.body).toContain('Status: Done');
     } finally {
       warn.mockRestore();
     }

@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from 'react';
 import { api, ApiError } from '../api.ts';
+import { useT } from '../i18n/index.tsx';
 
 const STORAGE_KEY = 'baxian.pendingRestart';
 const POLL_INTERVAL_MS = 500;
@@ -54,6 +55,7 @@ function persist(state: Persisted): void {
 }
 
 export function PendingRestartProvider({ children }: { children: ReactNode }) {
+  const t = useT();
   const initial = loadPersisted();
   const [count, setCount] = useState<number>(initial.count);
   const [baseline, setBaseline] = useState<string | null>(initial.baselineStartedAt);
@@ -180,7 +182,7 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
       beforeStartedAt = before.startedAt;
     } catch (err) {
       setPhaseValue('failed');
-      setError(`获取重启前 startedAt 失败: ${err instanceof Error ? err.message : String(err)}`);
+      setError(t.banner.preRestartFetchFailed(err instanceof Error ? err.message : String(err)));
       return;
     }
 
@@ -190,7 +192,7 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
       if (err instanceof ApiError && err.status === 409) {
       } else {
         setPhaseValue('failed');
-        setError(`触发重启失败: ${err instanceof Error ? err.message : String(err)}`);
+        setError(t.banner.restartTriggerFailed(err instanceof Error ? err.message : String(err)));
         return;
       }
     }
@@ -213,8 +215,8 @@ export function PendingRestartProvider({ children }: { children: ReactNode }) {
     }
 
     setPhaseValue('failed');
-    setError('重启超时（30s 未恢复）。请检查日志或手动 baxian start -c <path>');
-  }, [setCountValue, setPhaseValue]);
+    setError(t.banner.restartTimeout);
+  }, [setCountValue, setPhaseValue, t]);
 
   return (
     <PendingRestartContext.Provider

@@ -11,16 +11,19 @@ import {
 } from '../shared/github-review.js';
 import { useGithubReview } from '../hooks/use-github-review.ts';
 import { TurnRow } from './review-turn-row.tsx';
+import { useT, type Messages } from '../i18n/index.tsx';
 
 interface Props {
   task: TaskState;
 }
 
-const REASON_TEXT: Record<string, string> = {
-  'server-mode': '该 task 为 server 评审模式，代码评审记录见 server 评审轮次。',
-  'no-pr': '该 task 还没有 PR，暂无代码评审记录。',
-  'not-github': '该 task 的仓库不是 GitHub 仓库，无法拉取 PR 评审记录。',
-};
+function reasonText(t: Messages): Record<string, string> {
+  return {
+    'server-mode': t.githubReview.reasonServerModeEntry,
+    'no-pr': t.githubReview.reasonNoPr,
+    'not-github': t.githubReview.reasonNotGithub,
+  };
+}
 
 function firstLine(value?: string): string {
   return value?.trim().split('\n', 1)[0] ?? '';
@@ -35,17 +38,17 @@ function inlineLocation(item: GithubReviewItem): string | undefined {
   return item.line !== undefined ? `${item.path}:${item.line}` : item.path;
 }
 
-function truncatedSuffix(item: GithubReviewItem): string {
-  return item.bodyTruncated ? '（已截断）' : '';
+function truncatedSuffix(t: Messages, item: GithubReviewItem): string {
+  return item.bodyTruncated ? t.githubReview.truncatedSuffix : '';
 }
 
-function itemSummary(item: GithubReviewItem): string {
+function itemSummary(t: Messages, item: GithubReviewItem): string {
   const body = firstLine(item.body);
-  const suffix = truncatedSuffix(item);
+  const suffix = truncatedSuffix(t, item);
   if (item.kind === 'commit') {
     const sha = shortSha(item);
     if (sha && body) return `${sha} ${body}${suffix}`;
-    return `${body || sha || 'commit'}${suffix}`;
+    return `${body || sha || t.githubReview.commitFallback}${suffix}`;
   }
   if (item.kind === 'review-comment') {
     const loc = inlineLocation(item);
@@ -54,20 +57,20 @@ function itemSummary(item: GithubReviewItem): string {
       if (parts.length > 0) return `${parts.join(' · ')}${suffix}`;
     }
     if (loc && body) return `${loc} · ${body}${suffix}`;
-    return `${body || loc || '行内评论'}${suffix}`;
+    return `${body || loc || t.githubReview.inlineComment}${suffix}`;
   }
   if (item.kind === 'issue-comment') {
     if (item.author && body) return `${item.author} · ${body}${suffix}`;
-    return `${body || item.author || '评论'}${suffix}`;
+    return `${body || item.author || t.githubReview.comment}${suffix}`;
   }
-  return `${body || '无评审正文'}${suffix}`;
+  return `${body || t.githubReview.noReviewBodyFallback}${suffix}`;
 }
 
-function itemLabel(item: GithubReviewItem): string {
-  if (item.kind === 'commit') return '提交代码改动';
-  if (item.kind === 'review') return '评审';
-  if (item.kind === 'review-comment') return item.inReplyTo ? '反馈' : '行内评论';
-  return '评论';
+function itemLabel(t: Messages, item: GithubReviewItem): string {
+  if (item.kind === 'commit') return t.review.submitCodeChanges;
+  if (item.kind === 'review') return t.review.reviewTurnLabel;
+  if (item.kind === 'review-comment') return item.inReplyTo ? t.review.responseTurnLabel : t.githubReview.inlineComment;
+  return t.githubReview.comment;
 }
 
 function itemRole(item: GithubReviewItem): 'dev' | 'qa' {
@@ -75,6 +78,7 @@ function itemRole(item: GithubReviewItem): 'dev' | 'qa' {
 }
 
 export function GithubReviewEntry({ task }: Props) {
+  const t = useT();
   const navigate = useNavigate();
   const revision = githubReviewRevision(task);
   const { data, loaded, error } = useGithubReview(task.id, revision);
@@ -86,7 +90,7 @@ export function GithubReviewEntry({ task }: Props) {
   if (error) {
     return (
       <ReviewGroup>
-        <div className="text-sm text-accent">加载评审记录失败：{error}</div>
+        <div className="text-sm text-accent">{t.review.loadFailed(error)}</div>
       </ReviewGroup>
     );
   }
@@ -94,15 +98,16 @@ export function GithubReviewEntry({ task }: Props) {
   if (!loaded) {
     return (
       <ReviewGroup>
-        <div className="text-sm text-og-400">加载评审记录…</div>
+        <div className="text-sm text-og-400">{t.review.loadingRecords}</div>
       </ReviewGroup>
     );
   }
 
   if (!data?.available) {
+    const reasons = reasonText(t);
     return (
       <ReviewGroup>
-        <div className="text-sm text-og-400">{REASON_TEXT[data?.reason ?? 'no-pr'] ?? REASON_TEXT['no-pr']}</div>
+        <div className="text-sm text-og-400">{reasons[data?.reason ?? 'no-pr'] ?? reasons['no-pr']}</div>
       </ReviewGroup>
     );
   }
@@ -111,9 +116,9 @@ export function GithubReviewEntry({ task }: Props) {
     return (
       <ReviewGroup>
         {data.error ? (
-          <div className="text-sm text-accent">评审记录拉取失败：{data.error}</div>
+          <div className="text-sm text-accent">{t.githubReview.fetchFailed(data.error)}</div>
         ) : (
-          <div className="text-sm text-og-400">评审尚未开始</div>
+          <div className="text-sm text-og-400">{t.review.notStarted}</div>
         )}
       </ReviewGroup>
     );
@@ -124,7 +129,7 @@ export function GithubReviewEntry({ task }: Props) {
   return (
     <ReviewGroup>
       {data.error && (
-        <div className="text-xs text-accent">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
+        <div className="text-xs text-accent">{t.githubReview.partialFetchFailed(data.error)}</div>
       )}
       {rounds.map((round, index) => (
         <RoundBlock key={githubReviewRoundKey(round, String(index))} round={round} index={index} onOpen={open} />
@@ -134,9 +139,10 @@ export function GithubReviewEntry({ task }: Props) {
 }
 
 function ReviewGroup({ children }: { children: ReactNode }) {
+  const t = useT();
   return (
     <div>
-      <div className="mb-1.5 text-xs text-og-700">代码评审</div>
+      <div className="mb-1.5 text-xs text-og-700">{t.githubReview.codeReviewHeading}</div>
       <div className="space-y-3">{children}</div>
     </div>
   );
@@ -151,7 +157,8 @@ function RoundBlock({
   index: number;
   onOpen: () => void;
 }) {
-  const label = round.review ? `第 ${index + 1} 轮` : '进行中';
+  const t = useT();
+  const label = round.review ? t.agents.round(index + 1) : t.status.in_progress;
   return (
     <div>
       <div className="mb-1 text-xs text-og-400">{label}</div>
@@ -166,13 +173,14 @@ function RoundBlock({
 }
 
 function GithubTurnRow({ item, onOpen }: { item: GithubReviewItem; onOpen: () => void }) {
+  const t = useT();
   const verdict = item.kind === 'review' ? item.verdict : undefined;
   return (
     <TurnRow
       role={itemRole(item)}
-      label={itemLabel(item)}
+      label={itemLabel(t, item)}
       badge={verdict ? <span className={GITHUB_REVIEW_VERDICT_CLASS[verdict]}>{verdict}</span> : undefined}
-      summary={itemSummary(item)}
+      summary={itemSummary(t, item)}
       onClick={onOpen}
     />
   );

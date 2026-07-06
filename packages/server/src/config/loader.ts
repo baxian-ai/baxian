@@ -170,6 +170,9 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const reviewMode = (rv.mode === undefined ? 'github' : rv.mode) as ReviewMode;
 
   return {
+    ...(normalized.language !== undefined
+      ? { language: normalized.language as BaxianConfig['language'] }
+      : {}),
     review: {
       rounds: isFiniteNumber(rv.rounds) ? rv.rounds : DEFAULT_REVIEW_ROUNDS,
       mode: reviewMode,

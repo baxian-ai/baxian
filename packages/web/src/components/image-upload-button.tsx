@@ -2,6 +2,7 @@ import { useRef, useState, type ChangeEvent } from 'react';
 import { api, ApiError } from '../api.ts';
 import { IMAGE_UPLOAD_MAX_BYTES } from '../shared/index.ts';
 import { useToast } from './toast.tsx';
+import { useT } from '../i18n/index.tsx';
 
 export interface ImageUploadButtonProps {
   agentId: string;
@@ -11,6 +12,7 @@ export interface ImageUploadButtonProps {
 const MAX_MIB = Math.floor(IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024);
 
 export function ImageUploadButton({ agentId, className }: ImageUploadButtonProps) {
+  const t = useT();
   const inputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const { show } = useToast();
@@ -20,16 +22,16 @@ export function ImageUploadButton({ agentId, className }: ImageUploadButtonProps
     e.target.value = '';
     if (!file) return;
     if (file.size > IMAGE_UPLOAD_MAX_BYTES) {
-      show({ kind: 'error', title: '图片过大', body: `单张图片不能超过 ${MAX_MIB} MiB` });
+      show({ kind: 'error', title: t.createTask.imageTooLargeToastTitle, body: t.imageUpload.tooLargeBody(MAX_MIB) });
       return;
     }
     setUploading(true);
     try {
       await api.agents.uploadImage(agentId, file);
-      show({ kind: 'success', title: '图片已插入', body: '路径已粘贴到终端输入，补充说明后回车' });
+      show({ kind: 'success', title: t.imageUpload.insertedTitle, body: t.imageUpload.insertedBody });
     } catch (err) {
       const body = err instanceof ApiError || err instanceof Error ? err.message : String(err);
-      show({ kind: 'error', title: '图片上传失败', body });
+      show({ kind: 'error', title: t.imageUpload.uploadFailedTitle, body });
     } finally {
       setUploading(false);
     }
@@ -39,7 +41,7 @@ export function ImageUploadButton({ agentId, className }: ImageUploadButtonProps
     <>
       <button
         type="button"
-        aria-label="上传图片"
+        aria-label={t.imageUpload.uploadAriaLabel}
         disabled={uploading}
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => inputRef.current?.click()}

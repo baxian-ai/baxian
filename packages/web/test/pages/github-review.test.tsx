@@ -46,9 +46,9 @@ describe('GithubReviewPage', () => {
     renderAt('/tasks/task-1/github-review');
 
     expect(await screen.findByText('My Task')).toBeTruthy();
-    expect(screen.getByText('查看 PR #7')).toBeTruthy();
-    expect(screen.getByText('第 1 轮')).toBeTruthy();
-    expect(screen.getByText('第 2 轮')).toBeTruthy();
+    expect(screen.getByText('View PR #7')).toBeTruthy();
+    expect(screen.getByText('Round 1')).toBeTruthy();
+    expect(screen.getByText('Round 2')).toBeTruthy();
     expect(screen.getByText('a.ts:12')).toBeTruthy();
     expect(screen.getByText('nit')).toBeTruthy();
     expect(screen.getByText('fix: thing')).toBeTruthy();
@@ -61,16 +61,16 @@ describe('GithubReviewPage', () => {
   it('shows a reason message when records are unavailable', async () => {
     ghMock.mockResolvedValue({ available: false, reason: 'no-pr', items: [] } as GithubReviewConversation);
     renderAt('/tasks/task-1/github-review');
-    expect(await screen.findByText(/还没有 PR/)).toBeTruthy();
+    expect(await screen.findByText(/has no PR yet/)).toBeTruthy();
   });
 
   it('shows an empty state when the conversation has no items', async () => {
     ghMock.mockResolvedValue({ available: true, prNumber: 7, items: [] } as GithubReviewConversation);
     renderAt('/tasks/task-1/github-review');
-    expect(await screen.findByText('评审尚未开始')).toBeTruthy();
+    expect(await screen.findByText('Review has not started')).toBeTruthy();
   });
 
-  it('shows a degradation hint (not 评审尚未开始) when all sources failed with no items', async () => {
+  it('shows a degradation hint (not "Review has not started") when all sources failed with no items', async () => {
     ghMock.mockResolvedValue({
       available: true,
       prNumber: 7,
@@ -78,8 +78,8 @@ describe('GithubReviewPage', () => {
       items: [],
     } as GithubReviewConversation);
     renderAt('/tasks/task-1/github-review');
-    expect(await screen.findByText(/评审记录拉取失败：reviews: gh: not found/)).toBeTruthy();
-    expect(screen.queryByText('评审尚未开始')).toBeNull();
+    expect(await screen.findByText(/Failed to fetch review records: reviews: gh: not found/)).toBeTruthy();
+    expect(screen.queryByText('Review has not started')).toBeNull();
   });
 
   it('shows a partial-failure banner but still renders fetched items', async () => {
@@ -90,13 +90,13 @@ describe('GithubReviewPage', () => {
       items: [{ kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' }],
     } as GithubReviewConversation);
     renderAt('/tasks/task-1/github-review');
-    expect(await screen.findByText(/部分评审记录拉取失败/)).toBeTruthy();
+    expect(await screen.findByText(/Some review records failed to fetch/)).toBeTruthy();
     expect(screen.getByText('fix')).toBeTruthy();
   });
 
   it('renders a load error', async () => {
     ghMock.mockRejectedValue(new Error('network down'));
     renderAt('/tasks/task-1/github-review');
-    expect(await screen.findByText(/加载评审记录失败：network down/)).toBeTruthy();
+    expect(await screen.findByText(/Failed to load review records: network down/)).toBeTruthy();
   });
 });

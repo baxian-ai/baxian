@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { AuthGate } from '../../src/components/auth-gate.tsx';
 import { UNAUTHORIZED_EVENT } from '../../src/api.ts';
+import { I18nProvider, getLocale, syncLocaleFromConfig, __resetI18nForTests } from '../../src/i18n/index.tsx';
 
 function jsonResponse(status: number, body: unknown = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -23,6 +24,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  __resetI18nForTests();
 });
 
 describe('AuthGate', () => {
@@ -43,21 +45,21 @@ describe('AuthGate', () => {
     render(<AuthGate><div data-testid="app">app</div></AuthGate>);
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '登录' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Sign in' })).toBeTruthy();
     });
     expect(screen.queryByTestId('app')).toBeNull();
-    expect(screen.getByLabelText('访问令牌')).toBeTruthy();
+    expect(screen.getByLabelText('Token')).toBeTruthy();
   });
 
   it('blocks submit with empty token and shows inline validation', async () => {
     installFetch(vi.fn(async () => jsonResponse(401)));
 
     render(<AuthGate><div /></AuthGate>);
-    const submit = await screen.findByRole('button', { name: '登录' });
+    const submit = await screen.findByRole('button', { name: 'Sign in' });
 
     fireEvent.click(submit);
 
-    expect(await screen.findByText('请输入访问令牌')).toBeTruthy();
+    expect(await screen.findByText('Please enter the access token')).toBeTruthy();
   });
 
   it('saves token on successful login and renders children', async () => {
@@ -71,10 +73,10 @@ describe('AuthGate', () => {
     installFetch(fetchSpy);
 
     render(<AuthGate><div data-testid="app">app</div></AuthGate>);
-    const input = await screen.findByLabelText('访问令牌');
+    const input = await screen.findByLabelText('Token');
 
     fireEvent.change(input, { target: { value: 'good-token' } });
-    fireEvent.click(screen.getByRole('button', { name: '登录' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
 
     await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
     expect(localStorage.getItem('baxian.token')).toBe('good-token');
@@ -84,11 +86,11 @@ describe('AuthGate', () => {
     installFetch(vi.fn(async () => jsonResponse(401)));
 
     render(<AuthGate><div /></AuthGate>);
-    const input = await screen.findByLabelText('访问令牌');
+    const input = await screen.findByLabelText('Token');
     fireEvent.change(input, { target: { value: 'bad-token' } });
-    fireEvent.click(screen.getByRole('button', { name: '登录' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
 
-    await waitFor(() => expect(screen.getByText('令牌无效，请重试')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('Invalid token, please retry')).toBeTruthy());
     expect(localStorage.getItem('baxian.token')).toBeNull();
   });
 
@@ -101,7 +103,7 @@ describe('AuthGate', () => {
     installFetch(fetchSpy);
 
     render(<AuthGate><div data-testid="app">app</div></AuthGate>);
-    const retry = await screen.findByRole('button', { name: '重试' });
+    const retry = await screen.findByRole('button', { name: 'Retry' });
     expect(screen.getByText('network down')).toBeTruthy();
 
     mode = 'ok';
@@ -120,7 +122,37 @@ describe('AuthGate', () => {
       window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
     });
 
+    expect(await screen.findByText('Session expired, please enter the token again')).toBeTruthy();
+    expect(screen.queryByTestId('app')).toBeNull();
+  });
+
+  it('renders the session-expired message in the locale switched to after login', async () => {
+    installFetch(vi.fn(async () => jsonResponse(200, {})));
+
+    render(
+      <I18nProvider>
+        <AuthGate><div data-testid="app">app</div></AuthGate>
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+
+    act(() => syncLocaleFromConfig('zh-CN'));
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    });
+
     expect(await screen.findByText('登录已失效，请重新输入令牌')).toBeTruthy();
     expect(screen.queryByTestId('app')).toBeNull();
+  });
+
+  it('syncs the locale from config when the probe succeeds', async () => {
+    const fetchSpy: FetchSpy = vi.fn(async () => jsonResponse(200, { language: 'zh-CN' }));
+    installFetch(fetchSpy);
+
+    render(<AuthGate><div data-testid="app">app</div></AuthGate>);
+
+    await waitFor(() => expect(screen.queryByTestId('app')).not.toBeNull());
+    expect(getLocale()).toBe('zh-CN');
   });
 });

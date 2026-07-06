@@ -192,18 +192,18 @@ describe('TaskDetail page — header & info', () => {
     expect(within(heading).getByText('task-010').className).toContain('text-og-400');
     expect(within(heading).getByText('Clean tests')).toBeTruthy();
 
-    expect(within(container.querySelector('section')!).getByText('已通过').className).toContain('pill');
-    expect(container.textContent).toContain('创建于 2026-05-10 20:00 · 更新于 2026-05-10 21:00');
+    expect(within(container.querySelector('section')!).getByText('Approved').className).toContain('pill');
+    expect(container.textContent).toContain('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
     expect(container.textContent).toContain('Task body here');
-    expect(container.textContent).toContain('评审 1 轮');
-    expect(container.textContent).toContain('Spec 0 轮');
+    expect(container.textContent).toContain('Review round 1');
+    expect(container.textContent).toContain('Spec round 0');
     expect(container.textContent).toContain('Branch:');
     expect(screen.getByTestId('review-conversation').getAttribute('data-task')).toBe('task-010');
   });
 
   it('shows regular-weight Round/Spec counts beside the status pill', () => {
     const { container } = open({ reviewRound: 3, specReviewRound: 2 });
-    const status = within(container.querySelector('section')!).getByText('已通过').parentElement!;
+    const status = within(container.querySelector('section')!).getByText('Approved').parentElement!;
     expect(within(status).getByText('3').className).not.toContain('font-semibold');
     expect(within(status).getByText('2').className).not.toContain('font-semibold');
   });
@@ -211,12 +211,12 @@ describe('TaskDetail page — header & info', () => {
   it('keeps status, review rounds, and timestamps at body size', () => {
     const { container } = open({ status: 'max_rounds', reviewRound: 10, specReviewRound: 0 });
     const section = container.querySelector('section')!;
-    const row = within(section).getByText('轮次达上限').parentElement!;
-    const round = within(row).getByText((_, el) => el?.textContent === '评审 10 轮');
-    const spec = within(row).getByText((_, el) => el?.textContent === 'Spec 0 轮');
-    const timestamps = within(section).getByText('创建于 2026-05-10 20:00 · 更新于 2026-05-10 21:00');
+    const row = within(section).getByText('Max rounds reached').parentElement!;
+    const round = within(row).getByText((_, el) => el?.textContent === 'Review round 10');
+    const spec = within(row).getByText((_, el) => el?.textContent === 'Spec round 0');
+    const timestamps = within(section).getByText('Created 2026-05-10 20:00 · Updated 2026-05-10 21:00');
 
-    expect(within(row).getByText('轮次达上限').className).toContain('text-sm');
+    expect(within(row).getByText('Max rounds reached').className).toContain('text-sm');
     expect(round.className).toContain('text-sm');
     expect(spec.className).toContain('text-sm');
     expect(timestamps.className).toContain('text-sm');
@@ -237,21 +237,21 @@ describe('TaskDetail page — header & info', () => {
 
   it('renders timestamps at minute precision and tolerates empty values', () => {
     open({ createdAt: '2026-05-10T12:00:00.000Z', updatedAt: null as unknown as string });
-    expect(screen.getByText('创建于 2026-05-10 20:00 · 更新于')).toBeTruthy();
+    expect(screen.getByText('Created 2026-05-10 20:00 · Updated')).toBeTruthy();
   });
 
   it('places the action buttons on their own row below the status capsule, not in the title', () => {
     const { container } = open({ status: 'pending' });
     const section = container.querySelector('section')!;
-    const actionsRow = screen.getByRole('button', { name: '编辑' }).parentElement!;
+    const actionsRow = screen.getByRole('button', { name: 'Edit' }).parentElement!;
     expect(container.querySelector('h1')!.contains(actionsRow)).toBe(false);
     expect(section.contains(actionsRow)).toBe(true);
-    const capsuleRow = within(section).getByText('待处理').parentElement!;
+    const capsuleRow = within(section).getByText('Pending').parentElement!;
     expect(capsuleRow.compareDocumentPosition(actionsRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  const QA_BANNER = 'QA agent 已通过 · 正在核对反馈';
-  const MERGE_BANNER = 'PR 就绪 · 等你确认';
+  const QA_BANNER = 'QA agent approved · Confirming feedback';
+  const MERGE_BANNER = 'PR ready · Awaiting your confirmation';
   it.each([
     { status: 'approved', shown: QA_BANNER, hidden: MERGE_BANNER },
     { status: 'merge-ready', shown: MERGE_BANNER, hidden: QA_BANNER },
@@ -259,7 +259,7 @@ describe('TaskDetail page — header & info', () => {
     open({ status: status as TaskState['status'] });
     expect(screen.getByText(shown)).toBeTruthy();
     expect(screen.queryByText(hidden)).toBeNull();
-    expect(screen.getByRole('link', { name: '查看 PR #55' }).getAttribute('href'))
+    expect(screen.getByRole('link', { name: 'View PR #55' }).getAttribute('href'))
       .toBe('https://github.com/baxian-ai/baxian/pull/55');
   });
 });
@@ -355,14 +355,14 @@ describe('TaskDetail page — layout & agent cards', () => {
   it('shows a placeholder when projects are still loading', () => {
     setProjects(null);
     open();
-    expect(screen.getByText('加载中…')).toBeTruthy();
+    expect(screen.getByText('Loading…')).toBeTruthy();
     expect(screen.queryByTestId('agent-card')).toBeNull();
   });
 
   it('shows a placeholder for a legacy task with no resolvable agent group', () => {
     setTask(makeTask({ agentId: '', preferredAgentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText('暂无关联 Agent')).toBeTruthy();
+    expect(screen.getByText('No linked agent')).toBeTruthy();
     expect(screen.queryByTestId('agent-card')).toBeNull();
   });
 });
@@ -376,24 +376,24 @@ describe('TaskDetail page — actions & states', () => {
 
     setTask(null, { loaded: true });
     const r2 = renderPage();
-    expect(screen.getByText('任务不存在：task-010')).toBeTruthy();
+    expect(screen.getByText('Task not found: task-010')).toBeTruthy();
     r2.unmount();
 
     setTask(null, { loaded: true, error: { code: 'x', message: 'boom' } });
     renderPage();
-    expect(screen.getByText('加载失败：boom')).toBeTruthy();
+    expect(screen.getByText('Failed to load: boom')).toBeTruthy();
   });
 
   it('the back button navigates to the previous history entry', () => {
     setTask(makeTask());
     renderPage('task-010', { entries: ['/elsewhere', '/project/baxian/task/task-010'], index: 1 });
-    fireEvent.click(screen.getByRole('button', { name: '← 返回' }));
+    fireEvent.click(screen.getByRole('button', { name: '← Back' }));
     expect(screen.getByTestId('loc').textContent).toBe('/elsewhere');
   });
 
   it('Edit opens the edit modal overlay', () => {
     open({ status: 'pending' });
-    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
     expect(screen.getByTestId('edit-modal')).toBeTruthy();
   });
 
@@ -405,12 +405,12 @@ describe('TaskDetail page — actions & states', () => {
     tasksRetryMock.mockResolvedValue(makeTask({ id: 'task-011', projectId: 'baxian', status: 'pending' }));
     renderPage('task-010');
 
-    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('重试任务 task-010？')).toBeTruthy();
-    expect(within(dialog).getByText(/任务已合并。重试会用同样的标题\/描述新建一个任务从头跑。/)).toBeTruthy();
+    expect(within(dialog).getByText('Retry task task-010?')).toBeTruthy();
+    expect(within(dialog).getByText('The task is merged. Retrying creates a new task from scratch with the same title/description.')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: '重试' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Retry' }));
     });
 
     expect(tasksRetryMock).toHaveBeenCalledWith('task-010');
@@ -421,11 +421,11 @@ describe('TaskDetail page — actions & states', () => {
     tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
     open({ status: 'in_progress' });
 
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('取消任务 task-010？')).toBeTruthy();
+    expect(within(dialog).getByText('Cancel task task-010?')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: '取消任务' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel task' }));
     });
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
@@ -442,8 +442,8 @@ describe('TaskDetail page — actions & states', () => {
     });
     renderPage('task-010', { extra: <GoTo to="/project/baxian/task/task-011" /> });
 
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
-    await settleConfirmDialog('取消任务');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await settleConfirmDialog('Cancel task');
     expect(screen.getByText('AAA')).toBeTruthy();
 
     await act(async () => {
@@ -458,18 +458,18 @@ describe('TaskDetail page — actions & states', () => {
       open({ status: 'max_rounds', reviewRound: 10, ...overrides });
     }
 
-    it('code-phase shows 标记完成 / 继续一轮 / Call review and the warning, hides Retry', () => {
+    it('code-phase shows Mark complete / Continue another round / Call review and the warning, hides Retry', () => {
       openMaxRounds();
-      expect(screen.getByRole('button', { name: '标记完成' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: '继续一轮' })).toBeTruthy();
-      expect(screen.getByRole('button', { name: '发起评审' })).toBeTruthy();
-      expect(screen.queryByRole('button', { name: '重试' })).toBeNull();
-      expect(screen.getByText(/评审已达 10 轮上限/)).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Mark complete' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Continue another round' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Call review' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+      expect(screen.getByText(/Review round limit reached \(round 10\)/)).toBeTruthy();
     });
 
     it.each([
-      { button: '继续一轮', mock: tasksContinueMock, resolved: makeTask({ status: 'fixing', reviewRound: 11 }) },
-      { button: '标记完成', mock: tasksCompleteMock, resolved: makeTask({ status: 'merged' }) },
+      { button: 'Continue another round', mock: tasksContinueMock, resolved: makeTask({ status: 'fixing', reviewRound: 11 }) },
+      { button: 'Mark complete', mock: tasksCompleteMock, resolved: makeTask({ status: 'merged' }) },
     ])('$button confirms and calls its api', async ({ button, mock, resolved }) => {
       mock.mockResolvedValue(resolved);
       openMaxRounds();
@@ -481,10 +481,10 @@ describe('TaskDetail page — actions & states', () => {
 
     it('spec-phase shows Retry, hides the code actions, disables Call review', () => {
       openMaxRounds({ phase: 'spec' });
-      expect(screen.getByRole('button', { name: '重试' })).toBeTruthy();
-      expect(screen.queryByRole('button', { name: '标记完成' })).toBeNull();
-      expect((screen.getByRole('button', { name: '发起评审' }) as HTMLButtonElement).disabled).toBe(true);
-      expect(screen.getByText(/Spec 评审已达 0 轮上限/)).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Mark complete' })).toBeNull();
+      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(true);
+      expect(screen.getByText(/Spec review round limit reached \(round 0\)/)).toBeTruthy();
     });
   });
 
@@ -493,54 +493,54 @@ describe('TaskDetail page — actions & states', () => {
       open({ status: 'spec-ready', phase: 'spec', specReviewRound: 1, prNumber: undefined, prUrl: undefined, ...overrides });
     }
 
-    it('shows the Spec 需由人类审核 card with both actions; 打回 disabled until comments filled', () => {
+    it('shows the Spec requires human review card with both actions; Reject disabled until comments filled', () => {
       openSpecReady();
-      expect(screen.getByText('Spec 需由人类审核')).toBeTruthy();
-      expect(screen.getByRole('button', { name: '通过 Spec，开始编码' })).toBeTruthy();
-      const reject = screen.getByRole('button', { name: '打回 Spec' }) as HTMLButtonElement;
+      expect(screen.getByText('Spec requires human review')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Approve Spec and start coding' })).toBeTruthy();
+      const reject = screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement;
       expect(reject.disabled).toBe(true);
-      fireEvent.change(screen.getByPlaceholderText(/打回意见/), { target: { value: '补充回滚方案' } });
-      expect((screen.getByRole('button', { name: '打回 Spec' }) as HTMLButtonElement).disabled).toBe(false);
-      expect((screen.getByRole('button', { name: '取消' }) as HTMLButtonElement).disabled).toBe(false);
+      fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: '补充回滚方案' } });
+      expect((screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
     });
 
-    it('通过 Spec confirms and submits an approve verdict', async () => {
+    it('Approve Spec confirms and submits an approve verdict', async () => {
       tasksSpecMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
       openSpecReady();
 
-      fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('通过 Spec 并开始编码？')).toBeTruthy();
-      expect(within(dialog).getByText('任务 task-010 将进入编码阶段。')).toBeTruthy();
+      expect(within(dialog).getByText('Approve Spec and start coding?')).toBeTruthy();
+      expect(within(dialog).getByText('Task task-010 will move into the coding phase.')).toBeTruthy();
       await act(async () => {
-        fireEvent.click(within(dialog).getByRole('button', { name: '通过 Spec' }));
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Approve Spec' }));
       });
 
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已通过，已发起编码' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec approved; coding started' });
     });
 
-    it('打回 Spec submits request-changes with the comments', async () => {
+    it('Reject Spec submits request-changes with the comments', async () => {
       tasksSpecMock.mockResolvedValue(makeTask({ status: 'fixing' }));
       openSpecReady();
 
-      fireEvent.change(screen.getByPlaceholderText(/打回意见/), { target: { value: ' 边界场景没有覆盖 ' } });
+      fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: ' 边界场景没有覆盖 ' } });
       await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: '打回 Spec' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Reject Spec' }));
       });
 
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '边界场景没有覆盖' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec 已打回，Dev agent 开始修订' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec rejected; Dev agent is revising' });
     });
 
     it('verdict failure surfaces an error toast', async () => {
       tasksSpecMock.mockRejectedValue(new Error('task-010 is fixing'));
       openSpecReady();
 
-      fireEvent.click(screen.getByRole('button', { name: '通过 Spec，开始编码' }));
-      await settleConfirmDialog('通过 Spec');
+      fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
+      await settleConfirmDialog('Approve Spec');
 
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Spec 通过失败', body: 'task-010 is fixing' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to approve Spec', body: 'task-010 is fixing' });
     });
   });
 });
@@ -550,27 +550,27 @@ describe('TaskDetail page — call review', () => {
     tasksReviewMock.mockResolvedValue(makeTask({ status: 'review', reviewRound: 2, updatedAt: '2026-05-11T00:00:00.000Z' }));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('发起 QA 重审？')).toBeTruthy();
-    expect(within(dialog).getByText(/QA agent 将对任务 task-010 立即开始新一轮 review/)).toBeTruthy();
+    expect(within(dialog).getByText('Start a QA re-review?')).toBeTruthy();
+    expect(within(dialog).getByText(/QA agent will immediately start a new review round for task task-010/)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: '发起重审' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Start re-review' }));
     });
 
     expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已发起 QA 重审（第 2 轮）' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
   });
 
   it('warns that re-reviewing a terminal task will not feed back into the state machine', async () => {
     open({ status: 'merged' });
 
-    fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('重审已结束的任务？')).toBeTruthy();
-    expect(within(dialog).getByText(/已是「已合并」状态/)).toBeTruthy();
+    expect(within(dialog).getByText('Re-review a finished task?')).toBeTruthy();
+    expect(within(dialog).getByText(/is already in status "Merged"/)).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     });
 
     expect(tasksReviewMock).not.toHaveBeenCalled();
@@ -581,59 +581,59 @@ describe('TaskDetail page — call review', () => {
     tasksReviewMock.mockRejectedValue(new Error('qa is busy'));
     open({ status: 'review' });
 
-    fireEvent.click(screen.getByRole('button', { name: '发起评审' }));
-    await settleConfirmDialog('发起重审');
+    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+    await settleConfirmDialog('Start re-review');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '发起评审失败', body: 'qa is busy' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'qa is busy' });
   });
 });
 
 describe('TaskDetail page — action failures surface error toasts', () => {
-  it('Cancel failure shows 取消失败 and re-enables the button', async () => {
+  it('Cancel failure shows Cancel failed and re-enables the button', async () => {
     tasksUpdateMock.mockRejectedValue(new Error('cancel nope'));
     open({ status: 'in_progress' });
 
-    fireEvent.click(screen.getByRole('button', { name: '取消' }));
-    await settleConfirmDialog('取消任务');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await settleConfirmDialog('Cancel task');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '取消失败', body: 'cancel nope' });
-    expect((screen.getByRole('button', { name: '取消' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to cancel', body: 'cancel nope' });
+    expect((screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('Retry on a cancelled task uses the fresh-start prompt and reports failure without navigating', async () => {
     tasksRetryMock.mockRejectedValue(new Error('retry nope'));
     open({ status: 'cancelled' });
 
-    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('重试任务 task-010？')).toBeTruthy();
-    expect(within(dialog).getByText('会新建一个任务从头开始，旧任务保留为历史。')).toBeTruthy();
+    expect(within(dialog).getByText('Retry task task-010?')).toBeTruthy();
+    expect(within(dialog).getByText('This creates a new task from scratch; the old task is kept as history.')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: '重试' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Retry' }));
     });
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '重试失败', body: 'retry nope' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to retry', body: 'retry nope' });
     expect(screen.getByTestId('loc').textContent).toBe('/project/baxian/task/task-010');
   });
 
-  it('标记完成 failure shows 标记完成失败', async () => {
+  it('Mark complete failure shows Failed to mark complete', async () => {
     tasksCompleteMock.mockRejectedValue(new Error('merge conflict'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: '标记完成' }));
-    await settleConfirmDialog('标记完成');
+    fireEvent.click(screen.getByRole('button', { name: 'Mark complete' }));
+    await settleConfirmDialog('Mark complete');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '标记完成失败', body: 'merge conflict' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to mark complete', body: 'merge conflict' });
   });
 
-  it('继续一轮 failure shows 继续一轮失败', async () => {
+  it('Continue another round failure shows Failed to continue', async () => {
     tasksContinueMock.mockRejectedValue(new Error('dev is gone'));
     open({ status: 'max_rounds' });
 
-    fireEvent.click(screen.getByRole('button', { name: '继续一轮' }));
-    await settleConfirmDialog('继续一轮');
+    fireEvent.click(screen.getByRole('button', { name: 'Continue another round' }));
+    await settleConfirmDialog('Continue another round');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '继续一轮失败', body: 'dev is gone' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to continue', body: 'dev is gone' });
   });
 });
 
@@ -664,54 +664,54 @@ describe('TaskDetail page — human confirmation gates', () => {
     ];
   }
 
-  it('ready gate renders the banner plus review summary, and 确认 completes the task', async () => {
+  it('ready gate renders the banner plus review summary, and Confirm completes the task', async () => {
     tasksReviewsMock.mockResolvedValue(makeRounds());
     tasksCompleteMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
     const { container } = open({ status: 'ready' });
 
-    expect(screen.getByText('评审通过 · 等你确认')).toBeTruthy();
-    expect(screen.getByRole('link', { name: '查看 PR #55' })).toBeTruthy();
-    await waitFor(() => expect(container.textContent).toContain('Review 2 轮'));
-    expect(container.textContent).toContain('最终 verdict approve');
-    expect(container.textContent).toContain('findings 共 3 条');
+    expect(screen.getByText('Review approved · Awaiting your confirmation')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'View PR #55' })).toBeTruthy();
+    await waitFor(() => expect(container.textContent).toContain('Review rounds: 2'));
+    expect(container.textContent).toContain('Final verdict approve');
+    expect(container.textContent).toContain('Findings: 3 total');
 
-    fireEvent.click(screen.getByRole('button', { name: '确认' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
     const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('确认完成任务 task-010？')).toBeTruthy();
+    expect(within(dialog).getByText('Confirm task task-010 is complete?')).toBeTruthy();
     await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: '确认完成' }));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm complete' }));
     });
 
     expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已确认（done）' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Confirmed (done)' });
   });
 
-  it('确认 is skipped when the confirm dialog is cancelled and reports failures', async () => {
+  it('Confirm is skipped when the confirm dialog is cancelled and reports failures', async () => {
     open({ status: 'merge-ready' });
 
-    fireEvent.click(screen.getByRole('button', { name: '确认' }));
-    await settleConfirmDialog('取消');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    await settleConfirmDialog('Cancel');
     expect(tasksCompleteMock).not.toHaveBeenCalled();
 
     tasksCompleteMock.mockRejectedValue(new Error('gate says no'));
-    fireEvent.click(screen.getByRole('button', { name: '确认' }));
-    await settleConfirmDialog('确认完成');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    await settleConfirmDialog('Confirm complete');
 
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: '确认失败', body: 'gate says no' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to confirm', body: 'gate says no' });
   });
 
-  it('server-mode approved task offers 重试发布 which re-runs the publish step', async () => {
+  it('server-mode approved task offers Retry publish which re-runs the publish step', async () => {
     tasksCompleteMock.mockResolvedValue(
       makeTask({ reviewMode: 'server', status: 'ready', updatedAt: '2026-05-11T00:00:00.000Z' }),
     );
     open({ reviewMode: 'server', status: 'approved' });
 
-    expect(screen.queryByRole('button', { name: '确认' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '重试发布' }));
-    await settleConfirmDialog('确认完成');
+    expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry publish' }));
+    await settleConfirmDialog('Confirm complete');
 
     expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: '已确认（ready）' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Confirmed (ready)' });
   });
 });
 
@@ -719,13 +719,13 @@ describe('TaskDetail page — review verdict watchdog', () => {
   it('flags a review dispatched over 10 minutes ago with the missing-verdict banner', () => {
     open({ status: 'review', reviewDispatchedAt: '2026-05-10T12:00:00.000Z' });
 
-    expect(screen.getByText('评审逾期未交')).toBeTruthy();
-    expect(screen.getByText(/超过 10 分钟未提交结论/)).toBeTruthy();
+    expect(screen.getByText('Review verdict overdue')).toBeTruthy();
+    expect(screen.getByText(/with no verdict submitted after 10 minutes/)).toBeTruthy();
   });
 
   it('keeps the banner hidden for a freshly dispatched review', () => {
     open({ status: 'review', reviewDispatchedAt: new Date().toISOString() });
-    expect(screen.queryByText('评审逾期未交')).toBeNull();
+    expect(screen.queryByText('Review verdict overdue')).toBeNull();
   });
 });
 
@@ -733,15 +733,21 @@ describe('TaskDetail page — legacy tasks', () => {
   it('pending legacy task explains how to assign a dev', () => {
     setTask(makeTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    expect(screen.getByText(/任务还没有指定 Dev agent/)).toBeTruthy();
+    expect(screen.getByText(/This task has no Dev agent assigned/)).toBeTruthy();
   });
 
   it('terminal legacy task disables Retry with the legacy tooltip', () => {
     setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
     renderPage();
-    const retry = screen.getByRole('button', { name: '重试' }) as HTMLButtonElement;
+    const retry = screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement;
     expect(retry.disabled).toBe(true);
-    expect(retry.title).toBe('历史任务没有指定 Dev agent，无法重试');
+    expect(retry.title).toBe('Legacy task has no Dev agent assigned; cannot retry');
+  });
+
+  it('terminal legacy task explains the current status is read-only', () => {
+    setTask(makeTask({ status: 'cancelled', preferredAgentId: '', agentId: '', qaAgentId: undefined }));
+    renderPage();
+    expect(screen.getByText('Legacy task with no Dev agent assigned. Current status: "Cancelled". Read-only.')).toBeTruthy();
   });
 });
 
@@ -786,7 +792,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][0]]] }]);
     setTask(makeTask({ qaAgentId: undefined }));
     const { container } = renderPage();
-    expect(screen.getByText('暂无 QA agent')).toBeTruthy();
+    expect(screen.getByText('No QA agent')).toBeTruthy();
     expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
   });
 
@@ -794,7 +800,7 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][1]]] }]);
     setTask(makeTask({ agentId: 'ghost-dev', preferredAgentId: 'ghost-dev', qaAgentId: 'bx-qa' }));
     const { container } = renderPage();
-    expect(screen.getByText('暂无 Dev agent')).toBeTruthy();
+    expect(screen.getByText('No Dev agent')).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-qa']);
   });

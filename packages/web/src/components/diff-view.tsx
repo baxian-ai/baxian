@@ -1,3 +1,5 @@
+import { useT } from '../i18n/index.tsx';
+
 export type DiffLineType = 'file' | 'hunk' | 'add' | 'del' | 'context' | 'meta';
 
 export interface DiffLine {
@@ -58,9 +60,10 @@ const LINE_CLASS: Record<DiffLineType, string> = {
 };
 
 export function DiffView({ content, diffstat }: { content: string; diffstat?: string }) {
+  const t = useT();
   const lines = parseUnifiedDiff(content);
   if (lines.length === 0) {
-    return <div className="text-sm text-og-400">无内容</div>;
+    return <div className="text-sm text-og-400">{t.review.noContent}</div>;
   }
   return (
     <div>

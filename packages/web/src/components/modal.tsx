@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react';
+import { useT } from '../i18n/index.tsx';
 
 interface Props {
   open: boolean;
@@ -24,6 +25,7 @@ const FOCUSABLE_SELECTOR =
 const modalStack: symbol[] = [];
 
 export function Modal({ open, onClose, title, titleContent, children, footer, size = 'md', dismissOnBackdrop = true }: Props) {
+  const t = useT();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const instanceRef = useRef<symbol>();
   if (!instanceRef.current) instanceRef.current = Symbol('modal');
@@ -111,7 +113,7 @@ export function Modal({ open, onClose, title, titleContent, children, footer, si
             type="button"
             onClick={() => onCloseRef.current()}
             className="-mr-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-og-400 transition-colors hover:bg-og-50 hover:text-og-800"
-            aria-label="关闭"
+            aria-label={t.common.close}
           >
             ✕
           </button>

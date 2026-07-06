@@ -4,6 +4,7 @@ import { Modal } from './modal.tsx';
 import { inputCls, labelCls } from './form-styles.ts';
 import { api, type HostInput, type ProbeResponse } from '../api.ts';
 import { useToast } from './toast.tsx';
+import { useT } from '../i18n/index.tsx';
 
 interface Props {
   open: boolean;
@@ -29,6 +30,7 @@ export function hostLabel(h: HostConfig): string {
 }
 
 export function HostManagementModal({ open, onClose }: Props) {
+  const t = useT();
   const [hosts, setHosts] = useState<HostConfig[]>([]);
   const [view, setView] = useState<'list' | 'form'>('list');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -200,10 +202,10 @@ export function HostManagementModal({ open, onClose }: Props) {
     try {
       if (editingId) {
         await api.hosts.update(editingId, buildInput());
-        show({ kind: 'success', title: `Host ${editingId} 已更新` });
+        show({ kind: 'success', title: t.hostMgmt.updatedToastTitle(editingId) });
       } else {
         const result = await api.hosts.create(buildInput());
-        show({ kind: 'success', title: `Host ${result.host.id} 已添加` });
+        show({ kind: 'success', title: t.hostMgmt.createdToastTitle(result.host.id!) });
       }
       refresh();
       setView('list');
@@ -218,7 +220,7 @@ export function HostManagementModal({ open, onClose }: Props) {
     setError(null);
     try {
       await api.hosts.delete(h.id!);
-      show({ kind: 'success', title: `Host ${h.id} 已删除` });
+      show({ kind: 'success', title: t.hostMgmt.deletedToastTitle(h.id!) });
       refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -226,15 +228,15 @@ export function HostManagementModal({ open, onClose }: Props) {
   };
 
   const listFooter = (
-    <button type="button" onClick={onClose} className="btn-secondary">关闭</button>
+    <button type="button" onClick={onClose} className="btn-secondary">{t.common.close}</button>
   );
   const formFooter = (
     <>
       <button type="button" onClick={() => setView('list')} disabled={submitting} className="btn-secondary">
-        返回
+        {t.hostMgmt.back}
       </button>
       <button type="submit" form="host-form" disabled={!formValid || submitting} className="btn-primary">
-        {submitting ? '保存中…' : '保存'}
+        {submitting ? t.common.saving : t.common.save}
       </button>
     </>
   );
@@ -243,7 +245,7 @@ export function HostManagementModal({ open, onClose }: Props) {
     <Modal
       open={open}
       onClose={onClose}
-      title="Host 管理"
+      title={t.hostMgmt.title}
       size="md"
       footer={view === 'list' ? listFooter : formFooter}
     >
@@ -256,7 +258,7 @@ export function HostManagementModal({ open, onClose }: Props) {
       {view === 'list' ? (
         <div className="space-y-3">
           {hosts.length === 0 ? (
-            <p className="text-sm text-og-500">还没有配置 Host。点击下方「添加 Host」。</p>
+            <p className="text-sm text-og-500">{t.hostMgmt.emptyState}</p>
           ) : (
             <ul className="space-y-1.5">
               {hosts.map(h => (
@@ -268,79 +270,79 @@ export function HostManagementModal({ open, onClose }: Props) {
                     <div className="truncate text-sm font-medium text-og-800">{hostLabel(h)}</div>
                     <div className="truncate text-xs text-og-500">
                       {(h.user ? `${h.user}@` : '') + h.hostname}{h.port != null ? `:${h.port}` : ''}
-                      {h.password === REDACTED ? ' · 密码已保存' : ''}
+                      {h.password === REDACTED ? t.hostMgmt.passwordSavedIndicator : ''}
                     </div>
                   </div>
                   <div className="flex shrink-0 gap-2">
                     <button type="button" onClick={() => startEdit(h)}
                       className="text-xs text-accent transition-colors hover:text-accent-hover">
-                      编辑
+                      {t.hostMgmt.edit}
                     </button>
                     <button type="button" onClick={() => handleDelete(h)}
                       className="text-xs text-accent transition-colors hover:opacity-80">
-                      删除
+                      {t.common.delete}
                     </button>
                   </div>
                 </li>
               ))}
             </ul>
           )}
-          <button type="button" onClick={startAdd} className="btn-secondary w-full">+ 添加 Host</button>
+          <button type="button" onClick={startAdd} className="btn-secondary w-full">{t.hostMgmt.addHostButton}</button>
         </div>
       ) : (
         <form id="host-form" onSubmit={handleSubmit} className="space-y-3">
           <div>
-            <label className={labelCls} htmlFor="host-hostname">Host 地址</label>
+            <label className={labelCls} htmlFor="host-hostname">{t.hostMgmt.addressLabel}</label>
             <input id="host-hostname" type="text" value={form.hostname}
               onChange={e => setForm({ ...form, hostname: e.target.value })}
               className={inputCls} placeholder="remote.example.com" disabled={submitting} />
           </div>
           <div>
-            <label className={labelCls} htmlFor="host-port">端口（可选）</label>
+            <label className={labelCls} htmlFor="host-port">{t.hostMgmt.portLabel}</label>
             <input id="host-port" type="text" inputMode="numeric" value={form.port}
               onChange={e => setForm({ ...form, port: e.target.value })}
               className={inputCls} placeholder="22" disabled={submitting} />
             {form.port.trim() !== '' && !portValid && (
-              <div className="mt-1 text-xs text-accent">端口需为 1–65535 的整数</div>
+              <div className="mt-1 text-xs text-accent">{t.hostMgmt.portRangeError}</div>
             )}
           </div>
           <div>
-            <label className={labelCls} htmlFor="host-alias">别名（可选）</label>
+            <label className={labelCls} htmlFor="host-alias">{t.hostMgmt.aliasLabel}</label>
             <input id="host-alias" type="text" value={form.alias}
               onChange={e => setForm({ ...form, alias: e.target.value })}
               className={inputCls} placeholder="Prod worker" disabled={submitting} />
           </div>
           <div>
-            <label className={labelCls} htmlFor="host-user">用户名（可选）</label>
+            <label className={labelCls} htmlFor="host-user">{t.hostMgmt.userLabel}</label>
             <input id="host-user" type="text" value={form.user}
               onChange={e => setForm({ ...form, user: e.target.value })}
-              className={inputCls} placeholder="留空则读 ~/.ssh/config 的 User" disabled={submitting} />
+              className={inputCls} placeholder={t.hostMgmt.userPlaceholder} disabled={submitting} />
           </div>
           <div>
-            <label className={labelCls} htmlFor="host-password">密码（可选）</label>
+            <label className={labelCls} htmlFor="host-password">{t.hostMgmt.passwordLabel}</label>
             <input id="host-password" type="password" value={clearPassword ? '' : form.password}
               onChange={e => setForm({ ...form, password: e.target.value })}
               className={inputCls}
-              placeholder={hadPassword ? '已设置，留空保持不变' : '留空使用 key 认证'}
+              placeholder={hadPassword ? t.hostMgmt.passwordPlaceholderSet : t.hostMgmt.passwordPlaceholderUnset}
               disabled={submitting || clearPassword} autoComplete="new-password" />
             {editingId && hadPassword && (
               <label className="mt-1.5 flex items-center gap-2 text-xs text-og-700">
                 <input type="checkbox" className="h-3.5 w-3.5 accent-accent" checked={clearPassword}
                   onChange={e => setClearPassword(e.target.checked)} disabled={submitting} />
-                清除已保存的密码（改用 key 登录）
+                {t.hostMgmt.clearPasswordLabel}
               </label>
             )}
           </div>
 
           <div className="rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
-            建议为该 Host 配置好<strong className="font-semibold">免密码登入（SSH key）</strong>。
-            否则填写的密码将以<strong className="font-semibold">明文</strong>保存到 baxian.json 中。
+            {t.hostMgmt.passwordHintLead}<strong className="font-semibold">{t.hostMgmt.passwordHintStrong}</strong>{' '}
+            {t.hostMgmt.plaintextWarningLead}<strong className="font-semibold">{t.hostMgmt.plaintextWarningStrong}</strong>{t.hostMgmt.plaintextWarningTrail}
           </div>
 
           <div className="space-y-1.5">
             <button type="button" onClick={handleProbe} disabled={!formValid || probing || submitting || installingTmux}
               className="text-xs text-accent transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
-              {probing ? '测试中…' : '测试连接'}
+              {probing ? t.hostMgmt.testing : t.hostMgmt.testConnection}
             </button>
             {probeResult?.ssh && (
               <div className={`text-xs ${probeResult.ssh.ok ? 'text-og-800' : 'text-accent'}`}>
@@ -356,14 +358,14 @@ export function HostManagementModal({ open, onClose }: Props) {
                   {probeResult.ssh?.ok && (
                     <button type="button" onClick={handleInstallTmux} disabled={installingTmux || submitting}
                       className="ml-2 text-accent underline transition-colors hover:text-accent-hover disabled:cursor-not-allowed disabled:opacity-50">
-                      {installingTmux ? '安装中…' : '一键安装'}
+                      {installingTmux ? t.common.installing : t.common.oneClickInstall}
                     </button>
                   )}
                 </div>
               )
             )}
             {installingTmux && (
-              <div className="text-xs text-og-500">正在安装 tmux，可能需要几分钟，请勿关闭窗口…</div>
+              <div className="text-xs text-og-500">{t.common.installingTmuxNotice}</div>
             )}
             {!installingTmux && tmuxInstall && (
               <div className={`break-all text-xs ${tmuxInstall.ok ? 'text-og-800' : 'text-accent'}`}>

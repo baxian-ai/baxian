@@ -25,10 +25,10 @@ beforeEach(() => {
 async function renderAndFill(repoValue: string) {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.change(screen.getByLabelText('项目 ID'), { target: { value: 'newproj' } });
-  fireEvent.change(screen.getByLabelText('Git 仓库地址'), { target: { value: repoValue } });
+  fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'newproj' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: repoValue } });
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
 }
 
@@ -54,21 +54,21 @@ it('trims surrounding whitespace before submitting', async () => {
   });
 });
 
-it('shows baxian as the 项目 ID placeholder', async () => {
+it('shows baxian as the Project ID placeholder', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  expect((screen.getByLabelText('项目 ID') as HTMLInputElement).placeholder).toBe('baxian');
+  expect((screen.getByLabelText('Project ID') as HTMLInputElement).placeholder).toBe('baxian');
 });
 
-it('defaults Spec 审核 to 人类审核 and submits specApproval human', async () => {
+it('defaults Spec review to Human review and submits specApproval human', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  expect((screen.getByLabelText('人类审核（默认）') as HTMLInputElement).checked).toBe(true);
-  expect((screen.getByLabelText('QA Approve 后自动开始编码') as HTMLInputElement).checked).toBe(false);
-  fireEvent.change(screen.getByLabelText('项目 ID'), { target: { value: 'specproj' } });
-  fireEvent.change(screen.getByLabelText('Git 仓库地址'), { target: { value: 'example-owner/example-repo' } });
+  expect((screen.getByLabelText('Human review (default)') as HTMLInputElement).checked).toBe(true);
+  expect((screen.getByLabelText('Auto-start coding after QA approval') as HTMLInputElement).checked).toBe(false);
+  fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'specproj' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'example-owner/example-repo' } });
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
   expect(createMock).toHaveBeenCalledWith({
     id: 'specproj',
@@ -78,14 +78,14 @@ it('defaults Spec 审核 to 人类审核 and submits specApproval human', async 
   });
 });
 
-it('omits specApproval when QA Approve 后自动开始编码 is selected', async () => {
+it('omits specApproval when Auto-start coding after QA approval is selected', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.change(screen.getByLabelText('项目 ID'), { target: { value: 'autoproj' } });
-  fireEvent.change(screen.getByLabelText('Git 仓库地址'), { target: { value: 'example-owner/example-repo' } });
-  fireEvent.click(screen.getByLabelText('QA Approve 后自动开始编码'));
+  fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'autoproj' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'example-owner/example-repo' } });
+  fireEvent.click(screen.getByLabelText('Auto-start coding after QA approval'));
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
   expect(createMock).toHaveBeenCalledWith({
     id: 'autoproj',
@@ -94,24 +94,24 @@ it('omits specApproval when QA Approve 后自动开始编码 is selected', async
   });
 });
 
-it('resets Spec 审核 to 人类审核 when the modal reopens', async () => {
+it('resets Spec review to Human review when the modal reopens', async () => {
   const { rerender } = render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.click(screen.getByLabelText('QA Approve 后自动开始编码'));
-  expect((screen.getByLabelText('QA Approve 后自动开始编码') as HTMLInputElement).checked).toBe(true);
+  fireEvent.click(screen.getByLabelText('Auto-start coding after QA approval'));
+  expect((screen.getByLabelText('Auto-start coding after QA approval') as HTMLInputElement).checked).toBe(true);
   rerender(<CreateProjectModal open={false} onClose={() => {}} onCreated={() => {}} />);
   rerender(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
-  await waitFor(() => expect((screen.getByLabelText('人类审核（默认）') as HTMLInputElement).checked).toBe(true));
+  await waitFor(() => expect((screen.getByLabelText('Human review (default)') as HTMLInputElement).checked).toBe(true));
 });
 
 it('submits an explicit server review mode override', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
-  fireEvent.change(screen.getByLabelText('项目 ID'), { target: { value: 'serverproj' } });
-  fireEvent.change(screen.getByLabelText('Git 仓库地址'), { target: { value: 'example-owner/example-repo' } });
+  fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'serverproj' } });
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'example-owner/example-repo' } });
   fireEvent.click(screen.getByLabelText('Server'));
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
   });
   expect(createMock).toHaveBeenCalledWith({
     id: 'serverproj',
@@ -129,5 +129,5 @@ it.each([
 ])('rejects %s with the URL-format field error', async (_label, repo) => {
   await renderAndFill(repo);
   expect(createMock).not.toHaveBeenCalled();
-  expect(screen.getByText(/需为 git URL/)).toBeTruthy();
+  expect(screen.getByText(/Must be a git URL/)).toBeTruthy();
 });

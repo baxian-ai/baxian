@@ -1,16 +1,17 @@
+import { useT } from '../i18n/index.tsx';
+
 export type ArrowKey = 'up' | 'down' | 'left' | 'right';
 
 interface ArrowDef {
   key: ArrowKey;
-  label: string;
   path: string;
 }
 
 const ARROWS: ArrowDef[] = [
-  { key: 'up',    label: '上', path: 'M12 5l-6 6m6-6l6 6m-6-6v14' },
-  { key: 'down',  label: '下', path: 'M12 19l6-6m-6 6l-6-6m6 6V5' },
-  { key: 'left',  label: '左', path: 'M5 12l6-6m-6 6l6 6m-6-6h14' },
-  { key: 'right', label: '右', path: 'M19 12l-6-6m6 6l-6 6m6-6H5' },
+  { key: 'up',    path: 'M12 5l-6 6m6-6l6 6m-6-6v14' },
+  { key: 'down',  path: 'M12 19l6-6m-6 6l-6-6m6 6V5' },
+  { key: 'left',  path: 'M5 12l6-6m-6 6l6 6m-6-6h14' },
+  { key: 'right', path: 'M19 12l-6-6m6 6l-6 6m6-6H5' },
 ];
 
 const ARROW_BY_KEY: Record<ArrowKey, ArrowDef> = Object.fromEntries(
@@ -19,14 +20,15 @@ const ARROW_BY_KEY: Record<ArrowKey, ArrowDef> = Object.fromEntries(
 
 interface ArrowButtonProps {
   arrow: ArrowDef;
+  ariaLabel: string;
   onPress: (key: ArrowKey) => void;
 }
 
-function ArrowButton({ arrow, onPress }: ArrowButtonProps) {
+function ArrowButton({ arrow, ariaLabel, onPress }: ArrowButtonProps) {
   return (
     <button
       type="button"
-      aria-label={`方向键 ${arrow.label}`}
+      aria-label={ariaLabel}
       data-arrow={arrow.key}
       onMouseDown={(e) => e.preventDefault()}
       onClick={() => onPress(arrow.key)}
@@ -57,10 +59,11 @@ export interface TerminalKeyPadProps {
 }
 
 export function TerminalKeyPad({ onKey, onEscape, className }: TerminalKeyPadProps) {
+  const t = useT();
   return (
     <div
       role="group"
-      aria-label="终端按键"
+      aria-label={t.terminal.keyPadAriaLabel}
       className={
         className ??
         'flex flex-none items-center justify-center gap-1 border-t border-hairline bg-page px-3 py-2'
@@ -69,7 +72,7 @@ export function TerminalKeyPad({ onKey, onEscape, className }: TerminalKeyPadPro
       {onEscape && (
         <button
           type="button"
-          aria-label="Esc 键"
+          aria-label={t.terminal.escKeyAriaLabel}
           data-key="escape"
           onMouseDown={(e) => e.preventDefault()}
           onClick={onEscape}
@@ -78,10 +81,10 @@ export function TerminalKeyPad({ onKey, onEscape, className }: TerminalKeyPadPro
           ESC
         </button>
       )}
-      <ArrowButton arrow={ARROW_BY_KEY.left} onPress={onKey} />
-      <ArrowButton arrow={ARROW_BY_KEY.up} onPress={onKey} />
-      <ArrowButton arrow={ARROW_BY_KEY.down} onPress={onKey} />
-      <ArrowButton arrow={ARROW_BY_KEY.right} onPress={onKey} />
+      <ArrowButton arrow={ARROW_BY_KEY.left} ariaLabel={t.terminal.arrowAriaLabel(t.terminal.arrowLabel.left)} onPress={onKey} />
+      <ArrowButton arrow={ARROW_BY_KEY.up} ariaLabel={t.terminal.arrowAriaLabel(t.terminal.arrowLabel.up)} onPress={onKey} />
+      <ArrowButton arrow={ARROW_BY_KEY.down} ariaLabel={t.terminal.arrowAriaLabel(t.terminal.arrowLabel.down)} onPress={onKey} />
+      <ArrowButton arrow={ARROW_BY_KEY.right} ariaLabel={t.terminal.arrowAriaLabel(t.terminal.arrowLabel.right)} onPress={onKey} />
     </div>
   );
 }

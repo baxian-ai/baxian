@@ -10,6 +10,7 @@ import {
 } from '../shared/github-review.js';
 import { useTask } from '../hooks/use-events.ts';
 import { useGithubReview } from '../hooks/use-github-review.ts';
+import { useT, type Messages } from '../i18n/index.tsx';
 
 const VERDICT_LABEL: Record<GithubReviewVerdict, string> = {
   approve: 'approve',
@@ -17,14 +18,16 @@ const VERDICT_LABEL: Record<GithubReviewVerdict, string> = {
   comment: 'comment',
 };
 
-const REASON_TEXT: Record<NonNullable<ReturnType<typeof reasonOf>>, string> = {
-  'server-mode': '该 task 为 server 评审模式，代码评审记录见任务详情的「评审记录」。',
-  'no-pr': '该 task 还没有 PR，暂无代码评审记录。',
-  'not-github': '该 task 的仓库不是 GitHub 仓库，无法拉取 PR 评审记录。',
-};
-
 function reasonOf(reason?: string): 'server-mode' | 'no-pr' | 'not-github' | undefined {
   return reason === 'server-mode' || reason === 'no-pr' || reason === 'not-github' ? reason : undefined;
+}
+
+function reasonText(t: Messages): Record<NonNullable<ReturnType<typeof reasonOf>>, string> {
+  return {
+    'server-mode': t.githubReview.reasonServerMode,
+    'no-pr': t.githubReview.reasonNoPr,
+    'not-github': t.githubReview.reasonNotGithub,
+  };
 }
 
 function fmt(ts?: string): string {
@@ -34,6 +37,7 @@ function fmt(ts?: string): string {
 }
 
 export function GithubReviewPage() {
+  const t = useT();
   const { taskId = '' } = useParams();
   const navigate = useNavigate();
   const { data: task } = useTask(taskId);
@@ -47,37 +51,37 @@ export function GithubReviewPage() {
   return (
     <div className="mx-auto w-full max-w-5xl">
       <button type="button" onClick={() => navigate(-1)} className="btn-ghost mb-3">
-        ← 返回
+        {t.common.back}
       </button>
       <div className="mb-1 flex flex-wrap items-baseline gap-2">
         <span className="font-mono text-og-400">{taskId}</span>
         <span className="text-sm font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
-        <span className="pill">代码评审</span>
+        <span className="pill">{t.githubReview.codeReviewHeading}</span>
         {prUrl && prNumber !== undefined && (
           <a href={prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
-            查看 PR #{prNumber}
+            {t.taskDetail.viewPr(prNumber)}
           </a>
         )}
       </div>
 
-      {!loaded && <div className="text-sm text-og-500">加载中…</div>}
-      {loaded && error && <div className="text-sm text-accent">加载评审记录失败：{error}</div>}
+      {!loaded && <div className="text-sm text-og-500">{t.common.loading}</div>}
+      {loaded && error && <div className="text-sm text-accent">{t.review.loadFailed(error)}</div>}
       {loaded && !error && data && !data.available && (
-        <div className="text-sm text-og-500">{REASON_TEXT[reasonOf(data.reason) ?? 'no-pr']}</div>
+        <div className="text-sm text-og-500">{reasonText(t)[reasonOf(data.reason) ?? 'no-pr']}</div>
       )}
       {loaded && !error && data?.available &&
         (data.items.length === 0 ? (
           data.error ? (
-            <div className="text-sm text-accent">评审记录拉取失败：{data.error}</div>
+            <div className="text-sm text-accent">{t.githubReview.fetchFailed(data.error)}</div>
           ) : (
-            <div className="text-sm text-og-400">评审尚未开始</div>
+            <div className="text-sm text-og-400">{t.review.notStarted}</div>
           )
         ) : (
           <>
             {data.error && (
-              <div className="mb-3 text-xs text-accent">部分评审记录拉取失败：{data.error}（仅展示已获取的部分）</div>
+              <div className="mb-3 text-xs text-accent">{t.githubReview.partialFetchFailed(data.error)}</div>
             )}
             <div className="space-y-5">
               {rounds.map((round, i) => (
@@ -91,7 +95,8 @@ export function GithubReviewPage() {
 }
 
 function RoundBlock({ round, index }: { round: GithubReviewRound; index: number }) {
-  const label = round.review ? `第 ${index + 1} 轮` : '进行中';
+  const t = useT();
+  const label = round.review ? t.agents.round(index + 1) : t.status.in_progress;
   return (
     <div>
       <div className="mb-1.5 text-xs font-medium text-og-700">{label}</div>
@@ -106,11 +111,12 @@ function RoundBlock({ round, index }: { round: GithubReviewRound; index: number 
 }
 
 function ItemRow({ item }: { item: GithubReviewItem }) {
+  const t = useT();
   if (item.kind === 'commit') {
     return (
       <div className="card p-3 text-sm">
         <div className="mb-1 flex flex-wrap items-center gap-2">
-          <span className="pill shrink-0">提交</span>
+          <span className="pill shrink-0">{t.githubReview.commitPill}</span>
           {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
           {item.author && <span className="text-xs text-og-400">{item.author}</span>}
           {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
@@ -123,14 +129,14 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
   return (
     <div className="card p-3 text-sm">
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className="pill shrink-0">{isInline ? '行内评论' : '评论'}</span>
+        <span className="pill shrink-0">{isInline ? t.githubReview.inlineComment : t.githubReview.comment}</span>
         {item.author && <span className="font-medium text-og-700">{item.author}</span>}
         {isInline && item.path && (
           <span className="min-w-0 break-all font-mono text-xs text-og-500">
             {item.line !== undefined ? `${item.path}:${item.line}` : item.path}
           </span>
         )}
-        {item.inReplyTo && <span className="text-xs text-og-400">↩ 回复</span>}
+        {item.inReplyTo && <span className="text-xs text-og-400">{t.githubReview.replyIndicator}</span>}
         {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
       </div>
       <Body item={item} />
@@ -139,24 +145,26 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
 }
 
 function ReviewBlock({ item }: { item: GithubReviewItem }) {
+  const t = useT();
   const verdict = item.verdict ?? 'comment';
   return (
     <div className="card p-3 text-sm">
       <div className="mb-1 flex flex-wrap items-center gap-2">
         <span className="shrink-0 min-w-[1.75rem] text-xs font-semibold tracking-wide text-og-600">
-          QA
+          {t.review.roleQa}
         </span>
         <span className={GITHUB_REVIEW_VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
         {item.author && <span className="text-xs text-og-400">{item.author}</span>}
         {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
         {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
       </div>
-      <Body item={item} placeholder="（无评审正文）" />
+      <Body item={item} placeholder={t.githubReview.noReviewBody} />
     </div>
   );
 }
 
 function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: string }) {
+  const t = useT();
   return (
     <>
       {item.body ? (
@@ -164,7 +172,7 @@ function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: str
       ) : placeholder ? (
         <div className="text-og-400">{placeholder}</div>
       ) : null}
-      {item.bodyTruncated && <div className="mt-1 text-xs text-accent">内容较大，已截断。</div>}
+      {item.bodyTruncated && <div className="mt-1 text-xs text-accent">{t.githubReview.bodyTruncated}</div>}
     </>
   );
 }

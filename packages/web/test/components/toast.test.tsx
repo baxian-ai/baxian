@@ -67,7 +67,7 @@ describe('auto-dismiss pause on hover', () => {
       renderWithToast();
       const toast = screen.getByRole('status');
       fireEvent.mouseEnter(toast);
-      fireEvent.click(screen.getByRole('button', { name: '关闭通知' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Close notification' }));
       expect(screen.queryByRole('status')).toBeNull();
       await act(async () => { vi.advanceTimersByTime(10_000); });
       expect(screen.queryByRole('status')).toBeNull();
@@ -83,7 +83,7 @@ describe('hover and focus hold the timer independently', () => {
     try {
       renderWithToast();
       const toast = screen.getByRole('status');
-      const closeBtn = screen.getByRole('button', { name: '关闭通知' });
+      const closeBtn = screen.getByRole('button', { name: 'Close notification' });
 
       fireEvent.mouseEnter(toast);
       fireEvent.focus(closeBtn);
@@ -104,7 +104,7 @@ describe('hover and focus hold the timer independently', () => {
     try {
       renderWithToast();
       const toast = screen.getByRole('status');
-      const closeBtn = screen.getByRole('button', { name: '关闭通知' });
+      const closeBtn = screen.getByRole('button', { name: 'Close notification' });
 
       fireEvent.focus(closeBtn);
       fireEvent.mouseEnter(toast);

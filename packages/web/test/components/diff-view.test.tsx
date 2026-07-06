@@ -69,7 +69,7 @@ describe('parseUnifiedDiff', () => {
 describe('DiffView', () => {
   it('renders an empty-state for empty content', () => {
     render(<DiffView content="" />);
-    expect(screen.getByText('无内容')).toBeTruthy();
+    expect(screen.getByText('No content')).toBeTruthy();
   });
 
   it('renders the diffstat and colors add/del lines', () => {

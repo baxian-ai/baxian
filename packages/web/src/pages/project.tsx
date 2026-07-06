@@ -12,6 +12,7 @@ import { useToast } from '../components/toast.tsx';
 import { TopbarActions } from '../components/topbar-actions.tsx';
 import { useAgents, useProjectTasks } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
+import { useT } from '../i18n/index.tsx';
 import type { ProjectConfig, TaskState } from '../shared/index.js';
 
 const NO_TASKS: TaskState[] = [];
@@ -29,6 +30,7 @@ function readTaskPanelOpen(): boolean {
 export function Project() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const t = useT();
   const { show } = useToast();
   const { refresh: refreshProjectsList } = useProjects();
   const [project, setProject] = useState<ProjectConfig | null>(null);
@@ -95,7 +97,7 @@ export function Project() {
     try {
       await api.projects.delete(project.id);
       await refreshProjectsList();
-      show({ kind: 'success', title: `项目 ${project.id} 已删除` });
+      show({ kind: 'success', title: t.projectPage.deletedToastTitle(project.id) });
       setDeleteOpen(false);
       navigate('/');
     } catch (err) {
@@ -106,38 +108,38 @@ export function Project() {
   };
 
   if (!project) {
-    if (projectError) return <div className="text-sm text-accent">Error: {projectError}</div>;
-    return <div className="text-sm text-og-500">Loading…</div>;
+    if (projectError) return <div className="text-sm text-accent">{t.common.loadFailed(projectError)}</div>;
+    return <div className="text-sm text-og-500">{t.common.loading}</div>;
   }
 
   return (
     <div>
       <TopbarActions>
-        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-ghost">+ 新建任务</button>
-        <KebabMenu ariaLabel={`项目 ${project.id} 操作菜单`} menuClassName="min-w-[180px]" triggerRef={menuButtonRef}>
+        <button type="button" onClick={() => setCreateTaskOpen(true)} className="btn-ghost">{t.projectPage.newTaskButton}</button>
+        <KebabMenu ariaLabel={t.projectPage.menuAriaLabel(project.id)} menuClassName="min-w-[180px]" triggerRef={menuButtonRef}>
           {close => (
             <>
               {!taskPanelOpen && (
                 <MenuItem onClick={() => { close(); setTaskPanelOpen(true); }}>
-                  显示任务面板
+                  {t.projectPage.showTaskPanel}
                 </MenuItem>
               )}
               <MenuItem onClick={() => { close(); setCreateAgentOpen(true); }}>
-                添加 Agent
+                {t.projectPage.addAgent}
               </MenuItem>
               <div role="none" className="my-1 border-t border-hairline" />
               <MenuItem
                 onClick={() => { close(); setDeleteOpen(true); }}
                 disabled={!canDelete}
-                title={canDelete ? undefined : `请先删除项目下的 ${agentCount} 个 Agent`}
+                title={canDelete ? undefined : t.projectPage.deleteAgentsFirstHint(agentCount)}
               >
-                删除项目…
+                {t.projectPage.deleteProjectMenuItem}
               </MenuItem>
             </>
           )}
         </KebabMenu>
       </TopbarActions>
-      {error && <div className="mb-4 text-sm text-accent">加载失败：{error}</div>}
+      {error && <div className="mb-4 text-sm text-accent">{t.common.loadFailed(error)}</div>}
       <div className="mb-6 flex items-baseline gap-x-3">
         <h1 className="min-w-0 truncate font-display text-sm font-semibold tracking-tight text-og-1000" title={project.id}>{project.id}</h1>
         <span className="hidden min-w-0 truncate font-mono text-xs text-og-500 sm:inline-block" title={project.repo}>{project.repo}</span>
@@ -149,7 +151,7 @@ export function Project() {
           </div>
           {project.agent.flat().length === 0 ? (
             <div className="mb-8 rounded-lg border border-hairline bg-surface py-6 text-center text-sm text-og-500">
-              还没有 Agent，点击右上角菜单添加。
+              {t.projectPage.noAgentsYet}
             </div>
           ) : (
             <div className="mb-8 space-y-5">
@@ -177,7 +179,7 @@ export function Project() {
               <button
                 type="button"
                 onClick={() => { setTaskPanelOpen(false); menuButtonRef.current?.focus(); }}
-                aria-label="关闭任务面板"
+                aria-label={t.projectPage.closeTaskPanel}
                 className="flex h-7 w-7 items-center justify-center rounded text-og-500 transition-colors hover:bg-og-50 hover:text-og-1000"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -208,7 +210,7 @@ export function Project() {
       <Modal
         open={deleteOpen}
         onClose={() => { if (!deleting) setDeleteOpen(false); }}
-        title="删除项目"
+        title={t.projectPage.deleteModalTitle}
         size="sm"
         footer={
           <>
@@ -218,7 +220,7 @@ export function Project() {
               disabled={deleting}
               className="btn-secondary"
             >
-              取消
+              {t.common.cancel}
             </button>
             <button
               type="button"
@@ -226,18 +228,18 @@ export function Project() {
               disabled={!deleteConfirmed || deleting}
               className="btn-primary"
             >
-              {deleting ? '删除中…' : '确认删除'}
+              {deleting ? t.projectPage.deleting : t.projectPage.confirmDeleteButton}
             </button>
           </>
         }
       >
         <div className="space-y-4">
           <p className="text-sm text-og-700">
-            将从 <code className="font-mono text-og-1000">baxian.json</code> 中移除项目{' '}
-            <span className="font-mono text-og-1000">{project.id}</span>。此操作不可撤销，且不会删除 Git 仓库本身。
+            {t.projectPage.deleteBodyLead}<code className="font-mono text-og-1000">baxian.json</code>{t.projectPage.deleteBodyMid}
+            <span className="font-mono text-og-1000">{project.id}</span>{t.projectPage.deleteBodySuffix}
           </p>
           <p className="text-sm text-og-700">
-            如需确认，请在下方输入项目 ID <span className="font-mono text-og-1000">{project.id}</span>：
+            {t.projectPage.confirmInputLead}<span className="font-mono text-og-1000">{project.id}</span>{t.projectPage.confirmInputSuffix}
           </p>
           <input
             type="text"
@@ -248,7 +250,7 @@ export function Project() {
             autoCorrect="off"
             spellCheck={false}
             disabled={deleting}
-            aria-label="输入项目 ID 以确认删除"
+            aria-label={t.projectPage.confirmInputAriaLabel}
             className="w-full rounded border border-hairline bg-surface px-3 py-2 font-mono text-sm text-og-1000 focus:border-accent focus:outline-none"
           />
           {deleteError && (

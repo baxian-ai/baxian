@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ComponentType, type ReactNode, type SVGProps } from 'react';
 import { AlertTriangleIcon, CheckCircleIcon, XCircleIcon } from './icons.tsx';
+import { useT } from '../i18n/index.tsx';
 
 export type ToastKind = 'success' | 'warn' | 'error';
 
@@ -38,6 +39,7 @@ const KIND_ICON: Record<ToastKind, ComponentType<SVGProps<SVGSVGElement>>> = {
 let nextId = 1;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
+  const t = useT();
   const [items, setItems] = useState<ToastItem[]>([]);
   const timersRef = useRef(new Map<number, ReturnType<typeof setTimeout>>());
   const holdsRef = useRef(new Map<number, Set<HoldReason>>());
@@ -94,30 +96,30 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     <ToastContext.Provider value={{ show }}>
       {children}
       <div className="pointer-events-none fixed inset-x-4 top-4 z-[60] flex flex-col items-end gap-2">
-        {items.map(t => (
+        {items.map(item => (
           <div
-            key={t.id}
-            className={`pointer-events-auto w-full max-w-xs rounded-lg border px-4 py-3 shadow-toast ${KIND_CLASS[t.kind]}`}
+            key={item.id}
+            className={`pointer-events-auto w-full max-w-xs rounded-lg border px-4 py-3 shadow-toast ${KIND_CLASS[item.kind]}`}
             role="status"
-            onMouseEnter={() => hold(t.id, 'hover')}
-            onMouseLeave={() => release(t.id, 'hover', t.durationMs)}
-            onFocus={() => hold(t.id, 'focus')}
+            onMouseEnter={() => hold(item.id, 'hover')}
+            onMouseLeave={() => release(item.id, 'hover', item.durationMs)}
+            onFocus={() => hold(item.id, 'focus')}
             onBlur={(e) => {
               if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-              release(t.id, 'focus', t.durationMs);
+              release(item.id, 'focus', item.durationMs);
             }}
           >
             <div className="flex items-start gap-2">
-              {(() => { const Icon = KIND_ICON[t.kind]; return <Icon className="mt-0.5 shrink-0" width={14} height={14} />; })()}
+              {(() => { const Icon = KIND_ICON[item.kind]; return <Icon className="mt-0.5 shrink-0" width={14} height={14} />; })()}
               <div className="flex-1">
-                <div className="text-sm font-semibold">{t.title}</div>
-                {t.body && <div className="mt-1 whitespace-pre-line text-xs text-og-700">{t.body}</div>}
+                <div className="text-sm font-semibold">{item.title}</div>
+                {item.body && <div className="mt-1 whitespace-pre-line text-xs text-og-700">{item.body}</div>}
               </div>
               <button
                 type="button"
-                onClick={() => dismiss(t.id)}
+                onClick={() => dismiss(item.id)}
                 className="text-current opacity-50 transition-opacity hover:opacity-100"
-                aria-label="关闭通知"
+                aria-label={t.toast.dismissAriaLabel}
               >
                 ✕
               </button>

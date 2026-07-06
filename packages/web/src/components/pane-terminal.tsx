@@ -6,6 +6,7 @@ import type { StreamSubMode } from '../shared/index.js';
 import { usePaneStream } from '../hooks/use-pane-stream.ts';
 import { TerminalKeyPad, type ArrowKey } from './terminal-key-pad.tsx';
 import { ImageUploadButton } from './image-upload-button.tsx';
+import { useT } from '../i18n/index.tsx';
 
 const ARROW_FINAL: Record<ArrowKey, string> = { up: 'A', down: 'B', right: 'C', left: 'D' };
 
@@ -93,6 +94,7 @@ export function PaneTerminal({
   deferFullUntilFocus = false,
   arrowKeys = false,
 }: PaneTerminalProps) {
+  const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<XTerm | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -438,7 +440,7 @@ export function PaneTerminal({
     <div className={className ?? 'flex flex-col h-full w-full min-h-0 bg-term'}>
       {(error || sessionGone) && (
         <div className="border-b border-accent/25 bg-accent-soft px-3 py-1 font-mono text-xs text-accent">
-          {sessionGone ? '会话已结束' : error}
+          {sessionGone ? t.terminal.sessionEnded : error}
         </div>
       )}
       <div className="flex flex-1 min-h-0 px-2 py-1.5" style={containerStyle}>

@@ -59,7 +59,7 @@ function activate(cardOrId: HTMLElement | string): void {
   const card = typeof cardOrId === 'string'
     ? document.querySelector(`[data-agent-card="${cardOrId}"]`) as HTMLElement
     : cardOrId;
-  const trigger = within(card).getByRole('button', { name: /激活 .* 终端/ });
+  const trigger = within(card).getByRole('button', { name: /Activate .* terminal/ });
   fireEvent.click(trigger);
 }
 
@@ -116,8 +116,8 @@ describe('AgentGroup', () => {
     expect(idCell.getAttribute('title')).toBe('task-001');
     expect(within(region).getByText('梳理绑定逻辑')).toBeTruthy();
     const taskButton = within(region).getByRole('button', { name: /梳理绑定逻辑/ });
-    const round = within(taskButton).getByText('第 0 轮');
-    const status = within(taskButton).getByText('进行中');
+    const round = within(taskButton).getByText('Round 0');
+    const status = within(taskButton).getByText('In progress');
     expect(round.className).not.toContain('pill');
     expect(status.className).toContain('pill-live');
     expect(round.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -144,7 +144,7 @@ describe('AgentGroup', () => {
 
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     const taskButton = within(region).getByRole('button', { name: /梳理绑定逻辑/ });
-    const round = within(taskButton).getByText('第 3 轮');
+    const round = within(taskButton).getByText('Round 3');
     expect(round.className).not.toContain('pill');
     expect(within(taskButton).queryByText(/Dev /)).toBeNull();
     expect(within(taskButton).queryByText(/QA /)).toBeNull();
@@ -154,14 +154,14 @@ describe('AgentGroup', () => {
     renderGroup([task({ phase: 'spec', specReviewRound: 2, reviewRound: 0 })]);
 
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
-    expect(within(region).getByText('第 2 轮')).toBeTruthy();
+    expect(within(region).getByText('Round 2')).toBeTruthy();
   });
 
-  it('shows a muted "暂无任务" placeholder above the agent cards when no active task is bound to the group', () => {
+  it('shows a muted "No active task" placeholder above the agent cards when no active task is bound to the group', () => {
     renderGroup([]);
 
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
-    expect(within(region).getByText('暂无任务')).toBeTruthy();
+    expect(within(region).getByText('No active task')).toBeTruthy();
     expect(within(region).queryByRole('button', { name: /task-/ })).toBeNull();
   });
 
@@ -171,7 +171,7 @@ describe('AgentGroup', () => {
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     expect(within(region).queryByText('001')).toBeNull();
     expect(within(region).queryByText('梳理绑定逻辑')).toBeNull();
-    expect(within(region).getByText('暂无任务')).toBeTruthy();
+    expect(within(region).getByText('No active task')).toBeTruthy();
   });
 
   it('keeps the grid flush below the task bar even with a card pet — the pet may overlap it (no extra top gap)', () => {
@@ -354,28 +354,28 @@ describe('AgentGroup', () => {
     renderGroup([], { agentsById: new Map(), agentsLoaded: false, terminalMode: 'embedded-full' });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    expect(screen.getAllByText('Agent 状态加载中')).toHaveLength(2);
+    expect(screen.getAllByText('Agent status loading')).toHaveLength(2);
   });
 
   it('claimable list: shows pending task assigned to dev with a Start button when no active task is bound', () => {
     renderGroup([task({ id: 'task-q', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     expect(within(region).getByText('task-q')).toBeTruthy();
-    expect(within(region).getByRole('button', { name: '发起' })).toBeTruthy();
+    expect(within(region).getByRole('button', { name: 'Start' })).toBeTruthy();
   });
 
-  it('claimable list: unassigned task (preferredAgentId="") shows "未分配" pill and is still claimable', () => {
+  it('claimable list: unassigned task (preferredAgentId="") shows "Unassigned" pill and is still claimable', () => {
     renderGroup([task({ id: 'task-u', status: 'pending', preferredAgentId: '', agentId: '' })]);
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     expect(within(region).getByText('task-u')).toBeTruthy();
-    expect(within(region).getByText('未分配')).toBeTruthy();
+    expect(within(region).getByText('Unassigned')).toBeTruthy();
   });
 
   it('claimable list: clicking Start calls api.tasks.dispatch with agentId=dev-1', async () => {
     tasksDispatchMock.mockResolvedValue(makeTask({ id: 'task-d' }));
     renderGroup([task({ id: 'task-d', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
 
-    const startBtn = screen.getByRole('button', { name: '发起' });
+    const startBtn = screen.getByRole('button', { name: 'Start' });
     await act(async () => {
       fireEvent.click(startBtn);
     });
@@ -389,7 +389,7 @@ describe('AgentGroup', () => {
     ]);
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     expect(within(region).queryByText('task-other')).toBeNull();
-    expect(within(region).getByText('暂无任务')).toBeTruthy();
+    expect(within(region).getByText('No active task')).toBeTruthy();
   });
 
   it('claimable list renders ALONGSIDE active task summary when dev is idle (post-approve / approved state)', () => {
@@ -399,7 +399,7 @@ describe('AgentGroup', () => {
     const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
     expect(within(region).getByText('task-old')).toBeTruthy();
     expect(within(region).getByText('task-new')).toBeTruthy();
-    expect(within(region).getByRole('button', { name: '发起' })).toBeTruthy();
+    expect(within(region).getByRole('button', { name: 'Start' })).toBeTruthy();
   });
 
   it('Start button is disabled when dev is not in idle runtimeStatus', () => {
@@ -413,7 +413,7 @@ describe('AgentGroup', () => {
       },
     );
 
-    const btn = screen.getByRole('button', { name: '发起' }) as HTMLButtonElement;
+    const btn = screen.getByRole('button', { name: 'Start' }) as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
   });
 
@@ -436,7 +436,7 @@ describe('AgentGroup', () => {
 
   it('claimable Start button is a plain text button (no btn-secondary frame) so single-task row height matches the active row', () => {
     renderGroup([task({ id: 'task-q', status: 'pending', preferredAgentId: 'dev-1', agentId: '' })]);
-    const startBtn = screen.getByRole('button', { name: '发起' });
+    const startBtn = screen.getByRole('button', { name: 'Start' });
     expect(startBtn.className).not.toContain('btn-secondary');
     expect(startBtn.className).not.toContain('border');
     expect(startBtn.className).toContain('text-accent');
@@ -461,8 +461,8 @@ describe('AgentGroup', () => {
     });
 
     expect(screen.getAllByTestId('pane-terminal')).toHaveLength(2);
-    expect(screen.getAllByRole('link', { name: '终端' }).map(link => link.getAttribute('href')))
+    expect(screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href')))
       .toEqual(['/terminal/dev-1', '/terminal/qa-1']);
-    expect(screen.queryByText('Agent 状态加载中')).toBeNull();
+    expect(screen.queryByText('Agent status loading')).toBeNull();
   });
 });

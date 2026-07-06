@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from 'react';
 import { Modal } from './modal.tsx';
+import { useT } from '../i18n/index.tsx';
 
 export interface ConfirmOptions {
   title: string;
@@ -17,6 +18,7 @@ interface PendingConfirm extends ConfirmOptions {
 }
 
 export function ConfirmProvider({ children }: { children: ReactNode }) {
+  const t = useT();
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const pendingRef = useRef<PendingConfirm | null>(null);
 
@@ -50,10 +52,10 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
           footer={
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => settle(false)} className="btn-secondary">
-                {pending.cancelLabel ?? '取消'}
+                {pending.cancelLabel ?? t.common.cancel}
               </button>
               <button type="button" onClick={() => settle(true)} className="btn-primary">
-                {pending.confirmLabel ?? '确认'}
+                {pending.confirmLabel ?? t.common.confirm}
               </button>
             </div>
           }

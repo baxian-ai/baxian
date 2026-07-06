@@ -101,7 +101,7 @@ function titleInput(): HTMLInputElement {
 }
 
 function descriptionInput(): HTMLTextAreaElement {
-  return screen.getByLabelText('Description（可选）') as HTMLTextAreaElement;
+  return screen.getByLabelText('Description (optional)') as HTMLTextAreaElement;
 }
 
 function devSelect(): HTMLSelectElement {
@@ -109,7 +109,7 @@ function devSelect(): HTMLSelectElement {
 }
 
 function restoreHint(): HTMLElement | null {
-  return screen.queryByText('已恢复上次未提交的草稿');
+  return screen.queryByText('Restored your last unsaved draft');
 }
 
 beforeEach(() => {
@@ -142,7 +142,7 @@ describe('CreateTaskModal — draft persistence', () => {
 
     expect(titleInput().value).toBe('half-typed title');
     expect(descriptionInput().value).toBe('half-typed body');
-    expect(screen.getByText('已恢复上次未提交的草稿')).toBeTruthy();
+    expect(screen.getByText('Restored your last unsaved draft')).toBeTruthy();
   });
 
   it('writes each input change to localStorage synchronously (no debounce) so even an immediate close right after typing never drops the last keystrokes', async () => {
@@ -183,7 +183,7 @@ describe('CreateTaskModal — draft persistence', () => {
     await mountModal();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '创建' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Create' }));
     });
     await waitFor(() => {
       expect(tasksCreateMock).toHaveBeenCalledTimes(1);
@@ -192,7 +192,7 @@ describe('CreateTaskModal — draft persistence', () => {
     expect(localStorage.getItem(DRAFT_KEY_GLOBAL)).toBeNull();
   });
 
-  it('"丢弃" button removes the saved draft and resets the form to blank', async () => {
+  it('"Discard" button removes the saved draft and resets the form to blank', async () => {
     seedDraft(DRAFT_KEY_GLOBAL, {
       title: 'to discard',
       description: 'to discard body',
@@ -201,7 +201,7 @@ describe('CreateTaskModal — draft persistence', () => {
     });
     await mountModal();
 
-    fireEvent.click(screen.getByRole('button', { name: '丢弃' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
 
     expect(titleInput().value).toBe('');
     expect(descriptionInput().value).toBe('');
@@ -265,7 +265,7 @@ describe('CreateTaskModal — draft persistence', () => {
 
     expect(titleInput().value).toBe('strict title');
     expect(descriptionInput().value).toBe('strict body');
-    expect(screen.getByText('已恢复上次未提交的草稿')).toBeTruthy();
+    expect(screen.getByText('Restored your last unsaved draft')).toBeTruthy();
 
     const persisted = readDraft(DRAFT_KEY_GLOBAL);
     expect(persisted.title).toBe('strict title');
@@ -284,7 +284,7 @@ describe('CreateTaskModal — draft persistence', () => {
 
     expect(titleInput().value).toBe('dashboard title');
     expect(descriptionInput().value).toBe('dashboard body');
-    expect(screen.getByText('已恢复上次未提交的草稿')).toBeTruthy();
+    expect(screen.getByText('Restored your last unsaved draft')).toBeTruthy();
 
     expect(localStorage.getItem(DRAFT_KEY_GLOBAL)).toBeNull();
     const migrated = readDraft(DRAFT_KEY_BAXIAN);
@@ -430,7 +430,7 @@ describe('CreateTaskModal — images', () => {
     await mountModal({ projectId: 'baxian' });
     await act(async () => { fireEvent.change(fileInput(), { target: { files: [png('a.png')] } }); });
     expect(screen.getByText('a.png')).toBeTruthy();
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /移除图片 a.png/ })); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Remove image a.png/ })); });
     expect(screen.queryByText('a.png')).toBeNull();
   });
 
@@ -439,7 +439,7 @@ describe('CreateTaskModal — images', () => {
     fireEvent.change(titleInput(), { target: { value: '按图实现' } });
     fireEvent.change(descriptionInput(), { target: { value: '见附图' } });
     await act(async () => { fireEvent.change(fileInput(), { target: { files: [png('shot.png')] } }); });
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: '创建' })); });
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Create' })); });
     await waitFor(() => expect(tasksCreateMock).toHaveBeenCalledTimes(1));
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
       images: [{ dataBase64: 'QkFTRTY0', filename: 'shot.png' }],
@@ -455,12 +455,12 @@ describe('CreateTaskModal — images', () => {
 
   it('edit mode has no image control', async () => {
     await mountModal({ mode: 'edit', task: makeTask() });
-    expect(screen.queryByRole('button', { name: /添加图片/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Add images/ })).toBeNull();
   });
 });
 
-describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
-  it('defaults the Dev select to the first available dev once agents load, with 暂不指定 as the first option', async () => {
+describe('CreateTaskModal — Dev agent defaults to the first available dev', () => {
+  it('defaults the Dev select to the first available dev once agents load, with "Not assigned yet" as the first option', async () => {
     projectsListMock.mockResolvedValue([
       makeProject({
         agent: [[
@@ -474,7 +474,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
 
     const select = devSelect();
     expect(select.value).toBe('bx-dev-1');
-    expect(select.querySelector('option')?.textContent).toContain('暂不指定');
+    expect(select.querySelector('option')?.textContent).toContain('Not assigned yet');
   });
 
   it('submits the defaulted first dev when the user does not change the select', async () => {
@@ -483,7 +483,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
 
     fireEvent.change(titleInput(), { target: { value: '默认 dev' } });
     fireEvent.change(descriptionInput(), { target: { value: '不改 dev 选择' } });
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
     await flushApi();
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -497,8 +497,8 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
     await mountModal({ projectId: 'baxian' });
 
     fireEvent.change(titleInput(), { target: { value: '只填标题' } });
-    expect((screen.getByRole('button', { name: '创建' }) as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    expect((screen.getByRole('button', { name: 'Create' }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
     await flushApi();
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -508,7 +508,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
     }));
   });
 
-  it('lets the user re-select 暂不指定 and submits preferredAgentId="" without snapping back to the first dev', async () => {
+  it('lets the user re-select "Not assigned yet" and submits preferredAgentId="" without snapping back to the first dev', async () => {
     tasksCreateMock.mockResolvedValue(makeTask({ id: 'task-200', preferredAgentId: '', agentId: '' }));
     await mountModal({ projectId: 'baxian' });
 
@@ -520,7 +520,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
 
     fireEvent.change(titleInput(), { target: { value: '未指定任务' } });
     fireEvent.change(descriptionInput(), { target: { value: '稍后再选 dev' } });
-    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
     await flushApi();
 
     expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -529,7 +529,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
     }));
   });
 
-  it('leaves the Dev select on 暂不指定 when the project has no running dev', async () => {
+  it('leaves the Dev select on "Not assigned yet" when the project has no running dev', async () => {
     projectsListMock.mockResolvedValue([
       makeProject({ agent: [[{ id: 'bx-qa', runtime: 'claude-code', role: 'qa', mode: 'local' }]] }),
     ]);
@@ -539,7 +539,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
     expect(devSelect().value).toBe('');
   });
 
-  it('preserves a restored draft that explicitly selected 暂不指定 (empty preferredAgentId) instead of defaulting', async () => {
+  it('preserves a restored draft that explicitly selected "Not assigned yet" (empty preferredAgentId) instead of defaulting', async () => {
     seedDraft(DRAFT_KEY_BAXIAN, {
       title: '草稿标题',
       description: '草稿内容',
@@ -552,7 +552,7 @@ describe('CreateTaskModal — Dev Agent 默认选中第一个 dev', () => {
     expect(devSelect().value).toBe('');
   });
 
-  it('does not re-default a project the user set to 暂不指定 after switching away and back (global modal)', async () => {
+  it('does not re-default a project the user set to "Not assigned yet" after switching away and back (global modal)', async () => {
     projectsListMock.mockResolvedValue([
       makeProject({ id: 'proj-a', agent: [[{ id: 'a-dev', runtime: 'claude-code', role: 'dev', mode: 'local' }]] }),
       makeProject({ id: 'proj-b', agent: [[{ id: 'b-dev', runtime: 'claude-code', role: 'dev', mode: 'local' }]] }),

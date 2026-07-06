@@ -57,7 +57,7 @@ describe('ReviewConversation gating', () => {
         <ReviewConversation task={makeTask({ reviewMode: 'github' })} />
       </MemoryRouter>,
     );
-    expect(screen.queryByText('评审记录')).toBeNull();
+    expect(screen.queryByText('Review records')).toBeNull();
     expect(reviewsMock).not.toHaveBeenCalled();
   });
 
@@ -68,7 +68,7 @@ describe('ReviewConversation gating', () => {
         <ReviewConversation task={makeTask({ reviewMode: undefined })} />
       </MemoryRouter>,
     );
-    expect(screen.queryByText('评审记录')).toBeNull();
+    expect(screen.queryByText('Review records')).toBeNull();
     expect(reviewsMock).not.toHaveBeenCalled();
   });
 
@@ -77,13 +77,13 @@ describe('ReviewConversation gating', () => {
       { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
-    expect(await screen.findByText('Spec 评审')).toBeTruthy();
+    expect(await screen.findByText('Spec review')).toBeTruthy();
     expect(reviewsMock).toHaveBeenCalled();
   });
 });
 
 describe('ReviewConversation github code-review group', () => {
-  it('renders the 代码评审 process under 评审记录 without fetching server rounds', async () => {
+  it('renders the Code review process under Review records without fetching server rounds', async () => {
     githubReviewMock.mockResolvedValue({
       available: true,
       prNumber: 7,
@@ -94,17 +94,17 @@ describe('ReviewConversation github code-review group', () => {
       ],
     });
     renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 0 }));
-    expect(screen.getByText('评审记录')).toBeTruthy();
-    expect(await screen.findByText('第 1 轮')).toBeTruthy();
-    expect(screen.getByText('代码评审')).toBeTruthy();
-    expect(screen.getByText('行内评论')).toBeTruthy();
-    expect(screen.getByText('提交代码改动')).toBeTruthy();
+    expect(screen.getByText('Review records')).toBeTruthy();
+    expect(await screen.findByText('Round 1')).toBeTruthy();
+    expect(screen.getByText('Code review')).toBeTruthy();
+    expect(screen.getByText('Inline comment')).toBeTruthy();
+    expect(screen.getByText('Submit code changes')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(reviewsMock).not.toHaveBeenCalled();
     expect(githubReviewMock).toHaveBeenCalledWith('task-1');
   });
 
-  it('shows Spec 评审 and 代码评审 together for a github SDD task with spec rounds + PR', async () => {
+  it('shows Spec review and Code review together for a github SDD task with spec rounds + PR', async () => {
     reviewsMock.mockResolvedValue([
       { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
     ] as ReviewRound[]);
@@ -114,8 +114,8 @@ describe('ReviewConversation github code-review group', () => {
       items: [{ kind: 'review', id: '11', body: 'lgtm', verdict: 'approve' }],
     });
     renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 1 }));
-    expect(await screen.findByText('Spec 评审')).toBeTruthy();
-    expect(screen.getByText('代码评审')).toBeTruthy();
+    expect(await screen.findByText('Spec review')).toBeTruthy();
+    expect(screen.getByText('Code review')).toBeTruthy();
     expect(await screen.findAllByText('approve')).toHaveLength(2);
   });
 });
@@ -124,7 +124,7 @@ describe('ReviewConversation server mode', () => {
   it('shows an empty hint when there are no rounds', async () => {
     reviewsMock.mockResolvedValue([]);
     renderConv(makeTask());
-    expect(await screen.findByText('评审尚未开始')).toBeTruthy();
+    expect(await screen.findByText('Review has not started')).toBeTruthy();
   });
 
   it('groups rounds by phase and renders dev/QA/dev turns', async () => {
@@ -137,17 +137,17 @@ describe('ReviewConversation server mode', () => {
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
     ] as ReviewRound[]);
     renderConv(makeTask());
-    expect(await screen.findByText('Spec 评审')).toBeTruthy();
-    expect(screen.getByText('评审记录')).toBeTruthy();
-    expect(screen.getByText('代码评审')).toBeTruthy();
-    expect(screen.getByText('提交规格稿')).toBeTruthy();
-    expect(screen.getByText('提交代码改动')).toBeTruthy();
+    expect(await screen.findByText('Spec review')).toBeTruthy();
+    expect(screen.getByText('Review records')).toBeTruthy();
+    expect(screen.getByText('Code review')).toBeTruthy();
+    expect(screen.getByText('Submit Spec draft')).toBeTruthy();
+    expect(screen.getByText('Submit code changes')).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
-    expect(screen.getByText('反馈')).toBeTruthy();
+    expect(screen.getByText('Response')).toBeTruthy();
   });
 
-  it('renders the 用户 turn when a spec round carries a userDecision', async () => {
+  it('renders the User turn when a spec round carries a userDecision', async () => {
     reviewsMock.mockResolvedValue([
       {
         round: 1, phase: 'spec', content: 'spec body', startedAt: 'now',
@@ -156,8 +156,8 @@ describe('ReviewConversation server mode', () => {
       },
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
-    expect(await screen.findByText('用户')).toBeTruthy();
-    expect(screen.getByText('打回 Spec')).toBeTruthy();
+    expect(await screen.findByText('User')).toBeTruthy();
+    expect(screen.getByText('Reject Spec')).toBeTruthy();
     expect(screen.getByText('边界场景没有覆盖')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
   });
@@ -180,7 +180,7 @@ describe('ReviewConversation server mode', () => {
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewRound: 1 }));
-    const row = (await screen.findByText('提交代码改动')).closest('button')!;
+    const row = (await screen.findByText('Submit code changes')).closest('button')!;
     expect(row.className).toContain('card');
     expect(row.className).not.toContain('hover:border-accent');
   });
@@ -190,7 +190,7 @@ describe('ReviewConversation server mode', () => {
       codeRound(2, { findings: { round: 2, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'critical', message: 'x', file: 'a.ts', line: 3 }] } }),
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewRound: 2 }));
-    const qaRow = await screen.findByText('评审');
+    const qaRow = await screen.findByText('Review');
     fireEvent.click(qaRow.closest('button')!);
     expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/2#review');
   });
@@ -200,7 +200,7 @@ describe('ReviewConversation server mode', () => {
     const { rerender } = render(
       <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 1 })} /></MemoryRouter>,
     );
-    await screen.findByText('第 1 轮');
+    await screen.findByText('Round 1');
     expect(reviewsMock).toHaveBeenCalledTimes(1);
 
     reviewsMock.mockResolvedValueOnce([
@@ -211,13 +211,13 @@ describe('ReviewConversation server mode', () => {
       <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 2 })} /></MemoryRouter>,
     );
     await waitFor(() => expect(reviewsMock).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText('第 2 轮')).toBeTruthy();
+    expect(await screen.findByText('Round 2')).toBeTruthy();
   });
 
   it('shows an error message when the fetch fails', async () => {
     reviewsMock.mockRejectedValue(new Error('boom'));
     renderConv(makeTask());
-    expect(await screen.findByText(/加载评审记录失败/)).toBeTruthy();
+    expect(await screen.findByText(/Failed to load review records/)).toBeTruthy();
   });
 
   it('never renders NaN when severity/action values are unexpected', async () => {
@@ -229,7 +229,7 @@ describe('ReviewConversation server mode', () => {
       },
     ] as unknown as ReviewRound[]);
     renderConv(makeTask());
-    expect(await screen.findByText('评审')).toBeTruthy();
+    expect(await screen.findByText('Review')).toBeTruthy();
     expect(screen.queryByText(/NaN/)).toBeNull();
   });
 });

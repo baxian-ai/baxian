@@ -6,19 +6,21 @@ import {
   clearAuthToken,
   setAuthToken,
 } from '../api.ts';
+import { useT, syncLocaleFromConfig } from '../i18n/index.tsx';
 import { inputCls, labelCls } from './form-styles.ts';
 
 type GateState =
   | { kind: 'probing' }
   | { kind: 'authorized' }
-  | { kind: 'unauthorized'; message?: string }
-  | { kind: 'error'; message: string };
+  | { kind: 'unauthorized'; reason?: 'expired' | 'invalid' }
+  | { kind: 'error'; message?: string; fallback: 'connectFallback' | 'loginFailed' };
 
 interface Props {
   children: ReactNode;
 }
 
 export function AuthGate({ children }: Props) {
+  const t = useT();
   const [state, setState] = useState<GateState>({ kind: 'probing' });
   const stateRef = useRef(state);
   useEffect(() => { stateRef.current = state; }, [state]);
@@ -26,15 +28,15 @@ export function AuthGate({ children }: Props) {
   const probe = useCallback(async () => {
     setState({ kind: 'probing' });
     try {
-      await api.config.get();
+      const cfg = await api.config.get();
+      syncLocaleFromConfig(cfg.language);
       setState({ kind: 'authorized' });
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         setState({ kind: 'unauthorized' });
         return;
       }
-      const message = e instanceof Error ? e.message : '无法连接服务器';
-      setState({ kind: 'error', message });
+      setState({ kind: 'error', message: e instanceof Error ? e.message : undefined, fallback: 'connectFallback' });
     }
   }, []);
 
@@ -43,7 +45,7 @@ export function AuthGate({ children }: Props) {
   useEffect(() => {
     const onUnauthorized = () => {
       if (stateRef.current.kind === 'probing') return;
-      setState({ kind: 'unauthorized', message: '登录已失效，请重新输入令牌' });
+      setState({ kind: 'unauthorized', reason: 'expired' });
     };
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
@@ -53,10 +55,10 @@ export function AuthGate({ children }: Props) {
 
   if (state.kind === 'error') {
     return (
-      <CenteredCard title="无法连接服务器">
-        <p className="text-sm text-og-600">{state.message}</p>
+      <CenteredCard title={t.auth.connectFailedTitle}>
+        <p className="text-sm text-og-600">{state.message ?? t.auth[state.fallback]}</p>
         <button type="button" onClick={() => { void probe(); }} className="btn-primary mt-4 w-full">
-          重试
+          {t.common.retry}
         </button>
       </CenteredCard>
     );
@@ -64,28 +66,33 @@ export function AuthGate({ children }: Props) {
 
   if (state.kind === 'probing') {
     return (
-      <CenteredCard title="加载中">
-        <p className="text-sm text-og-500">正在检查登录状态…</p>
+      <CenteredCard title={t.auth.checkingTitle}>
+        <p className="text-sm text-og-500">{t.auth.checkingBody}</p>
       </CenteredCard>
     );
   }
 
+  const unauthorizedMessage =
+    state.reason === 'expired' ? t.auth.sessionExpired
+    : state.reason === 'invalid' ? t.auth.tokenInvalid
+    : undefined;
+
   return (
     <LoginForm
-      message={state.message}
+      message={unauthorizedMessage}
       onSubmit={async (token) => {
         setAuthToken(token);
         try {
-          await api.config.get();
+          const cfg = await api.config.get();
+          syncLocaleFromConfig(cfg.language);
           setState({ kind: 'authorized' });
         } catch (e) {
           clearAuthToken();
           if (e instanceof ApiError && e.status === 401) {
-            setState({ kind: 'unauthorized', message: '令牌无效，请重试' });
+            setState({ kind: 'unauthorized', reason: 'invalid' });
             return;
           }
-          const message = e instanceof Error ? e.message : '登录失败';
-          setState({ kind: 'error', message });
+          setState({ kind: 'error', message: e instanceof Error ? e.message : undefined, fallback: 'loginFailed' });
         }
       }}
     />
@@ -110,6 +117,7 @@ function LoginForm({
   message?: string;
   onSubmit: (token: string) => void | Promise<void>;
 }) {
+  const t = useT();
   const [token, setToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | undefined>(undefined);
@@ -118,7 +126,7 @@ function LoginForm({
     e.preventDefault();
     const trimmed = token.trim();
     if (!trimmed) {
-      setLocalError('请输入访问令牌');
+      setLocalError(t.auth.tokenRequired);
       return;
     }
     setLocalError(undefined);
@@ -133,11 +141,11 @@ function LoginForm({
   const displayError = localError ?? message;
 
   return (
-    <CenteredCard title="登录 baxian">
-      <p className="mb-4 text-sm text-og-600">服务器开启了访问鉴权，请输入访问令牌继续。</p>
+    <CenteredCard title={t.auth.loginTitle}>
+      <p className="mb-4 text-sm text-og-600">{t.auth.loginDescription}</p>
       <form onSubmit={(e) => { void handleSubmit(e); }}>
         <label className={labelCls} htmlFor="baxian-token">
-          访问令牌
+          {t.auth.tokenLabel}
         </label>
         <input
           id="baxian-token"
@@ -147,14 +155,14 @@ function LoginForm({
           value={token}
           onChange={(e) => setToken(e.target.value)}
           className={`${inputCls} font-mono`}
-          placeholder="请输入服务器配置的 token"
+          placeholder={t.auth.tokenPlaceholder}
           disabled={submitting}
         />
         {displayError && (
           <p role="alert" className="mt-2 text-xs text-accent">{displayError}</p>
         )}
         <button type="submit" disabled={submitting} className="btn-primary mt-4 w-full">
-          {submitting ? '登录中…' : '登录'}
+          {submitting ? t.auth.submitting : t.auth.submit}
         </button>
       </form>
     </CenteredCard>

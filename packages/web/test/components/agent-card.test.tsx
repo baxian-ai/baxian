@@ -90,7 +90,7 @@ function makeBinding(id: string, overrides: Partial<AgentBindingFacts> = {}): Ag
 }
 
 function kebab(): HTMLElement {
-  return screen.getByRole('button', { name: /操作菜单/ });
+  return screen.getByRole('button', { name: /actions menu/ });
 }
 
 function openMenu(): void {
@@ -98,7 +98,7 @@ function openMenu(): void {
 }
 
 function terminalHrefs(): (string | null)[] {
-  return screen.getAllByRole('link', { name: '终端' }).map(link => link.getAttribute('href'));
+  return screen.getAllByRole('link', { name: 'Terminal' }).map(link => link.getAttribute('href'));
 }
 
 async function findConfirmDialog(): Promise<HTMLElement> {
@@ -142,7 +142,7 @@ describe('AgentCard', () => {
     }
 
     function resumeButton(): HTMLElement {
-      return screen.getByRole('button', { name: /^恢复$/ });
+      return screen.getByRole('button', { name: /^Resume$/ });
     }
 
     it('routes Resume to restart-repl (re-greet) for a greeting_failed hold with a live session', async () => {
@@ -151,9 +151,9 @@ describe('AgentCard', () => {
 
       fireEvent.click(resumeButton());
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('恢复 Agent dev-greet？')).toBeTruthy();
-      expect(within(dialog).getByText(/重跑能力握手/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '恢复' })); });
+      expect(within(dialog).getByText('Resume agent dev-greet?')).toBeTruthy();
+      expect(within(dialog).getByText(/re-run the handshake/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Resume' })); });
 
       expect(restartReplMock).toHaveBeenCalledWith('proj', 'dev-greet');
       expect(retryAgentMock).not.toHaveBeenCalled();
@@ -167,7 +167,7 @@ describe('AgentCard', () => {
         heldCard('dev-gone', 'greeting_failed', sessionStatus);
 
         fireEvent.click(resumeButton());
-        await settleConfirmDialog('恢复');
+        await settleConfirmDialog('Resume');
 
         expect(retryAgentMock).toHaveBeenCalledWith('proj', 'dev-gone');
         expect(restartReplMock).not.toHaveBeenCalled();
@@ -181,8 +181,8 @@ describe('AgentCard', () => {
 
       fireEvent.click(resumeButton());
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText(/baxian 会清除 awaiting_human 状态/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '恢复' })); });
+      expect(within(dialog).getByText(/baxian will clear the awaiting_human state/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Resume' })); });
 
       expect(resumeAgentMock).toHaveBeenCalledWith('proj', 'dev-hold');
       expect(restartReplMock).not.toHaveBeenCalled();
@@ -190,7 +190,7 @@ describe('AgentCard', () => {
 
     it('gives the greeting_failed Resume button a distinct tooltip from the plain hold', () => {
       heldCard('dev-greet', 'greeting_failed');
-      expect(resumeButton().getAttribute('title')).toMatch(/握手|greeting|Restart REPL/i);
+      expect(resumeButton().getAttribute('title')).toMatch(/greeting|Restart REPL/i);
     });
 
     it('surfaces a Resume failure as an error toast and re-enables the button', async () => {
@@ -198,9 +198,9 @@ describe('AgentCard', () => {
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
       fireEvent.click(resumeButton());
-      await settleConfirmDialog('恢复');
+      await settleConfirmDialog('Resume');
 
-      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Resume 失败', body: 'binding busy' });
+      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Resume failed', body: 'binding busy' });
       expect((resumeButton() as HTMLButtonElement).disabled).toBe(false);
     });
 
@@ -208,7 +208,7 @@ describe('AgentCard', () => {
       heldCard('dev-hold', 'cancel-interrupt-failed');
 
       fireEvent.click(resumeButton());
-      await settleConfirmDialog('取消');
+      await settleConfirmDialog('Cancel');
 
       expect(resumeAgentMock).not.toHaveBeenCalled();
       expect(restartReplMock).not.toHaveBeenCalled();
@@ -235,12 +235,12 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-new', { creationToken: 'create-1' }),
     }));
 
-    expect(screen.getByText('启动中')).toBeTruthy();
-    expect(screen.getByRole('img', { name: '会话启动中' })).toBeTruthy();
-    expect(screen.getByText(/Agent 正在启动/)).toBeTruthy();
-    expect(screen.queryByText('等待人工介入')).toBeNull();
-    expect(screen.queryByRole('link', { name: '终端' })).toBeNull();
-    expect(screen.getByText('终端')).toBeTruthy();
+    expect(screen.getByText('Starting')).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'Session starting' })).toBeTruthy();
+    expect(screen.getByText(/Agent is starting/)).toBeTruthy();
+    expect(screen.queryByText('Awaiting human intervention')).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Terminal' })).toBeNull();
+    expect(screen.getByText('Terminal')).toBeTruthy();
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
   });
 
@@ -251,9 +251,9 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-pending', { creationToken: 'create-1', paneId: '%1' }),
     }));
 
-    expect(screen.getByText('待人工')).toBeTruthy();
+    expect(screen.getByText('Awaiting human')).toBeTruthy();
     expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
-    expect(screen.getByText('等待人工介入')).toBeTruthy();
+    expect(screen.getByText('Awaiting human intervention')).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-pending', '/terminal/dev-pending']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
   });
@@ -267,11 +267,11 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-pending-no-pane', { creationToken: 'create-1' }),
     }));
 
-    expect(screen.getByText('待人工')).toBeTruthy();
+    expect(screen.getByText('Awaiting human')).toBeTruthy();
     expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
-    expect(screen.getByText('等待人工介入')).toBeTruthy();
+    expect(screen.getByText('Awaiting human intervention')).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-pending-no-pane', '/terminal/dev-pending-no-pane']);
-    expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
+    expect(screen.queryByText(/Agent is starting/)).toBeNull();
   });
 
   it('allows attaching when binding.status flips to awaiting_human even if paneId is still missing', () => {
@@ -286,10 +286,10 @@ describe('AgentCard', () => {
       }),
     }));
 
-    expect(screen.getByText('挂起')).toBeTruthy();
+    expect(screen.getByText('Held')).toBeTruthy();
     expect(screen.getByText('agent_dialog_pending')).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-held', '/terminal/dev-held']);
-    expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
+    expect(screen.queryByText(/Agent is starting/)).toBeNull();
   });
 
   it('shows the need-input badge and hint when binding.needInputAt is set', () => {
@@ -302,8 +302,8 @@ describe('AgentCard', () => {
       }),
     }));
 
-    expect(screen.getByText('等回答')).toBeTruthy();
-    expect(screen.getByText('Agent 在等你的回答')).toBeTruthy();
+    expect(screen.getByText('Awaiting reply')).toBeTruthy();
+    expect(screen.getByText('Agent is waiting for your reply')).toBeTruthy();
     expect(terminalHrefs()).toContain('/terminal/dev-asking');
   });
 
@@ -314,8 +314,8 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-quiet', { taskId: 'task-9' }),
     }));
 
-    expect(screen.queryByText('等回答')).toBeNull();
-    expect(screen.queryByText('Agent 在等你的回答')).toBeNull();
+    expect(screen.queryByText('Awaiting reply')).toBeNull();
+    expect(screen.queryByText('Agent is waiting for your reply')).toBeNull();
   });
 
   it('reveals the live terminal during in-flight bootstrap once the tmux session is present', () => {
@@ -326,10 +326,10 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-launching', { creationToken: 'create-1' }),
     }));
 
-    expect(screen.getByText('启动中')).toBeTruthy();
-    expect(screen.getByRole('img', { name: '会话启动中' })).toBeTruthy();
-    expect(screen.queryByText('等待人工介入')).toBeNull();
-    expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
+    expect(screen.getByText('Starting')).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'Session starting' })).toBeTruthy();
+    expect(screen.queryByText('Awaiting human intervention')).toBeNull();
+    expect(screen.queryByText(/Agent is starting/)).toBeNull();
     expect(terminalHrefs()).toEqual(['/terminal/dev-launching']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
   });
@@ -342,8 +342,8 @@ describe('AgentCard', () => {
       binding: makeBinding('dev-emb-boot', { creationToken: 'create-1' }),
     }), { terminalMode: 'embedded-full' });
 
-    expect(screen.getByText('启动中')).toBeTruthy();
-    expect(screen.queryByText(/Agent 正在启动/)).toBeNull();
+    expect(screen.getByText('Starting')).toBeTruthy();
+    expect(screen.queryByText(/Agent is starting/)).toBeNull();
     expect(screen.getByTestId('pane-terminal').getAttribute('data-mode')).toBe('full');
   });
 
@@ -356,7 +356,7 @@ describe('AgentCard', () => {
     }), { terminalMode: 'embedded-full' });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    expect(screen.getByText('Agent 正在启动')).toBeTruthy();
+    expect(screen.getByText('Agent is starting')).toBeTruthy();
   });
 
   it('embedded terminal mode renders an interactive full terminal even when idle', () => {
@@ -408,14 +408,14 @@ describe('AgentCard', () => {
 
     it('invokes onActivate when the terminal container is clicked', () => {
       const { onActivate } = renderSelectable(false);
-      const trigger = screen.getByRole('button', { name: '激活 dev-sel 终端' });
+      const trigger = screen.getByRole('button', { name: 'Activate dev-sel terminal' });
       fireEvent.click(trigger);
       expect(onActivate).toHaveBeenCalledTimes(1);
     });
 
     it('does not activate when an inner control (e.g. the kebab menu button) inside the card is clicked', () => {
       const { onActivate } = renderSelectable(false);
-      const menuTrigger = screen.getByRole('button', { name: /Agent dev-sel 操作菜单/ });
+      const menuTrigger = screen.getByRole('button', { name: /Agent dev-sel actions menu/ });
       fireEvent.click(menuTrigger);
       expect(onActivate).not.toHaveBeenCalled();
     });
@@ -429,7 +429,7 @@ describe('AgentCard', () => {
 
     it('exposes the terminal container as a keyboard-activatable button while inactive', () => {
       const { onActivate } = renderSelectable(false);
-      const trigger = screen.getByRole('button', { name: '激活 dev-sel 终端' });
+      const trigger = screen.getByRole('button', { name: 'Activate dev-sel terminal' });
       expect(trigger.getAttribute('tabindex')).toBe('0');
       fireEvent.keyDown(trigger, { key: 'Enter' });
       expect(onActivate).toHaveBeenCalledTimes(1);
@@ -467,9 +467,9 @@ describe('AgentCard', () => {
   });
 
   it.each([
-    ['absent', '无会话', 'status-dot--warn'],
-    ['unreachable', '主机不可达', 'status-dot--danger'],
-    ['unknown', '会话状态未知', 'status-dot--warn'],
+    ['absent', 'No session', 'status-dot--warn'],
+    ['unreachable', 'Host unreachable', 'status-dot--danger'],
+    ['unknown', 'Session status unknown', 'status-dot--warn'],
   ] as const)('renders a non-normal %s tmux status as the %s dot (modifier %s)', (status, label, modifier) => {
     renderCard(makeSnapshot({ id: `dev-${status}`, tmuxSessionStatus: status }));
     const dot = screen.getByRole('img', { name: label });
@@ -478,7 +478,7 @@ describe('AgentCard', () => {
 
   it('non-normal status dots use the warning or danger treatment', () => {
     renderCard(makeSnapshot({ id: 'dev-no-session', tmuxSessionStatus: 'absent' }));
-    const dot = screen.getByRole('img', { name: '无会话' });
+    const dot = screen.getByRole('img', { name: 'No session' });
     expect(dot.className).toContain('status-dot--warn');
     expect(dot.className).not.toContain('status-dot--danger');
   });
@@ -490,9 +490,9 @@ describe('AgentCard', () => {
       tmuxSessionStatus: 'unreachable',
       stale: true,
     }));
-    const dot = screen.getByRole('img', { name: '主机不可达' });
-    const runtimePill = screen.getByText('工作中');
-    const stalePill = screen.getByText('失联');
+    const dot = screen.getByRole('img', { name: 'Host unreachable' });
+    const runtimePill = screen.getByText('Working');
+    const stalePill = screen.getByText('Stale');
     expect(dot.parentElement).toBe(runtimePill.parentElement);
     expect(dot.parentElement).toBe(stalePill.parentElement);
     const siblings = Array.from(dot.parentElement!.children);
@@ -502,7 +502,7 @@ describe('AgentCard', () => {
 
   it('abnormal status dot carries an explicit extra left margin so it breathes away from the pill cluster', () => {
     renderCard(makeSnapshot({ id: 'dev-spacing', tmuxSessionStatus: 'absent' }));
-    const dot = screen.getByRole('img', { name: '无会话' });
+    const dot = screen.getByRole('img', { name: 'No session' });
     expect(dot.className).toContain('ml-2');
   });
 
@@ -542,9 +542,9 @@ describe('AgentCard', () => {
       const items = screen.getAllByRole('menuitem');
       expect(items).toHaveLength(4);
       expect(items[0].textContent).toBe('Agent Pet');
-      expect(items[1].textContent).toBe('压缩上下文');
-      expect(items[2].textContent).toBe('清空上下文');
-      expect(items[3].textContent).toBe('删除');
+      expect(items[1].textContent).toBe('Compact context');
+      expect(items[2].textContent).toBe('Clear context');
+      expect(items[3].textContent).toBe('Delete');
     });
 
     it('labels the menu via the trigger so screen readers know which agent owns it', () => {
@@ -556,14 +556,14 @@ describe('AgentCard', () => {
       const menu = screen.getByRole('menu');
       expect(menu.getAttribute('aria-labelledby')).toBe(trigger.id);
       expect(trigger.id).toBeTruthy();
-      expect(screen.getByRole('menu', { name: /Agent dev-actions 操作菜单/ })).toBe(menu);
+      expect(screen.getByRole('menu', { name: /Agent dev-actions actions menu/ })).toBe(menu);
     });
 
     it('sends /compact via the Compact menu item and closes the menu', async () => {
       compactMock.mockResolvedValue({ compacted: true });
       renderIdleCard();
 
-      await clickMenuItem('压缩上下文');
+      await clickMenuItem('Compact context');
 
       expect(compactMock).toHaveBeenCalledWith('dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
@@ -574,11 +574,11 @@ describe('AgentCard', () => {
       clearMock.mockResolvedValue({ cleared: true });
       renderIdleCard();
 
-      await clickMenuItem('清空上下文');
+      await clickMenuItem('Clear context');
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('清空 Agent dev-actions 的上下文？')).toBeTruthy();
-      expect(within(dialog).getByText(/将发送 \/clear/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '清空' })); });
+      expect(within(dialog).getByText('Clear the context for agent dev-actions?')).toBeTruthy();
+      expect(within(dialog).getByText(/This sends \/clear/)).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Clear' })); });
 
       expect(clearMock).toHaveBeenCalledWith('dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
@@ -588,8 +588,8 @@ describe('AgentCard', () => {
     it('does not send /clear when user cancels the confirmation', async () => {
       renderIdleCard();
 
-      await clickMenuItem('清空上下文');
-      await settleConfirmDialog('取消');
+      await clickMenuItem('Clear context');
+      await settleConfirmDialog('Cancel');
 
       expect(clearMock).not.toHaveBeenCalled();
     });
@@ -598,12 +598,12 @@ describe('AgentCard', () => {
       clearMock.mockRejectedValue(new Error('Agent dev-actions has no live session'));
       renderIdleCard();
 
-      await clickMenuItem('清空上下文');
-      await settleConfirmDialog('清空');
+      await clickMenuItem('Clear context');
+      await settleConfirmDialog('Clear');
 
       expect(showMock).toHaveBeenCalledWith(expect.objectContaining({
         kind: 'error',
-        title: '清空上下文失败',
+        title: 'Failed to clear context',
         body: expect.stringContaining('no live session'),
       }));
     });
@@ -612,11 +612,11 @@ describe('AgentCard', () => {
       compactMock.mockRejectedValue(new Error('Agent dev-actions runtime is not at an idle REPL prompt'));
       renderIdleCard();
 
-      await clickMenuItem('压缩上下文');
+      await clickMenuItem('Compact context');
 
       expect(showMock).toHaveBeenCalledWith(expect.objectContaining({
         kind: 'error',
-        title: '压缩上下文失败',
+        title: 'Failed to compact context',
         body: expect.stringContaining('idle REPL prompt'),
       }));
     });
@@ -626,11 +626,11 @@ describe('AgentCard', () => {
       compactMock.mockReturnValue(new Promise(resolve => { resolveCompact = resolve; }));
       renderIdleCard();
 
-      await clickMenuItem('压缩上下文');
+      await clickMenuItem('Compact context');
       openMenu();
 
       const items = screen.getAllByRole('menuitem') as HTMLButtonElement[];
-      expect(items[1].textContent).toBe('压缩中…');
+      expect(items[1].textContent).toBe('Compacting…');
       expect(items.every(item => item.disabled)).toBe(true);
 
       await act(async () => {
@@ -642,11 +642,11 @@ describe('AgentCard', () => {
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions'], restartRequired: false });
       renderIdleCard();
 
-      await clickMenuItem('删除');
+      await clickMenuItem('Delete');
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('删除 Agent dev-actions？')).toBeTruthy();
-      expect(within(dialog).getByText('此操作不可撤销。')).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '删除' })); });
+      expect(within(dialog).getByText('Delete agent dev-actions?')).toBeTruthy();
+      expect(within(dialog).getByText('This action cannot be undone.')).toBeTruthy();
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
 
       expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-actions');
       expect(screen.queryByRole('menu')).toBeNull();
@@ -656,13 +656,13 @@ describe('AgentCard', () => {
       deleteAgentMock.mockRejectedValue(new Error('boom-delete-failed'));
       renderIdleCard();
 
-      await clickMenuItem('删除');
-      await settleConfirmDialog('删除');
+      await clickMenuItem('Delete');
+      await settleConfirmDialog('Delete');
 
       const errorEl = await screen.findByText('boom-delete-failed');
       expect(errorEl.tagName).toBe('DIV');
       expect(errorEl.className).toContain('break-words');
-      const actionRow = screen.getByRole('link', { name: '终端' }).parentElement as HTMLElement;
+      const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
       expect(actionRow.className).toContain('flex');
       expect(actionRow.contains(errorEl)).toBe(false);
     });
@@ -702,8 +702,8 @@ describe('AgentCard', () => {
       renderIdleCard();
       const trigger = kebab();
 
-      await clickMenuItem('删除');
-      await settleConfirmDialog('删除');
+      await clickMenuItem('Delete');
+      await settleConfirmDialog('Delete');
 
       expect((trigger as HTMLButtonElement).disabled).toBe(true);
       expect(trigger.className).toContain('disabled:opacity-50');
@@ -725,10 +725,10 @@ describe('AgentCard', () => {
 
     it('shows "Call review" as a menuitem inside the kebab menu for dev agents with a task', () => {
       renderDevWithTask();
-      expect(screen.queryByRole('button', { name: '发起评审' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Call review' })).toBeNull();
 
       openMenu();
-      expect(screen.getByRole('menuitem', { name: '发起评审' })).toBeTruthy();
+      expect(screen.getByRole('menuitem', { name: 'Call review' })).toBeTruthy();
     });
 
     it('hides "Call review" from the kebab menu for QA agents', () => {
@@ -737,22 +737,22 @@ describe('AgentCard', () => {
         binding: makeBinding('qa-footer', { taskId: 'task-1' }),
       }), { role: 'qa' });
       openMenu();
-      expect(screen.queryByRole('menuitem', { name: '发起评审' })).toBeNull();
+      expect(screen.queryByRole('menuitem', { name: 'Call review' })).toBeNull();
     });
 
     it('keeps the action buttons on one scrollable line (no wrap)', () => {
       renderDevWithTask();
-      const actionRow = screen.getByRole('link', { name: '终端' }).parentElement as HTMLElement;
+      const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
       expect(actionRow.className).toContain('flex');
       expect(actionRow.className).not.toContain('flex-wrap');
       expect(actionRow.className).toContain('overflow-x-auto');
       expect(actionRow.className).toContain('scrollbar-none');
-      expect(screen.getByRole('link', { name: '终端' }).className).toContain('shrink-0');
+      expect(screen.getByRole('link', { name: 'Terminal' }).className).toContain('shrink-0');
     });
 
     it('keeps the kebab menu outside the scroll area so its dropdown is never clipped', () => {
       renderDevWithTask();
-      const actionRow = screen.getByRole('link', { name: '终端' }).parentElement as HTMLElement;
+      const actionRow = screen.getByRole('link', { name: 'Terminal' }).parentElement as HTMLElement;
       expect(actionRow.contains(kebab())).toBe(false);
     });
   });
@@ -760,14 +760,14 @@ describe('AgentCard', () => {
   describe('Agent Pet', () => {
     it('renders the animated pet in place of the status pill when petId is set', () => {
       renderCard(makeSnapshot({ id: 'dev-pet', runtimeStatus: 'working', petId: 'pet-1' }));
-      expect(screen.queryByText('工作中')).toBeNull();
-      const pet = screen.getByRole('img', { name: '工作中' });
+      expect(screen.queryByText('Working')).toBeNull();
+      const pet = screen.getByRole('img', { name: 'Working' });
       expect(pet.getAttribute('data-pet-row')).toBe('7');
     });
 
     it('renders the card pet larger and lets it escape the card border', () => {
       renderCard(makeSnapshot({ id: 'dev-pet-large', runtimeStatus: 'working', petId: 'pet-1' }));
-      const pet = screen.getByRole('img', { name: '工作中' });
+      const pet = screen.getByRole('img', { name: 'Working' });
       expect(pet.style.height).toBe('72px');
       const petFrame = pet.parentElement as HTMLElement;
       expect(petFrame.className).toContain('absolute');
@@ -785,8 +785,8 @@ describe('AgentCard', () => {
 
     it('keeps the status pill when no pet is assigned', () => {
       renderCard(makeSnapshot({ id: 'dev-nopet', runtimeStatus: 'working' }));
-      expect(screen.getByText('工作中').className).toContain('pill');
-      expect(screen.queryByRole('img', { name: '工作中' })).toBeNull();
+      expect(screen.getByText('Working').className).toContain('pill');
+      expect(screen.queryByRole('img', { name: 'Working' })).toBeNull();
     });
 
     it('opens the Agent Pet config modal from the kebab menu', () => {
@@ -806,7 +806,7 @@ describe('AgentCard', () => {
     }), { terminalMode: 'embedded-full', terminalLoading: true });
 
     expect(screen.queryByTestId('pane-terminal')).toBeNull();
-    expect(screen.getByText('Agent 状态加载中')).toBeTruthy();
+    expect(screen.getByText('Agent status loading')).toBeTruthy();
   });
 
   describe('Stop button', () => {
@@ -814,10 +814,10 @@ describe('AgentCard', () => {
       stopMock.mockResolvedValue(undefined);
       renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '停止' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Stop' })); });
 
       expect(stopMock).toHaveBeenCalledWith('dev-stop');
-      expect(screen.getByRole('button', { name: '停止' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy();
     });
 
     it('shows Stopping… while in flight and renders a failure below the actions', async () => {
@@ -825,13 +825,13 @@ describe('AgentCard', () => {
       stopMock.mockReturnValue(new Promise((_resolve, reject) => { rejectStop = reject; }));
       renderCard(makeSnapshot({ id: 'dev-stop', runtimeStatus: 'working' }));
 
-      fireEvent.click(screen.getByRole('button', { name: '停止' }));
-      expect((screen.getByRole('button', { name: '停止中…' }) as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+      expect((screen.getByRole('button', { name: 'Stopping…' }) as HTMLButtonElement).disabled).toBe(true);
 
       await act(async () => { rejectStop?.(new Error('no live pane')); });
 
       expect(screen.getByText('no live pane')).toBeTruthy();
-      expect(screen.getByRole('button', { name: '停止' })).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy();
     });
   });
 
@@ -846,7 +846,7 @@ describe('AgentCard', () => {
     async function clickCallReview(): Promise<void> {
       openMenu();
       await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: '发起评审' }));
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Call review' }));
       });
     }
 
@@ -856,19 +856,19 @@ describe('AgentCard', () => {
 
       await clickCallReview();
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('发起 QA 重审？')).toBeTruthy();
+      expect(within(dialog).getByText('Start a QA re-review?')).toBeTruthy();
       expect(within(dialog).getByText(/task-9/)).toBeTruthy();
-      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: '发起重审' })); });
+      await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Start re-review' })); });
 
       expect(reviewMock).toHaveBeenCalledWith('task-9');
-      expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: '已发起 QA 重审（第 4 轮）' });
+      expect(showMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 4)' });
     });
 
     it('does nothing when the confirm dialog is cancelled', async () => {
       renderDevWithTask();
 
       await clickCallReview();
-      await settleConfirmDialog('取消');
+      await settleConfirmDialog('Cancel');
 
       expect(reviewMock).not.toHaveBeenCalled();
       expect(showMock).not.toHaveBeenCalled();
@@ -879,9 +879,9 @@ describe('AgentCard', () => {
       renderDevWithTask();
 
       await clickCallReview();
-      await settleConfirmDialog('发起重审');
+      await settleConfirmDialog('Start re-review');
 
-      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '发起评审失败', body: 'task has no PR' });
+      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'task has no PR' });
     });
   });
 
@@ -911,29 +911,29 @@ describe('AgentCard', () => {
       bootstrapMock.mockResolvedValue({ ok: true, ran: 1 });
       renderBootstrapError();
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '重试 bootstrap' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
 
       expect(bootstrapMock).toHaveBeenCalledWith('proj');
-      expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: '重试 bootstrap 完成' }));
+      expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Retry bootstrap succeeded' }));
     });
 
     it('reports a still-failing bootstrap as a warning', async () => {
       bootstrapMock.mockResolvedValue({ ok: false, ran: 1 });
       renderBootstrapError();
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '重试 bootstrap' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
 
-      expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'warn', title: '重试 bootstrap 仍失败' }));
+      expect(showMock).toHaveBeenCalledWith(expect.objectContaining({ kind: 'warn', title: 'Retry bootstrap still failed' }));
     });
 
     it('reports a thrown bootstrap retry error as an error toast', async () => {
       bootstrapMock.mockRejectedValue(new Error('ssh unreachable'));
       renderBootstrapError();
 
-      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '重试 bootstrap' })); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry bootstrap' })); });
 
-      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: '重试 bootstrap 失败', body: 'ssh unreachable' });
-      expect(screen.getByRole('button', { name: '重试 bootstrap' })).toBeTruthy();
+      expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Retry bootstrap failed', body: 'ssh unreachable' });
+      expect(screen.getByRole('button', { name: 'Retry bootstrap' })).toBeTruthy();
     });
   });
 
@@ -950,7 +950,7 @@ describe('AgentCard', () => {
 
     expect(screen.getByText('runtime crashed hard')).toBeTruthy();
     expect(screen.getByText('REPL_CRASH · 2026-06-02T03:04:05.000Z')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: '重试 bootstrap' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry bootstrap' })).toBeNull();
   });
 
   describe('paired deletion', () => {
@@ -960,15 +960,15 @@ describe('AgentCard', () => {
 
       openMenu();
       await act(async () => {
-        fireEvent.click(screen.getByRole('menuitem', { name: '删除' }));
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
       });
-      await settleConfirmDialog('删除');
+      await settleConfirmDialog('Delete');
 
       expect(flagDirtyMock).toHaveBeenCalled();
       expect(showMock).toHaveBeenCalledWith({
         kind: 'warn',
-        title: '已删除 Agent dev-actions',
-        body: '配对的 QA agent qa-actions 也被一并移除。',
+        title: 'Deleted agent dev-actions',
+        body: 'The paired QA agent qa-actions was removed as well.',
       });
     });
   });

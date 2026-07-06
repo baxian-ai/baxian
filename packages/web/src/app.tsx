@@ -14,6 +14,7 @@ import { api } from './api.ts';
 import { useProjects } from './hooks/use-projects.ts';
 import { notificationApi, TaskNotificationsProvider, useTaskNotifications } from './hooks/use-task-notifications.tsx';
 import { getEventsClient } from './stores/events-store.ts';
+import { getMessages, useLocaleConfigSync } from './i18n/index.tsx';
 import type { ProjectConfig, TaskState, TaskStatus } from './shared/index.js';
 
 const TASK_COMPLETION_STATUSES: ReadonlySet<TaskStatus> = new Set(['done', 'merged']);
@@ -44,11 +45,12 @@ function showTaskCompletionNotification(
   const apiRef = notificationApi();
   if (!apiRef || apiRef.permission !== 'granted') return;
   try {
-    const notification = new apiRef(`任务完成：${compactText(task.title || task.id, 80)}`, {
+    const messages = getMessages();
+    const notification = new apiRef(messages.notification.taskDone(compactText(task.title || task.id, 80)), {
       body: [
-        `项目：${compactText(projectLabel, 120)}`,
-        `任务：${compactText(taskBrief(task), 120)}`,
-        `状态：${taskStatusLabel(task.status)}`,
+        messages.notification.bodyProject(compactText(projectLabel, 120)),
+        messages.notification.bodyTask(compactText(taskBrief(task), 120)),
+        messages.notification.bodyStatus(taskStatusLabel(task.status)),
       ].join('\n'),
       icon: '/baxian-logo.png',
       tag: `baxian-task-${task.id}`,
@@ -180,6 +182,8 @@ function AppShell() {
   const { projects } = useProjects();
   const { enabled: taskNotificationsEnabled } = useTaskNotifications();
   const showBottomBrand = !location.pathname.startsWith('/terminal/');
+
+  useLocaleConfigSync();
 
   useTaskCompletionNotifications(
     projects,
