@@ -73,6 +73,9 @@ describe('isTransientNetworkFailure', () => {
     'gnutls_handshake() failed: GnuTLS recv error (-54)',
     'net/http: TLS handshake timeout',
     'curl 56: Recv failure: Connection reset by peer',
+    "fatal: unable to access 'https://github.com/o/r/': LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443",
+    "fatal: unable to access 'https://github.com/o/r/': OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443",
+    "fatal: unable to access 'https://github.com/o/r/': SSL connection timeout",
     'ssh: connect to host github.com port 22: Network is unreachable',
     'ssh: connect to host github.com port 22: No route to host',
     'kex_exchange_identification: read: Connection reset by peer',
@@ -95,6 +98,7 @@ describe('isTransientNetworkFailure', () => {
     'gh: Must have admin rights to Repository (HTTP 403)',
     'error: failed to push some refs (non-fast-forward)',
     'error: remote ref does not exist',
+    "fatal: unable to access 'https://github.com/o/r/': SSL certificate problem: unable to get local issuer certificate",
     'Command aborted',
   ])('treats %j as non-transient', (text) => {
     expect(isTransientNetworkFailure(text)).toBe(false);
