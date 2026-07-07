@@ -26,6 +26,7 @@ import {
   TASK_TERMINAL_STATUSES as TERMINAL_STATUSES,
   TASK_ACTIVE_STATUS_SET as ACTIVE_TASK_STATUSES,
   isGitHubRepo,
+  parseGitRemote,
   repoSlug,
 } from '../shared/index.js';
 import type { AgentStore } from '../state/agent-store.js';
@@ -38,6 +39,7 @@ import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-s
 import { SkillRegistry } from '../skill/registry.js';
 import type { CommandRunner } from './runner.js';
 import { createRunner, LocalRunner, shellQuote, resolveAgentHost, hostGroupKey } from './runner.js';
+import { findForeignTaskTip, type LineageViolation } from './lineage.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
   TmuxManager,
@@ -223,6 +225,13 @@ interface DispatchReviewSnapshot {
   reviewDispatchedAt?: string;
 }
 
+export interface ServerReviewDriver {
+  dispatchCodeReview(task: TaskState): Promise<boolean>;
+  dispatchSpecReview(task: TaskState): Promise<boolean>;
+}
+
+const MANUAL_SERVER_REVIEW_STATUSES: readonly TaskStatus[] = ['in_progress', 'review', 'fixing'];
+
 const IMAGE_DISPATCH_PHASES = new Set<string>(['develop', 'code', 'fix', 'server-feedback']);
 
 const RUNTIME_LIVENESS_SAMPLES = 3;
@@ -280,6 +289,7 @@ export class AgentManager {
   protected errorRecordStore?: ErrorRecordStore;
   protected reviewStore?: ReviewStore;
   private reviewTransportInstance?: ReviewTransport;
+  private serverReviewDriver?: ServerReviewDriver;
   protected dispatchAckTimeoutMs: number;
   protected dispatchSettleTimeoutMs: number;
   protected dispatchAckResendIntervalMs = 3_000;
@@ -352,6 +362,10 @@ export class AgentManager {
 
   getReviewStore(): ReviewStore | undefined {
     return this.reviewStore;
+  }
+
+  setServerReviewDriver(driver: ServerReviewDriver): void {
+    this.serverReviewDriver = driver;
   }
 
   effectiveReviewMode(projectId: string): ReviewMode {
@@ -2750,11 +2764,19 @@ export class AgentManager {
     return agentState?.repoPath ?? null;
   }
 
-  private async resolveAutoBaseRef(runner: CommandRunner, workdir: string): Promise<string | undefined> {
+  private async resolveAutoBaseRef(runner: CommandRunner, workdir: string): Promise<string> {
     const result = await runner.exec(
       `git -C ${shellQuote(workdir)} rev-parse --verify --quiet origin/HEAD`,
     );
-    return result.exitCode === 0 ? 'origin/HEAD' : undefined;
+    if (result.exitCode !== 0) {
+      // Falling back to the shared clone's HEAD would seed the worktree with whatever
+      // another agent left checked out — refuse instead of silently cross-contaminating.
+      throw new Error(
+        `origin/HEAD is unresolvable in ${workdir}; ` +
+        `run "git -C ${workdir} remote set-head origin --auto" and redispatch`,
+      );
+    }
+    return 'origin/HEAD';
   }
 
   getRepoCache(): RepoStoreCache {
@@ -3476,17 +3498,20 @@ export class AgentManager {
     const worktree = new WorktreeManager(runner);
     const tmux = new TmuxManager(runner);
 
-    const baseRef = agent.workdir
-      ? undefined
-      : await this.resolveAutoBaseRef(runner, workdir);
-
     const isServerQaPhase = phase === 'server-review' || phase === 'server-recheck' || phase === 'server-spec-review';
     const customBranch = task.branch && !task.branch.startsWith(BRANCH_PREFIX) ? task.branch : undefined;
+    // review/recheck check out the PR branch detached and never touch origin/HEAD,
+    // so the fail-fast base resolution only runs where the default base is used.
     const worktreePath = isServerQaPhase
       ? await worktree.createDetachedAtBase(workdir, taskId)
       : phase === 'review' || phase === 'recheck'
         ? await worktree.createDetached(workdir, taskId, task.branch!)
-        : await worktree.create(workdir, taskId, baseRef, customBranch);
+        : await worktree.create(
+            workdir,
+            taskId,
+            agent.workdir ? undefined : await this.resolveAutoBaseRef(runner, workdir),
+            customBranch,
+          );
 
     await this.agentStore.update(agentId, (stateNow) => {
       if (!stateNow || stateNow.taskId !== taskId) return AGENT_STORE_NOOP;
@@ -4351,18 +4376,21 @@ export class AgentManager {
   async cancelTask(taskId: string): Promise<TaskState> {
     let devToRelease: string | undefined;
     let qaToRelease: string | undefined;
-    let publishedCleanup: { afterDone: 'pr' | 'branch'; branch: string; prNumber?: number; devAgentId: string; mayBeInFlight: boolean } | undefined;
+    let publishedCleanup: { afterDone: 'pr' | 'branch'; branch: string; prNumber?: number; devAgentId?: string; mayBeInFlight: boolean } | undefined;
     this.phaseSignalWatcher?.stop(taskId);
     let cleanupClaimed = false;
     const result = await this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task) throw new ApiError(404, 'Task not found');
 
-      if (TERMINAL_STATUSES.includes(task.status)) return task;
-
       if (this.markCompleteInFlight.has(taskId)) {
         throw new ApiError(409, `Task ${taskId} is being completed (merge in progress); try again shortly`);
       }
+
+      // 终态不早退：状态不再改写，但残留的 pane/绑定（上次清理中途失败）仍走同一条强制清理路径。
+      // 唯一例外：清理已在进行中的重复取消——重跑只会重复中断同一批 pane，等它收尾即可。
+      const alreadyTerminal = TERMINAL_STATUSES.includes(task.status);
+      if (alreadyTerminal && this.cancelCleanupInFlight.has(taskId)) return task;
 
       if (task.agentId) devToRelease = task.agentId;
       if (task.qaAgentId) qaToRelease = task.qaAgentId;
@@ -4379,12 +4407,14 @@ export class AgentManager {
             mayBeInFlight: task.status === 'approved',
           };
         }
-      } else if (task.status === 'merge-ready' && task.prNumber !== undefined && task.branch && task.agentId) {
+      } else if (!alreadyTerminal && task.reviewMode !== 'server' && task.prNumber !== undefined && task.branch) {
+        // github 模式持有开放 PR 的任务（review/fixing/approved/merge-ready/max_rounds 等）取消时关 PR 删分支；
+        // server 模式仍只信 gate+marker——非 gate 状态上的孤立 prNumber 不足以证明远端有待回收的工件
         publishedCleanup = {
           afterDone: 'pr',
           branch: task.branch,
           prNumber: task.prNumber,
-          devAgentId: task.agentId,
+          ...(task.agentId ? { devAgentId: task.agentId } : {}),
           mayBeInFlight: false,
         };
       }
@@ -4393,19 +4423,21 @@ export class AgentManager {
         if (id) await this.markPaneCancelClearing(id, taskId);
       }
 
-      const now = new Date().toISOString();
-      task.status = 'cancelled';
-      task.updatedAt = now;
-      await this.taskStore.set(task);
+      if (!alreadyTerminal) {
+        const now = new Date().toISOString();
+        task.status = 'cancelled';
+        task.updatedAt = now;
+        await this.taskStore.set(task);
 
-      await this.safeEmit({
-        id: '',
-        type: 'task.updated',
-        timestamp: now,
-        projectId: task.projectId,
-        taskId,
-        data: { status: 'cancelled' },
-      });
+        await this.safeEmit({
+          id: '',
+          type: 'task.updated',
+          timestamp: now,
+          projectId: task.projectId,
+          taskId,
+          data: { status: 'cancelled' },
+        });
+      }
 
       this.claimCancelCleanup(taskId);
       cleanupClaimed = true;
@@ -4478,7 +4510,7 @@ export class AgentManager {
             `--comment ${shellQuote('Task cancelled in baxian; closing the published PR.')} --delete-branch`,
           );
           if (close.exitCode !== 0) throw new Error(close.stderr.trim() || close.stdout.trim());
-        } else {
+        } else if (publishedCleanup.devAgentId) {
           const dev = this.getAgentConfig(publishedCleanup.devAgentId);
           const state = await this.agentStore.get(publishedCleanup.devAgentId);
           if (dev && state?.repoPath) {
@@ -4569,11 +4601,37 @@ export class AgentManager {
           `Task ${taskId} review pass changed during redispatch (signalToken rotated); aborting`,
         );
       }
-      if (task.reviewMode === 'server') {
-        throw new ApiError(409, `Task ${taskId} uses server review mode; Call review applies only to github-mode tasks`);
-      }
-      if (task.phase === 'spec' && task.status === 'max_rounds') {
-        throw new ApiError(409, `Call review is not supported for spec-phase max_rounds tasks (use Retry or Cancel)`);
+      if (task.reviewMode === 'server' || task.phase === 'spec') {
+        if (!MANUAL_SERVER_REVIEW_STATUSES.includes(task.status)) {
+          throw new ApiError(
+            409,
+            `Task ${taskId} status is ${task.status}; manual server-side review requires ${MANUAL_SERVER_REVIEW_STATUSES.join('/')}`,
+          );
+        }
+        if (!this.serverReviewDriver) {
+          throw new ApiError(409, `Server review pipeline is not configured; cannot dispatch review for ${taskId}`);
+        }
+        // in_progress 且 phase 未定：dev 既可能交 spec-done 也可能交 code-done，评审对象无从判定
+        if (task.status === 'in_progress' && task.phase === undefined) {
+          throw new ApiError(
+            409,
+            `Task ${taskId} has no phase yet (the dev has not delivered spec-done/code-done); wait for the dev signal or use Cancel/Retry`,
+          );
+        }
+        // 手工发起=明确要求跑一次 QA 评审；无 QA 时必须拒绝，不得落入自动通过/停驻兜底
+        const qaAvailable = (task.qaAgentId !== undefined && !!this.getAgentConfig(task.qaAgentId))
+          || !!this.findQaPartner(task.agentId);
+        if (!qaAvailable) {
+          throw new ApiError(400, `Task ${taskId} has no QA partner configured; manual review requires a QA agent`);
+        }
+        const isSpec = task.phase === 'spec';
+        const cap = this.config.review.rounds + (task.maxRoundsContinues ?? 0);
+        const round = isSpec ? (task.specReviewRound ?? 0) : task.reviewRound;
+        if (round + 1 > cap) {
+          throw new ApiError(409, `Task ${taskId} reached the review round cap (${cap}); continue or cancel it instead`);
+        }
+        this.manualReviewInFlight.add(taskId);
+        return { mode: 'server' as const, isSpec, claimToken: task.signalToken };
       }
       if (!task.prNumber) {
         throw new ApiError(400, `Task ${taskId} has no PR yet; cannot dispatch review`);
@@ -4600,8 +4658,12 @@ export class AgentManager {
         qaId = qa.id;
       }
       this.manualReviewInFlight.add(taskId);
-      return { qaId, devAgentId: task.agentId, taskStatusAtClaim: task.status };
+      return { mode: 'github' as const, qaId, devAgentId: task.agentId, taskStatusAtClaim: task.status };
     });
+
+    if (claim.mode === 'server') {
+      return this.runManualServerReview(taskId, claim);
+    }
 
     try {
       const { qaId, devAgentId, taskStatusAtClaim } = claim;
@@ -4748,6 +4810,30 @@ export class AgentManager {
 
       const final = await this.taskStore.get(taskId);
       return final!;
+    } finally {
+      this.manualReviewInFlight.delete(taskId);
+    }
+  }
+
+  private async runManualServerReview(
+    taskId: string,
+    claim: { isSpec: boolean; claimToken?: string },
+  ): Promise<TaskState> {
+    try {
+      // 不在此处预释放旧 QA：可失败的准备工作（读 diff/spec、存轮次）失败时旧 pass 必须原样保留；
+      // 同任务的 QA 重新绑定由 dispatchServerReviewToQa 在派发前完成
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh || fresh.signalToken !== claim.claimToken
+        || !MANUAL_SERVER_REVIEW_STATUSES.includes(fresh.status)) {
+        throw new ApiError(409, `Task ${taskId} changed during manual review dispatch; aborting`);
+      }
+      const dispatched = claim.isSpec
+        ? await this.serverReviewDriver!.dispatchSpecReview(fresh)
+        : await this.serverReviewDriver!.dispatchCodeReview(fresh);
+      if (!dispatched) {
+        throw new ApiError(500, `Manual review dispatch for ${taskId} did not start; check the event feed for the cause`);
+      }
+      return (await this.taskStore.get(taskId))!;
     } finally {
       this.manualReviewInFlight.delete(taskId);
     }
@@ -5700,11 +5786,15 @@ export class AgentManager {
   async rollbackVerdictArmFailure(
     taskId: string,
     restore: { status: TaskStatus; signalToken?: string; reviewHeadAnchorSha?: string; reviewDispatchedAt?: string },
-  ): Promise<void> {
-    await this.withTaskLock(async () => {
+    opts: { expect?: { status: TaskStatus; signalToken?: string }; rearmSkipSnapshot?: boolean } = {},
+  ): Promise<boolean> {
+    const expected = opts.expect;
+    const rolledBack = await this.withTaskLock(async () => {
       const fresh = await this.taskStore.get(taskId);
-      if (!fresh) return;
-      if (TERMINAL_STATUSES.includes(fresh.status)) return;
+      if (!fresh) return false;
+      if (TERMINAL_STATUSES.includes(fresh.status)) return false;
+      // pass 已被并发接管（token 轮换或状态推进）时禁止回滚，否则会覆盖接管方刚写入的新 pass
+      if (expected && (fresh.status !== expected.status || fresh.signalToken !== expected.signalToken)) return false;
       await this.taskStore.set({
         ...fresh,
         status: restore.status,
@@ -5714,16 +5804,27 @@ export class AgentManager {
         qaAgentId: undefined,
         updatedAt: new Date().toISOString(),
       });
+      return true;
     });
+    if (!rolledBack) return false;
+    await this.rearmPhaseSignalForCurrentPass(taskId, { skipSnapshot: opts.rearmSkipSnapshot });
+    return true;
+  }
+
+  async rearmPhaseSignalForCurrentPass(taskId: string, opts: { skipSnapshot?: boolean } = {}): Promise<void> {
     if (!this.phaseSignalWatcher) return;
-    const restored = await this.taskStore.get(taskId);
-    if (!restored?.signalToken) return;
-    if (TERMINAL_STATUSES.includes(restored.status)) return;
-    const mapped = this.mapTaskStateToExpectedWatcher(restored);
-    if (mapped) {
-      await this.setupPhaseSignal(taskId, mapped.agentId, mapped.expectedKinds);
-      await this.tearDownWatcherIfTaskTerminal(taskId);
-    }
+    const task = await this.taskStore.get(taskId);
+    if (!task?.signalToken) return;
+    if (TERMINAL_STATUSES.includes(task.status)) return;
+    const mapped = this.mapTaskStateToExpectedWatcher(task);
+    if (!mapped) return;
+    await this.setupPhaseSignal(
+      taskId,
+      mapped.agentId,
+      mapped.expectedKinds,
+      opts.skipSnapshot ? { skipSnapshot: true } : undefined,
+    );
+    await this.tearDownWatcherIfTaskTerminal(taskId);
   }
 
   async parkTaskAtSpecReady(taskId: string, opts: { specReviewRound?: number } = {}): Promise<TaskState | null> {
@@ -5975,7 +6076,15 @@ export class AgentManager {
       if (task.reviewMode !== 'server' && opts.phase !== 'spec') {
         throw new Error(`dispatchServerReviewToQa: task ${taskId} is not in server review mode`);
       }
-      const qaId = task.qaAgentId ?? this.findQaPartner(task.agentId)?.id;
+      let recordedQaId = task.qaAgentId;
+      if (recordedQaId && !this.getAgentConfig(recordedQaId)) {
+        console.warn(
+          `[dispatchServerReviewToQa] task ${taskId}.qaAgentId="${recordedQaId}" no longer in config; ` +
+          `falling back to findQaPartner(${task.agentId})`,
+        );
+        recordedQaId = undefined;
+      }
+      const qaId = recordedQaId ?? this.findQaPartner(task.agentId)?.id;
       if (!qaId) {
         const entryKind: PhaseSignalKind = task.status === 'fixing'
           ? (opts.phase === 'spec' ? 'spec-fixed' : 'code-fixed')
@@ -6028,6 +6137,8 @@ export class AgentManager {
     };
 
     const rearmEntrySignal = async () => {
+      // 从 review 重派（手工发起）：入口信号早已被消费，dev 停驻等待中，无可重挂
+      if (claim.originalStatus === 'review') return;
       const entryKind: PhaseSignalKind = claim.originalStatus === 'fixing'
         ? (opts.phase === 'spec' ? 'spec-fixed' : 'code-fixed')
         : (opts.phase === 'spec' ? 'spec-done' : 'code-done');
@@ -6035,6 +6146,11 @@ export class AgentManager {
     };
 
     if (!opts.continuation) {
+      const prevQa = await this.agentStore.get(qaId);
+      if (prevQa?.taskId === taskId) {
+        // 手工重派：上一 pass 的 QA 仍绑定本任务，先释放再重新 acquire（与 github 手工路径一致）
+        await this.releaseAgentForTask(qaId, taskId, 'idle');
+      }
       const acquired = await this.acquireAgentForTask(qaId, taskId, dispatchPhase);
       if (!acquired) {
         await rearmEntrySignal();
@@ -6294,11 +6410,107 @@ export class AgentManager {
     return await this.taskStore.get(taskId);
   }
 
+  private projectRepoKey(projectId: string): string | null {
+    const repo = this.getProjectConfig(projectId)?.repo;
+    if (!repo) return null;
+    if (isGitHubRepo(repo)) return `gh:${repoSlug(repo).toLowerCase()}`;
+    const parsed = parseGitRemote(repo);
+    if (parsed) return `git:${parsed.host.toLowerCase()}/${parsed.path}`;
+    return `raw:${repo.trim()}`;
+  }
+
+  async findLineageViolation(taskId: string, baseSha?: string): Promise<LineageViolation | null> {
+    const task = await this.taskStore.get(taskId);
+    if (!task?.agentId) return null;
+    const agent = this.getAgentConfig(task.agentId);
+    const agentState = await this.agentStore.get(task.agentId);
+    // A rebound agent's worktree belongs to its new task — checking it would
+    // produce verdicts about the wrong branch. Skip; the dispatch path's own
+    // binding guards (acquire) surface the real failure.
+    if (agentState?.taskId !== taskId) return null;
+    const worktree = agentState.worktreePath;
+    if (!agent || !worktree) return null;
+
+    const runner = this.createRunnerFor(agent);
+    let base = baseSha;
+    if (!base) {
+      // Callers without a baseSha (publish) run long after the review diff was
+      // read; refresh origin/HEAD first or upstream commits merged since then
+      // would linger in base..HEAD and flag tasks that leak nothing.
+      const fetch = await runner.exec(
+        `git -C ${shellQuote(worktree)} fetch origin --quiet`,
+      );
+      if (fetch.exitCode !== 0) {
+        throw new Error(`lineage fetch failed in ${worktree}: ${fetch.stderr.trim()}`);
+      }
+      const mb = await runner.exec(
+        `git -C ${shellQuote(worktree)} merge-base origin/HEAD HEAD`,
+      );
+      if (mb.exitCode !== 0) {
+        throw new Error(`lineage merge-base failed in ${worktree}: ${mb.stderr.trim()}`);
+      }
+      base = mb.stdout.trim();
+    }
+
+    // Projects pointing at the same repo share one store and branch namespace,
+    // so candidates are scoped by repo identity, not by projectId.
+    const selfRepoKey = this.projectRepoKey(task.projectId);
+    if (!selfRepoKey) return null;
+    const tasks = await this.taskStore.list();
+    const candidates = tasks
+      .filter(t => t.id !== taskId
+        && !TERMINAL_STATUSES.includes(t.status)
+        && this.projectRepoKey(t.projectId) === selfRepoKey)
+      .map(t => ({ taskId: t.id, branch: t.branch ?? BRANCH_PREFIX + t.id }));
+    if (candidates.length === 0) return null;
+
+    return findForeignTaskTip((cmd) => runner.exec(cmd), worktree, base, candidates);
+  }
+
   async dispatchServerAfterDone(taskId: string, kind: 'branch' | 'pr'): Promise<TaskState | null> {
     const task = await this.taskStore.get(taskId);
     if (!task) throw new Error(`dispatchServerAfterDone: task ${taskId} not found`);
     const devAgentId = task.agentId;
     if (!devAgentId) throw new Error(`dispatchServerAfterDone: task ${taskId} has no dev agent`);
+
+    let violation: LineageViolation | null;
+    try {
+      violation = await this.findLineageViolation(taskId);
+    } catch (err) {
+      await this.safeEmit({
+        id: '',
+        type: 'human.intervention',
+        timestamp: new Date().toISOString(),
+        projectId: task.projectId,
+        agentId: devAgentId,
+        taskId,
+        data: {
+          phase: 'server-after-done-lineage-check-failed',
+          error: err instanceof Error ? err.message : String(err),
+          note: 'Publish was not dispatched; mark-complete retries it once the repo state is fixed.',
+        },
+      });
+      return null;
+    }
+    if (violation) {
+      await this.safeEmit({
+        id: '',
+        type: 'human.intervention',
+        timestamp: new Date().toISOString(),
+        projectId: task.projectId,
+        agentId: devAgentId,
+        taskId,
+        data: {
+          phase: 'server-after-done-lineage-violation',
+          offendingTaskId: violation.taskId,
+          offendingBranch: violation.branch,
+          offendingSha: violation.sha,
+          note: 'The task branch embeds another active task\'s commits; publishing would leak them into this PR. Rebase the branch onto origin/HEAD, then mark-complete to retry the publish.',
+        },
+      });
+      return null;
+    }
+
     const branch = task.branch ?? BRANCH_PREFIX + taskId;
     const originalToken = task.signalToken;
     const newToken = createSignalToken();

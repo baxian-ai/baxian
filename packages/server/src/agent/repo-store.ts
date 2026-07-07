@@ -83,36 +83,69 @@ export class RepoStore {
 
   private async cloneIfNeeded(absRepoPath: string): Promise<boolean> {
     const dirExists = (await this.runner.exec(`test -d ${shellQuote(absRepoPath)}`)).exitCode === 0;
-    const gitExists = (await this.runner.exec(`test -d ${shellQuote(`${absRepoPath}/.git`)}`)).exitCode === 0;
-
-    if (dirExists && !gitExists) {
-      throw new Error(
-        `${absRepoPath} exists but is not a git repository. Remove it manually or change project.repo.`,
-      );
-    }
 
     if (!dirExists) {
       const parent = absRepoPath.replace(/\/[^/]+$/, '');
       const mk = await this.runner.exec(`mkdir -p ${shellQuote(parent)}`);
       if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent}: ${mk.stderr}`);
+      // Bare store: no checkout for an agent REPL to contaminate — every task must
+      // work through its own worktree, and stray git commands in the store dir fail.
       const clone = this.isGitHub
         ? await this.runner.exec(
-            `gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(absRepoPath)} --no-upstream`,
+            `gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(absRepoPath)} --no-upstream -- --bare`,
           )
         : await this.runner.exec(
-            `git clone ${shellQuote(this.repo)} ${shellQuote(absRepoPath)}`,
+            `git clone --bare ${shellQuote(this.repo)} ${shellQuote(absRepoPath)}`,
           );
       if (clone.exitCode !== 0) {
         const cmd = this.isGitHub ? 'gh repo clone' : 'git clone';
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
+      await this.installFetchRefspec(absRepoPath);
       if (this.isGitHub && parseGitRemote(this.repo) !== null) {
         return this.syncMatchingOriginUrl(absRepoPath);
       }
       return false;
     }
 
+    // resolve-git-dir validates the directory itself (bare, or its .git for a
+    // working-tree clone) without git's upward discovery — `git -C <dir> rev-parse`
+    // would happily match an ancestor repo (e.g. a dotfiles repo in $HOME).
+    const isRepo = (await this.runner.exec(
+      `git rev-parse --resolve-git-dir ${shellQuote(absRepoPath)} || ` +
+      `git rev-parse --resolve-git-dir ${shellQuote(`${absRepoPath}/.git`)}`,
+    )).exitCode === 0;
+    if (!isRepo) {
+      throw new Error(
+        `${absRepoPath} exists but is not a git repository. Remove it manually or change project.repo.`,
+      );
+    }
+
+    await this.ensureFetchRefspec(absRepoPath);
     return this.syncMatchingOriginUrl(absRepoPath);
+  }
+
+  private async ensureFetchRefspec(absRepoPath: string): Promise<void> {
+    // A bare store created outside cloneIfNeeded (e.g. a manual `git clone --bare`)
+    // has no fetch refspec, so fetch never updates origin/* and origin/HEAD stays
+    // unresolvable — a dead end `set-head --auto` cannot fix. Install only when
+    // absent; a deliberate custom refspec is left alone.
+    const existing = await this.runner.exec(
+      `git -C ${shellQuote(absRepoPath)} config --get-all remote.origin.fetch`,
+    );
+    if (existing.exitCode === 0 && existing.stdout.trim() !== '') return;
+    await this.installFetchRefspec(absRepoPath);
+  }
+
+  private async installFetchRefspec(absRepoPath: string): Promise<void> {
+    // git clone --bare configures no remote-tracking refspec; without it fetch
+    // never updates refs/remotes/origin/* and origin/HEAD stays unresolvable.
+    const result = await this.runner.exec(
+      `git -C ${shellQuote(absRepoPath)} config remote.origin.fetch ${shellQuote('+refs/heads/*:refs/remotes/origin/*')}`,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(`Failed to install fetch refspec at ${absRepoPath}: ${result.stderr}`);
+    }
   }
 
   private async syncMatchingOriginUrl(absRepoPath: string): Promise<boolean> {

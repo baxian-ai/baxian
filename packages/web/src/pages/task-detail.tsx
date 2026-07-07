@@ -94,12 +94,22 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   const handleCancel = async () => {
     if (!task) return;
-    if (!(await confirmDialog({ title: t.taskDetail.cancelConfirmTitle(task.id), confirmLabel: t.taskDetail.cancelConfirmLabel, cancelLabel: t.common.backText }))) return;
+    const isTerminal = TASK_TERMINAL_STATUS_SET.has(task.status);
+    const ok = await confirmDialog({
+      title: t.taskDetail.cancelConfirmTitle(task.id),
+      ...(isTerminal ? { body: t.taskDetail.cancelConfirmBodyTerminal } : {}),
+      confirmLabel: t.taskDetail.cancelConfirmLabel,
+      cancelLabel: t.common.backText,
+    });
+    if (!ok) return;
     setCancelling(true);
     try {
       const updated = await api.tasks.update(task.id, { status: 'cancelled' });
       commitTaskExternal(updated);
-      show({ kind: 'success', title: t.taskDetail.cancelledToastTitle });
+      show({
+        kind: 'success',
+        title: updated.status === 'cancelled' ? t.taskDetail.cancelledToastTitle : t.taskDetail.cancelCleanupToastTitle,
+      });
     } catch (err) {
       show({ kind: 'error', title: t.taskDetail.cancelFailedTitle, body: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -126,7 +136,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     try {
       const updated = await api.tasks.review(task.id);
       commitTaskExternal(updated);
-      show({ kind: 'success', title: t.agents.reReviewStarted(updated.reviewRound) });
+      const round = updated.phase === 'spec' ? (updated.specReviewRound ?? 0) : updated.reviewRound;
+      show({ kind: 'success', title: t.agents.reReviewStarted(round) });
     } catch (err) {
       show({ kind: 'error', title: t.agents.reReviewStartFailed, body: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -517,14 +528,15 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const isCodeMaxRounds = isMaxRounds && task.phase !== 'spec';
     const isSpecMaxRounds = isMaxRounds && task.phase === 'spec';
     const isGate = task.status === 'ready' || task.status === 'merge-ready';
-    const isServerApprovedGate = task.reviewMode === 'server' && task.status === 'approved';
     const editEnabled = task.status === 'pending';
-    const cancelEnabled = task.status === 'pending' || task.status === 'in_progress'
-      || task.status === 'spec-ready' || isMaxRounds || isGate || isServerApprovedGate;
     const retryEnabled =
       (RETRYABLE_STATUSES.has(task.status) || isSpecMaxRounds) && !!task.preferredAgentId;
-    const reviewEnabled = !!task.prNumber && !isSpecMaxRounds && task.reviewMode !== 'server';
     const isServerMode = task.reviewMode === 'server';
+    const serverStyleReview = isServerMode || task.phase === 'spec';
+    const serverReviewUnphased = task.status === 'in_progress' && task.phase === undefined;
+    const serverReviewableNow = !serverReviewUnphased && (task.status === 'in_progress'
+      || task.status === 'review' || task.status === 'fixing');
+    const reviewEnabled = serverStyleReview ? serverReviewableNow : !!task.prNumber;
     const completeEnabled = isCodeMaxRounds && (!!task.prNumber || isServerMode);
     const continueEnabled = isCodeMaxRounds && (!!task.prNumber || isServerMode) && !!task.agentId;
     const serverPublishRetry = isServerMode && task.status === 'approved';
@@ -537,8 +549,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         </button>
         <button
           type="button"
-          disabled={!cancelEnabled || cancelling}
+          disabled={cancelling}
           onClick={handleCancel}
+          title={t.taskDetail.cancelForceTitle}
           className="btn-secondary"
         >
           {cancelling ? t.taskDetail.cancelling : t.common.cancel}
@@ -565,11 +578,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           disabled={!reviewEnabled || reviewing}
           onClick={handleReview}
           title={
-            !task.prNumber
-              ? t.taskDetail.reviewNoPrTitle
-              : isSpecMaxRounds
-                ? t.taskDetail.reviewSpecMaxRoundsTitle
-                : t.taskDetail.reviewButtonTitle
+            serverStyleReview
+              ? (reviewEnabled
+                ? t.taskDetail.reviewButtonTitle
+                : serverReviewUnphased ? t.taskDetail.reviewUnphasedTitle : t.taskDetail.reviewServerStatusTitle)
+              : (task.prNumber ? t.taskDetail.reviewButtonTitle : t.taskDetail.reviewNoPrTitle)
           }
           className="btn-secondary"
         >

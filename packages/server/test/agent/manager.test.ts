@@ -475,6 +475,62 @@ describe('AgentManager task binding flow', () => {
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', t.id, 'idle', { allowAwaitingHuman: true, fromCancelCleanup: true });
   });
 
+  it('cancelTask on a terminal task still interrupts and releases stale bound agents without rewriting the status', async () => {
+    await seedTask({ id: 'task-term', status: 'merged', agentId: 'dev-1', qaAgentId: 'qa-1', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1', taskId: 'task-term', paneId: '%0' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-term', paneId: '%1' });
+    const interruptSpy = mockInterruptPane(manager, true);
+
+    const result = await manager.cancelTask('task-term');
+
+    expect(result.status).toBe('merged');
+    expect(interruptSpy).toHaveBeenCalledTimes(2);
+    expect(await taskStore.get('task-term')).toMatchObject({ status: 'merged', updatedAt: NOW });
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(events.some(e => e.type === 'task.updated' && e.taskId === 'task-term')).toBe(false);
+  });
+
+  it('cancelTask on a terminal task with no live bindings is a clean no-op', async () => {
+    await seedTask({ id: 'task-term2', status: 'cancelled', agentId: 'dev-1', updatedAt: NOW });
+    await seedAgent({ id: 'dev-1' });
+    const interruptSpy = mockInterruptPane(manager, true);
+
+    const result = await manager.cancelTask('task-term2');
+
+    expect(result.status).toBe('cancelled');
+    expect(interruptSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-term2'))?.updatedAt).toBe(NOW);
+  });
+
+  it('cancelTask on a terminal task still refuses while completion is in flight (409)', async () => {
+    await seedTask({ id: 'task-term3', status: 'merged' });
+    manager['markCompleteInFlight'].add('task-term3');
+    try {
+      await expect(manager.cancelTask('task-term3')).rejects.toMatchObject({ status: 409 });
+    } finally {
+      manager['markCompleteInFlight'].delete('task-term3');
+    }
+  });
+
+  it('re-clicking cancel on a cancelled task retries a failed interrupt cleanup and frees the held agent', async () => {
+    await seedTask({ id: 'task-term4', status: 'cancelled', agentId: 'dev-1', updatedAt: NOW });
+    await seedAgent({
+      id: 'dev-1',
+      taskId: 'task-term4',
+      paneId: '%0',
+      status: 'awaiting_human',
+      awaitingPhase: 'cancel-interrupt-failed',
+    });
+    mockInterruptPane(manager, true);
+
+    await manager.cancelTask('task-term4');
+
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.taskId).toBeUndefined();
+    expect(dev?.status).toBeUndefined();
+  });
+
   it('cancelTask stops the watcher again after the cancelled write (closes rollback re-arm race)', async () => {
     const stop = vi.fn();
     const m = makeManager({ phaseSignalWatcher: { start: vi.fn(), stop } as never });
@@ -1539,16 +1595,200 @@ describe('AgentManager dispatchReviewToQa', () => {
     expect(stop).toHaveBeenCalledWith('task-review');
   });
 
-  it('rejects spec-phase max_rounds with 409 (Call review uses the code protocol, inert for spec)', async () => {
+  it('rollbackVerdictArmFailure re-arms with skipSnapshot when the consumed signal may still sit in the pane', async () => {
+    const m = makeManager({ phaseSignalWatcher: { start: vi.fn().mockResolvedValue(true), stop: vi.fn() } as never });
+    await taskStore.set(reviewable({ status: 'review', signalToken: 'armed-tok' }));
+    const setupSpy = vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(true);
+
+    const rolledBack = await m.rollbackVerdictArmFailure(
+      'task-review',
+      { status: 'fixing', signalToken: 'old-fix-tok', reviewDispatchedAt: NOW },
+      { expect: { status: 'review', signalToken: 'armed-tok' }, rearmSkipSnapshot: true },
+    );
+
+    expect(rolledBack).toBe(true);
+    expect(setupSpy).toHaveBeenCalledWith('task-review', expect.any(String), ['pr-fixed'], { skipSnapshot: true });
+  });
+
+  it('rearmPhaseSignalForCurrentPass re-arms the watcher mapped from the current pass', async () => {
+    const m = makeManager({ phaseSignalWatcher: { start: vi.fn().mockResolvedValue(true), stop: vi.fn() } as never });
+    await taskStore.set(reviewable({ status: 'fixing', signalToken: 'fix-tok' }));
+    const setupSpy = vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await m.rearmPhaseSignalForCurrentPass('task-review');
+
+    expect(setupSpy).toHaveBeenCalledWith('task-review', expect.any(String), ['pr-fixed'], undefined);
+  });
+
+  it('rejects spec-phase max_rounds with 409 (server-style manual review only runs from in_progress/review/fixing)', async () => {
     await taskStore.set(reviewable({ status: 'max_rounds', phase: 'spec' }));
     const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
     await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
       status: 409,
-      message: expect.stringMatching(/spec-phase max_rounds|Retry or Cancel/),
+      message: expect.stringContaining('manual server-side review requires'),
     });
     expect(startSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-review'))?.status).toBe('max_rounds');
+  });
+
+  describe('server-style manual dispatch (server review mode / spec phase)', () => {
+    function fakeDriver(overrides: Partial<Record<'code' | 'spec', boolean>> = {}) {
+      return {
+        dispatchCodeReview: vi.fn(async () => overrides.code ?? true),
+        dispatchSpecReview: vi.fn(async () => overrides.spec ?? true),
+      };
+    }
+
+    it('hands a server-mode review task to the code driver without pre-releasing the bound QA', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'review', prNumber: undefined, prUrl: undefined });
+      await seedAgent({ id: 'qa-1', taskId: 'task-review' });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+      const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
+
+      const result = await manager.dispatchReviewToQa('task-review');
+
+      // 释放/重绑属于派发管线内部动作：driver 失败时旧 QA pass 必须原样保留
+      expect(releaseSpy).not.toHaveBeenCalled();
+      expect(driver.dispatchCodeReview).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-review' }));
+      expect(driver.dispatchSpecReview).not.toHaveBeenCalled();
+      expect(result.id).toBe('task-review');
+      expect((await agentStore.get('qa-1'))?.taskId).toBe('task-review');
+      expect(manager['manualReviewInFlight'].has('task-review')).toBe(false);
+    });
+
+    it('rejects with 400 when no QA partner can run the manual review', async () => {
+      await taskStore.set(reviewable({ reviewMode: 'server', status: 'review', prNumber: undefined, qaAgentId: undefined, agentId: 'dev-x' }));
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('no QA partner'),
+      });
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+      expect(driver.dispatchSpecReview).not.toHaveBeenCalled();
+    });
+
+    it('rejects with 400 when the recorded QA left the config and no partner remains', async () => {
+      await taskStore.set(reviewable({ reviewMode: 'server', status: 'review', prNumber: undefined, qaAgentId: 'ghost', agentId: 'dev-x' }));
+      manager.setServerReviewDriver(fakeDriver());
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 400 });
+    });
+
+    it('routes spec-phase tasks to the spec driver even in github review mode', async () => {
+      await seedReviewable({ phase: 'spec', status: 'review', specReviewRound: 1, qaAgentId: undefined });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await manager.dispatchReviewToQa('task-review');
+
+      expect(driver.dispatchSpecReview).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-review' }));
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+    });
+
+    it('rejects statuses outside in_progress/review/fixing with 409', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'approved', prNumber: undefined });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('manual server-side review requires'),
+      });
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+    });
+
+    it('rejects terminal server-mode tasks (github terminal recheck stays PR-only)', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'cancelled', prNumber: undefined }, null);
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 409 });
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+    });
+
+    it('rejects with 409 when no server review driver is registered (no review store)', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'review', prNumber: undefined });
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('Server review pipeline is not configured'),
+      });
+    });
+
+    it('rejects with 409 at the review round cap and honors maxRoundsContinues', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'review', reviewRound: 2, prNumber: undefined, qaAgentId: undefined });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('review round cap'),
+      });
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+
+      await taskStore.set(reviewable({ reviewMode: 'server', status: 'review', reviewRound: 2, maxRoundsContinues: 1, prNumber: undefined, qaAgentId: undefined }));
+      await manager.dispatchReviewToQa('task-review');
+      expect(driver.dispatchCodeReview).toHaveBeenCalledTimes(1);
+    });
+
+    it('uses the spec round for the cap check on spec-phase tasks', async () => {
+      await seedReviewable({ phase: 'spec', status: 'review', specReviewRound: 2, reviewRound: 0, qaAgentId: undefined });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('review round cap'),
+      });
+      expect(driver.dispatchSpecReview).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unphased in_progress server task with 409 (spec-done/code-done both possible)', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'in_progress', phase: undefined, prNumber: undefined, qaAgentId: undefined });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('no phase yet'),
+      });
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+      expect(driver.dispatchSpecReview).not.toHaveBeenCalled();
+    });
+
+    it('throws 500 and clears the in-flight guard when the driver reports nothing dispatched', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'in_progress', phase: 'code', prNumber: undefined, qaAgentId: undefined });
+      manager.setServerReviewDriver(fakeDriver({ code: false }));
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 500,
+        message: expect.stringContaining('did not start'),
+      });
+      expect(manager['manualReviewInFlight'].has('task-review')).toBe(false);
+    });
+
+    it('aborts with 409 when the review pass rotates between claim and dispatch', async () => {
+      await seedReviewable({ reviewMode: 'server', status: 'review', signalToken: 'pass-a', prNumber: undefined });
+      const driver = fakeDriver();
+      manager.setServerReviewDriver(driver);
+      const realGet = taskStore.get.bind(taskStore);
+      const getSpy = vi.spyOn(taskStore, 'get');
+      getSpy.mockImplementation(async (id: string) => {
+        const stored = await realGet(id);
+        // 第 2 次 get 是 claim 后的复核读：模拟并发 pass 在锁外轮换了 token
+        return getSpy.mock.calls.length >= 2 && stored ? { ...stored, signalToken: 'pass-b' } : stored;
+      });
+
+      await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('changed during manual review dispatch'),
+      });
+      expect(driver.dispatchCodeReview).not.toHaveBeenCalled();
+    });
   });
 
   it('allows code-phase max_rounds Call review (only spec is rejected)', async () => {
@@ -2361,6 +2601,95 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(key(byId, '/repo/')).toBe(key(byId, '/repo'));
     expect(key(byId, '/other')).not.toBe(key(byId, '/repo'));
     expect(key({ ...byId, runtime: 'codex' }, '/repo')).not.toBe(key(byId, '/repo'));
+  });
+
+  function managedCloneConfig(): BaxianConfig {
+    return {
+      review: { rounds: 2 },
+      server: DEFAULT_SERVER_CONFIG,
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[
+          { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+        ]],
+      }],
+    } as BaxianConfig;
+  }
+
+  function baseRefProbeRunner(execs: string[], originHeadExit: number): CommandRunner {
+    return {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        execs.push(cmd);
+        if (cmd.includes('rev-parse --verify --quiet origin/HEAD')) {
+          return { stdout: originHeadExit === 0 ? 'abc123\n' : '', stderr: '', exitCode: originHeadExit };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    } as unknown as CommandRunner;
+  }
+
+  async function makeManagedCloneManager(): Promise<AgentManager> {
+    const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
+    await skillRegistry.scan();
+    return makeManager({ config: managedCloneConfig(), skillRegistry });
+  }
+
+  it('startSession develop refuses to create a worktree when origin/HEAD is unresolvable in a managed clone', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({ id: 'task-nohead', branch: 'bx/task-nohead' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    mockEnsureSession();
+    const execs: string[] = [];
+    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory =
+      () => baseRefProbeRunner(execs, 1);
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow(/origin\/HEAD/);
+    expect(execs.some(c => c.includes('git worktree add'))).toBe(false);
+  });
+
+  it('startSession develop pins the worktree base to origin/HEAD for a managed clone', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({ id: 'task-headok', branch: 'bx/task-headok' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    mockEnsureSession();
+    capturePrompts(manager);
+    const execs: string[] = [];
+    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory =
+      () => baseRefProbeRunner(execs, 0);
+
+    const ok = await manager.startSession(t.id, 'dev-1', 'develop');
+    expect(ok).toBe(true);
+    const addCmd = execs.find(c => c.includes('git worktree add'));
+    expect(addCmd).toContain("'origin/HEAD'");
+  });
+
+  it('startSession review phase does not require origin/HEAD — the detached PR worktree only fetches the PR branch', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-ghrev', branch: 'bx/task-ghrev', status: 'review',
+      reviewMode: 'github', prNumber: 7, signalToken: 'revtok1234ab',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('qa-1');
+
+    mockEnsureSession();
+    capturePrompts(manager);
+    const execs: string[] = [];
+    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory =
+      () => baseRefProbeRunner(execs, 1);
+
+    const ok = await manager.startSession(t.id, 'qa-1', 'review');
+    expect(ok).toBe(true);
+    expect(execs.some(c => c.includes('rev-parse --verify --quiet origin/HEAD'))).toBe(false);
+    expect(execs.some(c => c.includes('git worktree add --detach'))).toBe(true);
   });
 });
 

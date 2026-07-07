@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { homedir } from 'node:os';
 import { RepoStore, createRepoStoreCache, nonGitHubSubpath, accessMethodDiffers, type RepoStoreCache } from '../../src/agent/repo-store.js';
-import { shellQuote, type CommandRunner, type ExecResult } from '../../src/agent/runner.js';
+import { LocalRunner, type CommandRunner, type ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
 
@@ -19,6 +19,10 @@ function originStdout(url: string): ExecResult {
 function existingOrigin(originUrl: string): (cmd: string) => ExecResult {
   return cmd => {
     if (cmd.includes('test -d')) return OK;
+    if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+    if (cmd.includes('config --get-all remote.origin.fetch')) {
+      return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
+    }
     if (cmd.includes('remote get-url origin')) return originStdout(originUrl);
     if (cmd.includes('config --replace-all')) return OK;
     if (cmd.includes('config --unset-all')) return OK;
@@ -40,11 +44,12 @@ describe('RepoStore.ensure (clone path)', () => {
   let cache: RepoStoreCache;
   beforeEach(() => { cache = createRepoStoreCache(); });
 
-  it('clones with gh repo clone --no-upstream when neither dir nor .git exists', async () => {
+  it('clones bare with gh repo clone --no-upstream and installs the fetch refspec', async () => {
     const runner = makeRunner(cmd => {
       if (cmd.includes('test -d')) return FAIL;
       if (cmd.startsWith('mkdir -p ')) return OK;
       if (cmd.includes('gh repo clone')) return OK;
+      if (cmd.includes('config remote.origin.fetch')) return OK;
       if (cmd.includes('git fetch')) return OK;
       if (cmd.includes('git remote set-head')) return OK;
       return FAIL;
@@ -53,9 +58,64 @@ describe('RepoStore.ensure (clone path)', () => {
     const path = await store.ensure();
     expect(path).toBe(`${homedir()}/.baxian/repos/user/repo`);
     const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('gh repo clone') && c.includes('user/repo') && c.includes('--no-upstream'))).toBe(true);
-    expect(cmds.some(c => /gh repo clone .+ -- /.test(c))).toBe(false);
+    const clone = cmds.find(c => c.includes('gh repo clone'));
+    expect(clone).toContain('--no-upstream');
+    expect(clone).toMatch(/ -- --bare$/);
+    const cloneIdx = cmds.findIndex(c => c.includes('gh repo clone'));
+    const refspecIdx = cmds.findIndex(c =>
+      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*:refs/remotes/origin/*'));
+    expect(refspecIdx).toBeGreaterThan(cloneIdx);
     expect(cmds.some(c => c.includes('remote get-url origin'))).toBe(false);
+  });
+
+  it('installs the fetch refspec on an existing store that lacks one', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return OK;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+      if (cmd.includes('config --get-all remote.origin.fetch')) return FAIL;
+      if (cmd.includes('config remote.origin.fetch')) return OK;
+      if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
+      if (cmd.includes('git fetch')) return OK;
+      return FAIL;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await store.ensure();
+    const cmds = runner.exec.mock.calls.map(c => c[0]);
+    const getIdx = cmds.findIndex(c => c.includes('config --get-all remote.origin.fetch'));
+    const setIdx = cmds.findIndex(c =>
+      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*:refs/remotes/origin/*'));
+    expect(getIdx).toBeGreaterThanOrEqual(0);
+    expect(setIdx).toBeGreaterThan(getIdx);
+  });
+
+  it('leaves an existing custom fetch refspec untouched', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return OK;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+      if (cmd.includes('config --get-all remote.origin.fetch')) {
+        return { stdout: '+refs/heads/main:refs/remotes/origin/main\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
+      if (cmd.includes('git fetch')) return OK;
+      return FAIL;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await store.ensure();
+    const cmds = runner.exec.mock.calls.map(c => c[0]);
+    expect(cmds.some(c =>
+      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*'))).toBe(false);
+  });
+
+  it('fails ensure when the fetch refspec cannot be installed after a bare clone', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      if (cmd.includes('gh repo clone')) return OK;
+      if (cmd.includes('config remote.origin.fetch')) return { stdout: '', stderr: 'locked', exitCode: 1 };
+      return OK;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).rejects.toThrow(/refspec/i);
   });
 
   it('syncs origin immediately when a full GitHub URL is cloned through gh', async () => {
@@ -63,6 +123,7 @@ describe('RepoStore.ensure (clone path)', () => {
       if (cmd.includes('test -d')) return FAIL;
       if (cmd.startsWith('mkdir -p ')) return OK;
       if (cmd.includes('gh repo clone')) return OK;
+      if (cmd.includes('config remote.origin.fetch')) return OK;
       if (cmd.includes('remote get-url origin')) {
         return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
       }
@@ -86,6 +147,7 @@ describe('RepoStore.ensure (clone path)', () => {
       if (cmd.includes('test -d')) return FAIL;
       if (cmd.startsWith('mkdir -p ')) return OK;
       if (cmd.includes('gh repo clone')) return OK;
+      if (cmd.includes('config remote.origin.fetch')) return OK;
       if (cmd.includes('remote get-url origin')) {
         return { stdout: 'https://github.com/other/repo.git\n', stderr: '', exitCode: 0 };
       }
@@ -97,9 +159,11 @@ describe('RepoStore.ensure (clone path)', () => {
     expect(cmds.some(c => c.includes('git fetch'))).toBe(false);
   });
 
-  it('skips clone when dir + .git both exist and origin matches', async () => {
+  it('skips clone when the path is already a git repo (bare or with a working tree) and origin matches', async () => {
     const runner = makeRunner(cmd => {
       if (cmd.includes('test -d')) return OK;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
       if (cmd.includes('git -C') && cmd.includes('remote get-url origin')) {
         return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
       }
@@ -116,6 +180,8 @@ describe('RepoStore.ensure (clone path)', () => {
   it('throws when origin URL does not match repoSlug', async () => {
     const runner = makeRunner(cmd => {
       if (cmd.includes('test -d')) return OK;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
       if (cmd.includes('remote get-url origin')) {
         return { stdout: 'https://github.com/other/different.git\n', stderr: '', exitCode: 0 };
       }
@@ -150,9 +216,9 @@ describe('RepoStore.ensure (clone path)', () => {
     expect(cmds.some(c => c.includes('config --replace-all remote.origin.url'))).toBe(false);
   });
 
-  it('throws when dir exists but .git does not (unsafe to overwrite)', async () => {
+  it('throws when dir exists but is not a git repository (unsafe to overwrite)', async () => {
     const runner = makeRunner(cmd => {
-      if (cmd.endsWith(`test -d ${shellQuote(`${homedir()}/.baxian/repos/user/repo/.git`)}`)) return FAIL;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return FAIL;
       if (cmd.includes('test -d')) return OK;
       return FAIL;
     });
@@ -265,12 +331,13 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
   let cache: RepoStoreCache;
   beforeEach(() => { cache = createRepoStoreCache(); });
 
-  it('clones with plain `git clone` at repos-ext/<host>/<path> (case-preserved path)', async () => {
+  it('clones bare with plain `git clone` at repos-ext/<host>/<path> (case-preserved path)', async () => {
     const url = 'https://gitlab.example.com/Group/Sub/Proj.git';
     const runner = makeRunner(cmd => {
       if (cmd.includes('test -d')) return FAIL;
       if (cmd.startsWith('mkdir -p ')) return OK;
       if (cmd.includes('git clone')) return OK;
+      if (cmd.includes('config remote.origin.fetch')) return OK;
       if (cmd.includes('git fetch')) return OK;
       if (cmd.includes('git remote set-head')) return OK;
       return FAIL;
@@ -279,7 +346,9 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
     const path = await store.ensure();
     expect(path).toBe(`${homedir()}/.baxian/repos-ext/gitlab.example.com/Group/Sub/Proj`);
     const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('git clone') && c.includes(url))).toBe(true);
+    expect(cmds.some(c => c.includes('git clone --bare') && c.includes(url))).toBe(true);
+    expect(cmds.some(c =>
+      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*:refs/remotes/origin/*'))).toBe(true);
     expect(cmds.some(c => c.includes('gh repo clone'))).toBe(false);
   });
 
@@ -299,6 +368,8 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
     const url = 'https://gitlab.example.com/Group/Proj.git';
     const runner = makeRunner(cmd => {
       if (cmd.includes('test -d')) return OK;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
       if (cmd.includes('remote get-url origin')) {
         return { stdout: 'https://GITLAB.example.com/Group/Proj.git\n', stderr: '', exitCode: 0 };
       }
@@ -316,6 +387,8 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
     const url = 'https://gitlab.example.com/Group/Proj.git';
     const runner = makeRunner(cmd => {
       if (cmd.includes('test -d')) return OK;
+      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
+      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
       if (cmd.includes('remote get-url origin')) {
         return { stdout: 'https://gitlab.example.com/group/proj.git\n', stderr: '', exitCode: 0 };
       }
@@ -405,7 +478,7 @@ describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
     const path = await store.ensure();
     expect(path).toBe(`${homedir()}/.baxian/repos-ext/gitlab.example.com/group/proj`);
     const cloneCmd = runner.exec.mock.calls.map(c => c[0]).find(c => c.includes('git clone'));
-    expect(cloneCmd).toContain("git clone 'https://gitlab.example.com/group/proj.git'");
+    expect(cloneCmd).toContain("git clone --bare 'https://gitlab.example.com/group/proj.git'");
   });
 
   it('skips sync for cosmetic .git suffix difference (same access method)', async () => {
@@ -495,4 +568,40 @@ describe('syncOriginUrl — real git integration', () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
+});
+
+describe('repo detection — real git integration', () => {
+  async function withHome(run: (home: string, sh: (cmd: string) => string) => Promise<void>): Promise<void> {
+    const { execSync } = await import('node:child_process');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const home = mkdtempSync(join(tmpdir(), 'repo-store-home-'));
+    try {
+      await run(home, (cmd: string) => execSync(cmd, { cwd: home, encoding: 'utf8', stdio: 'pipe' }));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  function storeAt(home: string): RepoStore {
+    const cache = createRepoStoreCache();
+    cache.homes.set('local', home);
+    return new RepoStore(new LocalRunner(), 'user/repo', 'local', undefined, cache);
+  }
+
+  it('does not mistake a plain directory for a repo when an ancestor directory is one', () =>
+    withHome(async (home, sh) => {
+      sh('git init -q .');
+      sh('mkdir -p .baxian/repos/user/repo');
+      await expect(storeAt(home).ensure()).rejects.toThrow(/not a git repository/i);
+    }), 20_000);
+
+  it('recognizes an existing bare store and proceeds to origin validation', () =>
+    withHome(async (home, sh) => {
+      sh('git init -q --bare seed.git');
+      sh('mkdir -p .baxian/repos/user');
+      sh('git clone -q --bare seed.git .baxian/repos/user/repo');
+      await expect(storeAt(home).ensure()).rejects.toThrow(/does not match/i);
+    }), 20_000);
 });

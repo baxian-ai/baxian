@@ -206,7 +206,11 @@ async function runAutoModePreflight(
 
   const dirCheck = await runner.exec(`test -d ${absRepoPath}`);
   if (dirCheck.exitCode === 0) {
-    const gitCheck = await runner.exec(`test -d ${absRepoPath}/.git`);
+    // Same probe as RepoStore: accepts both bare stores and working-tree clones
+    // without git's upward discovery matching an ancestor repo.
+    const gitCheck = await runner.exec(
+      `git rev-parse --resolve-git-dir ${absRepoPath} || git rev-parse --resolve-git-dir ${absRepoPath}/.git`,
+    );
     if (gitCheck.exitCode !== 0) {
       results.push({
         step: 'workdir',

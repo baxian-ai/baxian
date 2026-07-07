@@ -349,6 +349,27 @@ async function handlePrFeedback(
   );
 }
 
+async function releaseQaAfterSkippedRollback(
+  manager: AgentManager,
+  taskId: string,
+  qaId: string,
+  logPrefix: string,
+): Promise<void> {
+  const now = await manager.getTask(taskId);
+  if (now && !TASK_TERMINAL_STATUS_SET.has(now.status)) {
+    // pass 被并发接管：QA 已被接管方 re-acquire，释放会误清其绑定；
+    // 但本次派发的 arm 可能已顶掉接管方的 watcher（start 先 stop 同 task 旧 watcher），按当前 pass 重建
+    console.warn(`${logPrefix} rollback skipped for task=${taskId}: pass superseded`);
+    await manager.rearmPhaseSignalForCurrentPass(taskId);
+    return;
+  }
+  // 终态/已删：没有接管方持有这只 QA，而 cancel 清理可能没见到刚写入的 qaAgentId
+  await manager.releaseAgentForTask(qaId, taskId, 'idle').catch(err => {
+    console.error(`${logPrefix} releaseAgentForTask(QA=${qaId}) after terminal-skip rollback failed:`, err);
+    return false;
+  });
+}
+
 async function handlePrCodePush(
   bus: EventBus,
   manager: AgentManager,
@@ -360,6 +381,8 @@ async function handlePrCodePush(
   const eventPrUrl = event.data.prUrl as string | undefined;
   const eventKind = event.data.kind as string | undefined;
   const eventHeadSha = validHeadSha(event.data.headSha);
+  // 合成 push 的触发信号已被消费但仍留在 pane，失败回滚重建 pr-fixed watcher 时跳过快照，否则立即重放成循环
+  const rearmSkipSnapshot = event.data.source === 'pr-fixed';
   const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'latestHeadSha'>> = {
     ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
     ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
@@ -462,7 +485,7 @@ async function handlePrCodePush(
 
   await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
 
-  const { armed } = await manager.rotateAndSetupPhaseSignal(
+  const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
     transitioned.id,
     qa.id,
     ['pr-approved', 'pr-changes-requested'] as const,
@@ -472,12 +495,16 @@ async function handlePrCodePush(
       `[EventHandler] pr.updated verdict watcher failed to arm for task=${transitioned.id} (${qaPhase}); rolling back recheck dispatch`,
     );
     if (previousStatus === 'in_progress' || previousStatus === 'fixing') {
-      await manager.rollbackVerdictArmFailure(transitioned.id, {
+      const rolledBack = await manager.rollbackVerdictArmFailure(transitioned.id, {
         status: previousStatus,
         signalToken: taskBeforeTransition.signalToken,
         reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
         reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
-      });
+      }, { expect: { status: 'review', signalToken: dispatchToken }, rearmSkipSnapshot });
+      if (!rolledBack) {
+        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated arm-failure');
+        return;
+      }
     } else {
       await manager.updateTask(transitioned.id, { qaAgentId: undefined });
     }
@@ -510,6 +537,27 @@ async function handlePrCodePush(
     if (dispatchErr instanceof DispatchTerminalError) {
       await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
     } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
+    } else if (previousStatus === 'in_progress' || previousStatus === 'fixing') {
+      // 仅回滚 status 会留下 transition 轮换后的 token，dev 在途 pass 的完成信号将永久失配；
+      // startSession 窗口内 pass 可能已被并发接管，此时回滚与 QA 释放都要让位于接管方
+      const rolledBack = await manager.rollbackVerdictArmFailure(transitioned.id, {
+        status: previousStatus,
+        signalToken: taskBeforeTransition.signalToken,
+        reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
+        reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
+      }, { expect: { status: 'review', signalToken: dispatchToken }, rearmSkipSnapshot });
+      if (rolledBack) {
+        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+          .catch(err => {
+            console.error(
+              `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
+              err,
+            );
+            return false;
+          });
+      } else {
+        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated recheck');
+      }
     } else {
       await manager.updateTask(transitioned.id, { qaAgentId: undefined });
       await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
@@ -525,8 +573,6 @@ async function handlePrCodePush(
           phase: 'qa-recheck-failed-after-approved-push',
           qaAgentId: qa.id,
         });
-      } else if (previousStatus !== 'review') {
-        await manager.transitionTaskStatus(transitioned.id, previousStatus, { fromStatus: ['review'] });
       } else {
         await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
           phase: 'qa-recheck-failed-after-stop',
@@ -1016,7 +1062,7 @@ export function registerEventHandlers(
 
     await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
 
-    const { armed } = await manager.rotateAndSetupPhaseSignal(
+    const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
       transitioned.id,
       qa.id,
       ['pr-approved', 'pr-changes-requested'] as const,
@@ -1025,12 +1071,16 @@ export function registerEventHandlers(
       console.warn(
         `[EventHandler] pr.created verdict watcher failed to arm for task=${transitioned.id}; rolling back review dispatch`,
       );
-      await manager.rollbackVerdictArmFailure(transitioned.id, {
+      const rolledBack = await manager.rollbackVerdictArmFailure(transitioned.id, {
         status: previousStatus,
         signalToken: taskBeforeTransition?.signalToken,
         reviewHeadAnchorSha: taskBeforeTransition?.reviewHeadAnchorSha,
         reviewDispatchedAt: taskBeforeTransition?.reviewDispatchedAt,
-      });
+      }, { expect: { status: 'review', signalToken: dispatchToken } });
+      if (!rolledBack) {
+        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.created arm-failure');
+        return;
+      }
       await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
         console.error(`[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
         return false;
@@ -1332,27 +1382,33 @@ export function registerEventHandlers(
       return;
     }
 
-    if (headSha !== task.reviewHeadAnchorSha) return;
+    if (headSha === task.reviewHeadAnchorSha) {
+      const since = task.fixDispatchedAt ?? task.reviewDispatchedAt;
+      let hasReplies: boolean;
+      try {
+        hasReplies = since ? await manager.prHasDevReplySince(task.id, since) : false;
+      } catch (err) {
+        await stayFixing({
+          phase: 'fix-verify-replies-fetch-failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
 
-    const since = task.fixDispatchedAt ?? task.reviewDispatchedAt;
-    let hasReplies: boolean;
-    try {
-      hasReplies = since ? await manager.prHasDevReplySince(task.id, since) : false;
-    } catch (err) {
-      await stayFixing({
-        phase: 'fix-verify-replies-fetch-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
+      if (!hasReplies) {
+        await stayFixing({
+          phase: 'fix-no-op-no-commit-no-reply',
+          note: 'Dev emitted pr-fixed but pushed no commit and left no reply on the PR — the fixing round changed nothing. Inspect the pane.',
+        });
+        return;
+      }
     }
+    // head fetch / 回复检查是秒级网络等待，期间真 push / verdict 可能已换代 pass；旧信号不得再驱动派发
+    const preEmit = await manager.getTask(task.id);
+    if (!preEmit || preEmit.status !== 'fixing' || preEmit.signalToken !== token) return;
 
-    if (!hasReplies) {
-      await stayFixing({
-        phase: 'fix-no-op-no-commit-no-reply',
-        note: 'Dev emitted pr-fixed but pushed no commit and left no reply on the PR — the fixing round changed nothing. Inspect the pane.',
-      });
-      return;
-    }
+    // head 前进时不能指望 poller：push 事件已被消费（cursor 不回退），若那次派发失败回滚，
+    // 这里的合成 push 是唯一重试入口；宁可与迟到的真 push 竞态重派一轮，也不静默滞留 fixing
 
     await bus.emit({
       id: '',

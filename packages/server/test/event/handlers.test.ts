@@ -192,6 +192,14 @@ function stubManager(spec: StubSpec, target: AgentManager = manager): StubSpies 
   return spies;
 }
 
+function stubRotateSignalWritingStore(taskId: string, token: string, armed: boolean): ReturnType<typeof vi.spyOn> {
+  return vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async () => {
+    const task = await taskStore.get(taskId);
+    await taskStore.set({ ...task!, signalToken: token, updatedAt: new Date().toISOString() });
+    return { token, armed };
+  });
+}
+
 type InterventionData = Record<string, unknown> & { phase?: string };
 
 function findIntervention(taskId: string, phase?: string): BaxianEvent | undefined {
@@ -260,7 +268,8 @@ describe('pr.created handler', () => {
   it('verdict watcher fails to arm → atomically rolls back to in_progress (status+token+anchor), releases QA + intervention', async () => {
     await seedTask({ id: 'task-noarm', status: 'in_progress', reviewRound: 0, signalToken: 'dev-token', reviewHeadAnchorSha: undefined });
     await seedDevAgent('task-noarm');
-    const { startSession: startSpy, releaseAgentForTask: releaseSpy } = stubManager({ startSession: true, rotateAndSetupPhaseSignal: { token: 'tok', armed: false }, releaseAgentForTask: true });
+    const { startSession: startSpy, releaseAgentForTask: releaseSpy } = stubManager({ startSession: true, releaseAgentForTask: true });
+    stubRotateSignalWritingStore('task-noarm', 'tok', false);
 
     await emitPrCreated('task-noarm', { prNumber: 58, prUrl: 'https://github.com/user/repo/pull/58' });
 
@@ -1522,25 +1531,27 @@ describe('pr.updated handler', () => {
   it('startSession resolve(false) from fixing → rollback to fixing, qaAgentId pre-arm rolled back, no other side effects', async () => {
     await seedTask({ id: 'task-up-rb', status: 'fixing', reviewRound: 1, prNumber: 71 });
     const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: false, markAgentWaiting: true, updateTask: undefined });
+    stubRotateSignalWritingStore('task-up-rb', 'rotated-rb', true);
 
     await emitPrUpdated('task-up-rb', { prNumber: 71 });
 
     const task = await taskStore.get('task-up-rb');
     expect(task!.status).toBe('fixing');
+    expect(task!.qaAgentId).toBeUndefined();
     expect(markWaitSpy).not.toHaveBeenCalled();
     const qaWrites = updateSpy.mock.calls.filter(([_id, patch]) =>
       patch && 'qaAgentId' in patch,
     );
     expect(qaWrites).toEqual([
       ['task-up-rb', { qaAgentId: 'qa-1' }],
-      ['task-up-rb', { qaAgentId: undefined }],
     ]);
   });
 
   it('recheck verdict watcher fails to arm → rolls back to fixing + restores token, releases QA + intervention', async () => {
     await seedTask({ id: 'task-up-noarm', status: 'fixing', reviewRound: 1, prNumber: 71, signalToken: 'fixing-token' });
     await seedDevAgent('task-up-noarm');
-    const { releaseAgentForTask: releaseSpy, startSession: startSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'rotated', armed: false }, startSession: true });
+    const { releaseAgentForTask: releaseSpy, startSession: startSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, startSession: true });
+    stubRotateSignalWritingStore('task-up-noarm', 'rotated', false);
 
     await emitPrUpdated('task-up-noarm', { prNumber: 71 });
 
@@ -1561,6 +1572,82 @@ describe('pr.updated handler', () => {
 
     const task = await taskStore.get('task-up-rb2');
     expect(task!.status).toBe('in_progress');
+  });
+
+  it('startSession hard error from fixing → restores signalToken + anchor so the dev pr-fixed pass stays valid', async () => {
+    const dispatchedAt = new Date(Date.now() - 60_000).toISOString();
+    await seedTask({
+      id: 'task-up-rb3', status: 'fixing', reviewRound: 1, prNumber: 73,
+      signalToken: 'fixing-token-live', latestHeadSha: HEAD_SHA,
+      reviewHeadAnchorSha: HEAD_SHA, reviewDispatchedAt: dispatchedAt,
+    });
+    await seedDevAgent('task-up-rb3');
+    const { releaseAgentForTask: releaseSpy } = stubManager({
+      acquireAgentForTask: true, releaseAgentForTask: true,
+    });
+    vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('git fetch failed'));
+
+    await emitPrUpdated('task-up-rb3', { prNumber: 73, kind: 'push', headSha: NEXT_HEAD_SHA });
+
+    const task = await taskStore.get('task-up-rb3');
+    expect(task!.status).toBe('fixing');
+    expect(task!.signalToken).toBe('fixing-token-live');
+    expect(task!.reviewHeadAnchorSha).toBe(HEAD_SHA);
+    expect(task!.reviewDispatchedAt).toBe(dispatchedAt);
+    expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
+    expect(task!.qaAgentId).toBeUndefined();
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-rb3', 'idle');
+  });
+
+  it('recheck startSession failure after concurrent pass takeover → rollback skipped, new pass untouched', async () => {
+    const dispatchedAt = new Date(Date.now() - 60_000).toISOString();
+    await seedTask({
+      id: 'task-up-drift', status: 'fixing', reviewRound: 1, prNumber: 77,
+      signalToken: 'fixing-token-old', latestHeadSha: HEAD_SHA,
+      reviewHeadAnchorSha: HEAD_SHA, reviewDispatchedAt: dispatchedAt,
+    });
+    await seedDevAgent('task-up-drift');
+    const { releaseAgentForTask: releaseSpy } = stubManager({
+      acquireAgentForTask: true, releaseAgentForTask: true,
+    });
+    const takeoverDispatchedAt = new Date().toISOString();
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-up-drift');
+      await taskStore.set({
+        ...fresh!, status: 'fixing', signalToken: 'next-fix-token',
+        reviewHeadAnchorSha: NEXT_HEAD_SHA, reviewDispatchedAt: takeoverDispatchedAt,
+        qaAgentId: undefined, updatedAt: new Date().toISOString(),
+      });
+      throw new Error('dispatch raced');
+    });
+    const rearmSpy = vi.spyOn(manager, 'rearmPhaseSignalForCurrentPass');
+
+    await emitPrUpdated('task-up-drift', { prNumber: 77, kind: 'push', headSha: NEXT_HEAD_SHA });
+
+    const task = await taskStore.get('task-up-drift');
+    expect(task!.status).toBe('fixing');
+    expect(task!.signalToken).toBe('next-fix-token');
+    expect(task!.reviewHeadAnchorSha).toBe(NEXT_HEAD_SHA);
+    expect(task!.reviewDispatchedAt).toBe(takeoverDispatchedAt);
+    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-up-drift', 'idle');
+    expect(rearmSpy).toHaveBeenCalledWith('task-up-drift');
+  });
+
+  it('startSession failure with task cancelled mid-dispatch → QA still released (terminal is not a takeover)', async () => {
+    await seedTask({ id: 'task-up-cxrace', status: 'fixing', reviewRound: 1, prNumber: 79, signalToken: 'tok-cxrace' });
+    const { releaseAgentForTask: releaseSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true });
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-up-cxrace');
+      await taskStore.set({ ...fresh!, status: 'cancelled', updatedAt: new Date().toISOString() });
+      return false;
+    });
+
+    await emitPrUpdated('task-up-cxrace', { prNumber: 79, kind: 'push', headSha: NEXT_HEAD_SHA });
+
+    const task = await taskStore.get('task-up-cxrace');
+    expect(task!.status).toBe('cancelled');
+    expect(task!.signalToken).not.toBe('tok-cxrace');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-cxrace', 'idle');
   });
 
   it('cancelled task → no-op', async () => {
@@ -1615,15 +1702,63 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
     expect(findInterventionByPhase('fix-no-op-no-commit-no-reply')).toBeDefined();
   });
 
-  it('new commit → defers to the poller push event (handler no-op, no double dispatch)', async () => {
+  it('new commit → synthetic push re-dispatches recheck (a consumed push is never re-emitted by the poller)', async () => {
     await seedFixingPass('task-pf-commit', { prNumber: 72, signalToken: 'tok-pf3' });
-    const { prHasDevReplySince: replySpy } = stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, prHasDevReplySince: true });
+    const { prHasDevReplySince: replySpy, startSession: startSpy } = stubManager({
+      fetchPrHeadSha: NEXT_HEAD_SHA, prHasDevReplySince: true,
+      acquireAgentForTask: true, releaseAgentForTask: true, markAgentWaiting: true, startSession: true,
+    });
+    stubRotateSignalWritingStore('task-pf-commit', 'tok-pf3-next', true);
 
     await emitPrFixSubmitted('task-pf-commit', { kind: 'pr-fixed', token: 'tok-pf3', verdictAgentId: 'dev-1', source: 'pane-signal' });
 
     const task = await taskStore.get('task-pf-commit');
-    expect(task!.status).toBe('fixing');
+    expect(task!.status).toBe('review');
+    expect(task!.reviewHeadAnchorSha).toBe(NEXT_HEAD_SHA);
+    expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
+    expect(startSpy).toHaveBeenCalledWith('task-pf-commit', 'qa-1', 'recheck');
     expect(replySpy).not.toHaveBeenCalled();
+  });
+
+  it('new commit + recheck dispatch fails again → rolls back to fixing + fix-advance-rolled-back escalation', async () => {
+    await seedFixingPass('task-pf-commit-fail', { prNumber: 78, signalToken: 'tok-pf-head' });
+    stubManager({ fetchPrHeadSha: NEXT_HEAD_SHA, acquireAgentForTask: true, releaseAgentForTask: true });
+    stubRotateSignalWritingStore('task-pf-commit-fail', 'tok-pf-head-next', true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+    const rollbackSpy = vi.spyOn(manager, 'rollbackVerdictArmFailure');
+
+    await emitPrFixSubmitted('task-pf-commit-fail', { kind: 'pr-fixed', token: 'tok-pf-head', verdictAgentId: 'dev-1', source: 'pane-signal' });
+
+    const task = await taskStore.get('task-pf-commit-fail');
+    expect(task!.status).toBe('fixing');
+    expect(task!.signalToken).toBe('tok-pf-head');
+    expect(task!.reviewHeadAnchorSha).toBe(HEAD_SHA);
+    expect(findInterventionByPhase('fix-advance-rolled-back')).toBeDefined();
+    // 触发 handler 的 pr-fixed 信号仍在 pane 里，重建 watcher 必须跳过快照否则会重放成循环
+    expect(rollbackSpy).toHaveBeenCalledWith(
+      'task-pf-commit-fail',
+      expect.anything(),
+      expect.objectContaining({ rearmSkipSnapshot: true }),
+    );
+  });
+
+  it('pr-fixed with advanced head + pass superseded during head fetch → no synthetic push', async () => {
+    await seedFixingPass('task-pf-race', { prNumber: 84, signalToken: 'tok-pf-race' });
+    const { startSession: startSpy } = stubManager({
+      acquireAgentForTask: true, releaseAgentForTask: true, markAgentWaiting: true, startSession: true,
+    });
+    vi.spyOn(manager, 'fetchPrHeadSha').mockImplementation(async () => {
+      const fresh = await taskStore.get('task-pf-race');
+      await taskStore.set({ ...fresh!, signalToken: 'tok-pf-next-round', updatedAt: new Date().toISOString() });
+      return NEXT_HEAD_SHA;
+    });
+
+    await emitPrFixSubmitted('task-pf-race', { kind: 'pr-fixed', token: 'tok-pf-race', verdictAgentId: 'dev-1', source: 'pane-signal' });
+
+    const task = await taskStore.get('task-pf-race');
+    expect(task!.status).toBe('fixing');
+    expect(task!.signalToken).toBe('tok-pf-next-round');
+    expect(startSpy).not.toHaveBeenCalled();
   });
 
   it('stale token → rejected before any GitHub fetch, stays fixing', async () => {
@@ -1724,7 +1859,8 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
     });
     vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(HEAD_SHA);
     vi.spyOn(manager, 'prHasDevReplySince').mockResolvedValue(true);
-    stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, rotateAndSetupPhaseSignal: { token: 'tok2', armed: true }, setupPhaseSignal: true });
+    stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, setupPhaseSignal: true });
+    stubRotateSignalWritingStore('task-pf-rollback', 'tok2', true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
 
     await emitPrFixSubmitted('task-pf-rollback', { kind: 'pr-fixed', token: 'tok-rb', verdictAgentId: 'dev-1', source: 'pane-signal' });

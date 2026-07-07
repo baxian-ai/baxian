@@ -211,24 +211,27 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
   }
 
-  async function autoApproveSpec(task: TaskState): Promise<void> {
+  async function autoApproveSpec(task: TaskState): Promise<boolean> {
     try {
       const result = await manager.transitionToCodePhase(task.id);
       if (!result) {
         await emitIntervention(bus, task, { phase: 'server-spec-auto-approve-transition-failed' });
+        return false;
       }
+      return true;
     } catch (err) {
       await emitIntervention(bus, task, {
         phase: 'server-spec-auto-approve-transition-failed',
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 
   async function prepareAndDispatchCodeReview(
     task: TaskState,
     opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       await emitIntervention(bus, task, { phase: 'server-code-review-no-dev-agent' });
@@ -236,13 +239,13 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
         await rearmOrHold(task, task.agentId, kind);
       }
-      return;
+      return false;
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     const nextRound = task.reviewRound + 1;
     if (nextRound > cap) {
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
-      if (!capResult) return;
+      if (!capResult) return false;
       const paused = capResult.task;
       if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
       await bus.emit({
@@ -254,7 +257,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         taskId: paused.id,
         data: { round: nextRound, cap },
       });
-      return;
+      return false;
     }
 
     await manager.refreshWorktreeCacheFor(task.agentId);
@@ -270,7 +273,33 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
       await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-      return;
+      return false;
+    }
+
+    const rearmEntry = async (): Promise<void> => {
+      const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
+      await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
+    };
+    try {
+      const violation = await manager.findLineageViolation(task.id, content.baseSha);
+      if (violation) {
+        await emitIntervention(bus, task, {
+          phase: 'server-code-lineage-violation',
+          offendingTaskId: violation.taskId,
+          offendingBranch: violation.branch,
+          offendingSha: violation.sha,
+          note: 'The task branch embeds another active task\'s commits — reviewing it would leak foreign work into this task. Have the dev rebase onto origin/HEAD and re-emit the signal.',
+        });
+        await rearmEntry();
+        return false;
+      }
+    } catch (err) {
+      await emitIntervention(bus, task, {
+        phase: 'server-code-lineage-check-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await rearmEntry();
+      return false;
     }
 
     const round: ReviewRound = {
@@ -302,14 +331,13 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const batches = buildBatches(splitDiffByFile(content.content), DIFF_LARGE_THRESHOLD);
       if (batches.length > 1) {
         round.batchFindings = [];
-        if (!(await putEntryRound(round))) return;
-        await dispatchBatch(task.id, batches, 0, content.diffstat, { ...opts, reviewHeadAnchorSha });
-        return;
+        if (!(await putEntryRound(round))) return false;
+        return dispatchBatch(task.id, batches, 0, content.diffstat, { ...opts, reviewHeadAnchorSha });
       }
     }
 
-    if (!(await putEntryRound(round))) return;
-    await manager.dispatchServerReviewToQa(task.id, {
+    if (!(await putEntryRound(round))) return false;
+    const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'code',
       recheck: opts.recheck,
       content: content.content,
@@ -318,6 +346,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
     });
+    return dispatched !== null;
   }
 
   async function dispatchBatch(
@@ -326,9 +355,9 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     index: number,
     diffstat: string | undefined,
     opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string; reviewHeadAnchorSha?: string },
-  ): Promise<void> {
+  ): Promise<boolean> {
     const text = batches[index].map(f => f.text).join('\n');
-    await manager.dispatchServerReviewToQa(taskId, {
+    const dispatched = await manager.dispatchServerReviewToQa(taskId, {
       phase: 'code',
       recheck: opts.recheck,
       continuation: index > 0,
@@ -339,6 +368,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
     });
+    return dispatched !== null;
   }
 
   function rebuildBatches(roundData: ReviewRound): DiffFile[][] {
@@ -495,24 +525,21 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     await manager.dispatchServerFixToDev(task.id, JSON.stringify(findings));
   }
 
-  bus.on('server.code.fix.submitted', async (event) => {
-    const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'code', requireServerMode: true });
-    if (!gated) return;
-    const { task } = gated;
+  async function runCodeFixSubmission(task: TaskState): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       await emitIntervention(bus, task, { phase: 'server-code-fix-no-dev-agent' });
       if (task.agentId) {
         await rearmOrHold(task, task.agentId, 'code-fixed');
       }
-      return;
+      return false;
     }
     const round = Math.max(task.reviewRound, 1);
     const roundData = await reviewStore.getRound(task.id, 'code', round);
     if (!roundData?.findings) {
       await emitIntervention(bus, task, { phase: 'server-code-fix-findings-missing', round });
       await manager.setupPhaseSignal(task.id, task.agentId, 'code-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
 
     await manager.refreshWorktreeCacheFor(task.agentId);
@@ -525,20 +552,19 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         error: err instanceof Error ? err.message : String(err),
       });
       await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
     if (response === null) {
       if (roundData.response === undefined) {
         await emitIntervention(bus, task, { phase: 'server-code-response-missing', round });
         await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-        return;
+        return false;
       }
-      await prepareAndDispatchCodeReview(task, {
+      return prepareAndDispatchCodeReview(task, {
         recheck: true,
         priorFindingsJson: JSON.stringify(roundData.findings),
         priorResponseJson: JSON.stringify(roundData.response),
       });
-      return;
     }
     if (response.round !== round) {
       await emitIntervention(bus, task, {
@@ -548,7 +574,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       await transport().deleteResponse(dev);
       await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
 
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
@@ -560,17 +586,23 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         unknownFindingIds: gaps.unknown,
       });
       await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
 
-    if (!(await putVerdictRound(task, dev.id, 'code-fixed', { ...roundData, response }))) return;
+    if (!(await putVerdictRound(task, dev.id, 'code-fixed', { ...roundData, response }))) return false;
     await transport().deleteResponse(dev);
 
-    await prepareAndDispatchCodeReview(task, {
+    return prepareAndDispatchCodeReview(task, {
       recheck: true,
       priorFindingsJson: JSON.stringify(roundData.findings),
       priorResponseJson: JSON.stringify(response),
     });
+  }
+
+  bus.on('server.code.fix.submitted', async (event) => {
+    const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'code', requireServerMode: true });
+    if (!gated) return;
+    await runCodeFixSubmission(gated.task);
   });
 
   bus.on('server.code.published', async (event) => {
@@ -647,7 +679,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     await dispatchSpecReview(task);
   });
 
-  async function dispatchSpecReview(task: TaskState, prior?: { findingsJson: string; responseJson: string }): Promise<void> {
+  async function dispatchSpecReview(task: TaskState, prior?: { findingsJson: string; responseJson?: string }): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       await emitIntervention(bus, task, { phase: 'server-spec-review-no-dev-agent' });
@@ -655,17 +687,17 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
         await rearmOrHold(task, task.agentId, kind);
       }
-      return;
+      return false;
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     const nextRound = (task.specReviewRound ?? 0) + 1;
     if (nextRound > cap) {
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
-      if (!capResult) return;
+      if (!capResult) return false;
       const paused = capResult.task;
       if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
       if (paused.agentId) await releaseAndClearAtCap(paused, paused.agentId, 'agentId');
-      return;
+      return false;
     }
     await manager.refreshWorktreeCacheFor(task.agentId);
     let content;
@@ -678,7 +710,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
       await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-      return;
+      return false;
     }
     try {
       await reviewStore.putRound(task.id, 'spec', {
@@ -694,24 +726,25 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
       await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-      return;
+      return false;
     }
     const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
     if (!hasQa) {
       if (specApprovalIsHuman(task)) {
         const parked = await manager.parkTaskAtSpecReady(task.id, { specReviewRound: nextRound });
         if (!parked) await emitIntervention(bus, task, { phase: 'server-spec-park-transition-failed' });
-      } else {
-        // 循环中途配置被关闭：退回无 QA 的自动通过
-        await autoApproveSpec(task);
+        return !!parked;
       }
-      return;
+      // 循环中途配置被关闭：退回无 QA 的自动通过
+      return autoApproveSpec(task);
     }
-    await manager.dispatchServerReviewToQa(task.id, {
+    const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'spec',
       content: content.content,
-      ...(prior ? { priorFindingsJson: prior.findingsJson, priorResponseJson: prior.responseJson } : {}),
+      ...(prior ? { priorFindingsJson: prior.findingsJson } : {}),
+      ...(prior?.responseJson ? { priorResponseJson: prior.responseJson } : {}),
     });
+    return dispatched !== null;
   }
 
   bus.on('server.spec.review.submitted', async (event) => {
@@ -788,24 +821,21 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     await manager.dispatchServerFixToDev(task.id, JSON.stringify(effective));
   });
 
-  bus.on('server.spec.fix.submitted', async (event) => {
-    const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'spec', requireServerMode: false });
-    if (!gated) return;
-    const { task } = gated;
+  async function runSpecFixSubmission(task: TaskState): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       await emitIntervention(bus, task, { phase: 'server-spec-fix-no-dev-agent' });
       if (task.agentId) {
         await rearmOrHold(task, task.agentId, 'spec-fixed');
       }
-      return;
+      return false;
     }
     const round = task.specReviewRound ?? 1;
     const roundData = await reviewStore.getRound(task.id, 'spec', round);
     if (!roundData?.findings) {
       await emitIntervention(bus, task, { phase: 'server-spec-fix-findings-missing', round });
       await manager.setupPhaseSignal(task.id, task.agentId, 'spec-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
     await manager.refreshWorktreeCacheFor(task.agentId);
     let response;
@@ -817,19 +847,18 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         error: err instanceof Error ? err.message : String(err),
       });
       await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
     if (response === null) {
       if (roundData.response === undefined) {
         await emitIntervention(bus, task, { phase: 'server-spec-response-missing', round });
         await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-        return;
+        return false;
       }
-      await dispatchSpecReview(task, {
+      return dispatchSpecReview(task, {
         findingsJson: JSON.stringify(roundData.findings),
         responseJson: JSON.stringify(roundData.response),
       });
-      return;
     }
     if (response.round !== round) {
       await emitIntervention(bus, task, {
@@ -839,7 +868,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       await transport().deleteResponse(dev);
       await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
     if (gaps.missing.length > 0 || gaps.unknown.length > 0) {
@@ -850,13 +879,51 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         unknownFindingIds: gaps.unknown,
       });
       await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-      return;
+      return false;
     }
-    if (!(await putVerdictRound(task, dev.id, 'spec-fixed', { ...roundData, response }))) return;
+    if (!(await putVerdictRound(task, dev.id, 'spec-fixed', { ...roundData, response }))) return false;
     await transport().deleteResponse(dev);
-    await dispatchSpecReview(task, {
+    return dispatchSpecReview(task, {
       findingsJson: JSON.stringify(roundData.findings),
       responseJson: JSON.stringify(response),
     });
+  }
+
+  bus.on('server.spec.fix.submitted', async (event) => {
+    const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'spec', requireServerMode: false });
+    if (!gated) return;
+    await runSpecFixSubmission(gated.task);
+  });
+
+  async function latestVerdictRound(taskId: string, phase: 'code' | 'spec', fromRound: number): Promise<ReviewRound | null> {
+    for (let r = fromRound; r >= 1; r--) {
+      const data = await reviewStore.getRound(taskId, phase, r);
+      if (data?.findings) return data;
+    }
+    return null;
+  }
+
+  // 手工发起复用自然入口的完整协议：fixing 走 fix-submission（读/校验 dev 的 response 后派 recheck，
+  // 缺 response 拒绝）；其余状态按最近结论轮携带 prior 上下文，否则 QA 无从核对上一轮 findings
+  manager.setServerReviewDriver({
+    dispatchCodeReview: async (task) => {
+      if (task.status === 'fixing') return runCodeFixSubmission(task);
+      const prior = await latestVerdictRound(task.id, 'code', task.reviewRound);
+      return prepareAndDispatchCodeReview(task, {
+        recheck: prior !== null,
+        ...(prior?.findings ? { priorFindingsJson: JSON.stringify(prior.findings) } : {}),
+        ...(prior?.response ? { priorResponseJson: JSON.stringify(prior.response) } : {}),
+      });
+    },
+    dispatchSpecReview: async (task) => {
+      if (task.status === 'fixing') return runSpecFixSubmission(task);
+      const prior = await latestVerdictRound(task.id, 'spec', task.specReviewRound ?? 0);
+      return dispatchSpecReview(task, prior?.findings
+        ? {
+          findingsJson: JSON.stringify(prior.findings),
+          ...(prior.response ? { responseJson: JSON.stringify(prior.response) } : {}),
+        }
+        : undefined);
+    },
   });
 }

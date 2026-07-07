@@ -20,7 +20,7 @@ beforeEach(async () => {
 });
 afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
 
-function makeConfig(mode: ReviewMode, opts: { omitQa?: boolean } = {}): BaxianConfig {
+function makeConfig(mode: ReviewMode, opts: { omitQa?: boolean; siblingProjects?: boolean } = {}): BaxianConfig {
   const agents = [
     { id: 'dev-1', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: tempDir },
     ...(opts.omitQa ? [] : [{ id: 'qa-1', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: tempDir }]),
@@ -29,11 +29,19 @@ function makeConfig(mode: ReviewMode, opts: { omitQa?: boolean } = {}): BaxianCo
     review: { rounds: 10, mode },
     server: DEFAULT_SERVER_CONFIG,
     host: [],
-    project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [agents] }],
+    project: [
+      { id: 'proj', repo: 'user/repo', merge: null, agent: [agents] },
+      ...(opts.siblingProjects
+        ? [
+          { id: 'proj-same-repo', repo: 'User/Repo', merge: null, agent: [] },
+          { id: 'proj-other-repo', repo: 'user/elsewhere', merge: null, agent: [] },
+        ]
+        : []),
+    ],
   } as BaxianConfig;
 }
 
-async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean } = {}) {
+async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean; siblingProjects?: boolean } = {}) {
   const runner = {
     exec: vi.fn(async (): Promise<ExecResult> =>
       ({ stdout: '', stderr: '', exitCode: 0 })),
@@ -60,7 +68,7 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean } = {}) {
     platformRunner: runner,
     phaseSignalWatcher: watcher as never,
   });
-  return { manager, taskStore, agentStore, events, watcher };
+  return { manager, taskStore, agentStore, events, watcher, runner };
 }
 
 function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
@@ -180,6 +188,50 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
       agentId: 'dev-1', expectedKinds: 'spec-fixed', skipSnapshot: true,
     }));
+  });
+
+  it('falls back to the configured QA partner when task.qaAgentId left the config', async () => {
+    const f = await makeFixture('server');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({ reviewMode: 'server', phase: 'code', status: 'in_progress', signalToken: 't', qaAgentId: 'ghost' }));
+    await f.agentStore.update('dev-1', () => ({ id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW }));
+    vi.spyOn(f.manager, 'startSession').mockResolvedValue(true);
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', { phase: 'code', content: 'diff' });
+
+    expect(result?.qaAgentId).toBe('qa-1');
+    expect((await f.agentStore.get('qa-1'))?.taskId).toBe('task-1');
+  });
+
+  it('releases a QA still bound to the same task before re-acquiring (manual redispatch from review)', async () => {
+    const f = await makeFixture('server');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({ reviewMode: 'server', phase: 'code', status: 'review', signalToken: 't', reviewRound: 1 }));
+    await f.agentStore.update('qa-1', () => ({ id: 'qa-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW }));
+    await f.agentStore.update('dev-1', () => ({ id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW }));
+    const releaseSpy = vi.spyOn(f.manager, 'releaseAgentForTask');
+    vi.spyOn(f.manager, 'startSession').mockResolvedValue(true);
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', { phase: 'code', content: 'diff', recheck: true });
+
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-1', 'idle');
+    expect(result?.status).toBe('review');
+    expect(result?.reviewRound).toBe(2);
+    expect((await f.agentStore.get('qa-1'))?.taskId).toBe('task-1');
+  });
+
+  it('a failed redispatch from review does not re-arm the dev entry signal (long consumed)', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({ reviewMode: 'server', phase: 'code', status: 'review', signalToken: 't', reviewRound: 1 }));
+    await f.agentStore.update('qa-1', () => ({
+      id: 'qa-1', projectId: 'proj', taskId: 'someone-else', updatedAt: new Date().toISOString(),
+    }));
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', { phase: 'code', content: 'diff', recheck: true });
+
+    expect(result).toBeNull();
+    expect(interventionPhases(f.events)).toContain('server-review-qa-acquire-failed');
+    expect(f.watcher.start).not.toHaveBeenCalled();
   });
 
   it('QA acquire failure re-arms code-fixed and emits qa-acquire-failed', async () => {
@@ -392,6 +444,33 @@ describe('dispatchServerAfterDone failure & success paths', () => {
     expect(after?.publishDispatchedAt).toBeUndefined();
   });
 
+  it('a rebound dev reaches dev-acquire-failed, not a lineage verdict computed on the wrong worktree', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'approved', signalToken: 'orig-token',
+    }));
+    await f.taskStore.set(taskFixture({
+      id: 'task-2', branch: 'bx/task-2', agentId: '', qaAgentId: undefined, status: 'in_progress',
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-9', worktreePath: '/wt/task-9',
+      updatedAt: new Date().toISOString(),
+    }));
+    const SHA = 'c'.repeat(40);
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('rev-list')) return { stdout: `${SHA}\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('merge-base --is-ancestor')) return { stdout: '', stderr: '', exitCode: 1 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+
+    const result = await f.manager.dispatchServerAfterDone('task-1', 'pr');
+
+    expect(result).toBeNull();
+    const phases = interventionPhases(f.events);
+    expect(phases).toContain('server-after-done-dev-acquire-failed');
+    expect(phases).not.toContain('server-after-done-lineage-violation');
+  });
+
   it('a generic publish dispatch error restores the signal token and rethrows', async () => {
     const f = await makeFixture('server');
     await f.taskStore.set(taskFixture({
@@ -439,6 +518,193 @@ describe('dispatchServerAfterDone failure & success paths', () => {
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
       agentId: 'dev-1', expectedKinds: 'code-ready',
     }));
+  });
+
+  it('a lineage check failure blocks the publish dispatch recoverably instead of leaking the error', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'approved', signalToken: 'orig-token',
+    }));
+    const continueSpy = vi.spyOn(f.manager, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(f.manager, 'findLineageViolation').mockRejectedValue(new Error('merge-base exploded'));
+
+    const result = await f.manager.dispatchServerAfterDone('task-1', 'pr');
+
+    expect(result).toBeNull();
+    expect(continueSpy).not.toHaveBeenCalled();
+    const intervention = f.events.find(e => e.type === 'human.intervention');
+    expect(intervention?.data).toMatchObject({ phase: 'server-after-done-lineage-check-failed' });
+    const after = await f.taskStore.get('task-1');
+    expect(after?.signalToken).toBe('orig-token');
+    expect(after?.publishDispatchedAt).toBeUndefined();
+  });
+
+  it('refuses the publish dispatch when the branch embeds another active task branch', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'approved', signalToken: 'orig-token',
+    }));
+    const continueSpy = vi.spyOn(f.manager, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(f.manager, 'findLineageViolation').mockResolvedValue({
+      taskId: 'task-2', branch: 'bx/task-2', sha: 'a'.repeat(40),
+    });
+
+    const result = await f.manager.dispatchServerAfterDone('task-1', 'pr');
+
+    expect(result).toBeNull();
+    expect(continueSpy).not.toHaveBeenCalled();
+    const intervention = f.events.find(e => e.type === 'human.intervention');
+    expect(intervention?.data).toMatchObject({
+      phase: 'server-after-done-lineage-violation',
+      offendingTaskId: 'task-2',
+      offendingBranch: 'bx/task-2',
+    });
+    const after = await f.taskStore.get('task-1');
+    expect(after?.signalToken).toBe('orig-token');
+    expect(after?.publishDispatchedAt).toBeUndefined();
+  });
+});
+
+describe('findLineageViolation', () => {
+  const NOW = new Date().toISOString();
+  const SHA_A = 'a'.repeat(40);
+  const SHA_B = 'b'.repeat(40);
+
+  async function seedLineageFixture(otherTask: Partial<TaskState>) {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({ reviewMode: 'server', phase: 'code', signalToken: 't' }));
+    await f.taskStore.set(taskFixture({
+      id: 'task-2', branch: 'bx/task-2', agentId: '', qaAgentId: undefined,
+      status: 'in_progress', ...otherTask,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1',
+      worktreePath: '/wt/task-1', updatedAt: NOW,
+    }));
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes("rev-list 'base123..refs/heads/bx/task-2'")) {
+        return { stdout: `${SHA_A}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes("rev-list 'base123..HEAD'")) {
+        return { stdout: `${SHA_B}\n${SHA_A}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('merge-base --is-ancestor')) return { stdout: '', stderr: '', exitCode: 1 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    return f;
+  }
+
+  it('reports another active task whose branch tip sits inside this branch history', async () => {
+    const f = await seedLineageFixture({});
+    const violation = await f.manager.findLineageViolation('task-1', 'base123');
+    expect(violation).toEqual({ taskId: 'task-2', branch: 'bx/task-2', sha: SHA_A });
+  });
+
+  it('ignores terminal tasks when collecting candidates', async () => {
+    const f = await seedLineageFixture({ status: 'merged' });
+    const violation = await f.manager.findLineageViolation('task-1', 'base123');
+    expect(violation).toBeNull();
+  });
+
+  it('resolves the merge base itself when no baseSha is provided', async () => {
+    const f = await seedLineageFixture({});
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('merge-base origin/HEAD HEAD')) return { stdout: 'base456\n', stderr: '', exitCode: 0 };
+      if (cmd.includes("rev-list 'base456..refs/heads/bx/task-2'")) {
+        return { stdout: `${SHA_A}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes("rev-list 'base456..HEAD'")) return { stdout: `${SHA_A}\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('merge-base --is-ancestor')) return { stdout: '', stderr: '', exitCode: 1 };
+      if (cmd.includes('rev-list')) return { stdout: '', stderr: 'wrong base', exitCode: 128 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    const violation = await f.manager.findLineageViolation('task-1');
+    expect(violation).toEqual({ taskId: 'task-2', branch: 'bx/task-2', sha: SHA_A });
+    const cmds = f.runner.exec.mock.calls.map(c => c[0] as string);
+    const fetchIdx = cmds.findIndex(c => c.includes('fetch origin'));
+    const mergeBaseIdx = cmds.findIndex(c => c.includes('merge-base origin/HEAD HEAD'));
+    expect(fetchIdx).toBeGreaterThanOrEqual(0);
+    expect(fetchIdx).toBeLessThan(mergeBaseIdx);
+  });
+
+  it('throws when the freshness fetch fails while self-resolving the base', async () => {
+    const f = await seedLineageFixture({});
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('fetch origin')) return { stdout: '', stderr: 'network down', exitCode: 1 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    await expect(f.manager.findLineageViolation('task-1')).rejects.toThrow(/fetch/i);
+  });
+
+  it('returns null when the dev agent has no recorded worktree', async () => {
+    const f = await seedLineageFixture({});
+    await f.agentStore.update('dev-1', (s) => {
+      const { worktreePath: _w, ...rest } = s!;
+      return rest;
+    });
+    const violation = await f.manager.findLineageViolation('task-1', 'base123');
+    expect(violation).toBeNull();
+  });
+
+  it('returns null when the dev agent has been rebound to another task — its worktree belongs to that task', async () => {
+    const f = await seedLineageFixture({});
+    await f.agentStore.update('dev-1', (s) => ({
+      ...s!, taskId: 'task-9', worktreePath: '/wt/task-9',
+    }));
+    const violation = await f.manager.findLineageViolation('task-1', 'base123');
+    expect(violation).toBeNull();
+    const probed = f.runner.exec.mock.calls.map(c => c[0] as string);
+    expect(probed.some(c => c.includes('/wt/task-9'))).toBe(false);
+  });
+
+  it('collects candidates from sibling projects sharing the same repo (shared branch namespace)', async () => {
+    const f = await makeFixture('server', { siblingProjects: true });
+    await f.taskStore.set(taskFixture({ reviewMode: 'server', phase: 'code', signalToken: 't' }));
+    await f.taskStore.set(taskFixture({
+      id: 'task-5', projectId: 'proj-same-repo', branch: 'bx/task-5',
+      agentId: '', qaAgentId: undefined, status: 'in_progress',
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1',
+      worktreePath: '/wt/task-1', updatedAt: NOW,
+    }));
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes("rev-list 'base123..refs/heads/bx/task-5'")) {
+        return { stdout: `${SHA_A}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes("rev-list 'base123..HEAD'")) {
+        return { stdout: `${SHA_B}\n${SHA_A}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('merge-base --is-ancestor')) return { stdout: '', stderr: '', exitCode: 1 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+
+    const violation = await f.manager.findLineageViolation('task-1', 'base123');
+    expect(violation).toEqual({ taskId: 'task-5', branch: 'bx/task-5', sha: SHA_A });
+  });
+
+  it('excludes tasks whose project points at a different repo', async () => {
+    const f = await makeFixture('server', { siblingProjects: true });
+    await f.taskStore.set(taskFixture({ reviewMode: 'server', phase: 'code', signalToken: 't' }));
+    await f.taskStore.set(taskFixture({
+      id: 'task-6', projectId: 'proj-other-repo', branch: 'bx/task-6',
+      agentId: '', qaAgentId: undefined, status: 'in_progress',
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1',
+      worktreePath: '/wt/task-1', updatedAt: NOW,
+    }));
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes("rev-list 'base123..HEAD'")) {
+        return { stdout: `${SHA_B}\n${SHA_A}\n`, stderr: '', exitCode: 0 };
+      }
+      return { stdout: `${SHA_A}\n`, stderr: '', exitCode: 0 };
+    });
+
+    const violation = await f.manager.findLineageViolation('task-1', 'base123');
+    expect(violation).toBeNull();
+    const probed = f.runner.exec.mock.calls.map(c => c[0] as string);
+    expect(probed.some(c => c.includes('refs/heads/bx/task-6'))).toBe(false);
   });
 });
 

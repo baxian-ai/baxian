@@ -430,6 +430,50 @@ describe('TaskDetail page — actions & states', () => {
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
 
+  it.each(['in_progress', 'review', 'fixing', 'approved', 'spec-ready', 'max_rounds', 'ready', 'merge-ready', 'pending'] as const)(
+    'Cancel stays clickable at non-terminal status %s with the force-cancel tooltip',
+    (status) => {
+      open({ status });
+      const cancel = screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement;
+      expect(cancel.disabled).toBe(false);
+      expect(cancel.title).toBe('Force-cancels the task from any state; interrupts and releases its agents');
+    },
+  );
+
+  it.each(['merged', 'done', 'failed', 'cancelled'] as const)(
+    'Cancel stays clickable at terminal status %s for stale-binding cleanup',
+    (status) => {
+      open({ status });
+      const cancel = screen.getByRole('button', { name: 'Cancel' }) as HTMLButtonElement;
+      expect(cancel.disabled).toBe(false);
+      expect(cancel.title).toBe('Force-cancels the task from any state; interrupts and releases its agents');
+    },
+  );
+
+  it('Cancel on a terminal task explains the cleanup semantics and reports the cleanup toast', async () => {
+    tasksUpdateMock.mockResolvedValue(makeTask({ status: 'merged' }));
+    open({ status: 'merged' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    const dialog = await findConfirmDialog();
+    expect(within(dialog).getByText(/its status will not change/)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel task' }));
+    });
+
+    expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Cleaned up stale agent bindings for the task' });
+  });
+
+  it('Cancel force-cancels a task that is under review', async () => {
+    tasksUpdateMock.mockResolvedValue(makeTask({ status: 'cancelled' }));
+    open({ status: 'review' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await settleConfirmDialog('Cancel task');
+    expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
+  });
+
   it('does not leak an optimistic override when switching tasks on the same route', async () => {
     // Cancel resolves to a NEWER updatedAt than task-011 — the stale-override guard
     // by updatedAt alone would keep showing task-010 on the new URL; remount must win.
@@ -585,6 +629,64 @@ describe('TaskDetail page — call review', () => {
     await settleConfirmDialog('Start re-review');
 
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'qa is busy' });
+  });
+
+  it('server-mode task without a PR dispatches a review while under review', async () => {
+    tasksReviewMock.mockResolvedValue(makeTask({ reviewMode: 'server', status: 'review', reviewRound: 2, prNumber: undefined, prUrl: undefined }));
+    open({ reviewMode: 'server', status: 'review', prNumber: undefined, prUrl: undefined });
+
+    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe('Has the QA agent start a new review round right away');
+    fireEvent.click(button);
+    await settleConfirmDialog('Start re-review');
+
+    expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
+  });
+
+  it.each(['in_progress', 'fixing'] as const)(
+    'server-mode Call review is enabled at %s (code phase) without a PR',
+    (status) => {
+      open({ reviewMode: 'server', status, phase: 'code', prNumber: undefined, prUrl: undefined });
+      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(false);
+    },
+  );
+
+  it('server-mode unphased in_progress task disables Call review with the unphased tooltip', () => {
+    open({ reviewMode: 'server', status: 'in_progress', phase: undefined, prNumber: undefined, prUrl: undefined });
+    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe('The dev has not delivered a spec/code signal yet, so there is nothing to review');
+  });
+
+  it.each(['approved', 'spec-ready', 'max_rounds', 'ready', 'merged'] as const)(
+    'server-mode Call review is disabled at %s with the status tooltip',
+    (status) => {
+      open({ reviewMode: 'server', status, prNumber: undefined, prUrl: undefined });
+      const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe('Reviews can only be started while the task is in progress, in review, or fixing');
+    },
+  );
+
+  it('spec-phase task reports the spec round in the toast (github mode without a PR)', async () => {
+    tasksReviewMock.mockResolvedValue(makeTask({ phase: 'spec', status: 'review', specReviewRound: 2, reviewRound: 0, prNumber: undefined, prUrl: undefined }));
+    open({ phase: 'spec', status: 'review', specReviewRound: 1, prNumber: undefined, prUrl: undefined });
+
+    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    fireEvent.click(button);
+    await settleConfirmDialog('Start re-review');
+
+    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
+  });
+
+  it('github-mode code-phase task without a PR keeps Call review disabled with the no-PR tooltip', () => {
+    open({ status: 'review', prNumber: undefined, prUrl: undefined });
+    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe('This task has no PR yet; cannot start a review');
   });
 });
 

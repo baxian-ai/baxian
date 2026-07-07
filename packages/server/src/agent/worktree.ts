@@ -35,13 +35,15 @@ export class WorktreeManager {
       if (remoteCheck.stdout.trim()) {
         throw new Error(`Branch ${branch} already exists on remote; use adopt to bind an existing branch`);
       }
+      // --no-track: branching off origin/HEAD would otherwise set the upstream to
+      // origin/<default>, which breaks a plain `git push` under push.default=simple.
       const result = await this.runner.exec(
-        `cd ${repo} && git worktree add ${wt} -b ${shellQuote(branch)}${baseClause}`,
+        `cd ${repo} && git worktree add --no-track ${wt} -b ${shellQuote(branch)}${baseClause}`,
       );
       if (result.exitCode !== 0) throw new Error(`Failed to create worktree: ${result.stderr}`);
     } else {
       const result = await this.runner.exec(
-        `cd ${repo} && git worktree add ${wt} -B ${shellQuote(branch)}${baseClause}`,
+        `cd ${repo} && git worktree add --no-track ${wt} -B ${shellQuote(branch)}${baseClause}`,
       );
       if (result.exitCode !== 0) throw new Error(`Failed to create worktree: ${result.stderr}`);
     }

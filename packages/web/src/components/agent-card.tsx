@@ -143,7 +143,8 @@ export function AgentCard({
     setReviewing(true);
     try {
       const updated = await api.tasks.review(taskId);
-      show({ kind: 'success', title: t.agents.reReviewStarted(updated.reviewRound) });
+      const round = updated.phase === 'spec' ? (updated.specReviewRound ?? 0) : updated.reviewRound;
+      show({ kind: 'success', title: t.agents.reReviewStarted(round) });
     } catch (err) {
       show({ kind: 'error', title: t.agents.reReviewStartFailed, body: err instanceof Error ? err.message : String(err) });
     } finally {

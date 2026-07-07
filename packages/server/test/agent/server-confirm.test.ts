@@ -401,10 +401,35 @@ describe('merge-ready cancel, Call review mode guard, and confirm head guard', (
     expect(execCalls.some(c => c.includes('gh pr close 21') && c.includes('--delete-branch'))).toBe(true);
   });
 
-  it('Call review refuses server-mode tasks', async () => {
+  it('Call review refuses server-mode tasks parked at a gate (only in_progress/review/fixing dispatch)', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'ready', prNumber: 5 }));
-    await expect(manager.dispatchReviewToQa('task-1')).rejects.toThrow(/server review mode/);
+    await expect(manager.dispatchReviewToQa('task-1')).rejects.toThrow(/manual server-side review requires/);
+  });
+
+  it.each(['review', 'fixing', 'approved'] as const)(
+    'cancelling a github task at %s closes the open PR and deletes the branch',
+    async (status) => {
+      const { manager, taskStore, execCalls } = await makeFixture(null, 'pr');
+      await taskStore.set(taskFixture({ status, reviewMode: 'github', prNumber: 33 }));
+
+      const result = await manager.cancelTask('task-1');
+
+      expect(result.status).toBe('cancelled');
+      expect(execCalls.some(c => c.includes('gh pr close 33') && c.includes('--delete-branch'))).toBe(true);
+    },
+  );
+
+  it('a terminal re-cancel cleans stale bindings but never touches the remote PR', async () => {
+    const { manager, taskStore, agentStore, execCalls } = await makeFixture(null, 'pr', readyPaneExec);
+    await taskStore.set(taskFixture({ status: 'cancelled', reviewMode: 'github', prNumber: 44 }));
+    await bindToTask(agentStore, 'dev-1', new Date().toISOString());
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    expect(execCalls.some(c => c.includes('gh pr close'))).toBe(false);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
   it('merge-ready confirm without recorded head → 409', async () => {

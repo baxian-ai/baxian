@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../../src/event/bus.js';
 import { registerServerEventHandlers } from '../../src/event/server-handlers.js';
 import { ReviewStore } from '../../src/state/review-store.js';
-import type { AgentManager } from '../../src/agent/manager.js';
+import type { AgentManager, ServerReviewDriver } from '../../src/agent/manager.js';
 import type { EventLog } from '../../src/event/log.js';
 import type {
   BaxianEvent,
@@ -56,6 +56,8 @@ interface Fixture {
   transitionTaskStatus: ReturnType<typeof vi.fn>;
   transitionToCodePhase: ReturnType<typeof vi.fn>;
   updateTask: ReturnType<typeof vi.fn>;
+  driver: { current?: ServerReviewDriver };
+  findLineageViolation: ReturnType<typeof vi.fn>;
   emitted: BaxianEvent[];
   emit: (type: string, data: Record<string, unknown>) => Promise<void>;
 }
@@ -64,6 +66,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
   const emitted: BaxianEvent[] = [];
   const bus = new EventBus({ append: async (e: BaxianEvent) => { emitted.push(e); } } as unknown as EventLog);
   const store = new ReviewStore();
+  const driverRef: { current?: ServerReviewDriver } = {};
   const task = makeTask(taskOverrides);
   const calls: Record<string, unknown[][]> = {
     dispatchServerReviewToQa: [],
@@ -107,6 +110,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     calls.transitionToCodePhase.push([id]);
     return task;
   });
+  const findLineageViolation = vi.fn(async (): Promise<unknown> => null);
   const parkTaskAtSpecReady = vi.fn(async (id: string, opts?: { specReviewRound?: number }) => {
     calls.parkTaskAtSpecReady.push(opts === undefined ? [id] : [id, opts]);
     task.status = 'spec-ready';
@@ -138,6 +142,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     releaseAgentForTask,
     getAgentState,
     updateTask,
+    findLineageViolation,
     dispatchServerReviewToQa: vi.fn(async (id: string, opts: unknown) => {
       calls.dispatchServerReviewToQa.push([id, opts]);
       task.status = 'review';
@@ -164,6 +169,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
       (config.verifyPr ?? true) ? { headRefName: 'bx/t1', headSha: 'h'.repeat(40) } : undefined),
     resolveAfterDone: (t: TaskState) =>
       t.afterDone !== undefined ? t.afterDone : (config.afterDone ?? null),
+    setServerReviewDriver: (d: ServerReviewDriver) => { driverRef.current = d; },
   } as unknown as AgentManager;
 
   registerServerEventHandlers(bus, manager);
@@ -178,7 +184,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
       data,
     });
   };
-  return { bus, store, task, calls, transport, releaseAgentForTask, getAgentState, transitionTaskStatus, transitionToCodePhase, updateTask, emitted, emit };
+  return { bus, store, task, calls, transport, releaseAgentForTask, getAgentState, transitionTaskStatus, transitionToCodePhase, updateTask, driver: driverRef, findLineageViolation, emitted, emit };
 }
 
 const FINDINGS_RC: ReviewFindings = {
@@ -246,6 +252,31 @@ describe('server.code.ready', () => {
     const fx = makeFixture();
     await fx.emit('server.code.ready', { token: 'WRONG', kind: 'code-done' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+  });
+
+  it('lineage violation blocks the review dispatch and re-arms the entry signal', async () => {
+    const fx = makeFixture();
+    fx.findLineageViolation.mockResolvedValue({ taskId: 't-other', branch: 'bx/t-other', sha: 'a'.repeat(40) });
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.findLineageViolation).toHaveBeenCalledWith('t1', 'base123');
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    const intervention = fx.emitted.find(e => e.type === 'human.intervention');
+    expect(intervention?.data).toMatchObject({
+      phase: 'server-code-lineage-violation',
+      offendingTaskId: 't-other',
+      offendingBranch: 'bx/t-other',
+    });
+    expect(fx.calls.setupPhaseSignal).toEqual([['t1', 'dev-1', 'code-done']]);
+  });
+
+  it('lineage check failure blocks the review dispatch and re-arms the entry signal', async () => {
+    const fx = makeFixture();
+    fx.findLineageViolation.mockRejectedValue(new Error('rev-list exploded'));
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    const intervention = fx.emitted.find(e => e.type === 'human.intervention');
+    expect(intervention?.data).toMatchObject({ phase: 'server-code-lineage-check-failed' });
+    expect(fx.calls.setupPhaseSignal).toEqual([['t1', 'dev-1', 'code-done']]);
   });
 
   it('round cap → max_rounds', async () => {
@@ -1106,16 +1137,18 @@ function interventionPhases(fx: Fixture): string[] {
 }
 
 describe('registration guard', () => {
-  it('no ReviewStore configured → warns once and registers no handlers', async () => {
+  it('no ReviewStore configured → warns once, registers no handlers, leaves no manual driver', async () => {
     const bus = new EventBus({ append: async () => undefined } as unknown as EventLog);
     const getTask = vi.fn();
-    const manager = { getReviewStore: () => undefined, getTask } as unknown as AgentManager;
+    const setServerReviewDriver = vi.fn();
+    const manager = { getReviewStore: () => undefined, getTask, setServerReviewDriver } as unknown as AgentManager;
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       registerServerEventHandlers(bus, manager);
       expect(warnSpy).toHaveBeenCalledWith(
         '[ServerEventHandler] no ReviewStore configured; server review mode disabled',
       );
+      expect(setServerReviewDriver).not.toHaveBeenCalled();
       await bus.emit({
         id: '',
         type: 'server.code.ready',
@@ -1128,6 +1161,151 @@ describe('registration guard', () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe('manual server review driver', () => {
+  it('registers a driver on the manager when the review store is configured', () => {
+    const fx = makeFixture();
+    expect(fx.driver.current).toBeDefined();
+  });
+
+  it('dispatchCodeReview runs the entry pipeline from review status: stores the round and dispatches QA fresh (no recheck)', async () => {
+    const fx = makeFixture({ status: 'review', reviewRound: 0 });
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(true);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { phase: string; recheck: boolean }];
+    expect(opts.phase).toBe('code');
+    expect(opts.recheck).toBe(false);
+    expect(await fx.store.getRound('t1', 'code', 1)).toMatchObject({ round: 1, phase: 'code' });
+  });
+
+  it('dispatchCodeReview reports false when the diff cannot be read', async () => {
+    const fx = makeFixture({ status: 'review', reviewRound: 0 });
+    fx.transport.readContent.mockRejectedValue(new Error('worktree gone'));
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(false);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(interventionPhases(fx)).toContain('server-code-content-read-failed');
+  });
+
+  it('dispatchSpecReview stores the spec round and dispatches the QA spec review', async () => {
+    const fx = makeFixture({ status: 'review', phase: 'spec', specReviewRound: 0 });
+    const ok = await fx.driver.current!.dispatchSpecReview(fx.task);
+
+    expect(ok).toBe(true);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { phase: string }];
+    expect(opts.phase).toBe('spec');
+    expect(await fx.store.getRound('t1', 'spec', 1)).toMatchObject({ round: 1, phase: 'spec' });
+  });
+
+  it('dispatchCodeReview splits an oversized diff and reports true after dispatching batch 0', async () => {
+    const fx = makeFixture({ status: 'review', reviewRound: 0 });
+    fx.transport.readContent.mockResolvedValue({ content: TWO_BATCH_DIFF, diffstat: ' 2 files', baseSha: 'base123', defaultBranch: 'main' });
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(true);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number; total: number } }];
+    expect(opts.batch).toEqual({ index: 0, total: 2 });
+  });
+
+  it('dispatchCodeReview from fixing dispatches a recheck carrying the stored prior findings and response', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    const response: ReviewResponse = { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] };
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC, response });
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(true);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string }];
+    expect(opts.recheck).toBe(true);
+    expect(opts.priorFindingsJson).toBe(JSON.stringify(FINDINGS_RC));
+    expect(opts.priorResponseJson).toBe(JSON.stringify(response));
+  });
+
+  it('dispatchCodeReview redispatching a hung round reuses the latest verdict round as priors', async () => {
+    const fx = makeFixture({ status: 'review', reviewRound: 2 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    await putRound(fx.store, 'code', 2);
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(true);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string }];
+    expect(opts.recheck).toBe(true);
+    expect(opts.priorFindingsJson).toBe(JSON.stringify(FINDINGS_RC));
+    expect(opts.priorResponseJson).toBeUndefined();
+  });
+
+  it('dispatchSpecReview redispatching a hung spec round forwards stored findings without a response', async () => {
+    const fx = makeFixture({ status: 'review', phase: 'spec', specReviewRound: 1 });
+    const specFindings = { ...FINDINGS_RC };
+    await putRound(fx.store, 'spec', 1, { findings: specFindings });
+
+    const ok = await fx.driver.current!.dispatchSpecReview(fx.task);
+
+    expect(ok).toBe(true);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { phase: string; priorFindingsJson?: string; priorResponseJson?: string }];
+    expect(opts.phase).toBe('spec');
+    expect(opts.priorFindingsJson).toBe(JSON.stringify(specFindings));
+    expect(opts.priorResponseJson).toBeUndefined();
+  });
+
+  it('dispatchCodeReview from fixing reads and stores the pending response file before the recheck', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    const pending: ReviewResponse = { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] };
+    fx.transport.readResponse.mockResolvedValue(pending);
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(true);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; priorResponseJson?: string }];
+    expect(opts.recheck).toBe(true);
+    expect(opts.priorResponseJson).toBe(JSON.stringify(pending));
+    expect((await fx.store.getRound('t1', 'code', 1))?.response).toEqual(pending);
+    expect(fx.transport.deleteResponse).toHaveBeenCalled();
+  });
+
+  it('dispatchCodeReview from fixing refuses to recheck when no dev response exists anywhere', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(false);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(interventionPhases(fx)).toContain('server-code-response-missing');
+  });
+
+  it('dispatchCodeReview from fixing enforces response coverage like the fix-submitted path', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({ round: 1, responses: [{ findingId: 'f-unknown', action: 'fix', rationale: 'x' }] });
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
+
+    expect(ok).toBe(false);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(interventionPhases(fx)).toContain('server-code-response-coverage-gap');
+  });
+
+  it('dispatchSpecReview from fixing refuses to recheck without a dev response', async () => {
+    const fx = makeFixture({ status: 'fixing', phase: 'spec', specReviewRound: 1 });
+    await putRound(fx.store, 'spec', 1, { findings: { ...FINDINGS_RC } });
+
+    const ok = await fx.driver.current!.dispatchSpecReview(fx.task);
+
+    expect(ok).toBe(false);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(interventionPhases(fx)).toContain('server-spec-response-missing');
   });
 });
 

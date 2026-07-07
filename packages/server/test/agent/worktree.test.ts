@@ -60,6 +60,15 @@ describe('WorktreeManager', () => {
       expect(cmdAt(0)).toContain("-B 'bx/task-001' 'origin/HEAD'");
     });
 
+    it('never sets up remote tracking — origin/HEAD must not become the branch upstream', async () => {
+      await wt.create('/repo', 'task-001', 'origin/HEAD');
+      expect(cmdAt(0)).toContain('--no-track');
+      runner.exec.mockClear();
+      queueExec(fail('', 128), exitOk, exitOk, exitOk);
+      await wt.create('/repo', 'task-002', 'origin/HEAD', 'feat/custom');
+      expect(cmdAt(2)).toContain('--no-track');
+    });
+
     it('returns the worktree path (regardless of baseRef)', async () => {
       const path = await wt.create('/repo', 'task-001', 'origin/HEAD');
       expect(path).toMatch(/^\/repo\/\.baxian-worktrees\/task-001_[0-9a-f]{16}$/);
@@ -365,5 +374,69 @@ describe('git safety: inbox files are invisible to git (real git)', () => {
     withRealGitRepo(async (repo) => {
       const wt = new WorktreeManager(new LocalRunner());
       await assertInboxInvisible(await wt.createDetachedAtBase(repo, 'task-gs2'));
+    }), 20_000);
+});
+
+describe('bare repo store: worktrees isolate agents from the shared clone (real git)', () => {
+  async function withBareStore(run: (store: string) => Promise<void>): Promise<void> {
+    const root = await mkdtemp(join(tmpdir(), 'baxian-bare-store-'));
+    try {
+      const local = new LocalRunner();
+      const origin = join(root, 'origin.git');
+      const seed = join(root, 'seed');
+      const store = join(root, 'store');
+      const setup = await local.exec(
+        `git init -q --bare ${shellQuote(origin)} && ` +
+        `git clone -q ${shellQuote(origin)} ${shellQuote(seed)} && ` +
+        `cd ${shellQuote(seed)} && git config user.email t@t && git config user.name t && ` +
+        `git commit --allow-empty -qm init && git push -q origin HEAD && ` +
+        `git clone --bare -q ${shellQuote(origin)} ${shellQuote(store)} && ` +
+        `git -C ${shellQuote(store)} config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*' && ` +
+        `git -C ${shellQuote(store)} fetch -q --all --prune && ` +
+        `git -C ${shellQuote(store)} remote set-head origin --auto`,
+      );
+      expect(setup.exitCode).toBe(0);
+      await run(store);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it('create() on a bare store yields a commit-ready worktree branched from origin/HEAD', () =>
+    withBareStore(async (store) => {
+      const wt = new WorktreeManager(new LocalRunner());
+      const path = await wt.create(store, 'task-bare1', 'origin/HEAD');
+      const local = new LocalRunner();
+      const branch = await local.exec(`cd ${shellQuote(path)} && git branch --show-current`);
+      expect(branch.stdout.trim()).toBe('bx/task-bare1');
+      const commit = await local.exec(
+        `cd ${shellQuote(path)} && git -c user.email=t@t -c user.name=t commit --allow-empty -qm work`,
+      );
+      expect(commit.exitCode).toBe(0);
+      const upstream = await local.exec(
+        `cd ${shellQuote(path)} && git rev-parse --abbrev-ref @{u}`,
+      );
+      expect(upstream.exitCode).not.toBe(0);
+    }), 20_000);
+
+  it('createDetachedAtBase() works against a bare store', () =>
+    withBareStore(async (store) => {
+      const wt = new WorktreeManager(new LocalRunner());
+      const path = await wt.createDetachedAtBase(store, 'task-bare2');
+      const local = new LocalRunner();
+      const head = await local.exec(`cd ${shellQuote(path)} && git rev-parse HEAD`);
+      expect(head.exitCode).toBe(0);
+    }), 20_000);
+
+  it('the bare store itself refuses commits and checkouts — nothing for a stray agent to contaminate', () =>
+    withBareStore(async (store) => {
+      const local = new LocalRunner();
+      const commit = await local.exec(
+        `cd ${shellQuote(store)} && git -c user.email=t@t -c user.name=t commit --allow-empty -m stray`,
+      );
+      expect(commit.exitCode).not.toBe(0);
+      expect(commit.stderr).toMatch(/work tree|working tree/i);
+      const checkout = await local.exec(`cd ${shellQuote(store)} && git checkout -b stray-branch`);
+      expect(checkout.exitCode).not.toBe(0);
     }), 20_000);
 });

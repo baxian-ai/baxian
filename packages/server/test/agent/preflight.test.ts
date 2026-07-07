@@ -325,7 +325,7 @@ describe('runPreflight — auto mode', () => {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.startsWith('mkdir -p') && cmd.includes('.baxian/repos &&')) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/repos/user/repo/.git`) return FAIL;
+        if (cmd.includes('rev-parse --resolve-git-dir')) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -341,7 +341,7 @@ describe('runPreflight — auto mode', () => {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
         if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/repos/user/repo/.git`) return OK_EMPTY;
+        if (cmd.includes('rev-parse --resolve-git-dir')) return OK_EMPTY;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -349,6 +349,27 @@ describe('runPreflight — auto mode', () => {
     const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     const wd = results.find(r => r.step === 'workdir');
     expect(wd?.ok).toBe(true);
+  });
+
+  it('passes workdir for a bare managed store (no .git subdirectory)', async () => {
+    const probes: string[] = [];
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
+        if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
+        if (cmd.includes('rev-parse --resolve-git-dir')) {
+          probes.push(cmd);
+          return OK_EMPTY;
+        }
+        if (cmd === `test -d ~/.baxian/repos/user/repo/.git`) return FAIL;
+        if (cmd.startsWith('command -v')) return OK_PATH;
+        return OK_EMPTY;
+      }),
+    };
+    const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
+    const wd = results.find(r => r.step === 'workdir');
+    expect(wd?.ok).toBe(true);
+    expect(probes.length).toBeGreaterThan(0);
   });
 
   it('passes workdir when nothing exists yet (clone will create it)', async () => {
