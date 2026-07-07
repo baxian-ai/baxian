@@ -13,6 +13,7 @@ import {
 import { MAX_INLINE_CONTENT_BYTES } from '../../src/shared/index.js';
 import { LocalRunner } from '../../src/agent/runner.js';
 import type { ExecResult } from '../../src/agent/runner.js';
+import { GIT_NET_ENV, NET_EXEC_TIMEOUT_MS, __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
 import type { AgentConfig, TaskState } from '../../src/shared/index.js';
 
 const DEV: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
@@ -126,6 +127,80 @@ describe('readContent (code)', () => {
     await expect(transport.readContent(task(), DEV, 'code')).rejects.toThrow(
       expect.objectContaining({ reason }),
     );
+  });
+
+  it('runs the fetch under the network timeout with the low-speed guard', async () => {
+    const seen: Array<{ cmd: string; timeout?: number }> = [];
+    const runner = {
+      exec: async (cmd: string, options?: { timeout?: number }): Promise<ExecResult> => {
+        seen.push({ cmd, ...(options?.timeout !== undefined ? { timeout: options.timeout } : {}) });
+        if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      },
+      writeFile: async () => {},
+      execWithStdin: async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
+    };
+    const transport = new ReviewTransport({
+      createRunnerFor: () => runner,
+      resolveWorktree: () => '/wt/dev',
+    });
+    await transport.readContent(task(), DEV, 'code');
+    const fetch = seen.find(c => c.cmd.includes('git fetch origin'));
+    expect(fetch).toBeDefined();
+    expect(fetch!.cmd).toContain(`${GIT_NET_ENV} git fetch origin --quiet`);
+    expect(fetch!.timeout).toBe(NET_EXEC_TIMEOUT_MS);
+  });
+
+  it('retries a transient fetch failure before reading the diff', async () => {
+    __setNetExecSleepForTests(async () => {});
+    try {
+      let fetchAttempts = 0;
+      const runner = {
+        exec: async (cmd: string): Promise<ExecResult> => {
+          if (cmd.includes('git fetch origin')) {
+            fetchAttempts++;
+            return fetchAttempts === 1
+              ? { stdout: '', stderr: 'fatal: unable to access: Could not resolve host: github.com', exitCode: 128 }
+              : { stdout: '', stderr: '', exitCode: 0 };
+          }
+          if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n', stderr: '', exitCode: 0 };
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+        writeFile: async () => {},
+        execWithStdin: async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
+      };
+      const transport = new ReviewTransport({
+        createRunnerFor: () => runner,
+        resolveWorktree: () => '/wt/dev',
+      });
+      await expect(transport.readContent(task(), DEV, 'code')).resolves.toBeDefined();
+      expect(fetchAttempts).toBe(2);
+    } finally {
+      __setNetExecSleepForTests();
+    }
+  });
+
+  it('wraps an exec timeout rejection as fetch-failed', async () => {
+    __setNetExecSleepForTests(async () => {});
+    try {
+      const runner = {
+        exec: async (cmd: string): Promise<ExecResult> => {
+          if (cmd.includes('git fetch origin')) throw new Error('Command timed out after 60000ms');
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+        writeFile: async () => {},
+        execWithStdin: async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
+      };
+      const transport = new ReviewTransport({
+        createRunnerFor: () => runner,
+        resolveWorktree: () => '/wt/dev',
+      });
+      await expect(transport.readContent(task(), DEV, 'code')).rejects.toThrow(
+        expect.objectContaining({ reason: 'fetch-failed' }),
+      );
+    } finally {
+      __setNetExecSleepForTests();
+    }
   });
 });
 

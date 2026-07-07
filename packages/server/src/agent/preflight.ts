@@ -1,5 +1,6 @@
 import type { CommandRunner, RemoteShellMode } from './runner.js';
 import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshEnv } from './runner.js';
+import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
 import { isGitHubRepo, redactGitCredentials, repoSlug } from '../shared/index.js';
 import { nonGitHubSubpath } from './repo-store.js';
@@ -16,6 +17,21 @@ const CLI_BINARY: Record<AgentRuntime, string> = {
 };
 
 const PREFLIGHT_PROBE_TIMEOUT_MS = 5000;
+
+// Health checks must answer fast: a timeout is itself the diagnosis, so no retry,
+// and a timeout rejection becomes a failed step instead of aborting the preflight.
+const PREFLIGHT_NET = { timeout: GH_EXEC_TIMEOUT_MS, retries: 0 } as const;
+
+async function probeNetwork(
+  runner: CommandRunner,
+  cmd: string,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  try {
+    return await execNetwork(runner, cmd, PREFLIGHT_NET);
+  } catch (err) {
+    return { stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: 124 };
+  }
+}
 
 export function lastNonEmptyLine(s: string): string {
   const lines = s.split(/\r?\n/);
@@ -144,7 +160,7 @@ export async function runPreflight(
       message: ghCheck.exitCode === 0 ? 'GitHub CLI authenticated' : 'Run "gh auth login" or set GITHUB_TOKEN',
     });
 
-    const ghRepoCheck = await runner.exec(`gh api repos/${slug}`);
+    const ghRepoCheck = await probeNetwork(runner, `gh api repos/${slug}`);
     results.push({
       step: 'gh-repo',
       ok: ghRepoCheck.exitCode === 0,
@@ -175,7 +191,7 @@ async function runManualModePreflight(
   });
 
   const lsRemoteUrl = isGitHubRepo(repo) ? `https://github.com/${repoSlug(repo)}.git` : repo;
-  const gitCheck = await runner.exec(`git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
+  const gitCheck = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
   results.push({
     step: 'git',
     ok: gitCheck.exitCode === 0,
@@ -233,7 +249,7 @@ async function runAutoModePreflight(
   }
 
   if (!gh) {
-    const ls = await runner.exec(`git ls-remote ${shellQuote(repo)} HEAD`);
+    const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(repo)} HEAD`);
     results.push({
       step: 'git',
       ok: ls.exitCode === 0,
@@ -250,7 +266,7 @@ async function runAutoModePreflight(
   const lsRemoteUrl = protocol === 'ssh'
     ? `git@github.com:${slug}.git`
     : `https://github.com/${slug}.git`;
-  const ls = await runner.exec(`git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
+  const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
   results.push({
     step: 'git',
     ok: ls.exitCode === 0,

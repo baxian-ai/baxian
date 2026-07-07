@@ -1,12 +1,18 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { homedir } from 'node:os';
 import { RepoStore, createRepoStoreCache, nonGitHubSubpath, accessMethodDiffers, type RepoStoreCache } from '../../src/agent/repo-store.js';
-import { LocalRunner, type CommandRunner, type ExecResult } from '../../src/agent/runner.js';
+import { LocalRunner, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
+import {
+  CLONE_EXEC_TIMEOUT_MS,
+  GIT_NET_ENV,
+  NET_EXEC_TIMEOUT_MS,
+  __setNetExecSleepForTests,
+} from '../../src/agent/net-exec.js';
 
-type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
+type ExecMock = ReturnType<typeof vi.fn<(cmd: string, options?: ExecOptions) => Promise<ExecResult>>>;
 
 function makeRunner(handler: (cmd: string) => ExecResult): CommandRunner & { exec: ExecMock } {
-  return { exec: vi.fn(async (cmd: string) => handler(cmd)) };
+  return { exec: vi.fn(async (cmd: string, _options?: ExecOptions) => handler(cmd)) };
 }
 
 const OK: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
@@ -281,6 +287,128 @@ describe('RepoStore — mutex serialization', () => {
     const store2 = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
     await Promise.all([store1.ensure(), store2.ensure()]);
     expect(maxRunning).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('RepoStore — network resilience', () => {
+  let cache: RepoStoreCache;
+  beforeEach(() => {
+    cache = createRepoStoreCache();
+    __setNetExecSleepForTests(async () => {});
+  });
+  afterEach(() => {
+    __setNetExecSleepForTests();
+  });
+
+  const DNS_FAIL: ExecResult = {
+    stdout: '',
+    stderr: 'fatal: unable to access: Could not resolve host: github.com',
+    exitCode: 128,
+  };
+
+  it('runs gh repo clone under the clone timeout with the low-speed guard', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      return OK;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await store.ensure();
+    const clone = runner.exec.mock.calls.find(c => c[0].includes('gh repo clone'));
+    expect(clone).toBeDefined();
+    expect(clone![0].startsWith(`${GIT_NET_ENV} gh repo clone`)).toBe(true);
+    expect(clone![1]?.timeout).toBe(CLONE_EXEC_TIMEOUT_MS);
+  });
+
+  it('runs plain git clone under the clone timeout with the low-speed guard', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      return OK;
+    });
+    const store = new RepoStore(runner, 'git@git.example.com:team/repo.git', 'local', undefined, cache);
+    await store.ensure();
+    const clone = runner.exec.mock.calls.find(c => c[0].includes('git clone --bare'));
+    expect(clone).toBeDefined();
+    expect(clone![0].startsWith(`${GIT_NET_ENV} git clone --bare`)).toBe(true);
+    expect(clone![1]?.timeout).toBe(CLONE_EXEC_TIMEOUT_MS);
+  });
+
+  it('removes the partial directory when clone exits non-zero', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      if (cmd.includes('gh repo clone')) return { stdout: '', stderr: 'fatal: fetch failed', exitCode: 128 };
+      return OK;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).rejects.toThrow(/gh repo clone .* failed/);
+    const cmds = runner.exec.mock.calls.map(c => c[0]);
+    expect(cmds.some(c => c.startsWith('rm -rf ') && c.includes('/.baxian/repos/user/repo'))).toBe(true);
+  });
+
+  it('removes the partial directory when clone is killed by the exec timeout', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      if (cmd.includes('gh repo clone')) throw new Error('Command timed out after 600000ms');
+      return OK;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).rejects.toThrow(/timed out/);
+    const cmds = runner.exec.mock.calls.map(c => c[0]);
+    expect(cmds.some(c => c.startsWith('rm -rf ') && c.includes('/.baxian/repos/user/repo'))).toBe(true);
+  });
+
+  it('does not retry a clone that fails with a transient error', async () => {
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('test -d')) return FAIL;
+      if (cmd.startsWith('mkdir -p ')) return OK;
+      if (cmd.includes('gh repo clone')) return DNS_FAIL;
+      return OK;
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).rejects.toThrow();
+    const clones = runner.exec.mock.calls.filter(c => c[0].includes('gh repo clone'));
+    expect(clones).toHaveLength(1);
+  });
+
+  it('fetches under the default network timeout with the low-speed guard', async () => {
+    const runner = makeRunner(existingGitHubOriginAllOk);
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await store.ensure();
+    const fetch = runner.exec.mock.calls.find(c => c[0].includes('git fetch --all --prune'));
+    expect(fetch).toBeDefined();
+    expect(fetch![0]).toContain(`${GIT_NET_ENV} git fetch --all --prune`);
+    expect(fetch![1]?.timeout).toBe(NET_EXEC_TIMEOUT_MS);
+  });
+
+  it('retries a transient fetch failure and succeeds', async () => {
+    let fetchAttempts = 0;
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('git fetch --all --prune')) {
+        fetchAttempts++;
+        return fetchAttempts === 1 ? DNS_FAIL : OK;
+      }
+      return existingGitHubOriginAllOk(cmd);
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).resolves.toBeDefined();
+    expect(fetchAttempts).toBe(2);
+  });
+
+  it('fails fetch immediately on a non-transient error', async () => {
+    let fetchAttempts = 0;
+    const runner = makeRunner(cmd => {
+      if (cmd.includes('git fetch --all --prune')) {
+        fetchAttempts++;
+        return { stdout: '', stderr: 'fatal: Authentication failed', exitCode: 128 };
+      }
+      return existingGitHubOriginAllOk(cmd);
+    });
+    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).rejects.toThrow(/git fetch failed/);
+    expect(fetchAttempts).toBe(1);
   });
 });
 

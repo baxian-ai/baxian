@@ -104,6 +104,14 @@ function emitProjectTasks(projectId: string, tasks: TaskState[]): void {
   });
 }
 
+// The app shell always subscribes to topics like 'pollers'; notification gating
+// is only about project task streams.
+function taskSubscribeCalls(): unknown[][] {
+  return appMockState.subscribe.mock.calls.filter(
+    (call) => typeof call[0] === 'string' && call[0].startsWith('project-tasks:'),
+  );
+}
+
 function installNotificationMock(permission: NotificationPermission) {
   const instances: Array<{ title: string; options?: NotificationOptions; close: ReturnType<typeof vi.fn> }> = [];
   const requestPermission = vi.fn<() => Promise<NotificationPermission>>();
@@ -270,7 +278,7 @@ describe('Task completion notifications', () => {
 
     expect(screen.queryByText('Task completion notifications')).toBeNull();
     expect(screen.queryByRole('button', { name: 'Task completion notifications' })).toBeNull();
-    expect(appMockState.subscribe).not.toHaveBeenCalled();
+    expect(taskSubscribeCalls()).toHaveLength(0);
   });
 
   it('does not subscribe to project task streams when notifications are turned off via the stored preference', async () => {
@@ -281,7 +289,7 @@ describe('Task completion notifications', () => {
     render(<App />);
 
     await act(async () => { await Promise.resolve(); });
-    expect(appMockState.subscribe).not.toHaveBeenCalled();
+    expect(taskSubscribeCalls()).toHaveLength(0);
   });
 
   it('drops an in-flight completion confirmation when notifications are disabled before it resolves', async () => {
@@ -554,7 +562,7 @@ describe('Task completion notifications', () => {
     render(<App />);
 
     await act(async () => { await Promise.resolve(); });
-    expect(appMockState.subscribe).not.toHaveBeenCalled();
+    expect(taskSubscribeCalls()).toHaveLength(0);
 
     notification.MockNotification.permission = 'granted';
     act(() => {
@@ -581,7 +589,7 @@ describe('Task completion notifications', () => {
     render(<App />);
 
     await act(async () => { await Promise.resolve(); });
-    expect(appMockState.subscribe).not.toHaveBeenCalled();
+    expect(taskSubscribeCalls()).toHaveLength(0);
 
     act(() => {
       localStorage.setItem('baxian.taskNotifications.enabled', '1');

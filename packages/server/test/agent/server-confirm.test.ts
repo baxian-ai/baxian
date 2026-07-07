@@ -13,6 +13,7 @@ import { initStateDir } from '../../src/state/init.js';
 import type { AfterDone, BaxianConfig, MergeStrategy, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
+import { __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
 
 let tempDir: string;
 
@@ -290,7 +291,7 @@ describe('cancel a published gate cleans up the remote (pr / branch)', () => {
     await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
-    expect(execCalls.some(c => c.includes('gh pr close 12') && c.includes('--delete-branch'))).toBe(true);
+    expect(execCalls.some(c => c.includes('gh pr close 12'))).toBe(true);
   });
 
   it('cancel of a published branch gate deletes the remote branch', async () => {
@@ -310,7 +311,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
     const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes("'Escape'"));
-    const closeAt = execCalls.findIndex(c => c.includes('gh pr close 31') && c.includes('--delete-branch'));
+    const closeAt = execCalls.findIndex(c => c.includes('gh pr close 31'));
     expect(interruptAt).toBeGreaterThanOrEqual(0);
     expect(closeAt).toBeGreaterThan(interruptAt);
   });
@@ -374,7 +375,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' });
     await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
     await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close 12') && c.includes('--delete-branch'))).toBe(true);
+    expect(execCalls.some(c => c.includes('gh pr close 12'))).toBe(true);
     expect(hasCleanupSkippedEvent(events)).toBe(false);
   });
 
@@ -398,7 +399,7 @@ describe('merge-ready cancel, Call review mode guard, and confirm head guard', (
     const { manager, taskStore, execCalls } = await makeFixture('auto', null);
     await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 21 }));
     await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close 21') && c.includes('--delete-branch'))).toBe(true);
+    expect(execCalls.some(c => c.includes('gh pr close 21'))).toBe(true);
   });
 
   it('Call review refuses server-mode tasks parked at a gate (only in_progress/review/fixing dispatch)', async () => {
@@ -416,7 +417,7 @@ describe('merge-ready cancel, Call review mode guard, and confirm head guard', (
       const result = await manager.cancelTask('task-1');
 
       expect(result.status).toBe('cancelled');
-      expect(execCalls.some(c => c.includes('gh pr close 33') && c.includes('--delete-branch'))).toBe(true);
+      expect(execCalls.some(c => c.includes('gh pr close 33'))).toBe(true);
     },
   );
 
@@ -660,9 +661,78 @@ describe('ffMergeBranch failure branches (via confirm gate)', () => {
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes('post-merge branch delete failed'))).toBe(true);
     warnSpy.mockRestore();
   });
+
+  it('a post-merge delete finding the branch already gone stays silent (retried delete after a dropped response)', async () => {
+    const f = await ffFixture(cmd => {
+      if (cmd.includes('symbolic-ref')) return { stdout: 'origin/main\n' };
+      if (cmd.includes('rev-parse')) return { stdout: 'head123\n' };
+      if (cmd.includes('--delete')) return { exitCode: 1, stderr: 'error: unable to delete: remote ref does not exist' };
+      return {};
+    });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const result = await f.manager.markTaskComplete('task-1');
+    expect(result.status).toBe('merged');
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('post-merge branch delete failed'))).toBe(false);
+    warnSpy.mockRestore();
+  });
 });
 
 describe('cancel remote retirement failure tolerance', () => {
+  beforeEach(() => {
+    __setNetExecSleepForTests(async () => {});
+  });
+  afterEach(() => {
+    __setNetExecSleepForTests();
+  });
+
+  it('closes the PR and deletes the published branch as separate idempotent steps', async () => {
+    const { manager, taskStore, execCalls, events } = await makeFixture('auto', 'pr', () => ({}));
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    const closeCmd = execCalls.find(c => c.includes('gh pr close'));
+    expect(closeCmd).toBeDefined();
+    expect(closeCmd).not.toContain('--delete-branch');
+    const deleteCmd = execCalls.find(c => c.includes('git/refs/heads/bx/task-1'));
+    expect(deleteCmd).toBeDefined();
+    expect(deleteCmd).toContain('-X DELETE');
+    expect(events.some(e => e.type === 'human.intervention'
+      && e.data?.phase === 'cancel-published-artifact-cleanup-failed')).toBe(false);
+  });
+
+  it('emits cleanup-failed when the branch deletion keeps failing after the PR closed (no silent leak)', async () => {
+    const { manager, taskStore, events } = await makeFixture('auto', 'pr', cmd =>
+      cmd.includes('git/refs/heads/')
+        ? { exitCode: 1, stderr: 'dial tcp 20.205.243.166:443: i/o timeout' }
+        : {});
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    const failure = events.find(e => e.type === 'human.intervention'
+      && e.data?.phase === 'cancel-published-artifact-cleanup-failed');
+    expect(failure?.data).toMatchObject({ afterDone: 'pr', error: expect.stringContaining('timeout') });
+    warnSpy.mockRestore();
+  });
+
+  it('treats a published branch already gone on the remote as retired (no cleanup-failed)', async () => {
+    const { manager, taskStore, events } = await makeFixture('auto', 'pr', cmd =>
+      cmd.includes('git/refs/heads/')
+        ? { exitCode: 1, stderr: 'gh: Reference does not exist (HTTP 422)' }
+        : {});
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    expect(events.some(e => e.type === 'human.intervention'
+      && e.data?.phase === 'cancel-published-artifact-cleanup-failed')).toBe(false);
+  });
+
   it('emits cleanup-failed (still cancelled) when gh pr close fails', async () => {
     const { manager, taskStore, events } = await makeFixture('auto', 'pr', cmd =>
       cmd.includes('gh pr close') ? { exitCode: 1, stderr: 'PR already closed upstream' } : {});
@@ -692,5 +762,20 @@ describe('cancel remote retirement failure tolerance', () => {
       && e.data?.phase === 'cancel-published-artifact-cleanup-failed');
     expect(failure?.data).toMatchObject({ afterDone: 'branch', error: expect.stringContaining('protected') });
     warnSpy.mockRestore();
+  });
+
+  it('treats a branch that is already gone on the remote as retired (no cleanup-failed)', async () => {
+    const { manager, taskStore, agentStore, events } = await makeFixture('auto', 'branch', cmd =>
+      cmd.includes('--delete')
+        ? { exitCode: 1, stderr: 'error: unable to delete: remote ref does not exist' }
+        : {});
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', repoPath: '/repo/dev' });
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'branch', latestHeadSha: 'h1' }));
+
+    const result = await manager.cancelTask('task-1');
+
+    expect(result.status).toBe('cancelled');
+    expect(events.some(e => e.type === 'human.intervention'
+      && e.data?.phase === 'cancel-published-artifact-cleanup-failed')).toBe(false);
   });
 });

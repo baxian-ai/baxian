@@ -590,6 +590,58 @@ describe('AgentManager task binding flow', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
+  it('rollbackFailedDispatch with a reason emits a human.intervention naming the failure', async () => {
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await lockManager.acquire('dev-1');
+
+    await manager['rollbackFailedDispatch'](t.id, 'dev-1', {
+      phase: 'dispatch-rollback',
+      message: 'ensureWorkdir failed: git fetch failed: Could not resolve host',
+    });
+
+    expect((await taskStore.get(t.id))?.status).toBe('pending');
+    const intervention = events.find(
+      e => e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'dispatch-rollback',
+    );
+    expect(intervention).toBeDefined();
+    expect((intervention!.data as { message?: string }).message).toContain('Could not resolve host');
+  });
+
+  it('rollbackFailedDispatch stays silent when the task did not need rolling back', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+
+    await manager['rollbackFailedDispatch'](t.id, 'dev-1', {
+      phase: 'dispatch-rollback',
+      message: 'irrelevant',
+    });
+
+    expect(events.some(
+      e => e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'dispatch-rollback',
+    )).toBe(false);
+  });
+
+  it('createAndStartTask surfaces a non-terminal dispatch error as a dispatch-rollback intervention', async () => {
+    vi.spyOn(manager, 'startSession').mockRejectedValue(
+      new Error('ensureWorkdir failed: git fetch failed at /repo: Connection timed out'),
+    );
+
+    const created = await manager.createAndStartTask('proj', {
+      title: 'T', description: 'D', preferredAgentId: 'dev-1',
+    });
+
+    expect(created?.status).toBe('pending');
+    const intervention = events.find(
+      e => e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'dispatch-rollback',
+    );
+    expect(intervention).toBeDefined();
+    expect((intervention!.data as { message?: string }).message).toContain('Connection timed out');
+  });
+
   it('createAndStartTask skips rollbackFailedDispatch when startSession throws EnsureSessionError(handled=true)', async () => {
     const dialogErr = new EnsureSessionError(
       { createdSession: true, agentId: 'dev-1', dialogPending: true, handled: true },
@@ -2625,6 +2677,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
         execs.push(cmd);
         if (cmd.includes('rev-parse --verify --quiet origin/HEAD')) {
           return { stdout: originHeadExit === 0 ? 'abc123\n' : '', stderr: '', exitCode: originHeadExit };
+        }
+        if (cmd.includes('git rev-parse --verify') && cmd.includes('refs/remotes/origin/')) {
+          return { stdout: 'fetchedsha1\n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),

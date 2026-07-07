@@ -468,6 +468,8 @@ export const enUS = {
     preRestartFetchFailed: (detail: string) => `Failed to read startedAt before restart: ${detail}`,
     restartTriggerFailed: (detail: string) => `Failed to trigger restart: ${detail}`,
     restartTimeout: 'Restart timed out (30s with no recovery). Check the logs, or run baxian start -c <path> manually.',
+    githubDegraded: (repo: string) => `GitHub polling degraded for ${repo} — reviews and PR updates may lag until connectivity recovers`,
+    githubUnreachable: (repo: string) => `GitHub unreachable for ${repo} — task progress is paused and will resume automatically once connectivity recovers`,
   },
   terminal: {
     sessionEnded: 'Session ended',

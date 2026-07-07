@@ -7,6 +7,7 @@ import { Terminal } from './pages/terminal.tsx';
 import { ReviewRoundPage } from './pages/review-round.tsx';
 import { GithubReviewPage } from './pages/github-review.tsx';
 import { BrandToggle } from './components/brand-toggle.tsx';
+import { GithubConnectivityBanner } from './components/github-connectivity-banner.tsx';
 import { PendingRestartBanner } from './components/pending-restart-banner.tsx';
 import { taskDetailPath, taskStatusLabel } from './components/task-status.tsx';
 import { TOPBAR_ACTIONS_ID } from './components/topbar-actions.tsx';
@@ -207,6 +208,7 @@ function AppShell() {
         />
       </nav>
       <PendingRestartBanner />
+      <GithubConnectivityBanner />
       <main className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-6 sm:px-6">
         <Routes>
           <Route path="/" element={<Dashboard />} />

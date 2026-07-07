@@ -12,6 +12,7 @@ import { initStateDir } from '../../src/state/init.js';
 import type { BaxianConfig, BaxianEvent, ReviewMode, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
+import { __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
 
 let tempDir: string;
 beforeEach(async () => {
@@ -634,6 +635,30 @@ describe('findLineageViolation', () => {
       return { stdout: '', stderr: '', exitCode: 0 };
     });
     await expect(f.manager.findLineageViolation('task-1')).rejects.toThrow(/fetch/i);
+  });
+
+  it('retries a transient freshness fetch before self-resolving the base', async () => {
+    __setNetExecSleepForTests(async () => {});
+    try {
+      const f = await seedLineageFixture({});
+      let fetchAttempts = 0;
+      f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('fetch origin')) {
+          fetchAttempts++;
+          return fetchAttempts === 1
+            ? { stdout: '', stderr: 'fatal: unable to access: Could not resolve host: github.com', exitCode: 128 }
+            : { stdout: '', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('merge-base origin/HEAD HEAD')) return { stdout: 'base456\n', stderr: '', exitCode: 0 };
+        if (cmd.includes("rev-list 'base456..HEAD'")) return { stdout: '', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      const violation = await f.manager.findLineageViolation('task-1');
+      expect(violation).toBeNull();
+      expect(fetchAttempts).toBe(2);
+    } finally {
+      __setNetExecSleepForTests();
+    }
   });
 
   it('returns null when the dev agent has no recorded worktree', async () => {

@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { CommandRunner } from './runner.js';
 import { shellQuote } from './runner.js';
+import { GIT_NET_ENV, execNetwork } from './net-exec.js';
 import { BRANCH_PREFIX, WORKTREE_DIR } from '../shared/index.js';
 
 function uniqueSuffix(): string {
@@ -24,8 +25,9 @@ export class WorktreeManager {
       if (refCheck.exitCode === 0) {
         throw new Error(`Branch ${branch} already exists locally; use adopt to bind an existing branch`);
       }
-      const remoteCheck = await this.runner.exec(
-        `cd ${repo} && git ls-remote --heads origin -- ${shellQuote('refs/heads/' + branch)}`,
+      const remoteCheck = await execNetwork(
+        this.runner,
+        `cd ${repo} && ${GIT_NET_ENV} git ls-remote --heads origin -- ${shellQuote('refs/heads/' + branch)}`,
       );
       if (remoteCheck.exitCode !== 0) {
         throw new Error(
@@ -66,13 +68,14 @@ export class WorktreeManager {
     const repo = shellQuote(repoDir);
     const wt = shellQuote(worktreePath);
 
+    const fetchedSha = await this.fetchBranchTip(repoDir, remoteBranch, 'Failed to adopt branch');
     const result = await this.runner.exec(
-      `cd ${repo} && git fetch origin -- ${shellQuote(remoteBranch)} && git worktree add -b ${shellQuote(remoteBranch)} ${wt} FETCH_HEAD`,
+      `cd ${repo} && git worktree add -b ${shellQuote(remoteBranch)} ${wt} ${shellQuote(fetchedSha)}`,
     );
 
     if (result.exitCode !== 0) {
       if (result.stderr.includes('already exists')) {
-        await this.adoptExistingLocal(repoDir, worktreePath, remoteBranch);
+        await this.adoptExistingLocal(repoDir, worktreePath, remoteBranch, fetchedSha);
       } else {
         throw new Error(`Failed to adopt branch: ${result.stderr}`);
       }
@@ -91,7 +94,7 @@ export class WorktreeManager {
   }
 
   private async adoptExistingLocal(
-    repoDir: string, worktreePath: string, remoteBranch: string,
+    repoDir: string, worktreePath: string, remoteBranch: string, fetchedSha: string,
   ): Promise<void> {
     const repo = shellQuote(repoDir);
     const wt = shellQuote(worktreePath);
@@ -109,28 +112,24 @@ export class WorktreeManager {
     const localSha = await this.runner.exec(
       `cd ${repo} && git rev-parse ${shellQuote('refs/heads/' + remoteBranch)}`,
     );
-    const remoteSha = await this.runner.exec(
-      `cd ${repo} && git rev-parse FETCH_HEAD`,
-    );
-    if (localSha.exitCode !== 0 || remoteSha.exitCode !== 0) {
+    if (localSha.exitCode !== 0) {
       throw new Error('Failed to resolve branch SHAs for consistency check');
     }
     const local = localSha.stdout.trim();
-    const remote = remoteSha.stdout.trim();
 
-    if (local !== remote) {
+    if (local !== fetchedSha) {
       const mergeBase = await this.runner.exec(
-        `cd ${repo} && git merge-base --is-ancestor ${shellQuote('refs/heads/' + remoteBranch)} FETCH_HEAD`,
+        `cd ${repo} && git merge-base --is-ancestor ${shellQuote('refs/heads/' + remoteBranch)} ${shellQuote(fetchedSha)}`,
       );
       if (mergeBase.exitCode === 0) {
         const ff = await this.runner.exec(
-          `cd ${repo} && git update-ref ${shellQuote('refs/heads/' + remoteBranch)} FETCH_HEAD`,
+          `cd ${repo} && git update-ref ${shellQuote('refs/heads/' + remoteBranch)} ${shellQuote(fetchedSha)}`,
         );
         if (ff.exitCode !== 0) throw new Error(`Fast-forward failed: ${ff.stderr}`);
       } else {
         throw new Error(
           `Local branch ${remoteBranch} (${local.slice(0, 8)}) diverges from ` +
-          `remote (${remote.slice(0, 8)}); resolve manually before adopting`,
+          `remote (${fetchedSha.slice(0, 8)}); resolve manually before adopting`,
         );
       }
     }
@@ -143,10 +142,11 @@ export class WorktreeManager {
 
   async createDetached(repoDir: string, taskId: string, remoteBranch: string): Promise<string> {
     const worktreePath = `${repoDir}/${WORKTREE_DIR}/${taskId}-review_${uniqueSuffix()}`;
+    const fetchedSha = await this.fetchBranchTip(
+      repoDir, remoteBranch, 'Failed to create detached worktree',
+    );
     const result = await this.runner.exec(
-      `cd ${shellQuote(repoDir)} ` +
-        `&& git fetch origin -- ${shellQuote(remoteBranch)} ` +
-        `&& git worktree add --detach ${shellQuote(worktreePath)} FETCH_HEAD`,
+      `cd ${shellQuote(repoDir)} && git worktree add --detach ${shellQuote(worktreePath)} ${shellQuote(fetchedSha)}`,
     );
     if (result.exitCode !== 0) throw new Error(`Failed to create detached worktree: ${result.stderr}`);
     await this.excludeBaxianDir(repoDir, worktreePath);
@@ -155,9 +155,15 @@ export class WorktreeManager {
 
   async createDetachedAtBase(repoDir: string, taskId: string): Promise<string> {
     const worktreePath = `${repoDir}/${WORKTREE_DIR}/${taskId}-review_${uniqueSuffix()}`;
+    const fetch = await execNetwork(
+      this.runner,
+      `cd ${shellQuote(repoDir)} && ${GIT_NET_ENV} git fetch origin --quiet`,
+    );
+    if (fetch.exitCode !== 0) {
+      throw new Error(`Failed to create base-detached worktree: ${fetch.stderr}`);
+    }
     const result = await this.runner.exec(
       `cd ${shellQuote(repoDir)} ` +
-        `&& git fetch origin --quiet ` +
         `&& git worktree add --detach ${shellQuote(worktreePath)} "$(git symbolic-ref --short refs/remotes/origin/HEAD)"`,
     );
     if (result.exitCode !== 0) {
@@ -165,6 +171,34 @@ export class WorktreeManager {
     }
     await this.excludeBaxianDir(repoDir, worktreePath);
     return worktreePath;
+  }
+
+  // Fetch and worktree-add run as separate commands: the network half may be
+  // retried by execNetwork, and a retried compound would re-run the add and
+  // trip over the branch it created on the first pass. The fetch writes an
+  // explicit refspec into the branch's own remote-tracking ref — FETCH_HEAD is
+  // repo-global, so a concurrent fetch for another task could overwrite it
+  // between the two commands and redirect this worktree to the wrong branch.
+  private async fetchBranchTip(
+    repoDir: string, remoteBranch: string, errorPrefix: string,
+  ): Promise<string> {
+    const repo = shellQuote(repoDir);
+    const remoteRef = `refs/remotes/origin/${remoteBranch}`;
+    const fetch = await execNetwork(
+      this.runner,
+      `cd ${repo} && ${GIT_NET_ENV} git fetch origin -- ${shellQuote(`+refs/heads/${remoteBranch}:${remoteRef}`)}`,
+    );
+    if (fetch.exitCode !== 0) {
+      throw new Error(`${errorPrefix}: ${fetch.stderr}`);
+    }
+    const fetched = await this.runner.exec(
+      `cd ${repo} && git rev-parse --verify ${shellQuote(remoteRef)}`,
+    );
+    const sha = fetched.stdout.trim();
+    if (fetched.exitCode !== 0 || !sha) {
+      throw new Error(`${errorPrefix}: cannot resolve ${remoteRef}: ${fetched.stderr}`);
+    }
+    return sha;
   }
 
   private async excludeBaxianDir(repoDir: string, worktreePath: string): Promise<void> {

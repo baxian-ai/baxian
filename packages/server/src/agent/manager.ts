@@ -39,6 +39,7 @@ import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-s
 import { SkillRegistry } from '../skill/registry.js';
 import type { CommandRunner } from './runner.js';
 import { createRunner, LocalRunner, shellQuote, resolveAgentHost, hostGroupKey } from './runner.js';
+import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
 import { findForeignTaskTip, type LineageViolation } from './lineage.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
 import {
@@ -193,6 +194,7 @@ export interface AgentManagerDeps {
 
 const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
+const GH_NET = { timeout: GH_EXEC_TIMEOUT_MS, retries: 1 } as const;
 
 export interface TransitionResult {
   task: TaskState;
@@ -2576,8 +2578,10 @@ export class AgentManager {
   }
 
   private async ghCreatedAt(endpoint: string, jq: string): Promise<string[]> {
-    const result = await this.platformRunner.exec(
+    const result = await execNetwork(
+      this.platformRunner,
       `gh api --paginate ${shellQuote(endpoint)} --jq ${shellQuote(jq)}`,
+      GH_NET,
     );
     if (result.exitCode !== 0) {
       throw new Error(`gh api ${endpoint} failed: ${result.stderr || result.stdout}`);
@@ -2594,8 +2598,10 @@ export class AgentManager {
     if (!project) {
       throw new Error(`fetchPrHeadSha: unknown project ${task.projectId}`);
     }
-    const result = await this.platformRunner.exec(
+    const result = await execNetwork(
+      this.platformRunner,
       `gh pr view ${task.prNumber} --repo ${shellQuote(repoSlug(project.repo))} --json headRefOid --jq .headRefOid`,
+      GH_NET,
     );
     if (result.exitCode !== 0) {
       throw new Error(
@@ -2617,10 +2623,12 @@ export class AgentManager {
     if (!task || !task.branch) return undefined;
     const project = this.getProjectConfig(task.projectId);
     if (!project) return undefined;
-    const result = await this.platformRunner.exec(
+    const result = await execNetwork(
+      this.platformRunner,
       `gh pr view ${prNumber} --repo ${shellQuote(repoSlug(project.repo))} --json headRefName,headRefOid --jq '.headRefName + "\\t" + .headRefOid'`,
-    );
-    if (result.exitCode !== 0) return undefined;
+      GH_NET,
+    ).catch(() => undefined);
+    if (!result || result.exitCode !== 0) return undefined;
     const [headRefName, headSha] = result.stdout.trim().split('\t');
     if (!headRefName || !/^[0-9a-f]{40}$/i.test(headSha)) return undefined;
     if (headRefName !== task.branch) return undefined;
@@ -2633,8 +2641,10 @@ export class AgentManager {
   ): Promise<{ headRefName: string; headSha: string; body: string } | undefined> {
     const project = this.getProjectConfig(projectId);
     if (!project) return undefined;
-    const result = await this.platformRunner.exec(
+    const result = await execNetwork(
+      this.platformRunner,
       `gh pr view ${prNumber} --repo ${shellQuote(repoSlug(project.repo))} --json headRefName,headRefOid,body,state,isCrossRepository --jq '.headRefName + "\\t" + .headRefOid + "\\t" + .state + "\\t" + (.isCrossRepository | tostring) + "\\t" + .body'`,
+      GH_NET,
     );
     if (result.exitCode !== 0) {
       const stderr = result.stderr ?? '';
@@ -2783,7 +2793,12 @@ export class AgentManager {
     return this.repoCache;
   }
 
-  private async rollbackFailedDispatch(taskId: string, agentId: string): Promise<void> {
+  private async rollbackFailedDispatch(
+    taskId: string,
+    agentId: string,
+    reason?: { phase: string; message: string },
+  ): Promise<void> {
+    let rolledBack: { projectId: string } | null = null;
     await this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task) return;
@@ -2792,7 +2807,23 @@ export class AgentManager {
       task.status = 'pending';
       task.updatedAt = new Date().toISOString();
       await this.taskStore.set(task);
+      rolledBack = { projectId: task.projectId };
     });
+    if (rolledBack && reason) {
+      await this.safeEmit({
+        id: '',
+        type: 'human.intervention',
+        timestamp: new Date().toISOString(),
+        projectId: (rolledBack as { projectId: string }).projectId,
+        agentId,
+        taskId,
+        data: {
+          phase: reason.phase,
+          message: reason.message,
+          note: 'Dispatch failed; the task is back in pending — re-dispatch it once the cause is resolved.',
+        },
+      });
+    }
 
     const existing = await this.agentStore.get(agentId);
     if (existing && existing.taskId !== taskId) {
@@ -3118,7 +3149,10 @@ export class AgentManager {
       if (fresh && TERMINAL_STATUSES.includes(fresh.status) && (await this.agentStore.get(agentId))?.taskId === taskId) {
         await this.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true });
       } else {
-        await this.rollbackFailedDispatch(taskId, agentId);
+        await this.rollbackFailedDispatch(taskId, agentId, dispatchErr ? {
+          phase: 'dispatch-rollback',
+          message: dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr),
+        } : undefined);
       }
     }
     return (await this.taskStore.get(taskId)) ?? null;
@@ -3397,7 +3431,10 @@ export class AgentManager {
       await this.failTaskForDispatchError(claimed.id, 'develop', claimed.agentId, dispatchErr);
     } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
     } else {
-      await this.rollbackFailedDispatch(claimed.id, claimed.agentId);
+      await this.rollbackFailedDispatch(claimed.id, claimed.agentId, dispatchErr ? {
+        phase: 'dispatch-rollback',
+        message: dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr),
+      } : undefined);
     }
     const refreshed = await this.taskStore.get(claimed.id);
     if (dispatchErr === null) {
@@ -4505,19 +4542,40 @@ export class AgentManager {
       const project = this.getProjectConfig(result.projectId);
       try {
         if (publishedCleanup.afterDone === 'pr' && publishedCleanup.prNumber !== undefined && project) {
-          const close = await this.platformRunner.exec(
+          const close = await execNetwork(
+            this.platformRunner,
             `gh pr close ${publishedCleanup.prNumber} --repo ${shellQuote(repoSlug(project.repo))} ` +
-            `--comment ${shellQuote('Task cancelled in baxian; closing the published PR.')} --delete-branch`,
+            `--comment ${shellQuote('Task cancelled in baxian; closing the published PR.')}`,
+            GH_NET,
           );
           if (close.exitCode !== 0) throw new Error(close.stderr.trim() || close.stdout.trim());
+          // Branch deletion is a separate idempotent step, not `--delete-branch`:
+          // a retried close that finds the PR already closed exits 0 before gh's
+          // branch-deletion block, which would report success while leaking the
+          // published branch.
+          const refPath = `repos/${repoSlug(project.repo)}/git/refs/heads/` +
+            encodeURIComponent(publishedCleanup.branch).replace(/%2F/gi, '/');
+          const del = await execNetwork(
+            this.platformRunner,
+            `gh api -X DELETE ${shellQuote(refPath)}`,
+            GH_NET,
+          );
+          if (del.exitCode !== 0 && !del.stderr.includes('Reference does not exist')) {
+            throw new Error(del.stderr.trim() || del.stdout.trim());
+          }
         } else if (publishedCleanup.devAgentId) {
           const dev = this.getAgentConfig(publishedCleanup.devAgentId);
           const state = await this.agentStore.get(publishedCleanup.devAgentId);
           if (dev && state?.repoPath) {
-            const del = await this.createRunnerFor(dev).exec(
-              `cd ${shellQuote(state.repoPath)} && git push origin --delete ${shellQuote(publishedCleanup.branch)}`,
+            const del = await execNetwork(
+              this.createRunnerFor(dev),
+              `cd ${shellQuote(state.repoPath)} && ${GIT_NET_ENV} git push origin --delete ${shellQuote(publishedCleanup.branch)}`,
             );
-            if (del.exitCode !== 0) throw new Error(del.stderr.trim() || del.stdout.trim());
+            // The goal is "branch absent": a retried delete whose first round
+            // landed reports a missing remote ref, which is success, not failure.
+            if (del.exitCode !== 0 && !del.stderr.includes('remote ref does not exist')) {
+              throw new Error(del.stderr.trim() || del.stdout.trim());
+            }
           }
         }
       } catch (err) {
@@ -5249,8 +5307,12 @@ export class AgentManager {
     const matchHead = opts.matchHeadSha
       ? ` --match-head-commit ${shellQuote(opts.matchHeadSha)}`
       : '';
-    const result = await this.platformRunner.exec(
+    // A merge is not idempotent from the caller's view (user-triggered, retryable
+    // in the UI), so it gets a timeout but no automatic retry.
+    const result = await execNetwork(
+      this.platformRunner,
       `gh pr merge ${task.prNumber} --repo ${shellQuote(repoSlug(project.repo))}${matchHead} --squash --delete-branch`,
+      { retries: 0 },
     );
     if (result.exitCode !== 0) {
       throw new Error(
@@ -6437,8 +6499,9 @@ export class AgentManager {
       // Callers without a baseSha (publish) run long after the review diff was
       // read; refresh origin/HEAD first or upstream commits merged since then
       // would linger in base..HEAD and flag tasks that leak nothing.
-      const fetch = await runner.exec(
-        `git -C ${shellQuote(worktree)} fetch origin --quiet`,
+      const fetch = await execNetwork(
+        runner,
+        `${GIT_NET_ENV} git -C ${shellQuote(worktree)} fetch origin --quiet`,
       );
       if (fetch.exitCode !== 0) {
         throw new Error(`lineage fetch failed in ${worktree}: ${fetch.stderr.trim()}`);
@@ -6781,7 +6844,7 @@ export class AgentManager {
       if (db.exitCode !== 0 || defaultBranch === '') {
         throw new Error(`ffMergeBranch: cannot resolve default branch: ${db.stderr.trim() || 'empty origin/HEAD'}`);
       }
-      const fetch = await runner.exec(`${cd}git fetch origin`);
+      const fetch = await execNetwork(runner, `${cd}${GIT_NET_ENV} git fetch origin`);
       if (fetch.exitCode !== 0) {
         throw new Error(`ffMergeBranch [git fetch] failed: ${fetch.stderr.trim()}`);
       }
@@ -6796,14 +6859,18 @@ export class AgentManager {
       } else {
         throw new Error(`ffMergeBranch: no reviewed head recorded for task ${task.id}; cannot safely merge`);
       }
-      const push = await runner.exec(
-        `${cd}git push origin ${shellQuote(`origin/${branch}`)}:${shellQuote(defaultBranch)}`,
+      const push = await execNetwork(
+        runner,
+        `${cd}${GIT_NET_ENV} git push origin ${shellQuote(`origin/${branch}`)}:${shellQuote(defaultBranch)}`,
       );
       if (push.exitCode !== 0) {
         throw new Error(`ffMergeBranch [push] failed: ${push.stderr.trim() || push.stdout.trim()}`);
       }
-      const del = await runner.exec(`${cd}git push origin --delete ${shellQuote(branch)}`);
-      if (del.exitCode !== 0) {
+      const del = await execNetwork(
+        runner,
+        `${cd}${GIT_NET_ENV} git push origin --delete ${shellQuote(branch)}`,
+      );
+      if (del.exitCode !== 0 && !del.stderr.includes('remote ref does not exist')) {
         console.warn(
           `[AgentManager] ffMergeBranch: post-merge branch delete failed for ${branch}: ${del.stderr.trim() || del.stdout.trim()}`,
         );

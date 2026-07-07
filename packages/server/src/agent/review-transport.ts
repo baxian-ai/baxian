@@ -14,7 +14,8 @@ import {
   type TaskPhase,
   type TaskState,
 } from '../shared/index.js';
-import type { CommandRunner } from './runner.js';
+import type { CommandRunner, ExecResult } from './runner.js';
+import { GIT_NET_ENV, execNetwork } from './net-exec.js';
 
 
 export class ReviewExchangeError extends Error {
@@ -139,7 +140,15 @@ export class ReviewTransport {
       return { content: r.stdout };
     }
     const cd = `cd ${shellQuote(wt)} && `;
-    const fetch = await runner.exec(`${cd}git fetch origin --quiet`);
+    let fetch: ExecResult;
+    try {
+      fetch = await execNetwork(runner, `${cd}${GIT_NET_ENV} git fetch origin --quiet`);
+    } catch (err) {
+      throw new ReviewExchangeError(
+        'fetch-failed',
+        `git fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     if (fetch.exitCode !== 0) {
       throw new ReviewExchangeError('fetch-failed', `git fetch failed: ${fetch.stderr.trim()}`);
     }

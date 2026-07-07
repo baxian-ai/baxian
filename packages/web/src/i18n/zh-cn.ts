@@ -468,6 +468,8 @@ export const zhCN: Messages = {
     preRestartFetchFailed: (detail) => `获取重启前 startedAt 失败：${detail}`,
     restartTriggerFailed: (detail) => `触发重启失败：${detail}`,
     restartTimeout: '重启超时（30s 未恢复）。请检查日志或手动 baxian start -c <path>',
+    githubDegraded: (repo) => `GitHub 轮询降级（${repo}）——评审与 PR 更新可能延迟，连通恢复后自动跟上`,
+    githubUnreachable: (repo) => `GitHub 无法访问（${repo}）——任务推进暂停，连通恢复后自动继续`,
   },
   terminal: {
     sessionEnded: '会话已结束',

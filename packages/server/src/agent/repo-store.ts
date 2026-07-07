@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
-import type { CommandRunner } from './runner.js';
+import type { CommandRunner, ExecResult } from './runner.js';
 import { shellQuote, hostGroupKey } from './runner.js';
+import { CLONE_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
 import type { AgentMode, HostConfig } from '../shared/index.js';
 import { isGitHubRepo, isSafeGitHost, normalizeRepoUrl, parseGitRemote, redactGitCredentials, repoSlug } from '../shared/index.js';
 
@@ -90,14 +91,21 @@ export class RepoStore {
       if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent}: ${mk.stderr}`);
       // Bare store: no checkout for an agent REPL to contaminate — every task must
       // work through its own worktree, and stray git commands in the store dir fail.
-      const clone = this.isGitHub
-        ? await this.runner.exec(
-            `gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(absRepoPath)} --no-upstream -- --bare`,
-          )
-        : await this.runner.exec(
-            `git clone --bare ${shellQuote(this.repo)} ${shellQuote(absRepoPath)}`,
-          );
+      const cloneCmd = this.isGitHub
+        ? `${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(absRepoPath)} --no-upstream -- --bare`
+        : `${GIT_NET_ENV} git clone --bare ${shellQuote(this.repo)} ${shellQuote(absRepoPath)}`;
+      let clone: ExecResult;
+      try {
+        clone = await execNetwork(this.runner, cloneCmd, {
+          timeout: CLONE_EXEC_TIMEOUT_MS,
+          retries: 0,
+        });
+      } catch (err) {
+        await this.removeCloneRemnant(absRepoPath);
+        throw err;
+      }
       if (clone.exitCode !== 0) {
+        await this.removeCloneRemnant(absRepoPath);
         const cmd = this.isGitHub ? 'gh repo clone' : 'git clone';
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
@@ -190,11 +198,18 @@ export class RepoStore {
     return want !== null && got !== null && want.host === got.host && want.path === got.path;
   }
 
+  // A clone killed by the exec timeout dies mid-transfer and leaves a partial
+  // directory that the next ensure() would reject as "not a git repository".
+  private async removeCloneRemnant(absRepoPath: string): Promise<void> {
+    await this.runner.exec(`rm -rf ${shellQuote(absRepoPath)}`).catch(() => undefined);
+  }
+
   private async fetchIfStale(cacheKey: string, absRepoPath: string): Promise<void> {
     const last = this.cache.lastFetchAt.get(cacheKey) ?? 0;
     if (Date.now() - last < FETCH_THROTTLE_MS) return;
-    const result = await this.runner.exec(
-      `cd ${shellQuote(absRepoPath)} && git fetch --all --prune && (git remote set-head origin --auto || true)`,
+    const result = await execNetwork(
+      this.runner,
+      `cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} git fetch --all --prune && (git remote set-head origin --auto || true)`,
     );
     if (result.exitCode !== 0) {
       throw new Error(`git fetch failed at ${absRepoPath}: ${result.stderr}`);
