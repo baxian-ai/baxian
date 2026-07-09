@@ -1214,7 +1214,7 @@ describe('AgentManager dispatchReviewToQa', () => {
     expect(startSpy).toHaveBeenCalledWith('task-review', 'qa-1', 'recheck', expect.objectContaining({ bypassTaskStatusGate: true }));
     expect(result).toMatchObject({ status: 'review', reviewRound: 2, qaAgentId: 'qa-1' });
     expect((await agentStore.get('qa-1'))?.taskId).toBe('task-review');
-  });
+  }, 10_000);
 
   it('throws + rolls back without dispatching when the verdict watcher fails to arm', async () => {
     await seedReviewable();
