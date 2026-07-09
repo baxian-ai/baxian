@@ -73,7 +73,7 @@ jobs:
   validate:
     needs: validate-repository
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
@@ -113,7 +113,7 @@ jobs:
       - validate
     runs-on: ubuntu-latest
     environment: npm
-    timeout-minutes: 15
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
