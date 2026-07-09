@@ -18,7 +18,7 @@ export function notificationApi(): typeof Notification | null {
   return typeof candidate === 'function' ? candidate : null;
 }
 
-export function notificationPermission(): TaskNotificationPermission {
+function notificationPermission(): TaskNotificationPermission {
   const apiRef = notificationApi();
   return apiRef ? apiRef.permission : 'unsupported';
 }

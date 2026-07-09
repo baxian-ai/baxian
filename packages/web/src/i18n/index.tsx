@@ -5,7 +5,7 @@ import { enUS, type Messages } from './en-us.ts';
 import { zhCN } from './zh-cn.ts';
 
 const STORAGE_KEY = 'baxian.language';
-export const DEFAULT_LOCALE: SupportedLanguage = 'en-US';
+const DEFAULT_LOCALE: SupportedLanguage = 'en-US';
 const DICTS: Record<SupportedLanguage, Messages> = { 'en-US': enUS, 'zh-CN': zhCN };
 
 export type { Messages };

@@ -1,16 +1,17 @@
 import type { AgentRuntime, TaskStatus } from './types.js';
 
-export const AGENT_RUNTIME_LABELS: Record<AgentRuntime, string> = {
+const AGENT_RUNTIME_LABELS: Record<AgentRuntime, string> = {
   'claude-code': 'Claude Code',
   codex: 'Codex',
 };
 
-export function agentRuntimeLabel(runtime: AgentRuntime | undefined): string | null {
-  return runtime ? AGENT_RUNTIME_LABELS[runtime] : null;
+export function agentRuntimeLabel(runtime: AgentRuntime | undefined, model?: string): string | null {
+  const parts = [runtime ? AGENT_RUNTIME_LABELS[runtime] : null, model || null].filter(Boolean);
+  return parts.length > 0 ? parts.join(' · ') : null;
 }
 
-export function agentRuntimeTitle(id: string, runtime: AgentRuntime | undefined): string {
-  const label = agentRuntimeLabel(runtime);
+export function agentRuntimeTitle(id: string, runtime: AgentRuntime | undefined, model?: string): string {
+  const label = agentRuntimeLabel(runtime, model);
   return label ? `${id} (${label})` : id;
 }
 
@@ -41,8 +42,5 @@ export const REVIEW_VERDICT_TIMEOUT_MS = 10 * 60 * 1000;
 
 export const PET_ATLAS_WIDTH = 1536;
 export const PET_ATLAS_HEIGHT = 1872;
-export const PET_GRID_COLS = 8;
-export const PET_GRID_ROWS = 9;
 export const PET_CELL_WIDTH = 192;
 export const PET_CELL_HEIGHT = 208;
-export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;

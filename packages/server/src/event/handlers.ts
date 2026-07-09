@@ -93,9 +93,9 @@ async function fetchVerifiedHeadSha(manager: AgentManager, taskId: string): Prom
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-export const POST_APPROVE_REDISPATCH_CAP = 10;
+const POST_APPROVE_REDISPATCH_CAP = 10;
 
-export const VERDICT_FRESHNESS_SKEW_MS = 5000;
+const VERDICT_FRESHNESS_SKEW_MS = 5000;
 
 async function dispatchDevPostApproveCheck(
   bus: EventBus,
@@ -168,11 +168,6 @@ async function dispatchDevPostApproveCheck(
   });
 }
 
-async function isServerModeTask(manager: AgentManager, taskId: string): Promise<boolean> {
-  const task = await manager.getTask(taskId);
-  return task?.reviewMode === 'server';
-}
-
 async function gateDevForPostApproveRedispatch(
   bus: EventBus,
   manager: AgentManager,
@@ -232,8 +227,10 @@ async function handlePrMergeReady(
     return;
   }
 
-  const freshTask = await manager.getTask(taskNow.id);
-  const freshCompletion = await manager.getPostApproveCompletion(taskNow.id);
+  const [freshTask, freshCompletion] = await Promise.all([
+    manager.getTask(taskNow.id),
+    manager.getPostApproveCompletion(taskNow.id),
+  ]);
   if (
     !freshTask
     || freshTask.status !== 'approved'
@@ -910,16 +907,13 @@ export function registerEventHandlers(
 ): void {
   bus.on('pr.created', async (event) => {
     if (!event.taskId || !event.agentId) return;
-    if (await isServerModeTask(manager, event.taskId)) return;
-
-    {
-      const taskNow = await manager.getTask(event.taskId);
-      if (taskNow?.phase === 'spec') {
-        console.warn(
-          `[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`,
-        );
-        return;
-      }
+    const taskAtEntry = await manager.getTask(event.taskId);
+    if (taskAtEntry?.reviewMode === 'server') return;
+    if (taskAtEntry?.phase === 'spec') {
+      console.warn(
+        `[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`,
+      );
+      return;
     }
 
     let paneVerifiedHeadSha: string | undefined;
@@ -1147,19 +1141,17 @@ export function registerEventHandlers(
 
   bus.on('pr.updated', async (event) => {
     if (!event.taskId || !event.agentId) return;
-    if (await isServerModeTask(manager, event.taskId)) return;
+    const taskAtEntry = await manager.getTask(event.taskId);
+    if (taskAtEntry?.reviewMode === 'server') return;
 
     const eventKind = event.data.kind as
       | 'push' | 'comment' | 'review-comment' | 'pr-edit' | 'pr-merge-ready' | undefined;
 
-    if (eventKind !== 'pr-merge-ready') {
-      const taskNow = await manager.getTask(event.taskId);
-      if (taskNow?.phase === 'spec') {
-        console.warn(
-          `[EventHandler] pr.updated (kind=${eventKind ?? 'push'}) ignored for task ${event.taskId}: task in spec phase`,
-        );
-        return;
-      }
+    if (eventKind !== 'pr-merge-ready' && taskAtEntry?.phase === 'spec') {
+      console.warn(
+        `[EventHandler] pr.updated (kind=${eventKind ?? 'push'}) ignored for task ${event.taskId}: task in spec phase`,
+      );
+      return;
     }
 
     if (eventKind === 'pr-merge-ready') return handlePrMergeReady(bus, manager, event);
@@ -1227,11 +1219,11 @@ export function registerEventHandlers(
 
   bus.on('review.submitted', async (event) => {
     if (!event.taskId) return;
-    if (await isServerModeTask(manager, event.taskId)) return;
 
     const action = event.data.action as 'APPROVE' | 'REQUEST_CHANGES' | string;
     let task = await manager.getTask(event.taskId);
     if (!task) return;
+    if (task.reviewMode === 'server') return;
 
     {
       const terminalQaId = task.qaAgentId;

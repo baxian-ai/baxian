@@ -5,7 +5,8 @@ import type { ReviewRound } from '../../src/shared/index.js';
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
 import { api } from '../../src/api.ts';
-import { useReviewRounds } from '../../src/hooks/use-review-rounds.ts';
+import { useReviewRounds, reviewRevision } from '../../src/hooks/use-review-rounds.ts';
+import { makeTask } from '../helpers/fixtures.ts';
 
 const reviewsMock = vi.mocked(api.tasks.reviews);
 
@@ -63,5 +64,21 @@ describe('useReviewRounds', () => {
     resolveB([round(1, 'b')]);
     await waitFor(() => expect(result.current.loaded).toBe(true));
     expect(result.current.rounds?.[0].content).toBe('b');
+  });
+});
+
+describe('reviewRevision', () => {
+  it('defaults batch fields to -1 when absent', () => {
+    expect(reviewRevision(makeTask({ reviewRound: 2, status: 'review', phase: 'code' })))
+      .toBe('0:2:review:code:-1:-1');
+  });
+
+  it('encodes batch progress so advancing a batch changes the revision', () => {
+    const base = makeTask({ reviewRound: 1, status: 'review', phase: 'code', batchTotal: 3 });
+    const a = reviewRevision({ ...base, batchIndex: 0 });
+    const b = reviewRevision({ ...base, batchIndex: 1 });
+    expect(a).toBe('0:1:review:code:0:3');
+    expect(b).toBe('0:1:review:code:1:3');
+    expect(a).not.toBe(b);
   });
 });

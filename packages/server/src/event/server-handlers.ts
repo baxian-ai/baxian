@@ -2,6 +2,7 @@ import {
   DIFF_LARGE_THRESHOLD,
 } from '../shared/index.js';
 import type {
+  AgentConfig,
   BaxianEvent,
   Finding,
   ReviewFindings,
@@ -153,13 +154,18 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     if (!armed) await manager.holdAgentForUnarmedSignal(task.id, agentId, kind);
   }
 
-  async function autoApproveCode(task: TaskState): Promise<void> {
+  function resolveActiveQa(task: TaskState): AgentConfig | undefined {
+    const recorded = task.qaAgentId ? manager.getAgentConfig(task.qaAgentId) : undefined;
+    return recorded ?? manager.findQaPartner(task.agentId);
+  }
+
+  async function autoApproveCode(task: TaskState, entryKind: PhaseSignalKind = 'code-done'): Promise<void> {
     const afterDone = manager.resolveAfterDone(task);
     if (task.afterDone === undefined) {
       await manager.updateTask(task.id, { afterDone });
     }
     if (afterDone === null) {
-      const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['in_progress'] });
+      const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['in_progress', 'fixing'] });
       if (!ready) await emitIntervention(bus, task, { phase: 'server-code-auto-approve-transition-failed' });
       return;
     }
@@ -177,11 +183,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         phase: 'server-code-auto-approve-head-capture-failed',
         error: err instanceof Error ? err.message : String(err),
       });
-      await manager.setupPhaseSignal(task.id, task.agentId, 'code-done', { skipSnapshot: true });
+      await manager.setupPhaseSignal(task.id, task.agentId, entryKind, { skipSnapshot: true });
       return;
     }
     const approved = await manager.transitionTaskStatus(
-      task.id, 'approved', { fromStatus: ['in_progress'] },
+      task.id, 'approved', { fromStatus: ['in_progress', 'fixing'] },
       { reviewHeadAnchorSha },
     );
     if (!approved) {
@@ -306,6 +312,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       round: nextRound,
       phase: 'code',
       content: content.content,
+      headSha: reviewHeadAnchorSha,
       ...(content.diffstat ? { diffstat: content.diffstat } : {}),
       ...(content.baseSha ? { baseSha: content.baseSha } : {}),
       startedAt: new Date().toISOString(),
@@ -326,22 +333,43 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
     };
 
+    const resolveRecheckInterdiff = async (): Promise<string | undefined> => {
+      if (!opts.recheck) return undefined;
+      try {
+        const result = await manager.computeCodeInterdiff(task.id, nextRound);
+        return result.ok && result.diff.trim() !== '' ? result.diff : undefined;
+      } catch (err) {
+        console.warn(
+          `[ServerEventHandler] recheck interdiff unavailable for task ${task.id} round ${nextRound}; ` +
+          `dispatching full diff only: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return undefined;
+      }
+    };
+
     const lines = countLines(content.content);
     if (lines > DIFF_LARGE_THRESHOLD) {
       const batches = buildBatches(splitDiffByFile(content.content), DIFF_LARGE_THRESHOLD);
       if (batches.length > 1) {
         round.batchFindings = [];
         if (!(await putEntryRound(round))) return false;
-        return dispatchBatch(task.id, batches, 0, content.diffstat, { ...opts, reviewHeadAnchorSha });
+        const interdiff = await resolveRecheckInterdiff();
+        return dispatchBatch(task.id, batches, 0, content.diffstat, {
+          ...opts,
+          reviewHeadAnchorSha,
+          ...(interdiff ? { interdiff } : {}),
+        });
       }
     }
 
     if (!(await putEntryRound(round))) return false;
+    const interdiff = await resolveRecheckInterdiff();
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'code',
       recheck: opts.recheck,
       content: content.content,
       reviewHeadAnchorSha,
+      ...(interdiff ? { interdiff } : {}),
       ...(content.diffstat ? { diffstat: content.diffstat } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
@@ -354,7 +382,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     batches: DiffFile[][],
     index: number,
     diffstat: string | undefined,
-    opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string; reviewHeadAnchorSha?: string },
+    opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string; reviewHeadAnchorSha?: string; interdiff?: string },
   ): Promise<boolean> {
     const text = batches[index].map(f => f.text).join('\n');
     const dispatched = await manager.dispatchServerReviewToQa(taskId, {
@@ -365,6 +393,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(diffstat ? { diffstat } : {}),
       batch: { index, total: batches.length },
       ...(index === 0 && opts.reviewHeadAnchorSha ? { reviewHeadAnchorSha: opts.reviewHeadAnchorSha } : {}),
+      ...(index === 0 && opts.interdiff ? { interdiff: opts.interdiff } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
     });
@@ -379,8 +408,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'code', requireServerMode: true });
     if (!gated) return;
     const { task } = gated;
-    const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
-    if (!hasQa) {
+    if (!resolveActiveQa(task)) {
       await autoApproveCode(task);
       return;
     }
@@ -525,6 +553,19 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     await manager.dispatchServerFixToDev(task.id, JSON.stringify(findings));
   }
 
+  async function recheckCodeOrAutoApprove(
+    task: TaskState,
+    priorFindingsJson: string,
+    priorResponseJson: string,
+  ): Promise<boolean> {
+    // 无 QA（含循环中途配置被关闭）：修复提交后自动通过回 ready，人机循环闭合，不派 QA 复审
+    if (!resolveActiveQa(task)) {
+      await autoApproveCode(task, 'code-fixed');
+      return true;
+    }
+    return prepareAndDispatchCodeReview(task, { recheck: true, priorFindingsJson, priorResponseJson });
+  }
+
   async function runCodeFixSubmission(task: TaskState): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
@@ -560,11 +601,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
         return false;
       }
-      return prepareAndDispatchCodeReview(task, {
-        recheck: true,
-        priorFindingsJson: JSON.stringify(roundData.findings),
-        priorResponseJson: JSON.stringify(roundData.response),
-      });
+      return recheckCodeOrAutoApprove(
+        task,
+        JSON.stringify(roundData.findings),
+        JSON.stringify(roundData.response),
+      );
     }
     if (response.round !== round) {
       await emitIntervention(bus, task, {
@@ -592,11 +633,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     if (!(await putVerdictRound(task, dev.id, 'code-fixed', { ...roundData, response }))) return false;
     await transport().deleteResponse(dev);
 
-    return prepareAndDispatchCodeReview(task, {
-      recheck: true,
-      priorFindingsJson: JSON.stringify(roundData.findings),
-      priorResponseJson: JSON.stringify(response),
-    });
+    return recheckCodeOrAutoApprove(
+      task,
+      JSON.stringify(roundData.findings),
+      JSON.stringify(response),
+    );
   }
 
   bus.on('server.code.fix.submitted', async (event) => {
@@ -670,8 +711,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'any', requireServerMode: false });
     if (!gated) return;
     const { task } = gated;
-    const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
-    if (!hasQa && !specApprovalIsHuman(task)) {
+    if (!resolveActiveQa(task) && !specApprovalIsHuman(task)) {
       await autoApproveSpec(task);
       return;
     }
@@ -728,8 +768,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
       return false;
     }
-    const hasQa = !!(task.qaAgentId ?? manager.findQaPartner(task.agentId)?.id);
-    if (!hasQa) {
+    if (!resolveActiveQa(task)) {
       if (specApprovalIsHuman(task)) {
         const parked = await manager.parkTaskAtSpecReady(task.id, { specReviewRound: nextRound });
         if (!parked) await emitIntervention(bus, task, { phase: 'server-spec-park-transition-failed' });

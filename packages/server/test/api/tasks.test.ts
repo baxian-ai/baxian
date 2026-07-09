@@ -536,6 +536,47 @@ describe('POST /api/tasks/:id/spec', () => {
   });
 });
 
+describe('POST /api/tasks/:id/code', () => {
+  it('202 request-changes passes comments through', async () => {
+    const updated = makeTask({ id: 'task-001', status: 'fixing' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict').mockResolvedValue(updated);
+
+    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: '这里漏了空态处理' });
+
+    expect(response.statusCode).toBe(202);
+    expect(spy).toHaveBeenCalledWith('task-001', '这里漏了空态处理');
+  });
+
+  it('non-request-changes verdict → 400 pointing at /complete, manager untouched', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict');
+    const response = await post('/api/tasks/task-001/code', { verdict: 'approve', comments: 'x' });
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/complete/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('empty comments → 400 without touching the manager', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict');
+    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: '   ' });
+    expect(response.statusCode).toBe(400);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('non-string comments → 400 without touching the manager', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict');
+    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: 123 });
+    expect(response.statusCode).toBe(400);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('round cap → 409 pass-through', async () => {
+    vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict')
+      .mockRejectedValue(new ApiError(409, 'Task task-001 has reached the code review round cap (2); confirm completion, or cancel the task'));
+    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: '还差点' });
+    expect(response.statusCode).toBe(409);
+  });
+});
+
 describe('POST /api/tasks/:id/continue', () => {
   it('202 with updated task; manager.continueDevRound invoked with the id', async () => {
     const updated = makeTask({ id: 'task-001', status: 'fixing', reviewRound: 3 });
@@ -833,6 +874,39 @@ describe('server review mode API', () => {
     const response = await get('/api/tasks/task-r/reviews');
     const rounds = JSON.parse(response.body) as Array<{ phase: string; round: number }>;
     expect(rounds.map(r => `${r.phase}-${r.round}`)).toEqual(['spec-1', 'code-1']);
+  });
+
+  it('GET .../reviews/code/:round/interdiff → 200 { diff }; manager called with (id, round)', async () => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
+      .mockResolvedValue({ ok: true, diff: 'PATCH-BODY' });
+    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({ diff: 'PATCH-BODY' });
+    expect(spy).toHaveBeenCalledWith('task-r', 2);
+  });
+
+  it('interdiff → 404 when no-anchor (historical round without headSha)', async () => {
+    vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
+      .mockResolvedValue({ ok: false, reason: 'no-anchor' });
+    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
+    expect(response.statusCode).toBe(404);
+    expect(JSON.parse(response.body).error).toBeTruthy();
+  });
+
+  it('interdiff → 409 when the dev worktree is released', async () => {
+    vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
+      .mockResolvedValue({ ok: false, reason: 'released' });
+    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/工作区已释放/);
+  });
+
+  it('interdiff → 500 when the manager throws', async () => {
+    vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
+      .mockRejectedValue(new Error('git exploded'));
+    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/git exploded/);
   });
 
   it('POST /api/tasks/:id/complete confirms a ready task to done', async () => {

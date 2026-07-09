@@ -24,6 +24,8 @@ export interface ErrorRecord extends Required<Omit<ErrorRecordInput, 'taskId' | 
 
 export class ErrorRecordStore {
   private chain: Promise<unknown> = Promise.resolve();
+  // reads dominate (every per-agent snapshot publish re-reads); this store is the dir's single writer
+  private cache: ErrorRecord[] | null = null;
 
   constructor(private dir: string) {}
 
@@ -43,6 +45,7 @@ export class ErrorRecordStore {
         ...(input.recommendation ? { recommendation: input.recommendation } : {}),
       };
       await appendFile(join(this.dir, `${occurredAt.slice(0, 10)}.jsonl`), JSON.stringify(record) + '\n');
+      this.cache?.push(record);
       return record;
     });
     this.chain = write.catch(() => undefined);
@@ -106,6 +109,7 @@ export class ErrorRecordStore {
     shouldDrop: (record: ErrorRecord) => boolean;
   }): Promise<{ removed: number }> {
     const result = this.chain.then(async () => {
+      this.cache = null;
       let files: string[];
       try {
         files = await readdir(this.dir);
@@ -168,7 +172,19 @@ export class ErrorRecordStore {
     };
   }
 
-  private async readAll(): Promise<ErrorRecord[]> {
+  // the cache fill rides the write chain so an in-flight append lands on disk
+  // before the first read snapshots it — a plain fill could miss it forever
+  private readAll(): Promise<ErrorRecord[]> {
+    if (this.cache) return Promise.resolve(this.cache);
+    const load = this.chain.then(async () => {
+      this.cache ??= await this.loadFromDisk();
+      return this.cache;
+    });
+    this.chain = load.catch(() => undefined);
+    return load;
+  }
+
+  private async loadFromDisk(): Promise<ErrorRecord[]> {
     let files: string[];
     try {
       files = await readdir(this.dir);

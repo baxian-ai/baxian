@@ -4,7 +4,6 @@ import {
   resolveAgentHost,
   hostGroupKey,
   sshTarget,
-  buildSshArgs,
   buildSshOptions,
   sshEnv,
 } from '../../src/agent/runner.js';
@@ -55,24 +54,22 @@ describe('sshTarget', () => {
   });
 });
 
-describe('buildSshArgs / buildSshOptions', () => {
+describe('buildSshOptions', () => {
   it('key host: BatchMode=yes + explicit -p port, no password flags', () => {
-    const args = buildSshArgs(KEY_HOST);
-    expect(args).toContain('BatchMode=yes');
-    expect(args).toContain('-p');
-    expect(args).toContain('2222');
-    expect(args).not.toContain('PreferredAuthentications=password,keyboard-interactive');
+    const opts = buildSshOptions(KEY_HOST);
+    expect(opts).toContain('-o BatchMode=yes');
+    expect(opts).toContain('-p 2222');
+    expect(opts).not.toContain('PreferredAuthentications=password,keyboard-interactive');
   });
 
   it('password host: drops BatchMode, allows password auth + accept-new host key', () => {
-    const args = buildSshArgs(PW_HOST);
-    expect(args).not.toContain('BatchMode=yes');
-    expect(args).toContain('PreferredAuthentications=password,keyboard-interactive');
-    expect(args).toContain('StrictHostKeyChecking=accept-new');
+    const opts = buildSshOptions(PW_HOST);
+    expect(opts).not.toContain('BatchMode=yes');
+    expect(opts).toContain('PreferredAuthentications=password,keyboard-interactive');
+    expect(opts).toContain('StrictHostKeyChecking=accept-new');
   });
 
-  it('never leaks the password into the ssh args/option string (env-only, not argv)', () => {
-    expect(buildSshArgs(PW_HOST).join(' ')).not.toContain('hunter2');
+  it('never leaks the password into the ssh option string (env-only, not argv)', () => {
     expect(buildSshOptions(PW_HOST)).not.toContain('hunter2');
   });
 
@@ -89,12 +86,10 @@ describe('buildSshArgs / buildSshOptions', () => {
   });
 
   it('emits -p when the host supplies a port', () => {
-    expect(buildSshArgs({ hostname: 'h', port: 22 })).toContain('-p');
     expect(buildSshOptions({ hostname: 'h', port: 22 })).toContain('-p 22');
   });
 
   it('omits -p for a host without a port, so ~/.ssh/config Port is honored', () => {
-    expect(buildSshArgs({ hostname: 'h' })).not.toContain('-p');
     expect(buildSshOptions({ hostname: 'h' })).not.toContain('-p ');
   });
 });

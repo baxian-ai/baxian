@@ -1,9 +1,10 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import type { Finding, FindingResponse, FindingSeverity, ReviewRound } from '../shared/index.js';
 import { useTask } from '../hooks/use-events.ts';
-import { useReviewRounds } from '../hooks/use-review-rounds.ts';
-import { DiffView } from '../components/diff-view.tsx';
+import { useReviewRounds, reviewRevision } from '../hooks/use-review-rounds.ts';
+import { DiffView, parseDiffFiles, type DiffExpandRequest } from '../components/diff-view.tsx';
+import { useInterdiff, type InterdiffUnavailableReason } from '../hooks/use-interdiff.ts';
 import { useT } from '../i18n/index.tsx';
 
 const SEVERITY_CLASS: Record<FindingSeverity, string> = {
@@ -35,9 +36,7 @@ export function ReviewRoundPage() {
   const navigate = useNavigate();
   const { hash } = useLocation();
   const { data: task } = useTask(taskId);
-  const revision = task
-    ? `${task.specReviewRound ?? 0}:${task.reviewRound}:${task.status}:${task.phase ?? 'code'}`
-    : undefined;
+  const revision = task ? reviewRevision(task) : undefined;
   const { rounds, loaded, error } = useReviewRounds(taskId, revision);
 
   const roundNum = Number(round);
@@ -82,32 +81,154 @@ export function ReviewRoundPage() {
       {loaded && !error && !data && (
         <div className="text-sm text-accent">{t.review.roundNotFound(phase, round)}</div>
       )}
-      {data && <RoundDetail round={data} />}
+      {data && <RoundDetail key={`${taskId}:${phase}:${roundNum}`} round={data} taskId={taskId} />}
     </div>
   );
 }
 
-function RoundDetail({ round }: { round: ReviewRound }) {
+function RoundDetail({ round, taskId }: { round: ReviewRound; taskId: string }) {
   const t = useT();
-  const findings = round.findings?.findings ?? [];
+  const canInterdiff = round.phase === 'code' && round.round >= 2;
+  const [viewMode, setViewMode] = useState<'full' | 'interdiff'>('full');
+  const inter = useInterdiff(taskId, round.round, canInterdiff && viewMode === 'interdiff');
+  const showInterdiff = canInterdiff && viewMode === 'interdiff' && inter.status === 'ready';
+  const interdiffPending = canInterdiff && viewMode === 'interdiff' && inter.status === 'loading';
+  const fullActive = !showInterdiff && !interdiffPending;
+
+  function interdiffReasonText(reason: InterdiffUnavailableReason): string {
+    if (reason === 'historical') return t.review.interdiffUnavailableHistorical;
+    if (reason === 'released') return t.review.interdiffUnavailableReleased;
+    return t.review.interdiffUnavailableGeneric;
+  }
+
   const responses = round.response?.responses ?? [];
+  // Pre-aggregation, each batch's finding ids are only unique within the batch; prefix
+  // with the server's own b{i}- scheme so DOM anchors and gutter jumps stay unambiguous.
+  const batchFindings = useMemo(
+    () => (round.batchFindings ?? [])
+      .filter(Boolean)
+      .map((b, i) => b.findings.map((f) => ({ ...f, id: /^b\d+-/.test(f.id) ? f.id : `b${i}-${f.id}` }))),
+    [round.batchFindings],
+  );
+  const findings = round.findings?.findings ?? [];
   const findingById = new Map(findings.map((f) => [f.id, f]));
+
+  const sectionFiles = useMemo(
+    () => new Set(parseDiffFiles(round.content).map((s) => s.file)),
+    [round.content],
+  );
+  const diffFindings = useMemo(
+    () => (round.findings?.findings ?? batchFindings.flat()),
+    [round.findings, batchFindings],
+  );
+
+  const [expandReq, setExpandReq] = useState<DiffExpandRequest | undefined>();
+  const [flashFinding, setFlashFinding] = useState<{ id: string; nonce: number } | null>(null);
+
+  useEffect(() => {
+    if (!flashFinding) return;
+    document.getElementById(`finding-${flashFinding.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const timer = setTimeout(() => setFlashFinding(null), 2000);
+    return () => clearTimeout(timer);
+  }, [flashFinding]);
+
+  const jumpToDiff = (f: Finding) => {
+    if (!f.file) return;
+    setExpandReq((prev) => ({ file: f.file!, line: f.line, nonce: (prev?.nonce ?? 0) + 1 }));
+  };
+  const flashFindingCard = (id: string) => setFlashFinding((prev) => ({ id, nonce: (prev?.nonce ?? 0) + 1 }));
+
+  function locationEl(f: Finding) {
+    const loc = findingLocation(f);
+    if (!loc) return null;
+    if (f.file && sectionFiles.has(f.file)) {
+      return (
+        <button
+          type="button"
+          onClick={() => jumpToDiff(f)}
+          className="min-w-0 break-all font-mono text-xs text-accent hover:underline"
+        >
+          {loc}
+        </button>
+      );
+    }
+    return (
+      <span
+        title={f.file ? t.review.locationNotInDiff : undefined}
+        className="min-w-0 break-all font-mono text-xs text-og-500"
+      >
+        {loc}
+      </span>
+    );
+  }
+
+  function findingCard(f: Finding) {
+    return (
+      <div
+        key={f.id}
+        id={`finding-${f.id}`}
+        className={`card p-3 text-sm ${flashFinding?.id === f.id ? 'ring-2 ring-accent' : ''}`}
+      >
+        <div className="mb-1 flex flex-wrap items-center gap-2">
+          <span className="font-mono text-og-400">{f.id}</span>
+          <span className={SEVERITY_CLASS[f.severity]}>{f.severity}</span>
+          {f.id.startsWith('u-') && <span className="pill pill-warn">{t.review.roleUser}</span>}
+          {locationEl(f)}
+        </div>
+        <div className="whitespace-pre-wrap break-words text-og-800">{f.message}</div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
       <section id="diff">
-        <h2 className="mb-2 text-sm font-semibold text-og-800">
-          {round.phase === 'spec' ? t.review.specDraft : t.review.codeChanges}
-        </h2>
-        {round.contentTruncated && (
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold text-og-800">
+            {round.phase === 'spec' ? t.review.specDraft : t.review.codeChanges}
+          </h2>
+          {canInterdiff && (
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setViewMode('full')}
+                className={`btn-ghost px-2 py-0.5 text-xs ${fullActive ? 'text-accent' : ''}`}
+              >
+                {t.review.viewFull}
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('interdiff')}
+                disabled={inter.status === 'unavailable'}
+                title={inter.status === 'unavailable' ? interdiffReasonText(inter.reason) : undefined}
+                className={`btn-ghost px-2 py-0.5 text-xs ${showInterdiff || interdiffPending ? 'text-accent' : ''}`}
+              >
+                {t.review.viewInterdiff}
+              </button>
+            </div>
+          )}
+        </div>
+        {round.contentTruncated && fullActive && (
           <div className="mb-2 text-xs text-accent">{t.review.contentTruncated}</div>
         )}
-        {round.content ? (
-          round.phase === 'spec' ? (
+        {round.phase === 'spec' ? (
+          round.content ? (
             <pre className="card whitespace-pre-wrap break-words p-4 text-sm text-og-800">{round.content}</pre>
           ) : (
-            <DiffView content={round.content} diffstat={round.diffstat} />
+            <div className="text-sm text-og-400">{t.review.noContent}</div>
           )
+        ) : interdiffPending ? (
+          <div className="text-sm text-og-500">{t.review.interdiffLoading}</div>
+        ) : showInterdiff ? (
+          <DiffView content={inter.diff} />
+        ) : round.content ? (
+          <DiffView
+            content={round.content}
+            diffstat={round.diffstat}
+            findings={diffFindings}
+            onFindingClick={flashFindingCard}
+            expandRequest={expandReq}
+          />
         ) : (
           <div className="text-sm text-og-400">{t.review.noContent}</div>
         )}
@@ -116,24 +237,24 @@ function RoundDetail({ round }: { round: ReviewRound }) {
       <section id="review">
         <h2 className="mb-2 text-sm font-semibold text-og-800">{t.review.qaReviewHeading}</h2>
         {round.findings === undefined ? (
-          <div className="text-sm text-og-400">{t.review.notSubmitted}</div>
+          batchFindings.length > 0 ? (
+            <div className="space-y-3">
+              {batchFindings.map((batch, i) => (
+                <div key={i} className="space-y-2">
+                  <div className="text-xs text-og-500">{t.review.batchPartialHeading(i + 1)}</div>
+                  {batch.length === 0
+                    ? <div className="text-sm text-og-400">{t.review.noFindingsThisRound}</div>
+                    : batch.map(findingCard)}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-og-400">{t.review.notSubmitted}</div>
+          )
         ) : findings.length === 0 ? (
           <div className="text-sm text-og-400">{t.review.noFindingsThisRound}</div>
         ) : (
-          <div className="space-y-2">
-            {findings.map((f) => (
-              <div key={f.id} className="card p-3 text-sm">
-                <div className="mb-1 flex flex-wrap items-center gap-2">
-                  <span className="font-mono text-og-400">{f.id}</span>
-                  <span className={SEVERITY_CLASS[f.severity]}>{f.severity}</span>
-                  {findingLocation(f) && (
-                    <span className="min-w-0 break-all font-mono text-xs text-og-500">{findingLocation(f)}</span>
-                  )}
-                </div>
-                <div className="whitespace-pre-wrap break-words text-og-800">{f.message}</div>
-              </div>
-            ))}
-          </div>
+          <div className="space-y-2">{findings.map(findingCard)}</div>
         )}
       </section>
 

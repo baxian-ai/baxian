@@ -188,6 +188,68 @@ describe('recover()', () => {
     expect(canDispatchWithBinding(state)).toBe(true);
   });
 
+  it('redrives context compaction for a recovered done-task binding (terminal without pr)', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0' });
+    await seedTask({ id: 'task-done', reviewMode: 'server', status: 'done' });
+    mockEnsureSessionOk();
+    let paneIdSeenByCompaction: string | undefined;
+    const compactSpy = vi.spyOn(
+      manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
+      'runPostMergeCompaction',
+    ).mockImplementation(async (_tmux, _paneId, agentId, taskId) => {
+      paneIdSeenByCompaction = (await agentStore.get(agentId as string))?.paneId;
+      await manager.releaseAgentForTask(agentId as string, taskId as string, 'idle');
+    });
+
+    await manager.recover();
+
+    await vi.waitFor(async () => {
+      expect(compactSpy).toHaveBeenCalled();
+      expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    });
+    expect(paneIdSeenByCompaction).toBe('%1');
+    expect(compactSpy.mock.calls[0]?.[2]).toBe('dev-1');
+    expect(compactSpy.mock.calls[0]?.[3]).toBe('task-done');
+  });
+
+  it('redrives context compaction for a recovered merged binding without a PR (branch merge)', async () => {
+    await seedAgent({ id: 'qa-1', taskId: 'task-branch-merged', paneId: '%0' });
+    await seedTask({
+      id: 'task-branch-merged', reviewMode: 'server', status: 'merged',
+      preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1',
+    });
+    mockEnsureSessionOk();
+    const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
+    const compactSpy = vi.spyOn(
+      manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
+      'runPostMergeCompaction',
+    ).mockImplementation(async (_tmux, _paneId, agentId, taskId) => {
+      await manager.releaseAgentForTask(agentId as string, taskId as string, 'idle');
+    });
+
+    await manager.recover();
+
+    await vi.waitFor(async () => {
+      expect(compactSpy).toHaveBeenCalled();
+      expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    });
+    expect(cleanupSpy).not.toHaveBeenCalled();
+  });
+
+  it('releases a recovered cancelled-task binding without compaction', async () => {
+    await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-gone', paneId: '%0' }],
+      tasks: [{ id: 'task-gone', status: 'cancelled' }],
+    });
+    const compactSpy = vi.spyOn(
+      manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
+      'runPostMergeCompaction',
+    );
+
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(compactSpy).not.toHaveBeenCalled();
+  });
+
   it('preserves Held state (status=awaiting_human + awaitingPhase/Reason/Since) when recovering an ack_unknown agent with active bound task', async () => {
     await runRecovery({
       agents: [{

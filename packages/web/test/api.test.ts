@@ -150,6 +150,13 @@ describe('request contract per endpoint', () => {
     { name: 'tasks.review', run: () => api.tasks.review('t-1'), url: '/api/tasks/t-1/review', method: 'POST' },
     { name: 'tasks.complete', run: () => api.tasks.complete('t-1'), url: '/api/tasks/t-1/complete', method: 'POST' },
     { name: 'tasks.continue', run: () => api.tasks.continue('t-1'), url: '/api/tasks/t-1/continue', method: 'POST' },
+    {
+      name: 'tasks.code',
+      run: () => api.tasks.code('t-1', { verdict: 'request-changes', comments: '打回' }),
+      url: '/api/tasks/t-1/code',
+      method: 'POST',
+      body: { verdict: 'request-changes', comments: '打回' },
+    },
     { name: 'tasks.reviews', run: () => api.tasks.reviews('t-1'), url: '/api/tasks/t-1/reviews' },
     { name: 'tasks.githubReview', run: () => api.tasks.githubReview('t-1'), url: '/api/tasks/t-1/github-review' },
     {

@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import { AlertTriangleIcon, CheckCircleIcon, XCircleIcon } from './icons.tsx';
 import { useT } from '../i18n/index.tsx';
 
-export type ToastKind = 'success' | 'warn' | 'error';
+type ToastKind = 'success' | 'warn' | 'error';
 
 interface ToastInput {
   kind: ToastKind;

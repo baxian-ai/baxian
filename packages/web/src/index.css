@@ -109,32 +109,24 @@
   .pill-idle::before {
     @apply bg-og-200;
   }
+  /* Stale = hollow outline, not opacity: dimming the whole pill drops text contrast below WCAG AA. */
+  .pill--stale {
+    @apply border border-dashed border-current bg-transparent;
+  }
+
+  .finding-dot {
+    @apply inline-block h-2 w-2 rounded-full bg-og-300 align-middle;
+  }
+  .finding-dot-critical {
+    @apply bg-danger;
+  }
+  .finding-dot-major {
+    @apply bg-warn;
+  }
 
   .card {
     @apply rounded-lg border border-hairline bg-surface transition-colors hover:border-og-100;
   }
-
-  .status-dot {
-    @apply inline-block h-[0.725rem] w-[0.725rem] shrink-0 rounded-full bg-og-50;
-  }
-  /* Attention dots pulse twice then hold steady: WCAG 2.2.2 forbids >5s of looping motion. */
-  .status-dot--warn {
-    @apply bg-warn;
-    animation: breathe 1.8s ease-in-out 2;
-  }
-  .status-dot--danger {
-    @apply bg-danger;
-    animation: breathe 1.8s ease-in-out 2;
-  }
-  .status-dot--info {
-    @apply bg-accent;
-    animation: breathe 1.8s ease-in-out 2;
-  }
-}
-
-@keyframes breathe {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
 }
 
 @layer utilities {

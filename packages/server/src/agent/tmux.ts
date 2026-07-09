@@ -2,11 +2,10 @@ import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
 import { shellQuote, SshRunner } from './runner.js';
 import { isHorizontalRule } from './detect/region.js';
+import { MAX_PROMPT_BYTES } from './prompt.js';
 
 const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<ExecResult> =>
   runner['exec'](cmd, opts);
-
-const MAX_PROMPT_BYTES = 80 * 1024;
 
 export type AgentRuntimeKind = 'claude-code' | 'codex';
 
@@ -87,7 +86,7 @@ export function detectRuntimeMenu(stripped: string): boolean {
 
 const RUNTIME_COMPLETION_POPUP_RE = /\benter to insert\b[^\n]{0,40}\besc to close\b/i;
 const COMPLETION_POPUP_FOOTER_LINES = 3;
-export function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKind): boolean {
+function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (runtime !== 'codex') return false;
   const lines = stripped.split('\n');
   const footer: string[] = [];
@@ -104,7 +103,7 @@ export function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRun
 // 它只在空闲态出现（工作中 Esc 是打断），故等价于一个 ready anchor。锚定屏幕底部避免误吃历史输出。
 const CODEX_BACKTRACK_HINT_RE = /(?:^|\n)[ \t]*esc again to edit previous message[ \t]*(?:\n[ \t]*)*$/i;
 
-export function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolean {
+function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (READY_ANCHORS[runtime].test(stripped)) return true;
   return runtime === 'codex' && CODEX_BACKTRACK_HINT_RE.test(stripped);
 }
@@ -204,7 +203,7 @@ function codexWorkingInTail(stripped: string, runtime?: AgentRuntimeKind): boole
   return lastWorking > lastIdlePromptIndex(activeTail, runtime);
 }
 
-export function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeKind): boolean {
+function detectActiveRegionBusy(stripped: string, runtime?: AgentRuntimeKind): boolean {
   return hasActiveSpinnerInTail(stripped)
     || escToInterruptActiveInTail(stripped, runtime)
     || codexWorkingInTail(stripped, runtime);
@@ -223,7 +222,7 @@ export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRun
   return false;
 }
 
-export function screenBlocksReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
+function screenBlocksReadyView(stripped: string, runtime: AgentRuntimeKind): boolean {
   return runtimeBusyCheck(stripped, runtime)
     || detectRuntimeMenu(stripped)
     || detectStartupDialog(stripped, runtime)
@@ -359,7 +358,7 @@ const stripAnsi = (s: string): string => s.replace(ANSI_PATTERN, '');
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
 const MIN_POLL_INTERVAL_MS = 50;
-export const COMPOSER_DIRTY_SETTLE_MS = 200;
+const COMPOSER_DIRTY_SETTLE_MS = 200;
 
 const HISTORY_SUFFIX_RE = /\n---history_size:\d+---$/;
 function stripHistorySuffix(snapshot: string): string {

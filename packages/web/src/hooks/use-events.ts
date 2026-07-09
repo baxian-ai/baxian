@@ -28,28 +28,6 @@ export function useAgents(): EventsResult<AgentSnapshot[]> {
   return { data, loaded, error };
 }
 
-export function useAgent(agentId: string): EventsResult<AgentSnapshot> {
-  const [data, setData] = useState<AgentSnapshot | null>(null);
-  const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState<{ code: string; message: string } | null>(null);
-  useEffect(() => {
-    setData(null);
-    setLoaded(false);
-    setError(null);
-    const unsub = getEventsClient().subscribe<AgentSnapshot | null>(
-      `agent:${agentId}`,
-      (next) => {
-        setError(null);
-        setData(next);
-        setLoaded(true);
-      },
-      (err) => setError(err),
-    );
-    return unsub;
-  }, [agentId]);
-  return { data, loaded, error };
-}
-
 export function useTask(taskId: string): EventsResult<TaskState> {
   const [data, setData] = useState<TaskState | null>(null);
   const [loaded, setLoaded] = useState(false);

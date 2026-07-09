@@ -1,11 +1,22 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ReviewRound } from '../shared/index.js';
+import type { ReviewRound, TaskState } from '../shared/index.js';
 import { api } from '../api.ts';
 
 export interface ReviewRoundsResult {
   rounds: ReviewRound[] | null;
   loaded: boolean;
   error: string | null;
+}
+
+export function reviewRevision(task: TaskState): string {
+  return [
+    task.specReviewRound ?? 0,
+    task.reviewRound,
+    task.status,
+    task.phase ?? 'code',
+    task.batchIndex ?? -1,
+    task.batchTotal ?? -1,
+  ].join(':');
 }
 
 export function useReviewRounds(taskId: string, revision?: string | number): ReviewRoundsResult {

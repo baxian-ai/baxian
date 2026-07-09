@@ -162,6 +162,19 @@ describe('ReviewConversation server mode', () => {
     expect(screen.getByText('request-changes')).toBeTruthy();
   });
 
+  it('labels a code-phase userDecision as Request changes, not Reject Spec', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, {
+        findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'u-1', severity: 'major', message: '这里要改' }] },
+        userDecision: { verdict: 'request-changes', comments: '这里要改', at: 'now' },
+      }),
+    ]);
+    renderConv(makeTask());
+    expect(await screen.findByText('User')).toBeTruthy();
+    expect(screen.getByText('Request changes')).toBeTruthy();
+    expect(screen.queryByText('Reject Spec')).toBeNull();
+  });
+
   it('renders dev/QA role markers as colored text, not pills', async () => {
     reviewsMock.mockResolvedValue([
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
@@ -212,6 +225,55 @@ describe('ReviewConversation server mode', () => {
     );
     await waitFor(() => expect(reviewsMock).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('Round 2')).toBeTruthy();
+  });
+
+  it('shows a batch progress row while QA reviews a large diff in batches', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1), // findings undefined: QA still reviewing
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1, status: 'review', batchIndex: 1, batchTotal: 3 }));
+    expect(await screen.findByText('QA reviewing… (batch 2/3)')).toBeTruthy();
+  });
+
+  it('shows a plain reviewing row when the review is not batched', async () => {
+    reviewsMock.mockResolvedValue([codeRound(1)] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1, status: 'review' }));
+    expect(await screen.findByText('QA reviewing…')).toBeTruthy();
+  });
+
+  it('shows a fixing row with the pending finding count', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, { findings: { round: 1, verdict: 'request-changes', findings: [
+        { id: 'f-1', severity: 'major', message: 'a' },
+        { id: 'f-2', severity: 'minor', message: 'b' },
+      ] } }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1, status: 'fixing' }));
+    expect(await screen.findByText('Dev fixing… (2 to respond)')).toBeTruthy();
+  });
+
+  it('renders per-batch partial review turns before aggregation', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, { batchFindings: [
+        { round: 1, verdict: 'request-changes', findings: [{ id: 'b0-1', severity: 'major', message: 'm' }] },
+        { round: 1, verdict: 'approve', findings: [] },
+      ] }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1, status: 'review', batchIndex: 1, batchTotal: 2 }));
+    expect(await screen.findByText('Review (batch 1)')).toBeTruthy();
+    expect(screen.getByText('Review (batch 2)')).toBeTruthy();
+  });
+
+  it('refetches when the batch index advances', async () => {
+    reviewsMock.mockResolvedValue([codeRound(1)] as ReviewRound[]);
+    const { rerender } = render(
+      <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 1, status: 'review', batchIndex: 0, batchTotal: 3 })} /></MemoryRouter>,
+    );
+    await waitFor(() => expect(reviewsMock).toHaveBeenCalledTimes(1));
+    rerender(
+      <MemoryRouter><ReviewConversation task={makeTask({ reviewRound: 1, status: 'review', batchIndex: 1, batchTotal: 3 })} /></MemoryRouter>,
+    );
+    await waitFor(() => expect(reviewsMock).toHaveBeenCalledTimes(2));
   });
 
   it('shows an error message when the fetch fails', async () => {

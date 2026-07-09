@@ -220,6 +220,27 @@ describe('ErrorRecordStore', () => {
     expect(content).not.toContain('"one"');
   });
 
+  it('serves repeated reads from the in-memory cache without re-reading disk', async () => {
+    const record = await appendRecord();
+    expect((await store.latestForAgent('dev-1'))?.id).toBe(record.id);
+    await rm(jsonlPath('2026-05-14'));
+    expect((await store.latestForAgent('dev-1'))?.id).toBe(record.id);
+  });
+
+  it('appends landing after a cached read are visible to subsequent reads', async () => {
+    await appendRecord({ message: 'first' });
+    expect((await store.latestForAgent('dev-1'))?.message).toBe('first');
+    await appendRecord({ message: 'second', occurredAt: '2026-05-14T06:00:00.000Z' });
+    expect((await store.latestForAgent('dev-1'))?.message).toBe('second');
+  });
+
+  it('purge invalidates the warm cache so reads reflect the rewritten files', async () => {
+    await appendRecord({ operation: 'bootstrap', message: 'boot' });
+    expect((await store.latestBootstrapForAgent('dev-1'))?.message).toBe('boot');
+    await store.purgeBootstrapForAgent('dev-1');
+    expect(await store.latestBootstrapForAgent('dev-1')).toBeUndefined();
+  });
+
   it('skips malformed jsonl lines without dropping the whole file', async () => {
     const path = jsonlPath('2026-05-14');
     await writeFile(path, [

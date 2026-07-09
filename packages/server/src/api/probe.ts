@@ -25,7 +25,7 @@ interface ProbeResponse {
   };
 }
 
-export interface InstallTmuxResponse extends TmuxInstallResult {
+interface InstallTmuxResponse extends TmuxInstallResult {
   tmux: ProbeStatus;
 }
 

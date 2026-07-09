@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useRef, useState, type ReactNod
 import { Modal } from './modal.tsx';
 import { useT } from '../i18n/index.tsx';
 
-export interface ConfirmOptions {
+interface ConfirmOptions {
   title: string;
   body?: string;
   confirmLabel?: string;

@@ -116,13 +116,6 @@ export class CleanupFailedError extends Error {
   }
 }
 
-export class DispatchTransientError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'DispatchTransientError';
-  }
-}
-
 export class DispatchTerminalError extends Error {
   constructor(
     public readonly reason: DispatchTerminalReason,
@@ -208,6 +201,7 @@ export interface ContinueSessionOpts {
   bypassTaskStatusGate?: boolean;
   dialogFailFromStatuses?: TaskStatus[];
   serverContent?: string;
+  serverInterdiff?: string;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
@@ -219,6 +213,11 @@ export interface ContinueSessionOpts {
 export interface MergePrOpts {
   matchHeadSha?: string;
 }
+
+export type CodeInterdiffResult =
+  | { ok: true; diff: string }
+  | { ok: false; reason: 'no-anchor' }
+  | { ok: false; reason: 'released' };
 
 interface DispatchReviewSnapshot {
   qaAgentId?: string;
@@ -265,7 +264,7 @@ function cancelPhaseDowngrades(prev: string | undefined, next: string): boolean 
 
 const REGREET_REQUIRED_HOLD_PHASES = new Set<string>(['greeting_failed']);
 
-export function shouldReleaseHeldBinding(
+function shouldReleaseHeldBinding(
   state: AgentBindingFacts,
   boundTask: TaskState | null | undefined,
 ): boolean {
@@ -315,6 +314,7 @@ export class AgentManager {
   private manualReviewInFlight = new Set<string>();
   private markCompleteInFlight = new Set<string>();
   private specVerdictInFlight = new Set<string>();
+  private codeVerdictInFlight = new Set<string>();
   // 引用计数：cancelTask 与 startCreatedTaskSession 的清理段可合法并存（启动期 Stop），先完成者不得清掉后者的 guard。
   private cancelCleanupInFlight = new Map<string, number>();
   private deletionInFlight = new Set<string>();
@@ -418,6 +418,23 @@ export class AgentManager {
         err,
       );
     }
+  }
+
+  private async emitIntervention(
+    projectId: string,
+    agentId: string | undefined,
+    taskId: string | undefined,
+    data: Record<string, unknown> & { phase: string },
+  ): Promise<void> {
+    await this.safeEmit({
+      id: '',
+      type: 'human.intervention',
+      timestamp: new Date().toISOString(),
+      projectId,
+      ...(agentId ? { agentId } : {}),
+      ...(taskId ? { taskId } : {}),
+      data,
+    });
   }
 
   private async recordError(input: ErrorRecordInput): Promise<void> {
@@ -863,14 +880,7 @@ export class AgentManager {
       };
     });
     if (!wrote) return;
-    await this.safeEmit({
-      id: '',
-      type: 'human.intervention',
-      timestamp: now,
-      projectId: existing.projectId,
-      agentId,
-      data: { phase: 'greeting_failed', reason },
-    });
+    await this.emitIntervention(existing.projectId, agentId, undefined, { phase: 'greeting_failed', reason });
   }
 
   async regreetHeldAgent(agentId: string): Promise<boolean> {
@@ -965,17 +975,9 @@ export class AgentManager {
       };
     });
     if (!wrote) return;
-    await this.safeEmit({
-      id: '',
-      type: 'human.intervention',
-      timestamp: now,
-      projectId: projectIdForEmit,
-      agentId,
-      ...(taskIdForEmit ? { taskId: taskIdForEmit } : {}),
-      data: {
-        phase: 'agent_dialog_pending',
-        reason: 'Agent REPL launched but blocked on a startup dialog (e.g. CLI update notice). Operator should attach via web terminal and dismiss it; baxian will auto-detect ready and resume.',
-      },
+    await this.emitIntervention(projectIdForEmit, agentId, taskIdForEmit, {
+      phase: 'agent_dialog_pending',
+      reason: 'Agent REPL launched but blocked on a startup dialog (e.g. CLI update notice). Operator should attach via web terminal and dismiss it; baxian will auto-detect ready and resume.',
     });
   }
 
@@ -1189,16 +1191,9 @@ export class AgentManager {
           data: { paneId, phase: 'session_dialog_resolved' },
         });
       } else {
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: now,
-          projectId: projectIdForEmit,
-          agentId,
-          data: {
-            phase: 'agent_dialog_resolved_runtime',
-            note: 'Runtime dialog resolved; agent REPL ready. Click Resume to continue.',
-          },
+        await this.emitIntervention(projectIdForEmit, agentId, undefined, {
+          phase: 'agent_dialog_resolved_runtime',
+          note: 'Runtime dialog resolved; agent REPL ready. Click Resume to continue.',
         });
       }
       return;
@@ -1263,18 +1258,9 @@ export class AgentManager {
       const onMenu = detectRuntimeMenu(stripped);
       if (onMenu && !pendingMenu) {
         pendingMenu = true;
-        const now = new Date().toISOString();
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: now,
-          projectId: fresh.projectId,
-          agentId,
-          taskId: fresh.taskId,
-          data: {
-            phase: 'agent_runtime_menu_pending',
-            note: 'Agent paused on an interactive menu mid-task. Attach via web terminal and respond; baxian will auto-clear once the menu closes.',
-          },
+        await this.emitIntervention(fresh.projectId, agentId, fresh.taskId, {
+          phase: 'agent_runtime_menu_pending',
+          note: 'Agent paused on an interactive menu mid-task. Attach via web terminal and respond; baxian will auto-clear once the menu closes.',
         });
       } else if (!onMenu && pendingMenu) {
         pendingMenu = false;
@@ -1680,17 +1666,9 @@ export class AgentManager {
       };
     });
     if (!wrote) return;
-    await this.safeEmit({
-      id: '',
-      type: 'human.intervention',
-      timestamp: now,
-      projectId,
-      agentId,
-      ...(taskId ? { taskId } : {}),
-      data: {
-        phase,
-        reason,
-      },
+    await this.emitIntervention(projectId, agentId, taskId, {
+      phase,
+      reason,
     });
   }
 
@@ -1833,18 +1811,10 @@ export class AgentManager {
       if (shouldReleaseBinding) {
         await this.lockManager.release(agentId);
       }
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: now,
-        projectId: state.projectId,
-        agentId,
-        ...(state.taskId ? { taskId: state.taskId } : {}),
-        data: {
-          phase: 'resumed',
-          previousPhase: state.awaitingPhase,
-          releasedBinding: shouldReleaseBinding,
-        },
+      await this.emitIntervention(state.projectId, agentId, state.taskId, {
+        phase: 'resumed',
+        previousPhase: state.awaitingPhase,
+        releasedBinding: shouldReleaseBinding,
       });
       return { resumed: true, releasedBinding: shouldReleaseBinding };
     });
@@ -2074,19 +2044,11 @@ export class AgentManager {
         releaseErr,
       );
     }
-    await this.safeEmit({
-      id: '',
-      type: 'human.intervention',
-      timestamp: new Date().toISOString(),
-      projectId: transitioned?.task.projectId ?? '',
-      agentId,
-      taskId,
-      data: {
-        phase: `dispatch-failed:${err.reason}`,
-        reason: err.reason,
-        message: err.message,
-        replDrained: err.replDrained,
-      },
+    await this.emitIntervention(transitioned?.task.projectId ?? '', agentId, taskId, {
+      phase: `dispatch-failed:${err.reason}`,
+      reason: err.reason,
+      message: err.message,
+      replDrained: err.replDrained,
     });
   }
 
@@ -2525,18 +2487,10 @@ export class AgentManager {
             : {}),
         });
         if (interventionKindLabel) {
-          await this.safeEmit({
-            id: '',
-            type: 'human.intervention',
-            timestamp: new Date().toISOString(),
-            projectId: task.projectId,
-            agentId,
-            taskId: task.id,
-            data: {
-              phase: 'spec-signal-setup-during-recovery',
-              kind: interventionKindLabel,
-              note: 'Task is waiting for a spec signal after server recovery; if no signal arrives, the prompt may not have been fully delivered before the previous crash. Inspect the agent pane and consider manual retry or transition.',
-            },
+          await this.emitIntervention(task.projectId, agentId, task.id, {
+            phase: 'spec-signal-setup-during-recovery',
+            kind: interventionKindLabel,
+            note: 'Task is waiting for a spec signal after server recovery; if no signal arrives, the prompt may not have been fully delivered before the previous crash. Inspect the agent pane and consider manual retry or transition.',
           });
         }
       } catch (err) {
@@ -2810,18 +2764,10 @@ export class AgentManager {
       rolledBack = { projectId: task.projectId };
     });
     if (rolledBack && reason) {
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: (rolledBack as { projectId: string }).projectId,
-        agentId,
-        taskId,
-        data: {
-          phase: reason.phase,
-          message: reason.message,
-          note: 'Dispatch failed; the task is back in pending — re-dispatch it once the cause is resolved.',
-        },
+      await this.emitIntervention((rolledBack as { projectId: string }).projectId, agentId, taskId, {
+        phase: reason.phase,
+        message: reason.message,
+        note: 'Dispatch failed; the task is back in pending — re-dispatch it once the cause is resolved.',
       });
     }
 
@@ -3454,6 +3400,7 @@ export class AgentManager {
       currentSpecRound?: number;
       dialogFailFromStatuses?: TaskStatus[];
       serverContent?: string;
+      serverInterdiff?: string;
       serverDiffstat?: string;
       serverBatch?: { index: number; total: number };
       serverPriorFindings?: string;
@@ -3570,7 +3517,7 @@ export class AgentManager {
     try {
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
-      if (opts.serverContent !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
+      if (opts.serverContent !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
         payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, worktreePath, {
           phase,
           ...(task.phase ? { taskPhase: task.phase } : {}),
@@ -3578,6 +3525,7 @@ export class AgentManager {
           reviewRound: task.reviewRound,
           ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
           ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
+          ...(opts.serverInterdiff !== undefined ? { serverInterdiff: opts.serverInterdiff } : {}),
           ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
           ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
         });
@@ -3856,22 +3804,14 @@ export class AgentManager {
         `[AgentManager] dispatch ack timeout for pane ${paneId} agent ${agentId}: ${message}`,
       );
       const state = await this.agentStore.get(agentId).catch(() => null);
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: state?.projectId ?? '',
-        agentId,
-        ...(state?.taskId ? { taskId: state.taskId } : {}),
-        data: {
-          phase: 'dispatch-ack-timeout',
-          paneId,
-          message,
-          note:
-            'REPL did not acknowledge the pasted prompt within timeout. ' +
-            'baxian intentionally did NOT send C-c — the input may still be queued. ' +
-            'Attach via web terminal to verify and resolve.',
-        },
+      await this.emitIntervention(state?.projectId ?? '', agentId, state?.taskId, {
+        phase: 'dispatch-ack-timeout',
+        paneId,
+        message,
+        note:
+          'REPL did not acknowledge the pasted prompt within timeout. ' +
+          'baxian intentionally did NOT send C-c — the input may still be queued. ' +
+          'Attach via web terminal to verify and resolve.',
       });
       const composerDelivered = !/pane already busy at baseline/.test(message);
       return { acked: false, composerDelivered };
@@ -3982,7 +3922,7 @@ export class AgentManager {
         && !ensure.freshRuntime;
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
-      if (opts.serverContent !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
+      if (opts.serverContent !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
         payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, worktreePath, {
           phase,
           ...(task.phase ? { taskPhase: task.phase } : {}),
@@ -3990,6 +3930,7 @@ export class AgentManager {
           reviewRound: task.reviewRound,
           ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
           ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
+          ...(opts.serverInterdiff !== undefined ? { serverInterdiff: opts.serverInterdiff } : {}),
           ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
           ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
         });
@@ -4183,9 +4124,7 @@ export class AgentManager {
         if (
           state.taskId
           && boundTask?.id === state.taskId
-          && boundTask.status === 'merged'
-          && boundTask.prNumber != null
-          && boundTask.branch
+          && (boundTask.status === 'merged' || boundTask.status === 'done')
           && !state.creationToken
           && state.status !== 'awaiting_human'
         ) {
@@ -4204,11 +4143,14 @@ export class AgentManager {
             ) {
               continue;
             }
-            await this.dispatchPostMergeCleanup(state.id, {
-              taskId: boundTask.id,
-              branch: boundTask.branch,
-            });
-            continue;
+            if (boundTask.status === 'merged' && boundTask.prNumber != null && boundTask.branch) {
+              await this.dispatchPostMergeCleanup(state.id, {
+                taskId: boundTask.id,
+                branch: boundTask.branch,
+              });
+              continue;
+            }
+            if (this.startCompactionThenRelease(recovered.id, recovered, boundTask.id)) continue;
           } catch (cleanupErr) {
             console.warn(
               `[recover] dispatchPostMergeCleanup(${state.id}, ${boundTask.id}) failed:`,
@@ -4325,15 +4267,7 @@ export class AgentManager {
           observation: { phase: 'recovery-failed' },
           recommendation: 'Inspect or recreate the tmux session, then retry the affected task.',
         });
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: state.projectId,
-          agentId: state.id,
-          taskId: state.taskId ?? '',
-          data: { phase: 'recovery-failed', error: message },
-        });
+        await this.emitIntervention(state.projectId, state.id, state.taskId, { phase: 'recovery-failed', error: message });
       }
     }
 
@@ -4523,19 +4457,12 @@ export class AgentManager {
 
     if (publishedCleanup) {
       if (publishedCleanup.mayBeInFlight && !devStopConfirmed) {
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: result.projectId,
-          taskId,
-          data: {
-            phase: 'cancel-published-artifact-cleanup-skipped',
-            afterDone: publishedCleanup.afterDone,
-            branch: publishedCleanup.branch,
-            ...(publishedCleanup.prNumber !== undefined ? { prNumber: publishedCleanup.prNumber } : {}),
-            reason: 'dev pane stop unconfirmed; the publish prompt may still be running and would recreate the remote artifacts',
-          },
+        await this.emitIntervention(result.projectId, undefined, taskId, {
+          phase: 'cancel-published-artifact-cleanup-skipped',
+          afterDone: publishedCleanup.afterDone,
+          branch: publishedCleanup.branch,
+          ...(publishedCleanup.prNumber !== undefined ? { prNumber: publishedCleanup.prNumber } : {}),
+          reason: 'dev pane stop unconfirmed; the publish prompt may still be running and would recreate the remote artifacts',
         });
         return result;
       }
@@ -4580,19 +4507,12 @@ export class AgentManager {
         }
       } catch (err) {
         console.warn(`[AgentManager] cancelTask remote retirement failed for ${taskId}:`, err);
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: result.projectId,
-          taskId,
-          data: {
-            phase: 'cancel-published-artifact-cleanup-failed',
-            afterDone: publishedCleanup.afterDone,
-            branch: publishedCleanup.branch,
-            ...(publishedCleanup.prNumber !== undefined ? { prNumber: publishedCleanup.prNumber } : {}),
-            error: err instanceof Error ? err.message : String(err),
-          },
+        await this.emitIntervention(result.projectId, undefined, taskId, {
+          phase: 'cancel-published-artifact-cleanup-failed',
+          afterDone: publishedCleanup.afterDone,
+          branch: publishedCleanup.branch,
+          ...(publishedCleanup.prNumber !== undefined ? { prNumber: publishedCleanup.prNumber } : {}),
+          error: err instanceof Error ? err.message : String(err),
         });
       }
     }
@@ -5203,19 +5123,11 @@ export class AgentManager {
     if (!agentId) return;
     const cur = await this.agentStore.get(agentId);
     if (!cur || cur.taskId !== expectedTaskId) return;
-    await this.safeEmit({
-      id: '',
-      type: 'human.intervention',
-      timestamp: new Date().toISOString(),
-      projectId: cur.projectId,
-      agentId,
-      taskId: expectedTaskId,
-      data: {
-        phase: 'manual-review-dev-parked-qa-failed',
-        note:
-          'Manual QA dispatch parked the dev agent into waiting; QA then failed to start. ' +
-          'Dev binding is kept but no new prompt is running — re-dispatch the manual review or cancel the task.',
-      },
+    await this.emitIntervention(cur.projectId, agentId, expectedTaskId, {
+      phase: 'manual-review-dev-parked-qa-failed',
+      note:
+        'Manual QA dispatch parked the dev agent into waiting; QA then failed to start. ' +
+        'Dev binding is kept but no new prompt is running — re-dispatch the manual review or cancel the task.',
     });
   }
 
@@ -5908,30 +5820,14 @@ export class AgentManager {
     if (task.agentId) {
       const devOk = await this.markAgentWaiting(task.agentId, taskId).catch(() => false);
       if (!devOk) {
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: task.projectId,
-          agentId: task.agentId,
-          taskId,
-          data: { phase: 'spec-ready-dev-park-failed', devAgentId: task.agentId },
-        });
+        await this.emitIntervention(task.projectId, task.agentId, taskId, { phase: 'spec-ready-dev-park-failed', devAgentId: task.agentId });
       }
     }
     if (task.qaAgentId) {
       const released = await this.releaseAgentForTask(task.qaAgentId, taskId, 'idle')
         .catch(() => false);
       if (!released) {
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: task.projectId,
-          agentId: task.qaAgentId,
-          taskId,
-          data: { phase: 'spec-ready-qa-release-failed', qaAgentId: task.qaAgentId },
-        });
+        await this.emitIntervention(task.projectId, task.qaAgentId, taskId, { phase: 'spec-ready-qa-release-failed', qaAgentId: task.qaAgentId });
       }
     }
     return transition.task;
@@ -6014,6 +5910,114 @@ export class AgentManager {
     return dispatched;
   }
 
+  async submitCodeVerdict(taskId: string, comments: string): Promise<TaskState> {
+    const trimmed = comments?.trim();
+    if (!trimmed) {
+      throw new ApiError(400, 'comments is required for request-changes');
+    }
+    const task = await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh) throw new ApiError(404, `Task ${taskId} not found`);
+      if (fresh.status !== 'ready') {
+        throw new ApiError(409, `Task ${taskId} is ${fresh.status}; code verdict requires ready`);
+      }
+      if (fresh.phase === 'spec') {
+        throw new ApiError(409, `Task ${taskId} is in the spec phase; reject the spec via the spec verdict instead`);
+      }
+      if (fresh.reviewMode !== 'server') {
+        throw new ApiError(409, `Task ${taskId} is not in server review mode; request changes on the PR instead`);
+      }
+      if (!fresh.agentId) {
+        throw new ApiError(400, `Task ${taskId} has no dev agent; cannot request changes`);
+      }
+      if (this.markCompleteInFlight.has(taskId)) {
+        throw new ApiError(409, `Task ${taskId} is being completed (merge in progress); try again shortly`);
+      }
+      if (this.codeVerdictInFlight.has(taskId)) {
+        throw new ApiError(409, `Task ${taskId} code verdict is already being processed`);
+      }
+      this.codeVerdictInFlight.add(taskId);
+      return fresh;
+    });
+    try {
+      return await this.executeCodeVerdict(task, trimmed);
+    } finally {
+      this.codeVerdictInFlight.delete(taskId);
+    }
+  }
+
+  private async executeCodeVerdict(task: TaskState, trimmed: string): Promise<TaskState> {
+    const taskId = task.id;
+    const store = this.getReviewStore();
+    if (!store) throw new ApiError(500, 'Review store unavailable');
+    const round = Math.max(task.reviewRound, 1);
+    const at = new Date().toISOString();
+
+    // 打回消耗一轮修订；到达上限时拒绝而非派发注定进 max_rounds 的修订，让用户当场决策
+    const cap = this.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
+    if (round >= cap) {
+      throw new ApiError(
+        409,
+        `Task ${taskId} has reached the code review round cap (${cap}); `
+        + 'confirm completion, or cancel the task',
+      );
+    }
+
+    const roundData = await store.getRound(taskId, 'code', round);
+    // 无 QA 项目经 autoApproveCode 到达 ready 时从未存轮；补底轮次保证 userDecision 留痕与 fix 闭环
+    const base = roundData ?? await this.synthesizeEmptyCodeRound(task, round, at);
+
+    // runCodeFixSubmission 按 Math.max(reviewRound,1) 读轮、recheck 按 reviewRound+1 存新轮；
+    // reviewRound 停在 0 会让 recheck 覆写本轮，故落库为 1 对齐两侧
+    if (task.reviewRound === 0) {
+      await this.withTaskLock(async () => {
+        const fresh = await this.taskStore.get(taskId);
+        if (!fresh) return;
+        fresh.reviewRound = 1;
+        fresh.updatedAt = new Date().toISOString();
+        await this.taskStore.set(fresh);
+      });
+    }
+
+    const priorFindings = base.findings?.findings ?? [];
+    const nextUserId = `u-${priorFindings.filter(f => f.id.startsWith('u-')).length + 1}`;
+    const mergedFindings: ReviewFindings = {
+      round,
+      verdict: 'request-changes',
+      findings: [...priorFindings, { id: nextUserId, severity: 'major', message: trimmed }],
+    };
+    await store.putRound(taskId, 'code', {
+      ...base,
+      findings: mergedFindings,
+      userDecision: { verdict: 'request-changes', comments: trimmed, at },
+    });
+    const dispatched = await this.dispatchServerFixToDev(taskId, JSON.stringify(mergedFindings));
+    if (!dispatched) throw new ApiError(500, `Failed to dispatch code fix for task ${taskId}`);
+    return dispatched;
+  }
+
+  private async synthesizeEmptyCodeRound(task: TaskState, round: number, at: string): Promise<ReviewRound> {
+    const empty: ReviewRound = { round, phase: 'code', content: '', startedAt: at };
+    const dev = task.agentId ? this.getAgentConfig(task.agentId) : undefined;
+    if (!dev || !task.agentId) return empty;
+    // 读取失败不阻断打回：留痕与 fix 闭环优先于 diff 展示
+    try {
+      await this.refreshWorktreeCacheFor(task.agentId);
+      const content = await this.getReviewTransport().readContent(task, dev, 'code');
+      return {
+        round,
+        phase: 'code',
+        content: content.content,
+        ...(content.diffstat ? { diffstat: content.diffstat } : {}),
+        ...(content.baseSha ? { baseSha: content.baseSha } : {}),
+        startedAt: at,
+      };
+    } catch (err) {
+      console.warn(`[AgentManager] submitCodeVerdict: code content read failed for ${task.id}; using empty round:`, err);
+      return empty;
+    }
+  }
+
   async transitionToCodePhase(taskId: string): Promise<TaskState | null> {
     const task = await this.taskStore.get(taskId);
     if (!task) return null;
@@ -6039,15 +6043,7 @@ export class AgentManager {
       const released = await this.releaseAgentForTask(task.qaAgentId, taskId, 'idle')
         .catch(() => false);
       if (!released) {
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: task.projectId,
-          agentId: task.qaAgentId,
-          taskId,
-          data: { phase: 'code-phase-qa-release-failed', qaAgentId: task.qaAgentId },
-        });
+        await this.emitIntervention(task.projectId, task.qaAgentId, taskId, { phase: 'code-phase-qa-release-failed', qaAgentId: task.qaAgentId });
       }
     }
 
@@ -6059,15 +6055,7 @@ export class AgentManager {
         'Dev could not be acquired for the code phase after spec approval; the task looks in_progress but the code prompt was never dispatched. Resume the agent to redispatch or cancel the task.',
         { expectedTaskId: taskId },
       ).catch(() => undefined);
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        agentId: devAgentId,
-        taskId,
-        data: { phase: 'code-dev-acquire-failed', devAgentId },
-      });
+      await this.emitIntervention(task.projectId, devAgentId, taskId, { phase: 'code-dev-acquire-failed', devAgentId });
       return null;
     }
 
@@ -6098,15 +6086,7 @@ export class AgentManager {
         'Code-phase prompt was not delivered after spec approval; the task looks in_progress but the dev never received it. Resume/restart the agent or cancel the task.',
         { expectedTaskId: taskId },
       ).catch(() => undefined);
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        agentId: devAgentId,
-        taskId,
-        data: { phase: 'code-resume-failed', devAgentId },
-      });
+      await this.emitIntervention(task.projectId, devAgentId, taskId, { phase: 'code-resume-failed', devAgentId });
       return null;
     }
     return await this.taskStore.get(taskId);
@@ -6120,6 +6100,7 @@ export class AgentManager {
       recheck?: boolean;
       continuation?: boolean;
       content: string;
+      interdiff?: string;
       diffstat?: string;
       batch?: { index: number; total: number };
       priorFindingsJson?: string;
@@ -6152,15 +6133,7 @@ export class AgentManager {
           ? (opts.phase === 'spec' ? 'spec-fixed' : 'code-fixed')
           : (opts.phase === 'spec' ? 'spec-done' : 'code-done');
         await this.setupPhaseSignal(taskId, task.agentId, entryKind, { skipSnapshot: true });
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId: task.projectId,
-          agentId: task.agentId,
-          taskId,
-          data: { phase: 'server-review-no-qa-partner', devAgentId: task.agentId },
-        });
+        await this.emitIntervention(task.projectId, task.agentId, taskId, { phase: 'server-review-no-qa-partner', devAgentId: task.agentId });
         return null;
       }
       const roundField = opts.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
@@ -6216,15 +6189,7 @@ export class AgentManager {
       const acquired = await this.acquireAgentForTask(qaId, taskId, dispatchPhase);
       if (!acquired) {
         await rearmEntrySignal();
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId,
-          agentId: qaId,
-          taskId,
-          data: { phase: 'server-review-qa-acquire-failed', qaAgentId: qaId },
-        });
+        await this.emitIntervention(projectId, qaId, taskId, { phase: 'server-review-qa-acquire-failed', qaAgentId: qaId });
         return null;
       }
       if (devAgentId) {
@@ -6232,15 +6197,7 @@ export class AgentManager {
         if (!devOk) {
           await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
           await rearmEntrySignal();
-          await this.safeEmit({
-            id: '',
-            type: 'human.intervention',
-            timestamp: new Date().toISOString(),
-            projectId,
-            agentId: devAgentId,
-            taskId,
-            data: { phase: 'server-review-dev-park-failed', devAgentId },
-          });
+          await this.emitIntervention(projectId, devAgentId, taskId, { phase: 'server-review-dev-park-failed', devAgentId });
           return null;
         }
       }
@@ -6268,15 +6225,7 @@ export class AgentManager {
       if (!opts.continuation) {
         await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
       }
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId,
-        agentId: qaId,
-        taskId,
-        data: { phase: 'server-review-transition-failed', qaAgentId: qaId },
-      });
+      await this.emitIntervention(projectId, qaId, taskId, { phase: 'server-review-transition-failed', qaAgentId: qaId });
       return null;
     }
 
@@ -6284,6 +6233,7 @@ export class AgentManager {
       bypassTaskStatusGate: true,
       signalToken: newToken,
       serverContent: opts.content,
+      ...(opts.interdiff !== undefined ? { serverInterdiff: opts.interdiff } : {}),
       ...(opts.diffstat !== undefined ? { serverDiffstat: opts.diffstat } : {}),
       ...(opts.batch ? { serverBatch: opts.batch } : {}),
       ...(opts.priorFindingsJson ? { serverPriorFindings: opts.priorFindingsJson } : {}),
@@ -6328,15 +6278,7 @@ export class AgentManager {
         await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
       }
       await rearmConsumedSignal();
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId,
-        agentId: qaId,
-        taskId,
-        data: { phase: 'server-review-start-failed', qaAgentId: qaId },
-      });
+      await this.emitIntervention(projectId, qaId, taskId, { phase: 'server-review-start-failed', qaAgentId: qaId });
       return null;
     }
 
@@ -6382,15 +6324,7 @@ export class AgentManager {
     const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'server-feedback');
     if (!acquired) {
       await rearmReviewedSignal();
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId,
-        agentId: devAgentId,
-        taskId,
-        data: { phase: 'server-fix-dev-acquire-failed', devAgentId },
-      });
+      await this.emitIntervention(projectId, devAgentId, taskId, { phase: 'server-fix-dev-acquire-failed', devAgentId });
       return null;
     }
 
@@ -6399,15 +6333,7 @@ export class AgentManager {
         .catch(() => false);
       if (!released) {
         await rearmReviewedSignal();
-        await this.safeEmit({
-          id: '',
-          type: 'human.intervention',
-          timestamp: new Date().toISOString(),
-          projectId,
-          agentId: qaAgentId,
-          taskId,
-          data: { phase: 'server-fix-qa-release-failed', qaAgentId },
-        });
+        await this.emitIntervention(projectId, qaAgentId, taskId, { phase: 'server-fix-qa-release-failed', qaAgentId });
         return null;
       }
     }
@@ -6415,19 +6341,11 @@ export class AgentManager {
     const transition = await this.transitionTaskStatus(
       taskId,
       'fixing',
-      { fromStatus: ['review', 'max_rounds', 'spec-ready'] },
+      { fromStatus: ['review', 'max_rounds', 'spec-ready', 'ready'] },
       { signalToken: newToken, fixDispatchedAt: new Date().toISOString() },
     );
     if (!transition) {
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId,
-        agentId: devAgentId,
-        taskId,
-        data: { phase: 'server-fix-transition-failed', devAgentId },
-      });
+      await this.emitIntervention(projectId, devAgentId, taskId, { phase: 'server-fix-transition-failed', devAgentId });
       return null;
     }
 
@@ -6456,15 +6374,7 @@ export class AgentManager {
       await rollbackToEntry();
       await this.releaseAgentForTask(devAgentId, taskId, 'idle').catch(() => undefined);
       await rearmReviewedSignal();
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId,
-        agentId: devAgentId,
-        taskId,
-        data: { phase: 'server-fix-resume-failed', devAgentId },
-      });
+      await this.emitIntervention(projectId, devAgentId, taskId, { phase: 'server-fix-resume-failed', devAgentId });
       return null;
     }
 
@@ -6479,6 +6389,32 @@ export class AgentManager {
     const parsed = parseGitRemote(repo);
     if (parsed) return `git:${parsed.host.toLowerCase()}/${parsed.path}`;
     return `raw:${repo.trim()}`;
+  }
+
+  async computeCodeInterdiff(taskId: string, round: number): Promise<CodeInterdiffResult> {
+    const store = this.getReviewStore();
+    if (!store || !Number.isInteger(round) || round < 2) return { ok: false, reason: 'no-anchor' };
+    const [cur, prev] = await Promise.all([
+      store.getRound(taskId, 'code', round),
+      store.getRound(taskId, 'code', round - 1),
+    ]);
+    const curSha = cur?.headSha;
+    const prevSha = prev?.headSha;
+    if (!curSha || !prevSha) return { ok: false, reason: 'no-anchor' };
+
+    const task = await this.taskStore.get(taskId);
+    if (!task?.agentId) return { ok: false, reason: 'released' };
+    const agent = this.getAgentConfig(task.agentId);
+    const agentState = await this.agentStore.get(task.agentId);
+    // A rebound agent's worktree belongs to its new task — its git state describes
+    // another branch, so the interdiff would be meaningless. Same skip rule as
+    // findLineageViolation: worktree must still be bound to THIS task.
+    if (!agent || agentState?.taskId !== taskId || !agentState.worktreePath) {
+      return { ok: false, reason: 'released' };
+    }
+    await this.refreshWorktreeCacheFor(task.agentId);
+    const diff = await this.getReviewTransport().readInterdiff(agent, prevSha, curSha);
+    return { ok: true, diff };
   }
 
   async findLineageViolation(taskId: string, baseSha?: string): Promise<LineageViolation | null> {
@@ -6540,36 +6476,20 @@ export class AgentManager {
     try {
       violation = await this.findLineageViolation(taskId);
     } catch (err) {
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        agentId: devAgentId,
-        taskId,
-        data: {
-          phase: 'server-after-done-lineage-check-failed',
-          error: err instanceof Error ? err.message : String(err),
-          note: 'Publish was not dispatched; mark-complete retries it once the repo state is fixed.',
-        },
+      await this.emitIntervention(task.projectId, devAgentId, taskId, {
+        phase: 'server-after-done-lineage-check-failed',
+        error: err instanceof Error ? err.message : String(err),
+        note: 'Publish was not dispatched; mark-complete retries it once the repo state is fixed.',
       });
       return null;
     }
     if (violation) {
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        agentId: devAgentId,
-        taskId,
-        data: {
-          phase: 'server-after-done-lineage-violation',
-          offendingTaskId: violation.taskId,
-          offendingBranch: violation.branch,
-          offendingSha: violation.sha,
-          note: 'The task branch embeds another active task\'s commits; publishing would leak them into this PR. Rebase the branch onto origin/HEAD, then mark-complete to retry the publish.',
-        },
+      await this.emitIntervention(task.projectId, devAgentId, taskId, {
+        phase: 'server-after-done-lineage-violation',
+        offendingTaskId: violation.taskId,
+        offendingBranch: violation.branch,
+        offendingSha: violation.sha,
+        note: 'The task branch embeds another active task\'s commits; publishing would leak them into this PR. Rebase the branch onto origin/HEAD, then mark-complete to retry the publish.',
       });
       return null;
     }
@@ -6586,15 +6506,7 @@ export class AgentManager {
     const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'server-after-done');
     if (!acquired) {
       await rollbackToken();
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        agentId: devAgentId,
-        taskId,
-        data: { phase: 'server-after-done-dev-acquire-failed', devAgentId },
-      });
+      await this.emitIntervention(task.projectId, devAgentId, taskId, { phase: 'server-after-done-dev-acquire-failed', devAgentId });
       return null;
     }
 
@@ -6617,18 +6529,10 @@ export class AgentManager {
     }
     if (!resumed) {
       await rollbackToken();
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        agentId: devAgentId,
-        taskId,
-        data: {
-          phase: 'server-after-done-resume-failed',
-          devAgentId,
-          note: 'Publish prompt was not delivered; mark-complete retries the publish dispatch.',
-        },
+      await this.emitIntervention(task.projectId, devAgentId, taskId, {
+        phase: 'server-after-done-resume-failed',
+        devAgentId,
+        note: 'Publish prompt was not delivered; mark-complete retries the publish dispatch.',
       });
       return null;
     }
@@ -6772,6 +6676,9 @@ export class AgentManager {
       if (this.markCompleteInFlight.has(taskId)) {
         throw new ApiError(409, `Task ${taskId} is already being completed`);
       }
+      if (this.codeVerdictInFlight.has(taskId)) {
+        throw new ApiError(409, `Task ${taskId} code verdict is already being processed`);
+      }
       this.markCompleteInFlight.add(taskId);
       return fresh;
     });
@@ -6782,18 +6689,11 @@ export class AgentManager {
       await merge();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      await this.safeEmit({
-        id: '',
-        type: 'human.intervention',
-        timestamp: new Date().toISOString(),
-        projectId: task.projectId,
-        taskId: task.id,
-        data: {
-          phase: 'confirm-merge-failed',
-          gate: task.status,
-          error: message,
-          note: 'Task stays at the gate: Confirm again to retry, or Cancel to retire the published artifact.',
-        },
+      await this.emitIntervention(task.projectId, undefined, task.id, {
+        phase: 'confirm-merge-failed',
+        gate: task.status,
+        error: message,
+        note: 'Task stays at the gate: Confirm again to retry, or Cancel to retire the published artifact.',
       });
       throw new ApiError(409, `Merge failed for task ${task.id}: ${message}`);
     }
@@ -6818,11 +6718,29 @@ export class AgentManager {
       if (!id) continue;
       const state = await this.agentStore.get(id);
       if (!state || state.taskId !== taskId) continue;
+      if (this.startCompactionThenRelease(id, state, taskId)) continue;
       await this.releaseAgentForTask(id, taskId, 'idle', { allowAwaitingHuman: true })
         .catch(err => {
           console.warn(`[AgentManager] confirm release ${id} failed:`, err);
         });
     }
+  }
+
+  private startCompactionThenRelease(
+    agentId: string,
+    state: AgentBindingFacts,
+    taskId: string,
+  ): boolean {
+    // 人工介入/重建中的 pane 不发 /clear;confirm 语义要求解绑,落回直接释放
+    if (!state.paneId || state.status === 'awaiting_human' || state.creationToken) return false;
+    const cfg = this.getAgentConfig(agentId);
+    if (!cfg) return false;
+    const tmux = new TmuxManager(this.createRunnerFor(cfg));
+    void this.runPostMergeCompaction(tmux, state.paneId, agentId, taskId, agentRuntimeKindFor(cfg))
+      .catch(err =>
+        console.warn(`[AgentManager] releaseTaskAgents compaction(${agentId}) failed:`, err),
+      );
+    return true;
   }
 
   private repoMergeQueue = new Map<string, Promise<unknown>>();

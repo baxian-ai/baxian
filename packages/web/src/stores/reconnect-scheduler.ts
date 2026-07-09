@@ -1,4 +1,4 @@
-export const DEFAULT_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000, 15000, 30000];
+const DEFAULT_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000, 15000, 30000];
 
 export interface ReconnectSchedulerOptions {
   reconnect: () => void;

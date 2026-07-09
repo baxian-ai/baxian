@@ -7,7 +7,7 @@ import type {
   TaskPhase,
   TaskState,
 } from '../shared/index.js';
-import { useReviewRounds } from '../hooks/use-review-rounds.ts';
+import { useReviewRounds, reviewRevision } from '../hooks/use-review-rounds.ts';
 import { GithubReviewEntry } from './github-review-entry.tsx';
 import { TurnRow } from './review-turn-row.tsx';
 import { useT, type Messages } from '../i18n/index.tsx';
@@ -85,8 +85,7 @@ export function ReviewConversation({ task }: Props) {
 function ReviewRounds({ task }: Props) {
   const t = useT();
   const navigate = useNavigate();
-  const revision = `${task.specReviewRound ?? 0}:${task.reviewRound}:${task.status}:${task.phase ?? 'code'}`;
-  const { rounds, loaded, error } = useReviewRounds(task.id, revision);
+  const { rounds, loaded, error } = useReviewRounds(task.id, reviewRevision(task));
 
   function openRound(phase: TaskPhase, round: number, hash: string) {
     navigate(`/tasks/${encodeURIComponent(task.id)}/rounds/${phase}/${round}${hash}`);
@@ -106,7 +105,7 @@ function ReviewRounds({ task }: Props) {
         return (
           <ReviewGroup key={phase} title={t.review.phaseLabel[phase]}>
             {phaseRounds.map((round) => (
-              <RoundBlock key={`${phase}-${round.round}`} round={round} onOpen={openRound} />
+              <RoundBlock key={`${phase}-${round.round}`} round={round} task={task} onOpen={openRound} />
             ))}
           </ReviewGroup>
         );
@@ -126,13 +125,21 @@ function ReviewGroup({ title, children }: { title: string; children: ReactNode }
 
 function RoundBlock({
   round,
+  task,
   onOpen,
 }: {
   round: ReviewRound;
+  task: TaskState;
   onOpen: (phase: TaskPhase, round: number, hash: string) => void;
 }) {
   const t = useT();
   const isSpec = round.phase === 'spec';
+  const phase = task.phase ?? 'code';
+  const currentRound = phase === 'spec' ? Math.max(task.specReviewRound ?? 0, 1) : Math.max(task.reviewRound, 1);
+  const isCurrent = round.phase === phase && round.round === currentRound;
+  const inProgress = isCurrent
+    && (task.status === 'fixing' || (task.status === 'review' && round.findings === undefined));
+  const partialBatches = round.findings === undefined ? (round.batchFindings ?? []).filter(Boolean) : [];
   return (
     <div>
       <div className="mb-1 text-xs text-og-400">{t.agents.round(round.round)}</div>
@@ -143,6 +150,15 @@ function RoundBlock({
           summary={devSummary(t, round)}
           onClick={() => onOpen(round.phase, round.round, '')}
         />
+        {partialBatches.map((b, i) => (
+          <TurnRow
+            key={i}
+            role="qa"
+            label={t.review.batchTurn(i + 1)}
+            summary={findingsSummary(t, b)}
+            onClick={() => onOpen(round.phase, round.round, '#review')}
+          />
+        ))}
         {round.findings && (
           <TurnRow
             role="qa"
@@ -163,13 +179,32 @@ function RoundBlock({
         {round.userDecision && (
           <TurnRow
             role="user"
-            label={round.userDecision.verdict === 'approve' ? t.taskDetail.specApprove : t.taskDetail.specReject}
+            label={round.userDecision.verdict === 'approve'
+              ? t.taskDetail.specApprove
+              : (round.phase === 'spec' ? t.taskDetail.specReject : t.taskDetail.codeReject)}
             badge={<span className={VERDICT_CLASS[round.userDecision.verdict]}>{round.userDecision.verdict}</span>}
             summary={round.userDecision.comments ?? ''}
             onClick={() => onOpen(round.phase, round.round, '#review')}
           />
         )}
+        {inProgress && <InProgressRow t={t} task={task} round={round} />}
       </div>
+    </div>
+  );
+}
+
+function InProgressRow({ t, task, round }: { t: Messages; task: TaskState; round: ReviewRound }) {
+  const findingCount = round.findings?.findings.length
+    ?? (round.batchFindings ?? []).filter(Boolean).reduce((a, b) => a + b.findings.length, 0);
+  const label = task.status === 'review'
+    ? (task.batchTotal !== undefined
+        ? t.review.reviewingBatch((task.batchIndex ?? 0) + 1, task.batchTotal)
+        : t.review.reviewing)
+    : t.review.fixingCount(findingCount);
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 text-sm text-og-500">
+      <span aria-hidden className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-accent" />
+      <span>{label}</span>
     </div>
   );
 }

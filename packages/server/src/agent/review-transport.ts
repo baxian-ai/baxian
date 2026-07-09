@@ -14,7 +14,7 @@ import {
   type TaskPhase,
   type TaskState,
 } from '../shared/index.js';
-import type { CommandRunner, ExecResult } from './runner.js';
+import { shellQuote, type CommandRunner, type ExecResult } from './runner.js';
 import { GIT_NET_ENV, execNetwork } from './net-exec.js';
 
 
@@ -26,10 +26,6 @@ export class ReviewExchangeError extends Error {
     super(message);
     this.name = 'ReviewExchangeError';
   }
-}
-
-export function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export interface ReadContentResult {
@@ -208,6 +204,19 @@ export class ReviewTransport {
     return r.stdout.trim();
   }
 
+  async readInterdiff(devAgent: AgentConfig, prevSha: string, curSha: string): Promise<string> {
+    const wt = this.requireWorktree(devAgent.id);
+    const runner = this.deps.createRunnerFor(devAgent);
+    // two-arg tree diff, not prev...cur — three-dot regresses to the whole patchset when the review head was rewritten (amend/squash/rebase, #515)
+    const r = await runner.exec(
+      `cd ${shellQuote(wt)} && git -c core.quotepath=false diff ${shellQuote(prevSha)} ${shellQuote(curSha)}`,
+    );
+    if (r.exitCode !== 0) {
+      throw new ReviewExchangeError('interdiff-failed', `git diff failed: ${r.stderr.trim()}`);
+    }
+    return r.stdout;
+  }
+
   async readFileRange(
     devAgent: AgentConfig,
     file: string,
@@ -311,6 +320,7 @@ export interface ServerPayloadInput {
   reviewRound: number;
   batch?: { index: number; total: number };
   serverContent?: string;
+  serverInterdiff?: string;
   serverPriorFindings?: string;
   serverPriorResponse?: string;
 }
@@ -318,6 +328,8 @@ export interface ServerPayloadInput {
 export interface ServerPayloadPromptOpts {
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverInterdiff?: string;
+  serverInterdiffFile?: ReviewContentFileRef;
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
   serverPriorResponse?: string;
@@ -349,8 +361,8 @@ export async function resolveServerPayloads(
   const place = async (
     value: string | undefined,
     filename: string,
-    inlineKey: 'serverContent' | 'serverPriorFindings' | 'serverPriorResponse',
-    fileKey: 'serverContentFile' | 'serverPriorFindingsFile' | 'serverPriorResponseFile',
+    inlineKey: 'serverContent' | 'serverInterdiff' | 'serverPriorFindings' | 'serverPriorResponse',
+    fileKey: 'serverContentFile' | 'serverInterdiffFile' | 'serverPriorFindingsFile' | 'serverPriorResponseFile',
   ): Promise<void> => {
     if (value === undefined) return;
     if (Buffer.byteLength(value, 'utf8') <= MAX_INLINE_CONTENT_BYTES) {
@@ -360,6 +372,7 @@ export async function resolveServerPayloads(
     out[fileKey] = await transport.deliverToInbox(agent, worktreePath, filename, value);
   };
   await place(input.serverContent, contentFilename(input.phase, round, input.batch), 'serverContent', 'serverContentFile');
+  await place(input.serverInterdiff, `interdiff-round-${round}.patch`, 'serverInterdiff', 'serverInterdiffFile');
   const findingsName = input.phase === 'server-feedback'
     ? `findings-round-${round}.json`
     : `prior-findings-round-${round}.json`;

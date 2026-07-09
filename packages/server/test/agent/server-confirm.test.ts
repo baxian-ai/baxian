@@ -255,6 +255,91 @@ describe('server-mode max_rounds escape', () => {
   });
 });
 
+describe('terminal confirm clears agent context before release', () => {
+  async function boundAgentsFixture(
+    merge: MergeStrategy,
+    afterDone: AfterDone,
+    taskOverrides: Partial<TaskState> = {},
+    execImpl?: (cmd: string) => Partial<ExecResult>,
+  ): Promise<Fixture> {
+    const fx = await makeFixture(merge, afterDone, execImpl);
+    const now = new Date().toISOString();
+    await bindToTask(fx.agentStore, 'dev-1', now);
+    await bindToTask(fx.agentStore, 'qa-1', now);
+    await fx.taskStore.set(taskFixture(taskOverrides));
+    vi.spyOn(
+      fx.manager as never as { waitForReplPromptReady: (...a: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+    return fx;
+  }
+
+  function clearSentTo(execCalls: string[], paneId: string): boolean {
+    return execCalls.some(c =>
+      c.includes('send-keys -l') && c.includes(`'${paneId}'`) && c.includes(`'/clear'`));
+  }
+
+  async function expectClearedAndReleased(fx: Fixture): Promise<void> {
+    await vi.waitFor(async () => {
+      expect(clearSentTo(fx.execCalls, '%1')).toBe(true);
+      expect(clearSentTo(fx.execCalls, '%2')).toBe(true);
+      expect((await fx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+      expect((await fx.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    }, { timeout: 5000 });
+  }
+
+  it('ready confirm sends /clear to both dev and qa panes, then releases the bindings', async () => {
+    const fx = await boundAgentsFixture(null, null);
+    const result = await fx.manager.markTaskComplete('task-1');
+    expect(result.status).toBe('done');
+    await expectClearedAndReleased(fx);
+  });
+
+  it('branch auto-merge confirm sends /clear to both panes after the merged transition', async () => {
+    const fx = await boundAgentsFixture('auto', 'branch', { latestHeadSha: 'head123' }, cmd =>
+      cmd.includes('symbolic-ref') ? { stdout: 'origin/main\n' }
+        : cmd.includes('rev-parse') ? { stdout: 'head123\n' } : {});
+    await bindAgent(fx.agentStore, 'dev-1', { taskId: 'task-1', paneId: '%1', repoPath: '/repo/dev' });
+    const result = await fx.manager.markTaskComplete('task-1');
+    expect(result.status).toBe('merged');
+    await expectClearedAndReleased(fx);
+  });
+
+  it('max_rounds escape with afterDone:null sends /clear to both panes, then releases', async () => {
+    const fx = await boundAgentsFixture(null, null, { status: 'max_rounds', reviewRound: 10 });
+    const result = await fx.manager.markTaskComplete('task-1');
+    expect(result.status).toBe('done');
+    await expectClearedAndReleased(fx);
+  });
+
+  it('an awaiting_human agent is released directly without /clear', async () => {
+    const fx = await boundAgentsFixture(null, null);
+    await bindAgent(fx.agentStore, 'dev-1', {
+      taskId: 'task-1', paneId: '%1',
+      status: 'awaiting_human', awaitingPhase: 'greeting-failed',
+      awaitingReason: 'x', awaitingSince: 'now',
+    });
+    await fx.manager.markTaskComplete('task-1');
+    await vi.waitFor(async () => {
+      expect((await fx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+      expect((await fx.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    }, { timeout: 5000 });
+    expect(clearSentTo(fx.execCalls, '%1')).toBe(false);
+    expect(clearSentTo(fx.execCalls, '%2')).toBe(true);
+  });
+
+  it('an agent without a live pane is released directly without /clear', async () => {
+    const fx = await boundAgentsFixture(null, null);
+    await bindAgent(fx.agentStore, 'dev-1', { taskId: 'task-1' });
+    await fx.manager.markTaskComplete('task-1');
+    await vi.waitFor(async () => {
+      expect((await fx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+      expect((await fx.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    }, { timeout: 5000 });
+    expect(clearSentTo(fx.execCalls, '%1')).toBe(false);
+  });
+});
+
 describe('snapshot + resume semantics', () => {
   it('ready confirm uses task.afterDone over hot config', async () => {
     const { manager, taskStore } = await makeFixture(null, 'pr');

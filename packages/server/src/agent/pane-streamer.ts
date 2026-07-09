@@ -5,7 +5,6 @@ import type { AgentConfig, HostConfig } from '../shared/index.js';
 import xterm from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { buildAttachInteractiveCommand, type AttachCommand } from '../terminal/attach.js';
-import type { CommandRunner } from './runner.js';
 import { sshEnv } from './runner.js';
 import { TmuxManager } from './tmux.js';
 import { computeBackoffMs } from '../timing/backoff.js';
@@ -24,7 +23,7 @@ export interface PaneStreamerOptions {
   random?: () => number;
 }
 
-export interface PaneSnapshot {
+interface PaneSnapshot {
   cols: number;
   rows: number;
   data: string;
@@ -196,7 +195,6 @@ export class PaneStreamer {
   constructor(
     private readonly agent: AgentConfig,
     private readonly tmux: TmuxManager,
-    _runner: CommandRunner,
     private readonly resolveHost: () => HostConfig | undefined,
     opts: PaneStreamerOptions = {},
   ) {

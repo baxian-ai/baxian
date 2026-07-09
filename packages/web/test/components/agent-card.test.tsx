@@ -14,8 +14,9 @@ vi.mock('../../src/hooks/use-pets.ts', () => ({
 }));
 
 import { api } from '../../src/api.ts';
-import { AgentCard, type TerminalMode } from '../../src/components/agent-card.tsx';
+import { AgentCard, resolveAgentBadge, type TerminalMode } from '../../src/components/agent-card.tsx';
 import { ConfirmProvider } from '../../src/components/confirm-dialog.tsx';
+import { enUS } from '../../src/i18n/en-us.ts';
 import { makeTask } from '../helpers/fixtures.ts';
 import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
@@ -33,6 +34,7 @@ const bootstrapMock = vi.mocked(api.projects.bootstrap);
 
 type RenderCardOptions = {
   runtime?: AgentRuntime;
+  model?: string;
   role?: AgentRole;
   terminalMode?: TerminalMode;
   terminalLoading?: boolean;
@@ -41,7 +43,7 @@ type RenderCardOptions = {
 };
 
 function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void {
-  const { runtime, role = 'dev', terminalMode, terminalLoading, active, onActivate } = options;
+  const { runtime, model, role = 'dev', terminalMode, terminalLoading, active, onActivate } = options;
   render(
     <MemoryRouter>
       <ConfirmProvider>
@@ -50,6 +52,7 @@ function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void
           projectId="proj"
           role={role}
           runtime={runtime}
+          model={model}
           terminalMode={terminalMode}
           terminalLoading={terminalLoading}
           active={active}
@@ -111,6 +114,156 @@ async function settleConfirmDialog(buttonName: string): Promise<void> {
     fireEvent.click(within(dialog).getByRole('button', { name: buttonName }));
   });
 }
+
+describe('resolveAgentBadge', () => {
+  const t = enUS.agents;
+
+  function badgeFor(overrides: Partial<AgentSnapshot> = {}) {
+    return resolveAgentBadge(makeSnapshot(overrides), t);
+  }
+
+  it('ranks host unreachable above every other signal', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'error',
+      tmuxSessionStatus: 'unreachable',
+      stale: true,
+      binding: makeBinding('dev-1', {
+        status: 'awaiting_human',
+        awaitingReason: 'stuck',
+        needInputAt: '2026-07-06T10:00:00Z',
+      }),
+    });
+    expect(badge.label).toBe('Host unreachable');
+    expect(badge.cls).toBe('pill pill-danger');
+    expect(badge.kind).toBe('alert');
+  });
+
+  it('shows Starting while bootstrapping even though the session is still absent', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'pending',
+      tmuxSessionStatus: 'absent',
+      binding: makeBinding('dev-1', { creationToken: 'create-1' }),
+    });
+    expect(badge.label).toBe('Starting');
+    expect(badge.cls).toBe('pill pill-review');
+    expect(badge.kind).toBe('runtime');
+  });
+
+  it('ranks a missing session above a runtime error outside bootstrap', () => {
+    const badge = badgeFor({ runtimeStatus: 'error', tmuxSessionStatus: 'absent' });
+    expect(badge.label).toBe('No session');
+    expect(badge.cls).toBe('pill pill-warn');
+    expect(badge.kind).toBe('alert');
+  });
+
+  it('ranks a runtime error above a human hold', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'error',
+      binding: makeBinding('dev-1', { status: 'awaiting_human' }),
+    });
+    expect(badge.label).toBe('Error');
+    expect(badge.cls).toBe('pill pill-warn');
+    expect(badge.kind).toBe('alert');
+  });
+
+  it('ranks a human hold above an unanswered question and titles it with the awaiting reason', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'pending',
+      binding: makeBinding('dev-1', {
+        status: 'awaiting_human',
+        awaitingReason: 'recheck dispatch failed',
+        needInputAt: '2026-07-06T10:00:00Z',
+      }),
+    });
+    expect(badge.label).toBe('Held');
+    expect(badge.kind).toBe('alert');
+    expect(badge.title).toBe('recheck dispatch failed');
+  });
+
+  it('falls back to the default hold reason when the binding carries none', () => {
+    const badge = badgeFor({ binding: makeBinding('dev-1', { status: 'awaiting_human' }) });
+    expect(badge.label).toBe('Held');
+    expect(badge.title).toBe('Needs human attention');
+  });
+
+  it('ranks an unanswered question above the pending runtime status', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'pending',
+      binding: makeBinding('dev-1', { needInputAt: '2026-07-06T10:00:00Z' }),
+    });
+    expect(badge.label).toBe('Awaiting reply');
+    expect(badge.kind).toBe('alert');
+    expect(badge.title).toContain('Agent is waiting for your reply');
+  });
+
+  it('reports the pending runtime status as an alert', () => {
+    const badge = badgeFor({ runtimeStatus: 'pending' });
+    expect(badge.label).toBe('Awaiting human');
+    expect(badge.cls).toBe('pill pill-warn');
+    expect(badge.kind).toBe('alert');
+  });
+
+  it.each([
+    ['working', 'Working', 'pill pill-live'],
+    ['waiting', 'Waiting', 'pill pill-review'],
+    ['idle', 'Idle', 'pill pill-idle'],
+    ['unknown', 'Unknown', 'pill pill-idle'],
+  ] as const)('maps the %s runtime status to a plain %s badge', (status, label, cls) => {
+    const badge = badgeFor({ runtimeStatus: status });
+    expect(badge.label).toBe(label);
+    expect(badge.cls).toBe(cls);
+    expect(badge.kind).toBe('runtime');
+  });
+
+  it('lets the runtime status speak while the first session probe is still pending', () => {
+    const badge = badgeFor({ runtimeStatus: 'idle', tmuxSessionStatus: 'unknown' });
+    expect(badge.label).toBe('Idle');
+  });
+
+  it('does not treat an agent with a live pane as bootstrapping', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'pending',
+      binding: makeBinding('dev-1', { creationToken: 'create-1', paneId: '%1' }),
+    });
+    expect(badge.label).toBe('Awaiting human');
+  });
+
+  it('does not treat a startup-dialog hold as bootstrapping once the probe reports PENDING_HUMAN', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'pending',
+      reason: 'PENDING_HUMAN',
+      binding: makeBinding('dev-1', { creationToken: 'create-1' }),
+    });
+    expect(badge.label).toBe('Awaiting human');
+  });
+
+  it('marks any badge as stale and appends the last-observed note to its title', () => {
+    const badge = badgeFor({
+      runtimeStatus: 'working',
+      stale: true,
+      observedAt: '2026-07-06T10:00:00Z',
+    });
+    expect(badge.label).toBe('Working');
+    expect(badge.stale).toBe(true);
+    expect(badge.title).toContain('stale');
+    expect(badge.title).toContain(new Date('2026-07-06T10:00:00Z').toLocaleString());
+  });
+
+  it('keeps the hold reason and the stale note together in the title', () => {
+    const badge = badgeFor({
+      stale: true,
+      binding: makeBinding('dev-1', { status: 'awaiting_human', awaitingReason: 'stuck' }),
+    });
+    expect(badge.title).toContain('stuck');
+    expect(badge.title).toContain('stale');
+  });
+
+  it('leaves fresh badges without a stale marker', () => {
+    const badge = badgeFor({ runtimeStatus: 'working' });
+    expect(badge.stale).toBe(false);
+    expect(badge.title).toBeUndefined();
+  });
+});
 
 describe('AgentCard', () => {
   beforeEach(() => {
@@ -227,6 +380,22 @@ describe('AgentCard', () => {
     expect(runtime.className).toContain('sm:inline');
   });
 
+  it('appends the configured model after the runtime label when set', () => {
+    renderCard(makeSnapshot({ id: 'dev-codex' }), { runtime: 'codex', model: 'gpt-5.4' });
+
+    const name = screen.getByText('dev-codex');
+    const runtime = screen.getByText('(Codex · gpt-5.4)');
+    expect(name.getAttribute('title')).toBe('dev-codex (Codex · gpt-5.4)');
+    expect(runtime.className).toContain('text-og-400');
+  });
+
+  it('shows the model alone when the runtime is unknown', () => {
+    renderCard(makeSnapshot({ id: 'dev-x' }), { model: 'opus' });
+
+    expect(screen.getByText('(opus)')).toBeTruthy();
+    expect(screen.getByText('dev-x').getAttribute('title')).toBe('dev-x (opus)');
+  });
+
   it('shows bootstrap as starting and keeps the terminal gated until the tmux session appears', () => {
     renderCard(makeSnapshot({
       id: 'dev-new',
@@ -236,7 +405,6 @@ describe('AgentCard', () => {
     }));
 
     expect(screen.getByText('Starting')).toBeTruthy();
-    expect(screen.getByRole('img', { name: 'Session starting' })).toBeTruthy();
     expect(screen.getByText(/Agent is starting/)).toBeTruthy();
     expect(screen.queryByText('Awaiting human intervention')).toBeNull();
     expect(screen.queryByRole('link', { name: 'Terminal' })).toBeNull();
@@ -252,7 +420,6 @@ describe('AgentCard', () => {
     }));
 
     expect(screen.getByText('Awaiting human')).toBeTruthy();
-    expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(screen.getByText('Awaiting human intervention')).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-pending', '/terminal/dev-pending']);
     expect(screen.getByTestId('pane-terminal')).toBeTruthy();
@@ -268,7 +435,6 @@ describe('AgentCard', () => {
     }));
 
     expect(screen.getByText('Awaiting human')).toBeTruthy();
-    expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
     expect(screen.getByText('Awaiting human intervention')).toBeTruthy();
     expect(terminalHrefs()).toEqual(['/terminal/dev-pending-no-pane', '/terminal/dev-pending-no-pane']);
     expect(screen.queryByText(/Agent is starting/)).toBeNull();
@@ -327,7 +493,6 @@ describe('AgentCard', () => {
     }));
 
     expect(screen.getByText('Starting')).toBeTruthy();
-    expect(screen.getByRole('img', { name: 'Session starting' })).toBeTruthy();
     expect(screen.queryByText('Awaiting human intervention')).toBeNull();
     expect(screen.queryByText(/Agent is starting/)).toBeNull();
     expect(terminalHrefs()).toEqual(['/terminal/dev-launching']);
@@ -459,51 +624,117 @@ describe('AgentCard', () => {
     });
   });
 
-  it('hides the session-present status dot in the normal path', () => {
-    renderCard(makeSnapshot({ id: 'dev-present' }));
+  describe('unified status badge', () => {
+    it('renders exactly one status badge even when several signals fire at once', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-multi',
+        runtimeStatus: 'working',
+        tmuxSessionStatus: 'unreachable',
+        stale: true,
+        binding: makeBinding('dev-multi', {
+          status: 'awaiting_human',
+          needInputAt: '2026-07-06T10:00:00Z',
+        }),
+      }));
 
-    expect(screen.queryByRole('img', { name: 'Session present' })).toBeNull();
-    expect(document.querySelector('.status-dot')).toBeNull();
-  });
+      const badge = screen.getByText('Host unreachable');
+      expect(badge.className).toContain('pill-danger');
+      expect(screen.queryByText('Working')).toBeNull();
+      expect(screen.queryByText('Held')).toBeNull();
+      expect(screen.queryByText('Awaiting reply')).toBeNull();
+    });
 
-  it.each([
-    ['absent', 'No session', 'status-dot--warn'],
-    ['unreachable', 'Host unreachable', 'status-dot--danger'],
-    ['unknown', 'Session status unknown', 'status-dot--warn'],
-  ] as const)('renders a non-normal %s tmux status as the %s dot (modifier %s)', (status, label, modifier) => {
-    renderCard(makeSnapshot({ id: `dev-${status}`, tmuxSessionStatus: status }));
-    const dot = screen.getByRole('img', { name: label });
-    expect(dot.className).toContain(modifier);
-  });
+    it.each([
+      ['absent', 'No session', 'pill-warn'],
+      ['unreachable', 'Host unreachable', 'pill-danger'],
+    ] as const)('renders a %s tmux session as a %s badge', (status, label, cls) => {
+      renderCard(makeSnapshot({ id: `dev-${status}`, tmuxSessionStatus: status }));
+      expect(screen.getByText(label).className).toContain(cls);
+    });
 
-  it('non-normal status dots use the warning or danger treatment', () => {
-    renderCard(makeSnapshot({ id: 'dev-no-session', tmuxSessionStatus: 'absent' }));
-    const dot = screen.getByRole('img', { name: 'No session' });
-    expect(dot.className).toContain('status-dot--warn');
-    expect(dot.className).not.toContain('status-dot--danger');
-  });
+    it('keeps the runtime badge as the only indicator while the first session probe is pending', () => {
+      renderCard(makeSnapshot({ id: 'dev-probe', runtimeStatus: 'idle', tmuxSessionStatus: 'unknown' }));
 
-  it('abnormal status dot sits to the right of the runtime pill in the top-right group', () => {
-    renderCard(makeSnapshot({
-      id: 'dev-position',
-      runtimeStatus: 'working',
-      tmuxSessionStatus: 'unreachable',
-      stale: true,
-    }));
-    const dot = screen.getByRole('img', { name: 'Host unreachable' });
-    const runtimePill = screen.getByText('Working');
-    const stalePill = screen.getByText('Stale');
-    expect(dot.parentElement).toBe(runtimePill.parentElement);
-    expect(dot.parentElement).toBe(stalePill.parentElement);
-    const siblings = Array.from(dot.parentElement!.children);
-    expect(siblings.indexOf(dot)).toBeGreaterThan(siblings.indexOf(runtimePill));
-    expect(siblings.indexOf(dot)).toBeGreaterThan(siblings.indexOf(stalePill));
-  });
+      expect(screen.getByText('Idle')).toBeTruthy();
+      expect(screen.queryByRole('img', { name: /[Ss]ession/ })).toBeNull();
+    });
 
-  it('abnormal status dot carries an explicit extra left margin so it breathes away from the pill cluster', () => {
-    renderCard(makeSnapshot({ id: 'dev-spacing', tmuxSessionStatus: 'absent' }));
-    const dot = screen.getByRole('img', { name: 'No session' });
-    expect(dot.className).toContain('ml-2');
+    it('outlines the stale badge without dimming its text and explains the staleness on hover', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-stale',
+        runtimeStatus: 'working',
+        stale: true,
+        observedAt: '2026-07-06T10:00:00Z',
+      }));
+
+      const badge = screen.getByText('Working');
+      expect(badge.className).toContain('pill--stale');
+      expect(badge.className).not.toContain('opacity');
+      expect(badge.getAttribute('title')).toContain('stale');
+      expect(badge.getAttribute('aria-label')).toBeNull();
+    });
+
+    it('exposes the staleness as real visually-hidden text next to the badge', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-stale-sr',
+        runtimeStatus: 'working',
+        stale: true,
+        observedAt: '2026-07-06T10:00:00Z',
+      }));
+
+      const note = screen.getByText(/Data may be stale/);
+      expect(note.className).toContain('sr-only');
+      expect(note.parentElement).toBe(screen.getByText('Working').parentElement);
+    });
+
+    it('folds the hold reason into the hidden stale note', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-held-stale',
+        stale: true,
+        binding: makeBinding('dev-held-stale', { status: 'awaiting_human', awaitingReason: 'stuck' }),
+      }));
+
+      const note = screen.getByText(/Data may be stale/);
+      expect(note.textContent).toContain('stuck');
+    });
+
+    it('keeps a fresh badge solid, untitled, and free of hidden notes', () => {
+      renderCard(makeSnapshot({ id: 'dev-fresh', runtimeStatus: 'working' }));
+
+      const badge = screen.getByText('Working');
+      expect(badge.className).not.toContain('pill--stale');
+      expect(badge.getAttribute('title')).toBeNull();
+      expect(badge.getAttribute('aria-label')).toBeNull();
+      expect(screen.queryByText(/Data may be stale/)).toBeNull();
+    });
+
+    it('keeps the outlined stale badge and its hidden note next to a pet so the staleness stays visible', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-pet-stale',
+        petId: 'pet-1',
+        runtimeStatus: 'working',
+        stale: true,
+        observedAt: '2026-07-06T10:00:00Z',
+      }));
+
+      const badge = screen.getByText('Working');
+      expect(badge.className).toContain('pill--stale');
+      expect(badge.getAttribute('title')).toContain('stale');
+      expect(screen.getByText(/Data may be stale/).className).toContain('sr-only');
+    });
+
+    it('keeps alert badges visible when a pet replaces the runtime badge', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-pet-alert',
+        petId: 'pet-1',
+        binding: makeBinding('dev-pet-alert', {
+          status: 'awaiting_human',
+          awaitingReason: 'stuck on dialog',
+        }),
+      }));
+
+      expect(screen.getByText('Held').getAttribute('title')).toContain('stuck on dialog');
+    });
   });
 
   describe('actions menu', () => {

@@ -139,6 +139,20 @@ describe('AgentGroup', () => {
     expect(within(region).getByText('(Codex)').className).toContain('text-og-400');
   });
 
+  it('passes the configured model through to the agent card runtime label', () => {
+    renderGroup([], {
+      group: [
+        { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', model: 'opus' },
+        { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' },
+      ],
+    });
+
+    const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-1' });
+    expect(within(region).getByText('dev-1').getAttribute('title')).toBe('dev-1 (Claude Code · opus)');
+    expect(within(region).getByText('(Claude Code · opus)').className).toContain('text-og-400');
+    expect(within(region).getByText('qa-1').getAttribute('title')).toBe('qa-1 (Codex)');
+  });
+
   it('task summary shows Round as text without re-printing the dev/qa agent ids that the cards below already show', () => {
     renderGroup([task({ reviewRound: 3 })]);
 

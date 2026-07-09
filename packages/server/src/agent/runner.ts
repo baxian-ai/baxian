@@ -189,7 +189,7 @@ export function __resetMuxDirReadyForTests(): void {
 const SSH_ASKPASS_PATH = join(homedir(), '.baxian', 'ssh-askpass');
 const SSH_ASKPASS_SCRIPT = '#!/bin/sh\nprintf \'%s\\n\' "$BAXIAN_SSH_PASSWORD"\n';
 let askpassReady: Promise<string> | undefined;
-export function ensureAskpassHelper(): Promise<string> {
+function ensureAskpassHelper(): Promise<string> {
   if (!askpassReady) {
     askpassReady = (async () => {
       await mkdir(dirname(SSH_ASKPASS_PATH), { recursive: true });
@@ -202,10 +202,6 @@ export function ensureAskpassHelper(): Promise<string> {
     });
   }
   return askpassReady;
-}
-
-export function __resetAskpassReadyForTests(): void {
-  askpassReady = undefined;
 }
 
 export function resolveAgentHost(
@@ -277,27 +273,6 @@ export function sshAuthArgs(host: HostConfig | undefined): string[] {
     ];
   }
   return ['-o', 'BatchMode=yes'];
-}
-
-export function buildSshArgs(host: HostConfig | undefined, args: BuildSshOptionsArgs = {}): string[] {
-  const connectTimeoutSec = args.connectTimeoutSec ?? 10;
-  const out: string[] = [...sshAuthArgs(host)];
-  out.push(
-    '-o', `ConnectTimeout=${connectTimeoutSec}`,
-    '-o', 'ServerAliveInterval=2',
-    '-o', 'ServerAliveCountMax=2',
-  );
-  if (args.noMux) {
-    out.push('-o', 'ControlMaster=no', '-o', 'ControlPath=none');
-  } else {
-    out.push(
-      '-o', 'ControlMaster=auto',
-      '-o', `ControlPath=${join(SSH_MUX_DIR, 'cm-%C')}`,
-      '-o', `ControlPersist=${SSH_CONTROL_PERSIST}`,
-    );
-  }
-  if (host?.port !== undefined) out.push('-p', String(host.port));
-  return out;
 }
 
 export function buildSshOptions(host: HostConfig | undefined, args: BuildSshOptionsArgs = {}): string {

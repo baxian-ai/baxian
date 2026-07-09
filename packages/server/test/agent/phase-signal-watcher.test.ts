@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
-import { buildPhaseSignal, buildPhaseSignalTemplate, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
+import { buildPhaseSignal, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
 import type { AgentConfig, BaxianEvent, EventType } from '../../src/shared/index.js';
 import type { EventBus } from '../../src/event/bus.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
@@ -206,7 +206,7 @@ describe('PhaseSignalWatcher', () => {
     const promptShape = [
       'Post-approve PR feedback check:',
       `- Emit on its own line, substituting <token>:`,
-      `    ${buildPhaseSignalTemplate('pr-merge-ready')}`,
+      '    [bx:pr-merge-ready:<token>]',
       `  token: ${token}`,
     ].join('\n') + '\n';
     streamer.triggerLive(promptShape);

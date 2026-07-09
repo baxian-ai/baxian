@@ -105,11 +105,6 @@ export function createSignalToken(): string {
   return randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
-export function buildPhaseSignalTemplate(kind: PhaseSignalKind): string {
-  if (kind === 'pr-created') return '[bx:pr-created:<pr_number>:<token>]';
-  return `[bx:${kind}:<token>]`;
-}
-
 export function scanPhaseSignals(text: string): PhaseSignal[] {
   const stripped = stripSignalAnsi(text);
   const compact = stripped.replace(/\s+/g, '');

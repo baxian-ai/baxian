@@ -1,6 +1,7 @@
 import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { TaskState, TaskStatus } from '../shared/index.js';
+import { mapWithConcurrency, FS_READ_CONCURRENCY } from '../shared/index.js';
 
 // a store id becomes a filename; constrain it so a path-like id can't escape the store dir
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
@@ -88,29 +89,38 @@ export class TaskStore {
     } catch {
       return [];
     }
-    const tasks: TaskState[] = [];
-    for (const file of files) {
-      if (!file.endsWith('.json')) continue;
-      let task: TaskState;
-      try {
-        const content = await readFile(join(this.dir, file), 'utf-8');
-        const raw = JSON.parse(content) as Record<string, unknown>;
-        task = sanitizeTask({ ...raw, id: file.slice(0, -'.json'.length) });
-      } catch (err) {
-        console.warn(`[TaskStore] skipping unreadable file ${file}:`, err);
-        continue;
-      }
-      if (filter?.projectId && task.projectId !== filter.projectId) continue;
-      if (filter?.status && task.status !== filter.status) continue;
-      tasks.push(task);
-    }
-    return tasks;
+    const loaded = await mapWithConcurrency(
+      files.filter(f => f.endsWith('.json')),
+      FS_READ_CONCURRENCY,
+      async (file) => {
+        try {
+          const content = await readFile(join(this.dir, file), 'utf-8');
+          const raw = JSON.parse(content) as Record<string, unknown>;
+          return sanitizeTask({ ...raw, id: file.slice(0, -'.json'.length) });
+        } catch (err) {
+          console.warn(`[TaskStore] skipping unreadable file ${file}:`, err);
+          return null;
+        }
+      },
+    );
+    return loaded.filter((task): task is TaskState => {
+      if (!task) return false;
+      if (filter?.projectId && task.projectId !== filter.projectId) return false;
+      if (filter?.status && task.status !== filter.status) return false;
+      return true;
+    });
   }
 
+  // ids come from filenames, so the max scan never needs to read file contents
   async nextId(): Promise<string> {
-    const tasks = await this.list();
-    const maxNum = tasks.reduce((max, t) => {
-      const match = t.id.match(/^task-(\d+)$/);
+    let files: string[];
+    try {
+      files = await readdir(this.dir);
+    } catch {
+      files = [];
+    }
+    const maxNum = files.reduce((max, f) => {
+      const match = f.match(/^task-(\d+)\.json$/);
       return match ? Math.max(max, parseInt(match[1], 10)) : max;
     }, 0);
     return `task-${String(maxNum + 1).padStart(3, '0')}`;

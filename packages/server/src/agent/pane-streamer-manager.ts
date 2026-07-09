@@ -47,7 +47,7 @@ export class PaneStreamerManager {
       ? this.hostResolver(agent)
       : (typeof agent.host === 'object' ? agent.host : undefined));
     const tmux = new TmuxManager(runner);
-    const streamer = new PaneStreamer(agent, tmux, runner, resolveHost, this.streamerDefaults);
+    const streamer = new PaneStreamer(agent, tmux, resolveHost, this.streamerDefaults);
     this.streamers.set(agent.id, streamer);
     this.tmuxByAgent.set(agent.id, tmux);
     return streamer;

@@ -5,6 +5,7 @@ import type {
 } from '../shared/index.js';
 import { getAuthToken } from '../api.ts';
 import { ReconnectScheduler } from './reconnect-scheduler.ts';
+import { defaultWsFactory, toHex, wsUrl, type WebSocketFactory } from './ws-shared.ts';
 
 export interface SnapshotPayload {
   cols: number;
@@ -43,8 +44,6 @@ interface Subscription {
   snapshotSeq?: number;
 }
 
-type WebSocketFactory = (url: string, protocols?: string[]) => WebSocket;
-
 let subscriberCounter = 0;
 function genSubscriberId(): string {
   subscriberCounter++;
@@ -52,21 +51,9 @@ function genSubscriberId(): string {
   return `sub-${Date.now().toString(36)}-${subscriberCounter}-${rand}`;
 }
 
-function toHex(s: string): string {
-  return Array.from(new TextEncoder().encode(s))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
 function defaultWsUrl(): string {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/api/stream`;
+  return wsUrl('/api/stream');
 }
-
-const defaultWsFactory: WebSocketFactory = (url, protocols) =>
-  protocols && protocols.length > 0
-    ? new WebSocket(url, protocols)
-    : new WebSocket(url);
 
 export interface PaneStreamClientOptions {
   wsUrl?: string;

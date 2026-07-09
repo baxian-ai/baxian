@@ -150,7 +150,7 @@ async function del<T = void>(path: string): Promise<T> {
 
 const enc = encodeURIComponent;
 
-export interface ProbeStatus {
+interface ProbeStatus {
   ok: boolean;
   path?: string;
   message: string;
@@ -279,7 +279,11 @@ export const api = {
     continue: (id: string) => post<TaskState>(`/tasks/${enc(id)}/continue`),
     spec: (id: string, body: { verdict: 'approve' | 'request-changes'; comments?: string }) =>
       post<TaskState>(`/tasks/${enc(id)}/spec`, body),
+    code: (id: string, body: { verdict: 'request-changes'; comments: string }) =>
+      post<TaskState>(`/tasks/${enc(id)}/code`, body),
     reviews: (id: string) => get<ReviewRound[]>(`/tasks/${enc(id)}/reviews`),
+    interdiff: (id: string, round: number) =>
+      get<{ diff: string }>(`/tasks/${enc(id)}/reviews/code/${round}/interdiff`),
     githubReview: (id: string) =>
       get<GithubReviewConversation>(`/tasks/${enc(id)}/github-review`),
     dispatch: (id: string, body: { agentId: string }) =>

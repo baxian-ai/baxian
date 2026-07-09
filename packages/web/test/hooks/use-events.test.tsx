@@ -113,59 +113,6 @@ describe('useAgents', () => {
   });
 });
 
-describe('useAgent', () => {
-  it('distinguishes "not yet loaded" from "loaded with null" for a missing agent', async () => {
-    const { useAgent } = await import('../../src/hooks/use-events.ts');
-    const { result } = renderHook(() => useAgent('ghost'));
-
-    expect(result.current.loaded).toBe(false);
-    const ws = MockWebSocket.lastInstance!;
-    act(() => { ws.open(); });
-    expect(ws.sent.some(s => s.includes('"topic":"agent:ghost"'))).toBe(true);
-
-    act(() => {
-      ws.push({ type: 'data', topic: 'agent:ghost', data: null });
-    });
-    expect(result.current.loaded).toBe(true);
-    expect(result.current.data).toBe(null);
-  });
-
-  it('resets data/loaded/error and resubscribes when agentId changes (no stale snapshot flash)', async () => {
-    const { useAgent } = await import('../../src/hooks/use-events.ts');
-    const { result, rerender } = renderHook(({ id }) => useAgent(id), {
-      initialProps: { id: 'dev-1' },
-    });
-
-    const ws1 = MockWebSocket.lastInstance!;
-    act(() => { ws1.open(); });
-    act(() => {
-      ws1.push({ type: 'error', topic: 'agent:dev-1', code: 'forbidden', message: 'nope' });
-    });
-    expect(result.current.error).toEqual({ code: 'forbidden', message: 'nope' });
-    act(() => {
-      ws1.push({ type: 'data', topic: 'agent:dev-1', data: { id: 'dev-1', runtimeStatus: 'idle' } });
-    });
-    expect(result.current.error).toBe(null);
-    expect(result.current.loaded).toBe(true);
-    expect(result.current.data?.id).toBe('dev-1');
-
-    rerender({ id: 'qa-1' });
-    expect(result.current.data).toBe(null);
-    expect(result.current.loaded).toBe(false);
-    expect(result.current.error).toBe(null);
-
-    const ws2 = MockWebSocket.lastInstance!;
-    expect(ws2).not.toBe(ws1);
-    act(() => { ws2.open(); });
-    expect(ws2.sent.some(s => s.includes('"topic":"agent:qa-1"'))).toBe(true);
-    act(() => {
-      ws2.push({ type: 'data', topic: 'agent:qa-1', data: { id: 'qa-1', runtimeStatus: 'busy' } });
-    });
-    expect(result.current.data?.id).toBe('qa-1');
-    expect(result.current.loaded).toBe(true);
-  });
-});
-
 describe('useTask', () => {
   it('distinguishes "not yet loaded" from "loaded with null" so missing tasks render NotFound, not Loading', async () => {
     const { useTask } = await import('../../src/hooks/use-events.ts');
@@ -204,6 +151,41 @@ describe('useTask', () => {
 
     expect(result.current.loaded).toBe(true);
     expect(result.current.data?.id).toBe('t1');
+  });
+
+  it('resets data/loaded/error and resubscribes when taskId changes (no stale snapshot flash)', async () => {
+    const { useTask } = await import('../../src/hooks/use-events.ts');
+    const { result, rerender } = renderHook(({ id }) => useTask(id), {
+      initialProps: { id: 't1' },
+    });
+
+    const ws1 = MockWebSocket.lastInstance!;
+    act(() => { ws1.open(); });
+    act(() => {
+      ws1.push({ type: 'error', topic: 'task:t1', code: 'forbidden', message: 'nope' });
+    });
+    expect(result.current.error).toEqual({ code: 'forbidden', message: 'nope' });
+    act(() => {
+      ws1.push({ type: 'data', topic: 'task:t1', data: { id: 't1', status: 'pending' } });
+    });
+    expect(result.current.error).toBe(null);
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.data?.id).toBe('t1');
+
+    rerender({ id: 't2' });
+    expect(result.current.data).toBe(null);
+    expect(result.current.loaded).toBe(false);
+    expect(result.current.error).toBe(null);
+
+    const ws2 = MockWebSocket.lastInstance!;
+    expect(ws2).not.toBe(ws1);
+    act(() => { ws2.open(); });
+    expect(ws2.sent.some(s => s.includes('"topic":"task:t2"'))).toBe(true);
+    act(() => {
+      ws2.push({ type: 'data', topic: 'task:t2', data: { id: 't2', status: 'review' } });
+    });
+    expect(result.current.data?.id).toBe('t2');
+    expect(result.current.loaded).toBe(true);
   });
 });
 

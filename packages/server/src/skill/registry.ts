@@ -5,7 +5,7 @@ import { TextDecoder } from 'node:util';
 import { AGENT_PHASES } from '../shared/index.js';
 import type { AgentRole } from '../shared/index.js';
 
-export interface SkillFile {
+interface SkillFile {
   relPath: string;
   content: Buffer;
   text: string;
@@ -20,7 +20,7 @@ export interface SkillDef {
   files: SkillFile[];
 }
 
-export class SkillScanError extends Error {
+class SkillScanError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'SkillScanError';
@@ -209,7 +209,7 @@ export class SkillRegistry {
 
 export type SkillFileWriter = (path: string, content: Buffer) => Promise<void>;
 
-export const CORE_SKILLS = ['baxian-greeting', 'baxian-signals'] as const;
+const CORE_SKILLS = ['baxian-greeting', 'baxian-signals'] as const;
 
 export function assertCoreSkillsPresent(registry: SkillRegistry, skillsDir?: string): void {
   const missing = CORE_SKILLS.filter((name) => !registry.has(name));

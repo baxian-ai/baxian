@@ -47,6 +47,8 @@ export interface BuildPromptOpts {
   imagePaths?: string[];
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverInterdiff?: string;
+  serverInterdiffFile?: ReviewContentFileRef;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
@@ -74,6 +76,8 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     imagePaths: opts.imagePaths,
     serverContent: opts.serverContent,
     serverContentFile: opts.serverContentFile,
+    serverInterdiff: opts.serverInterdiff,
+    serverInterdiffFile: opts.serverInterdiffFile,
     serverDiffstat: opts.serverDiffstat,
     serverBatch: opts.serverBatch,
     serverPriorFindings: opts.serverPriorFindings,
@@ -108,6 +112,8 @@ interface TaskBodyArgs {
   imagePaths?: string[];
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverInterdiff?: string;
+  serverInterdiffFile?: ReviewContentFileRef;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
@@ -125,6 +131,8 @@ interface PhasePromptCtx {
   postApproveRedispatchCount?: number;
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverInterdiff?: string;
+  serverInterdiffFile?: ReviewContentFileRef;
   serverDiffstat?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
@@ -228,7 +236,7 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
 };
 
 function buildServerReviewInstructions(
-  { task, serverContent, serverContentFile, serverDiffstat, serverBatch, serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile }: PhasePromptCtx,
+  { task, serverContent, serverContentFile, serverInterdiff, serverInterdiffFile, serverDiffstat, serverBatch, serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile }: PhasePromptCtx,
 ): PhasePrompt {
   const round = task.reviewRound || 1;
   return {
@@ -236,6 +244,7 @@ function buildServerReviewInstructions(
       `round: ${round}`,
       ...(serverBatch ? [`batch: ${serverBatch.index + 1}/${serverBatch.total}`] : []),
       ...(serverContentFile ? [fileField('diff-file', serverContentFile)] : []),
+      ...(serverInterdiffFile ? [fileField('interdiff-file', serverInterdiffFile)] : []),
       ...(serverPriorFindingsFile ? [fileField('prior-findings-file', serverPriorFindingsFile)] : []),
       ...(serverPriorResponseFile ? [fileField('prior-response-file', serverPriorResponseFile)] : []),
       'signal: code-reviewed',
@@ -244,6 +253,7 @@ function buildServerReviewInstructions(
       ...(serverDiffstat ? ['diffstat:', serverDiffstat] : []),
       ...(serverPriorFindings ? ['prior-findings:', serverPriorFindings] : []),
       ...(serverPriorResponse ? ['prior-response:', serverPriorResponse] : []),
+      ...(serverInterdiff !== undefined ? ['interdiff (本轮相对上一轮的增量，优先核对；全量 diff 供交叉确认):', serverInterdiff] : []),
       ...(serverContent !== undefined ? ['diff:', serverContent] : []),
     ],
   };
@@ -253,7 +263,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
   const {
     task, phase, worktreePath, signalToken, postApproveRedispatchCount,
     currentSpecRound, imagePaths,
-    serverContent, serverContentFile, serverDiffstat, serverBatch,
+    serverContent, serverContentFile, serverInterdiff, serverInterdiffFile, serverDiffstat, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   } = args;
@@ -267,6 +277,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
     throw new Error(`${phase} prompt requires signalToken`);
   }
   if ((serverContent !== undefined && serverContentFile)
+    || (serverInterdiff !== undefined && serverInterdiffFile)
     || (serverPriorFindings !== undefined && serverPriorFindingsFile)
     || (serverPriorResponse !== undefined && serverPriorResponseFile)) {
     throw new Error(`${phase} prompt: inline and file payload forms are mutually exclusive`);
@@ -278,7 +289,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
   }
   const { fields, blocks } = phaseBuilder({
     task, signalToken, currentSpecRound, postApproveRedispatchCount,
-    serverContent, serverContentFile, serverDiffstat, serverBatch,
+    serverContent, serverContentFile, serverInterdiff, serverInterdiffFile, serverDiffstat, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   });

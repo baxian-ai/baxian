@@ -5,7 +5,7 @@ export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
 export type ReviewMode = 'github' | 'server';
 export type AfterDone = 'pr' | 'branch' | null;
-export type SupportedLanguage = 'zh-CN' | 'en-US';
+type SupportedLanguage = 'zh-CN' | 'en-US';
 
 export interface HostConfig {
   id?: string;
@@ -37,11 +37,11 @@ export interface ProjectConfig {
   agent: AgentConfig[][];
 }
 
-export interface ProjectReviewConfig {
+interface ProjectReviewConfig {
   mode?: ReviewMode;
 }
 
-export interface ReviewConfig {
+interface ReviewConfig {
   rounds: number;
   mode?: ReviewMode;
   afterDone?: AfterDone;
@@ -104,7 +104,7 @@ export type TaskStatus =
 
 export type TaskPhase = 'spec' | 'code';
 
-export type AgentLifecycleStatus = 'ok' | 'awaiting_human';
+type AgentLifecycleStatus = 'ok' | 'awaiting_human';
 
 export interface AgentBindingFacts {
   id: string;
@@ -192,7 +192,7 @@ export interface TaskState {
   verdictOverdue?: boolean;
 }
 
-export type FindingSeverity = 'critical' | 'major' | 'minor';
+type FindingSeverity = 'critical' | 'major' | 'minor';
 
 export interface Finding {
   id: string;
@@ -209,9 +209,9 @@ export interface ReviewFindings {
   findings: Finding[];
 }
 
-export type FindingAction = 'fix' | 'reject' | 'out-of-scope';
+type FindingAction = 'fix' | 'reject' | 'out-of-scope';
 
-export interface FindingResponse {
+interface FindingResponse {
   findingId: string;
   action: FindingAction;
   rationale: string;
@@ -228,7 +228,7 @@ export interface ReviewContentFileRef {
   bytes: number;
 }
 
-export interface SpecUserDecision {
+interface SpecUserDecision {
   verdict: 'approve' | 'request-changes';
   comments?: string;
   at: string;
@@ -241,6 +241,7 @@ export interface ReviewRound {
   contentTruncated?: boolean;
   diffstat?: string;
   baseSha?: string;
+  headSha?: string;
   findings?: ReviewFindings;
   response?: ReviewResponse;
   batchFindings?: ReviewFindings[];
@@ -265,15 +266,6 @@ export interface GithubReviewItem {
   line?: number;
   commitSha?: string;
   inReplyTo?: boolean;
-}
-
-export interface GithubReviewConversation {
-  available: boolean;
-  reason?: 'server-mode' | 'no-pr' | 'not-github';
-  prNumber?: number;
-  prUrl?: string;
-  items: GithubReviewItem[];
-  error?: string;
 }
 
 export type EventType =
@@ -311,32 +303,32 @@ export interface BaxianEvent {
 
 export type StreamSubMode = 'preview' | 'full';
 
-export interface StreamSubscribeMsg {
+interface StreamSubscribeMsg {
   op: 'subscribe';
   subscriberId: string;
   agentId: string;
   mode: StreamSubMode;
 }
 
-export interface StreamUnsubscribeMsg {
+interface StreamUnsubscribeMsg {
   op: 'unsubscribe';
   subscriberId: string;
 }
 
-export interface StreamInputMsg {
+interface StreamInputMsg {
   op: 'input';
   subscriberId: string;
   data: string;
 }
 
-export interface StreamResizeMsg {
+interface StreamResizeMsg {
   op: 'resize';
   subscriberId: string;
   cols: number;
   rows: number;
 }
 
-export interface StreamPingMsg {
+interface StreamPingMsg {
   op: 'ping';
 }
 
@@ -347,7 +339,7 @@ export type StreamClientMsg =
   | StreamResizeMsg
   | StreamPingMsg;
 
-export interface StreamSnapshotMsg {
+interface StreamSnapshotMsg {
   type: 'snapshot';
   subscriberId: string;
   cols: number;
@@ -356,14 +348,14 @@ export interface StreamSnapshotMsg {
   snapshotSeq: number;
 }
 
-export interface StreamDataMsg {
+interface StreamDataMsg {
   type: 'data';
   agentId: string;
   data: string;
   seq: number;
 }
 
-export interface StreamSubscribedMsg {
+interface StreamSubscribedMsg {
   type: 'subscribed';
   subscriberId: string;
   agentId: string;
@@ -372,7 +364,7 @@ export interface StreamSubscribedMsg {
   snapshotSeq: number;
 }
 
-export interface StreamErrorMsg {
+interface StreamErrorMsg {
   type: 'error';
   subscriberId?: string;
   agentId?: string;
@@ -380,12 +372,12 @@ export interface StreamErrorMsg {
   message: string;
 }
 
-export interface StreamSessionGoneMsg {
+interface StreamSessionGoneMsg {
   type: 'session_gone';
   agentId: string;
 }
 
-export interface StreamPongMsg {
+interface StreamPongMsg {
   type: 'pong';
 }
 
@@ -413,11 +405,11 @@ export interface PollerSnapshot {
   health: PollerHealth;
 }
 
-export type EventsTopicAgents = 'agents';
-export type EventsTopicAgent = `agent:${string}`;
-export type EventsTopicTask = `task:${string}`;
-export type EventsTopicProjectTasks = `project-tasks:${string}`;
-export type EventsTopicPollers = 'pollers';
+type EventsTopicAgents = 'agents';
+type EventsTopicAgent = `agent:${string}`;
+type EventsTopicTask = `task:${string}`;
+type EventsTopicProjectTasks = `project-tasks:${string}`;
+type EventsTopicPollers = 'pollers';
 export type EventsTopic =
   | EventsTopicAgents
   | EventsTopicAgent

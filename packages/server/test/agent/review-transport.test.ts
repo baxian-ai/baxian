@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -6,7 +6,6 @@ import {
   ReviewExchangeError,
   ReviewTransport,
   resolveServerPayloads,
-  shellQuote,
   validateReviewFindings,
   validateReviewResponse,
 } from '../../src/agent/review-transport.js';
@@ -67,13 +66,6 @@ const FINDINGS_JSON = JSON.stringify({
 const RESPONSE_JSON = JSON.stringify({
   round: 1,
   responses: [{ findingId: 'f-1', action: 'fix', rationale: 'fixed', commitSha: 'abc123' }],
-});
-
-describe('shellQuote', () => {
-  it('wraps in single quotes and escapes embedded quotes', () => {
-    expect(shellQuote('plain')).toBe("'plain'");
-    expect(shellQuote("a'b")).toBe(`'a'\\''b'`);
-  });
 });
 
 describe('readContent (code)', () => {
@@ -219,6 +211,84 @@ describe('readContent (spec)', () => {
       { match: c => c.startsWith('cat '), result: { exitCode: 1, stderr: 'No such file' } },
     ]);
     await expect(transport.readContent(task(), DEV, 'spec')).rejects.toThrow(ReviewExchangeError);
+  });
+});
+
+describe('readInterdiff', () => {
+  const PREV = 'a'.repeat(40);
+  const CUR = 'b'.repeat(40);
+
+  it('runs a direct two-arg tree diff (not three-dot) with core.quotepath=false in the worktree', async () => {
+    const { transport, calls } = makeTransport([
+      { match: c => / diff\b/.test(c), result: { stdout: 'diff --git a/x b/x\n+y' } },
+    ]);
+    const out = await transport.readInterdiff(DEV, PREV, CUR);
+    expect(out).toContain('diff --git');
+    const diffCall = calls.find(c => c.includes('git -c core.quotepath=false diff'));
+    expect(diffCall).toBeDefined();
+    expect(diffCall).toContain(`diff '${PREV}' '${CUR}'`);
+    expect(diffCall).not.toContain(`${PREV}...${CUR}`);
+    expect(diffCall).toContain('/wt/dev');
+  });
+
+  it('throws interdiff-failed when git diff exits non-zero', async () => {
+    const { transport } = makeTransport([
+      { match: c => / diff\b/.test(c), result: { exitCode: 128, stderr: 'fatal: bad object' } },
+    ]);
+    await expect(transport.readInterdiff(DEV, PREV, CUR)).rejects.toThrow(
+      expect.objectContaining({ reason: 'interdiff-failed' }),
+    );
+  });
+});
+
+describe('readInterdiff (e2e: real git, rewritten review head)', () => {
+  it('shows only this round’s net delta between the two snapshots when the head was amended', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'review-interdiff-e2e-'));
+    const runner = new LocalRunner();
+    const git = async (argline: string): Promise<string> => {
+      const r = await runner.exec(`git -C '${worktree}' ${argline}`);
+      if (r.exitCode !== 0) throw new Error(`git ${argline} failed: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    try {
+      await git('init -q');
+      await git('config user.email t@example.com');
+      await git('config user.name tester');
+      await writeFile(join(worktree, 'alpha.txt'), '0\n');
+      await writeFile(join(worktree, 'beta.txt'), '0\n');
+      await git('add -A');
+      await git('commit -q -m base');
+
+      // round-1 reviewed head: change alpha.txt
+      await writeFile(join(worktree, 'alpha.txt'), '1\n');
+      await git('add -A');
+      await git('commit -q -m round1');
+      const prev = await git('rev-parse HEAD');
+
+      // round-2 reviewed head: amend (rewrite history) — keep alpha.txt, change beta.txt.
+      // cur is no longer a descendant of prev; merge-base(prev, cur) regresses to base.
+      await writeFile(join(worktree, 'beta.txt'), '2\n');
+      await git('add -A');
+      await git('commit -q --amend -m round2');
+      const cur = await git('rev-parse HEAD');
+      expect(cur).not.toBe(prev);
+
+      const transport = new ReviewTransport({
+        createRunnerFor: () => runner,
+        resolveWorktree: () => worktree,
+      });
+      const diff = await transport.readInterdiff(DEV, prev, cur);
+      // only beta.txt changed this round; alpha.txt was already reviewed last round
+      expect(diff).toContain('beta.txt');
+      expect(diff).not.toContain('alpha.txt');
+
+      // the discarded three-dot form would regress to the whole patchset and re-surface alpha.txt
+      const threeDot = await git(`-c core.quotepath=false diff '${prev}...${cur}'`);
+      expect(threeDot).toContain('alpha.txt');
+      expect(threeDot).toContain('beta.txt');
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
   });
 });
 
@@ -584,5 +654,33 @@ describe('resolveServerPayloads', () => {
     await expect(resolveServerPayloads(transport, QA, QA_WT, {
       phase: 'server-spec-review', specRound: 1, reviewRound: 0, serverContent: big('s'),
     })).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+  });
+
+  it('keeps a small interdiff inline as serverInterdiff, alongside the full diff', async () => {
+    const { transport, writes } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-recheck', reviewRound: 3,
+      serverContent: 'full diff', serverInterdiff: 'round delta',
+    });
+    expect(out.serverContent).toBe('full diff');
+    expect(out.serverInterdiff).toBe('round delta');
+    expect(out.serverInterdiffFile).toBeUndefined();
+    expect(writes).toHaveLength(0);
+  });
+
+  it('delivers an oversized interdiff as interdiff-round-<reviewRound>.patch, splitting independently of the full diff', async () => {
+    const { transport, writes } = makeTransport([]);
+    const out = await resolveServerPayloads(transport, QA, QA_WT, {
+      phase: 'server-recheck', reviewRound: 2,
+      serverContent: 'small full diff', serverInterdiff: big('i'),
+    });
+    expect(out.serverContent).toBe('small full diff');
+    expect(out.serverInterdiff).toBeUndefined();
+    expect(out.serverInterdiffFile).toEqual({
+      path: '.baxian/review/inbox/interdiff-round-2.patch',
+      bytes: MAX_INLINE_CONTENT_BYTES + 1,
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0].content).toBe(big('i'));
   });
 });

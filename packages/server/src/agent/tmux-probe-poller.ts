@@ -13,7 +13,8 @@ import type { AgentManager } from './manager.js';
 import type { CommandRunner } from './runner.js';
 import { createRunner, resolveAgentHost } from './runner.js';
 import { TmuxManager, type AdoptPaneState, type AgentRuntimeKind } from './tmux.js';
-import { evaluateManifest, WorkingToIdleDebounce, type AgentManifest, type DetectedState } from './detect/index.js';
+import { evaluateManifest, type AgentManifest, type DetectedState } from './detect/manifest.js';
+import { WorkingToIdleDebounce } from './detect/debounce.js';
 import type { DetectionInput } from './detect/region.js';
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
 import type { AgentStore } from '../state/agent-store.js';
@@ -330,27 +331,24 @@ export class TmuxProbePoller {
     try {
       const paneId = await tmux.getSinglePaneId(agent.id, { timeout: this.probeTimeoutMs });
       const paneState = await tmux.classifyPaneForAdopt(paneId, agent.runtime, { timeout: this.probeTimeoutMs });
-      const runtimeScreen = paneState.kind === 'live-runtime'
-        ? await tmux.capturePaneById(paneId, {
-            ansi: false,
-            scrollback: 0,
-            timeoutMs: this.probeTimeoutMs,
-          })
-        : '';
       const liveRuntime = paneState.kind === 'live-runtime';
-      const currentTaskId = liveRuntime && this.agentStore
-        ? (await this.agentStore.get(agent.id))?.taskId ?? null
-        : null;
-      let oscTitle = '';
-      let paneWidth = 0;
-      if (liveRuntime) {
-        try {
-          oscTitle = await tmux.readPaneTitle(paneId, { timeout: this.probeTimeoutMs });
-        } catch { }
-        try {
-          paneWidth = parseInt(await tmux.displayMessage(paneId, '#{pane_width}', { timeout: this.probeTimeoutMs }), 10) || 0;
-        } catch { }
-      }
+      // the four reads only depend on paneId — run the round-trips concurrently
+      const [runtimeScreen, currentTaskId, oscTitle, paneWidth] = liveRuntime
+        ? await Promise.all([
+            tmux.capturePaneById(paneId, {
+              ansi: false,
+              scrollback: 0,
+              timeoutMs: this.probeTimeoutMs,
+            }),
+            this.agentStore
+              ? this.agentStore.get(agent.id).then((binding) => binding?.taskId ?? null)
+              : Promise.resolve(null),
+            tmux.readPaneTitle(paneId, { timeout: this.probeTimeoutMs }).catch(() => ''),
+            tmux.displayMessage(paneId, '#{pane_width}', { timeout: this.probeTimeoutMs })
+              .then((raw) => parseInt(raw, 10) || 0)
+              .catch(() => 0),
+          ])
+        : ['', null, '', 0] as const;
       const manifestResult = liveRuntime
         ? this.detectViaManifest(agent.id, agent.runtime, runtimeScreen, oscTitle)
         : undefined;

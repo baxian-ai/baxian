@@ -4,7 +4,7 @@ description: QA reviews injected server-review content (a code diff or a spec do
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields; the review input rides either in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `prior-findings:` / `prior-response:` on a recheck — or, when a payload is large, as a file reference field: `diff-file:` / `spec-file:` / `prior-findings-file:` / `prior-response-file:`, each `<path> (<size>)` relative to your worktree. Read a referenced file with your file tools; it carries the exact content the block otherwise would. If a referenced file cannot be read, state that in a finding and emit your signal as usual — never guess at missing content. Do NOT fetch branches or use `gh` — those blocks and files ARE the review input.
+baxian dispatches you with a block of `key: value` dispatch fields; the review input rides either in trailing blocks — `diff:` (code) or `spec:` (spec review), plus `interdiff:` / `prior-findings:` / `prior-response:` on a recheck — or, when a payload is large, as a file reference field: `diff-file:` / `interdiff-file:` / `spec-file:` / `prior-findings-file:` / `prior-response-file:`, each `<path> (<size>)` relative to your worktree. Read a referenced file with your file tools; it carries the exact content the block otherwise would. If a referenced file cannot be read, state that in a finding and emit your signal as usual — never guess at missing content. Do NOT fetch branches or use `gh` — those blocks and files ARE the review input.
 
 Work in `worktree:`. QA judges risk independently — human authorization is input, not a bypass. Route on `phase:`: follow §Code Review for `server-review`; §Code Review + §Recheck Closure for `server-recheck`; §Spec Review for `server-spec-review`.
 
@@ -21,6 +21,7 @@ Judge the diff (the `diff:` block, or the `diff-file:` file) against the task sp
 
 The earlier findings and the dev response arrive as `prior-findings:` / `prior-response:` blocks, or as `prior-findings-file:` / `prior-response-file:` references when large. Close them out before judging anything new.
 
+- When present, the `interdiff:` block (or `interdiff-file:` reference) is this round's net change since the previous review head — verify each claimed fix against it first, then cross-confirm against the full `diff:` for regressions the increment alone would not surface. It is absent on the first round or when history is unavailable; judge from the full `diff:` alone then.
 - Resolve the status of EVERY prior finding first.
 - A finding the dev claims fixed: verify it in the new diff. No "fixed" without evidence.
 - A finding the dev rejected / called out-of-scope: judge the rationale on merit; re-raise it with concrete counter-evidence if it is wrong.

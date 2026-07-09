@@ -70,6 +70,7 @@ const tasksReviewMock = vi.mocked(api.tasks.review);
 const tasksCompleteMock = vi.mocked(api.tasks.complete);
 const tasksContinueMock = vi.mocked(api.tasks.continue);
 const tasksSpecMock = vi.mocked(api.tasks.spec);
+const tasksCodeMock = vi.mocked(api.tasks.code);
 const tasksReviewsMock = vi.mocked(api.tasks.reviews);
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
@@ -175,6 +176,7 @@ beforeEach(() => {
   tasksCompleteMock.mockReset();
   tasksContinueMock.mockReset();
   tasksSpecMock.mockReset();
+  tasksCodeMock.mockReset();
   tasksReviewsMock.mockReset();
   tasksReviewsMock.mockResolvedValue([]);
   toastShowMock.mockReset();
@@ -585,6 +587,51 @@ describe('TaskDetail page — actions & states', () => {
       await settleConfirmDialog('Approve Spec');
 
       expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to approve Spec', body: 'task-010 is fixing' });
+    });
+  });
+
+  describe('code-ready gate (server)', () => {
+    function openCodeReady(overrides: Partial<TaskState> = {}) {
+      open({ status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 2, prNumber: undefined, prUrl: undefined, ...overrides });
+    }
+
+    it('shows the request-changes textarea + button on a server code ready task; disabled until comments filled', () => {
+      openCodeReady();
+      const reject = screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement;
+      expect(reject.disabled).toBe(true);
+      fireEvent.change(screen.getByPlaceholderText(/[Cc]hange request/), { target: { value: '这里漏了空态' } });
+      expect((screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    it('does not show the reject affordance for a github-mode ready task', () => {
+      openCodeReady({ reviewMode: 'github', prNumber: 5 });
+      expect(screen.queryByRole('button', { name: 'Request changes' })).toBeNull();
+    });
+
+    it('does not show the reject affordance for a spec-phase task', () => {
+      openCodeReady({ phase: 'spec' });
+      expect(screen.queryByRole('button', { name: 'Request changes' })).toBeNull();
+    });
+
+    it('Request changes submits request-changes with trimmed comments and reports success', async () => {
+      tasksCodeMock.mockResolvedValue(makeTask({ status: 'fixing' }));
+      openCodeReady();
+      fireEvent.change(screen.getByPlaceholderText(/[Cc]hange request/), { target: { value: ' 补一下测试 ' } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Request changes' }));
+      });
+      expect(tasksCodeMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '补一下测试' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Sent back; Dev agent is revising' });
+    });
+
+    it('reject failure surfaces an error toast', async () => {
+      tasksCodeMock.mockRejectedValue(new Error('task-010 is fixing'));
+      openCodeReady();
+      fireEvent.change(screen.getByPlaceholderText(/[Cc]hange request/), { target: { value: '打回' } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Request changes' }));
+      });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to send back', body: 'task-010 is fixing' });
     });
   });
 });

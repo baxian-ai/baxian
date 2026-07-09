@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildPhaseSignal,
-  buildPhaseSignalTemplate,
   createSignalToken,
   PHASE_SIGNAL_KINDS,
   scanNeedInputSignals,
@@ -23,21 +22,19 @@ describe('phase signal protocol', () => {
   it('supports the pr-fixed dev-completion signal (symmetric with spec-fixed)', () => {
     expect(PHASE_SIGNAL_KINDS).toContain('pr-fixed');
     expect(buildPhaseSignal('pr-fixed', 'tok456abc')).toBe('[bx:pr-fixed:tok456abc]');
-    expect(buildPhaseSignalTemplate('pr-fixed')).toBe('[bx:pr-fixed:<token>]');
     expect(scanPhaseSignals('done\n[bx:pr-fixed:xyz789def]')).toEqual([
       { kind: 'pr-fixed', token: 'xyz789def' },
     ]);
-    expect(scanPhaseSignals(buildPhaseSignalTemplate('pr-fixed'))).toEqual([]);
+    expect(scanPhaseSignals('[bx:pr-fixed:<token>]')).toEqual([]);
   });
 
   it('handles the greeting bootstrap handshake signal kind', () => {
     expect(PHASE_SIGNAL_KINDS).toContain('greeting');
     expect(buildPhaseSignal('greeting', 'tok456abc')).toBe('[bx:greeting:tok456abc]');
-    expect(buildPhaseSignalTemplate('greeting')).toBe('[bx:greeting:<token>]');
     expect(scanPhaseSignals('hi\n[bx:greeting:abc123def456]')).toEqual([
       { kind: 'greeting', token: 'abc123def456' },
     ]);
-    expect(scanPhaseSignals(buildPhaseSignalTemplate('greeting'))).toEqual([]);
+    expect(scanPhaseSignals('[bx:greeting:<token>]')).toEqual([]);
   });
 
   it('builds [bx:pr-created:<num>:<token>] three-segment for pr-created', () => {
@@ -50,11 +47,9 @@ describe('phase signal protocol', () => {
     expect(() => buildPhaseSignal('pr-created', 'abc123def456')).toThrow(/requires prNumber/);
   });
 
-  it('builds template with <token> / <pr_number> placeholders — never the filled signal', () => {
-    expect(buildPhaseSignalTemplate('spec-done')).toBe('[bx:spec-done:<token>]');
-    expect(buildPhaseSignalTemplate('pr-created')).toBe('[bx:pr-created:<pr_number>:<token>]');
-    expect(scanPhaseSignals(buildPhaseSignalTemplate('spec-done'))).toEqual([]);
-    expect(scanPhaseSignals(buildPhaseSignalTemplate('pr-created'))).toEqual([]);
+  it('never matches the skill-doc placeholder templates as real signals', () => {
+    expect(scanPhaseSignals('[bx:spec-done:<token>]')).toEqual([]);
+    expect(scanPhaseSignals('[bx:pr-created:<pr_number>:<token>]')).toEqual([]);
   });
 
   it('scanPhaseSignals returns kind + token for each plain-kind match', () => {
@@ -145,7 +140,7 @@ describe('phase signal protocol', () => {
         { kind, token: 'abcdef123456' },
       ]);
       expect(buildPhaseSignal(kind, 'tok123abc')).toBe(`[bx:${kind}:tok123abc]`);
-      expect(buildPhaseSignalTemplate(kind)).toBe(`[bx:${kind}:<token>]`);
+      expect(scanPhaseSignals(`[bx:${kind}:<token>]`)).toEqual([]);
     }
   });
 
@@ -158,7 +153,6 @@ describe('phase signal protocol', () => {
     ]);
     expect(buildPhaseSignal('code-ready', 'tok123abc')).toBe('[bx:code-ready:tok123abc]');
     expect(buildPhaseSignal('code-ready', 'tok123abc', 7)).toBe('[bx:code-ready:7:tok123abc]');
-    expect(buildPhaseSignalTemplate('code-ready')).toBe('[bx:code-ready:<token>]');
   });
 
   it('code-ready template echo does not fire the scanner', () => {

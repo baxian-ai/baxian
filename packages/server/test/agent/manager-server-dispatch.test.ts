@@ -325,6 +325,29 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
 
     expect(result).toMatchObject({ status: 'review', reviewRound: 2, qaAgentId: 'qa-1' });
   });
+
+  it('threads the recheck interdiff payload into startSession as serverInterdiff', async () => {
+    const f = await makeFixture('server');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'in_progress', signalToken: 't', reviewRound: 1,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW,
+    }));
+    let captured: Record<string, unknown> | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      captured = opts as Record<string, unknown>;
+      return true;
+    });
+
+    await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'full diff', recheck: true, interdiff: 'round-2 delta',
+    });
+
+    expect(captured?.serverContent).toBe('full diff');
+    expect(captured?.serverInterdiff).toBe('round-2 delta');
+  });
 });
 
 describe('dispatchServerFixToDev failure & success paths', () => {

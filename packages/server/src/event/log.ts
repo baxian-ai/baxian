@@ -1,6 +1,7 @@
 import { appendFile, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { BaxianEvent } from '../shared/index.js';
+import { mapWithConcurrency, FS_READ_CONCURRENCY } from '../shared/index.js';
 
 export class EventLog {
   constructor(private dir: string) {}
@@ -33,10 +34,7 @@ export class EventLog {
       .map(f => f.replace('.jsonl', ''))
       .filter(date => date >= from && date <= to)
       .sort();
-    const events: BaxianEvent[] = [];
-    for (const date of matching) {
-      events.push(...(await this.readDate(date)));
-    }
-    return events;
+    const perDate = await mapWithConcurrency(matching, FS_READ_CONCURRENCY, date => this.readDate(date));
+    return perDate.flat();
   }
 }

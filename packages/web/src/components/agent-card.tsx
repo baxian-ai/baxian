@@ -10,7 +10,7 @@ import { PaneTerminal } from './pane-terminal.tsx';
 import { AgentPet } from './agent-pet.tsx';
 import { AgentPetConfigModal } from './agent-pet-config-modal.tsx';
 import { agentRuntimeLabel, agentRuntimeTitle } from '../shared/index.js';
-import { useT } from '../i18n/index.tsx';
+import { useT, type Messages } from '../i18n/index.tsx';
 
 export type TerminalMode = 'activity-preview' | 'embedded-full';
 
@@ -25,28 +25,69 @@ const RUNTIME_BADGE_CLASSES: Record<AgentSnapshot['runtimeStatus'], string> = {
 
 const AGENT_CARD_PET_HEIGHT = 72;
 
-type TmuxDotState = AgentSnapshot['tmuxSessionStatus'] | 'starting';
+export interface AgentBadge {
+  kind: 'alert' | 'runtime';
+  label: string;
+  cls: string;
+  title?: string;
+  stale: boolean;
+}
 
-const TMUX_DOT_CLASSES: Record<Exclude<TmuxDotState, 'present'>, string> = {
-  absent: 'status-dot--warn',
-  unreachable: 'status-dot--danger',
-  unknown: 'status-dot--warn',
-  starting: 'status-dot--info',
-};
+function isAgentBootstrapping(agent: AgentSnapshot): boolean {
+  return !!agent.binding?.creationToken
+    && !agent.binding.paneId
+    && agent.binding.status !== 'awaiting_human'
+    && agent.reason !== 'PENDING_HUMAN';
+}
 
-function StatusDot({ state }: { state: TmuxDotState }) {
-  const t = useT();
-  if (state === 'present') return null;
-  const label = t.agents.sessionStatus[state];
-  const modifier = TMUX_DOT_CLASSES[state];
-  return (
-    <span
-      role="img"
-      aria-label={label}
-      title={label}
-      className={`status-dot ml-2 ${modifier}`}
-    />
-  );
+function baseBadge(agent: AgentSnapshot, t: Messages['agents']): Omit<AgentBadge, 'stale'> {
+  if (agent.tmuxSessionStatus === 'unreachable') {
+    return { kind: 'alert', label: t.sessionStatus.unreachable, cls: 'pill pill-danger' };
+  }
+  if (isAgentBootstrapping(agent)) {
+    return { kind: 'runtime', label: t.bootstrappingBadge, cls: 'pill pill-review' };
+  }
+  if (agent.tmuxSessionStatus === 'absent') {
+    return { kind: 'alert', label: t.sessionStatus.absent, cls: 'pill pill-warn' };
+  }
+  if (agent.runtimeStatus === 'error') {
+    return { kind: 'alert', label: t.runtimeStatus.error, cls: RUNTIME_BADGE_CLASSES.error };
+  }
+  if (agent.binding?.status === 'awaiting_human') {
+    return {
+      kind: 'alert',
+      label: t.heldBadge,
+      cls: 'pill pill-warn',
+      title: agent.binding.awaitingReason ?? t.heldDefaultReason,
+    };
+  }
+  if (agent.binding?.needInputAt) {
+    return {
+      kind: 'alert',
+      label: t.needInputBadge,
+      cls: 'pill pill-warn',
+      title: t.needInputTitle(new Date(agent.binding.needInputAt).toLocaleString()),
+    };
+  }
+  if (agent.runtimeStatus === 'pending') {
+    return { kind: 'alert', label: t.runtimeStatus.pending, cls: RUNTIME_BADGE_CLASSES.pending };
+  }
+  return {
+    kind: 'runtime',
+    label: t.runtimeStatus[agent.runtimeStatus],
+    cls: RUNTIME_BADGE_CLASSES[agent.runtimeStatus],
+  };
+}
+
+export function resolveAgentBadge(agent: AgentSnapshot, t: Messages['agents']): AgentBadge {
+  const base = baseBadge(agent, t);
+  if (!agent.stale) return { ...base, stale: false };
+  const staleNote = t.staleTitle(agent.observedAt ? new Date(agent.observedAt).toLocaleString() : undefined);
+  return {
+    ...base,
+    stale: true,
+    title: base.title ? `${base.title} · ${staleNote}` : staleNote,
+  };
 }
 
 interface AgentCardProps {
@@ -54,6 +95,7 @@ interface AgentCardProps {
   projectId: string;
   role: AgentRole;
   runtime?: AgentRuntime;
+  model?: string;
   onDeleted?: () => void;
   pendingRestart?: boolean;
   terminalLoading?: boolean;
@@ -68,6 +110,7 @@ export function AgentCard({
   projectId,
   role,
   runtime,
+  model,
   onDeleted,
   pendingRestart = false,
   terminalLoading = false,
@@ -94,19 +137,13 @@ export function AgentCard({
   const taskId = agent.binding?.taskId;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
   const needInputAt = agent.binding?.needInputAt;
-  const needInputTitle = needInputAt
-    ? t.agents.needInputTitle(new Date(needInputAt).toLocaleString())
-    : undefined;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
-  const isBootstrapping = !!agent.binding?.creationToken
-    && !agent.binding?.paneId
-    && !isAwaitingHuman
-    && agent.reason !== 'PENDING_HUMAN';
+  const isBootstrapping = isAgentBootstrapping(agent);
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';
-  const runtimeBadge = isBootstrapping
-    ? { label: t.agents.bootstrappingBadge, cls: 'pill pill-review' }
-    : { label: t.agents.runtimeStatus[agent.runtimeStatus], cls: RUNTIME_BADGE_CLASSES[agent.runtimeStatus] };
-  const tmuxDotState: TmuxDotState = isBootstrapping ? 'starting' : agent.tmuxSessionStatus;
+  const badge = resolveAgentBadge(agent, t.agents);
+  const petLabel = isBootstrapping
+    ? t.agents.bootstrappingBadge
+    : t.agents.runtimeStatus[agent.runtimeStatus];
   const showTerminalPreview = terminalMode === 'activity-preview' &&
     !bootstrapBlocksTerminal && (agent.runtimeStatus === 'working' || agent.runtimeStatus === 'pending');
   const showEmbeddedTerminal = terminalMode === 'embedded-full';
@@ -118,7 +155,7 @@ export function AgentCard({
     : pendingRestart
       ? t.agents.terminalNeedsRestart
       : t.agents.bootstrappingTerminalDisabled;
-  const runtimeTypeLabel = agentRuntimeLabel(runtime);
+  const runtimeTypeLabel = agentRuntimeLabel(runtime, model);
 
   const handleStop = async () => {
     setStopping(true);
@@ -297,7 +334,7 @@ export function AgentCard({
             petId={agent.petId}
             status={agent.runtimeStatus}
             bootstrapping={isBootstrapping}
-            label={runtimeBadge.label}
+            label={petLabel}
             displayHeight={AGENT_CARD_PET_HEIGHT}
           />
         </div>
@@ -307,7 +344,7 @@ export function AgentCard({
           <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">{role === 'qa' ? 'QA' : 'Dev'}</span>
           <span
             className="min-w-0 truncate whitespace-nowrap font-display text-sm font-semibold text-og-1000"
-            title={agentRuntimeTitle(agent.id, runtime)}
+            title={agentRuntimeTitle(agent.id, runtime, model)}
           >
             {agent.id}
           </span>
@@ -320,23 +357,18 @@ export function AgentCard({
             </span>
           )}
         </div>
-        <div className="flex flex-wrap items-center justify-end gap-1">
-          {isAwaitingHuman && (
-            <span className="pill pill-warn" title={agent.binding?.awaitingReason ?? t.agents.heldDefaultReason}>{t.agents.heldBadge}</span>
-          )}
-          {needInputAt && (
-            <span className="pill pill-warn" title={needInputTitle}>{t.agents.needInputBadge}</span>
-          )}
-          {!agent.petId && (
-            <span className={runtimeBadge.cls}>{runtimeBadge.label}</span>
-          )}
-          {agent.stale && (
-            <span className="pill pill-warn" title={agent.observedAt ? `Last observed at ${agent.observedAt}` : undefined}>
-              {t.agents.staleBadge}
+        {(!agent.petId || badge.kind === 'alert' || badge.stale) && (
+          <>
+            <span
+              className={badge.stale ? `${badge.cls} pill--stale shrink-0` : `${badge.cls} shrink-0`}
+              title={badge.title}
+            >
+              {badge.label}
             </span>
-          )}
-          <StatusDot state={tmuxDotState} />
-        </div>
+            {/* Real hidden text, not aria-label: span's generic role prohibits author naming. */}
+            {badge.stale && <span className="sr-only">{badge.title}</span>}
+          </>
+        )}
       </div>
       {bootstrapBlocksTerminal && (
         <div className="mb-2 rounded-md border border-accent-soft bg-accent-soft/40 px-2.5 py-2 text-xs text-accent">

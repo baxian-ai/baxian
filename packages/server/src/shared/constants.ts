@@ -20,7 +20,7 @@ export const DEFAULT_SERVER_CONFIG = {
 } as const;
 
 export const BRANCH_PREFIX = 'bx/';
-export const BRANCH_NAME_RE = /^(?!-)[A-Za-z0-9._\/-]+$/;
+const BRANCH_NAME_RE = /^(?!-)[A-Za-z0-9._\/-]+$/;
 
 export function isValidBranchName(name: string): boolean {
   if (!BRANCH_NAME_RE.test(name)) return false;
@@ -34,20 +34,14 @@ export const STATE_DIR = '.baxian';
 export const CONFIG_FILE = 'baxian.json';
 
 export const IMAGE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024;
-export const IMAGE_UPLOAD_ALLOWED_EXTS = ['png', 'jpg', 'gif', 'webp'] as const;
 export const TASK_IMAGE_MAX_COUNT = 4;
 export const AGENT_HOST_UPLOAD_DIR = '/tmp/baxian/upload';
-export const TASK_IMAGE_STAGING_SUBDIR = 'task-images';
 export const IMAGE_UPLOAD_ROUTE_BODY_LIMIT = 8 * 1024 * 1024;
 export const TASK_CREATE_ROUTE_BODY_LIMIT = 32 * 1024 * 1024;
 export const MAX_CONFIG_BACKUPS = 7;
 
 export const PET_ATLAS_WIDTH = 1536;
 export const PET_ATLAS_HEIGHT = 1872;
-export const PET_GRID_COLS = 8;
-export const PET_GRID_ROWS = 9;
-export const PET_CELL_WIDTH = 192;
-export const PET_CELL_HEIGHT = 208;
 export const PET_DISPLAY_NAME_MAX = 80;
 export const PET_DESCRIPTION_MAX = 500;
 export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
@@ -136,7 +130,7 @@ export const TASK_TERMINAL_STATUSES: readonly TaskStatus[] = [
 
 export const TASK_TERMINAL_STATUS_SET: ReadonlySet<TaskStatus> = new Set(TASK_TERMINAL_STATUSES);
 
-export const TASK_ACTIVE_STATUSES: readonly TaskStatus[] = [
+const TASK_ACTIVE_STATUSES: readonly TaskStatus[] = [
   'in_progress',
   'review',
   'fixing',
@@ -149,7 +143,7 @@ export const TASK_ACTIVE_STATUSES: readonly TaskStatus[] = [
 
 export const TASK_ACTIVE_STATUS_SET: ReadonlySet<TaskStatus> = new Set(TASK_ACTIVE_STATUSES);
 
-export const TASK_STATUSES: readonly TaskStatus[] = [
+const TASK_STATUSES: readonly TaskStatus[] = [
   'pending',
   ...TASK_ACTIVE_STATUSES,
   ...TASK_TERMINAL_STATUSES,

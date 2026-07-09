@@ -10,11 +10,7 @@ import {
   PromptSizeError,
   RequiredSkillsMissingError,
 } from '../../src/agent/prompt.js';
-import {
-  buildPhaseSignal,
-  buildPhaseSignalTemplate,
-  scanPhaseSignals,
-} from '../../src/agent/phase-signal.js';
+import { buildPhaseSignal, scanPhaseSignals } from '../../src/agent/phase-signal.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
 import type { AgentConfig, TaskState } from '../../src/shared/index.js';
 
@@ -434,7 +430,6 @@ describe('buildPromptInline', () => {
 
 
   it('signal emit block keeps the template + token on separate lines so the prompt itself never matches scanPhaseSignals', () => {
-    expect(buildPhaseSignalTemplate('spec-done')).toBe('[bx:spec-done:<token>]');
     expect(scanPhaseSignals('[bx:spec-done:<token>]')).toEqual([]);
     expect(scanPhaseSignals(buildPhaseSignal('spec-done', 'abc123def456'))).toEqual([
       { kind: 'spec-done', token: 'abc123def456' },
@@ -682,6 +677,51 @@ describe('server review mode prompt builders', () => {
     });
     expect(prompt).toContain('prior-response-file: .baxian/review/inbox/prior-response-round-1.json (12KB)');
     expect(prompt).not.toContain('prior-response:\n');
+  });
+
+  it('server-recheck renders the interdiff block before the full diff, with prioritize-increment wording', async () => {
+    const prompt = build('server-recheck', QA_AGENT, {
+      serverContent: 'FULLDIFFMARKER',
+      serverInterdiff: 'INTERDIFFMARKER',
+      serverPriorFindings: CODE_FINDINGS,
+    });
+    expect(prompt).toContain('INTERDIFFMARKER');
+    expect(prompt).toContain('diff:\nFULLDIFFMARKER');
+    expect(prompt).toContain('优先核对');
+    expect(prompt).toContain('交叉确认');
+    // increment precedes the full diff so QA reads the delta first
+    expect(prompt.indexOf('INTERDIFFMARKER')).toBeLessThan(prompt.indexOf('FULLDIFFMARKER'));
+  });
+
+  it('server-recheck renders an interdiff-file field when the interdiff was delivered to the inbox', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
+      phase: 'server-recheck',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'diff',
+      serverInterdiffFile: { path: '.baxian/review/inbox/interdiff-round-2.patch', bytes: 30 * 1024 },
+    });
+    expect(prompt).toContain('interdiff-file: .baxian/review/inbox/interdiff-round-2.patch (30KB)');
+    expect(prompt).not.toContain('interdiff (');
+  });
+
+  it('rejects an interdiff passed in both inline and file form', async () => {
+    const registry = getRegistry();
+    expect(() => buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
+      phase: 'server-recheck',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'diff',
+      serverInterdiff: 'x',
+      serverInterdiffFile: { path: '.baxian/review/inbox/interdiff-round-2.patch', bytes: 1 },
+    })).toThrow(/mutually exclusive/);
   });
 
   it('server-feedback floors the rendered round at 1, matching the delivery filename floor', async () => {

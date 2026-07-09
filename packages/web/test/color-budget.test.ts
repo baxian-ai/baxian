@@ -61,9 +61,4 @@ describe('color budget: ink neutrals + accent chrome, semantic status colors via
     expect(colors['diff-del-ink']).toBe('#b91c1c');
     expect(colors['probe-ok']).toBe('#15803d');
   });
-
-  it('keeps attention pulses finite (WCAG 2.2.2: no looping motion beyond 5s)', () => {
-    const css = readFileSync(resolve(srcDir, 'index.css'), 'utf8');
-    expect(css).not.toMatch(/animation:[^;]*breathe[^;]*infinite/);
-  });
 });

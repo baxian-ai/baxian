@@ -8,7 +8,7 @@ export const GIT_NET_ENV = 'GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIM
 export const NET_EXEC_TIMEOUT_MS = 60_000;
 export const GH_EXEC_TIMEOUT_MS = 30_000;
 export const CLONE_EXEC_TIMEOUT_MS = 600_000;
-export const NET_EXEC_RETRIES = 2;
+const NET_EXEC_RETRIES = 2;
 
 const BACKOFF = { baseMs: 2_000, maxMs: 8_000, factor: 2, jitter: 0.2 };
 

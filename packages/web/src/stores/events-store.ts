@@ -1,12 +1,7 @@
-import type {
-  AgentSnapshot,
-  EventsClientMsg,
-  EventsServerMsg,
-  EventsTopic,
-  TaskState,
-} from '../shared/index.js';
+import type { EventsClientMsg, EventsServerMsg, EventsTopic } from '../shared/index.js';
 import { getAuthToken } from '../api.ts';
 import { ReconnectScheduler } from './reconnect-scheduler.ts';
+import { defaultWsFactory, toHex, wsUrl, type WebSocketFactory } from './ws-shared.ts';
 
 export interface EventsErrorPayload {
   code: string;
@@ -21,23 +16,9 @@ interface TopicSubscribers {
   error: Set<EventsErrorHandler>;
 }
 
-type WebSocketFactory = (url: string, protocols?: string[]) => WebSocket;
-
-function toHex(s: string): string {
-  return Array.from(new TextEncoder().encode(s))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
 function defaultWsUrl(): string {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/api/realtime`;
+  return wsUrl('/api/realtime');
 }
-
-const defaultWsFactory: WebSocketFactory = (url, protocols) =>
-  protocols && protocols.length > 0
-    ? new WebSocket(url, protocols)
-    : new WebSocket(url);
 
 export interface EventsClientOptions {
   wsUrl?: string;
@@ -296,7 +277,3 @@ export function _resetEventsClientForTest(client?: EventsClient | null): void {
   if (singleton) singleton.close();
   singleton = client ?? null;
 }
-
-export type AgentsTopicData = AgentSnapshot[];
-export type AgentTopicData = AgentSnapshot | null;
-export type TaskTopicData = TaskState | null;

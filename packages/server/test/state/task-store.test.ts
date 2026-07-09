@@ -141,6 +141,11 @@ describe('TaskStore', () => {
     expect(id).toBe('task-006');
   });
 
+  it('nextId never reuses the id of an unreadable task file', async () => {
+    await writeFile(join(tasksDir, 'task-007.json'), '{corrupt');
+    expect(await store.nextId()).toBe('task-008');
+  });
+
   it('deletes task', async () => {
     await store.set(makeTask('task-001'));
     await store.delete('task-001');

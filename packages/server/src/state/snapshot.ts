@@ -190,10 +190,12 @@ export async function buildAgentSnapshotById(
 ): Promise<AgentSnapshot | null> {
   const configured = ctx.agentManager.getAgentConfig(id);
   if (!configured) return null;
-  const binding = await ctx.agentStore.get(id);
+  const [binding, latestBootstrapError, petId] = await Promise.all([
+    ctx.agentStore.get(id),
+    loadLatestBootstrapError(ctx, id),
+    loadPetAssignment(ctx, id),
+  ]);
   const task = binding?.taskId ? await ctx.taskStore.get(binding.taskId) : null;
-  const latestBootstrapError = await loadLatestBootstrapError(ctx, id);
-  const petId = await loadPetAssignment(ctx, id);
   return agentSnapshot(
     configured,
     binding ?? undefined,

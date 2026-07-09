@@ -125,6 +125,7 @@ export function AgentGroup({
               projectId={projectId}
               role={cfg.role}
               runtime={cfg.runtime}
+              model={cfg.model}
               pendingRestart={agentsLoaded && !snapshot}
               terminalLoading={!agentsLoaded && !snapshot && !agentsError}
               onDeleted={onDeleted}

@@ -2280,6 +2280,248 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
   });
 });
 
+describe('AgentManager.submitCodeVerdict', () => {
+  const watcherStub = () => ({ start: vi.fn(async () => true), stop: vi.fn(), has: vi.fn(() => false) });
+
+  function codeManager(reviewStore: ReviewStore): AgentManager {
+    return makeManager({
+      skillRegistry: freshRegistry(),
+      reviewStore,
+      phaseSignalWatcher: watcherStub() as never,
+    });
+  }
+
+  async function seedCodeReady(
+    store: ReviewStore,
+    taskOverrides: Partial<TaskState> = {},
+    roundOverrides: Record<string, unknown> = {},
+  ): Promise<void> {
+    await seedTask({
+      id: 'task-code-1', branch: 'bx/task-code-1',
+      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 1, qaAgentId: undefined,
+      ...taskOverrides,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
+    await store.putRound('task-code-1', 'code', {
+      round: 1, phase: 'code', content: 'diff --git a/a.ts b/a.ts', startedAt: NOW,
+      findings: { round: 1, verdict: 'approve', findings: [{ id: 'f-1', severity: 'minor', message: 'nit' }] },
+      ...roundOverrides,
+    });
+  }
+
+  function mockDispatchDeps(m: AgentManager): void {
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+  }
+
+  it('request-changes merges a u- finding, flips the verdict, records userDecision, and dispatches the fix', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store);
+    mockDispatchDeps(m);
+
+    const result = await m.submitCodeVerdict('task-code-1', '这里漏了空态处理');
+    expect(result.status).toBe('fixing');
+    const round = await store.getRound('task-code-1', 'code', 1);
+    expect(round?.findings?.verdict).toBe('request-changes');
+    expect(round?.findings?.findings).toContainEqual(
+      { id: 'u-1', severity: 'major', message: '这里漏了空态处理' },
+    );
+    expect(round?.findings?.findings.some(f => f.id === 'f-1')).toBe(true);
+    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes', comments: '这里漏了空态处理' });
+    // u- 前缀不与批次聚合前缀 b\d+- 冲突（防回归）
+    expect(/^b\d+-/.test('u-1')).toBe(false);
+  });
+
+  it('with a bound QA at ready: releases the QA and dispatches the fix to fixing', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store, { qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-code-1' });
+    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
+    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+
+    const result = await m.submitCodeVerdict('task-code-1', 'QA 也得再看看');
+    expect(result.status).toBe('fixing');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-code-1', 'idle');
+    const round = await store.getRound('task-code-1', 'code', 1);
+    expect(round?.findings?.findings.some(f => f.id === 'u-1')).toBe(true);
+  });
+
+  it('request-changes without comments is a 400 and leaves the task ready', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store);
+    await expect(m.submitCodeVerdict('task-code-1', '   '))
+      .rejects.toMatchObject({ status: 400 });
+    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
+  });
+
+  it('rejects when the task is not ready (409)', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store, { status: 'review' });
+    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('rejects a spec-phase task (409)', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store, { phase: 'spec' });
+    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('rejects a non-server (github) task (409)', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store, { reviewMode: 'github' });
+    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('rejects a task with no dev agent (400)', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store, { agentId: undefined });
+    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 400 });
+  });
+
+  it('refuses request-changes at the round cap with 409 (task stays ready, no userDecision)', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    // CONFIG.review.rounds = 2：reviewRound 已到上限
+    await seedTask({
+      id: 'task-code-1', branch: 'bx/task-code-1',
+      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 2, qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
+    await store.putRound('task-code-1', 'code', {
+      round: 2, phase: 'code', content: 'd', startedAt: NOW,
+      findings: { round: 2, verdict: 'approve', findings: [] },
+    });
+    mockDispatchDeps(m);
+    await expect(m.submitCodeVerdict('task-code-1', '还差点'))
+      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('round cap') });
+    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
+    expect((await store.getRound('task-code-1', 'code', 2))?.userDecision).toBeUndefined();
+  });
+
+  it('synthesizes a round from the dev worktree when none is stored, persists reviewRound=1, and dispatches u-1', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedTask({
+      id: 'task-code-1', branch: 'bx/task-code-1',
+      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 0, qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
+    mockDispatchDeps(m);
+    vi.spyOn(m, 'refreshWorktreeCacheFor').mockResolvedValue(undefined);
+    vi.spyOn(m, 'getReviewTransport').mockReturnValue({
+      readContent: vi.fn(async () => ({ content: 'diff synth', diffstat: 'stat', baseSha: 'sha1' })),
+    } as never);
+
+    const result = await m.submitCodeVerdict('task-code-1', '补一下测试');
+    expect(result.status).toBe('fixing');
+    expect((await taskStore.get('task-code-1'))?.reviewRound).toBe(1);
+    const round = await store.getRound('task-code-1', 'code', 1);
+    expect(round?.content).toBe('diff synth');
+    expect(round?.findings?.findings).toEqual([{ id: 'u-1', severity: 'major', message: '补一下测试' }]);
+    expect(round?.userDecision?.verdict).toBe('request-changes');
+  });
+
+  it('degrades to an empty round when the worktree read fails, still dispatching u-1', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedTask({
+      id: 'task-code-1', branch: 'bx/task-code-1',
+      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 0, qaAgentId: undefined,
+    });
+    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
+    mockDispatchDeps(m);
+    vi.spyOn(m, 'refreshWorktreeCacheFor').mockResolvedValue(undefined);
+    vi.spyOn(m, 'getReviewTransport').mockReturnValue({
+      readContent: vi.fn(async () => { throw new Error('git unavailable'); }),
+    } as never);
+
+    const result = await m.submitCodeVerdict('task-code-1', '这块得改');
+    expect(result.status).toBe('fixing');
+    const round = await store.getRound('task-code-1', 'code', 1);
+    expect(round?.content).toBe('');
+    expect(round?.findings?.findings).toEqual([{ id: 'u-1', severity: 'major', message: '这块得改' }]);
+  });
+
+  it('appends u-2 on a subsequent request-changes', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store, {}, {
+      findings: { round: 1, verdict: 'request-changes', findings: [
+        { id: 'f-1', severity: 'minor', message: 'nit' },
+        { id: 'u-1', severity: 'major', message: '第一次意见' },
+      ] },
+    });
+    mockDispatchDeps(m);
+    const result = await m.submitCodeVerdict('task-code-1', '第二次意见');
+    expect(result.status).toBe('fixing');
+    const round = await store.getRound('task-code-1', 'code', 1);
+    expect(round?.findings?.findings.map(f => f.id)).toEqual(['f-1', 'u-1', 'u-2']);
+  });
+
+  it('serializes concurrent verdicts: exactly one wins, the other gets 409', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store);
+    mockDispatchDeps(m);
+    const results = await Promise.allSettled([
+      m.submitCodeVerdict('task-code-1', '意见 A'),
+      m.submitCodeVerdict('task-code-1', '意见 B'),
+    ]);
+    const fulfilled = results.filter(r => r.status === 'fulfilled');
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toMatchObject({ status: 409 });
+  });
+
+  it('returns 409 while a merge is in flight', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store);
+    (m as unknown as { markCompleteInFlight: Set<string> }).markCompleteInFlight.add('task-code-1');
+    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
+    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
+  });
+
+  it('confirmHumanGate returns 409 while a code verdict is in flight', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store);
+    const gates = m as unknown as {
+      codeVerdictInFlight: Set<string>;
+      markCompleteInFlight: Set<string>;
+    };
+    gates.codeVerdictInFlight.add('task-code-1');
+    await expect(m.confirmHumanGate('task-code-1')).rejects.toMatchObject({ status: 409 });
+    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
+    expect(gates.markCompleteInFlight.has('task-code-1')).toBe(false);
+  });
+
+  it('returns 500 when the dev cannot be acquired; the task stays ready with the decision on record', async () => {
+    const store = new ReviewStore();
+    const m = codeManager(store);
+    await seedCodeReady(store);
+    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(false);
+    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
+    await expect(m.submitCodeVerdict('task-code-1', '打回但派发失败'))
+      .rejects.toMatchObject({ status: 500 });
+    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
+    // 留档不回滚：意见已记录，重复发起会追加 u-2
+    const round = await store.getRound('task-code-1', 'code', 1);
+    expect(round?.userDecision?.comments).toBe('打回但派发失败');
+    expect(round?.findings?.findings.some(f => f.id === 'u-1')).toBe(true);
+  });
+});
+
 describe('AgentManager.startSession status gate', () => {
   it('rejects terminal task even when bypassTaskStatusGate=true', async () => {
     await seedTask({ status: 'cancelled' });
@@ -7079,5 +7321,88 @@ describe('AgentManager.releaseAgentForTask waiting-mode gate', () => {
     expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes('not active'))).toBe(true);
     warnSpy.mockRestore();
+  });
+});
+
+describe('AgentManager.computeCodeInterdiff', () => {
+  const PREV = 'a'.repeat(40);
+  const CUR = 'b'.repeat(40);
+
+  function interdiffRunner(execs: string[], diff: string): CommandRunner {
+    return {
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        execs.push(cmd);
+        if (cmd.includes('git') && cmd.includes('diff')) {
+          return { stdout: diff, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      writeFile: vi.fn(async (): Promise<void> => undefined),
+    } as unknown as CommandRunner;
+  }
+
+  async function seedRounds(store: ReviewStore, opts: { prevHead?: string; curHead?: string }): Promise<void> {
+    await store.putRound('task-inter-1', 'code', {
+      round: 1, phase: 'code', content: 'd1', startedAt: NOW,
+      ...(opts.prevHead !== undefined ? { headSha: opts.prevHead } : {}),
+    });
+    await store.putRound('task-inter-1', 'code', {
+      round: 2, phase: 'code', content: 'd2', startedAt: NOW,
+      ...(opts.curHead !== undefined ? { headSha: opts.curHead } : {}),
+    });
+  }
+
+  it('returns the two-round diff, executed via the dev agent runner in its worktree', async () => {
+    const execs: string[] = [];
+    const store = new ReviewStore();
+    const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'INTERDIFF-BODY') });
+    await seedRounds(store, { prevHead: PREV, curHead: CUR });
+    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', worktreePath: '/wt/task-inter-1' });
+
+    const result = await m.computeCodeInterdiff('task-inter-1', 2);
+    expect(result).toEqual({ ok: true, diff: 'INTERDIFF-BODY' });
+    const gitDiff = execs.find(c => c.includes('git -c core.quotepath=false diff'));
+    expect(gitDiff).toBeDefined();
+    // direct two-arg tree diff, not three-dot (#515)
+    expect(gitDiff).toContain(`diff '${PREV}' '${CUR}'`);
+    expect(gitDiff).not.toContain(`${PREV}...${CUR}`);
+    expect(gitDiff).toContain('/wt/task-inter-1');
+  });
+
+  it('no-anchor when the current round has no headSha (historical round)', async () => {
+    const store = new ReviewStore();
+    const m = makeManager({ reviewStore: store });
+    await seedRounds(store, { prevHead: PREV });
+    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', worktreePath: '/wt/task-inter-1' });
+    expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'no-anchor' });
+  });
+
+  it('no-anchor for round < 2 (no predecessor to diff against)', async () => {
+    const m = makeManager({ reviewStore: new ReviewStore() });
+    expect(await m.computeCodeInterdiff('task-inter-1', 1)).toEqual({ ok: false, reason: 'no-anchor' });
+  });
+
+  it('released when the dev agent is rebound to another task; runner is never invoked', async () => {
+    const execs: string[] = [];
+    const store = new ReviewStore();
+    const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'x') });
+    await seedRounds(store, { prevHead: PREV, curHead: CUR });
+    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'other-task', worktreePath: '/wt/other' });
+    expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'released' });
+    expect(execs.some(c => c.includes('git') && c.includes('diff'))).toBe(false);
+  });
+
+  it('released when the worktree is gone; runner is never invoked', async () => {
+    const execs: string[] = [];
+    const store = new ReviewStore();
+    const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'x') });
+    await seedRounds(store, { prevHead: PREV, curHead: CUR });
+    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1' });
+    expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'released' });
+    expect(execs.some(c => c.includes('git') && c.includes('diff'))).toBe(false);
   });
 });

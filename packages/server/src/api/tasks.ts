@@ -260,6 +260,25 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(rounds);
   });
 
+  app.get<{ Params: { id: string; round: string } }>(
+    '/tasks/:id/reviews/code/:round/interdiff',
+    async (request, reply) => {
+      try {
+        const result = await app.ctx.agentManager.computeCodeInterdiff(
+          request.params.id,
+          Number(request.params.round),
+        );
+        if (result.ok) return reply.send({ diff: result.diff });
+        if (result.reason === 'no-anchor') {
+          return reply.status(404).send({ error: '该轮次缺少 headSha 锚点（历史轮次），增量视图不可用' });
+        }
+        return reply.status(409).send({ error: 'dev 工作区已释放，增量不可用' });
+      } catch (err) {
+        return reply.status(500).send({ error: err instanceof Error ? err.message : String(err) });
+      }
+    },
+  );
+
   app.get<{ Params: { id: string } }>('/tasks/:id/github-review', async (request, reply) => {
     const task = await app.ctx.taskStore.get(request.params.id);
     if (!task) return reply.status(404).send({ error: 'task not found' });
@@ -301,6 +320,23 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(400).send({ error: 'comments must be a string' });
       }
       const updated = await app.ctx.agentManager.submitSpecVerdict(request.params.id, verdict, comments);
+      return reply.status(202).send(updated);
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: { verdict?: string; comments?: string } }>(
+    '/tasks/:id/code',
+    async (request, reply) => {
+      const { verdict, comments } = request.body ?? {};
+      if (verdict !== 'request-changes') {
+        return reply
+          .status(400)
+          .send({ error: 'verdict must be "request-changes"; to approve, POST /tasks/:id/complete' });
+      }
+      if (typeof comments !== 'string' || comments.trim() === '') {
+        return reply.status(400).send({ error: 'comments must be a non-empty string' });
+      }
+      const updated = await app.ctx.agentManager.submitCodeVerdict(request.params.id, comments);
       return reply.status(202).send(updated);
     },
   );

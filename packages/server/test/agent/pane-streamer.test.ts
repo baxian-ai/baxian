@@ -98,7 +98,7 @@ function makeStreamer(opts: MakeStreamerOpts = {}): MadeStreamer {
   const fakePty = explicitPty ?? createFakePty();
   const runner = explicitRunner ?? mockRunner();
   const tmux = new TmuxManager(runner);
-  const streamer = new PaneStreamer(agent ?? TEST_AGENT, tmux, runner, () => undefined, {
+  const streamer = new PaneStreamer(agent ?? TEST_AGENT, tmux, () => undefined, {
     ptyFactory: ptyFactory ?? (() => fakePty),
     idleGraceMs: idleGraceMs ?? 50,
     ...rest,
@@ -720,7 +720,6 @@ describe('PaneStreamer host re-resolution', () => {
     const streamer = new PaneStreamer(
       { id: 'r-dev', runtime: 'codex', role: 'dev', mode: 'remote' } as AgentConfig,
       new TmuxManager(mockRunner()),
-      mockRunner(),
       () => { resolveCalls++; return host; },
       { ptyFactory: (cmd) => { captured.push(cmd); return fakePty; }, idleGraceMs: 50 },
     );

@@ -62,14 +62,27 @@ interface Fixture {
   emit: (type: string, data: Record<string, unknown>) => Promise<void>;
 }
 
-function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: number; afterDone?: 'pr' | 'branch' | null; verifyPr?: boolean; specApproval?: 'human' | null } = {}): Fixture {
+function makeFixture(
+  taskOverrides: Partial<TaskState> = {},
+  config: {
+    rounds?: number;
+    afterDone?: 'pr' | 'branch' | null;
+    verifyPr?: boolean;
+    specApproval?: 'human' | null;
+    hasQaPartner?: boolean;
+    interdiff?: { ok: true; diff: string } | { ok: false; reason: string };
+    interdiffThrows?: boolean;
+  } = {},
+): Fixture {
   const emitted: BaxianEvent[] = [];
   const bus = new EventBus({ append: async (e: BaxianEvent) => { emitted.push(e); } } as unknown as EventLog);
   const store = new ReviewStore();
   const driverRef: { current?: ServerReviewDriver } = {};
   const task = makeTask(taskOverrides);
+  const hasQaPartner = config.hasQaPartner ?? task.qaAgentId === QA.id;
   const calls: Record<string, unknown[][]> = {
     dispatchServerReviewToQa: [],
+    computeCodeInterdiff: [],
     dispatchServerFixToDev: [],
     dispatchServerAfterDone: [],
     transitionTaskStatus: [],
@@ -130,7 +143,7 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     getReviewTransport: () => transport,
     getTask: async () => task,
     getAgentConfig: (id: string) => (id === DEV.id ? DEV : id === QA.id ? QA : undefined),
-    findQaPartner: (devId: string) => (devId === DEV.id && task.qaAgentId ? QA : undefined),
+    findQaPartner: (devId: string) => (devId === DEV.id && hasQaPartner ? QA : undefined),
     getConfig: () => ({
       review: { rounds: config.rounds ?? 10, mode: 'server', afterDone: config.afterDone ?? null },
       server: DEFAULT_SERVER_CONFIG,
@@ -143,6 +156,11 @@ function makeFixture(taskOverrides: Partial<TaskState> = {}, config: { rounds?: 
     getAgentState,
     updateTask,
     findLineageViolation,
+    computeCodeInterdiff: vi.fn(async (id: string, round: number) => {
+      calls.computeCodeInterdiff.push([id, round]);
+      if (config.interdiffThrows) throw new Error('git diff failed: bad object');
+      return config.interdiff ?? { ok: false, reason: 'no-anchor' };
+    }),
     dispatchServerReviewToQa: vi.fn(async (id: string, opts: unknown) => {
       calls.dispatchServerReviewToQa.push([id, opts]);
       task.status = 'review';
@@ -241,6 +259,7 @@ describe('server.code.ready', () => {
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.baseSha).toBe('base123');
+    expect(round?.headSha).toBe('head123');
     expect(round?.content).toContain('diff --git');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { content: string; recheck: boolean }];
@@ -299,6 +318,7 @@ describe('server.code.ready', () => {
     expect(opts.batch).toEqual({ index: 0, total: 2 });
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.batchFindings).toEqual([]);
+    expect(round?.headSha).toBe('head123');
   });
 });
 
@@ -469,6 +489,181 @@ describe('server.code.fix.submitted', () => {
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; priorFindingsJson?: string }];
     expect(opts.recheck).toBe(true);
     expect(opts.priorFindingsJson).toContain('f-1');
+  });
+
+  it('recheck: computes the round interdiff and forwards it to the QA dispatch', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 }, { interdiff: { ok: true, diff: 'ROUND2-DELTA' } });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.computeCodeInterdiff).toContainEqual(['t1', 2]);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; interdiff?: string }];
+    expect(opts.recheck).toBe(true);
+    expect(opts.interdiff).toBe('ROUND2-DELTA');
+  });
+
+  it('recheck: interdiff unavailable degrades gracefully — dispatch proceeds with no interdiff payload', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 }, { interdiff: { ok: false, reason: 'released' } });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; interdiff?: string }];
+    expect(opts.recheck).toBe(true);
+    expect(opts.interdiff).toBeUndefined();
+  });
+
+  it('recheck: an interdiff computation error degrades gracefully — recheck is not blocked', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 }, { interdiffThrows: true });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; interdiff?: string }];
+    expect(opts.recheck).toBe(true);
+    expect(opts.interdiff).toBeUndefined();
+  });
+
+  it('recheck: an empty interdiff is treated as unavailable (no empty payload)', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 }, { interdiff: { ok: true, diff: '   \n' } });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { interdiff?: string }];
+    expect(opts.interdiff).toBeUndefined();
+  });
+
+  it('recheck batch path: interdiff rides on the first batch dispatch only', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 }, { interdiff: { ok: true, diff: 'ROUND2-DELTA' } });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    fx.transport.readContent.mockResolvedValue({
+      content: [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n'),
+      diffstat: 'stat', baseSha: 'base123',
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number }; interdiff?: string }];
+    expect(opts.batch).toEqual({ index: 0, total: 2 });
+    expect(opts.interdiff).toBe('ROUND2-DELTA');
+  });
+
+  it('initial review (round 1) carries no interdiff and never computes one', async () => {
+    const fx = makeFixture();
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+    expect(fx.calls.computeCodeInterdiff).toHaveLength(0);
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; interdiff?: string }];
+    expect(opts.recheck).toBe(false);
+    expect(opts.interdiff).toBeUndefined();
+  });
+
+  it('no QA: full coverage → auto-approve to ready (afterDone null), no QA dispatch', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1, qaAgentId: undefined });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.transport.deleteResponse).toHaveBeenCalled();
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
+  });
+
+  it('stale qaAgentId without a configured QA partner auto-approves after code-fixed', async () => {
+    const fx = makeFixture(
+      { status: 'fixing', reviewRound: 1, qaAgentId: 'ghost-qa' },
+      { hasQaPartner: false },
+    );
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
+  });
+
+  it('no QA: full coverage → approved + dispatchServerAfterDone (afterDone branch)', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1, qaAgentId: undefined }, { afterDone: 'branch' });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.transport.readHeadSha).toHaveBeenCalled();
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'approved']);
+    expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'branch']);
+  });
+
+  it('no QA: head capture failure re-arms code-fixed (not code-done)', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1, qaAgentId: undefined }, { afterDone: 'branch' });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done', commitSha: 'abc' }],
+    });
+    fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git failed'));
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expect(fx.calls.transitionTaskStatus).toHaveLength(0);
+    expect(fx.calls.dispatchServerAfterDone).toHaveLength(0);
+  });
+
+  it('no QA recovery: response already stored (readResponse null) → auto-approve, no QA dispatch', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1, qaAgentId: undefined });
+    await putRound(fx.store, 'code', 1, {
+      findings: FINDINGS_RC,
+      response: { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] },
+    });
+    fx.transport.readResponse.mockResolvedValue(null);
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
+  });
+
+  it('dev responses to u- findings (fix/reject/out-of-scope) pass coverage and dispatch recheck', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, {
+      findings: { round: 1, verdict: 'request-changes', findings: [
+        { id: 'f-1', severity: 'major', message: 'broken' },
+        { id: 'u-1', severity: 'major', message: '用户意见 1' },
+        { id: 'u-2', severity: 'major', message: '用户意见 2' },
+      ] },
+    });
+    fx.transport.readResponse.mockResolvedValue({
+      round: 1,
+      responses: [
+        { findingId: 'f-1', action: 'fix', rationale: 'fixed', commitSha: 'abc' },
+        { findingId: 'u-1', action: 'reject', rationale: '不认同' },
+        { findingId: 'u-2', action: 'out-of-scope', rationale: '超范围' },
+      ],
+    });
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    expect(fx.emitted.some(e => e.type === 'human.intervention'
+      && (e.data as { phase?: string }).phase === 'server-code-response-coverage-gap')).toBe(false);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    // QA 复审的 prior findings 携带用户意见（u-1）
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { priorFindingsJson?: string }];
+    expect(opts.priorFindingsJson).toContain('u-1');
   });
 });
 

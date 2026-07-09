@@ -69,6 +69,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const [continuing, setContinuing] = useState(false);
   const [specSubmitting, setSpecSubmitting] = useState(false);
   const [specComments, setSpecComments] = useState('');
+  const [codeSubmitting, setCodeSubmitting] = useState(false);
+  const [codeComments, setCodeComments] = useState('');
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
@@ -230,6 +232,23 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     }
   };
 
+  const handleCodeReject = async () => {
+    if (!task) return;
+    const comments = codeComments.trim();
+    if (!comments) return;
+    setCodeSubmitting(true);
+    try {
+      const updated = await api.tasks.code(task.id, { verdict: 'request-changes', comments });
+      commitTaskExternal(updated);
+      setCodeComments('');
+      show({ kind: 'success', title: t.taskDetail.codeRejectedToastTitle });
+    } catch (err) {
+      show({ kind: 'error', title: t.taskDetail.codeRejectFailedTitle, body: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setCodeSubmitting(false);
+    }
+  };
+
   const handleConfirmGate = async () => {
     if (!task) return;
     if (!(await confirmDialog({ title: t.taskDetail.confirmGateConfirmTitle(task.id), body: t.taskDetail.confirmGateConfirmBody, confirmLabel: t.taskDetail.confirmComplete }))) return;
@@ -358,6 +377,30 @@ function TaskDetailView({ taskId }: { taskId: string }) {
               >
                 {t.taskDetail.viewPr(task.prNumber ?? 0)}
               </a>
+            )}
+            {task.reviewMode === 'server' && task.phase !== 'spec' && (
+              <div className="mt-3 flex flex-col gap-2">
+                <div className="text-og-700">{t.taskDetail.readyGateRejectHint}</div>
+                <textarea
+                  value={codeComments}
+                  onChange={e => setCodeComments(e.target.value)}
+                  placeholder={t.taskDetail.codeRejectCommentsPlaceholder}
+                  rows={3}
+                  disabled={codeSubmitting}
+                  className={inputCls}
+                />
+                <div>
+                  <button
+                    type="button"
+                    disabled={codeSubmitting || completing || codeComments.trim() === ''}
+                    onClick={handleCodeReject}
+                    title={codeComments.trim() === '' ? t.taskDetail.codeRejectTitleEmpty : t.taskDetail.codeRejectTitleReady}
+                    className="btn-secondary"
+                  >
+                    {codeSubmitting ? t.taskDetail.submitting : t.taskDetail.codeReject}
+                  </button>
+                </div>
+              </div>
             )}
           </div>
         )}
@@ -513,6 +556,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         projectId={task.projectId}
         role={cfg.role}
         runtime={cfg.runtime}
+        model={cfg.model}
         pendingRestart={agentsLoaded && !snapshot}
         terminalLoading={!agentsLoaded && !snapshot && !agentsErrorPayload}
         showTaskBinding={false}
@@ -613,7 +657,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         {isGate && (
           <button
             type="button"
-            disabled={completing}
+            disabled={completing || codeSubmitting}
             onClick={handleConfirmGate}
             title={t.taskDetail.confirmButtonTitle}
             className="btn-primary"
