@@ -94,7 +94,14 @@ function makeFixture(
     releaseAgentForTask: [],
   };
   const transport = {
-    readContent: vi.fn(async () => ({ content: 'diff --git a/a.ts b/a.ts\n+x', diffstat: ' a.ts | 1 +', baseSha: 'base123', defaultBranch: 'main' })),
+    readContent: vi.fn(async () => ({
+      content: 'diff --git a/a.ts b/a.ts\n+x',
+      diffstat: ' a.ts | 1 +',
+      baseSha: 'base123',
+      headSha: 'head123',
+      headTree: 'tree123',
+      defaultBranch: 'main',
+    })),
     readFindings: vi.fn(async (): Promise<ReviewFindings | null> => null),
     readResponse: vi.fn(async (): Promise<ReviewResponse | null> => null),
     deleteFindings: vi.fn(async () => undefined),
@@ -260,11 +267,19 @@ describe('server.code.ready', () => {
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.baseSha).toBe('base123');
     expect(round?.headSha).toBe('head123');
+    expect(round?.headTree).toBe('tree123');
     expect(round?.content).toContain('diff --git');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
-    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { content: string; recheck: boolean }];
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, {
+      content: string;
+      recheck: boolean;
+      baseSha?: string;
+      headTree?: string;
+    }];
     expect(opts.recheck).toBe(false);
     expect(opts.content).toContain('diff --git');
+    expect(opts.baseSha).toBe('base123');
+    expect(opts.headTree).toBe('tree123');
   });
 
   it('token mismatch → no dispatch', async () => {
@@ -305,20 +320,32 @@ describe('server.code.ready', () => {
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('large diff → first batch dispatched with batch meta', async () => {
+  it('large diff dispatches once with the full content and review head metadata', async () => {
     const fx = makeFixture();
+    const content = [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n');
     fx.transport.readContent.mockResolvedValue({
-      content: [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n'),
+      content,
       diffstat: 'stat',
       baseSha: 'base123',
+      headSha: 'head123',
+      headTree: 'tree123',
     });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
-    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number; total: number } }];
-    expect(opts.batch).toEqual({ index: 0, total: 2 });
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, {
+      batch?: { index: number; total: number };
+      content: string;
+      baseSha?: string;
+      headTree?: string;
+    }];
+    expect(opts.batch).toBeUndefined();
+    expect(opts.content).toBe(content);
+    expect(opts.baseSha).toBe('base123');
+    expect(opts.headTree).toBe('tree123');
     const round = await fx.store.getRound('t1', 'code', 1);
-    expect(round?.batchFindings).toEqual([]);
+    expect(round?.batchFindings).toBeUndefined();
     expect(round?.headSha).toBe('head123');
+    expect(round?.headTree).toBe('tree123');
   });
 });
 
@@ -409,21 +436,24 @@ describe('server.code.review.submitted', () => {
     expect(JSON.parse(json).findings[0].id).toBe('f-1');
   });
 
-  it('batched: stashes slice, dispatches next batch as continuation with diffstat', async () => {
+  it('legacy batch fields continue to the next batch during the compatibility window', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, batchIndex: 0, batchTotal: 2 });
     await putRound(fx.store, 'code', 1, { content: TWO_BATCH_DIFF, diffstat: 'FULL-SCOPE-STAT', batchFindings: [] });
     fx.transport.readFindings.mockResolvedValue(FINDINGS_RC);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     const round = await fx.store.getRound('t1', 'code', 1);
+    expect(round?.findings).toBeUndefined();
     expect(round?.batchFindings?.[0]?.findings[0].id).toBe('f-1');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
-    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { continuation?: boolean; batch?: { index: number }; diffstat?: string }];
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { continuation?: boolean; batch?: { index: number; total: number }; content: string; diffstat?: string }];
     expect(opts.continuation).toBe(true);
-    expect(opts.batch?.index).toBe(1);
+    expect(opts.batch).toEqual({ index: 1, total: 2 });
+    expect(opts.content).toContain('diff --git a/lib/b.ts');
     expect(opts.diffstat).toBe('FULL-SCOPE-STAT');
+    expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
   });
 
-  it('last batch aggregates with namespaced ids and routes verdict', async () => {
+  it('legacy final-batch state aggregates namespaced findings and routes the combined verdict', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, batchIndex: 1, batchTotal: 2 });
     await putRound(fx.store, 'code', 1, {
       batchFindings: [{ round: 1, verdict: 'approve', findings: [{ id: 'f-1', severity: 'minor', message: 'nit' }] }],
@@ -545,7 +575,7 @@ describe('server.code.fix.submitted', () => {
     expect(opts.interdiff).toBeUndefined();
   });
 
-  it('recheck batch path: interdiff rides on the first batch dispatch only', async () => {
+  it('recheck large diff carries interdiff on the single dispatch', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 }, { interdiff: { ok: true, diff: 'ROUND2-DELTA' } });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
@@ -554,12 +584,12 @@ describe('server.code.fix.submitted', () => {
     });
     fx.transport.readContent.mockResolvedValue({
       content: [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n'),
-      diffstat: 'stat', baseSha: 'base123',
+      diffstat: 'stat', baseSha: 'base123', headSha: 'head123', headTree: 'tree123',
     });
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number }; interdiff?: string }];
-    expect(opts.batch).toEqual({ index: 0, total: 2 });
+    expect(opts.batch).toBeUndefined();
     expect(opts.interdiff).toBe('ROUND2-DELTA');
   });
 
@@ -807,15 +837,13 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(1);
   });
 
-  it('code-reviewed replay mid-batch resumes next batch dispatch', async () => {
+  it('code-reviewed replay with legacy batch fields continues from stored batchFindings', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1, batchIndex: 0, batchTotal: 2 });
-    await putRound(fx.store, 'code', 1, { content: TWO_BATCH_DIFF, batchFindings: [FINDINGS_RC] });
+    await putRound(fx.store, 'code', 1, { content: TWO_BATCH_DIFF, findings: FINDINGS_RC, batchFindings: [FINDINGS_RC] });
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
-    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number }; continuation?: boolean }];
-    expect(opts.batch?.index).toBe(1);
-    expect(opts.continuation).toBe(true);
+    expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
   });
 
   it('code-fixed replay with stored response resumes recheck dispatch', async () => {
@@ -854,18 +882,18 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
   });
 
-  it('batch continuation derives recheck from round number', async () => {
+  it('legacy batch fields derive continuation dispatch on fresh findings', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 0, batchTotal: 2 });
     await putRound(fx.store, 'code', 2, { content: TWO_BATCH_DIFF, batchFindings: [] });
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 2 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck?: boolean }];
-    expect(opts.recheck).toBe(true);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
   });
 });
 
-describe('batched recheck id stability', () => {
-  it('aggregation keeps already-namespaced ids unprefixed', async () => {
+describe('legacy batch compatibility', () => {
+  it('aggregates existing batchFindings with the current final batch', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 1, batchTotal: 2 });
     await putRound(fx.store, 'code', 2, {
       batchFindings: [{
@@ -996,21 +1024,28 @@ describe('Codex: reviewed-head anchor', () => {
     expect(opts.reviewHeadAnchorSha).toBe('head123');
   });
 
-  it('batched dispatch pins the anchor on the round-opening slice', async () => {
+  it('large diff dispatch pins the anchor without batch metadata', async () => {
     const fx = makeFixture();
     fx.transport.readContent.mockResolvedValue({
       content: [bigFile('src/a.ts'), bigFile('lib/b.ts')].join('\n'),
       diffstat: 'stat',
+      baseSha: 'base123',
+      headSha: 'head123',
+      headTree: 'tree123',
     });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number }; reviewHeadAnchorSha?: string }];
-    expect(opts.batch?.index).toBe(0);
+    expect(opts.batch).toBeUndefined();
     expect(opts.reviewHeadAnchorSha).toBe('head123');
   });
 
-  it('anchor read failure re-arms the entry signal and dispatches nothing (fail-closed)', async () => {
+  it('captured content missing review head re-arms the entry signal and dispatches nothing (fail-closed)', async () => {
     const fx = makeFixture();
-    fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git down'));
+    fx.transport.readContent.mockResolvedValueOnce({
+      content: 'diff --git a/a b/a\n+x',
+      diffstat: 'stat',
+      baseSha: 'base123',
+    });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-done']);
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
@@ -1083,8 +1118,8 @@ describe('guard exits re-arm the consumed signal', () => {
   });
 });
 
-describe('aggregation id disambiguation', () => {
-  it('a restated namespaced id and a colliding new id stay one-to-one', async () => {
+describe('legacy batch aggregation data', () => {
+  it('keeps legacy batch ids collision-safe during final aggregation', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2, batchIndex: 1, batchTotal: 2 });
     await putRound(fx.store, 'code', 2, {
       batchFindings: [{
@@ -1099,9 +1134,7 @@ describe('aggregation id disambiguation', () => {
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     const round = await fx.store.getRound('t1', 'code', 2);
     const ids = round?.findings?.findings.map(f => f.id) ?? [];
-    expect(new Set(ids).size).toBe(ids.length);
-    expect(ids).toContain('b0-f-1');
-    expect(ids).toContain('b0-r2-f-1');
+    expect(ids).toEqual(['b0-f-1', 'b0-r2-f-1']);
   });
 });
 
@@ -1399,16 +1432,24 @@ describe('manual server review driver', () => {
     expect(await fx.store.getRound('t1', 'spec', 1)).toMatchObject({ round: 1, phase: 'spec' });
   });
 
-  it('dispatchCodeReview splits an oversized diff and reports true after dispatching batch 0', async () => {
+  it('dispatchCodeReview sends an oversized diff once with review head metadata', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 0 });
-    fx.transport.readContent.mockResolvedValue({ content: TWO_BATCH_DIFF, diffstat: ' 2 files', baseSha: 'base123', defaultBranch: 'main' });
+    fx.transport.readContent.mockResolvedValue({
+      content: TWO_BATCH_DIFF,
+      diffstat: ' 2 files',
+      baseSha: 'base123',
+      headSha: 'head123',
+      headTree: 'tree123',
+      defaultBranch: 'main',
+    });
 
     const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
 
     expect(ok).toBe(true);
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
-    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number; total: number } }];
-    expect(opts.batch).toEqual({ index: 0, total: 2 });
+    const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { batch?: { index: number; total: number }; headTree?: string }];
+    expect(opts.batch).toBeUndefined();
+    expect(opts.headTree).toBe('tree123');
   });
 
   it('dispatchCodeReview from fixing dispatches a recheck carrying the stored prior findings and response', async () => {
@@ -1530,7 +1571,12 @@ describe('prompt content passthrough', () => {
   it('oversized single-batch diff reaches dispatch untruncated; stored round keeps the full diff', async () => {
     const fx = makeFixture();
     const hugeDiff = `diff --git a/a.ts b/a.ts\n+${'哈'.repeat(30000)}`;
-    fx.transport.readContent.mockResolvedValue({ content: hugeDiff, baseSha: 'base123' });
+    fx.transport.readContent.mockResolvedValue({
+      content: hugeDiff,
+      baseSha: 'base123',
+      headSha: 'head123',
+      headTree: 'tree123',
+    });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
 
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);

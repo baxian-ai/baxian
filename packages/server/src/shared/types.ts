@@ -183,6 +183,10 @@ export interface TaskState {
   reviewMode?: ReviewMode;
   batchIndex?: number;
   batchTotal?: number;
+  // Persisted so recovery can re-arm the read-file side-channel for a base fallback
+  // review (its prompt depends on read-file) without re-enabling it for a head-mode
+  // review (which would bypass the worktree tree proof).
+  reviewWorktreeMode?: 'head' | 'base';
   maxRoundsContinues?: number;
   afterDone?: AfterDone;
   publishDispatchedAt?: string;
@@ -242,6 +246,7 @@ export interface ReviewRound {
   diffstat?: string;
   baseSha?: string;
   headSha?: string;
+  headTree?: string;
   findings?: ReviewFindings;
   response?: ReviewResponse;
   batchFindings?: ReviewFindings[];

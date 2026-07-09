@@ -743,6 +743,90 @@ describe('setupRecoveredSpecSignals()', () => {
     expect('onReadFile' in args).toBe(false);
   });
 
+  it('does not recover read-file for server code review without a known fallback mode', async () => {
+    await seedTask({
+      id: 'task-server-code-review',
+      qaAgentId: 'qa-1',
+      phase: 'code',
+      reviewMode: 'server',
+      status: 'review',
+      reviewRound: 1,
+      signalToken: 'tok-code-review',
+    });
+    const { watcher } = await buildManagerWithSpecWatcher();
+
+    await manager.setupRecoveredSpecSignals();
+
+    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
+    expect(args.expectedKinds).toEqual(['code-reviewed']);
+    expect(args.skipSnapshot).toBe(false);
+    expect('onReadFile' in args).toBe(false);
+  });
+
+  it('recovers read-file for legacy server batch continuations', async () => {
+    await seedTask({
+      id: 'task-server-code-batch',
+      qaAgentId: 'qa-1',
+      phase: 'code',
+      reviewMode: 'server',
+      status: 'review',
+      reviewRound: 1,
+      batchIndex: 1,
+      batchTotal: 2,
+      signalToken: 'tok-code-batch',
+    });
+    const { watcher } = await buildManagerWithSpecWatcher();
+
+    await manager.setupRecoveredSpecSignals();
+
+    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      expectedKinds: ['code-reviewed'],
+      onReadFile: expect.any(Function),
+      skipSnapshot: false,
+    }));
+  });
+
+  it('recovers read-file for a base-fallback server code review', async () => {
+    await seedTask({
+      id: 'task-server-code-base',
+      qaAgentId: 'qa-1',
+      phase: 'code',
+      reviewMode: 'server',
+      status: 'review',
+      reviewRound: 1,
+      reviewWorktreeMode: 'base',
+      signalToken: 'tok-code-base',
+    });
+    const { watcher } = await buildManagerWithSpecWatcher();
+
+    await manager.setupRecoveredSpecSignals();
+
+    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      expectedKinds: ['code-reviewed'],
+      onReadFile: expect.any(Function),
+      skipSnapshot: false,
+    }));
+  });
+
+  it('does NOT recover read-file for a head-mode server code review', async () => {
+    await seedTask({
+      id: 'task-server-code-head',
+      qaAgentId: 'qa-1',
+      phase: 'code',
+      reviewMode: 'server',
+      status: 'review',
+      reviewRound: 1,
+      reviewWorktreeMode: 'head',
+      signalToken: 'tok-code-head',
+    });
+    const { watcher } = await buildManagerWithSpecWatcher();
+
+    await manager.setupRecoveredSpecSignals();
+
+    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
+    expect('onReadFile' in args).toBe(false);
+  });
+
   it('does NOT emit intervention for pre-spec (spec-done|pr-created) recovered tasks', async () => {
     await seedTask({ id: 'task-pre-spec', signalToken: 'tok-pre-spec' });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();

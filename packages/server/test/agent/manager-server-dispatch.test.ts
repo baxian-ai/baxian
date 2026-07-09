@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
+import { AgentManager, type DispatchArmContext, DispatchTerminalError } from '../../src/agent/manager.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -124,10 +124,10 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
     const armedSpecReviewed = () => f.watcher.start.mock.calls.some(
       (c) => (c[0] as { expectedKinds?: unknown }).expectedKinds === 'spec-reviewed',
     );
-    let capturedOpts: { armBeforeInject?: () => Promise<boolean> } | undefined;
+    let capturedOpts: { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> } | undefined;
     let armedBeforeStart = false;
     const startSpy = vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
-      capturedOpts = opts as { armBeforeInject?: () => Promise<boolean> };
+      capturedOpts = opts as { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> };
       armedBeforeStart = armedSpecReviewed();
       return false;
     });
@@ -138,13 +138,98 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
     expect(startSpy).toHaveBeenCalled();
     expect(armedBeforeStart).toBe(false);
     expect(capturedOpts?.armBeforeInject).toBeTypeOf('function');
-    await capturedOpts!.armBeforeInject!();
+    await capturedOpts!.armBeforeInject!({});
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
       expectedKinds: 'spec-reviewed',
       onReadFile: expect.any(Function),
       skipSnapshot: false,
     }));
   });
+
+  it('does not arm read-file for code review when the QA worktree holds the reviewed head', async () => {
+    const f = await makeFixture('server');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'in_progress',
+      signalToken: 'orig-token', reviewRound: 0,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW,
+    }));
+    let capturedOpts: { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> } | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      capturedOpts = opts as { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> };
+      return false;
+    });
+
+    await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff text', reviewHeadAnchorSha: 'head123', headTree: 'tree123',
+    }).catch(() => undefined);
+
+    await capturedOpts!.armBeforeInject!({ serverReviewWorktree: 'head' });
+    expect(f.watcher.start).toHaveBeenCalledWith(expect.not.objectContaining({
+      onReadFile: expect.any(Function),
+    }));
+    expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      expectedKinds: 'code-reviewed',
+      skipSnapshot: false,
+    }));
+  });
+
+  it('arms read-file for code review fallback worktrees', async () => {
+    const f = await makeFixture('server');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'in_progress',
+      signalToken: 'orig-token', reviewRound: 0,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW,
+    }));
+    let capturedOpts: { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> } | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      capturedOpts = opts as { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> };
+      return false;
+    });
+
+    await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff text', reviewHeadAnchorSha: 'head123', headTree: 'tree123',
+    }).catch(() => undefined);
+
+    await capturedOpts!.armBeforeInject!({ serverReviewWorktree: 'base' });
+    expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      expectedKinds: 'code-reviewed',
+      onReadFile: expect.any(Function),
+      skipSnapshot: false,
+    }));
+  });
+
+  it.each(['base', 'head'] as const)(
+    'persists reviewWorktreeMode=%s from the materialized worktree so recovery can re-arm read-file',
+    async (mode) => {
+      const f = await makeFixture('server');
+      const NOW = new Date().toISOString();
+      await f.taskStore.set(taskFixture({
+        reviewMode: 'server', phase: 'code', status: 'in_progress',
+        signalToken: 'orig-token', reviewRound: 0,
+      }));
+      await f.agentStore.update('dev-1', () => ({
+        id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW,
+      }));
+      vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+        await (opts as { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> })
+          .armBeforeInject?.({ serverReviewWorktree: mode });
+        return true;
+      });
+
+      await f.manager.dispatchServerReviewToQa('task-1', {
+        phase: 'code', content: 'diff text', reviewHeadAnchorSha: 'head123', headTree: 'tree123',
+      });
+
+      const task = await f.taskStore.get('task-1');
+      expect(task?.reviewWorktreeMode).toBe(mode);
+    },
+  );
 });
 
 describe('dispatchServerReviewToQa rollback restores originalPhase', () => {
@@ -347,6 +432,37 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
 
     expect(captured?.serverContent).toBe('full diff');
     expect(captured?.serverInterdiff).toBe('round-2 delta');
+  });
+
+  it('threads captured review head metadata into startSession for QA worktree materialization', async () => {
+    const f = await makeFixture('server');
+    const NOW = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'in_progress', signalToken: 't', reviewRound: 0,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: NOW,
+    }));
+    let captured: Record<string, unknown> | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      captured = opts as Record<string, unknown>;
+      return true;
+    });
+
+    await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code',
+      content: 'full diff',
+      diffstat: 'stat',
+      baseSha: 'base123',
+      reviewHeadAnchorSha: 'head123',
+      headTree: 'tree123',
+    });
+
+    expect(captured?.serverContent).toBe('full diff');
+    expect(captured?.serverDiffstat).toBe('stat');
+    expect(captured?.serverBaseSha).toBe('base123');
+    expect(captured?.serverHeadSha).toBe('head123');
+    expect(captured?.serverHeadTree).toBe('tree123');
   });
 });
 
@@ -841,6 +957,33 @@ describe('startSession/continueSession resolve server payloads before prompt bui
     expect(worktreeArg).toBe(devWorktree);
     expect(filename).toBe('findings-round-2.json');
     expect(content).toBe(findings);
+  });
+
+  it('startSession forces a small review diff into diff-file when the QA worktree materializes the head tree', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'tok', reviewRound: 1,
+    }));
+    stubSessionEnv(f);
+    f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('git rev-parse HEAD^{tree}')) return { stdout: 'tree123\n', stderr: '', exitCode: 0 };
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    const deliver = stubTransport(f);
+
+    await expect(f.manager.startSession('task-1', 'qa-1', 'server-review', {
+      bypassTaskStatusGate: true,
+      signalToken: 'tok',
+      serverContent: 'small diff',
+      serverBaseSha: 'base123',
+      serverHeadSha: 'head123',
+      serverHeadTree: 'tree123',
+    })).rejects.toMatchObject({ reason: 'required_skills_missing' });
+
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const [, , filename, content] = deliver.mock.calls[0]!;
+    expect(filename).toBe('diff-round-1.patch');
+    expect(content).toBe('small diff');
   });
 
   it('a within-threshold payload stays inline: prompt build is reached with zero inbox deliveries', async () => {

@@ -1,6 +1,3 @@
-import {
-  DIFF_LARGE_THRESHOLD,
-} from '../shared/index.js';
 import type {
   AgentConfig,
   BaxianEvent,
@@ -11,9 +8,87 @@ import type {
 } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import type { AgentManager } from '../agent/manager.js';
-import { buildBatches, countLines, splitDiffByFile, type DiffFile } from '../agent/diff-split.js';
 import { ReviewExchangeError } from '../agent/review-transport.js';
 import type { PhaseSignalKind } from '../agent/phase-signal.js';
+
+const LEGACY_DIFF_LARGE_THRESHOLD = 2000;
+const FILE_HEADER_RE = /^diff --git a\/(.+?) b\//;
+
+interface LegacyDiffFile {
+  path: string;
+  text: string;
+  lines: number;
+}
+
+function splitLegacyDiffByFile(diff: string): LegacyDiffFile[] {
+  if (diff.trim() === '') return [];
+  const out: LegacyDiffFile[] = [];
+  let current: { path: string; lines: string[] } | null = null;
+  const flush = () => {
+    if (!current) return;
+    out.push({
+      path: current.path,
+      text: current.lines.join('\n'),
+      lines: current.lines.length,
+    });
+    current = null;
+  };
+  for (const line of diff.split('\n')) {
+    const m = FILE_HEADER_RE.exec(line);
+    if (m) {
+      flush();
+      current = { path: m[1], lines: [line] };
+    } else if (current) {
+      current.lines.push(line);
+    }
+  }
+  flush();
+  return out;
+}
+
+function legacyTopDir(path: string): string {
+  const idx = path.lastIndexOf('/');
+  return idx === -1 ? '.' : path.slice(0, idx);
+}
+
+function buildLegacyBatches(files: LegacyDiffFile[], maxLines: number): LegacyDiffFile[][] {
+  const groups: Array<{ files: LegacyDiffFile[]; lines: number }> = [];
+  const indexByDir = new Map<string, number>();
+  for (const file of files) {
+    const dir = legacyTopDir(file.path);
+    const existing = indexByDir.get(dir);
+    if (existing === undefined) {
+      indexByDir.set(dir, groups.length);
+      groups.push({ files: [file], lines: file.lines });
+    } else {
+      groups[existing].files.push(file);
+      groups[existing].lines += file.lines;
+    }
+  }
+
+  const batches: LegacyDiffFile[][] = [];
+  let pending: LegacyDiffFile[] = [];
+  let pendingLines = 0;
+  const flushPending = () => {
+    if (pending.length === 0) return;
+    batches.push(pending);
+    pending = [];
+    pendingLines = 0;
+  };
+
+  for (const group of groups) {
+    if (group.lines > maxLines) {
+      flushPending();
+      for (const file of group.files) batches.push([file]);
+      continue;
+    }
+    if (pendingLines + group.lines > maxLines) flushPending();
+    pending.push(...group.files);
+    pendingLines += group.lines;
+  }
+  flushPending();
+  return batches;
+}
 
 function aggregateBatchFindings(batches: ReviewFindings[], round: number): ReviewFindings {
   const findings: Finding[] = [];
@@ -270,8 +345,9 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     let content;
     let reviewHeadAnchorSha: string;
     try {
-      reviewHeadAnchorSha = await transport().readHeadSha(dev);
       content = await transport().readContent(task, dev, 'code');
+      if (!content.headSha) throw new ReviewExchangeError('head-failed', 'review head missing from captured content');
+      reviewHeadAnchorSha = content.headSha;
     } catch (err) {
       await emitIntervention(bus, task, {
         phase: 'server-code-content-read-failed',
@@ -315,6 +391,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       headSha: reviewHeadAnchorSha,
       ...(content.diffstat ? { diffstat: content.diffstat } : {}),
       ...(content.baseSha ? { baseSha: content.baseSha } : {}),
+      ...(content.headTree ? { headTree: content.headTree } : {}),
       startedAt: new Date().toISOString(),
     };
 
@@ -347,21 +424,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
     };
 
-    const lines = countLines(content.content);
-    if (lines > DIFF_LARGE_THRESHOLD) {
-      const batches = buildBatches(splitDiffByFile(content.content), DIFF_LARGE_THRESHOLD);
-      if (batches.length > 1) {
-        round.batchFindings = [];
-        if (!(await putEntryRound(round))) return false;
-        const interdiff = await resolveRecheckInterdiff();
-        return dispatchBatch(task.id, batches, 0, content.diffstat, {
-          ...opts,
-          reviewHeadAnchorSha,
-          ...(interdiff ? { interdiff } : {}),
-        });
-      }
-    }
-
     if (!(await putEntryRound(round))) return false;
     const interdiff = await resolveRecheckInterdiff();
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
@@ -369,6 +431,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       recheck: opts.recheck,
       content: content.content,
       reviewHeadAnchorSha,
+      ...(content.baseSha ? { baseSha: content.baseSha } : {}),
+      ...(content.headTree ? { headTree: content.headTree } : {}),
       ...(interdiff ? { interdiff } : {}),
       ...(content.diffstat ? { diffstat: content.diffstat } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
@@ -377,31 +441,29 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     return dispatched !== null;
   }
 
-  async function dispatchBatch(
+  async function dispatchLegacyBatch(
     taskId: string,
-    batches: DiffFile[][],
+    batches: LegacyDiffFile[][],
     index: number,
     diffstat: string | undefined,
-    opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string; reviewHeadAnchorSha?: string; interdiff?: string },
+    opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string },
   ): Promise<boolean> {
     const text = batches[index].map(f => f.text).join('\n');
     const dispatched = await manager.dispatchServerReviewToQa(taskId, {
       phase: 'code',
       recheck: opts.recheck,
-      continuation: index > 0,
+      continuation: true,
       content: text,
       ...(diffstat ? { diffstat } : {}),
       batch: { index, total: batches.length },
-      ...(index === 0 && opts.reviewHeadAnchorSha ? { reviewHeadAnchorSha: opts.reviewHeadAnchorSha } : {}),
-      ...(index === 0 && opts.interdiff ? { interdiff: opts.interdiff } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
     });
     return dispatched !== null;
   }
 
-  function rebuildBatches(roundData: ReviewRound): DiffFile[][] {
-    return buildBatches(splitDiffByFile(roundData.content), DIFF_LARGE_THRESHOLD);
+  function rebuildLegacyBatches(roundData: ReviewRound): LegacyDiffFile[][] {
+    return buildLegacyBatches(splitLegacyDiffByFile(roundData.content), LEGACY_DIFF_LARGE_THRESHOLD);
   }
 
   bus.on('server.code.ready', async (event) => {
@@ -482,12 +544,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
 
     const isRecheck = round > 1;
-
     if (task.batchTotal !== undefined && task.batchIndex !== undefined) {
       const nextIndex = task.batchIndex + 1;
       if (nextIndex < task.batchTotal) {
         const prev = isRecheck ? await reviewStore.getRound(task.id, 'code', round - 1) : null;
-        await dispatchBatch(task.id, rebuildBatches(current), nextIndex, current.diffstat, {
+        await dispatchLegacyBatch(task.id, rebuildLegacyBatches(current), nextIndex, current.diffstat, {
           recheck: isRecheck,
           ...(prev?.findings ? { priorFindingsJson: JSON.stringify(prev.findings) } : {}),
           ...(prev?.response ? { priorResponseJson: JSON.stringify(prev.response) } : {}),

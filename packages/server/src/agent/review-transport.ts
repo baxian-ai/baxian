@@ -32,6 +32,8 @@ export interface ReadContentResult {
   content: string;
   diffstat?: string;
   baseSha?: string;
+  headSha?: string;
+  headTree?: string;
   defaultBranch?: string;
 }
 
@@ -44,6 +46,7 @@ export interface ReviewTransportDeps {
 const SEVERITIES = new Set(['critical', 'major', 'minor']);
 const VERDICTS = new Set(['approve', 'request-changes']);
 const ACTIONS = new Set(['fix', 'reject', 'out-of-scope']);
+const REVIEW_DIFF_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 
 export function validateReviewFindings(raw: unknown): ReviewFindings {
   if (!isRecord(raw)) throw new ReviewExchangeError('schema', 'findings: not an object');
@@ -154,22 +157,40 @@ export class ReviewTransport {
     }
     const defaultBranch = db.stdout.trim().replace(/^origin\//, '') || 'main';
     const base = `origin/${defaultBranch}`;
-    const sha = await runner.exec(`${cd}git merge-base ${shellQuote(base)} HEAD`);
+    const head = await runner.exec(`${cd}git rev-parse HEAD`);
+    if (head.exitCode !== 0 || head.stdout.trim() === '') {
+      throw new ReviewExchangeError('head-failed', `git rev-parse HEAD failed: ${head.stderr.trim()}`);
+    }
+    const headSha = head.stdout.trim();
+    const sha = await runner.exec(`${cd}git merge-base ${shellQuote(base)} ${shellQuote(headSha)}`);
     if (sha.exitCode !== 0) {
       throw new ReviewExchangeError('merge-base-failed', `git merge-base failed: ${sha.stderr.trim()}`);
     }
-    const stat = await runner.exec(`${cd}git -c core.quotepath=false diff --stat ${shellQuote(`${base}...HEAD`)}`);
+    const baseSha = sha.stdout.trim();
+    const tree = await runner.exec(`${cd}git rev-parse ${shellQuote(`${headSha}^{tree}`)}`);
+    if (tree.exitCode !== 0 || tree.stdout.trim() === '') {
+      throw new ReviewExchangeError('head-tree-failed', `git rev-parse HEAD tree failed: ${tree.stderr.trim()}`);
+    }
+    const headTree = tree.stdout.trim();
+    const stat = await runner.exec(
+      `${cd}git -c core.quotepath=false diff --stat ${shellQuote(baseSha)} ${shellQuote(headSha)}`,
+    );
     if (stat.exitCode !== 0) {
       throw new ReviewExchangeError('diffstat-failed', `git diff --stat failed: ${stat.stderr.trim()}`);
     }
-    const diff = await runner.exec(`${cd}git -c core.quotepath=false diff ${shellQuote(`${base}...HEAD`)}`);
+    const diff = await runner.exec(
+      `${cd}git -c core.quotepath=false diff --binary ${shellQuote(baseSha)} ${shellQuote(headSha)}`,
+      { maxBuffer: REVIEW_DIFF_MAX_BUFFER_BYTES },
+    );
     if (diff.exitCode !== 0) {
       throw new ReviewExchangeError('diff-failed', `git diff failed: ${diff.stderr.trim()}`);
     }
     return {
       content: diff.stdout,
       diffstat: stat.stdout,
-      baseSha: sha.stdout.trim(),
+      baseSha,
+      headSha,
+      headTree,
       defaultBranch,
     };
   }
@@ -320,6 +341,8 @@ export interface ServerPayloadInput {
   reviewRound: number;
   batch?: { index: number; total: number };
   serverContent?: string;
+  forceContentFile?: boolean;
+  serverDiffstat?: string;
   serverInterdiff?: string;
   serverPriorFindings?: string;
   serverPriorResponse?: string;
@@ -328,6 +351,8 @@ export interface ServerPayloadInput {
 export interface ServerPayloadPromptOpts {
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverDiffstat?: string;
+  serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
   serverPriorFindings?: string;
@@ -361,17 +386,30 @@ export async function resolveServerPayloads(
   const place = async (
     value: string | undefined,
     filename: string,
-    inlineKey: 'serverContent' | 'serverInterdiff' | 'serverPriorFindings' | 'serverPriorResponse',
-    fileKey: 'serverContentFile' | 'serverInterdiffFile' | 'serverPriorFindingsFile' | 'serverPriorResponseFile',
+    inlineKey: 'serverContent' | 'serverDiffstat' | 'serverInterdiff' | 'serverPriorFindings' | 'serverPriorResponse',
+    fileKey: 'serverContentFile' | 'serverDiffstatFile' | 'serverInterdiffFile' | 'serverPriorFindingsFile' | 'serverPriorResponseFile',
+    forceFile = false,
   ): Promise<void> => {
     if (value === undefined) return;
-    if (Buffer.byteLength(value, 'utf8') <= MAX_INLINE_CONTENT_BYTES) {
+    if (!forceFile && Buffer.byteLength(value, 'utf8') <= MAX_INLINE_CONTENT_BYTES) {
       out[inlineKey] = value;
       return;
     }
     out[fileKey] = await transport.deliverToInbox(agent, worktreePath, filename, value);
   };
-  await place(input.serverContent, contentFilename(input.phase, round, input.batch), 'serverContent', 'serverContentFile');
+  await place(
+    input.serverContent,
+    contentFilename(input.phase, round, input.batch),
+    'serverContent',
+    'serverContentFile',
+    input.forceContentFile,
+  );
+  await place(
+    input.serverDiffstat,
+    `diffstat-round-${round}.txt`,
+    'serverDiffstat',
+    'serverDiffstatFile',
+  );
   await place(input.serverInterdiff, `interdiff-round-${round}.patch`, 'serverInterdiff', 'serverInterdiffFile');
   const findingsName = input.phase === 'server-feedback'
     ? `findings-round-${round}.json`

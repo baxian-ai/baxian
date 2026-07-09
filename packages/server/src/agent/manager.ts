@@ -203,11 +203,18 @@ export interface ContinueSessionOpts {
   serverContent?: string;
   serverInterdiff?: string;
   serverDiffstat?: string;
+  serverBaseSha?: string;
+  serverHeadSha?: string;
+  serverHeadTree?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorResponse?: string;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
-  armBeforeInject?: () => Promise<boolean>;
+  armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean>;
+}
+
+export interface DispatchArmContext {
+  serverReviewWorktree?: 'head' | 'base';
 }
 
 export interface MergePrOpts {
@@ -2473,6 +2480,10 @@ export class AgentManager {
       const scanSnapshotOnRecover = isServerProtocol
         || (task.phase === undefined && task.status === 'in_progress')
         || (task.phase !== 'spec' && (task.status === 'review' || task.status === 'fixing'));
+      const allowRecoveredReadFile = task.status === 'review'
+        && (task.phase === 'spec'
+          || (task.reviewMode === 'server' && task.batchTotal !== undefined)
+          || (task.reviewMode === 'server' && task.reviewWorktreeMode === 'base'));
       try {
         await this.startPhaseSignalWatch({
           taskId: task.id,
@@ -2482,7 +2493,7 @@ export class AgentManager {
           token: task.signalToken,
           skipSnapshot: !scanSnapshotOnRecover,
           recovered: true,
-          ...(isServerProtocol && task.status === 'review'
+          ...(allowRecoveredReadFile
             ? { onReadFile: (req: ReadFileSignal) => { void this.handleReadFileRequest(task.id, agentId, req); } }
             : {}),
         });
@@ -3402,10 +3413,13 @@ export class AgentManager {
       serverContent?: string;
       serverInterdiff?: string;
       serverDiffstat?: string;
+      serverBaseSha?: string;
+      serverHeadSha?: string;
+      serverHeadTree?: string;
       serverBatch?: { index: number; total: number };
       serverPriorFindings?: string;
       serverPriorResponse?: string;
-      armBeforeInject?: () => Promise<boolean>;
+      armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean>;
     } = {},
   ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
@@ -3483,10 +3497,19 @@ export class AgentManager {
     const tmux = new TmuxManager(runner);
 
     const isServerQaPhase = phase === 'server-review' || phase === 'server-recheck' || phase === 'server-spec-review';
+    const isServerCodeReviewPhase = phase === 'server-review' || phase === 'server-recheck';
     const customBranch = task.branch && !task.branch.startsWith(BRANCH_PREFIX) ? task.branch : undefined;
-    // review/recheck check out the PR branch detached and never touch origin/HEAD,
-    // so the fail-fast base resolution only runs where the default base is used.
-    const worktreePath = isServerQaPhase
+    // Server code reviews materialize the captured head; other QA modes stay off origin/HEAD.
+    // The fail-fast base resolution only runs where the default base is used.
+    const reviewWorktree = isServerCodeReviewPhase && opts.serverContent !== undefined
+      ? await worktree.createDetachedForReviewHead(workdir, taskId, {
+          patch: opts.serverContent,
+          baseSha: opts.serverBaseSha,
+          headSha: opts.serverHeadSha,
+          headTree: opts.serverHeadTree,
+        })
+      : undefined;
+    const worktreePath = reviewWorktree?.path ?? (isServerQaPhase
       ? await worktree.createDetachedAtBase(workdir, taskId)
       : phase === 'review' || phase === 'recheck'
         ? await worktree.createDetached(workdir, taskId, task.branch!)
@@ -3495,7 +3518,7 @@ export class AgentManager {
             taskId,
             agent.workdir ? undefined : await this.resolveAutoBaseRef(runner, workdir),
             customBranch,
-          );
+          ));
 
     await this.agentStore.update(agentId, (stateNow) => {
       if (!stateNow || stateNow.taskId !== taskId) return AGENT_STORE_NOOP;
@@ -3517,7 +3540,7 @@ export class AgentManager {
     try {
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
-      if (opts.serverContent !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
+      if (opts.serverContent !== undefined || opts.serverDiffstat !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
         payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, worktreePath, {
           phase,
           ...(task.phase ? { taskPhase: task.phase } : {}),
@@ -3525,6 +3548,8 @@ export class AgentManager {
           reviewRound: task.reviewRound,
           ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
           ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
+          ...(reviewWorktree?.mode === 'head' ? { forceContentFile: true } : {}),
+          ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
           ...(opts.serverInterdiff !== undefined ? { serverInterdiff: opts.serverInterdiff } : {}),
           ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
           ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
@@ -3540,7 +3565,11 @@ export class AgentManager {
         ...(promptSignalToken ? { signalToken: promptSignalToken } : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
-        ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
+        ...(reviewWorktree ? { serverReviewWorktree: reviewWorktree.mode } : {}),
+        ...(reviewWorktree?.fallbackReason ? { serverReviewFallbackReason: reviewWorktree.fallbackReason } : {}),
+        ...(opts.serverBaseSha !== undefined ? { serverBaseSha: opts.serverBaseSha } : {}),
+        ...(opts.serverHeadSha !== undefined ? { serverHeadSha: opts.serverHeadSha } : {}),
+        ...(opts.serverHeadTree !== undefined ? { serverHeadTree: opts.serverHeadTree } : {}),
         ...(opts.serverBatch ? { serverBatch: opts.serverBatch } : {}),
         ...payloadOpts,
       });
@@ -3599,7 +3628,7 @@ export class AgentManager {
       return false;
     }
 
-    if (opts.armBeforeInject && !(await opts.armBeforeInject())) {
+    if (opts.armBeforeInject && !(await opts.armBeforeInject({ serverReviewWorktree: reviewWorktree?.mode }))) {
       try { await worktree.removeWithBranch(workdir, worktreePath, customBranch); } catch {}
       return false;
     }
@@ -3922,7 +3951,7 @@ export class AgentManager {
         && !ensure.freshRuntime;
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
-      if (opts.serverContent !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
+      if (opts.serverContent !== undefined || opts.serverDiffstat !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
         payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, worktreePath, {
           phase,
           ...(task.phase ? { taskPhase: task.phase } : {}),
@@ -3930,6 +3959,7 @@ export class AgentManager {
           reviewRound: task.reviewRound,
           ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
           ...(opts.serverContent !== undefined ? { serverContent: opts.serverContent } : {}),
+          ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
           ...(opts.serverInterdiff !== undefined ? { serverInterdiff: opts.serverInterdiff } : {}),
           ...(opts.serverPriorFindings ? { serverPriorFindings: opts.serverPriorFindings } : {}),
           ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
@@ -3947,7 +3977,6 @@ export class AgentManager {
           : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
-        ...(opts.serverDiffstat !== undefined ? { serverDiffstat: opts.serverDiffstat } : {}),
         ...(opts.serverBatch ? { serverBatch: opts.serverBatch } : {}),
         ...(opts.serverAfterDone ? { serverAfterDone: opts.serverAfterDone } : {}),
         ...payloadOpts,
@@ -4005,7 +4034,7 @@ export class AgentManager {
       }
     }
 
-    if (opts.armBeforeInject && !(await opts.armBeforeInject())) {
+    if (opts.armBeforeInject && !(await opts.armBeforeInject({}))) {
       return false;
     }
 
@@ -6102,6 +6131,8 @@ export class AgentManager {
       content: string;
       interdiff?: string;
       diffstat?: string;
+      baseSha?: string;
+      headTree?: string;
       batch?: { index: number; total: number };
       priorFindingsJson?: string;
       priorResponseJson?: string;
@@ -6201,6 +6232,13 @@ export class AgentManager {
           return null;
         }
       }
+    } else {
+      const qaState = await this.agentStore.get(qaId);
+      if (qaState?.taskId !== taskId) {
+        await this.setupPhaseSignal(taskId, qaId, expectedKind, { skipSnapshot: true });
+        await this.emitIntervention(projectId, qaId, taskId, { phase: 'server-review-continuation-qa-not-bound', qaAgentId: qaId });
+        return null;
+      }
     }
 
     const roundPatch = opts.phase === 'spec'
@@ -6218,6 +6256,10 @@ export class AgentManager {
         ...(opts.batch
           ? { batchIndex: opts.batch.index, batchTotal: opts.batch.total }
           : { batchIndex: undefined, batchTotal: undefined }),
+        // Fresh dispatch: clear any stale mode until startSession materializes the worktree,
+        // so a crash in this window recovers conservatively (no read-file) rather than
+        // re-arming it for what might be a head-mode review.
+        ...(opts.continuation ? {} : { reviewWorktreeMode: undefined }),
         ...roundPatch,
       },
     );
@@ -6229,20 +6271,28 @@ export class AgentManager {
       return null;
     }
 
+    let dispatchedWorktreeMode: 'head' | 'base' | undefined;
     const sessionOpts = {
       bypassTaskStatusGate: true,
       signalToken: newToken,
       serverContent: opts.content,
       ...(opts.interdiff !== undefined ? { serverInterdiff: opts.interdiff } : {}),
       ...(opts.diffstat !== undefined ? { serverDiffstat: opts.diffstat } : {}),
+      ...(opts.baseSha !== undefined ? { serverBaseSha: opts.baseSha } : {}),
+      ...(opts.reviewHeadAnchorSha !== undefined ? { serverHeadSha: opts.reviewHeadAnchorSha } : {}),
+      ...(opts.headTree !== undefined ? { serverHeadTree: opts.headTree } : {}),
       ...(opts.batch ? { serverBatch: opts.batch } : {}),
       ...(opts.priorFindingsJson ? { serverPriorFindings: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { serverPriorResponse: opts.priorResponseJson } : {}),
       ...(opts.phase === 'spec' ? { currentSpecRound: newRound } : {}),
-      armBeforeInject: () => this.setupPhaseSignalWatcher(
-        taskId, qaId, expectedKind, newToken, false,
-        (req) => { void this.handleReadFileRequest(taskId, qaId, req); },
-      ),
+      armBeforeInject: (ctx: DispatchArmContext) => {
+        dispatchedWorktreeMode = ctx.serverReviewWorktree;
+        const allowReadFile = opts.phase === 'spec' || opts.continuation || ctx.serverReviewWorktree === 'base';
+        return this.setupPhaseSignalWatcher(
+          taskId, qaId, expectedKind, newToken, false,
+          allowReadFile ? (req) => { void this.handleReadFileRequest(taskId, qaId, req); } : undefined,
+        );
+      },
     };
     const rearmConsumedSignal = async () => {
       if (opts.continuation) {
@@ -6282,6 +6332,11 @@ export class AgentManager {
       return null;
     }
 
+    // Persist the materialized worktree mode so a restart can re-arm read-file for a base
+    // fallback review (whose prompt depends on it) but not for a head-mode one.
+    if (opts.phase !== 'spec' && !opts.continuation) {
+      await this.updateTask(taskId, { reviewWorktreeMode: dispatchedWorktreeMode }).catch(() => {});
+    }
     return await this.taskStore.get(taskId);
   }
 

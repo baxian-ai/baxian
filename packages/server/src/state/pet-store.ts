@@ -172,7 +172,9 @@ export class PetStore {
 }
 
 function byCreatedAt(a: PetMeta, b: PetMeta): number {
-  return a.createdAt.localeCompare(b.createdAt);
+  return a.createdAt.localeCompare(b.createdAt)
+    || a.displayName.localeCompare(b.displayName)
+    || a.id.localeCompare(b.id);
 }
 
 function noop(): void {}

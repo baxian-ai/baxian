@@ -2,10 +2,23 @@ import { randomBytes } from 'node:crypto';
 import type { CommandRunner } from './runner.js';
 import { shellQuote } from './runner.js';
 import { GIT_NET_ENV, execNetwork } from './net-exec.js';
-import { BRANCH_PREFIX, WORKTREE_DIR } from '../shared/index.js';
+import { BRANCH_PREFIX, REVIEW_INBOX_DIR, WORKTREE_DIR } from '../shared/index.js';
 
 function uniqueSuffix(): string {
   return randomBytes(8).toString('hex');
+}
+
+export interface ReviewHeadWorktreeOpts {
+  baseSha?: string;
+  headSha?: string;
+  headTree?: string;
+  patch: string;
+}
+
+export interface ReviewHeadWorktreeResult {
+  path: string;
+  mode: 'head' | 'base';
+  fallbackReason?: string;
 }
 
 export class WorktreeManager {
@@ -171,6 +184,165 @@ export class WorktreeManager {
     }
     await this.excludeBaxianDir(repoDir, worktreePath);
     return worktreePath;
+  }
+
+  async createDetachedForReviewHead(
+    repoDir: string,
+    taskId: string,
+    opts: ReviewHeadWorktreeOpts,
+  ): Promise<ReviewHeadWorktreeResult> {
+    if (!opts.baseSha || !opts.headSha || !opts.headTree) {
+      return {
+        path: await this.createDetachedAtBase(repoDir, taskId),
+        mode: 'base',
+        fallbackReason: 'missing-review-head-metadata',
+      };
+    }
+    const worktreePath = `${repoDir}/${WORKTREE_DIR}/${taskId}-review_${uniqueSuffix()}`;
+    const repo = shellQuote(repoDir);
+    const headRef = `${opts.headSha}^{commit}`;
+    const headProbe = await this.runner.exec(
+      `cd ${repo} && git cat-file -e ${shellQuote(headRef)}`,
+    );
+    if (headProbe.exitCode === 0) {
+      const added = await this.addDetachedRef(repoDir, worktreePath, opts.headSha, 'Failed to create review-head worktree');
+      if (!added) return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-head-checkout-failed', opts.baseSha);
+      try {
+        await this.excludeBaxianDir(repoDir, worktreePath);
+      } catch {
+        return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-head-exclude-failed', opts.baseSha);
+      }
+      if (await this.verifyTree(worktreePath, opts.headTree)) {
+        return { path: worktreePath, mode: 'head' };
+      }
+      return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-head-tree-mismatch', opts.baseSha);
+    }
+
+    const fetch = await execNetwork(
+      this.runner,
+      `cd ${repo} && ${GIT_NET_ENV} git fetch origin --quiet`,
+    );
+    const baseProbe = await this.runner.exec(
+      `cd ${repo} && git cat-file -e ${shellQuote(`${opts.baseSha}^{commit}`)}`,
+    );
+    if (baseProbe.exitCode !== 0) {
+      return this.createDetachedFallback(
+        repoDir,
+        taskId,
+        worktreePath,
+        fetch.exitCode !== 0 ? 'review-base-fetch-failed' : 'review-base-unreachable',
+        opts.baseSha,
+      );
+    }
+    const added = await this.addDetachedRef(repoDir, worktreePath, opts.baseSha, 'Failed to create review-base worktree');
+    if (!added) return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-base-checkout-failed', opts.baseSha);
+    try {
+      await this.excludeBaxianDir(repoDir, worktreePath);
+      const patchFile = `${worktreePath}/${REVIEW_INBOX_DIR}/.materialize-${uniqueSuffix()}.patch`;
+      await this.runner.writeFile(patchFile, opts.patch);
+      if (opts.patch.trim() !== '') {
+        const apply = await this.runner.exec(
+          `cd ${shellQuote(worktreePath)} && git apply --index --binary ${shellQuote(patchFile)}`,
+        );
+        if (apply.exitCode !== 0) {
+          await this.runner.exec(`cd ${shellQuote(worktreePath)} && git reset --hard HEAD && git clean -fd`).catch(() => {});
+          const threeWay = await this.runner.exec(
+            `cd ${shellQuote(worktreePath)} && git apply --index --3way --binary ${shellQuote(patchFile)}`,
+          );
+          if (threeWay.exitCode !== 0) {
+            return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-patch-apply-failed', opts.baseSha);
+          }
+        }
+      }
+      const staged = await this.runner.exec(`cd ${shellQuote(worktreePath)} && git diff --cached --quiet`);
+      if (staged.exitCode === 1) {
+        const commitIdentity = [
+          `GIT_AUTHOR_NAME=${shellQuote('baxian review')}`,
+          'GIT_AUTHOR_EMAIL=baxian-review@localhost',
+          `GIT_COMMITTER_NAME=${shellQuote('baxian review')}`,
+          'GIT_COMMITTER_EMAIL=baxian-review@localhost',
+        ].join(' ');
+        const commit = await this.runner.exec(
+          `cd ${shellQuote(worktreePath)} && ${commitIdentity} ` +
+            `git -c user.email=baxian-review@localhost -c user.name=${shellQuote('baxian review')} ` +
+            `commit --no-gpg-sign --no-verify -q -m ${shellQuote(`baxian review head ${opts.headSha}`)}`,
+        );
+        if (commit.exitCode !== 0) {
+          return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-patch-commit-failed', opts.baseSha);
+        }
+      } else if (staged.exitCode !== 0) {
+        return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-patch-index-check-failed', opts.baseSha);
+      }
+      await this.runner.exec(`rm -f ${shellQuote(patchFile)}`).catch(() => {});
+      if (await this.verifyTree(worktreePath, opts.headTree)) {
+        return { path: worktreePath, mode: 'head' };
+      }
+      return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-patch-tree-mismatch', opts.baseSha);
+    } catch {
+      return this.createDetachedFallback(repoDir, taskId, worktreePath, 'review-patch-materialize-failed', opts.baseSha);
+    }
+  }
+
+  private async addDetachedRef(
+    repoDir: string,
+    worktreePath: string,
+    ref: string,
+    errorPrefix: string,
+  ): Promise<boolean> {
+    const result = await this.runner.exec(
+      `cd ${shellQuote(repoDir)} && git worktree add --detach ${shellQuote(worktreePath)} ${shellQuote(ref)}`,
+    );
+    if (result.exitCode === 0) return true;
+    console.warn(`${errorPrefix}: ${result.stderr}`);
+    return false;
+  }
+
+  private async createDetachedFallback(
+    repoDir: string,
+    taskId: string,
+    failedWorktreePath: string,
+    fallbackReason: string,
+    baseSha?: string,
+  ): Promise<ReviewHeadWorktreeResult> {
+    await this.remove(repoDir, failedWorktreePath).catch(() => {});
+    if (baseSha) {
+      const atBase = await this.tryDetachAtBaseSha(repoDir, taskId, baseSha);
+      if (atBase) return { path: atBase, mode: 'base', fallbackReason };
+    }
+    return {
+      path: await this.createDetachedAtBase(repoDir, taskId),
+      mode: 'base',
+      fallbackReason,
+    };
+  }
+
+  private async tryDetachAtBaseSha(
+    repoDir: string,
+    taskId: string,
+    baseSha: string,
+  ): Promise<string | null> {
+    const reachable = await this.runner.exec(
+      `cd ${shellQuote(repoDir)} && git cat-file -e ${shellQuote(`${baseSha}^{commit}`)}`,
+    );
+    if (reachable.exitCode !== 0) return null;
+    const worktreePath = `${repoDir}/${WORKTREE_DIR}/${taskId}-review_${uniqueSuffix()}`;
+    if (!(await this.addDetachedRef(repoDir, worktreePath, baseSha, 'Failed to create review-base fallback worktree'))) {
+      return null;
+    }
+    try {
+      await this.excludeBaxianDir(repoDir, worktreePath);
+      return worktreePath;
+    } catch {
+      await this.remove(repoDir, worktreePath).catch(() => {});
+      return null;
+    }
+  }
+
+  private async verifyTree(worktreePath: string, expectedTree: string): Promise<boolean> {
+    const tree = await this.runner.exec(
+      `cd ${shellQuote(worktreePath)} && git rev-parse HEAD^{tree}`,
+    );
+    return tree.exitCode === 0 && tree.stdout.trim() === expectedTree;
   }
 
   // Fetch and worktree-add run as separate commands: the network half may be

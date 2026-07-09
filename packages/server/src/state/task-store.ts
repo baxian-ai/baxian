@@ -16,7 +16,7 @@ const TASK_FIELDS = [
   'agentId', 'qaAgentId', 'prNumber', 'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha',
   'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'specReviewRound', 'phase', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
-  'reviewMode', 'batchIndex', 'batchTotal', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
+  'reviewMode', 'batchIndex', 'batchTotal', 'reviewWorktreeMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
 ] as const;
 
 function sanitizeTask(state: unknown): TaskState {

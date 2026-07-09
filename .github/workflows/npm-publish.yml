@@ -16,6 +16,7 @@ permissions:
 
 concurrency:
   group: npm-publish-${{ github.ref }}
+  queue: max
   cancel-in-progress: false
 
 jobs:

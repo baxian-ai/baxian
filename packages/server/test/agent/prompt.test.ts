@@ -486,7 +486,7 @@ describe('server review mode prompt builders', () => {
     ['server-review injects diff + diffstat blocks, carries round + signal fields', 'server-review', QA_AGENT,
       { serverContent: 'diff --git a/a.ts b/a.ts\n+new line', serverDiffstat: ' a.ts | 1 +\n' },
       { contains: ['phase: server-review', 'round: 1', 'signal: code-reviewed', 'srvtok123456', 'diffstat:', ' a.ts | 1 +', 'diff:', 'diff --git a/a.ts'] }],
-    ['server-review labels batches with a batch field', 'server-review', QA_AGENT,
+    ['server-review labels legacy batches with a batch field', 'server-review', QA_AGENT,
       { serverContent: 'diff x', serverBatch: { index: 1, total: 3 } },
       { contains: ['batch: 2/3'] }],
     ['server-recheck carries prior-findings + prior-response blocks', 'server-recheck', QA_AGENT,
@@ -591,15 +591,24 @@ describe('server review mode prompt builders', () => {
       worktreePath: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
-      serverDiffstat: ' a.ts | 1 +',
+      serverReviewWorktree: 'head',
+      serverBaseSha: 'base123',
+      serverHeadSha: 'head123',
+      serverHeadTree: 'tree123',
+      serverDiffstatFile: { path: '.baxian/review/inbox/diffstat-round-4.txt', bytes: 18 * 1024 },
       serverContentFile: { path: '.baxian/review/inbox/diff-round-4.patch', bytes: 120 * 1024 },
       serverPriorFindingsFile: { path: '.baxian/review/inbox/prior-findings-round-4.json', bytes: 11 * 1024 },
       serverPriorResponse: '{"round":3,"responses":[]}',
     });
+    expect(prompt).toContain('review-worktree: head');
+    expect(prompt).toContain('base-sha: base123');
+    expect(prompt).toContain('head-sha: head123');
+    expect(prompt).toContain('head-tree: tree123');
     expect(prompt).toContain('diff-file: .baxian/review/inbox/diff-round-4.patch (120KB)');
+    expect(prompt).toContain('diffstat-file: .baxian/review/inbox/diffstat-round-4.txt (18KB)');
     expect(prompt).toContain('prior-findings-file: .baxian/review/inbox/prior-findings-round-4.json (11KB)');
     expect(prompt).toContain('prior-response:');
-    expect(prompt).toContain('diffstat:');
+    expect(prompt).not.toContain('\ndiffstat:\n');
     expect(prompt).not.toContain('\ndiff:\n');
   });
 
@@ -660,6 +669,21 @@ describe('server review mode prompt builders', () => {
       serverContent: 'diff',
       serverPriorResponse: '{"round":1,"responses":[]}',
       serverPriorResponseFile: { path: '.baxian/review/inbox/prior-response-round-1.json', bytes: 1 },
+    })).toThrow(/mutually exclusive/);
+  });
+
+  it('rejects diffstat passed in both inline and file form', async () => {
+    const registry = getRegistry();
+    expect(() => buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
+      phase: 'server-review',
+      agent: QA_AGENT,
+      worktreePath: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverContent: 'diff',
+      serverDiffstat: 'stat',
+      serverDiffstatFile: { path: '.baxian/review/inbox/diffstat-round-2.txt', bytes: 1 },
     })).toThrow(/mutually exclusive/);
   });
 

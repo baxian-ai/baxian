@@ -42,6 +42,19 @@ describe.each([
     expect(sprite?.bytes.toString()).toBe('px-alpha');
   });
 
+  it('keeps list order deterministic when createdAt ties', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-09T00:00:00.000Z'));
+    try {
+      await store.create(petInput('beta'));
+      await store.create(petInput('alpha'));
+    } finally {
+      vi.useRealTimers();
+    }
+    const list = await store.list();
+    expect(list.map((p) => p.displayName)).toEqual(['alpha', 'beta']);
+  });
+
   it('returns null for unknown / unsafe pet ids', async () => {
     expect(await store.getMeta('nope')).toBeNull();
     expect(await store.getMeta('../escape')).toBeNull();

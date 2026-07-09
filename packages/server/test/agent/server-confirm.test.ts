@@ -584,24 +584,6 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
     );
   });
 
-  it('dispatchServerReviewToQa continuation failure re-arms the reviewed watcher and keeps the QA bound', async () => {
-    const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
-    await taskStore.set(taskFixture({ status: 'review', signalToken: 'tok', batchIndex: 0, batchTotal: 2 }));
-    await bindToTask(agentStore, 'qa-1', NOW);
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(false);
-    const rearmSpy = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
-    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
-
-    const result = await manager.dispatchServerReviewToQa('task-1', {
-      phase: 'code', recheck: true, continuation: true, content: 'diff', batch: { index: 1, total: 2 },
-    });
-
-    expect(result).toBeNull();
-    expect(rearmSpy).toHaveBeenCalledWith('task-1', 'qa-1', 'code-reviewed', { skipSnapshot: true });
-    expect(releaseSpy).not.toHaveBeenCalled();
-    expect((await agentStore.get('qa-1'))?.taskId).toBe('task-1');
-  });
-
   it('dispatchServerFixToDev resume failure re-arms the QA reviewed watcher after rollback', async () => {
     const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
     await taskStore.set(taskFixture({ status: 'review', signalToken: 'tok' }));

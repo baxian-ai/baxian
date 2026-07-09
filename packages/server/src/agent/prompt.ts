@@ -47,9 +47,15 @@ export interface BuildPromptOpts {
   imagePaths?: string[];
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverDiffstat?: string;
+  serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
-  serverDiffstat?: string;
+  serverReviewWorktree?: 'head' | 'base';
+  serverReviewFallbackReason?: string;
+  serverBaseSha?: string;
+  serverHeadSha?: string;
+  serverHeadTree?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
@@ -76,9 +82,15 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     imagePaths: opts.imagePaths,
     serverContent: opts.serverContent,
     serverContentFile: opts.serverContentFile,
+    serverDiffstat: opts.serverDiffstat,
+    serverDiffstatFile: opts.serverDiffstatFile,
     serverInterdiff: opts.serverInterdiff,
     serverInterdiffFile: opts.serverInterdiffFile,
-    serverDiffstat: opts.serverDiffstat,
+    serverReviewWorktree: opts.serverReviewWorktree,
+    serverReviewFallbackReason: opts.serverReviewFallbackReason,
+    serverBaseSha: opts.serverBaseSha,
+    serverHeadSha: opts.serverHeadSha,
+    serverHeadTree: opts.serverHeadTree,
     serverBatch: opts.serverBatch,
     serverPriorFindings: opts.serverPriorFindings,
     serverPriorFindingsFile: opts.serverPriorFindingsFile,
@@ -112,9 +124,15 @@ interface TaskBodyArgs {
   imagePaths?: string[];
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverDiffstat?: string;
+  serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
-  serverDiffstat?: string;
+  serverReviewWorktree?: 'head' | 'base';
+  serverReviewFallbackReason?: string;
+  serverBaseSha?: string;
+  serverHeadSha?: string;
+  serverHeadTree?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
@@ -131,9 +149,15 @@ interface PhasePromptCtx {
   postApproveRedispatchCount?: number;
   serverContent?: string;
   serverContentFile?: ReviewContentFileRef;
+  serverDiffstat?: string;
+  serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
-  serverDiffstat?: string;
+  serverReviewWorktree?: 'head' | 'base';
+  serverReviewFallbackReason?: string;
+  serverBaseSha?: string;
+  serverHeadSha?: string;
+  serverHeadTree?: string;
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
@@ -236,14 +260,38 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
 };
 
 function buildServerReviewInstructions(
-  { task, serverContent, serverContentFile, serverInterdiff, serverInterdiffFile, serverDiffstat, serverBatch, serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile }: PhasePromptCtx,
+  {
+    task,
+    serverContent,
+    serverContentFile,
+    serverDiffstat,
+    serverDiffstatFile,
+    serverInterdiff,
+    serverInterdiffFile,
+    serverReviewWorktree,
+    serverReviewFallbackReason,
+    serverBaseSha,
+    serverHeadSha,
+    serverHeadTree,
+    serverBatch,
+    serverPriorFindings,
+    serverPriorFindingsFile,
+    serverPriorResponse,
+    serverPriorResponseFile,
+  }: PhasePromptCtx,
 ): PhasePrompt {
   const round = task.reviewRound || 1;
   return {
     fields: [
       `round: ${round}`,
+      ...(serverReviewWorktree ? [`review-worktree: ${serverReviewWorktree}`] : []),
+      ...(serverBaseSha ? [`base-sha: ${serverBaseSha}`] : []),
+      ...(serverHeadSha ? [`head-sha: ${serverHeadSha}`] : []),
+      ...(serverHeadTree ? [`head-tree: ${serverHeadTree}`] : []),
+      ...(serverReviewFallbackReason ? [`fallback-reason: ${serverReviewFallbackReason}`] : []),
       ...(serverBatch ? [`batch: ${serverBatch.index + 1}/${serverBatch.total}`] : []),
       ...(serverContentFile ? [fileField('diff-file', serverContentFile)] : []),
+      ...(serverDiffstatFile ? [fileField('diffstat-file', serverDiffstatFile)] : []),
       ...(serverInterdiffFile ? [fileField('interdiff-file', serverInterdiffFile)] : []),
       ...(serverPriorFindingsFile ? [fileField('prior-findings-file', serverPriorFindingsFile)] : []),
       ...(serverPriorResponseFile ? [fileField('prior-response-file', serverPriorResponseFile)] : []),
@@ -263,7 +311,8 @@ function buildTaskBody(args: TaskBodyArgs): string {
   const {
     task, phase, worktreePath, signalToken, postApproveRedispatchCount,
     currentSpecRound, imagePaths,
-    serverContent, serverContentFile, serverInterdiff, serverInterdiffFile, serverDiffstat, serverBatch,
+    serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
+    serverReviewWorktree, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   } = args;
@@ -277,6 +326,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
     throw new Error(`${phase} prompt requires signalToken`);
   }
   if ((serverContent !== undefined && serverContentFile)
+    || (serverDiffstat !== undefined && serverDiffstatFile)
     || (serverInterdiff !== undefined && serverInterdiffFile)
     || (serverPriorFindings !== undefined && serverPriorFindingsFile)
     || (serverPriorResponse !== undefined && serverPriorResponseFile)) {
@@ -289,7 +339,8 @@ function buildTaskBody(args: TaskBodyArgs): string {
   }
   const { fields, blocks } = phaseBuilder({
     task, signalToken, currentSpecRound, postApproveRedispatchCount,
-    serverContent, serverContentFile, serverInterdiff, serverInterdiffFile, serverDiffstat, serverBatch,
+    serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
+    serverReviewWorktree, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   });

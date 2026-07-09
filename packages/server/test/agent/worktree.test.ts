@@ -8,11 +8,17 @@ import { LocalRunner, shellQuote } from '../../src/agent/runner.js';
 import { GIT_NET_ENV, NET_EXEC_TIMEOUT_MS, __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
 import { REVIEW_INBOX_DIR } from '../../src/shared/index.js';
 
-function mockRunner(): CommandRunner & { exec: ReturnType<typeof vi.fn> } {
+function mockRunner(): CommandRunner & {
+  exec: ReturnType<typeof vi.fn>;
+  writeFile: ReturnType<typeof vi.fn>;
+  execWithStdin: ReturnType<typeof vi.fn>;
+} {
   return {
     exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockResolvedValue({
       stdout: '', stderr: '', exitCode: 0,
     }),
+    writeFile: vi.fn(async () => undefined),
+    execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
   };
 }
 
@@ -265,6 +271,157 @@ describe('WorktreeManager', () => {
         .rejects.toThrow(/Failed to create base-detached worktree/);
       const cmds = runner.exec.mock.calls.map(c => c[0] as string);
       expect(cmds.some(c => c.includes('git worktree add'))).toBe(false);
+    });
+  });
+
+  describe('createDetachedForReviewHead', () => {
+    it('checks out the anchored head directly when the commit object is present', async () => {
+      queueExec(exitOk, exitOk, exitOk, out('tree123\n'));
+
+      const result = await wt.createDetachedForReviewHead('/repo', 'task-001', {
+        baseSha: 'base123',
+        headSha: 'head123',
+        headTree: 'tree123',
+        patch: 'diff --git a/a b/a\n+1',
+      });
+
+      expect(result.mode).toBe('head');
+      expect(result.path).toMatch(/task-001-review_[0-9a-f]{16}$/);
+      expect(cmdAt(0)).toContain("git cat-file -e 'head123^{commit}'");
+      expect(cmdAt(1)).toContain("git worktree add --detach");
+      expect(cmdAt(1)).toContain("'head123'");
+      expect(cmdAt(3)).toContain('git rev-parse HEAD^{tree}');
+      expect(runner.writeFile).not.toHaveBeenCalled();
+    });
+
+    it('applies the captured patch at baseSha and commits a synthetic reviewed tree when the head object is absent', async () => {
+      queueExec(
+        fail('missing', 128),
+        exitOk,
+        exitOk,
+        exitOk,
+        exitOk,
+        exitOk,
+        fail('', 1),
+        exitOk,
+        exitOk,
+        out('tree123\n'),
+      );
+
+      const result = await wt.createDetachedForReviewHead('/repo', 'task-001', {
+        baseSha: 'base123',
+        headSha: 'head123',
+        headTree: 'tree123',
+        patch: 'diff --git a/a b/a\n+1',
+      });
+
+      expect(result.mode).toBe('head');
+      expect(cmdAt(1)).toContain(`${GIT_NET_ENV} git fetch origin --quiet`);
+      expect(cmdAt(2)).toContain("git cat-file -e 'base123^{commit}'");
+      expect(cmdAt(3)).toContain("'base123'");
+      expect(runner.writeFile).toHaveBeenCalledWith(
+        expect.stringContaining('/.baxian/review/inbox/.materialize-'),
+        'diff --git a/a b/a\n+1',
+      );
+      expect(cmdAt(5)).toContain('git apply --index --binary');
+      expect(cmdAt(7)).toContain('GIT_AUTHOR_NAME=');
+      expect(cmdAt(7)).toContain('GIT_COMMITTER_EMAIL=baxian-review@localhost');
+      expect(cmdAt(7)).toContain('git -c user.email=baxian-review@localhost');
+      expect(cmdAt(7)).toContain('commit --no-gpg-sign --no-verify');
+      expect(cmdAt(9)).toContain('git rev-parse HEAD^{tree}');
+    });
+
+    it('continues from a locally cached baseSha when origin fetch fails', async () => {
+      queueExec(
+        fail('missing', 128),  // head object absent
+        fail('offline', 128),  // fetch unavailable
+        exitOk,                // base object already local
+        exitOk,                // worktree add at baseSha
+        exitOk,                // exclude .baxian
+        exitOk,                // patch applies
+        fail('', 1),           // staged changes exist
+        exitOk,                // synthetic commit
+        exitOk,                // remove materialization patch
+        out('tree123\n'),      // tree proof
+      );
+
+      const result = await wt.createDetachedForReviewHead('/repo', 'task-001', {
+        baseSha: 'base123',
+        headSha: 'head123',
+        headTree: 'tree123',
+        patch: 'diff --git a/a b/a\n+1',
+      });
+
+      expect(result.mode).toBe('head');
+      expect(cmdAt(1)).toContain(`${GIT_NET_ENV} git fetch origin --quiet`);
+      expect(cmdAt(2)).toContain("git cat-file -e 'base123^{commit}'");
+      expect(cmdAt(3)).toContain("'base123'");
+      expect(runner.exec.mock.calls.some(c => (c[0] as string).includes('symbolic-ref'))).toBe(false);
+    });
+
+    it('falls back to a base worktree at the captured baseSha when patch application cannot materialize the reviewed tree', async () => {
+      queueExec(
+        fail('missing', 128),  // head object absent
+        exitOk,                // fetch origin
+        exitOk,                // base object present
+        exitOk,                // worktree add at baseSha
+        exitOk,                // exclude .baxian
+        fail('patch does not apply'),
+        exitOk,                // reset --hard && clean
+        fail('conflict'),      // --3way also fails
+        exitOk,                // remove failed worktree
+        exitOk,                // fallback: base object still reachable
+        exitOk,                // fallback: worktree add at baseSha
+        exitOk,                // fallback: exclude .baxian
+      );
+
+      const result = await wt.createDetachedForReviewHead('/repo', 'task-001', {
+        baseSha: 'base123',
+        headSha: 'head123',
+        headTree: 'tree123',
+        patch: 'diff --git a/a b/a\n+1',
+      });
+
+      expect(result.mode).toBe('base');
+      expect(result.fallbackReason).toBe('review-patch-apply-failed');
+      expect(runner.exec.mock.calls.some(c => (c[0] as string).includes('git apply --index --3way --binary'))).toBe(true);
+      expect(runner.exec.mock.calls.some(c => (c[0] as string).includes('git worktree remove'))).toBe(true);
+      // fallback rebuilds at the captured baseSha, not the (possibly-advanced) origin/HEAD
+      expect(runner.exec.mock.calls.some(c => (c[0] as string).includes('symbolic-ref'))).toBe(false);
+      expect(
+        runner.exec.mock.calls.filter(
+          c => (c[0] as string).includes('git worktree add --detach') && (c[0] as string).includes("'base123'"),
+        ).length,
+      ).toBe(2);
+    });
+
+    it('falls back to origin/HEAD only when the captured baseSha is no longer reachable', async () => {
+      queueExec(
+        fail('missing', 128),  // head object absent
+        exitOk,                // fetch origin
+        exitOk,                // base object present initially
+        exitOk,                // worktree add at baseSha
+        exitOk,                // exclude .baxian
+        fail('patch does not apply'),
+        exitOk,                // reset --hard && clean
+        fail('conflict'),      // --3way also fails
+        exitOk,                // remove failed worktree
+        fail('gone', 128),     // fallback: base object no longer reachable
+        exitOk,                // createDetachedAtBase: fetch
+        exitOk,                // createDetachedAtBase: worktree add at origin/HEAD
+        exitOk,                // createDetachedAtBase: exclude .baxian
+      );
+
+      const result = await wt.createDetachedForReviewHead('/repo', 'task-001', {
+        baseSha: 'base123',
+        headSha: 'head123',
+        headTree: 'tree123',
+        patch: 'diff --git a/a b/a\n+1',
+      });
+
+      expect(result.mode).toBe('base');
+      expect(result.fallbackReason).toBe('review-patch-apply-failed');
+      expect(runner.exec.mock.calls.some(c => (c[0] as string).includes('git symbolic-ref --short refs/remotes/origin/HEAD'))).toBe(true);
     });
   });
 

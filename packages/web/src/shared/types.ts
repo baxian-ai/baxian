@@ -230,6 +230,7 @@ export interface ReviewRound {
   diffstat?: string;
   baseSha?: string;
   headSha?: string;
+  headTree?: string;
   findings?: ReviewFindings;
   response?: ReviewResponse;
   batchFindings?: ReviewFindings[];
