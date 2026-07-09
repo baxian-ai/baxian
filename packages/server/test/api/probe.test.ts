@@ -141,7 +141,7 @@ describe('POST /api/agents/probe', () => {
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body);
       expect(body.ssh.ok).toBe(true);
-      expect(remoteCalls).toBe(3);
+      expect(remoteCalls).toBe(5);
       expect(body.tmux.ok).toBe(true);
       expect(body.runtimes['claude-code'].ok).toBe(true);
       expect(body.runtimes['codex'].ok).toBe(false);

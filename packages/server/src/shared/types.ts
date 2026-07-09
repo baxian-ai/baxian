@@ -1,4 +1,4 @@
-export type AgentRuntime = 'claude-code' | 'codex';
+export type AgentRuntime = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
 export type AgentRole = 'dev' | 'qa';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;

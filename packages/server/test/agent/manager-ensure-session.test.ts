@@ -831,7 +831,7 @@ describe('AgentManager.ensureSession', () => {
       let exited = false;
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('send-keys')) {
-          if (cmd.includes("'exit'")) exited = true;
+          if (cmd.includes("'/exit'")) exited = true;
           if (cmd.includes('permission-mode')) exited = false;
           return { stdout: '', stderr: '', exitCode: 0 };
         }
@@ -843,7 +843,7 @@ describe('AgentManager.ensureSession', () => {
 
       await manager.restartReplOnly('dev-1');
 
-      expect(execCmds().some(c => c.includes('send-keys') && c.includes("'exit'"))).toBe(true);
+      expect(execCmds().some(c => c.includes('send-keys') && c.includes("'/exit'"))).toBe(true);
       expect(execCmds().some(c => c.includes('permission-mode'))).toBe(true);
       expect((await manager['agentStore'].get('dev-1'))?.paneId).toBe('%0');
     });

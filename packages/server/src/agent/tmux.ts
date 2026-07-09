@@ -7,7 +7,7 @@ import { MAX_PROMPT_BYTES } from './prompt.js';
 const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<ExecResult> =>
   runner['exec'](cmd, opts);
 
-export type AgentRuntimeKind = 'claude-code' | 'codex';
+export type AgentRuntimeKind = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
 
 export interface PaneInfo {
   paneId: string;
@@ -42,19 +42,31 @@ export interface WaitSubmitAckOpts extends WaitOpts {
   baselineTitle?: string;
 }
 
+// A pattern that can never match — used where a runtime has no dialog of a given kind.
+const NEVER_RE = /[^\s\S]/;
+
 const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /^(?:claude(?:\.exe)?|\d+\.\d+\.\d+)$/,
   codex: /^(?:codex|node)$/,
+  // qodercli's npm bin reports a versioned process name (e.g. qodercli-1.0.40); the standalone binary may not.
+  opencode: /^opencode$/,
+  qodercli: /^qodercli(?:-[\d.]+)?$/,
 };
 
 const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /⏵⏵ bypass permissions on/,
   codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n\s*)?$/,
+  // opencode/qodercli have no idle-only anchor line (their footers persist while working);
+  // readiness for them is decided by the idle-composer + not-busy path in hasRuntimeReadyView.
+  opencode: NEVER_RE,
+  qodercli: NEVER_RE,
 };
 
 const TRUST_DIALOGS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /Quick safety check[\s\S]{0,500}Yes, I trust this folder/,
   codex: /Do you trust the contents[\s\S]{0,500}Yes, continue/,
+  opencode: NEVER_RE,
+  qodercli: /Do you trust the files in this folder[\s\S]{0,500}Trust folder/,
 };
 
 const STARTUP_DIALOG_SIGNALS: readonly RegExp[] = [
@@ -67,6 +79,9 @@ const RUNTIME_STARTUP_DIALOG_SIGNALS: Partial<Record<AgentRuntimeKind, readonly 
   codex: [
     /Welcome to Codex[\s\S]{0,300}?Sign in with ChatGPT[\s\S]{0,300}?Provide your own API key/i,
     /Update ran successfully[\s\S]{0,200}?Please restart Codex/i,
+  ],
+  qodercli: [
+    /Welcome to Qoder CLI[\s\S]{0,200}?Sign in to continue/i,
   ],
 };
 
@@ -136,6 +151,26 @@ const CODEX_IDLE_COMPOSER_LINE_RE = /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:\s+git:\([
 const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
 const CODEX_WORKING_TAIL_LINES = 8;
 const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t]*[❯>][ \t]*$/m;
+// opencode working: progress bar `■■■⬝⬝⬝` + interrupt hint. Matches the herdr-listed
+// "esc to interrupt", the post-TUI-rewrite "esc interrupt" (no "to"), and the
+// "ctrl+c to interrupt" footer that can be the only busy evidence if the bar wraps out of tail.
+const OPENCODE_BUSY_RE = /(?:esc|ctrl\+c)\s+(?:to\s+)?interrupt|(?:■|⬝){4,}/i;
+const OPENCODE_IDLE_COMPOSER_RE = /ctrl\+p\s+commands/;
+// qodercli working: "(esc to cancel," suffix + braille "Thinking…" spinner line.
+const QODER_BUSY_RE = /\(esc to cancel,|^[ \t]*[⠀-⣿][ \t]+.*\p{L}/mu;
+// Only the composer placeholder marks idle. "? for shortcuts" is dropped on purpose: it is also
+// an OVERLAY_FOOTER_SIGNAL (help/shortcuts overlay), so using it as an idle cue would read an
+// overlay pane as ready and paste the prompt into the overlay instead of the composer.
+const QODER_IDLE_COMPOSER_RE = /Type your message or @/;
+// opencode/qodercli keep their idle footer visible while a permission prompt is up, so the
+// footer-based idle-composer check alone would read a pending pane as ready. Block the ready
+// view on the prompt text. Kept in sync with each manifest's pending rule (opencode.json
+// permission_required, qodercli.json confirmation_blocker) so ready gate and detection never
+// diverge. Misfire only degrades to a dispatch timeout (fail-closed), never an inject over a live prompt.
+const RUNTIME_PENDING_RES: Partial<Record<AgentRuntimeKind, RegExp>> = {
+  opencode: /△\s*Permission required|Permission required|Allow once|Allow always/i,
+  qodercli: /Permission Required|Allow this command to run|Do you want to allow|waiting for user confirmation|awaiting approval|allow once or always\?|asking user|enter your response|review your answers:|shell awaiting input/i,
+};
 
 export function hasActiveSpinner(stripped: string): boolean {
   for (const m of stripped.matchAll(SPINNER_LINE_RE)) {
@@ -219,6 +254,12 @@ export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRun
     const t = tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES);
     return CODEX_IDLE_COMPOSER_LINE_RE.test(t) || CODEX_EMPTY_COMPOSER_RE.test(t);
   }
+  if (runtime === 'opencode') {
+    return OPENCODE_IDLE_COMPOSER_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  }
+  if (runtime === 'qodercli') {
+    return QODER_IDLE_COMPOSER_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  }
   return false;
 }
 
@@ -226,7 +267,9 @@ function screenBlocksReadyView(stripped: string, runtime: AgentRuntimeKind): boo
   return runtimeBusyCheck(stripped, runtime)
     || detectRuntimeMenu(stripped)
     || detectStartupDialog(stripped, runtime)
-    || TRUST_DIALOGS[runtime].test(stripped);
+    || TRUST_DIALOGS[runtime].test(stripped)
+    || (RUNTIME_PENDING_RES[runtime]?.test(stripped) ?? false)
+    || detectRuntimeOverlay(stripped);
 }
 
 // manifest blocker 规则（bash/generic permission、live_blocked_form、dynamic workflow、legacy）的文本指纹。
@@ -313,15 +356,18 @@ export function hasRuntimeReadyView(stripped: string, runtime: AgentRuntimeKind)
 }
 
 export function runtimeBusyCheck(stripped: string, runtime: AgentRuntimeKind): boolean {
-  return runtime === 'codex'
-    ? detectActiveRegionBusy(stripped, runtime)
-    : detectReplActiveBusy(stripped);
+  if (runtime === 'codex') return detectActiveRegionBusy(stripped, runtime);
+  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  return detectReplActiveBusy(stripped);
 }
 
 function submitAckBusy(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (runtime === 'codex') {
     return hasActiveSpinner(stripped) || escToInterruptActiveInTail(stripped, runtime);
   }
+  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
   return detectReplActiveBusy(stripped);
 }
 
@@ -707,7 +753,11 @@ export class TmuxManager {
         !detectRuntimeMenu(bottomLine)
         && !detectStartupDialog(bottomLine, runtime)
         && !TRUST_DIALOGS[runtime].test(visible)
-        && !detectRuntimeCompletionPopup(visible, runtime);
+        && !detectRuntimeCompletionPopup(visible, runtime)
+        // opencode/qodercli can open a permission/confirmation prompt right after submit,
+        // before any busy spinner. Resending Enter there would hit the default option
+        // (e.g. Allow once), so treat a pending prompt as "already left the composer".
+        && !(RUNTIME_PENDING_RES[runtime]?.test(visible) ?? false);
       if (
         opts.resend
         && enterWouldSubmit

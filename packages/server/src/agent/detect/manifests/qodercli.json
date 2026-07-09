@@ -1,0 +1,49 @@
+{
+  "id": "qodercli",
+  "rules": [
+    {
+      "id": "confirmation_blocker",
+      "state": "pending",
+      "priority": 300,
+      "region": "whole",
+      "visibleBlocker": true,
+      "any": [
+        { "contains": ["Permission Required"] },
+        { "contains": ["Allow this command to run"] },
+        { "contains": ["Do you want to allow"] },
+        { "contains": ["waiting for user confirmation"] },
+        { "contains": ["awaiting approval"] },
+        { "contains": ["permission required"] },
+        { "contains": ["allow once or always?"] },
+        { "contains": ["asking user"] },
+        { "contains": ["enter your response"] },
+        { "contains": ["review your answers:"] },
+        { "contains": ["shell awaiting input"] }
+      ]
+    },
+    {
+      "id": "cancel_hint_working",
+      "state": "working",
+      "priority": 100,
+      "region": "whole",
+      "visibleWorking": true,
+      "contains": ["(esc to cancel,"]
+    },
+    {
+      "id": "spinner_working",
+      "state": "working",
+      "priority": 90,
+      "region": "whole",
+      "visibleWorking": true,
+      "lineRegex": ["^\\s*[\\u2800-\\u28FF]\\s+.*[A-Za-z]"]
+    },
+    {
+      "id": "idle_composer",
+      "state": "idle",
+      "priority": 80,
+      "region": "tail(6)",
+      "visibleIdle": true,
+      "contains": ["Type your message or @"]
+    }
+  ]
+}

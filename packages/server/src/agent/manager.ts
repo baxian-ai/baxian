@@ -138,11 +138,22 @@ export function buildLaunchCommand(agent: AgentConfig): string {
     case 'codex':
       segments.push('codex --dangerously-bypass-approvals-and-sandbox');
       break;
+    case 'opencode':
+      // opencode materializes skills into .agents/skills (shared with codex; see skillSubdirFor).
+      // Its .agents/.claude compatibility scans can't both be disabled by env, so also turn off
+      // the .claude/skills scan — that closes the last collision source: a claude-code agent's
+      // .claude/skills/baxian-* in a shared base repo.
+      segments.push('env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode --auto');
+      break;
+    case 'qodercli':
+      segments.push('qodercli --dangerously-skip-permissions');
+      break;
   }
   if (agent.model) {
     segments.push(`--model ${shellQuote(agent.model)}`);
   }
-  if (agent.addDirs && agent.addDirs.length > 0) {
+  // opencode has no --add-dir; extra roots go through its permission model instead (validator rejects the pairing).
+  if (agent.addDirs && agent.addDirs.length > 0 && agent.runtime !== 'opencode') {
     for (const dir of agent.addDirs) {
       segments.push(`--add-dir ${shellQuote(dir)}`);
     }
@@ -150,8 +161,34 @@ export function buildLaunchCommand(agent: AgentConfig): string {
   return segments.join(' ');
 }
 
-function agentRuntimeKindFor(agent: AgentConfig): 'claude-code' | 'codex' {
+function agentRuntimeKindFor(agent: AgentConfig): AgentConfig['runtime'] {
   return agent.runtime;
+}
+
+// restart-repl drives the REPL back to a shell before relaunch. Each runtime exits
+// via its own slash command (a bare "exit" would be sent to the model as chat text).
+const REPL_EXIT_COMMAND: Record<AgentConfig['runtime'], string> = {
+  'claude-code': '/exit',
+  codex: '/quit',
+  opencode: '/exit',
+  qodercli: '/quit',
+};
+
+export function skillSubdirFor(runtime: AgentConfig['runtime']): string {
+  switch (runtime) {
+    case 'codex':
+    case 'opencode':
+      // opencode has no way to disable its .agents/skills compatibility scan (only .claude via
+      // env), and when it shares a base repo with a codex agent it loads the codex copy of a
+      // same-named baxian-* skill (verified: the .agents copy wins over .opencode). So opencode
+      // materializes into .agents/skills too — both runtimes share one runtime-agnostic copy
+      // (serialized by the same skill-dir lock) instead of colliding on duplicate names.
+      return '.agents/skills';
+    case 'qodercli':
+      return '.qoder/skills';
+    default:
+      return '.claude/skills';
+  }
 }
 
 export interface AgentManagerDeps {
@@ -560,9 +597,14 @@ export class AgentManager {
     workdir: string,
   ): Promise<void> {
     if (this.skillRegistry.names().length === 0) return;
-    const subdir = agent.runtime === 'codex' ? '.agents/skills' : '.claude/skills';
+    const subdir = skillSubdirFor(agent.runtime);
     const destRoot = `${workdir}/${subdir}`;
     await this.excludeInjectedSkills(runner, workdir, subdir);
+    // opencode's skills are model-invoked, not slash commands; the dispatched /<skill> sigil
+    // reaches the model as message text and it loads the skill from .opencode/skills. We do NOT
+    // wrap skills as .opencode/commands: opencode expands $ARGUMENTS in a command template and
+    // would execute a `!`cmd`` / inline a @path embedded in an untrusted task title/description
+    // before the skill runs. Message-body payloads are not expanded, so this path is injection-safe.
     await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
       await this.ensureSkillDirSafe(runner, workdir, subdir);
       await this.skillRegistry.materialize(
@@ -575,7 +617,7 @@ export class AgentManager {
   private skillDirChain = new Map<string, Promise<unknown>>();
   private skillDirLockKey(agent: AgentConfig, workdir: string): string {
     const host = hostGroupKey(agent.mode, resolveAgentHost(this.config.host, agent.host));
-    const subdir = agent.runtime === 'codex' ? '.agents/skills' : '.claude/skills';
+    const subdir = skillSubdirFor(agent.runtime);
     const dir = workdir.replace(/\/+$/, '');
     return `${host}:${dir}:${subdir}`;
   }
@@ -2162,10 +2204,10 @@ export class AgentManager {
     const paneId = await tmux.getSinglePaneId(agentId);
     await tmux.sendKeysToPane(paneId, 'C-c');
     const cmd = await this.pollPaneCommandStable(tmux, paneId, { timeoutMs: 2_000 });
-    const RUNTIME = /^(?:claude|codex|node|\d+\.\d+\.\d+)$/;
+    const RUNTIME = /^(?:claude|codex|node|opencode|qodercli(?:-[\d.]+)?|\d+\.\d+\.\d+)$/;
     const SHELL = /^(?:zsh|bash|sh|fish)$/;
     if (RUNTIME.test(cmd)) {
-      await tmux.sendKeysToPane(paneId, 'exit', 'Enter');
+      await tmux.sendKeysToPane(paneId, REPL_EXIT_COMMAND[cfg.runtime], 'Enter');
       await this.pollPaneCommandStable(tmux, paneId, { timeoutMs: 2_000, expectShell: true });
     } else if (!SHELL.test(cmd)) {
       throw new Error(`restart-repl precondition failed: unexpected pane state "${cmd}"`);

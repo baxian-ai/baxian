@@ -1,6 +1,7 @@
 import type {
   AgentSnapshot,
   AgentConfig,
+  AgentRuntime,
   TaskState,
   ProjectConfig,
   BaxianConfig,
@@ -159,10 +160,7 @@ interface ProbeStatus {
 export interface ProbeResponse {
   ssh?: { ok: boolean; message: string };
   tmux: ProbeStatus;
-  runtimes: {
-    'claude-code': ProbeStatus;
-    'codex': ProbeStatus;
-  };
+  runtimes: Record<AgentRuntime, ProbeStatus>;
 }
 
 export interface TmuxInstallResponse {

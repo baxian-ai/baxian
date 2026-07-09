@@ -144,6 +144,14 @@ describe('buildPromptInline', () => {
     expect(reviewPrompt.startsWith('$baxian-pr-review\n')).toBe(true);
   });
 
+  it('opencode and qodercli runtimes use the / sigil like claude-code', async () => {
+    await seedAndScan();
+    const oc = build({ agent: { ...DEV_AGENT, runtime: 'opencode' } });
+    expect(oc.startsWith('/baxian-task-check\n')).toBe(true);
+    const qo = build({ agent: { ...DEV_AGENT, runtime: 'qodercli' } });
+    expect(qo.startsWith('/baxian-task-check\n')).toBe(true);
+  });
+
   it('imagePaths → appends a structured images: list of every absolute path', async () => {
     await seedAndScan();
     const prompt = build({

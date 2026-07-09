@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { AgentMode, AgentRuntime, AgentRole, ProjectConfig, AgentConfig, HostConfig } from '../shared/index.js';
+import { AGENT_RUNTIME_LAUNCH_FLAG } from '../shared/index.js';
 import { Modal } from './modal.tsx';
 import { inputCls, labelCls, fieldErrCls, helpCls, radioCls } from './form-styles.ts';
 import { api, type ProbeResponse, type AddAgentBody } from '../api.ts';
@@ -173,9 +174,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
   const idValid = ID_PATTERN.test(form.id) && !allAgentIds.has(form.id);
   const hostValid = form.mode === 'local' || (form.mode === 'remote' && form.host !== '');
-  const runtimeValid = form.runtime !== '' && (
-    form.runtime === 'claude-code' ? !!probe?.runtimes['claude-code'].ok : !!probe?.runtimes['codex'].ok
-  );
+  const runtimeValid = form.runtime !== '' && !!probe?.runtimes[form.runtime]?.ok;
   const tmuxValid = !!probe?.tmux.ok;
   const sshValid = form.mode === 'local' || !!probe?.ssh?.ok;
   const pairValid = form.role === 'dev' || (form.role === 'qa' && form.pairWith !== '');
@@ -224,6 +223,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     if (probeLoading) return <span className="ml-2 text-xs text-og-400">{t.createAgent.probingLabel}</span>;
     if (!probe) return <span className="ml-2 text-xs text-og-400">?</span>;
     const status = probe.runtimes[rt];
+    if (!status) return <span className="ml-2 text-xs text-og-400">?</span>;
     if (status.ok) return <span className="ml-2 text-xs text-probe-ok">✓ {status.path ?? ''}</span>;
     return <span className="ml-2 text-xs text-accent" title={status.message}>⨯ {status.message}</span>;
   };
@@ -383,16 +383,30 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
           <label className="flex items-center gap-2">
             <input type="radio" name="runtime" checked={form.runtime === 'claude-code'} className={radioCls}
               onChange={() => setForm({ ...form, runtime: 'claude-code' })}
-              disabled={submitting || (probe ? !probe.runtimes['claude-code'].ok : false)} />
+              disabled={submitting || (probe ? !probe.runtimes['claude-code']?.ok : false)} />
             <span className="text-sm text-og-800">Claude Code</span>
             <RuntimeStatus rt="claude-code" />
           </label>
           <label className="mt-1 flex items-center gap-2">
             <input type="radio" name="runtime" checked={form.runtime === 'codex'} className={radioCls}
               onChange={() => setForm({ ...form, runtime: 'codex' })}
-              disabled={submitting || (probe ? !probe.runtimes['codex'].ok : false)} />
+              disabled={submitting || (probe ? !probe.runtimes['codex']?.ok : false)} />
             <span className="text-sm text-og-800">Codex</span>
             <RuntimeStatus rt="codex" />
+          </label>
+          <label className="mt-1 flex items-center gap-2">
+            <input type="radio" name="runtime" checked={form.runtime === 'opencode'} className={radioCls}
+              onChange={() => setForm({ ...form, runtime: 'opencode' })}
+              disabled={submitting || (probe ? !probe.runtimes['opencode']?.ok : false)} />
+            <span className="text-sm text-og-800">OpenCode</span>
+            <RuntimeStatus rt="opencode" />
+          </label>
+          <label className="mt-1 flex items-center gap-2">
+            <input type="radio" name="runtime" checked={form.runtime === 'qodercli'} className={radioCls}
+              onChange={() => setForm({ ...form, runtime: 'qodercli' })}
+              disabled={submitting || (probe ? !probe.runtimes['qodercli']?.ok : false)} />
+            <span className="text-sm text-og-800">Qoder CLI</span>
+            <RuntimeStatus rt="qodercli" />
           </label>
           <div className="mt-2"><TmuxStatus /></div>
           <div><SshStatus /></div>
@@ -452,7 +466,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             <div className="text-sm text-og-800">
               <div className="font-medium">{t.createAgent.yoloTitle}</div>
               <div className="mt-1 text-xs text-accent">
-                {t.createAgent.yoloBodyLead}<code>--permission-mode bypassPermissions</code>{t.createAgent.yoloBodyMid}<code>--dangerously-bypass-approvals-and-sandbox</code>{t.createAgent.yoloBodyTrail}
+                {t.createAgent.yoloBodyLead}<code>{AGENT_RUNTIME_LAUNCH_FLAG[form.runtime || 'claude-code']}</code>{t.createAgent.yoloBodyTrail}
               </div>
             </div>
           </label>

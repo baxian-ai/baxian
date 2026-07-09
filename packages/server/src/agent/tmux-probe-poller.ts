@@ -111,6 +111,8 @@ function loadManifests(): Map<AgentRuntimeKind, AgentManifest> {
   return new Map<AgentRuntimeKind, AgentManifest>([
     ['claude-code', JSON.parse(readFileSync(join(dir, 'claude-code.json'), 'utf-8')) as AgentManifest],
     ['codex', JSON.parse(readFileSync(join(dir, 'codex.json'), 'utf-8')) as AgentManifest],
+    ['opencode', JSON.parse(readFileSync(join(dir, 'opencode.json'), 'utf-8')) as AgentManifest],
+    ['qodercli', JSON.parse(readFileSync(join(dir, 'qodercli.json'), 'utf-8')) as AgentManifest],
   ]);
 }
 

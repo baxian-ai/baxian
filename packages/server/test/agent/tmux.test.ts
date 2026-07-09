@@ -681,6 +681,34 @@ describe('TmuxManager', () => {
       expect(resend).toHaveBeenCalled();
     });
 
+    it('does NOT re-send Enter when opencode opens a permission prompt (Enter would hit Allow once)', async () => {
+      const baseline = buildBaseline('┃  Build auto · Zen\n', 0);
+      runner.exec.mockResolvedValue({
+        stdout: composeSnapStdout('△ Permission required\n  Allow once   Reject\n  ctrl+p commands\n', 0),
+        stderr: '',
+        exitCode: 0,
+      });
+      const resend = vi.fn(async () => undefined);
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'opencode', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).rejects.toThrow(/runtime ack timeout/);
+      expect(resend).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-send Enter when qodercli opens a confirmation prompt', async () => {
+      const baseline = buildBaseline('*   Type your message or @path\n', 0);
+      runner.exec.mockResolvedValue({
+        stdout: composeSnapStdout('Permission Required\nAllow this command to run?\n  Type your message or @path\n', 0),
+        stderr: '',
+        exitCode: 0,
+      });
+      const resend = vi.fn(async () => undefined);
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'qodercli', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).rejects.toThrow(/runtime ack timeout/);
+      expect(resend).not.toHaveBeenCalled();
+    });
+
     it('re-sends Enter when the prompt body quotes a menu footer but the composer is held below it', async () => {
       const held = '› $baxian-task\n  describe a menu: Enter to select · Esc to cancel\n'
         + Array.from({ length: 20 }, (_, i) => `  detail line ${i}`).join('\n')
@@ -1526,6 +1554,69 @@ describe('hasRuntimeReadyView', () => {
   it('does not treat the backtrack hint as ready for claude-code', () => {
     expect(hasRuntimeReadyView('  esc again to edit previous message\n', 'claude-code')).toBe(false);
   });
+
+  it('opencode: idle composer footer without busy signals is ready', () => {
+    expect(hasRuntimeReadyView('┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode')).toBe(true);
+  });
+
+  it('opencode: a working screen (progress bar + esc interrupt) is not ready', () => {
+    expect(hasRuntimeReadyView('   ■■■⬝⬝⬝  esc interrupt          ctrl+p commands\n', 'opencode')).toBe(false);
+  });
+
+  it('qodercli: idle composer placeholder is ready', () => {
+    expect(hasRuntimeReadyView('*   Type your message or @path/to/file\n', 'qodercli')).toBe(true);
+  });
+
+  it('qodercli: a thinking spinner screen is not ready', () => {
+    expect(hasRuntimeReadyView('⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli')).toBe(false);
+  });
+
+  it('opencode: a permission prompt that keeps the idle footer is not ready', () => {
+    expect(hasRuntimeReadyView('△ Permission required\n  Allow once   Reject\n  ctrl+p commands\n', 'opencode')).toBe(false);
+  });
+
+  // every qodercli.json confirmation_blocker phrase must also block the ready gate, even
+  // when the idle composer placeholder is still on screen.
+  it.each([
+    'Permission Required',
+    'Allow this command to run?',
+    'Do you want to allow this read?',
+    'waiting for user confirmation',
+    'awaiting approval',
+    'allow once or always?',
+    'asking user',
+    'enter your response',
+    'review your answers:',
+    'shell awaiting input',
+  ])('qodercli: pending prompt %j keeping the composer is not ready', (prompt) => {
+    expect(hasRuntimeReadyView(`${prompt}\n  Type your message or @path\n`, 'qodercli')).toBe(false);
+  });
+
+  it('qodercli: a shortcuts/help overlay is not ready (footer alone is not an idle cue)', () => {
+    expect(hasRuntimeReadyView('  keyboard shortcuts\n  ? for shortcuts\n', 'qodercli')).toBe(false);
+  });
+});
+
+describe('runtimeBusyCheck (opencode/qodercli screen-only busy)', () => {
+  it('opencode: esc interrupt hint is busy', () => {
+    expect(runtimeBusyCheck('   ■■■⬝⬝⬝  esc interrupt\n', 'opencode')).toBe(true);
+  });
+
+  it('opencode: idle composer is not busy', () => {
+    expect(runtimeBusyCheck('┃  Build auto · Zen\n   8.3K (4%)  ctrl+p commands\n', 'opencode')).toBe(false);
+  });
+
+  it('qodercli: "(esc to cancel," spinner is busy', () => {
+    expect(runtimeBusyCheck('⠼ Thinking... (esc to cancel, 3s)\n', 'qodercli')).toBe(true);
+  });
+
+  it('qodercli: idle composer is not busy', () => {
+    expect(runtimeBusyCheck('*   Type your message or @path/to/file\n', 'qodercli')).toBe(false);
+  });
+
+  it('opencode: ctrl+c interrupt hint alone (progress bar wrapped out of tail) is busy', () => {
+    expect(runtimeBusyCheck('running a long tool call\n  ctrl+c to interrupt          ctrl+p commands\n', 'opencode')).toBe(true);
+  });
 });
 
 describe('hasOscTitleIdle', () => {
@@ -1537,6 +1628,8 @@ describe('hasOscTitleIdle', () => {
     ['✳ without the following space is not the idle contract', '✳分析', 'claude-code' as const, false],
     ['codex cwd-shaped title has no idle contract', 'baxian', 'codex' as const, false],
     ['codex: even a ✳-prefixed title is not an idle signal', '✳ x', 'codex' as const, false],
+    ['opencode title has no idle contract', 'OC | some session', 'opencode' as const, false],
+    ['qodercli Ready title is not an idle signal (shown while working too)', '◇  Ready (repo)', 'qodercli' as const, false],
   ])('%s → %s', (_label, title, runtime, expected) => {
     expect(hasOscTitleIdle(title, runtime)).toBe(expected);
   });

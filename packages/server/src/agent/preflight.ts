@@ -14,6 +14,8 @@ export interface PreflightResult {
 const CLI_BINARY: Record<AgentRuntime, string> = {
   'claude-code': 'claude',
   codex: 'codex',
+  opencode: 'opencode',
+  qodercli: 'qodercli',
 };
 
 const PREFLIGHT_PROBE_TIMEOUT_MS = 5000;

@@ -3,6 +3,15 @@ import type { AgentRuntime, TaskStatus } from './types.js';
 const AGENT_RUNTIME_LABELS: Record<AgentRuntime, string> = {
   'claude-code': 'Claude Code',
   codex: 'Codex',
+  opencode: 'OpenCode',
+  qodercli: 'Qoder CLI',
+};
+
+export const AGENT_RUNTIME_LAUNCH_FLAG: Record<AgentRuntime, string> = {
+  'claude-code': '--permission-mode bypassPermissions',
+  codex: '--dangerously-bypass-approvals-and-sandbox',
+  opencode: '--auto',
+  qodercli: '--dangerously-skip-permissions',
 };
 
 export function agentRuntimeLabel(runtime: AgentRuntime | undefined, model?: string): string | null {

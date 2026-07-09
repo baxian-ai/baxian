@@ -28,6 +28,8 @@ export class RequiredSkillsMissingError extends Error {
 const SKILL_INVOKE_SIGIL: Record<AgentRuntime, string> = {
   'claude-code': '/',
   codex: '$',
+  opencode: '/',
+  qodercli: '/',
 };
 
 function phasePrimarySkill(role: AgentRole, phase: string): string | undefined {

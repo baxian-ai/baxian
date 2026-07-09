@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import type { AgentMode, HostConfig } from '../shared/index.js';
+import type { AgentMode, AgentRuntime, HostConfig } from '../shared/index.js';
 import type { CommandRunner, RemoteShellMode } from '../agent/runner.js';
 import { createRunner, LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshEnv } from '../agent/runner.js';
 import { installTmux, type TmuxInstallResult } from '../agent/tmux-install.js';
@@ -19,10 +19,7 @@ interface ProbeStatus {
 interface ProbeResponse {
   ssh?: { ok: boolean; message: string };
   tmux: ProbeStatus;
-  runtimes: {
-    'claude-code': ProbeStatus;
-    'codex': ProbeStatus;
-  };
+  runtimes: Record<AgentRuntime, ProbeStatus>;
 }
 
 interface InstallTmuxResponse extends TmuxInstallResult {
@@ -152,6 +149,8 @@ export async function probeRoutes(app: FastifyInstance, options: ProbeRoutesOpti
       runtimes: {
         'claude-code': { ok: false, message: '' },
         codex: { ok: false, message: '' },
+        opencode: { ok: false, message: '' },
+        qodercli: { ok: false, message: '' },
       },
     };
 
@@ -162,20 +161,26 @@ export async function probeRoutes(app: FastifyInstance, options: ProbeRoutesOpti
         result.tmux = { ok: false, message: 'SSH 不通，无法探测' };
         result.runtimes['claude-code'] = { ok: false, message: 'SSH 不通，无法探测' };
         result.runtimes['codex'] = { ok: false, message: 'SSH 不通，无法探测' };
+        result.runtimes['opencode'] = { ok: false, message: 'SSH 不通，无法探测' };
+        result.runtimes['qodercli'] = { ok: false, message: 'SSH 不通，无法探测' };
         return reply.send(result);
       }
     }
 
     const runner = body.mode === 'remote' ? makeRemote(host as HostConfig) : makeLocal();
-    const [tmux, claude, codex] = await Promise.all([
+    const [tmux, claude, codex, opencode, qodercli] = await Promise.all([
       probeWhich(runner, 'tmux', '请安装 tmux'),
       probeWhich(runner, 'claude', '请先安装 Claude Code CLI', 'login-interactive'),
       probeWhich(runner, 'codex', '请先安装 Codex CLI', 'login-interactive'),
+      probeWhich(runner, 'opencode', '请先安装 OpenCode CLI', 'login-interactive'),
+      probeWhich(runner, 'qodercli', '请先安装 Qoder CLI', 'login-interactive'),
     ]);
 
     result.tmux = tmux;
     result.runtimes['claude-code'] = claude;
     result.runtimes['codex'] = codex;
+    result.runtimes['opencode'] = opencode;
+    result.runtimes['qodercli'] = qodercli;
 
     return reply.send(result);
   });

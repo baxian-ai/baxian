@@ -10,6 +10,7 @@ import { api } from '../../src/api.ts';
 import { CreateAgentModal } from '../../src/components/create-agent-modal.tsx';
 import { flagDirtyMock } from '../helpers/pending-restart-mock.tsx';
 import { toastShowMock } from '../helpers/toast-mock.tsx';
+import { makeRuntimes } from '../helpers/fixtures.ts';
 
 const configGetMock = vi.mocked(api.config.get);
 const probeMock = vi.mocked(api.agents.probe);
@@ -30,7 +31,7 @@ beforeEach(() => {
   probeMock.mockReset().mockResolvedValue({
     ssh: { ok: true, message: 'SSH OK' },
     tmux: { ok: true, message: 'tmux' },
-    runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+    runtimes: makeRuntimes(),
   });
   installTmuxMock.mockReset().mockResolvedValue({
     ok: true,
@@ -247,7 +248,7 @@ it('shows the probe error and blocks submission when probing fails', async () =>
   await renderReady();
 
   expect(await screen.findByText('probe exploded')).toBeTruthy();
-  expect(screen.getAllByText('?')).toHaveLength(2);
+  expect(screen.getAllByText('?')).toHaveLength(4);
 
   fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'kk-cc' } });
   fireEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
@@ -257,10 +258,10 @@ it('shows the probe error and blocks submission when probing fails', async () =>
 it('marks an unavailable runtime with the probe message and disables its radio', async () => {
   probeMock.mockResolvedValue({
     tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux ok' },
-    runtimes: {
+    runtimes: makeRuntimes({
       'claude-code': { ok: false, message: 'claude-code not found' },
       codex: { ok: true, path: '/usr/local/bin/codex', message: '' },
-    },
+    }),
   });
   await renderReady();
 
@@ -274,7 +275,7 @@ it('marks an unavailable runtime with the probe message and disables its radio',
 it('shows a tmux probe failure', async () => {
   probeMock.mockResolvedValue({
     tmux: { ok: false, message: 'tmux missing' },
-    runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+    runtimes: makeRuntimes(),
   });
   await renderReady();
 
@@ -285,7 +286,7 @@ it('shows an SSH probe failure for remote hosts and clears it when switching bac
   probeMock.mockResolvedValue({
     ssh: { ok: false, message: 'auth failed' },
     tmux: { ok: true, message: '' },
-    runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+    runtimes: makeRuntimes(),
   });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 
@@ -300,10 +301,10 @@ it('shows an SSH probe failure for remote hosts and clears it when switching bac
 it('renders installed runtime and tmux probe results in green (text-probe-ok)', async () => {
   probeMock.mockResolvedValue({
     tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
-    runtimes: {
+    runtimes: makeRuntimes({
       'claude-code': { ok: true, path: '/usr/local/bin/claude', message: '' },
       codex: { ok: true, path: '/usr/local/bin/codex', message: '' },
-    },
+    }),
   });
   await renderReady();
 
@@ -341,11 +342,21 @@ it('prefills the Agent ID placeholder as <project>-<role> and tracks role switch
   expect(input.placeholder).toBe('baxian-dev');
 });
 
-it('describes YOLO by the real per-runtime launch flags instead of explaining the mode', async () => {
+it('describes YOLO by the selected runtime real launch flag instead of explaining the mode', async () => {
   await renderReady();
 
+  // no runtime picked yet: falls back to the claude-code flag
   expect(screen.getByText('--permission-mode bypassPermissions')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('radio', { name: /Codex/ }));
   expect(screen.getByText('--dangerously-bypass-approvals-and-sandbox')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('radio', { name: /OpenCode/ }));
+  expect(screen.getByText('--auto')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('radio', { name: /Qoder CLI/ }));
+  expect(screen.getByText('--dangerously-skip-permissions')).toBeTruthy();
+
   expect(screen.queryByText(/without asking for confirmation|controlled environment/)).toBeNull();
 });
 
@@ -377,7 +388,7 @@ it('Re-probe re-runs the probe on demand', async () => {
 
 const TMUX_MISSING = {
   tmux: { ok: false, message: '请安装 tmux' },
-  runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+  runtimes: makeRuntimes(),
 };
 
 it('offers a one-click install when tmux is missing; success re-probes and flips the status to ✓', async () => {
@@ -385,7 +396,7 @@ it('offers a one-click install when tmux is missing; success re-probes and flips
     .mockResolvedValueOnce(TMUX_MISSING)
     .mockResolvedValueOnce({
       tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
-      runtimes: { 'claude-code': { ok: true, message: '' }, codex: { ok: true, message: '' } },
+      runtimes: makeRuntimes(),
     });
   await renderReady();
 
@@ -424,10 +435,7 @@ it('hides the one-click install button when remote SSH is unreachable (tmux stat
   probeMock.mockResolvedValue({
     ssh: { ok: false, message: 'SSH 不通，请检查地址 / 端口 / 密码或 key 认证' },
     tmux: { ok: false, message: 'SSH 不通，无法探测' },
-    runtimes: {
-      'claude-code': { ok: false, message: 'SSH 不通，无法探测' },
-      codex: { ok: false, message: 'SSH 不通，无法探测' },
-    },
+    runtimes: makeRuntimes({}, { ok: false, message: 'SSH 不通，无法探测' }),
   });
   await renderReady(cfg([{ id: 'box', hostname: 'h.example.com' }]));
 

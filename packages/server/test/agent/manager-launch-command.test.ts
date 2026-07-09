@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { buildLaunchCommand } from '../../src/agent/manager.js';
-import type { AgentConfig } from '../../src/shared/index.js';
+import { buildLaunchCommand, skillSubdirFor } from '../../src/agent/manager.js';
+import type { AgentConfig, AgentRuntime } from '../../src/shared/index.js';
 
 function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -94,5 +94,42 @@ describe('buildLaunchCommand', () => {
     expect(cmd).toBe(
       "env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --permission-mode bypassPermissions --add-dir '/path with space/$(whoami)'",
     );
+  });
+
+  it('opencode: auto-approve mode by default', () => {
+    expect(buildLaunchCommand(agent({ runtime: 'opencode' }))).toBe('env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode --auto');
+  });
+
+  it('opencode with --model', () => {
+    expect(buildLaunchCommand(agent({ runtime: 'opencode', model: 'anthropic/claude-sonnet-4-6' }))).toBe(
+      "env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode --auto --model 'anthropic/claude-sonnet-4-6'",
+    );
+  });
+
+  it('opencode drops addDirs: it has no --add-dir flag', () => {
+    expect(buildLaunchCommand(agent({ runtime: 'opencode', addDirs: ['/a', '/b'] }))).toBe('env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode --auto');
+  });
+
+  it('qodercli: skip-permissions mode by default', () => {
+    expect(buildLaunchCommand(agent({ runtime: 'qodercli' }))).toBe(
+      'qodercli --dangerously-skip-permissions',
+    );
+  });
+
+  it('qodercli with --model and --add-dir', () => {
+    expect(buildLaunchCommand(agent({ runtime: 'qodercli', model: 'efficient', addDirs: ['/x'] }))).toBe(
+      "qodercli --dangerously-skip-permissions --model 'efficient' --add-dir '/x'",
+    );
+  });
+});
+
+describe('skillSubdirFor', () => {
+  it.each<[AgentRuntime, string]>([
+    ['claude-code', '.claude/skills'],
+    ['codex', '.agents/skills'],
+    ['opencode', '.agents/skills'],
+    ['qodercli', '.qoder/skills'],
+  ])('%s materializes skills under %s', (runtime, dir) => {
+    expect(skillSubdirFor(runtime)).toBe(dir);
   });
 });

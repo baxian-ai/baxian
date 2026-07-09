@@ -519,6 +519,23 @@ describe('agent.addDirs field', () => {
   });
 });
 
+describe('opencode/qodercli runtime', () => {
+  it('rejects addDirs on an opencode agent (opencode has no --add-dir)', () => {
+    const cfg = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', runtime: 'opencode', addDirs: ['/a'] })]] }));
+    expect(validateConfig(cfg).some(e => /\.addDirs$/.test(e.path))).toBe(true);
+  });
+
+  it('accepts an opencode agent without addDirs', () => {
+    const cfg = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', runtime: 'opencode' })]] }));
+    expect(validateConfig(cfg)).toEqual([]);
+  });
+
+  it('accepts a qodercli agent with addDirs', () => {
+    const cfg = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', runtime: 'qodercli', addDirs: ['/a'] })]] }));
+    expect(validateConfig(cfg)).toEqual([]);
+  });
+});
+
 describe('project.agent empty array', () => {
   it('accepts empty agent array', () => {
     expect(validateConfig(withProject(devProject({ agent: [] })))).toEqual([]);

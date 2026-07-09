@@ -9,7 +9,7 @@ export interface ValidationError {
   message: string;
 }
 
-const VALID_RUNTIMES: AgentRuntime[] = ['claude-code', 'codex'];
+const VALID_RUNTIMES: AgentRuntime[] = ['claude-code', 'codex', 'opencode', 'qodercli'];
 const VALID_ROLES: AgentRole[] = ['dev', 'qa'];
 const VALID_MODES: AgentMode[] = ['local', 'remote'];
 const VALID_MERGE: MergeStrategy[] = ['auto', null];
@@ -310,6 +310,12 @@ function validateAgentFields(config: BaxianConfig, errors: ValidationError[]): v
               }
             }
           }
+        }
+        if (agent.runtime === 'opencode' && Array.isArray(agent.addDirs) && agent.addDirs.length > 0) {
+          errors.push({
+            path: `${path}.addDirs`,
+            message: 'agent.addDirs is not supported for opencode runtime; opencode has no --add-dir, grant extra roots via its permission config',
+          });
         }
         if (agent.yolo !== undefined && typeof agent.yolo !== 'boolean') {
           errors.push({

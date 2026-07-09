@@ -16,6 +16,8 @@ baxian scans the pane fuzzily (strips ANSI escapes and whitespace), so a TUI sof
 - Two-segment: `[bx:KIND:TOKEN]` — for kinds with no payload.
 - Three-segment: `[bx:pr-created:<pr_number>:TOKEN]` — `pr-created` always carries the PR number; `code-ready` may carry it (publish-as-PR).
 
+If your runtime's TUI renders assistant markdown and would turn a bare `[bx:...]` into a link — dropping the square brackets from what baxian captures — wrap the signal in inline-code backticks so the brackets survive to the pane: `` `[bx:KIND:TOKEN]` ``. Backticks are always safe to add, so when in doubt wrap every signal.
+
 ## How to emit
 
 The dispatch descriptor names the signal kind in a signal field and the token in `token:`. The default completion field is `signal:`; some phases add an alternate field for an optional branch (e.g. `spec-signal:` on develop's SDD route). Your phase skill's flow tells you which field applies — emit the one for the route you took, never both:

@@ -7,6 +7,7 @@ vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts'))
 
 import { api } from '../../src/api.ts';
 import { HostManagementModal } from '../../src/components/host-management-modal.tsx';
+import { makeRuntimes } from '../helpers/fixtures.ts';
 
 const listMock = vi.mocked(api.hosts.list);
 const createMock = vi.mocked(api.hosts.create);
@@ -20,10 +21,7 @@ const HOST: HostConfig = { id: 'box', hostname: 'h.example.com', port: 2222, ali
 const PROBE_OK = {
   ssh: { ok: true, message: 'SSH OK' },
   tmux: { ok: true, path: '/usr/bin/tmux', message: 'tmux found' },
-  runtimes: {
-    'claude-code': { ok: true, message: '' },
-    codex: { ok: true, message: '' },
-  },
+  runtimes: makeRuntimes(),
 };
 
 const PROBE_TMUX_MISSING = {
