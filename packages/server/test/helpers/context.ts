@@ -44,8 +44,8 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
       repo: 'user/repo',
       merge: null,
       agent: [[
-        { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: tempDir },
-        { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: tempDir },
+        { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: join(tempDir, 'dev-1') },
+        { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: join(tempDir, 'qa-1') },
       ]],
     }],
   };

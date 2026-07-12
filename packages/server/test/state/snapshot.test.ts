@@ -314,7 +314,7 @@ describe('agentSnapshot', () => {
     expect(snapshot.message).toBe('ssh timeout');
   });
 
-  it('surfaces latestBootstrapError when no repoPath has been recorded yet', () => {
+  it('surfaces latestBootstrapError when no workdir has been recorded yet', () => {
     const snapshot = agentSnapshot(
       { id: 'dev-1', projectId: 'proj' },
       undefined,
@@ -332,10 +332,10 @@ describe('agentSnapshot', () => {
     expect(snapshot.latestBootstrapError?.recommendation).toContain('Verify');
   });
 
-  it('shows latestBootstrapError even when binding.repoPath exists (later failure after first success)', () => {
+  it('shows latestBootstrapError even when binding.workdir exists (later failure after first success)', () => {
     const snapshot = agentSnapshot(
       { id: 'dev-1', projectId: 'proj' },
-      binding({ repoPath: '/local/repo' }),
+      binding({ workdir: '/local/repo' }),
       { tmuxSessionStatus: 'present', observedAt: NOW },
       undefined,
       {

@@ -31,6 +31,7 @@ const CONFIG: BaxianConfig = {
 
 let tempDir: string;
 let agentStore: AgentStore;
+let lockManager: LockManager;
 let manager: AgentManager;
 let mockRunner: CommandRunner;
 let waitReadySpy: ReturnType<typeof vi.spyOn>;
@@ -67,7 +68,22 @@ function callPrivate<T>(name: string, ...args: unknown[]): T {
   return (manager as never as Record<string, (...a: unknown[]) => T>)[name](...args);
 }
 
-function runPostMergeCompaction(...args: unknown[]): Promise<void> {
+async function ensureTaskLock(agentId: string, taskId: string): Promise<string> {
+  const existing = await lockManager.claimOf(agentId);
+  const token = existing?.taskId === taskId
+    ? existing.token
+    : await lockManager.acquire(agentId, taskId);
+  if (!token) throw new Error(`failed to seed ${agentId}/${taskId} lock`);
+  await agentStore.update(agentId, state => ({
+    ...state!,
+    lockToken: token,
+    updatedAt: state!.updatedAt,
+  }));
+  return token;
+}
+
+async function runPostMergeCompaction(...args: unknown[]): Promise<void> {
+  await ensureTaskLock(String(args[2]), String(args[3]));
   return callPrivate('runPostMergeCompaction', ...args);
 }
 
@@ -180,7 +196,7 @@ beforeEach(async () => {
 
   agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
   const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  const lockManager = new LockManager(join(tempDir, 'locks'));
+  lockManager = new LockManager(join(tempDir, 'locks'));
   const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
 
   mockRunner = {
@@ -192,7 +208,7 @@ beforeEach(async () => {
     ...CONFIG,
     project: CONFIG.project.map(p => ({
       ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: tempDir }))),
+      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
     })),
   };
 
@@ -411,6 +427,9 @@ describe('compactAgent', () => {
 
   it('aborts a guarded dispatch when the binding is released while waiting (task cancelled)', async () => {
     await seedAgent({ taskId: 't1' });
+    const lockToken = await lockManager.acquire('dev-1', 't1');
+    expect(lockToken).toBeTruthy();
+    await agentStore.update('dev-1', state => ({ ...state!, lockToken: lockToken!, updatedAt: state!.updatedAt }));
     setPollMs(1);
     const fakeTmux = fakeDispatchTmux();
     const { gates, holder: manual } = await startGuarded();
@@ -428,6 +447,7 @@ describe('compactAgent', () => {
 
   it('read-file text injection waits for the guard, then pastes once it is released', async () => {
     await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
+    expect(await lockManager.acquire('qa-1', 't1')).toBeTruthy();
     setPollMs(1);
     const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
     const enterSpy = vi.spyOn(TmuxManager.prototype, 'sendEnter').mockResolvedValue(undefined);
@@ -447,6 +467,7 @@ describe('compactAgent', () => {
 
   it('drops stale read-file injection when the agent was rebound during the guard wait', async () => {
     await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
+    expect(await lockManager.acquire('qa-1', 't1')).toBeTruthy();
     setPollMs(1);
     const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined);
     const { gates, holder: manual } = await startGuarded(() => manager.compactAgent('qa-1'));
@@ -644,11 +665,13 @@ describe('compactAgent', () => {
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
     expect(slashCalls).toHaveLength(2);
     const draftCalls = fakeTmux.clearComposerDraft.mock.calls.filter(([paneId]) => paneId === '%7');
-    expect(draftCalls).toHaveLength(3);
+    expect(draftCalls).toHaveLength(2);
     const draftOrders = fakeTmux.clearComposerDraft.mock.invocationCallOrder;
-    const lastSlashOrder = Math.max(...fakeTmux.sendKeysLiteral.mock.calls
-      .map((c, i) => (c[1] === '/clear' ? fakeTmux.sendKeysLiteral.mock.invocationCallOrder[i] : -1)));
-    expect(draftOrders[draftOrders.length - 1]).toBeGreaterThan(lastSlashOrder);
+    const slashOrders = fakeTmux.sendKeysLiteral.mock.calls
+      .map((c, i) => (c[1] === '/clear' ? fakeTmux.sendKeysLiteral.mock.invocationCallOrder[i] : -1))
+      .filter(order => order >= 0);
+    expect(draftOrders[0]).toBeLessThan(slashOrders[0]);
+    expect(draftOrders[1]).toBeLessThan(slashOrders[1]);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
     expect(guardSet().has('dev-1')).toBe(false);
   });
@@ -685,6 +708,7 @@ describe('compactAgent', () => {
 
   it('recovers post-merge cleanup when the pane probe reports a missing pane', async () => {
     await seedAgent({ taskId: 't1' });
+    const lockToken = await ensureTaskLock('dev-1', 't1');
     const ensureSpy = vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true,
       createdSession: false,
@@ -702,6 +726,7 @@ describe('compactAgent', () => {
       '%7',
       'dev-1',
       't1',
+      lockToken,
       'codex',
     );
 
@@ -712,7 +737,8 @@ describe('compactAgent', () => {
 
   it('does not rewrite post-merge recovery state when the fresh runtime facts are already current', async () => {
     const updatedAt = '2026-06-26T00:00:00.000Z';
-    await seedAgent({ taskId: 't1', repoPath: tempDir, updatedAt });
+    await seedAgent({ taskId: 't1', workdir: tempDir, updatedAt });
+    const lockToken = await ensureTaskLock('dev-1', 't1');
     vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true,
       createdSession: false,
@@ -731,6 +757,7 @@ describe('compactAgent', () => {
       '%7',
       'dev-1',
       't1',
+      lockToken,
       'codex',
     );
 

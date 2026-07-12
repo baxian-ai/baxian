@@ -29,7 +29,6 @@ export function isValidBranchName(name: string): boolean {
   if (name.endsWith('.')) return false;
   return name.split('/').every(p => !p.startsWith('.') && !p.endsWith('.lock'));
 }
-export const WORKTREE_DIR = '.baxian-worktrees';
 export const STATE_DIR = '.baxian';
 export const CONFIG_FILE = 'baxian.json';
 

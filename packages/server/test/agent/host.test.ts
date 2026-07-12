@@ -3,6 +3,7 @@ import type { HostConfig } from '../../src/shared/index.js';
 import {
   resolveAgentHost,
   hostGroupKey,
+  workdirHostGroupKey,
   sshTarget,
   buildSshOptions,
   sshEnv,
@@ -44,6 +45,20 @@ describe('hostGroupKey', () => {
   it('keys a no-explicit-port host as :default (distinct from explicit :22, which honors ~/.ssh/config)', () => {
     expect(hostGroupKey('remote', { hostname: 'h', user: 'u' })).toBe('remote:u@h:default');
     expect(hostGroupKey('remote', { hostname: 'h', user: 'u', port: 22 })).toBe('remote:u@h:22');
+  });
+});
+
+describe('workdirHostGroupKey', () => {
+  it('conservatively groups an omitted SSH port with explicit port 22', () => {
+    expect(workdirHostGroupKey('remote', { hostname: 'h', user: 'u' })).toBe(
+      workdirHostGroupKey('remote', { hostname: 'h', user: 'u', port: 22 }),
+    );
+  });
+
+  it('keeps a non-default explicit SSH port in a separate Workdir group', () => {
+    expect(workdirHostGroupKey('remote', { hostname: 'h', user: 'u', port: 2222 })).not.toBe(
+      workdirHostGroupKey('remote', { hostname: 'h', user: 'u' }),
+    );
   });
 });
 

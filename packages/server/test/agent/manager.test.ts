@@ -11,7 +11,7 @@ import { ApiError } from '../../src/errors.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { PromptSizeError, RequiredSkillsMissingError } from '../../src/agent/prompt.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
-import { WorktreeManager } from '../../src/agent/worktree.js';
+import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from '../../src/agent/branch.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -32,7 +32,7 @@ const CONFIG: BaxianConfig = {
     merge: null,
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo' },
+      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
     ]],
   }],
 };
@@ -48,11 +48,21 @@ const events: BaxianEvent[] = [];
 function readyRunner(): CommandRunner {
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('tmux has-session') || cmd.includes('tmux list-panes')) {
+        return { stdout: '', stderr: 'session not found', exitCode: 1 };
+      }
       if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        return { stdout: cmd.includes('%1') ? 'codex\n' : 'claude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
+        const frame = cmd.includes('%1')
+          ? 'permissions: YOLO mode\n\n>'
+          : '⏵⏵ bypass permissions on /tmp/repo\n\n>';
+        return {
+          stdout: cmd.includes('history_size') ? `${frame}\n___bx-snap-sep___\n0\n` : frame,
+          stderr: '',
+          exitCode: 0,
+        };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
@@ -159,14 +169,17 @@ function smallPaneClaudeCompactRunner(execs: string[]): CommandRunner {
 }
 
 function task(overrides: Partial<TaskState> = {}): TaskState {
+  const id = overrides.id ?? 'task-1';
+  const branch = overrides.branch ?? `bx/${id}`;
   return {
-    id: 'task-1',
+    id,
     projectId: 'proj',
     title: 'T',
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
-    branch: 'bx/task-1',
+    branch,
+    branchCreatedByBaxian: overrides.branchCreatedByBaxian ?? branch === `bx/${id}`,
     reviewRound: 0,
     status: 'in_progress',
     createdAt: NOW,
@@ -252,6 +265,14 @@ async function seedTask(overrides: Partial<TaskState> = {}): Promise<TaskState> 
   return t;
 }
 
+async function acquireBoundLock(agentId: string, taskId?: string): Promise<string | null> {
+  const binding = await agentStore.get(agentId);
+  const owner = taskId ?? binding?.taskId ?? 'task-1';
+  const existing = await lockManager.claimOf(agentId);
+  if (existing?.taskId === owner) return existing.token;
+  return lockManager.acquire(agentId, owner);
+}
+
 function capturePaneRunner(
   execs: string[],
   capture: () => string | Promise<string>,
@@ -294,6 +315,38 @@ beforeEach(async () => {
   agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
   taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
   lockManager = new LockManager(join(tempDir, 'locks'));
+  const setAgent = agentStore.set.bind(agentStore);
+  const updateAgent = agentStore.update.bind(agentStore);
+  const mirrorExactLock = async (id: string): Promise<void> => {
+    const state = await agentStore.get(id);
+    if (!state?.taskId) return;
+    let next = state;
+    if (state.workdir === undefined) {
+      next = {
+        ...next,
+        workdir: id === 'qa-1' ? '/tmp/qa-repo' : '/tmp/repo',
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    const claim = await lockManager.claimOf(id);
+    const token = claim?.taskId === next.taskId
+      ? claim.token
+      : claim
+        ? null
+        : await lockManager.acquire(id, next.taskId);
+    if (token && next.lockToken !== token) {
+      next = { ...next, lockToken: token, updatedAt: new Date().toISOString() };
+    }
+    if (next !== state) await setAgent(next);
+  };
+  vi.spyOn(agentStore, 'set').mockImplementation(async (state) => {
+    await setAgent(state);
+    await mirrorExactLock(state.id);
+  });
+  vi.spyOn(agentStore, 'update').mockImplementation(async (id, update) => {
+    await updateAgent(id, update);
+    await mirrorExactLock(id);
+  });
   eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   events.length = 0;
   eventBus.on('*', (event) => { events.push(event); });
@@ -304,6 +357,17 @@ beforeEach(async () => {
   await skillRegistry.scan();
 
   manager = makeManager({ skillRegistry });
+  vi.spyOn(BranchManager.prototype, 'assertClean').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockResolvedValue({ status: 'deleted' });
+  vi.spyOn(BranchManager.prototype, 'currentRef').mockImplementation(async (workdir) => {
+    const binding = (await agentStore.list()).find(state => state.workdir === workdir && state.taskId);
+    const boundTask = binding?.taskId ? await taskStore.get(binding.taskId) : null;
+    return boundTask?.branch ? `refs/heads/${boundTask.branch}` : null;
+  });
 });
 
 afterEach(async () => {
@@ -461,6 +525,62 @@ describe('AgentManager task binding flow', () => {
     })).rejects.toThrow(/already bound to task/);
   });
 
+  it('createTask rejects a duplicate custom branch across projects sharing one repo', async () => {
+    manager = makeManager({
+      config: {
+        ...CONFIG,
+        project: [
+          { id: 'proj-a', repo: 'https://github.com/User/Repo.git', merge: null, agent: [] },
+          { id: 'proj-b', repo: 'git@github.com:user/repo.git', merge: null, agent: [] },
+        ],
+      },
+    });
+    await taskStore.set(task({
+      id: 'task-shared',
+      projectId: 'proj-a',
+      preferredAgentId: '',
+      agentId: '',
+      branch: 'feat/shared',
+      branchCreatedByBaxian: false,
+    }));
+
+    await expect(manager.createTask('proj-b', {
+      title: 'duplicate in the same repo',
+      description: 'details',
+      preferredAgentId: '',
+      branch: 'feat/shared',
+    })).rejects.toThrow(/already bound to task task-shared/);
+  });
+
+  it('createTask allows the same custom branch name in different repos', async () => {
+    manager = makeManager({
+      config: {
+        ...CONFIG,
+        project: [
+          { id: 'proj-a', repo: 'user/repo-a', merge: null, agent: [] },
+          { id: 'proj-b', repo: 'user/repo-b', merge: null, agent: [] },
+        ],
+      },
+    });
+    await taskStore.set(task({
+      id: 'task-other-repo',
+      projectId: 'proj-a',
+      preferredAgentId: '',
+      agentId: '',
+      branch: 'feat/shared',
+      branchCreatedByBaxian: false,
+    }));
+
+    const created = await manager.createTask('proj-b', {
+      title: 'same name in another repo',
+      description: 'details',
+      preferredAgentId: '',
+      branch: 'feat/shared',
+    });
+
+    expect(created).toMatchObject({ projectId: 'proj-b', branch: 'feat/shared', status: 'pending' });
+  });
+
   it('cancelTask delegates releaseAgentForTask for dev and qa after cancelling the task', async () => {
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -556,7 +676,7 @@ describe('AgentManager task binding flow', () => {
       taskId: t.id,
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const timeout = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error('cancelTask timed out')), 1_500);
@@ -575,30 +695,45 @@ describe('AgentManager task binding flow', () => {
     await seedAgent({
       id: 'dev-1',
       taskId: t.id,
-      worktreePath: '/tmp/wt',
+      workdir: '/tmp/wt',
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    await manager['rollbackFailedDispatch'](t.id, 'dev-1');
+    const token = (await agentStore.get('dev-1'))?.lockToken;
+    await manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, token);
 
     expect((await taskStore.get(t.id))?.status).toBe('pending');
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBeUndefined();
-    expect(state?.worktreePath).toBeUndefined();
+    expect(state?.workdir).toBe('/tmp/wt');
     expect(state?.paneId).toBe('%0');
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('rollbackFailedDispatch can safely recover when agent state disappeared but the exact lock remains', async () => {
+    const t = await seedTask({ id: 'task-state-missing' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const token = (await agentStore.get('dev-1'))!.lockToken!;
+    await agentStore.delete('dev-1');
+
+    await manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, token);
+
+    expect((await taskStore.get(t.id))?.status).toBe('pending');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('rollbackFailedDispatch with a reason emits a human.intervention naming the failure', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
+    const token = (await agentStore.get('dev-1'))?.lockToken;
     await manager['rollbackFailedDispatch'](t.id, 'dev-1', {
       phase: 'dispatch-rollback',
       message: 'ensureWorkdir failed: git fetch failed: Could not resolve host',
-    });
+    }, token);
 
     expect((await taskStore.get(t.id))?.status).toBe('pending');
     const intervention = events.find(
@@ -612,16 +747,32 @@ describe('AgentManager task binding flow', () => {
   it('rollbackFailedDispatch stays silent when the task did not need rolling back', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const token = (await agentStore.get('dev-1'))?.lockToken;
 
     await manager['rollbackFailedDispatch'](t.id, 'dev-1', {
       phase: 'dispatch-rollback',
       message: 'irrelevant',
-    });
+    }, token);
 
     expect(events.some(
       e => e.type === 'human.intervention'
         && (e.data as { phase?: string }).phase === 'dispatch-rollback',
     )).toBe(false);
+  });
+
+  it('rollbackFailedDispatch cannot clear a newer lock generation for the same task', async () => {
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const oldToken = (await agentStore.get('dev-1'))!.lockToken!;
+    await lockManager.releaseIfOwner('dev-1', t.id, oldToken);
+    const newToken = await lockManager.acquire('dev-1', t.id);
+    await agentStore.update('dev-1', state => ({ ...state!, lockToken: newToken!, updatedAt: NOW }));
+
+    await manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, oldToken);
+
+    expect((await taskStore.get(t.id))?.status).toBe('in_progress');
+    expect((await agentStore.get('dev-1'))?.lockToken).toBe(newToken);
+    expect(await lockManager.isOwner('dev-1', t.id, newToken!)).toBe(true);
   });
 
   it('createAndStartTask surfaces a non-terminal dispatch error as a dispatch-rollback intervention', async () => {
@@ -850,7 +1001,7 @@ describe('AgentManager task binding flow', () => {
       taskId: t.id,
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     await manager.failTaskForDispatchError(
       t.id,
@@ -917,7 +1068,7 @@ describe('AgentManager task binding flow', () => {
       taskId: t.id,
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     await manager.failTaskForDispatchError(
       t.id,
@@ -935,12 +1086,10 @@ describe('AgentManager task binding flow', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     const beforeUpdatedAt = NOW;
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    stubEnsureSession(manager);
     vi.spyOn(manager as unknown as { injectAndAwaitAck: () => Promise<void> }, 'injectAndAwaitAck')
       .mockRejectedValue(new DispatchTerminalError('ack_unknown', 'simulated ack_unknown from infra failure'));
     const minimalRunner: CommandRunner = {
@@ -957,7 +1106,7 @@ describe('AgentManager task binding flow', () => {
 
     const stateAfter = await agentStore.get('dev-1');
     expect(stateAfter?.taskId).toBe(t.id);
-    expect(stateAfter?.worktreePath).toBeTruthy();
+    expect(stateAfter?.workdir).toBeTruthy();
     expect(stateAfter?.updatedAt).not.toBe(beforeUpdatedAt);
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
@@ -965,11 +1114,9 @@ describe('AgentManager task binding flow', () => {
   it('startSession cleanup leaves the binding when cancel took it over (cancel-clearing) during the mutex wait', async () => {
     const t = await seedTask({ id: 'task-ss-cancel-clearing', branch: 'bx/task-ss-cancel-clearing' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    stubEnsureSession(manager);
     vi.spyOn(manager as unknown as { injectAndAwaitAck: () => Promise<unknown> }, 'injectAndAwaitAck')
       .mockImplementation(async () => {
         await (manager as unknown as { markPaneCancelClearing: (a: string, tid: string) => Promise<void> })
@@ -997,11 +1144,9 @@ describe('AgentManager task binding flow', () => {
   it('startSession set-running write preserves a cancel-clearing hold present at write time (does NOT wipe it)', async () => {
     const t = await seedTask({ id: 'task-ss-cancel-clearing-prewrite', branch: 'bx/task-ss-cancel-clearing-prewrite' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo',
-    });
+    stubEnsureSession(manager);
     const injectSpy = vi.spyOn(manager as unknown as { injectAndAwaitAck: () => Promise<unknown> }, 'injectAndAwaitAck')
       .mockRejectedValue(new Error('injectAndAwaitAck must not run when a cancel hold owns the binding'));
     const minimalRunner: CommandRunner = {
@@ -1028,10 +1173,12 @@ describe('AgentManager task binding flow', () => {
   it('rollbackFailedDispatch leaves the binding/lock when the agent is held by cancel cleanup', async () => {
     const t = await seedTask({ id: 'task-rollback-cancel', status: 'cancelled' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    await (manager as unknown as { rollbackFailedDispatch: (tid: string, aid: string) => Promise<void> })
-      .rollbackFailedDispatch(t.id, 'dev-1');
+    const token = (await agentStore.get('dev-1'))?.lockToken;
+    await (manager as unknown as {
+      rollbackFailedDispatch: (tid: string, aid: string, reason?: unknown, token?: string) => Promise<void>;
+    }).rollbackFailedDispatch(t.id, 'dev-1', undefined, token);
 
     const st = await agentStore.get('dev-1');
     expect(st?.taskId).toBe(t.id);
@@ -1047,8 +1194,8 @@ describe('AgentManager task binding flow', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('qa-1');
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('qa-1');
+    await acquireBoundLock('dev-1');
 
     await manager.failTaskForDispatchError(
       t.id, 'review', 'qa-1',
@@ -1068,7 +1215,7 @@ describe('AgentManager task binding flow', () => {
       taskId: t.id,
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
 
     await manager.failTaskForDispatchError(
@@ -1844,7 +1991,7 @@ describe('AgentManager dispatchReviewToQa', () => {
   });
 
   it('allows code-phase max_rounds Call review (only spec is rejected)', async () => {
-    await seedReviewable({ status: 'max_rounds' }, { status: 'waiting', worktreePath: '/tmp/wt', paneId: '%0' });
+    await seedReviewable({ status: 'max_rounds' }, { status: 'waiting', workdir: '/tmp/wt', paneId: '%0' });
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
 
@@ -2416,7 +2563,7 @@ describe('AgentManager.submitCodeVerdict', () => {
     });
     await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
     mockDispatchDeps(m);
-    vi.spyOn(m, 'refreshWorktreeCacheFor').mockResolvedValue(undefined);
+    vi.spyOn(m, 'refreshWorkdirCacheFor').mockResolvedValue(undefined);
     vi.spyOn(m, 'getReviewTransport').mockReturnValue({
       readContent: vi.fn(async () => ({ content: 'diff synth', diffstat: 'stat', baseSha: 'sha1' })),
     } as never);
@@ -2439,7 +2586,7 @@ describe('AgentManager.submitCodeVerdict', () => {
     });
     await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
     mockDispatchDeps(m);
-    vi.spyOn(m, 'refreshWorktreeCacheFor').mockResolvedValue(undefined);
+    vi.spyOn(m, 'refreshWorkdirCacheFor').mockResolvedValue(undefined);
     vi.spyOn(m, 'getReviewTransport').mockReturnValue({
       readContent: vi.fn(async () => { throw new Error('git unavailable'); }),
     } as never);
@@ -2567,6 +2714,14 @@ describe('AgentManager dispatch & skill provisioning', () => {
     vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo', ...over,
     });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForTaskBoundary',
+    ).mockResolvedValue(undefined);
   }
 
   function useWorkdirRunner(): void {
@@ -2584,9 +2739,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('startSession develop prompt drops the spec route when the dev has no QA partner', async () => {
     const t = await seedTask({ id: 'task-noqa-1', branch: 'bx/task-noqa-1', signalToken: 'devtok1234ab' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     vi.spyOn(manager, 'findQaPartner').mockReturnValue(undefined);
     const prompts = capturePrompts(manager);
     useWorkdirRunner();
@@ -2600,9 +2755,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('startSession develop prompt keeps the spec route when the config pair has a QA', async () => {
     const t = await seedTask({ id: 'task-hasqa-1', branch: 'bx/task-hasqa-1', signalToken: 'devtok5678cd' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     const prompts = capturePrompts(manager);
     useWorkdirRunner();
 
@@ -2615,10 +2770,10 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('startSession marks bootstrappingTaskId during dispatch and clears it once the prompt is ack\'d', async () => {
     const t = await seedTask({ id: 'task-deliver-1', branch: 'bx/task-deliver-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     let markerDuringInject: string | undefined;
     spyInject(manager, async () => {
       markerDuringInject = (await agentStore.get('dev-1'))?.bootstrappingTaskId;
@@ -2642,9 +2797,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('startSession holds (not destructively cleans up) when clearing the bootstrap marker fails after delivery', async () => {
     const t = await seedTask({ id: 'task-deliver-2', branch: 'bx/task-deliver-2' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     useWorkdirRunner();
 
     let afterAck = false;
@@ -2656,12 +2811,12 @@ describe('AgentManager dispatch & skill provisioning', () => {
       return realUpdate(id, updater);
     });
     const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
 
     expect(ok).toBe(true);
-    expect(removeSpy).not.toHaveBeenCalled();
+    expect(parkSpy).not.toHaveBeenCalled();
     expect(holdSpy).toHaveBeenCalledWith(
       'dev-1', 'bootstrap-marker-clear-failed', expect.any(String), { expectedTaskId: t.id },
     );
@@ -2671,9 +2826,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
     const t = await seedTask({ id: 'task-fresh-redispatch', branch: 'bx/task-fresh-redispatch', status: 'approved' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     await manager['postApproveStore'].set(t.id, {
       token: 'tok', approvedHeadSha: 'sha', redispatchCount: 5,
     });
@@ -2698,9 +2853,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
     const t = await seedTask({ id: 'task-reuse-redispatch', branch: 'bx/task-reuse-redispatch', status: 'approved' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     await manager['postApproveStore'].set(t.id, {
       token: 'tok', approvedHeadSha: 'sha', redispatchCount: 2,
     });
@@ -2723,9 +2878,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('startSession runs armBeforeInject before pasting the prompt', async () => {
     const t = await seedTask({ id: 'task-arm-before', branch: 'bx/task-arm-before' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     const prompts = capturePrompts(manager);
     useWorkdirRunner();
 
@@ -2742,9 +2897,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('startSession aborts without pasting when armBeforeInject returns false', async () => {
     const t = await seedTask({ id: 'task-arm-abort', branch: 'bx/task-arm-abort' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     const prompts = capturePrompts(manager);
     useWorkdirRunner();
 
@@ -2760,9 +2915,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
     const t = await seedTask({ id: 'task-arm-abort-cont', branch: 'bx/task-arm-abort-cont', status: 'approved' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     await manager['postApproveStore'].set(t.id, { token: 'tok', approvedHeadSha: 'sha' });
 
     mockEnsureSession();
@@ -2780,7 +2935,11 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('provisionRepoSkills materializes skills under .claude/skills for claude-code and .agents/skills for codex', async () => {
     function capturingRunner(): { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn> } {
       return {
-        exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+        exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
+          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+          stderr: '',
+          exitCode: 0,
+        })),
         writeFile: vi.fn(async (): Promise<void> => undefined),
       };
     }
@@ -2819,7 +2978,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(qaStaged.every(p => !p.includes('/.claude/skills/'))).toBe(true);
   });
 
-  it('provisionRepoSkills treats info/exclude failure as best-effort (does not block the session)', async () => {
+  it('provisionRepoSkills fails when info/exclude cannot protect injected skills', async () => {
     const runner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> =>
         cmd.includes('info/exclude')
@@ -2828,13 +2987,18 @@ describe('AgentManager dispatch & skill provisioning', () => {
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
     const agent = agentConfig({ id: 'dev-1' });
-    await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).resolves.toBeUndefined();
-    expect(runner.writeFile.mock.calls.some(c => (c[0] as string).includes('/.claude/skills/baxian-task-check/SKILL.md'))).toBe(true);
+    await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo'))
+      .rejects.toThrow(/skill exclusion probe failed/);
+    expect(runner.writeFile).not.toHaveBeenCalled();
   });
 
   it('provisionRepoSkills re-materializes on every call — no skip cache (hot-reload of workdir/runtime + tamper safe)', async () => {
     const runner = {
-      exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+      exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
+        stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+        stderr: '',
+        exitCode: 0,
+      })),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
     const agent = agentConfig({ id: 'dev-nocache', workdir: '/repo-a' });
@@ -2857,7 +3021,11 @@ describe('AgentManager dispatch & skill provisioning', () => {
           await new Promise(r => setTimeout(r, 5));
           active -= 1;
         }
-        return { stdout: '', stderr: '', exitCode: 0 };
+        return {
+          stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
+          stderr: '',
+          exitCode: 0,
+        };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
     };
@@ -2872,7 +3040,9 @@ describe('AgentManager dispatch & skill provisioning', () => {
   it('provisionRepoSkills fails fast on a symlinked parent skills dir (no silent rm of user config)', async () => {
     const runner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> =>
-        cmd.includes('[ -L')
+        cmd.includes('BX_SKILLS_NON_GIT')
+          ? { stdout: 'BX_SKILLS_OK\n', stderr: '', exitCode: 0 }
+          : cmd.includes('[ -L')
           ? { stdout: '', stderr: 'baxian: .claude/skills is a symlink -> /shared/skills; replace it with a real directory', exitCode: 3 }
           : { stdout: '', stderr: '', exitCode: 0 }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
@@ -2913,80 +3083,85 @@ describe('AgentManager dispatch & skill provisioning', () => {
     } as BaxianConfig;
   }
 
-  function baseRefProbeRunner(execs: string[], originHeadExit: number): CommandRunner {
-    return {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        execs.push(cmd);
-        if (cmd.includes('rev-parse --verify --quiet origin/HEAD')) {
-          return { stdout: originHeadExit === 0 ? 'abc123\n' : '', stderr: '', exitCode: originHeadExit };
-        }
-        if (cmd.includes('git rev-parse --verify') && cmd.includes('refs/remotes/origin/')) {
-          return { stdout: 'fetchedsha1\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    } as unknown as CommandRunner;
-  }
-
   async function makeManagedCloneManager(): Promise<AgentManager> {
     const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
     await skillRegistry.scan();
     return makeManager({ config: managedCloneConfig(), skillRegistry });
   }
 
-  it('startSession develop refuses to create a worktree when origin/HEAD is unresolvable in a managed clone', async () => {
+  it('startSession develop surfaces an unresolvable origin/HEAD from fixed-Workdir branch switching', async () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({ id: 'task-nohead', branch: 'bx/task-nohead' });
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
-    const execs: string[] = [];
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory =
-      () => baseRefProbeRunner(execs, 1);
+    mockEnsureSession({ freshRuntime: true });
+    const switchSpy = vi.spyOn(BranchManager.prototype, 'switchToTaskBranch')
+      .mockRejectedValue(new Error('Cannot resolve commit origin/HEAD'));
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow(/origin\/HEAD/);
-    expect(execs.some(c => c.includes('git worktree add'))).toBe(false);
+    expect(switchSpy).toHaveBeenCalledWith('/tmp/repo', t.id, t.branch, true);
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'checkout-preparation-failed',
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('startSession develop pins the worktree base to origin/HEAD for a managed clone', async () => {
+  it('startSession holds the task and lock when the fixed Workdir is dirty', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({ id: 'task-dirty', branch: 'bx/task-dirty' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
+    await acquireBoundLock('dev-1');
+
+    mockEnsureSession({ freshRuntime: true });
+    vi.spyOn(BranchManager.prototype, 'switchToTaskBranch')
+      .mockRejectedValue(new DirtyWorkdirError('/tmp/repo'));
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true }),
+    });
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'dirty-workdir',
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  it('startSession develop switches the fixed Workdir to the exact baxian task branch', async () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({ id: 'task-headok', branch: 'bx/task-headok' });
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
+    await acquireBoundLock('dev-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     capturePrompts(manager);
-    const execs: string[] = [];
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory =
-      () => baseRefProbeRunner(execs, 0);
+    const switchSpy = vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue();
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
-    const addCmd = execs.find(c => c.includes('git worktree add'));
-    expect(addCmd).toContain("'origin/HEAD'");
+    expect(switchSpy).toHaveBeenCalledWith('/tmp/repo', t.id, t.branch, true);
   });
 
-  it('startSession review phase does not require origin/HEAD — the detached PR worktree only fetches the PR branch', async () => {
+  it('startSession review checks out the remote PR branch detached in the QA Workdir', async () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-ghrev', branch: 'bx/task-ghrev', status: 'review',
       reviewMode: 'github', prNumber: 7, signalToken: 'revtok1234ab',
+      latestHeadSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
-    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('qa-1');
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
+    await acquireBoundLock('qa-1');
 
-    mockEnsureSession();
+    mockEnsureSession({ freshRuntime: true });
     capturePrompts(manager);
-    const execs: string[] = [];
-    (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory =
-      () => baseRefProbeRunner(execs, 1);
+    const switchSpy = vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue();
 
     const ok = await manager.startSession(t.id, 'qa-1', 'review');
     expect(ok).toBe(true);
-    expect(execs.some(c => c.includes('rev-parse --verify --quiet origin/HEAD'))).toBe(false);
-    expect(execs.some(c => c.includes('git worktree add --detach'))).toBe(true);
+    expect(switchSpy).toHaveBeenCalledWith('/tmp/repo', t.branch, t.latestHeadSha);
   });
 });
 
@@ -3049,8 +3224,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
       taskId: t.id,
       paneId: '%1',
     });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     const cancelled = await localManager.cancelTask(t.id);
 
@@ -3094,7 +3269,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
       taskId: oldTask.id,
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const realAgentGet = agentStore.get.bind(agentStore);
     let switched = false;
@@ -3143,7 +3318,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
       taskId: t.id,
       paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const cancelled = await localManager.cancelTask(t.id);
 
@@ -3173,7 +3348,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
 
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const cancelled = await localManager.cancelTask(t.id);
 
@@ -3195,8 +3370,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     let devStillHeldDuringQaInterrupt: boolean | undefined;
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
@@ -3223,8 +3398,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     let resumeDuringCancel: { resumed: boolean; reason?: string } | undefined;
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
@@ -3251,8 +3426,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     let resumeAfterDuplicateCancel: { resumed: boolean; reason?: string } | undefined;
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
@@ -3280,8 +3455,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: (state: { id: string }) => Promise<boolean> }, 'interruptPaneAndWaitReady')
       .mockImplementation(async (state) => state.id !== 'dev-1');
@@ -3303,7 +3478,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const t = await seedTask();
     await taskStore.set(task({ id: 'task-new' }));
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
       .mockImplementation(async () => {
@@ -3322,7 +3497,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('refuses release of a cancel-clearing pane unless it is cancel\'s own (fromCancelCleanup)', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle')).toBe(false);
     expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true })).toBe(false);
@@ -3338,8 +3513,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     const t = await seedTask({ qaAgentId: 'qa-1' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     let escapeReleaseResult: boolean | undefined;
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
@@ -3364,8 +3539,8 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     await taskStore.set(task({ id: 'task-new', agentId: 'dev-1' }));
     await seedAgent({ id: 'dev-1', taskId: 'task-new', paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: 'task-old', paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
 
     let devReleaseByNewTask: boolean | undefined;
     vi.spyOn(localManager as unknown as { interruptPaneAndWaitReady: () => Promise<boolean> }, 'interruptPaneAndWaitReady')
@@ -3397,28 +3572,10 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     expect((await agentStore.get('dev-1'))?.taskId).toBe('task-a');
   });
 
-  it('escape release still refuses a legacy cancel-clear-failed hold, but Resume releases it to idle', async () => {
-    const t = await seedTask({ status: 'cancelled' });
-    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
-    await lockManager.acquire('dev-1');
-
-    expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle')).toBe(false);
-    expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
-    expect(await lockManager.isLocked('dev-1')).toBe(true);
-
-    const res = await manager.resumeAgent('dev-1');
-    expect(res.resumed).toBe(true);
-    expect(res.releasedBinding).toBe(true);
-    const after = await agentStore.get('dev-1');
-    expect(after?.taskId).toBeUndefined();
-    expect(after?.awaitingPhase).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
-  });
-
   it('Resume releases a stale cancel-clearing hold whose task already reached a terminal status', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const res = await manager.resumeAgent('dev-1');
     expect(res.resumed).toBe(true);
@@ -3430,7 +3587,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('recover() holds a cancel-clearing agent bound to a cancelled task (restart mid-cleanup)', async () => {
     await taskStore.set(task({ id: 'task-x', status: 'cancelled', agentId: 'dev-1' }));
     await seedAgent({ id: 'dev-1', taskId: 'task-x', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     vi.spyOn(manager as unknown as { ensureSession: () => Promise<{ paneId: string }> }, 'ensureSession')
       .mockResolvedValue({ paneId: '%0' });
 
@@ -3446,7 +3603,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('does not auto-release a cancel-interrupt-failed pane (escape/handler), but Resume can', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     expect(await manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true })).toBe(false);
     expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
@@ -3461,7 +3618,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('recover() holds a cancel-interrupt-failed agent (restart) instead of auto-releasing it', async () => {
     await taskStore.set(task({ id: 'task-y', status: 'cancelled', agentId: 'dev-1' }));
     await seedAgent({ id: 'dev-1', taskId: 'task-y', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     vi.spyOn(manager as unknown as { ensureSession: () => Promise<{ paneId: string }> }, 'ensureSession')
       .mockResolvedValue({ paneId: '%0' });
 
@@ -3813,6 +3970,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
   it('injectTextToAgent re-checks after the task read: aborts before paste if cancel lands during taskStore.get', async () => {
     const t = await seedTask({ status: 'in_progress' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await acquireBoundLock('qa-1', t.id);
     const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
     const realGet = taskStore.get.bind(taskStore);
     vi.spyOn(taskStore, 'get').mockImplementation(async (id: string) => {
@@ -3836,9 +3994,32 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
   it('injectTextToAgent refuses to inject when the bound task is already terminal', async () => {
     const t = await seedTask({ id: 'task-rf-terminal', status: 'cancelled' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await acquireBoundLock('qa-1', t.id);
     await expect(
       manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
     ).rejects.toThrow(/terminal/);
+  });
+
+  it('injectTextToAgent refuses a newer lock generation for the same task', async () => {
+    const t = await seedTask({ id: 'task-rf-rebound', status: 'in_progress' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    const oldToken = await acquireBoundLock('qa-1', t.id);
+    expect(oldToken).toBeTruthy();
+    await agentStore.update('qa-1', state => ({ ...state!, lockToken: oldToken!, updatedAt: NOW }));
+    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    const realGet = taskStore.get.bind(taskStore);
+    vi.spyOn(taskStore, 'get').mockImplementation(async (id: string) => {
+      await lockManager.releaseIfOwner('qa-1', t.id, oldToken!);
+      const newToken = await lockManager.acquire('qa-1', t.id);
+      expect(newToken).toBeTruthy();
+      await agentStore.update('qa-1', state => ({ ...state!, lockToken: newToken!, updatedAt: NOW }));
+      return realGet(id);
+    });
+
+    await expect(
+      manager.injectTextToAgent('qa-1', 'stale file body', { expectedTaskId: t.id }),
+    ).rejects.toThrow(/exclusive lock changed/);
+    expect(injectSpy).not.toHaveBeenCalled();
   });
 
   it('attachImageToRunningAgent refuses to paste into a pane held by cancel cleanup', async () => {
@@ -3907,33 +4088,18 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     expect(m.cancelInterruptGuardWaitMs).toBeGreaterThanOrEqual(60_000);
   });
 
-  it('markAwaitingHuman does not let a generic hold overwrite a cancel-cleanup hold (but cancel transitions do)', async () => {
+  it('markAwaitingHuman does not let a generic hold overwrite a cancel-cleanup hold', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
 
     await manager.markAwaitingHuman('dev-1', 'code-dispatch-failed', 'generic dispatch failure');
     expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clearing');
 
-    await manager.markAwaitingHuman('dev-1', 'cancel-clear-failed', 'cancel /clear unconfirmed');
-    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clear-failed');
-  });
-
-  it('markAwaitingHuman does NOT downgrade cancel-clear-failed (DELETE-only) to cancel-interrupt-failed', async () => {
-    await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
-    await manager.markAwaitingHuman('dev-1', 'cancel-interrupt-failed', 'late interrupt failure');
-    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clear-failed');
   });
 
   it('markAwaitingHuman still allows the escalation cancel-clearing → cancel-interrupt-failed', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
     await manager.markAwaitingHuman('dev-1', 'cancel-interrupt-failed', 'interrupt failed');
     expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-interrupt-failed');
-  });
-
-  it('markPaneCancelClearing does NOT downgrade an existing cancel-clear-failed back to cancel-clearing', async () => {
-    await seedAgent({ id: 'dev-1', taskId: 'tX', status: 'awaiting_human', awaitingPhase: 'cancel-clear-failed' });
-    await (manager as unknown as { markPaneCancelClearing: (a: string, t: string) => Promise<void> })
-      .markPaneCancelClearing('dev-1', 'tX');
-    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('cancel-clear-failed');
   });
 
   it('markPaneCancelClearing still sets cancel-clearing from a non-hold binding (initial cancel)', async () => {
@@ -4007,14 +4173,19 @@ describe('AgentManager.prHasDevReplySince', () => {
 });
 
 describe('AgentManager dispatchPostMergeCleanup', () => {
-  it('releases the agent when it has no paneId in the store (no compact possible)', async () => {
+  it('keeps the binding and lock when no runtime pane is available for safe release', async () => {
     const execs: string[] = [];
     manager = makeManager({ runnerFactory: () => recordingRunner(execs) });
     await seedAgent({ id: 'dev-1', taskId: 'task-x' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'task-x', branch: 'bx/task-x' });
 
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-x',
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
   it('runs the full cycle: idle → /clear → release, with NO agent dialogue', async () => {
@@ -4022,7 +4193,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const promptInjections: string[] = [];
     manager = makeManager({ runnerFactory: () => compactRunner(execs, captureInjection(promptInjections)) });
     setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -4035,11 +4206,26 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
+  it('temporarily claims an exact lock before cleaning an unbound idle agent', async () => {
+    const execs: string[] = [];
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main' });
+
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+    await waitUntilAsync(async () =>
+      !(await agentStore.get('dev-1'))?.taskId && !(await lockManager.isLocked('dev-1')),
+    );
+
+    expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
   it('releases after post-merge clear when a small claude pane hides the footer ready anchor', async () => {
     const execs: string[] = [];
     manager = makeManager({ runnerFactory: () => smallPaneClaudeCompactRunner(execs) });
     setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -4048,60 +4234,40 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('runs server-side fetch+prune + branch -D in repoPath, then /clear', async () => {
+  it('never force-deletes a local branch during post-merge cleanup', async () => {
     const execs: string[] = [];
     manager = makeManager({ runnerFactory: () => compactRunner(execs) });
     setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main-clone', taskId: 'merged-task' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main-clone', taskId: 'merged-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/task-merge' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
-    const fetchCmd = execs.find(c => c.includes('git fetch --prune origin'));
-    expect(fetchCmd).toContain("cd '/repo/main-clone'");
-    expect(fetchCmd).toContain('git worktree prune');
-    const delCmd = execs.find(c => c.includes('git branch -D'));
-    expect(delCmd).toContain("git branch -D 'bx/task-merge'");
+    expect(execs.join('\n')).not.toContain('git branch -D');
     expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
   });
 
-  it('removes the worktree before deleting the branch (branch -D would fail while the worktree holds the ref)', async () => {
+  it('holds taskId on the binding during local branch cleanup and releases after', async () => {
     const execs: string[] = [];
+    let taskIdDuringCheckoutCleanup: string | undefined;
     manager = makeManager({ runnerFactory: () => compactRunner(execs) });
     setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main', worktreePath: '/wt/merged-task' });
-
-    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
-
-    const removeIdx = execs.findIndex(c => c.includes('git worktree remove'));
-    const branchIdx = execs.findIndex(c => c.includes('git branch -D'));
-    expect(removeIdx).toBeGreaterThanOrEqual(0);
-    expect(branchIdx).toBeGreaterThan(removeIdx);
-    expect(execs.find(c => c.includes('git worktree remove'))).toContain("git worktree remove '/wt/merged-task' --force");
-    expect((await agentStore.get('dev-1'))?.worktreePath).toBeUndefined();
-  });
-
-  it('holds taskId on the binding during cleanup and releases after', async () => {
-    const execs: string[] = [];
-    let taskIdDuringBranchDelete: string | undefined;
-    manager = makeManager({
-      runnerFactory: () => compactRunner(execs, async (cmd) => {
-        if (cmd.includes('git branch -D')) taskIdDuringBranchDelete = (await agentStore.get('dev-1'))?.taskId;
-      }),
+    await seedTask({ id: 'merged-task', branch: 'bx/merged-task', status: 'merged' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'merged-task' });
+    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
+      taskIdDuringCheckoutCleanup = (await agentStore.get('dev-1'))?.taskId;
+      return { status: 'deleted' };
     });
-    setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
-    expect(taskIdDuringBranchDelete).toBe('merged-task');
+    expect(taskIdDuringCheckoutCleanup).toBe('merged-task');
     expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('a failed branch delete is logged server-side but does not change the wrap-up — still /clear, never /compact', async () => {
+  it('post-merge wrap-up never invokes the retired force-delete path', async () => {
     const BUSY = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
     const IDLE = '⏵⏵ bypass permissions on /tmp/repo\n\n>';
     let busyLeft = 0;
@@ -4110,9 +4276,6 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
       runnerFactory: () => ({
         exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
           execs.push(cmd);
-          if (cmd.includes('git branch -D')) {
-            return { stdout: '', stderr: "error: Cannot delete branch 'bx/merged-task' checked out at '/tmp/wt'", exitCode: 1 };
-          }
           if (cmd.includes('send-keys') && cmd.includes("'Enter'")) busyLeft = 3;
           if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
             return { stdout: 'claude\n', stderr: '', exitCode: 0 };
@@ -4129,40 +4292,38 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
       }) as unknown as CommandRunner,
     });
     setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main', taskId: 'merged-task' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'merged-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const joined = execs.join('\n');
+    expect(joined).not.toContain('git branch -D');
     expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
     expect(joined).not.toMatch(/\/compact/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
-  it('warns (does not silently skip) when the binding has no repoPath to delete the branch from', async () => {
+  it('releases a binding without workdir because branch deletion is centralized elsewhere', async () => {
     const execs: string[] = [];
     manager = makeManager({ runnerFactory: () => compactRunner(execs) });
     setCompactTiming(manager);
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/no repoPath on binding; skipping local branch delete/));
     const joined = execs.join('\n');
     expect(joined).not.toContain('git branch -D');
     expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    warnSpy.mockRestore();
   });
 
   it('treats a fast /clear (busy seen only briefly) as success, not a failed start', async () => {
     const execs: string[] = [];
     manager = makeManager({ runnerFactory: () => compactRunner(execs, undefined, 1) });
     setCompactTiming(manager);
-    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
@@ -4177,7 +4338,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const execs: string[] = [];
     manager = makeManager({ runnerFactory: () => compactRunner(execs) });
     setCompactTiming(manager, 50, 5);
-    await seedAgent({ id: 'dev-1', paneId: '%5', repoPath: '/repo/main', taskId: 'next-task' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', workdir: '/repo/main', taskId: 'next-task' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/task-merge' });
     await new Promise(r => setTimeout(r, 60));
@@ -4199,19 +4360,23 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await taskStore.get('next-task'))?.status).toBe('pending');
   });
 
-  it('retries once and releases agent on persistent failure', async () => {
+  it('keeps the binding and exact lock when runtime idleness cannot be proven', async () => {
     const execs: string[] = [];
     const alwaysBusy = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
     manager = makeManager({ runnerFactory: () => capturePaneRunner(execs, () => alwaysBusy) });
     setCompactTiming(manager, 50, 5);
-    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
-    await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId, 5000);
+    await waitUntilAsync(async () => (await agentStore.get('dev-1'))?.awaitingPhase === 'post-merge-cleanup-not-idle', 5000);
 
     const binding = await agentStore.get('dev-1');
-    expect(binding?.taskId).toBeUndefined();
-    expect(binding?.status).not.toBe('awaiting_human');
+    expect(binding).toMatchObject({
+      taskId: 'merged-task',
+      status: 'awaiting_human',
+      awaitingPhase: 'post-merge-cleanup-not-idle',
+    });
+    expect(await lockManager.isOwner('dev-1', 'merged-task', binding!.lockToken!)).toBe(true);
   });
 
   it('does not write taskId when paneId changes between initial read and update (race with retry/restart)', async () => {
@@ -4233,6 +4398,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const binding = await agentStore.get('dev-1');
     expect(binding?.taskId).toBeUndefined();
     expect(binding?.paneId).toBe('%99');
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
     expect(execs.join('\n')).not.toContain('git fetch');
     expect(execs.join('\n')).not.toContain('/clear');
   });
@@ -4254,7 +4420,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
       }),
     });
     setCompactTiming(manager, 50, 5);
-    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', repoPath: '/repo/main' });
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
 
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await new Promise(r => setTimeout(r, 500));
@@ -4265,6 +4431,42 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const binding = await agentStore.get('dev-1');
     expect(binding?.taskId).toBe('new-review-task');
   });
+
+  it('stops touching the pane when the same task acquires a newer lock generation', async () => {
+    const execs: string[] = [];
+    const busy = '⏵⏵ bypass permissions on /tmp/repo\n\n· Compacting… (3s)\n  esc to interrupt\n';
+    let captureCount = 0;
+    let generationChangedAt = -1;
+    manager = makeManager({
+      runnerFactory: () => capturePaneRunner(execs, async () => {
+        captureCount++;
+        if (captureCount === 3) {
+          const current = (await agentStore.get('dev-1'))!;
+          await lockManager.releaseIfOwner('dev-1', 'merged-task', current.lockToken!);
+          const newToken = await lockManager.acquire('dev-1', 'merged-task');
+          expect(newToken).toBeTruthy();
+          await agentStore.update('dev-1', state => ({
+            ...state!,
+            lockToken: newToken!,
+            updatedAt: new Date().toISOString(),
+          }));
+          generationChangedAt = execs.length;
+        }
+        return busy;
+      }),
+    });
+    setCompactTiming(manager, 50, 5);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+    await new Promise(r => setTimeout(r, 500));
+
+    expect(generationChangedAt).toBeGreaterThanOrEqual(0);
+    expect(execs.slice(generationChangedAt).filter(c => c.includes('send-keys'))).toHaveLength(0);
+    const binding = await agentStore.get('dev-1');
+    expect(binding?.taskId).toBe('merged-task');
+    expect(await lockManager.isOwner('dev-1', 'merged-task', binding!.lockToken!)).toBe(true);
+  });
 });
 
 describe('AgentManager awaiting_human lifecycle', () => {
@@ -4273,7 +4475,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     await manager.markAwaitingHuman('dev-1', 'test-phase', 'test reason');
 
@@ -4297,7 +4499,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   ])('resumeAgent on awaiting_human (cancel-interrupt-failed): $name', async ({ taskStatus, expectRelease }) => {
     const t = await seedTask({ status: taskStatus });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
 
@@ -4319,7 +4521,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   ])('resumeAgent REFUSES on awaitingPhase=%s + active task', async (phase) => {
     const t = await seedTask({ status: 'in_progress' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', status: 'awaiting_human', awaitingPhase: phase });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
 
@@ -4337,7 +4539,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'agent_dialog_resolved_runtime',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
 
@@ -4353,7 +4555,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
 
@@ -4394,7 +4596,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   ])('resumeAgent on dev-wait-gate-failed-after-qa-started: $name', async ({ taskId, taskStatus, expectRelease }) => {
     const t = await seedTask({ id: taskId, status: taskStatus });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', status: 'awaiting_human', awaitingPhase: 'dev-wait-gate-failed-after-qa-started' });
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('qa-1');
 
     const result = await manager.resumeAgent('qa-1');
 
@@ -4411,7 +4613,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const ok = await manager.releaseAgentForTask('dev-1', t.id, 'idle', { allowAwaitingHuman: true });
 
@@ -4435,10 +4637,10 @@ describe('AgentManager awaiting_human lifecycle', () => {
   it('resumeAgent no longer triggers drainQueue (pending tasks wait for explicit dispatchPendingTask)', async () => {
     const t = await seedTask({ id: 'task-resume-drain', status: 'cancelled' });
     await seedAgent({
-      id: 'dev-1', taskId: t.id,
+      id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const result = await manager.resumeAgent('dev-1');
 
@@ -4456,7 +4658,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
   ])('releaseAgentForTask gate: $name', async ({ agentId, paneId, taskStatus, phase, opt, expectedOk }) => {
     const t = await seedTask({ status: taskStatus });
     await seedAgent({ id: agentId, taskId: t.id, paneId, status: 'awaiting_human', awaitingPhase: phase });
-    await lockManager.acquire(agentId);
+    await acquireBoundLock(agentId);
 
     const ok = await manager.releaseAgentForTask(agentId, t.id, 'idle', opt);
 
@@ -4476,7 +4678,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
       taskId = t.id;
     }
     await seedAgent({ id: 'qa-1', taskId, paneId: '%1', status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown' });
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('qa-1');
 
     const result = await manager.resumeAgent('qa-1');
 
@@ -4501,8 +4703,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'qa-1', taskId: t.id, paneId: '%1',
     });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
     vi.spyOn(manager, 'startSession').mockRejectedValue(
       new DispatchTerminalError('ack_unknown', 'simulated infra'),
     );
@@ -4551,8 +4753,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'qa-1', taskId: t.id, paneId: '%1',
     });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
     vi.spyOn(manager, 'startSession').mockImplementation(async (_taskId, agentId, _phase, opts) => {
       const err = new EnsureSessionError(
         { createdSession: true, agentId, dialogPending: true },
@@ -4575,8 +4777,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
     const t = await seedTask({ id: 'task-claim-approved', status: 'approved', prNumber: 99, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 1 });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
-    await lockManager.acquire('dev-1');
-    await lockManager.acquire('qa-1');
+    await acquireBoundLock('dev-1');
+    await acquireBoundLock('qa-1');
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
       const fresh = await taskStore.get(t.id);
       if (fresh) await taskStore.set({ ...fresh, status: 'fixing', updatedAt: NOW });
@@ -4725,8 +4927,8 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('qa-1');
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('qa-1');
+    await acquireBoundLock('dev-1');
 
     const err = new EnsureSessionError(
       { createdSession: false, agentId: 'qa-1', dialogPending: true },
@@ -4745,7 +4947,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const err = new EnsureSessionError(
       { createdSession: false, agentId: 'dev-1', dialogPending: true },
@@ -4766,7 +4968,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const err = new EnsureSessionError(
       { createdSession: false, agentId: 'dev-1', dialogPending: true },
@@ -4784,7 +4986,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const err = new EnsureSessionError(
       { createdSession: false, agentId: 'dev-1', dialogPending: true },
@@ -4803,7 +5005,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const err = new EnsureSessionError(
       { createdSession: false, agentId: 'dev-1', dialogPending: true },
@@ -4955,7 +5157,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const ok = await manager.releaseAgentForTask('dev-1', t.id, 'idle');
 
@@ -4983,7 +5185,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
       id: 'dev-1', taskId: 'task-reentry-block', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const ok = await manager.acquireAgentForTask('dev-1', 'task-reentry-block', 'fix');
     expect(ok).toBe(false);
@@ -5027,7 +5229,7 @@ async function runAck(
   const localManager = makeInjectManager(runner, opts.ackMs, opts.settleMs);
   const t = await seedTask();
   await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-  if (opts.lock !== false) await lockManager.acquire('dev-1');
+  if (opts.lock !== false) await acquireBoundLock('dev-1');
   const tmux = new TmuxManager(runner);
   try {
     const result = await callInjectAndAwaitAck(localManager, tmux, '%0', opts.prompt ?? 'hello prompt', 'dev-1', 'claude-code');
@@ -5058,7 +5260,7 @@ describe('injectAndAwaitAck ack timeout', () => {
 
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
 
     const tmux = new TmuxManager(stuckRunner);
 
@@ -5661,7 +5863,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const localManager = makeInjectManager(runner, 150, 150);
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     const tmux = new TmuxManager(runner);
     vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockImplementation(async () => {
       const cur = await taskStore.get(t.id);
@@ -5748,7 +5950,7 @@ describe('AgentManager max_rounds manual actions', () => {
       await seedAgent({
         id: 'dev-1', status: 'awaiting_human',
         awaitingPhase: 'signal-arm-failed:pr-fixed', taskId: 'task-mr',
-        worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
+        workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
       });
       const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
       await expect(manager.markTaskComplete('task-mr')).rejects.toMatchObject({ status: 409 });
@@ -5760,7 +5962,7 @@ describe('AgentManager max_rounds manual actions', () => {
       await taskStore.set(maxRoundsTask({ qaAgentId: 'qa-1' }));
       await seedAgent({
         id: 'dev-1', status: 'waiting',
-        taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
+        taskId: 'task-mr', workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc', paneId: '%1',
       });
       await seedAgent({
         id: 'qa-1', status: 'awaiting_human',
@@ -5798,7 +6000,7 @@ describe('AgentManager max_rounds manual actions', () => {
       await taskStore.set(maxRoundsTask());
       await seedAgent({
         id: 'dev-1', status: 'waiting',
-        taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc',
+        taskId: 'task-mr', workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc',
         paneId: '%1',
       });
       let release: () => void = () => {};
@@ -5838,7 +6040,7 @@ describe('AgentManager max_rounds manual actions', () => {
     async function bindReservedDev(): Promise<void> {
       await seedAgent({
         id: 'dev-1', status: 'waiting',
-        taskId: 'task-mr', worktreePath: '/tmp/repo/.baxian-worktrees/task-mr_abc',
+        taskId: 'task-mr', workdir: '/tmp/repo/.baxian-worktrees/task-mr_abc',
         paneId: '%1',
       });
     }
@@ -5873,7 +6075,7 @@ describe('AgentManager max_rounds manual actions', () => {
 
     it('rejects with 409 when the reserved worktree is gone, pointing at complete/cancel (not Retry)', async () => {
       await taskStore.set(maxRoundsTask());
-      await seedAgent({ id: 'dev-1', taskId: 'task-mr' });
+      await seedAgent({ id: 'dev-1', taskId: 'task-mr', workdir: '' });
       await expect(manager.continueDevRound('task-mr')).rejects.toMatchObject({
         status: 409,
         message: expect.stringMatching(/mark-complete|cancel/),
@@ -5950,7 +6152,7 @@ describe('AgentManager max_rounds manual actions', () => {
     });
 
     it('allows spec-phase max_rounds to retry AND finalizes the old task (no lingering active duplicate)', async () => {
-      await taskStore.set(maxRoundsTask({ phase: 'spec' }));
+      await taskStore.set(maxRoundsTask({ phase: 'spec', prNumber: undefined, prUrl: undefined }));
       vi.spyOn(manager, 'validateTaskDispatch').mockResolvedValue();
       const createSpy = vi
         .spyOn(manager, 'createAndStartTask')
@@ -5965,7 +6167,7 @@ describe('AgentManager max_rounds manual actions', () => {
   });
 
   it('cancelTask cancels a max_rounds task (non-terminal) and releases the reserved dev', async () => {
-    await taskStore.set(maxRoundsTask());
+    await taskStore.set(maxRoundsTask({ prNumber: undefined, prUrl: undefined }));
     await seedAgent({
       id: 'dev-1', status: 'waiting',
       taskId: 'task-mr', paneId: '%1',
@@ -6013,7 +6215,7 @@ describe('AgentManager — non-GitHub platform derivation', () => {
     glHasQa?: boolean;
   }): BaxianConfig {
     const dev = { id: 'gldev', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: '/tmp/repo' };
-    const qa = { id: 'glqa', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: '/tmp/repo' };
+    const qa = { id: 'glqa', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: '/tmp/qa-repo' };
     return {
       review: {
         rounds: 2,
@@ -6128,7 +6330,7 @@ describe('AgentManager — non-GitHub platform derivation', () => {
       review: { rounds: 2, mode: 'server' },
       project: [{ id: 'gl', repo: GL, merge: null, agent: [[
         { id: 'gldev', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-        { id: 'glqa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo' },
+        { id: 'glqa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
       ]] }],
     });
     const m = makeMgr(prepared);
@@ -6148,6 +6350,18 @@ function stubEnsureSession(mgr: AgentManager, over: Record<string, unknown> = {}
   vi.spyOn(mgr, 'ensureSession').mockResolvedValue({
     ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo', ...over,
   });
+  vi.spyOn(
+    mgr as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+    'waitForReplPromptReady',
+  ).mockResolvedValue(undefined);
+  vi.spyOn(
+    mgr as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
+    'clearRuntimeForTaskBoundary',
+  ).mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 }
 
 function stubImagePathsThrow(mgr: AgentManager, err: Error): void {
@@ -6158,6 +6372,18 @@ function stubImagePathsThrow(mgr: AgentManager, err: Error): void {
 }
 
 describe('AgentManager.startSession pre/mid-dispatch gates', () => {
+  it('aborts before ensureSession when the exact task lock is missing', async () => {
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const state = (await agentStore.get('dev-1'))!;
+    await lockManager.releaseIfOwner('dev-1', t.id, state.lockToken!);
+    const ensureSpy = vi.spyOn(manager, 'ensureSession');
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).resolves.toBe(false);
+
+    expect(ensureSpy).not.toHaveBeenCalled();
+  });
+
   it('aborts before ensureSession when the task disappears at the pre-create gate', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
@@ -6235,45 +6461,42 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     expect(killSpy).not.toHaveBeenCalled();
   });
 
-  it('maps PromptSizeError to DispatchTerminalError(prompt_too_large) and removes the fresh worktree', async () => {
+  it('maps PromptSizeError to DispatchTerminalError(prompt_too_large) and parks the fixed Workdir', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
     stubImagePathsThrow(manager, new PromptSizeError(999_999));
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
       name: 'DispatchTerminalError',
       reason: 'prompt_too_large',
     });
-    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/wt', undefined);
+    expect(parkSpy).toHaveBeenCalledWith('/tmp/repo');
   });
 
   it('maps RequiredSkillsMissingError to DispatchTerminalError(required_skills_missing)', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
     stubImagePathsThrow(manager, new RequiredSkillsMissingError(['baxian-task-check']));
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
       reason: 'required_skills_missing',
     });
-    expect(removeSpy).toHaveBeenCalled();
+    expect(parkSpy).toHaveBeenCalledWith('/tmp/repo');
   });
 
   it.each([
     { name: 'task disappears mid-dispatch', fresh: null },
     { name: 'task turns terminal mid-dispatch', fresh: { status: 'cancelled' as const } },
     { name: 'task status leaves the phase expectation mid-dispatch', fresh: { status: 'review' as const } },
-  ])('cleans up the worktree and aborts when the $name', async ({ fresh }) => {
+  ])('parks the fixed Workdir and aborts when the $name', async ({ fresh }) => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
     stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
     const realGet = taskStore.get.bind(taskStore);
     let calls = 0;
@@ -6284,63 +6507,166 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     });
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).resolves.toBe(false);
-    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/wt', undefined);
+    expect(parkSpy).toHaveBeenCalledWith('/tmp/repo');
   });
 
-  it('cleans up and aborts when the bound agent loses the binding mid-dispatch', async () => {
+  it('aborts without cleanup when the bound agent loses ownership mid-dispatch', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
+    let checkoutFinished = false;
+    vi.spyOn(
+      manager as unknown as { imagePathsForDispatch: (...args: unknown[]) => Promise<string[]> },
+      'imagePathsForDispatch',
+    ).mockImplementation(async () => {
+      checkoutFinished = true;
+      return [];
+    });
     const realGet = agentStore.get.bind(agentStore);
-    let calls = 0;
     vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
-      calls += 1;
-      if (calls >= 2) return { id: 'dev-1', projectId: 'proj', updatedAt: NOW };
+      if (checkoutFinished) return { id: 'dev-1', projectId: 'proj', updatedAt: NOW };
       return realGet(id);
     });
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).resolves.toBe(false);
-    expect(removeSpy).toHaveBeenCalled();
+    expect(parkSpy).not.toHaveBeenCalled();
   });
 
-  it('cleans up and aborts when an unbound-phase agent gets reassigned mid-dispatch', async () => {
-    const t = await seedTask({ status: 'review', signalToken: 'tok123456789' });
-    await seedAgent({ id: 'qa-1' });
+  it('aborts without cleanup when an unbound-phase agent gets reassigned mid-dispatch', async () => {
+    const t = await seedTask({
+      status: 'review', signalToken: 'tok123456789', latestHeadSha: 'a'.repeat(40),
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id });
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'createDetached').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
+    let checkoutFinished = false;
+    vi.spyOn(
+      manager as unknown as { imagePathsForDispatch: (...args: unknown[]) => Promise<string[]> },
+      'imagePathsForDispatch',
+    ).mockImplementation(async () => {
+      checkoutFinished = true;
+      return [];
+    });
     const realGet = agentStore.get.bind(agentStore);
-    let calls = 0;
     vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
-      calls += 1;
-      if (calls >= 2) return { id: 'qa-1', projectId: 'proj', taskId: 'stolen-task', updatedAt: NOW };
+      if (checkoutFinished) return { id: 'qa-1', projectId: 'proj', taskId: 'stolen-task', updatedAt: NOW };
       return realGet(id);
     });
 
     await expect(manager.startSession(t.id, 'qa-1', 'review')).resolves.toBe(false);
-    expect(removeSpy).toHaveBeenCalled();
+    expect(parkSpy).not.toHaveBeenCalled();
   });
 
-  it('review phase builds a detached worktree from the task branch', async () => {
-    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1', signalToken: 'tok123456789' });
-    await seedAgent({ id: 'qa-1' });
+  it('review phase checks out the exact verified remote head in the fixed Workdir', async () => {
+    const latestHeadSha = 'a'.repeat(40);
+    const t = await seedTask({
+      status: 'review', qaAgentId: 'qa-1', signalToken: 'tok123456789', latestHeadSha,
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id });
     stubEnsureSession(manager);
-    const detachedSpy = vi.spyOn(WorktreeManager.prototype, 'createDetached')
-      .mockResolvedValue('/tmp/repo/.baxian-worktrees/wt-detached');
+    const detachedSpy = vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached')
+      .mockResolvedValue(undefined);
     stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
 
     await expect(manager.startSession(t.id, 'qa-1', 'review')).resolves.toBe(true);
-    expect(detachedSpy).toHaveBeenCalledWith('/tmp/repo', t.id, t.branch);
+    expect(detachedSpy).toHaveBeenCalledWith('/tmp/repo', t.branch, latestHeadSha);
+  });
+
+  it('refreshes a moved PR head and retries the exact detached checkout once', async () => {
+    const oldHeadSha = 'a'.repeat(40);
+    const newHeadSha = 'b'.repeat(40);
+    const t = await seedTask({
+      status: 'review', qaAgentId: 'qa-1', prNumber: 17,
+      signalToken: 'tok123456789', latestHeadSha: oldHeadSha,
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id });
+    stubEnsureSession(manager, { freshRuntime: true });
+    const detachedSpy = vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached')
+      .mockRejectedValueOnce(new ReviewHeadMismatchError(t.branch!, oldHeadSha, newHeadSha))
+      .mockResolvedValue(undefined);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(newHeadSha);
+    stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
+
+    await expect(manager.startSession(t.id, 'qa-1', 'review')).resolves.toBe(true);
+
+    expect(detachedSpy).toHaveBeenNthCalledWith(1, '/tmp/repo', t.branch, oldHeadSha);
+    expect(detachedSpy).toHaveBeenNthCalledWith(2, '/tmp/repo', t.branch, newHeadSha);
+    expect((await taskStore.get(t.id))?.latestHeadSha).toBe(newHeadSha);
+  });
+
+  it('fails closed when the runtime rejects task-boundary /clear', async () => {
+    const tmux = new TmuxManager(readyRunner());
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(tmux, 'clearComposerDraft').mockResolvedValue(undefined);
+    vi.spyOn(tmux, 'captureSettledSnapshot').mockResolvedValue('before');
+    vi.spyOn(tmux, 'readPaneTitle').mockResolvedValue('');
+    vi.spyOn(tmux, 'sendKeysLiteral').mockResolvedValue(undefined);
+    vi.spyOn(tmux, 'sendEnter').mockResolvedValue(undefined);
+    vi.spyOn(tmux, 'waitSubmitAck').mockResolvedValue(undefined);
+    vi.spyOn(
+      manager as unknown as { hasRuntimeSlashCommandRejection: (...args: unknown[]) => Promise<boolean> },
+      'hasRuntimeSlashCommandRejection',
+    ).mockResolvedValue(true);
+    const revalidate = vi.fn(async () => undefined);
+    const clearBoundary = (
+      manager as unknown as {
+        clearRuntimeForTaskBoundary: (
+          tmuxManager: TmuxManager,
+          paneId: string,
+          agentId: string,
+          runtime: AgentConfig['runtime'],
+          revalidateOwner: () => Promise<void>,
+        ) => Promise<void>;
+      }
+    ).clearRuntimeForTaskBoundary.bind(manager);
+
+    await expect(clearBoundary(tmux, '%0', 'dev-1', 'claude-code', revalidate))
+      .rejects.toThrow('Runtime rejected /clear');
+
+    expect(tmux.sendKeysLiteral).toHaveBeenCalledWith('%0', '/clear');
+    expect(revalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retag stale skills when task-boundary /clear fails', async () => {
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    vi.spyOn(manager, 'ensureSession').mockResolvedValue({
+      ok: true,
+      createdSession: false,
+      freshRuntime: false,
+      skillsStale: true,
+      paneId: '%0',
+      workdir: '/tmp/repo',
+    });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForTaskBoundary',
+    ).mockRejectedValue(new Error('Runtime rejected /clear'));
+    const tagSpy = vi.spyOn(
+      manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
+      'tagSessionSkillsVersion',
+    ).mockResolvedValue(undefined);
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
+      name: 'EnsureSessionError',
+      partial: expect.objectContaining({ handled: true }),
+    });
+    expect(tagSpy).not.toHaveBeenCalled();
   });
 
   it('warns but keeps the delivered dispatch when both marker-clear and the hold fail', async () => {
     const t = await seedTask({ id: 'task-deliver-hold-fails', branch: 'bx/task-deliver-hold-fails' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
 
     let afterAck = false;
     let threwOnce = false;
@@ -6358,30 +6684,47 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     warnSpy.mockRestore();
   });
 
-  it('releases the binding, lock and worktree when the paste fails with a non-ack_unknown error', async () => {
+  it('releases the binding and lock after parking the Workdir when paste fails definitively', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
     stubInject(manager, async () => { throw new Error('paste failed'); });
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow('paste failed');
-    expect(removeSpy).toHaveBeenCalled();
+    expect(parkSpy).toHaveBeenCalledWith('/tmp/repo');
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBeUndefined();
     expect(state?.paneId).toBe('%0');
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
+  it('holds the binding and lock when a failed dispatch checkout cannot be parked', async () => {
+    const t = await seedTask();
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await acquireBoundLock('dev-1');
+    stubEnsureSession(manager);
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockRejectedValue(new Error('checkout park failed'));
+    stubInject(manager, async () => { throw new Error('paste failed'); });
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true }),
+      message: expect.stringContaining('checkout park failed'),
+    });
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'checkout-cleanup-failed',
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
   it('leaves the new owner untouched when the agent was reassigned while the paste was failing', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
     stubInject(manager, async () => {
       await agentStore.set({ id: 'dev-1', projectId: 'proj', taskId: 'new-owner-task', updatedAt: NOW });
       throw new Error('paste failed');
@@ -6395,10 +6738,8 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
   it('rethrows the paste error even when the cleanup write itself fails', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     stubEnsureSession(manager);
-    vi.spyOn(WorktreeManager.prototype, 'create').mockResolvedValue('/tmp/repo/.baxian-worktrees/wt');
-    vi.spyOn(WorktreeManager.prototype, 'removeWithBranch').mockResolvedValue();
     stubInject(manager, async () => { throw new Error('paste failed'); });
     const realUpdate = agentStore.update.bind(agentStore);
     let updates = 0;
@@ -6422,7 +6763,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     const t = await seedTask({ status: 'fixing', signalToken: 'tok123456789' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
     return t;
   }
@@ -6431,7 +6772,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     const t = await seedTask({ status: 'approved' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
     stubEnsureSession(manager);
     const ensureSpy = vi.spyOn(manager, 'ensureSession');
@@ -6445,7 +6786,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     const t = await seedTask({ status: 'fixing' });
     await seedAgent({
       id: 'dev-1', taskId: 'other-task', paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
 
     await expect(manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(false);
@@ -6455,7 +6796,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     const t = await seedTask({ status: 'review', signalToken: 'tok123456789' });
     await seedAgent({
       id: 'qa-1', taskId: 'other-task', paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
 
     await expect(manager.continueSession(t.id, 'qa-1', 'recheck')).resolves.toBe(false);
@@ -6535,16 +6876,22 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   it('skips the paste when an unbound-phase agent gets reassigned pre-paste', async () => {
     const t = await seedTask({ status: 'review', signalToken: 'tok123456789' });
     await seedAgent({
-      id: 'qa-1', paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      id: 'qa-1', taskId: t.id, paneId: '%0',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
     stubEnsureSession(manager);
     stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
+    let promptBuilt = false;
+    vi.spyOn(
+      manager as unknown as { imagePathsForDispatch: (...args: unknown[]) => Promise<string[]> },
+      'imagePathsForDispatch',
+    ).mockImplementation(async () => {
+      promptBuilt = true;
+      return [];
+    });
     const realGet = agentStore.get.bind(agentStore);
-    let calls = 0;
     vi.spyOn(agentStore, 'get').mockImplementation(async (id) => {
-      calls += 1;
-      if (calls >= 2) return { id: 'qa-1', projectId: 'proj', taskId: 'stolen-task', updatedAt: NOW };
+      if (promptBuilt) return { id: 'qa-1', projectId: 'proj', taskId: 'stolen-task', updatedAt: NOW };
       return realGet(id);
     });
 
@@ -6555,7 +6902,7 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     const t = await seedTask({ status: 'approved' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
     });
     stubEnsureSession(manager);
     stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
@@ -6575,7 +6922,7 @@ describe('AgentManager need-input badge lifecycle', () => {
     const t = await seedTask({ status: 'fixing', signalToken: 'tok123456789' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo/.baxian-worktrees/wt',
       needInputAt: '2026-07-06T10:00:00.000Z',
     });
     stubEnsureSession(manager);
@@ -6604,39 +6951,51 @@ describe('AgentManager need-input badge lifecycle', () => {
 });
 
 describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', () => {
-  it('removes the reserved worktree when the release path runs', async () => {
+  it('cleans the exact baxian task branch when the release path runs', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo',
     });
-    await lockManager.acquire('dev-1');
-    const removeSpy = vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue();
+    await acquireBoundLock('dev-1');
+    const cleanupSpy = vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch')
+      .mockResolvedValue({ status: 'deleted' });
 
     const result = await manager.resumeAgent('dev-1');
 
     expect(result).toEqual({ resumed: true, releasedBinding: true });
-    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/wt');
+    expect(cleanupSpy).toHaveBeenCalledWith('/tmp/repo', expect.objectContaining({
+      taskId: t.id,
+      taskBranch: t.branch,
+    }), expect.any(Function));
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('still resumes when the worktree removal fails', async () => {
+  it('keeps the binding and lock when fixed-Workdir branch cleanup fails', async () => {
     const t = await seedTask({ status: 'cancelled' });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+      workdir: '/tmp/repo',
     });
-    await lockManager.acquire('dev-1');
-    vi.spyOn(WorktreeManager.prototype, 'remove').mockRejectedValue(new Error('rm blip'));
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await acquireBoundLock('dev-1');
+    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockRejectedValue(new Error('cleanup blip'));
 
     const result = await manager.resumeAgent('dev-1');
 
-    expect(result).toEqual({ resumed: true, releasedBinding: true });
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('worktree.remove failed'))).toBe(true);
-    warnSpy.mockRestore();
+    expect(result).toMatchObject({
+      resumed: false,
+      releasedBinding: false,
+      reason: expect.stringContaining('cleanup blip'),
+    });
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+      awaitingReason: expect.stringContaining('cleanup blip'),
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
   it('re-holds the agent when the code redispatch is not delivered', async () => {
@@ -6645,7 +7004,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'code-dispatch-failed',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     vi.spyOn(manager, 'continueSession').mockResolvedValue(false);
     const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
 
@@ -6663,7 +7022,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       id: 'dev-1', taskId: t.id, paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'code-dispatch-failed',
     });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     vi.spyOn(manager, 'continueSession').mockRejectedValue(new Error('redispatch boom'));
     const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -6682,7 +7041,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
 describe('AgentManager.createTask queue reasons', () => {
   it('queues with agent_locked when the dev binding is free but its lock is already held', async () => {
     await seedAgent({ id: 'dev-1' });
-    await lockManager.acquire('dev-1', 'foreign-holder');
+    await acquireBoundLock('dev-1', 'foreign-holder');
 
     const created = await manager.createTask('proj', {
       title: 'locked out',
@@ -6812,16 +7171,16 @@ describe('AgentManager read-file relay', () => {
     expect(manager.getReviewTransport()).toBe(manager.getReviewTransport());
   });
 
-  it('refreshWorktreeCacheFor caches the bound worktree and clears it when absent', async () => {
-    await seedAgent({ id: 'dev-1', worktreePath: '/tmp/repo/.baxian-worktrees/wt' });
-    await expect(manager.refreshWorktreeCacheFor('dev-1')).resolves.toBe('/tmp/repo/.baxian-worktrees/wt');
+  it('refreshWorkdirCacheFor caches the bound worktree and clears it when absent', async () => {
+    await seedAgent({ id: 'dev-1', workdir: '/tmp/repo/.baxian-worktrees/wt' });
+    await expect(manager.refreshWorkdirCacheFor('dev-1')).resolves.toBe('/tmp/repo/.baxian-worktrees/wt');
     await seedAgent({ id: 'dev-1' });
-    await expect(manager.refreshWorktreeCacheFor('dev-1')).resolves.toBeUndefined();
+    await expect(manager.refreshWorkdirCacheFor('dev-1')).resolves.toBeUndefined();
   });
 
   it('injects the file range back to the still-bound QA', async () => {
     const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id, worktreePath: '/tmp/repo/.baxian-worktrees/wt' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, workdir: '/tmp/repo/.baxian-worktrees/wt' });
     await seedAgent({ id: 'qa-1', taskId: t.id });
     stubTransport(manager, async () => 'line one\nline two');
     const injectSpy = vi.spyOn(manager, 'injectTextToAgent').mockResolvedValue();
@@ -6984,7 +7343,7 @@ describe('AgentManager.continueDevRound guards & server-mode rounds', () => {
   async function bindDev(taskId: string): Promise<void> {
     await seedAgent({
       id: 'dev-1', status: 'waiting', taskId,
-      worktreePath: '/tmp/repo/.baxian-worktrees/wt', paneId: '%1',
+      workdir: '/tmp/repo/.baxian-worktrees/wt', paneId: '%1',
     });
   }
 
@@ -7358,7 +7717,7 @@ describe('AgentManager.computeCodeInterdiff', () => {
     const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'INTERDIFF-BODY') });
     await seedRounds(store, { prevHead: PREV, curHead: CUR });
     await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', worktreePath: '/wt/task-inter-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', workdir: '/wt/task-inter-1' });
 
     const result = await m.computeCodeInterdiff('task-inter-1', 2);
     expect(result).toEqual({ ok: true, diff: 'INTERDIFF-BODY' });
@@ -7375,7 +7734,7 @@ describe('AgentManager.computeCodeInterdiff', () => {
     const m = makeManager({ reviewStore: store });
     await seedRounds(store, { prevHead: PREV });
     await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', worktreePath: '/wt/task-inter-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', workdir: '/wt/task-inter-1' });
     expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'no-anchor' });
   });
 
@@ -7390,7 +7749,7 @@ describe('AgentManager.computeCodeInterdiff', () => {
     const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'x') });
     await seedRounds(store, { prevHead: PREV, curHead: CUR });
     await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'other-task', worktreePath: '/wt/other' });
+    await seedAgent({ id: 'dev-1', taskId: 'other-task', workdir: '/wt/other' });
     expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'released' });
     expect(execs.some(c => c.includes('git') && c.includes('diff'))).toBe(false);
   });
@@ -7401,7 +7760,7 @@ describe('AgentManager.computeCodeInterdiff', () => {
     const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'x') });
     await seedRounds(store, { prevHead: PREV, curHead: CUR });
     await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', workdir: '' });
     expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'released' });
     expect(execs.some(c => c.includes('git') && c.includes('diff'))).toBe(false);
   });

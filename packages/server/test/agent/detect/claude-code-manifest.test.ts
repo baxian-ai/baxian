@@ -37,6 +37,33 @@ const BASH_PERMISSION_PROMPT = [
 
 const cases: Case[] = [
   {
+    name: '非 YOLO bash 写文件权限 prompt（真实截屏 perm2-cc，issue #475）',
+    lines: [
+      "⏺ bx475",
+      "",
+      "✻ Churned for 10s",
+      "",
+      "❯ Run this exact bash command: touch /tmp/bx475-perm-probe",
+      "",
+      "⏺ Running 1 shell command…",
+      "  ⎿  $ touch /tmp/bx475-perm-probe",
+      "",
+      "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+      " Bash command",
+      "",
+      "   touch /tmp/bx475-perm-probe",
+      "   Create empty file /tmp/bx475-perm-probe",
+      "",
+      " Do you want to proceed?",
+      " ❯ 1. Yes",
+      "   2. Yes, and always allow access to tmp/ from this project",
+      "   3. No",
+      "",
+      " Esc to cancel · Tab to amend · ctrl+e to explain",
+    ],
+    expect: { state: 'pending', rule: 'generic_permission_prompt', visibleBlocker: true },
+  },
+  {
     name: 'detects OSC braille spinner as working',
     lines: [''],
     osc: '⠁ Reading file',
@@ -126,6 +153,12 @@ const cases: Case[] = [
   {
     name: 'screen idle overrides stale OSC working when no screen working signals',
     lines: ['❯ ', ''],
+    osc: '⠁ Thinking',
+    expect: { state: 'idle', rule: 'idle_composer_prompt' },
+  },
+  {
+    name: 'NBSP composer (claude-code ≥2.1 non-yolo, no box chrome) still overrides stale OSC working',
+    lines: ['❯\u00a0', ''],
     osc: '⠁ Thinking',
     expect: { state: 'idle', rule: 'idle_composer_prompt' },
   },
@@ -246,6 +279,18 @@ const cases: Case[] = [
       '❯ ',
     ],
     expect: { notRule: 'esc_to_interrupt_working' },
+  },
+  {
+    name: 'stale esc-to-interrupt above an NBSP idle composer does not stay working (claude-code ≥2.1 non-yolo)',
+    lines: [
+      '────────────────',
+      '  ❯ previous',
+      '────────────────',
+      '  esc to interrupt',
+      '',
+      '❯\u00a0',
+    ],
+    expect: { state: 'idle', notRule: 'esc_to_interrupt_working' },
   },
   {
     name: 'visible screen blocker overrides stale OSC working spinner',

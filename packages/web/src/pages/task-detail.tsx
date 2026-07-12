@@ -315,6 +315,18 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     return (
       <div>
         {error && <div className="mb-4 text-sm text-accent">{t.common.loadFailed(error)}</div>}
+        {task.branchCleanupPending && (
+          <div className="mb-4 rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
+            <div className="font-semibold">{t.taskDetail.branchCleanupPendingTitle}</div>
+            <div className="mt-1 text-og-700">{task.branchCleanupPending.reason}</div>
+          </div>
+        )}
+        {task.branchCleanupSkipped && (
+          <div className="mb-4 rounded-md border border-hairline bg-og-25 px-3 py-2.5 text-xs text-og-700">
+            <div className="font-semibold">{t.taskDetail.branchCleanupSkippedTitle}</div>
+            <div className="mt-1">{task.branchCleanupSkipped.reason}</div>
+          </div>
+        )}
         {isLegacy && (
           <div className="mb-4 rounded-md border border-accent/25 bg-accent-soft/60 px-3 py-2.5 text-xs text-accent">
             {task.status === 'pending'

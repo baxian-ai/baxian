@@ -36,10 +36,14 @@ type PollerOverrides = {
   repoStoreFactory?: unknown;
   errorRecordStore?: ErrorRecordStore;
   intervalMs?: number;
+  onPollComplete?: () => Promise<void>;
 };
 
 function makePoller(overrides: PollerOverrides = {}): BootstrapPoller {
-  const { config: cfg = config, ensure, repoStoreFactory, errorRecordStore, intervalMs = 60_000 } = overrides;
+  const {
+    config: cfg = config, ensure, repoStoreFactory, errorRecordStore,
+    intervalMs = 60_000, onPollComplete,
+  } = overrides;
   return new BootstrapPoller({
     config: cfg,
     agentStore,
@@ -48,6 +52,7 @@ function makePoller(overrides: PollerOverrides = {}): BootstrapPoller {
     repoCache: createRepoStoreCache(),
     runnerFactory: () => noopRunner as never,
     repoStoreFactory: (repoStoreFactory ?? (() => ({ ensure: ensure ?? (async () => '/p') }))) as never,
+    onPollComplete,
     intervalMs,
   });
 }
@@ -87,11 +92,11 @@ describe('BootstrapPoller', () => {
     expect(events.filter(e => e.type === 'agent.bootstrap_succeeded')).toHaveLength(0);
   });
 
-  it('updates repoPath and emits succeeded when an existing binding is updated', async () => {
+  it('updates workdir and emits succeeded when an existing binding is updated', async () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', updatedAt: NOW });
     const poller = makePoller();
     await poller.pollOnce();
-    expect((await agentStore.get('dev-1'))?.repoPath).toBe('/p');
+    expect((await agentStore.get('dev-1'))?.workdir).toBe('/p');
     expect(events.some(e => e.type === 'agent.bootstrap_succeeded')).toBe(true);
   });
 
@@ -114,6 +119,15 @@ describe('BootstrapPoller', () => {
     });
     await poller.pollOnce();
     expect(ensureCalls).toBe(2);
+  });
+
+  it('runs branch reconciliation after a completed poll', async () => {
+    const onPollComplete = vi.fn().mockResolvedValue(undefined);
+    const poller = makePoller({ onPollComplete });
+
+    await poller.pollOnce();
+
+    expect(onPollComplete).toHaveBeenCalledTimes(1);
   });
 
   it('deduplicates repeated bootstrap_failed events for the same target and error', async () => {
@@ -215,10 +229,16 @@ describe('BootstrapPoller', () => {
         ...config,
         server: { ...config.server, bootstrapRetryIntervalMs: 5000 },
       };
-      const poller = makePoller({ config: customConfig, ensure, intervalMs: 5000 });
+      let resolveInitialPoll!: () => void;
+      const initialPoll = new Promise<void>(resolve => { resolveInitialPoll = resolve; });
+      const poller = makePoller({
+        config: customConfig,
+        ensure,
+        intervalMs: 5000,
+        onPollComplete: async () => { resolveInitialPoll(); },
+      });
       poller.start();
-      await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(0);
+      await initialPoll;
       const callsAtBoot = ensure.mock.calls.length;
       expect(callsAtBoot).toBeGreaterThan(0);
 

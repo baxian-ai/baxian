@@ -4,7 +4,7 @@ description: Use when a baxian dispatch descriptor carries `phase: develop` or `
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields followed by the task `title:` and its description. Work in the directory named by `worktree:` — cd there before any file operation. Route on `phase:`: follow §Develop for `develop`, §Code for `code`. Signal wire format and emit rules: see the baxian-signals skill.
+baxian dispatches you with a block of `key: value` dispatch fields followed by the task `title:` and its description. `workdir:` is your fixed current directory and already has the task branch checked out; do not change directories or branches. Route on `phase:`: follow §Develop for `develop`, §Code for `code`. Signal wire format and emit rules: see the baxian-signals skill.
 
 ## Analyze
 
@@ -22,8 +22,8 @@ Stay in scope — out-of-scope work goes to a new GitHub Issue for `exchange: gi
 
 Your `exchange:` field selects the cross-agent medium:
 
-- `github-pr`: communicate via the GitHub PR (description, commits, reviews, comments). Commit on the branch already checked out in your `worktree:` — do NOT create or push a differently-named branch, or baxian can't match the PR to your task.
-- `server-files`: baxian reads your worktree directly; do NOT push or open a PR (the publish phase does that).
+- `github-pr`: communicate via the GitHub PR (description, commits, reviews, comments). Commit on the branch already checked out in `workdir:` — do NOT create or push a differently-named branch, or baxian can't match the PR to your task.
+- `server-files`: baxian reads your Workdir directly; do NOT push or open a PR (the publish phase does that).
 
 ## Develop
 
@@ -36,7 +36,7 @@ How you develop is yours — your installed skills and workflows decide how you 
 
 The companion for spec-first development: baxian routes your spec through review before you code.
 
-1. Write the spec to `.baxian/spec.md` in your worktree. Do NOT commit or push it — baxian reads the file directly for review.
+1. Write the spec to `.baxian/spec.md` in your Workdir. Do NOT commit or push it — baxian reads the file directly for review.
 2. Emit `spec-signal:` (`spec-done`) with `token:` — NOT the default `signal:`, which would skip spec review and push an unimplemented task forward.
 
 After the spec is approved, baxian dispatches the code phase back to you.

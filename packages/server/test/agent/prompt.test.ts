@@ -99,7 +99,7 @@ describe('buildPromptInline', () => {
       task: TASK,
       phase: 'develop',
       agent: DEV_AGENT,
-      worktreePath: '/tmp/repo',
+      workdir: '/tmp/repo',
       skillRegistry: registry,
       ...extra,
     });
@@ -114,14 +114,14 @@ describe('buildPromptInline', () => {
 
   it('dev develop force-loads the primary skill via /command, then structured key:value dispatch fields', async () => {
     await seedAndScan();
-    const prompt = build({ worktreePath: '/tmp/repo/.baxian-worktrees/task-001_abc' });
+    const prompt = build({ workdir: '/tmp/repo/.baxian-worktrees/task-001_abc' });
     expect(prompt.startsWith('/baxian-task-check\nphase: develop\n')).toBe(true);
     expect(prompt).not.toContain('[baxian]');
     expect(prompt).toContain('phase: develop');
     expect(prompt).not.toContain('role:');
     expect(prompt).not.toContain('task: task-001');
     expect(prompt).toContain('exchange: github-pr');
-    expect(prompt).toContain('worktree: /tmp/repo/.baxian-worktrees/task-001_abc');
+    expect(prompt).toContain('workdir: /tmp/repo/.baxian-worktrees/task-001_abc');
     expect(prompt).toContain('title: Fix login redirect');
     expect(prompt).not.toContain('cd into the worktree');
     expect(prompt).not.toContain('baxian conventions:');
@@ -155,7 +155,7 @@ describe('buildPromptInline', () => {
   it('imagePaths → appends a structured images: list of every absolute path', async () => {
     await seedAndScan();
     const prompt = build({
-      worktreePath: '/tmp/repo/.baxian-worktrees/task-001_abc',
+      workdir: '/tmp/repo/.baxian-worktrees/task-001_abc',
       imagePaths: ['/tmp/baxian/upload/task-001/a.png', '/tmp/baxian/upload/task-001/b.webp'],
     });
     expect(prompt).toContain('images:');
@@ -460,7 +460,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server' },
       phase,
       agent,
-      worktreePath: '/wt/x',
+      workdir: '/wt/x',
       skillRegistry: getRegistry(),
       signalToken: 'srvtok123456',
       ...extra,
@@ -536,7 +536,7 @@ describe('server review mode prompt builders', () => {
       task: TASK,
       phase: 'server-spec-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/x',
+      workdir: '/wt/x',
       skillRegistry: getRegistry(),
       signalToken: 'srvtok123456',
       serverContent: '# spec',
@@ -546,7 +546,7 @@ describe('server review mode prompt builders', () => {
       task: TASK,
       phase: 'merge',
       agent: DEV_AGENT,
-      worktreePath: '/wt/x',
+      workdir: '/wt/x',
       skillRegistry: getRegistry(),
     } as Parameters<typeof buildPromptInline>[0]);
     expect(merge).not.toContain('exchange:');
@@ -568,7 +568,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server' },
       phase: 'server-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/x',
+      workdir: '/wt/x',
       skillRegistry: getRegistry(),
       serverContent: 'diff',
     } as Parameters<typeof buildPromptInline>[0])).toThrow(/requires signalToken/);
@@ -580,7 +580,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', phase: 'spec', specReviewRound: 2 },
       phase: 'server-spec-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       currentSpecRound: 2,
@@ -596,10 +596,10 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 4 },
       phase: 'server-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
-      serverReviewWorktree: 'head',
+      serverReviewCheckout: 'head',
       serverBaseSha: 'base123',
       serverHeadSha: 'head123',
       serverHeadTree: 'tree123',
@@ -608,7 +608,7 @@ describe('server review mode prompt builders', () => {
       serverPriorFindingsFile: { path: '.baxian/review/inbox/prior-findings-round-4.json', bytes: 11 * 1024 },
       serverPriorResponse: '{"round":3,"responses":[]}',
     });
-    expect(prompt).toContain('review-worktree: head');
+    expect(prompt).toContain('review-checkout: head');
     expect(prompt).toContain('base-sha: base123');
     expect(prompt).toContain('head-sha: head123');
     expect(prompt).toContain('head-tree: tree123');
@@ -626,7 +626,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 5, phase: 'code' },
       phase: 'server-feedback',
       agent: DEV_AGENT,
-      worktreePath: '/wt/dev',
+      workdir: '/wt/dev',
       skillRegistry: registry,
       signalToken: 'tok',
       serverPriorFindingsFile: { path: '.baxian/review/inbox/findings-round-5.json', bytes: 20 * 1024 },
@@ -641,7 +641,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
       phase: 'server-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'diff --git a/a b/a\n+1',
@@ -657,7 +657,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
       phase: 'server-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'x',
@@ -671,7 +671,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
       phase: 'server-recheck',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'diff',
@@ -686,7 +686,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
       phase: 'server-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'diff',
@@ -701,7 +701,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
       phase: 'server-recheck',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'diff',
@@ -731,7 +731,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
       phase: 'server-recheck',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'diff',
@@ -747,7 +747,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
       phase: 'server-recheck',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       serverContent: 'diff',
@@ -762,7 +762,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', reviewRound: 0, phase: 'code' },
       phase: 'server-feedback',
       agent: DEV_AGENT,
-      worktreePath: '/wt/dev',
+      workdir: '/wt/dev',
       skillRegistry: registry,
       signalToken: 'tok',
       serverPriorFindings: '{"round":1,"verdict":"request-changes","findings":[]}',
@@ -777,7 +777,7 @@ describe('server review mode prompt builders', () => {
       task: { ...TASK, reviewMode: 'server', phase: 'spec', specReviewRound: 1 },
       phase: 'server-spec-review',
       agent: QA_AGENT,
-      worktreePath: '/wt/qa',
+      workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
       currentSpecRound: 1,

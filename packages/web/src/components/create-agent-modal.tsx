@@ -432,6 +432,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
                   className={inputCls}
                   placeholder={t.createAgent.workdirPlaceholder}
                   disabled={submitting} />
+                <div className={helpCls}>{t.createAgent.workdirHint}</div>
               </div>
 
               <div>

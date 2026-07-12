@@ -78,7 +78,7 @@ describe('bootstrapAutoRepos', () => {
     await bootstrapAutoRepos(autoBootstrapDeps(
       () => ({ ensure, refresh: vi.fn() } as unknown as RepoStore),
     ));
-    expect(ensure).toHaveBeenCalledTimes(1);
+    expect(ensure).toHaveBeenCalledTimes(2);
   });
 
   it('on success: emits agent.bootstrap_succeeded but does NOT create state files for never-dispatched agents', async () => {
@@ -88,13 +88,13 @@ describe('bootstrapAutoRepos', () => {
     expect(await agentStore.get('qa-a')).toBeNull();
   });
 
-  it('on success: records repoPath on existing bindings', async () => {
+  it('on success: records the resolved Workdir on existing bindings', async () => {
     await agentStore.set({
       id: 'dev-a', projectId: 'p1', updatedAt: new Date().toISOString(),
     });
     await bootstrapAutoRepos(autoBootstrapDeps(() => repoStore(async () => '/r')));
     const state = await agentStore.get('dev-a');
-    expect(state?.repoPath).toBe('/r');
+    expect(state?.workdir).toBe('/r');
     expect(hasEvent('agent.bootstrap_succeeded')).toBe(true);
   });
 
@@ -106,7 +106,7 @@ describe('bootstrapAutoRepos', () => {
     expect(await agentStore.get('dev-a')).toBeNull();
   });
 
-  it('one (project, host) failure does not block others', async () => {
+  it('one per-agent clone failure does not block other agents', async () => {
     const config: BaxianConfig = {
       ...baseConfig,
       project: [
@@ -126,7 +126,7 @@ describe('bootstrapAutoRepos', () => {
       config,
     ));
     expect(countEvents('agent.bootstrap_failed')).toBe(1);
-    expect(countEvents('agent.bootstrap_succeeded')).toBe(1);
+    expect(countEvents('agent.bootstrap_succeeded')).toBe(2);
   });
 });
 
@@ -248,7 +248,7 @@ describe('runSingleTarget — new behaviors', () => {
     const target = collectTargets(baseConfig)[0];
     events.length = 0;
     await runSingleTarget(target, buildDeps(), { emitOnUnchanged: false });
-    expect((await agentStore.get('dev-a'))?.repoPath).toBe('/r');
+    expect((await agentStore.get('dev-a'))?.workdir).toBe('/r');
     const success = events.find(e => e.type === 'agent.bootstrap_succeeded');
     expect(success).toBeTruthy();
     expect((success!.data as { updated: number }).updated).toBe(1);
@@ -271,7 +271,7 @@ describe('runSingleTarget — new behaviors', () => {
     events.length = 0;
     await runSingleTarget(target, buildDeps(), { emitOnUnchanged: false });
 
-    expect((await agentStore.get('dev-a'))?.repoPath).toBeUndefined();
+    expect((await agentStore.get('dev-a'))?.workdir).toBeUndefined();
     expect(hasEvent('agent.bootstrap_succeeded')).toBe(false);
   });
 
@@ -287,7 +287,7 @@ describe('runSingleTarget — new behaviors', () => {
     await expect(
       runSingleTarget(target, buildDeps({ eventBus: failingBus }), { emitOnUnchanged: false }),
     ).resolves.toEqual({ ok: true });
-    expect((await agentStore.get('dev-a'))?.repoPath).toBe('/r');
+    expect((await agentStore.get('dev-a'))?.workdir).toBe('/r');
   });
 
   it('failure emits bootstrap_failed even when bindings already exist', async () => {
@@ -423,7 +423,7 @@ describe('collectTargets host resolution (string id refs)', () => {
     expect(targets[0].resolvedHost).toEqual({ id: 'box', hostname: 'box.example.com', port: 2222, user: 'agent' });
   });
 
-  it('collapses two agents referencing the same machine (different ids, same endpoint) into one bootstrap group', () => {
+  it('keeps agents on the same machine as separate clone targets', () => {
     const config: BaxianConfig = {
       review: { rounds: 10 },
       server: DEFAULT_SERVER_CONFIG,
@@ -439,6 +439,8 @@ describe('collectTargets host resolution (string id refs)', () => {
         ],
       }],
     };
-    expect(collectTargets(config)).toHaveLength(1);
+    const targets = collectTargets(config);
+    expect(targets).toHaveLength(2);
+    expect(targets.map(target => target.representativeAgent.id)).toEqual(['da', 'db']);
   });
 });

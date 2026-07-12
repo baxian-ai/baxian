@@ -157,7 +157,7 @@ function makeFixture(
       host: [],
       project: [projectConfig],
     }),
-    refreshWorktreeCacheFor: async () => '/wt',
+    refreshWorkdirCacheFor: async () => '/wt',
     transitionTaskStatus,
     releaseAgentForTask,
     getAgentState,

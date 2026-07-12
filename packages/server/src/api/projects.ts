@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
+import { isAbsolute, normalize } from 'node:path';
 import type {
   AgentMode,
   AgentBindingFacts,
@@ -12,7 +13,13 @@ import type {
 import { TASK_ACTIVE_STATUS_SET, TASK_TERMINAL_STATUS_SET } from '../shared/index.js';
 import { probeTmux, runPreflight, type PreflightResult } from '../agent/preflight.js';
 import { installTmux } from '../agent/tmux-install.js';
-import { createRunner, hostGroupKey, resolveAgentHost, type CommandRunner } from '../agent/runner.js';
+import {
+  createRunner,
+  hostGroupKey,
+  resolveAgentHost,
+  workdirHostGroupKey,
+  type CommandRunner,
+} from '../agent/runner.js';
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
 import { redactProjects } from './config.js';
@@ -173,7 +180,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(409).send({
           error:
             `Project "${id}" still has ${remaining.length} agent(s); ` +
-            `delete every agent (which reclaims its tmux session / worktree) before deleting the project.`,
+            `delete every agent (which reclaims its tmux session / Workdir binding) before deleting the project.`,
           agents: remaining.map(a => a.id),
         });
       }
@@ -285,6 +292,14 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (existsGlobally) {
         return reply.status(409).send({ error: `Agent id "${agentInput.id}" already exists` });
       }
+      const workdirConflict = findConfiguredWorkdirConflict(app.ctx.config, agentInput);
+      if (workdirConflict) {
+        return reply.status(409).send({
+          error:
+            `Workdir "${normalize(agentInput.workdir!)}" is already used by agent ` +
+            `"${workdirConflict}" on the same host; different agents must not share a directory`,
+        });
+      }
 
       if (agentInput.role === 'qa') {
         if (!pairWith) {
@@ -384,7 +399,31 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const originalStates: Map<string, AgentBindingFacts | null> = new Map();
       let originalConfigHash = '';
       let validatedAfterRemove: BaxianConfig | null = null;
-      const acquiredLocks: string[] = [];
+      const deleteOwner = 'maintenance:delete-agent';
+      const acquiredLocks = new Map<string, { taskId: string; token: string }>();
+      const releaseAcquiredLocks = async (): Promise<void> => {
+        for (const [id, claim] of acquiredLocks) {
+          await app.ctx.lockManager.releaseIfOwner(id, claim.taskId, claim.token);
+        }
+        acquiredLocks.clear();
+      };
+      const rollbackAndRelease = async (): Promise<Error | null> => {
+        let rollbackError: Error | null = null;
+        try {
+          await rollbackPerTargetState(app, targets, originalStates);
+        } catch (err) {
+          rollbackError = err instanceof Error ? err : new Error(String(err));
+        }
+        try {
+          await releaseAcquiredLocks();
+        } catch (err) {
+          const releaseError = err instanceof Error ? err : new Error(String(err));
+          rollbackError = rollbackError
+            ? new AggregateError([rollbackError, releaseError], 'Agent deletion rollback and lock release failed')
+            : releaseError;
+        }
+        return rollbackError;
+      };
       let claimedTargets: string[] = [];
 
       try {
@@ -407,7 +446,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
             return reply.status(409).send({
               error:
                 `Agent "${id}" is still active on task ${task.id}; cancel the task before deleting ` +
-                `(prevents orphan task / tmux session / lock / worktree).`,
+                `(prevents orphan task / tmux session / lock / Workdir binding).`,
             });
           }
           if (state?.status === 'awaiting_human') continue;
@@ -443,18 +482,39 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         claimedTargets = targets.slice();
 
         for (const id of targets) {
-          const ok = await app.ctx.lockManager.acquire(id);
-          if (!ok) {
-            const state = await app.ctx.agentStore.get(id);
-            if (state?.status === 'awaiting_human') continue;
-            for (const got of acquiredLocks) {
-              await app.ctx.lockManager.release(got);
+          const state = await app.ctx.agentStore.get(id);
+          if (state?.taskId) {
+            let token = state.lockToken;
+            if (!token || !(await app.ctx.lockManager.isOwner(id, state.taskId, token))) {
+              const claim = await app.ctx.lockManager.claimOf(id);
+              token = claim?.taskId === state.taskId ? claim.token : undefined;
+              if (!token && claim === null) {
+                token = await app.ctx.lockManager.acquire(id, state.taskId) ?? undefined;
+                if (token) acquiredLocks.set(id, { taskId: state.taskId, token });
+              }
             }
+            if (token && await app.ctx.lockManager.isOwner(id, state.taskId, token)) {
+              await app.ctx.agentStore.update(id, (latest) => {
+                if (!latest || latest.taskId !== state.taskId || latest.lockToken === token) return latest;
+                return { ...latest, lockToken: token, updatedAt: new Date().toISOString() };
+              });
+            }
+            if (!token || !(await app.ctx.lockManager.isOwner(id, state.taskId, token))) {
+              await releaseAcquiredLocks();
+              return reply.status(409).send({
+                error: `Agent "${id}" has a stale task binding whose exclusive lock is owned by another operation; retry after it finishes.`,
+              });
+            }
+            continue;
+          }
+          const token = await app.ctx.lockManager.acquire(id, deleteOwner);
+          if (!token) {
+            await releaseAcquiredLocks();
             return reply.status(409).send({
               error: `Agent "${id}" is currently locked by another op; please retry later`,
             });
           }
-          acquiredLocks.push(id);
+          acquiredLocks.set(id, { taskId: deleteOwner, token });
         }
 
         for (const id of targets) {
@@ -467,7 +527,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         try {
           validatedAfterRemove = prepareConfig(removeRequest);
         } catch (err) {
-          for (const got of acquiredLocks) await app.ctx.lockManager.release(got);
+          await releaseAcquiredLocks();
           if (err instanceof ConfigValidationError) {
             return reply.status(400).send({ error: 'Invalid config', details: err.errors });
           }
@@ -481,23 +541,25 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       try {
         await app.ctx.agentManager.cleanupRemovedAgentRuntime(targets);
       } catch (err) {
-        if (err instanceof CleanupFailedError) {
-          app.log.error({ failures: err.failures, targets },
-            'DELETE /agents cleanupRemovedAgentRuntime failed; rolling back deletion marker');
-          await withConfigLock(async () => {
-            await rollbackPerTargetState(app, targets, originalStates);
-            for (const got of acquiredLocks) await app.ctx.lockManager.release(got);
-          });
-          return reply.status(502).send({
-            error:
-              `runtime cleanup failed for ${targets.join(',')}; agent state rolled back ` +
-              `to idle+missing. Fix the underlying SSH / tmux / worktree issue and retry DELETE.`,
-            failures: err.failures.map(f => ({ agentId: f.agentId, step: f.step,
-              error: f.error instanceof Error ? f.error.message : String(f.error) })),
+        const failures = err instanceof CleanupFailedError
+          ? err.failures
+          : [{ agentId: agentId, step: 'runtime.cleanup', error: err }];
+        app.log.error({ failures, targets },
+          'DELETE /agents cleanupRemovedAgentRuntime failed; rolling back state and locks');
+        const rollbackError = await withConfigLock(rollbackAndRelease);
+        if (rollbackError) {
+          app.log.error({ err: rollbackError, targets }, 'DELETE /agents rollback failed');
+          return reply.status(500).send({
+            error: `runtime cleanup failed and agent state could not be restored safely: ${rollbackError.message}`,
           });
         }
-        app.log.warn({ err, targets },
-          'DELETE /agents cleanupRemovedAgentRuntime threw an unrecognised error — proceeding to commit anyway');
+        return reply.status(502).send({
+          error:
+            `runtime cleanup failed for ${targets.join(',')}; agent state and exact task locks were restored. ` +
+            `Fix the underlying SSH / tmux / Workdir issue and retry DELETE.`,
+          failures: failures.map(f => ({ agentId: f.agentId, step: f.step,
+            error: f.error instanceof Error ? f.error.message : String(f.error) })),
+        });
       }
 
       const phase3Result = await withConfigLock(async () => {
@@ -509,8 +571,13 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         try {
           validated = prepareConfig(rollbackBase);
         } catch (err) {
-          await rollbackPerTargetState(app, targets, originalStates);
-          for (const got of acquiredLocks) await app.ctx.lockManager.release(got);
+          const rollbackError = await rollbackAndRelease();
+          if (rollbackError) {
+            app.log.error({ err: rollbackError, targets }, 'DELETE /agents rollback after config validation failed');
+            return reply.status(500).send({
+              error: `config validation and agent-state rollback both failed: ${rollbackError.message}`,
+            });
+          }
           if (err instanceof ConfigValidationError) {
             return reply.status(400).send({ error: 'Invalid config', details: err.errors });
           }
@@ -520,11 +587,16 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           await saveConfig(app.ctx.configPath!, validated);
         } catch (err) {
           app.log.error({ err, targets },
-            'DELETE /agents Phase 3 saveConfig failed; rolling agent state back to idle+missing');
-          await rollbackPerTargetState(app, targets, originalStates);
-          for (const got of acquiredLocks) await app.ctx.lockManager.release(got);
+            'DELETE /agents Phase 3 saveConfig failed; restoring agent state and exact locks');
+          const rollbackError = await rollbackAndRelease();
+          if (rollbackError) {
+            app.log.error({ err: rollbackError, targets }, 'DELETE /agents rollback after saveConfig failed');
+            return reply.status(500).send({
+              error: `failed to persist config and restore agent state safely: ${rollbackError.message}`,
+            });
+          }
           return reply.status(500).send({
-            error: 'failed to persist config after runtime cleanup; agents marked idle+missing for retry',
+            error: 'failed to persist config after runtime cleanup; agent state and exact task locks were restored',
           });
         }
         app.ctx.config = validated;
@@ -554,7 +626,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
                 'DELETE /agents petStore.setAssignment(null) failed');
             }
           }
-          await app.ctx.lockManager.release(id);
+          const claim = acquiredLocks.get(id);
+          if (claim) await app.ctx.lockManager.releaseIfOwner(id, claim.taskId, claim.token);
         }
         return reply.send({ removed: targets, restartRequired: false });
       });
@@ -612,6 +685,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (guard) return reply.status(guard.status).send({ error: guard.error });
 
       const owner = await resolveLockOwnership(app, agentId);
+      const maintenanceOwner = 'maintenance:restart-repl';
+      let maintenanceLockOwner = maintenanceOwner;
+      let maintenanceToken: string | null = null;
+      let acquiredMaintenanceLock = false;
       if (!owner.takeover) {
         const stateBefore = await app.ctx.agentStore.get(agentId);
         const task = stateBefore?.taskId ? await app.ctx.taskStore.get(stateBefore.taskId) : null;
@@ -623,20 +700,27 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
               `task would lose work. cancel the task first.`,
           });
         }
-        const ok = await app.ctx.lockManager.acquire(agentId);
-        if (!ok) {
+        maintenanceLockOwner = stateBefore?.taskId ?? maintenanceOwner;
+        const lock = await acquireOrReuseExactLock(app, agentId, maintenanceLockOwner);
+        if (!lock) {
           return reply.status(409).send({ error: `Agent "${agentId}" is locked by another op; please retry later` });
         }
+        maintenanceToken = lock.token;
+        acquiredMaintenanceLock = lock.acquired;
       }
 
       try {
         await app.ctx.agentManager.restartReplOnly(agentId);
       } catch (err) {
-        if (!owner.takeover) await app.ctx.lockManager.release(agentId);
+        if (maintenanceToken && acquiredMaintenanceLock) {
+          await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.status(500).send({ error: message });
       }
-      await pendingCleanupAfterReplReady(app, agentId, owner.takeover);
+      await pendingCleanupAfterReplReady(app, agentId, owner.takeover, maintenanceToken
+        ? { taskId: maintenanceLockOwner, token: maintenanceToken }
+        : undefined);
       return reply.send({ ok: true, agentId });
     },
   );
@@ -660,11 +744,25 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const owner = await resolveLockOwnership(app, agentId);
+      const maintenanceOwner = 'maintenance:retry';
+      const maintenanceLockOwner = stateBefore?.taskId ?? maintenanceOwner;
+      let maintenanceToken: string | null = null;
+      let acquiredMaintenanceLock = false;
       if (!owner.takeover) {
-        const ok = await app.ctx.lockManager.acquire(agentId);
-        if (!ok) {
+        const task = stateBefore?.taskId ? await app.ctx.taskStore.get(stateBefore.taskId) : null;
+        if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
+          return reply.status(409).send({
+            error:
+              `agent "${agentId}" is bound to active task ${task.id}, but does not hold that task's ` +
+              `exclusive lock; Resume or cancel the task before retrying the REPL.`,
+          });
+        }
+        const lock = await acquireOrReuseExactLock(app, agentId, maintenanceLockOwner);
+        if (!lock) {
           return reply.status(409).send({ error: `Agent "${agentId}" is locked by another op; please retry later` });
         }
+        maintenanceToken = lock.token;
+        acquiredMaintenanceLock = lock.acquired;
       }
 
       try {
@@ -678,7 +776,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         });
       } catch (err) {
         if (await app.ctx.agentManager.handleDialogPendingFromRuntime(agentId, err)) {
-          if (!owner.takeover) await app.ctx.lockManager.release(agentId);
+          if (maintenanceToken && acquiredMaintenanceLock) {
+            await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+          }
           return reply.status(202).send({
             ok: true,
             agentId,
@@ -697,18 +797,67 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
               'POST /retry ensureSession rollback killSession failed');
           }
         }
-        if (!owner.takeover) await app.ctx.lockManager.release(agentId);
+        if (maintenanceToken && acquiredMaintenanceLock) {
+          await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+        }
         const message = err instanceof Error ? err.message : String(err);
         return reply.status(500).send({ error: message });
       }
-      await pendingCleanupAfterReplReady(app, agentId, owner.takeover);
+      await pendingCleanupAfterReplReady(app, agentId, owner.takeover, maintenanceToken
+        ? { taskId: maintenanceLockOwner, token: maintenanceToken }
+        : undefined);
       return reply.send({ ok: true, agentId });
     },
   );
 }
 
+function findConfiguredWorkdirConflict(config: BaxianConfig, candidate: AgentConfig): string | null {
+  if (
+    typeof candidate.workdir !== 'string'
+    || candidate.workdir.trim() === ''
+    || !isAbsolute(candidate.workdir)
+    || (candidate.mode !== 'local' && candidate.mode !== 'remote')
+  ) return null;
+  const resolvedCandidateHost = resolveAgentHost(config.host, candidate.host);
+  if (
+    candidate.mode === 'remote'
+    && (!resolvedCandidateHost || typeof resolvedCandidateHost.hostname !== 'string')
+  ) return null;
+  const candidateHost = workdirHostGroupKey(
+    candidate.mode,
+    resolvedCandidateHost,
+  );
+  const candidatePath = normalize(candidate.workdir);
+  for (const project of config.project) {
+    for (const existing of project.agent.flat()) {
+      if (!existing.workdir) continue;
+      const existingHost = workdirHostGroupKey(
+        existing.mode,
+        resolveAgentHost(config.host, existing.host),
+      );
+      if (existingHost === candidateHost && normalize(existing.workdir) === candidatePath) {
+        return existing.id;
+      }
+    }
+  }
+  return null;
+}
+
 interface LockOwner {
   takeover: boolean;
+}
+
+async function acquireOrReuseExactLock(
+  app: FastifyInstance,
+  agentId: string,
+  taskId: string,
+): Promise<{ token: string; acquired: boolean } | null> {
+  const claim = await app.ctx.lockManager.claimOf(agentId);
+  if (claim) {
+    return claim.taskId === taskId ? { token: claim.token, acquired: false } : null;
+  }
+  const token = await app.ctx.lockManager.acquire(agentId, taskId);
+  return token ? { token, acquired: true } : null;
 }
 
 async function resolveLockOwnership(
@@ -722,9 +871,19 @@ async function resolveLockOwnership(
   const task = await app.ctx.taskStore.get(state.taskId);
   if (!task) return { takeover: false };
   if (!TASK_ACTIVE_STATUS_SET.has(task.status)) return { takeover: false };
-  const locked = await app.ctx.lockManager.isLocked(agentId);
-  if (!locked) return { takeover: false };
-  return { takeover: true };
+  let token = state.lockToken;
+  if (!token || !(await app.ctx.lockManager.isOwner(agentId, task.id, token))) {
+    const claim = await app.ctx.lockManager.claimOf(agentId);
+    token = claim?.taskId === task.id ? claim.token : undefined;
+    if (token) {
+      await app.ctx.agentStore.update(agentId, (latest) => {
+        if (!latest || latest.taskId !== task.id || latest.lockToken === token) return latest;
+        return { ...latest, lockToken: token, updatedAt: new Date().toISOString() };
+      });
+    }
+  }
+  if (!token) return { takeover: false };
+  return { takeover: await app.ctx.lockManager.isOwner(agentId, task.id, token) };
 }
 
 async function rejectIfOpInProgress(
@@ -742,6 +901,7 @@ async function pendingCleanupAfterReplReady(
   app: FastifyInstance,
   agentId: string,
   takeover: boolean,
+  maintenance?: { taskId: string; token: string },
 ): Promise<void> {
   const state = await app.ctx.agentStore.get(agentId);
   const taskId = state?.taskId;
@@ -751,11 +911,23 @@ async function pendingCleanupAfterReplReady(
     } else {
       await app.ctx.agentManager.clearAwaitingHuman(agentId);
     }
-    if (!takeover) await app.ctx.lockManager.release(agentId);
+    if (!takeover && maintenance) {
+      await app.ctx.lockManager.releaseIfOwner(agentId, maintenance.taskId, maintenance.token);
+    }
     return;
   }
   const task = await app.ctx.taskStore.get(taskId);
   if (!task || TASK_TERMINAL_STATUS_SET.has(task.status)) {
+    if (maintenance?.taskId === taskId) {
+      await app.ctx.agentStore.update(agentId, (latest) => {
+        if (!latest || latest.taskId !== taskId) return latest;
+        return {
+          ...latest,
+          lockToken: maintenance.token,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    }
     await app.ctx.agentManager.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true })
       .catch(err => app.log.warn({ err, agentId, taskId }, 'restart/retry idle-release failed'));
     return;
@@ -771,20 +943,43 @@ async function rollbackPerTargetState(
   targets: string[],
   originalStates: Map<string, AgentBindingFacts | null>,
 ): Promise<void> {
+  const failures: Error[] = [];
   for (const id of targets) {
     const original = originalStates.get(id) ?? null;
     if (!original) {
-      try { await app.ctx.agentStore.delete(id); } catch {}
+      try {
+        await app.ctx.agentStore.delete(id);
+      } catch (err) {
+        failures.push(new Error(`delete transient state for ${id}: ${err instanceof Error ? err.message : String(err)}`));
+      }
       continue;
     }
     try {
+      let lockToken = original.lockToken;
+      if (original.taskId) {
+        const claim = await app.ctx.lockManager.claimOf(id);
+        if (claim?.taskId === original.taskId) {
+          lockToken = claim.token;
+        } else if (claim === null) {
+          lockToken = await app.ctx.lockManager.acquire(id, original.taskId) ?? undefined;
+        } else {
+          throw new Error(`lock is owned by ${claim.taskId}, expected ${original.taskId}`);
+        }
+        if (!lockToken || !(await app.ctx.lockManager.isOwner(id, original.taskId, lockToken))) {
+          throw new Error(`could not restore exact task lock for ${original.taskId}`);
+        }
+      }
       await app.ctx.agentStore.set({
         ...original,
+        ...(original.taskId ? { lockToken } : { lockToken: undefined }),
         paneId: undefined,
         updatedAt: new Date().toISOString(),
       });
     } catch (err) {
-      app.log.warn({ err, agentId: id }, 'DELETE /agents rollback agentStore.set failed');
+      failures.push(new Error(`restore state for ${id}: ${err instanceof Error ? err.message : String(err)}`));
     }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `Failed to roll back ${failures.length} agent deletion state(s)`);
   }
 }

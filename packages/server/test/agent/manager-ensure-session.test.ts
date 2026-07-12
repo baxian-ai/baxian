@@ -10,7 +10,6 @@ import {
   EnsureSessionError,
 } from '../../src/agent/manager.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { WorktreeManager } from '../../src/agent/worktree.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -104,6 +103,7 @@ describe('AgentManager.ensureSession', () => {
       eventBus: new EventBus(new EventLog(join(tempDir, `events-${suffix}`))),
       skillRegistry: new SkillRegistry(join(tempDir, `skills-${suffix}`)),
       runnerFactory: () => runner as unknown as CommandRunner,
+      repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
       paneStreamerManager: paneStreamerManager as never,
     });
   }
@@ -116,7 +116,7 @@ describe('AgentManager.ensureSession', () => {
         agent: [
           [
             { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', yolo: true },
-            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo', yolo: true },
+            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo', yolo: true },
           ],
         ],
       }],
@@ -199,6 +199,9 @@ describe('AgentManager.ensureSession', () => {
           stderr: '', exitCode: 0,
         };
       }
+      if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
+        return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+      }
       if (cmd.includes('capture-pane')) {
         if (overrides.trustDialogReady) {
           return {
@@ -213,6 +216,9 @@ describe('AgentManager.ensureSession', () => {
       }
       if (cmd.includes('display-message')) {
         return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('BX_SKILLS_NON_GIT')) {
+        return { stdout: 'BX_SKILLS_OK\n', stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     };
@@ -251,6 +257,7 @@ describe('AgentManager.ensureSession', () => {
       eventBus,
       skillRegistry,
       runnerFactory: () => runner as unknown as CommandRunner,
+      repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
       bootstrapTimeoutsMs: { trustDialog: 200, waitReplReady: 400 },
     });
   });
@@ -326,17 +333,19 @@ describe('AgentManager.ensureSession', () => {
     expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
   });
 
-  it('runtime mode, live REPL with a stale skills version → kills + rebuilds so /baxian-* resolves', async () => {
+  it('runtime mode, live REPL with stale skills defers retagging until task-boundary /clear succeeds', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
     overrideExec(
       c => c.includes('show-option') && c.includes('@baxian-skills-version'),
       { stdout: 'stale-version\n' },
     );
     const result = await manager.ensureSession('dev-1', 'runtime');
-    expect(result.createdSession).toBe(true);
+    expect(result.createdSession).toBe(false);
+    expect(result.skillsStale).toBe(true);
     const calls = execCmds();
-    expect(calls.some(c => c.includes('kill-session'))).toBe(true);
-    expect(calls.some(c => c.includes('new-session'))).toBe(true);
+    expect(calls.some(c => c.includes('kill-session'))).toBe(false);
+    expect(calls.some(c => c.includes('new-session'))).toBe(false);
+    expect(setOptionCalls('@baxian-skills-version')).toHaveLength(0);
   });
 
   it('runtime mode, a tmux probe failure during the skills-version check surfaces as EnsureSessionError (does NOT kill the live REPL)', async () => {
@@ -496,11 +505,14 @@ describe('AgentManager.ensureSession', () => {
     expect(await manager['lockManager'].isLocked('dev-1')).toBe(true);
   });
 
-  it('release on a non-ready pane (mode=idle): clears binding and lock regardless of REPL state', async () => {
+  it('release on a non-ready pane (mode=idle): keeps the binding and lock without touching checkout', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
     await seedRunningTask('task-r1');
     await manager.acquireAgentForTask('dev-1', 'task-r1', 'develop');
     await setPaneId('dev-1', '%0');
+    await manager['agentStore'].update('dev-1', state => ({ ...state!, workdir: '/tmp/repo' }));
+    manager['cleanComposerWaitMs'] = 10;
+    manager['compactIdlePollMs'] = 1;
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('capture-pane')) return { stdout: '$ \n', stderr: '', exitCode: 0 };
       if (cmd.includes('display-message')) return { stdout: 'zsh\n', stderr: '', exitCode: 0 };
@@ -509,11 +521,13 @@ describe('AgentManager.ensureSession', () => {
       return { stdout: '', stderr: '', exitCode: 0 };
     });
 
-    expect(await manager.releaseAgentForTask('dev-1', 'task-r1', 'idle')).toBe(true);
+    expect(await manager.releaseAgentForTask('dev-1', 'task-r1', 'idle')).toBe(false);
 
     const state = await manager['agentStore'].get('dev-1');
-    expect(state?.taskId).toBeUndefined();
-    expect(await manager['lockManager'].isLocked('dev-1')).toBe(false);
+    expect(state?.taskId).toBe('task-r1');
+    expect(state).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending' });
+    expect(await manager['lockManager'].isLocked('dev-1')).toBe(true);
+    expect(execCmds().some(cmd => cmd.includes('git switch') || cmd.includes('git branch -d'))).toBe(false);
   });
 
   it('cleanupRemovedAgentRuntime: destroys streamer BEFORE tmux kill', async () => {
@@ -572,6 +586,14 @@ describe('AgentManager.ensureSession', () => {
     expect(manager.getAgentConfig('qa-1')).toBeDefined();
   });
 
+  it('replaceConfig clears stale canonical Workdir ownership claims', () => {
+    manager.getRepoCache().owners.set('local:/old/repo', 'dev-1');
+
+    manager.replaceConfig(expandedConfig());
+
+    expect(manager.getRepoCache().owners.size).toBe(0);
+  });
+
   type RestartReplPrivates = {
     pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
     ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }>;
@@ -597,17 +619,37 @@ describe('AgentManager.ensureSession', () => {
     expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
   });
 
-  it('restartReplOnly does NOT tag @baxian-skills-version when re-provision fails (keeps it stale for ensureSession self-heal)', async () => {
+  it('restartReplOnly fails closed and does not relaunch when skill re-provision fails', async () => {
     const m = stubRestartRepl();
     vi.spyOn(m, 'provisionRepoSkills').mockRejectedValue(new Error('ssh write failed'));
     const tagSpy = vi.spyOn(m, 'tagSessionSkillsVersion');
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    await manager.restartReplOnly('dev-1');
+    await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/ssh write failed/);
 
     expect(tagSpy).not.toHaveBeenCalled();
     expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
-    warnSpy.mockRestore();
+    expect(execCmds().some(c => c.includes('permission-mode'))).toBe(false);
+  });
+
+  it('restartReplOnly refuses to relaunch when the pane has moved outside the fixed Workdir', async () => {
+    const m = stubRestartRepl();
+    vi.spyOn(m, 'provisionRepoSkills').mockResolvedValue(undefined);
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
+        return { stdout: '/tmp/wrong-directory\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes("cd -P '/tmp/wrong-directory'")) {
+        return { stdout: '/tmp/wrong-directory\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes("cd -P '/tmp/repo'")) {
+        return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+      }
+      return makeMockExec({ trustDialogReady: true })(cmd);
+    });
+
+    await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/does not match agent Workdir/i);
+
+    expect(execCmds().some(c => c.includes('permission-mode'))).toBe(false);
   });
 
   function classifyOutput(proc: string, screen: string): string {
@@ -637,6 +679,25 @@ describe('AgentManager.ensureSession', () => {
       );
       const err = await expectAdoptError(/getOption\(@baxian-agent-id\) failed/);
       expect(err.partial.createdSession).toBe(false);
+    });
+
+    it('adopts when logical and physical Workdir paths identify the same directory', async () => {
+      runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
+          return { stdout: '/private/tmp/repo\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes("cd -P '/private/tmp/repo'") || cmd.includes("cd -P '/tmp/repo'")) {
+          return { stdout: '/private/tmp/repo\n', stderr: '', exitCode: 0 };
+        }
+        return makeMockExec({ trustDialogReady: true })(cmd);
+      });
+
+      await expect(manager.ensureSession('dev-1', 'runtime')).resolves.toMatchObject({
+        freshRuntime: false,
+        paneId: '%0',
+        workdir: '/tmp/repo',
+      });
+      expect(execCmds().some(command => command.includes('kill-session'))).toBe(false);
     });
 
     it('refuses a session with more than one pane (getSinglePaneId failure)', async () => {
@@ -747,6 +808,9 @@ describe('AgentManager.ensureSession', () => {
         if (cmd.includes('capture-pane')) {
           return { stdout: 'Press enter to continue\n', stderr: '', exitCode: 0 };
         }
+        if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
+          return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+        }
         if (cmd.includes('display-message')) {
           return { stdout: 'claude\n', stderr: '', exitCode: 0 };
         }
@@ -764,6 +828,9 @@ describe('AgentManager.ensureSession', () => {
         }
         if (cmd.includes('capture-pane')) {
           return { stdout: 'still booting...\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
+          return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message')) {
           return { stdout: 'claude\n', stderr: '', exitCode: 0 };
@@ -793,10 +860,14 @@ describe('AgentManager.ensureSession', () => {
         manager as unknown as { ensureWorkdir: () => Promise<unknown> },
         'ensureWorkdir',
       ).mockResolvedValue({ workdir: '/tmp/auto-repo', repoStore: {} });
+      overrideExec(
+        command => command.includes('display-message') && command.includes('pane_current_path'),
+        { stdout: '/tmp/auto-repo\n' },
+      );
 
       await manager.ensureSession('dev-1', 'runtime');
 
-      expect((await manager['agentStore'].get('dev-1'))?.repoPath).toBe('/tmp/auto-repo');
+      expect((await manager['agentStore'].get('dev-1'))?.workdir).toBe('/tmp/auto-repo');
     });
 
     it('wraps a skill provisioning failure', async () => {
@@ -835,6 +906,9 @@ describe('AgentManager.ensureSession', () => {
           if (cmd.includes('permission-mode')) exited = false;
           return { stdout: '', stderr: '', exitCode: 0 };
         }
+        if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
+          return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+        }
         if (cmd.includes('display-message') && !cmd.includes('capture-pane')) {
           return { stdout: exited ? 'zsh\n' : 'claude\n', stderr: '', exitCode: 0 };
         }
@@ -857,7 +931,7 @@ describe('AgentManager.ensureSession', () => {
       await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/unexpected pane state "vim"/);
     });
 
-    it('relaunches without the skill-dir lock when the workdir cannot be resolved', async () => {
+    it('fails closed without relaunching when the Workdir cannot be resolved', async () => {
       tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
       const m = manager as unknown as {
         pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
@@ -865,14 +939,11 @@ describe('AgentManager.ensureSession', () => {
       };
       vi.spyOn(m, 'pollPaneCommandStable').mockResolvedValue('zsh');
       vi.spyOn(m, 'ensureWorkdir').mockRejectedValue(new Error('repo store down'));
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-      await manager.restartReplOnly('dev-1');
+      await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/repo store down/);
 
-      expect(execCmds().some(c => c.includes('permission-mode'))).toBe(true);
+      expect(execCmds().some(c => c.includes('permission-mode'))).toBe(false);
       expect(setOptionCalls('@baxian-skills-version')).toEqual([]);
-      expect(warnSpy.mock.calls.some(c => String(c[0]).includes('skill re-provision failed'))).toBe(true);
-      warnSpy.mockRestore();
     });
   });
 
@@ -906,24 +977,5 @@ describe('AgentManager.ensureSession', () => {
       }
     });
 
-    it('aggregates a worktree removal failure into CleanupFailedError', async () => {
-      await manager['agentStore'].set({
-        id: 'dev-1', projectId: 'proj',
-        worktreePath: '/tmp/repo/.baxian-worktrees/wt',
-        updatedAt: new Date().toISOString(),
-      });
-      vi.spyOn(WorktreeManager.prototype, 'remove').mockRejectedValue(new Error('worktree locked'));
-
-      try {
-        await manager.cleanupRemovedAgentRuntime(['dev-1']);
-        throw new Error('expected throw');
-      } catch (err) {
-        expect(err).toBeInstanceOf(CleanupFailedError);
-        expect((err as CleanupFailedError).failures).toEqual([
-          expect.objectContaining({ agentId: 'dev-1', step: 'worktree.remove' }),
-        ]);
-        expect((err as CleanupFailedError).message).toContain('worktree locked');
-      }
-    });
   });
 });

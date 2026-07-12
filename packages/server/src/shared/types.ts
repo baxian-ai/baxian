@@ -110,8 +110,8 @@ export interface AgentBindingFacts {
   id: string;
   projectId: string;
   taskId?: string;
-  worktreePath?: string;
-  repoPath?: string;
+  lockToken?: string;
+  workdir?: string;
   startedAt?: string;
   bootstrappingTaskId?: string;
   updatedAt: string;
@@ -170,6 +170,17 @@ export interface TaskState {
   prNumber?: number;
   prUrl?: string;
   branch?: string;
+  branchCreatedByBaxian?: boolean;
+  branchCleanupPending?: {
+    agentId: string;
+    reason: string;
+    updatedAt: string;
+  };
+  branchCleanupSkipped?: {
+    agentId: string;
+    reason: string;
+    updatedAt: string;
+  };
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
@@ -183,10 +194,9 @@ export interface TaskState {
   reviewMode?: ReviewMode;
   batchIndex?: number;
   batchTotal?: number;
-  // Persisted so recovery can re-arm the read-file side-channel for a base fallback
-  // review (its prompt depends on read-file) without re-enabling it for a head-mode
-  // review (which would bypass the worktree tree proof).
-  reviewWorktreeMode?: 'head' | 'base';
+  // Persisted so recovery can re-arm read-file for a base fallback without
+  // re-enabling it for a head checkout, which would bypass the tree proof.
+  reviewCheckoutMode?: 'head' | 'base';
   maxRoundsContinues?: number;
   afterDone?: AfterDone;
   publishDispatchedAt?: string;

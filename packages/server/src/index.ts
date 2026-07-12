@@ -219,6 +219,7 @@ export async function startServer(configPath?: string): Promise<void> {
       repoCache: agentManager.getRepoCache(),
       errorRecordStore,
       onAgentAffected: onBootstrapAgentAffected,
+      onPollComplete: () => agentManager.reconcileTaskBranches(),
     });
 
     try {

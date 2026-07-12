@@ -13,18 +13,22 @@ import type { BaxianConfig, BaxianEvent, ReviewMode, TaskState } from '../../src
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
 import { __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
+import { BranchManager } from '../../src/agent/branch.js';
 
 let tempDir: string;
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-server-dispatch-'));
   await initStateDir(tempDir);
 });
-afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await rm(tempDir, { recursive: true, force: true });
+});
 
 function makeConfig(mode: ReviewMode, opts: { omitQa?: boolean; siblingProjects?: boolean } = {}): BaxianConfig {
   const agents = [
-    { id: 'dev-1', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: tempDir },
-    ...(opts.omitQa ? [] : [{ id: 'qa-1', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: tempDir }]),
+    { id: 'dev-1', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: join(tempDir, 'dev-1') },
+    ...(opts.omitQa ? [] : [{ id: 'qa-1', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: join(tempDir, 'qa-1') }]),
   ];
   return {
     review: { rounds: 10, mode },
@@ -51,6 +55,18 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean; siblingPr
   };
   const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
   const agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
+  const lockManager = new LockManager(join(tempDir, 'locks'));
+  const updateAgent = agentStore.update.bind(agentStore);
+  vi.spyOn(agentStore, 'update').mockImplementation(async (id, update) => {
+    await updateAgent(id, update);
+    const state = await agentStore.get(id);
+    if (!state?.taskId || await lockManager.isLocked(id)) return;
+    const token = await lockManager.acquire(id, state.taskId);
+    if (!token) return;
+    await updateAgent(id, latest => latest?.taskId === state.taskId
+      ? { ...latest, lockToken: token, updatedAt: new Date().toISOString() }
+      : latest);
+  });
   const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   const events: BaxianEvent[] = [];
   eventBus.on('*', (e) => { events.push(e); });
@@ -63,7 +79,7 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean; siblingPr
     config: makeConfig(mode, opts),
     agentStore,
     taskStore,
-    lockManager: new LockManager(join(tempDir, 'locks')),
+    lockManager,
     eventBus,
     runnerFactory: () => runner,
     platformRunner: runner,
@@ -146,7 +162,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
     }));
   });
 
-  it('does not arm read-file for code review when the QA worktree holds the reviewed head', async () => {
+  it('does not arm read-file for code review when the QA checkout holds the reviewed head', async () => {
     const f = await makeFixture('server');
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
@@ -166,7 +182,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
       phase: 'code', content: 'diff text', reviewHeadAnchorSha: 'head123', headTree: 'tree123',
     }).catch(() => undefined);
 
-    await capturedOpts!.armBeforeInject!({ serverReviewWorktree: 'head' });
+    await capturedOpts!.armBeforeInject!({ serverReviewCheckout: 'head' });
     expect(f.watcher.start).toHaveBeenCalledWith(expect.not.objectContaining({
       onReadFile: expect.any(Function),
     }));
@@ -176,7 +192,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
     }));
   });
 
-  it('arms read-file for code review fallback worktrees', async () => {
+  it('arms read-file for a base-mode review checkout', async () => {
     const f = await makeFixture('server');
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
@@ -196,7 +212,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
       phase: 'code', content: 'diff text', reviewHeadAnchorSha: 'head123', headTree: 'tree123',
     }).catch(() => undefined);
 
-    await capturedOpts!.armBeforeInject!({ serverReviewWorktree: 'base' });
+    await capturedOpts!.armBeforeInject!({ serverReviewCheckout: 'base' });
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
       expectedKinds: 'code-reviewed',
       onReadFile: expect.any(Function),
@@ -205,7 +221,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
   });
 
   it.each(['base', 'head'] as const)(
-    'persists reviewWorktreeMode=%s from the materialized worktree so recovery can re-arm read-file',
+    'persists reviewCheckoutMode=%s from the materialized checkout so recovery can re-arm read-file',
     async (mode) => {
       const f = await makeFixture('server');
       const NOW = new Date().toISOString();
@@ -218,7 +234,7 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
       }));
       vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
         await (opts as { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> })
-          .armBeforeInject?.({ serverReviewWorktree: mode });
+          .armBeforeInject?.({ serverReviewCheckout: mode });
         return true;
       });
 
@@ -227,9 +243,38 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
       });
 
       const task = await f.taskStore.get('task-1');
-      expect(task?.reviewWorktreeMode).toBe(mode);
+      expect(task?.reviewCheckoutMode).toBe(mode);
     },
   );
+
+  it('emits an intervention when checkout-mode persistence fails after prompt delivery', async () => {
+    const f = await makeFixture('server');
+    const now = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'in_progress',
+      signalToken: 'orig-token', reviewRound: 0,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: now,
+    }));
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async (_t, _a, _p, opts) => {
+      await (opts as { armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean> })
+        .armBeforeInject?.({ serverReviewCheckout: 'head' });
+      return true;
+    });
+    vi.spyOn(f.manager, 'updateTask').mockRejectedValueOnce(new Error('state disk full'));
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff text', reviewHeadAnchorSha: 'head123', headTree: 'tree123',
+    })).resolves.not.toBeNull();
+
+    expect(f.events.some(event => event.type === 'human.intervention'
+      && event.data?.phase === 'review-checkout-mode-persist-failed')).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('failed to persist review checkout mode'),
+    );
+  });
 });
 
 describe('dispatchServerReviewToQa rollback restores originalPhase', () => {
@@ -593,7 +638,7 @@ describe('dispatchServerAfterDone failure & success paths', () => {
       id: 'task-2', branch: 'bx/task-2', agentId: '', qaAgentId: undefined, status: 'in_progress',
     }));
     await f.agentStore.update('dev-1', () => ({
-      id: 'dev-1', projectId: 'proj', taskId: 'task-9', worktreePath: '/wt/task-9',
+      id: 'dev-1', projectId: 'proj', taskId: 'task-9', workdir: '/wt/task-9',
       updatedAt: new Date().toISOString(),
     }));
     const SHA = 'c'.repeat(40);
@@ -719,7 +764,7 @@ describe('findLineageViolation', () => {
     }));
     await f.agentStore.update('dev-1', () => ({
       id: 'dev-1', projectId: 'proj', taskId: 'task-1',
-      worktreePath: '/wt/task-1', updatedAt: NOW,
+      workdir: '/wt/task-1', updatedAt: NOW,
     }));
     f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes("rev-list 'base123..refs/heads/bx/task-2'")) {
@@ -800,20 +845,20 @@ describe('findLineageViolation', () => {
     }
   });
 
-  it('returns null when the dev agent has no recorded worktree', async () => {
+  it('returns null when the dev agent has no recorded Workdir', async () => {
     const f = await seedLineageFixture({});
     await f.agentStore.update('dev-1', (s) => {
-      const { worktreePath: _w, ...rest } = s!;
+      const { workdir: _workdir, ...rest } = s!;
       return rest;
     });
     const violation = await f.manager.findLineageViolation('task-1', 'base123');
     expect(violation).toBeNull();
   });
 
-  it('returns null when the dev agent has been rebound to another task — its worktree belongs to that task', async () => {
+  it('returns null when the dev agent has been rebound to another task — its Workdir belongs to that task', async () => {
     const f = await seedLineageFixture({});
     await f.agentStore.update('dev-1', (s) => ({
-      ...s!, taskId: 'task-9', worktreePath: '/wt/task-9',
+      ...s!, taskId: 'task-9', workdir: '/wt/task-9',
     }));
     const violation = await f.manager.findLineageViolation('task-1', 'base123');
     expect(violation).toBeNull();
@@ -830,7 +875,7 @@ describe('findLineageViolation', () => {
     }));
     await f.agentStore.update('dev-1', () => ({
       id: 'dev-1', projectId: 'proj', taskId: 'task-1',
-      worktreePath: '/wt/task-1', updatedAt: NOW,
+      workdir: '/wt/task-1', updatedAt: NOW,
     }));
     f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes("rev-list 'base123..refs/heads/bx/task-5'")) {
@@ -856,7 +901,7 @@ describe('findLineageViolation', () => {
     }));
     await f.agentStore.update('dev-1', () => ({
       id: 'dev-1', projectId: 'proj', taskId: 'task-1',
-      worktreePath: '/wt/task-1', updatedAt: NOW,
+      workdir: '/wt/task-1', updatedAt: NOW,
     }));
     f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes("rev-list 'base123..HEAD'")) {
@@ -897,10 +942,33 @@ describe('dispatchServerReviewToQa forwards full content to startSession (split 
 describe('startSession/continueSession resolve server payloads before prompt build', () => {
   type Fixture = Awaited<ReturnType<typeof makeFixture>>;
 
-  function stubSessionEnv(f: Fixture) {
+  async function stubSessionEnv(
+    f: Fixture,
+    agentId: 'dev-1' | 'qa-1',
+    checkoutMode: 'head' | 'base' = 'base',
+  ) {
+    const current = await f.agentStore.get(agentId);
+    const workdir = current?.workdir ?? join(tempDir, agentId);
+    if (!current?.taskId) {
+      await f.agentStore.update(agentId, () => ({
+        id: agentId,
+        projectId: 'proj',
+        taskId: 'task-1',
+        workdir,
+        updatedAt: new Date().toISOString(),
+      }));
+    }
     vi.spyOn(f.manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, freshRuntime: true, paneId: '%1', workdir: tempDir,
+      ok: true, createdSession: false, freshRuntime: true, paneId: '%1', workdir,
     });
+    vi.spyOn(
+      f.manager as never as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(BranchManager.prototype, 'materializeReviewHead').mockResolvedValue({ mode: checkoutMode });
+    vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+    vi.spyOn(BranchManager.prototype, 'currentRef').mockResolvedValue('refs/heads/bx/task-1');
   }
 
   function stubTransport(f: Fixture) {
@@ -908,7 +976,10 @@ describe('startSession/continueSession resolve server payloads before prompt bui
       path: `.baxian/review/inbox/${filename}`,
       bytes: Buffer.byteLength(content, 'utf8'),
     }));
-    vi.spyOn(f.manager, 'getReviewTransport').mockReturnValue({ deliverToInbox } as never);
+    vi.spyOn(f.manager, 'getReviewTransport').mockReturnValue({
+      clearDispatchOutputs: vi.fn(async () => undefined),
+      deliverToInbox,
+    } as never);
     return deliverToInbox;
   }
 
@@ -917,7 +988,7 @@ describe('startSession/continueSession resolve server payloads before prompt bui
     await f.taskStore.set(taskFixture({
       reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'tok', reviewRound: 1,
     }));
-    stubSessionEnv(f);
+    await stubSessionEnv(f, 'qa-1');
     const deliver = stubTransport(f);
     const huge = 'd'.repeat(10 * 1024 + 1);
 
@@ -928,7 +999,7 @@ describe('startSession/continueSession resolve server payloads before prompt bui
     expect(deliver).toHaveBeenCalledTimes(1);
     const [agentArg, worktreeArg, filename, content] = deliver.mock.calls[0]!;
     expect((agentArg as { id: string }).id).toBe('qa-1');
-    expect(worktreeArg).toContain('task-1-review_');
+    expect(worktreeArg).toBe(join(tempDir, 'qa-1'));
     expect(filename).toBe('diff-round-1.patch');
     expect(content).toBe(huge);
   });
@@ -941,9 +1012,9 @@ describe('startSession/continueSession resolve server payloads before prompt bui
     const devWorktree = join(tempDir, 'wt-dev');
     await f.agentStore.update('dev-1', () => ({
       id: 'dev-1', projectId: 'proj', taskId: 'task-1',
-      worktreePath: devWorktree, updatedAt: new Date().toISOString(),
+      workdir: devWorktree, updatedAt: new Date().toISOString(),
     }));
-    stubSessionEnv(f);
+    await stubSessionEnv(f, 'dev-1');
     const deliver = stubTransport(f);
     const findings = JSON.stringify({ pad: 'f'.repeat(10 * 1024 + 1) });
 
@@ -964,7 +1035,7 @@ describe('startSession/continueSession resolve server payloads before prompt bui
     await f.taskStore.set(taskFixture({
       reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'tok', reviewRound: 1,
     }));
-    stubSessionEnv(f);
+    await stubSessionEnv(f, 'qa-1', 'head');
     f.runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('git rev-parse HEAD^{tree}')) return { stdout: 'tree123\n', stderr: '', exitCode: 0 };
       return { stdout: '', stderr: '', exitCode: 0 };
@@ -991,7 +1062,7 @@ describe('startSession/continueSession resolve server payloads before prompt bui
     await f.taskStore.set(taskFixture({
       reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'tok', reviewRound: 1,
     }));
-    stubSessionEnv(f);
+    await stubSessionEnv(f, 'qa-1');
     const deliver = stubTransport(f);
 
     await expect(f.manager.startSession('task-1', 'qa-1', 'server-review', {

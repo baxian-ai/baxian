@@ -16,7 +16,7 @@ function mockRunner(responses: Record<string, ExecResult>): CommandRunner {
       for (const [pattern, result] of Object.entries(responses)) {
         if (cmd.includes(pattern)) return result;
       }
-      if (cmd.includes('rev-parse --is-inside-work-tree')) return OK_TRUE;
+      if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
       if (cmd.startsWith('command -v')) return OK_PATH;
       return OK_EMPTY;
     }),
@@ -145,7 +145,7 @@ describe('runPreflight', () => {
   });
 
   it('detects bad workdir', async () => {
-    const runner = mockRunner({ 'rev-parse --is-inside-work-tree': FAIL });
+    const runner = mockRunner({ 'rev-parse --show-toplevel': FAIL });
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
     expect(results.find(r => r.step === 'workdir')?.ok).toBe(false);
   });
@@ -181,7 +181,7 @@ describe('runPreflight', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string, opts?: { remoteShell?: string }) => {
         calls.push({ cmd, opts });
-        if (cmd.includes('rev-parse --is-inside-work-tree')) return OK_TRUE;
+        if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -273,19 +273,19 @@ function makeAutoAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 }
 
 describe('runPreflight — auto mode', () => {
-  it('runs mkdir -p ~/.baxian/repos and test -w on parent', async () => {
+  it('runs mkdir -p for the per-agent clone parent and checks it is writable', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAutoAgent(), 'user/repo');
     const calls = execCmds(runner);
-    expect(calls.some(c => c.includes('mkdir -p') && c.includes('.baxian/repos'))).toBe(true);
-    expect(calls.some(c => c.includes('test -w') && c.includes('.baxian/repos'))).toBe(true);
+    expect(calls.some(c => c.includes('mkdir -p') && c.includes('.baxian/agents/dev-auto'))).toBe(true);
+    expect(calls.some(c => c.includes('test -w') && c.includes('.baxian/agents/dev-auto'))).toBe(true);
   });
 
-  it('lowercases the slug in absRepoPath so it stays consistent with RepoStore.resolveAbsPath', async () => {
+  it('uses the agent id rather than the project slug for the clone path', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAutoAgent(), 'Owner/Repo');
     const calls = execCmds(runner);
-    expect(calls.some(c => c.includes('test -d ~/.baxian/repos/owner/repo'))).toBe(true);
+    expect(calls.some(c => c.includes('test -d ~/.baxian/agents/dev-auto/repo'))).toBe(true);
     expect(calls.some(c => /test -d .*Owner\/Repo/.test(c))).toBe(false);
   });
 
@@ -323,9 +323,9 @@ describe('runPreflight — auto mode', () => {
   it('reports workdir failure when existing repo dir is not a git repo', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd.startsWith('mkdir -p') && cmd.includes('.baxian/repos &&')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
-        if (cmd.includes('rev-parse --resolve-git-dir')) return FAIL;
+        if (cmd.startsWith('mkdir -p') && cmd.includes('.baxian/agents/dev-auto')) return OK_EMPTY;
+        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return OK_EMPTY;
+        if (cmd.includes('rev-parse --show-toplevel')) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -333,15 +333,14 @@ describe('runPreflight — auto mode', () => {
     const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     const wd = results.find(r => r.step === 'workdir');
     expect(wd?.ok).toBe(false);
-    expect(wd?.message).toMatch(/not a git/i);
+    expect(wd?.message).toMatch(/not an independent ordinary Git clone/i);
   });
 
   it('passes workdir when existing repo dir is a valid git repo', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
-        if (cmd.includes('rev-parse --resolve-git-dir')) return OK_EMPTY;
+        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return OK_EMPTY;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -349,34 +348,30 @@ describe('runPreflight — auto mode', () => {
     const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     const wd = results.find(r => r.step === 'workdir');
     expect(wd?.ok).toBe(true);
+    expect(execCmds(runner).some(c => c.includes('objects/info/alternates'))).toBe(true);
   });
 
-  it('passes workdir for a bare managed store (no .git subdirectory)', async () => {
-    const probes: string[] = [];
+  it('rejects a bare repository at the managed clone path', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/repos/user/repo`) return OK_EMPTY;
-        if (cmd.includes('rev-parse --resolve-git-dir')) {
-          probes.push(cmd);
-          return OK_EMPTY;
-        }
-        if (cmd === `test -d ~/.baxian/repos/user/repo/.git`) return FAIL;
+        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return OK_EMPTY;
+        if (cmd.includes('rev-parse --is-bare-repository')) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
     };
     const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     const wd = results.find(r => r.step === 'workdir');
-    expect(wd?.ok).toBe(true);
-    expect(probes.length).toBeGreaterThan(0);
+    expect(wd?.ok).toBe(false);
+    expect(wd?.message).toMatch(/independent ordinary/i);
   });
 
   it('passes workdir when nothing exists yet (clone will create it)', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/repos/user/repo`) return FAIL;
+        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -401,22 +396,23 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
     expect(results.find(r => r.step === 'git')?.ok).toBe(true);
   });
 
-  it('auto mode: uses repos-ext/<host>/<path> and git ls-remote, never gh', async () => {
+  it('auto mode: uses the per-agent clone path and git ls-remote, never gh', async () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAgent({ workdir: undefined }), GL);
     const cmds = execCmds(runner);
-    expect(cmds.some(c => c.includes('.baxian/repos-ext/gitlab.example.com/group/proj'))).toBe(true);
+    expect(cmds.some(c => c.includes('.baxian/agents/dev-1/repo'))).toBe(true);
     expect(cmds.some(c => c.includes('gh config get git_protocol'))).toBe(false);
     expect(cmds.some(c => c.includes('gh auth') || c.includes('gh api'))).toBe(false);
     expect(cmds.some(c => c.includes('git ls-remote') && c.includes(GL))).toBe(true);
   });
 
-  it('auto mode: a malicious host throws before building any shell command (no injection)', async () => {
+  it('auto mode: shell-quotes a malicious repo URL instead of executing it', async () => {
     const runner = mockRunner({});
     const evil = 'https://gitlab.example.com;touch pwned/group/proj.git';
-    await expect(runPreflight(runner, makeAgent({ workdir: undefined }), evil)).rejects.toThrow(/unsafe host/i);
+    await expect(runPreflight(runner, makeAgent({ workdir: undefined }), evil)).resolves.toBeDefined();
     const cmds = execCmds(runner);
-    expect(cmds.some(c => c.includes(';touch pwned'))).toBe(false);
+    const lsRemote = cmds.find(c => c.includes('git ls-remote'));
+    expect(lsRemote).toContain("'https://gitlab.example.com;touch pwned/group/proj.git'");
   });
 
   it('auto mode: redacts embedded credentials from a failed ls-remote message', async () => {

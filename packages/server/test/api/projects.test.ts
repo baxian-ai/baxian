@@ -358,6 +358,16 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(proj.agent[0][0].id).toBe('new-dev');
   });
 
+  it('accepts yolo: false and persists it (issue #475)', async () => {
+    await createProject('ny');
+
+    const response = await addAgent('ny', { ...devAgent('ny-dev'), yolo: false });
+    expect(response.statusCode).toBe(201);
+    const body = JSON.parse(response.body);
+    expect(body.agent.yolo).toBe(false);
+    expect(findProject('ny').agent[0][0].yolo).toBe(false);
+  });
+
   it('returns restartRequired:false — agent CRUD is hot-loaded via replaceConfig, no restart needed', async () => {
     await createProject('rr1');
     const response = await addAgent('rr1', devAgent('rr1-dev'));
@@ -428,6 +438,49 @@ describe('POST /api/projects/:projectId/agents', () => {
     const response = await addAgent('pid', devAgent('   '));
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(/agent id is required/);
+  });
+
+  it('returns 400 instead of 500 for a malformed Workdir value', async () => {
+    await createProject('bad-wd');
+
+    const response = await addAgent('bad-wd', devAgent('bad-wd-dev', {
+      workdir: { path: '/tmp/not-a-string' },
+    }));
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toBe('Invalid config');
+  });
+
+  it('returns 409 when another agent on the same host already uses the normalized Workdir', async () => {
+    await createProject('shared-wd');
+    expect((await addAgent('shared-wd', devAgent('shared-wd-1', {
+      workdir: '/tmp/baxian-shared',
+    }))).statusCode).toBe(201);
+
+    const response = await addAgent('shared-wd', devAgent('shared-wd-2', {
+      workdir: '/tmp/other/../baxian-shared',
+    }));
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/must not share a directory/);
+  });
+
+  it('returns 409 when omitted and explicit default SSH ports share a Workdir', async () => {
+    await createProject('shared-ssh-wd');
+    expect((await addAgent('shared-ssh-wd', devAgent('shared-ssh-wd-1', {
+      mode: 'remote',
+      host: { hostname: 'box.example.com', user: 'git' },
+      workdir: '/srv/baxian-shared',
+    }))).statusCode).toBe(201);
+
+    const response = await addAgent('shared-ssh-wd', devAgent('shared-ssh-wd-2', {
+      mode: 'remote',
+      host: { hostname: 'box.example.com', user: 'git', port: 22 },
+      workdir: '/srv/baxian-shared',
+    }));
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/must not share a directory/);
   });
 
   it('returns 409 when pairWith dev is still being created (creationToken set)', async () => {
@@ -621,7 +674,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     await seedAgent('da-dup-dev', 'da-dup', {
       paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    await app.ctx.lockManager.acquire('da-dup-dev');
 
     let resolveCleanup: () => void = () => undefined;
     const cleanupGate = new Promise<void>((resolve) => { resolveCleanup = resolve; });
@@ -646,7 +698,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     await seedAgent('da-petrace-dev', 'da-petrace', {
       paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    await app.ctx.lockManager.acquire('da-petrace-dev');
     const pet = await app.ctx.petStore!.create({
       displayName: 'P', description: '', spritesheet: { bytes: Buffer.from('x'), ext: 'webp' },
     });
@@ -665,16 +716,16 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(await app.ctx.petStore!.getAssignment('da-petrace-dev')).toBeNull();
   });
 
-  it('awaiting_human with stale lock: DELETE takes over (does not 409 on acquire failure)', async () => {
+  it('awaiting_human with a foreign lock: DELETE refuses to steal ownership', async () => {
     await projectWithDev('da-stale', 'da-stale-dev');
     await seedAgent('da-stale-dev', 'da-stale', {
       paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-interrupt-failed',
     });
-    await app.ctx.lockManager.acquire('da-stale-dev');
+    await app.ctx.lockManager.acquire('da-stale-dev', 'test:foreign');
 
     const response = await del('/api/projects/da-stale/agents/da-stale-dev');
-    expect(response.statusCode).toBe(200);
-    expect(await app.ctx.lockManager.isLocked('da-stale-dev')).toBe(false);
+    expect(response.statusCode).toBe(409);
+    expect(await app.ctx.lockManager.isLocked('da-stale-dev')).toBe(true);
   });
 
   it('awaiting_human + active task is REFUSED (cannot leave orphan task)', async () => {
@@ -699,7 +750,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       status: 'max_rounds', prNumber: 7, branch: 'bx/task-mr-reserved',
     });
     await seedAgent('da-mr-active-dev', 'da-mr-active', {
-      taskId: 'task-mr-reserved', paneId: '%0', status: 'waiting', worktreePath: '/tmp/wt',
+      taskId: 'task-mr-reserved', paneId: '%0', status: 'waiting', workdir: '/tmp/wt',
     });
 
     const response = await del('/api/projects/da-mr-active/agents/da-mr-active-dev');
@@ -737,6 +788,28 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(200);
   });
 
+  it('deletes a terminal task binding after acquiring its missing exact task lock', async () => {
+    await projectWithDev('da-terminal-binding', 'da-terminal-dev');
+    await seedTask('task-terminal-binding', 'da-terminal-binding', {
+      preferredAgentId: 'da-terminal-dev',
+      agentId: 'da-terminal-dev',
+      status: 'cancelled',
+      branch: 'bx/task-terminal-binding',
+    });
+    await seedAgent('da-terminal-dev', 'da-terminal-binding', {
+      taskId: 'task-terminal-binding',
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+      workdir: '/tmp/da-terminal-dev',
+    });
+
+    const response = await del('/api/projects/da-terminal-binding/agents/da-terminal-dev');
+
+    expect(response.statusCode).toBe(200);
+    expect(await app.ctx.lockManager.isLocked('da-terminal-dev')).toBe(false);
+    expect(await app.ctx.agentStore.get('da-terminal-dev')).toBeNull();
+  });
+
   it('preserves other pairs when deleting from a multi-pair project', async () => {
     await createProject('da4');
     await addAgent('da4', devAgent('da4-dev1'));
@@ -762,7 +835,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('Phase 3 saveConfig fails → 500 + rollbackPerTargetState + lock released', async () => {
     await projectWithDev('da-rb', 'da-rb-dev');
-    await seedAgent('da-rb-dev', 'da-rb', { paneId: '%0', repoPath: '/tmp/repo' });
+    await seedAgent('da-rb-dev', 'da-rb', { paneId: '%0', workdir: '/tmp/repo' });
 
     const { saveConfig: realSaveConfig } = await import('../../src/config/loader.js');
     const loader = await import('../../src/config/loader.js');
@@ -783,9 +856,8 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
 
     const stateAfter = await app.ctx.agentStore.get('da-rb-dev');
-    expect(stateAfter?.worktreePath).toBeUndefined();
     expect(stateAfter?.paneId).toBeUndefined();
-    expect(stateAfter?.repoPath).toBe('/tmp/repo');
+    expect(stateAfter?.workdir).toBe('/tmp/repo');
 
     expect(await app.ctx.lockManager.isLocked('da-rb-dev')).toBe(false);
   });
@@ -824,27 +896,27 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
   it('409 when a non-awaiting agent is locked by another op', async () => {
     await projectWithDev('lk1', 'lk1-dev');
     await seedAgent('lk1-dev', 'lk1', { status: 'idle' });
-    await app.ctx.lockManager.acquire('lk1-dev');
+    const token = await app.ctx.lockManager.acquire('lk1-dev', 'test:foreign');
 
     const response = await del('/api/projects/lk1/agents/lk1-dev');
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
     expect(findProject('lk1').agent[0][0].id).toBe('lk1-dev');
-    await app.ctx.lockManager.release('lk1-dev');
+    await app.ctx.lockManager.releaseIfOwner('lk1-dev', 'test:foreign', token!);
   });
 
   it('releases locks it already acquired when a later pair member is locked', async () => {
     await projectWithDev('lk2', 'lk2-dev');
     await addAgent('lk2', qaAgent('lk2-qa', 'lk2-dev'));
     await seedAgent('lk2-qa', 'lk2', { status: 'idle' });
-    await app.ctx.lockManager.acquire('lk2-qa');
+    const token = await app.ctx.lockManager.acquire('lk2-qa', 'test:foreign');
 
     const response = await del('/api/projects/lk2/agents/lk2-dev');
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
     expect(await app.ctx.lockManager.isLocked('lk2-dev')).toBe(false);
     expect(await app.ctx.lockManager.isLocked('lk2-qa')).toBe(true);
-    await app.ctx.lockManager.release('lk2-qa');
+    await app.ctx.lockManager.releaseIfOwner('lk2-qa', 'test:foreign', token!);
   });
 
   it('phase1 prepareConfig validation failure → 400 Invalid config + locks released', async () => {
@@ -877,7 +949,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('phase3 prepareConfig validation failure → 400 + state rollback + lock released', async () => {
     await projectWithDev('v3', 'v3-dev');
-    await seedAgent('v3-dev', 'v3', { paneId: '%9', repoPath: '/tmp/repo3' });
+    await seedAgent('v3-dev', 'v3', { paneId: '%9', workdir: '/tmp/repo3' });
     const realPrepare = loaderModule.prepareConfig;
     let call = 0;
     vi.spyOn(loaderModule, 'prepareConfig').mockImplementation((raw) => {
@@ -891,7 +963,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(response.body).error).toBe('Invalid config');
     const state = await app.ctx.agentStore.get('v3-dev');
     expect(state?.paneId).toBeUndefined();
-    expect(state?.repoPath).toBe('/tmp/repo3');
+    expect(state?.workdir).toBe('/tmp/repo3');
     expect(await app.ctx.lockManager.isLocked('v3-dev')).toBe(false);
     expect(findProject('v3').agent.flat().map(a => a.id)).toEqual(['v3-dev']);
   });
@@ -915,7 +987,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('runtime cleanup CleanupFailedError → 502 + failures payload + state rollback, config intact', async () => {
     await projectWithDev('cf1', 'cf1-dev');
-    await seedAgent('cf1-dev', 'cf1', { paneId: '%3', repoPath: '/tmp/r' });
+    await seedAgent('cf1-dev', 'cf1', { paneId: '%3', workdir: '/tmp/r' });
     vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockRejectedValue(
       new CleanupFailedError('cleanup failed', [
         { agentId: 'cf1-dev', step: 'kill-session', error: new Error('ssh down') },
@@ -934,18 +1006,52 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(findProject('cf1').agent.flat().map(a => a.id)).toEqual(['cf1-dev']);
     const state = await app.ctx.agentStore.get('cf1-dev');
     expect(state?.paneId).toBeUndefined();
-    expect(state?.repoPath).toBe('/tmp/r');
+    expect(state?.workdir).toBe('/tmp/r');
     expect(await app.ctx.lockManager.isLocked('cf1-dev')).toBe(false);
   });
 
-  it('unrecognised runtime cleanup error → deletion proceeds and commits (200)', async () => {
+  it('unrecognised runtime cleanup error → 502 with config and agent state preserved', async () => {
     await projectWithDev('cf2', 'cf2-dev');
+    await seedAgent('cf2-dev', 'cf2', { paneId: '%4' });
     vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockRejectedValue(new Error('flaky ssh'));
 
     const response = await del('/api/projects/cf2/agents/cf2-dev');
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).removed).toEqual(['cf2-dev']);
-    expect(findProject('cf2').agent).toEqual([]);
+    expect(response.statusCode).toBe(502);
+    expect(JSON.parse(response.body).failures).toEqual([
+      { agentId: 'cf2-dev', step: 'runtime.cleanup', error: 'flaky ssh' },
+    ]);
+    expect(findProject('cf2').agent.flat().map(agent => agent.id)).toEqual(['cf2-dev']);
+    expect(await app.ctx.agentStore.get('cf2-dev')).toMatchObject({ id: 'cf2-dev', projectId: 'cf2' });
+  });
+
+  it('cleanup rollback restores an exact task lock after the old generation was released', async () => {
+    await projectWithDev('cf-lock', 'cf-lock-dev');
+    await seedTask('cf-lock-task', 'cf-lock', {
+      agentId: 'cf-lock-dev', preferredAgentId: 'cf-lock-dev', status: 'failed',
+    });
+    const oldToken = await app.ctx.lockManager.acquire('cf-lock-dev', 'cf-lock-task');
+    await seedAgent('cf-lock-dev', 'cf-lock', {
+      taskId: 'cf-lock-task', lockToken: oldToken!, paneId: '%5',
+    });
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => {
+      await app.ctx.lockManager.releaseIfOwner('cf-lock-dev', 'cf-lock-task', oldToken!);
+      await app.ctx.agentStore.update('cf-lock-dev', state => ({
+        ...state!, taskId: undefined, lockToken: undefined, updatedAt: now(),
+      }));
+      throw new CleanupFailedError('cleanup failed', [
+        { agentId: 'cf-lock-dev', step: 'tmux', error: new Error('ssh down') },
+      ]);
+    });
+
+    const response = await del('/api/projects/cf-lock/agents/cf-lock-dev');
+
+    expect(response.statusCode).toBe(502);
+    const restored = (await app.ctx.agentStore.get('cf-lock-dev'))!;
+    expect(restored.taskId).toBe('cf-lock-task');
+    expect(restored.lockToken).not.toBe(oldToken);
+    expect(await app.ctx.lockManager.isOwner(
+      'cf-lock-dev', 'cf-lock-task', restored.lockToken!,
+    )).toBe(true);
   });
 
   it('config changed during cleanup → phase3 recomputes the removal from the fresh config', async () => {
@@ -1114,7 +1220,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
       preferredAgentId: 'dev-1', agentId: 'dev-1', status: 'review', branch: 'bx/task-tk1',
     });
     await seedAgent('dev-1', 'proj', { taskId: 'task-tk1' });
-    await app.ctx.lockManager.acquire('dev-1');
+    await app.ctx.lockManager.acquire('dev-1', 'task-tk1');
     vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
     vi.spyOn(app.ctx.agentManager, 'markAgentWaiting').mockResolvedValue(true);
 
@@ -1144,7 +1250,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
       awaitingReason: 'simulated prior ack_unknown',
       awaitingSince: now(),
     });
-    await app.ctx.lockManager.acquire('dev-1');
+    await app.ctx.lockManager.acquire('dev-1', 'task-clear-held');
     vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
 
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
@@ -1180,6 +1286,72 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
   });
 
+  it('restart-repl replaces a stale token before releasing a terminal task binding', async () => {
+    await seedTask('task-terminal-restart', 'proj', {
+      preferredAgentId: 'dev-1',
+      agentId: 'dev-1',
+      status: 'merged',
+      branch: 'bx/task-terminal-restart',
+    });
+    await seedAgent('dev-1', 'proj', {
+      taskId: 'task-terminal-restart',
+      lockToken: 'stale-generation',
+      paneId: '%0',
+    });
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    expect((await app.ctx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('restart-repl reuses an existing exact lock for a terminal task binding', async () => {
+    await seedTask('task-terminal-locked', 'proj', {
+      preferredAgentId: 'dev-1',
+      agentId: 'dev-1',
+      status: 'merged',
+      branch: 'bx/task-terminal-locked',
+    });
+    const token = await app.ctx.lockManager.acquire('dev-1', 'task-terminal-locked');
+    await seedAgent('dev-1', 'proj', {
+      taskId: 'task-terminal-locked',
+      lockToken: token!,
+      paneId: '%0',
+    });
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    expect((await app.ctx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('restart-repl preserves a reused terminal-task lock when restart fails', async () => {
+    await seedTask('task-terminal-restart-fails', 'proj', {
+      preferredAgentId: 'dev-1',
+      agentId: 'dev-1',
+      status: 'failed',
+      branch: 'bx/task-terminal-restart-fails',
+    });
+    const token = await app.ctx.lockManager.acquire('dev-1', 'task-terminal-restart-fails');
+    await seedAgent('dev-1', 'proj', {
+      taskId: 'task-terminal-restart-fails',
+      lockToken: token!,
+      paneId: '%0',
+    });
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockRejectedValue(new Error('restart failed'));
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(500);
+    expect(await app.ctx.lockManager.isOwner(
+      'dev-1', 'task-terminal-restart-fails', token!,
+    )).toBe(true);
+  });
+
   it('returns 404 when agent is not in the project', async () => {
     const response = await post('/api/projects/no-such/agents/dev-1/restart-repl');
     expect(response.statusCode).toBe(404);
@@ -1212,7 +1384,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
 
   it('idle agent locked by another op → 409', async () => {
     await seedAgent('dev-1', 'proj');
-    await app.ctx.lockManager.acquire('dev-1');
+    await app.ctx.lockManager.acquire('dev-1', 'test:foreign');
     const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
 
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
@@ -1249,6 +1421,39 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(response.statusCode).toBe(200);
     const stateAfter = await app.ctx.agentStore.get('dev-1');
     expect(stateAfter?.paneId).toBe('%0');
+  });
+
+  it('releases a stale QA binding with the same generation token used for recovery', async () => {
+    await seedAgent('qa-1', 'proj', { taskId: 'task-gone' });
+    app.ctx.tmuxSessionStatusStore.set('qa-1', { tmuxSessionStatus: 'absent' });
+
+    const response = await post('/api/projects/proj/agents/qa-1/retry');
+
+    expect(response.statusCode).toBe(200);
+    expect((await app.ctx.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(await app.ctx.lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  it('retry reuses an existing exact lock and releases a terminal task binding', async () => {
+    await seedTask('task-terminal-retry', 'proj', {
+      preferredAgentId: 'dev-1',
+      agentId: 'dev-1',
+      status: 'failed',
+      branch: 'bx/task-terminal-retry',
+    });
+    const token = await app.ctx.lockManager.acquire('dev-1', 'task-terminal-retry');
+    await seedAgent('dev-1', 'proj', {
+      taskId: 'task-terminal-retry',
+      lockToken: token!,
+      paneId: '%old',
+    });
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(200);
+    expect((await app.ctx.agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('retry clears stale awaiting_human Held state after ensureSession confirms REPL ready', async () => {
@@ -1331,7 +1536,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
   it('locked by another op → 409', async () => {
     await seedAgent('dev-1', 'proj');
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
-    await app.ctx.lockManager.acquire('dev-1');
+    await app.ctx.lockManager.acquire('dev-1', 'test:foreign');
 
     const response = await post('/api/projects/proj/agents/dev-1/retry');
     expect(response.statusCode).toBe(409);

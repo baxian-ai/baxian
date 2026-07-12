@@ -59,16 +59,15 @@ beforeEach(async () => {
 afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
 
 describe('poller integration', () => {
-  it('absent tmux probe clears volatile binding fields within one tick', async () => {
+  it('absent tmux probe holds the binding and exclusive lock within one tick', async () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj',
       taskId: 'orphan',
-      worktreePath: '/tmp/wt',
       paneId: 'pane-7',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
       updatedAt: NOW,
     });
-    await lockManager.acquire('dev-1');
+    await lockManager.acquire('dev-1', 'orphan');
 
     const probePoller = new TmuxProbePoller({
       config, store: new TmuxSessionStatusStore(), agentManager,
@@ -83,11 +82,11 @@ describe('poller integration', () => {
     await probePoller.pollOnce();
 
     const state = await agentStore.get('dev-1');
-    expect(state?.taskId).toBeUndefined();
-    expect(state?.worktreePath).toBeUndefined();
+    expect(state?.taskId).toBe('orphan');
     expect(state?.paneId).toBeUndefined();
-    expect(state?.repoPath).toBe('/tmp/repo');
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(state?.workdir).toBe('/tmp/repo');
+    expect(state).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'runtime-missing' });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
     const recovered = events.find(e => e.type === 'agent.recovered' && e.agentId === 'dev-1');
     expect(recovered?.data).toEqual({ reason: 'tmux-probe=absent' });
   });
@@ -117,7 +116,7 @@ describe('poller integration', () => {
     expect(events.some(e => e.type === 'agent.recovered' && e.agentId === 'dev-1')).toBe(false);
   });
 
-  it('BootstrapPoller records repoPath on existing binding', async () => {
+  it('BootstrapPoller records Workdir on existing binding', async () => {
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', updatedAt: NOW,
     });
@@ -130,7 +129,7 @@ describe('poller integration', () => {
     });
     await poller.pollOnce();
     const state = await agentStore.get('dev-1');
-    expect(state?.repoPath).toBe('/path/to/repo');
+    expect(state?.workdir).toBe('/path/to/repo');
     const succeeded = events.filter(e => e.type === 'agent.bootstrap_succeeded');
     expect(succeeded).toHaveLength(1);
     expect((succeeded[0] as { data: { updated: number } }).data.updated).toBe(1);

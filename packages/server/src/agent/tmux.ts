@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
 import { shellQuote, SshRunner } from './runner.js';
-import { isHorizontalRule } from './detect/region.js';
+import { isHorizontalRule, tailNonEmpty } from './detect/region.js';
 import { MAX_PROMPT_BYTES } from './prompt.js';
 
 const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<ExecResult> =>
@@ -150,7 +150,8 @@ const CODEX_IDLE_PROMPT_LINE_RE = /^[ \t]*[›→](?:[ \t].*)?$/im;
 const CODEX_IDLE_COMPOSER_LINE_RE = /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:\s+git:\([^\s)]+\))?\s*$/i;
 const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
 const CODEX_WORKING_TAIL_LINES = 8;
-const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t]*[❯>][ \t]*$/m;
+// claude-code ≥2.1 的空 composer 行是 ❯ + no-break space（U+00A0），[ \t] 不含它
+const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t\u00A0]*[❯>][ \t\u00A0]*$/m;
 // opencode working: progress bar `■■■⬝⬝⬝` + interrupt hint. Matches the herdr-listed
 // "esc to interrupt", the post-TUI-rewrite "esc interrupt" (no "to"), and the
 // "ctrl+c to interrupt" footer that can be the only busy evidence if the bar wraps out of tail.
@@ -254,11 +255,13 @@ export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRun
     const t = tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES);
     return CODEX_IDLE_COMPOSER_LINE_RE.test(t) || CODEX_EMPTY_COMPOSER_RE.test(t);
   }
+  // opencode/qodercli 的 fresh 屏顶部锚定/垂直居中，idle 标记落在物理 tail 之外（下方是空行海），
+  // 取非空行窗口（与 manifest region tailNonEmpty 同语义）做到几何无关。
   if (runtime === 'opencode') {
-    return OPENCODE_IDLE_COMPOSER_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+    return OPENCODE_IDLE_COMPOSER_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
   }
   if (runtime === 'qodercli') {
-    return QODER_IDLE_COMPOSER_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+    return QODER_IDLE_COMPOSER_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
   }
   return false;
 }
@@ -357,8 +360,8 @@ export function hasRuntimeReadyView(stripped: string, runtime: AgentRuntimeKind)
 
 export function runtimeBusyCheck(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (runtime === 'codex') return detectActiveRegionBusy(stripped, runtime);
-  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
   return detectReplActiveBusy(stripped);
 }
 
@@ -366,8 +369,8 @@ function submitAckBusy(stripped: string, runtime: AgentRuntimeKind): boolean {
   if (runtime === 'codex') {
     return hasActiveSpinner(stripped) || escToInterruptActiveInTail(stripped, runtime);
   }
-  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
-  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tail(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  if (runtime === 'opencode') return OPENCODE_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
+  if (runtime === 'qodercli') return QODER_BUSY_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
   return detectReplActiveBusy(stripped);
 }
 
@@ -546,6 +549,12 @@ export class TmuxManager {
       throw new Error(`tmux displayMessage ${paneId} failed: ${result.stderr}`);
     }
     return result.stdout.replace(/\n$/, '');
+  }
+
+  async getPaneCurrentPath(paneId: string, opts?: ExecOptions): Promise<string> {
+    const path = await this.displayMessage(paneId, '#{pane_current_path}', opts);
+    if (path === '') throw new Error(`tmux pane ${paneId} has an empty current path`);
+    return path;
   }
 
   async readPaneTitle(paneId: string, opts?: ExecOptions): Promise<string> {
@@ -757,7 +766,10 @@ export class TmuxManager {
         // opencode/qodercli can open a permission/confirmation prompt right after submit,
         // before any busy spinner. Resending Enter there would hit the default option
         // (e.g. Allow once), so treat a pending prompt as "already left the composer".
-        && !(RUNTIME_PENDING_RES[runtime]?.test(visible) ?? false);
+        && !(RUNTIME_PENDING_RES[runtime]?.test(visible) ?? false)
+        // 非 YOLO 下 claude-code 的权限 prompt 底行（Esc to cancel · Tab to amend…）不落上面任何
+        // 守卫；区域限定的 pending 指纹兜底，误伤只退化为 ack 超时（fail-closed），绝不 Enter 进 prompt。
+        && !detectRuntimePendingPrompt(visible);
       if (
         opts.resend
         && enterWouldSubmit

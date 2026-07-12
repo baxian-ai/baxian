@@ -4,12 +4,13 @@ import type { BaxianConfig, AgentConfig, ProjectConfig, MergeStrategy, SpecAppro
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
 function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
+  const id = overrides.id ?? 'dev-1';
   return {
-    id: 'dev-1',
+    id,
     runtime: 'claude-code',
     role: 'dev',
     mode: 'local',
-    workdir: '/tmp/test',
+    workdir: `/tmp/${id}`,
     ...overrides,
   };
 }
@@ -82,8 +83,7 @@ describe('validateConfig', () => {
       ],
     });
     const errors = validateConfig(config);
-    expect(errors).toHaveLength(1);
-    expect(errors[0].message).toContain('Duplicate agent id');
+    expect(errors.filter(error => error.message.includes('Duplicate agent id'))).toHaveLength(1);
   });
 
   it('detects duplicate agent ids within same project', () => {
@@ -423,6 +423,70 @@ describe('validateConfig', () => {
     expect(hasPathEndingWith(config, '.workdir')).toBe(true);
   });
 
+  it('rejects two agents that resolve to the same Workdir on one host', () => {
+    const config = withProject(devProject({
+      agent: [[
+        makeAgent({ id: 'd1', role: 'dev', workdir: '/tmp/shared/../agent' }),
+        makeAgent({ id: 'q1', role: 'qa', workdir: '/tmp/agent' }),
+      ]],
+    }));
+
+    const error = validateConfig(config).find(item => item.path.endsWith('[1].workdir'));
+    expect(error?.message).toContain('must not share a directory');
+  });
+
+  it('allows equal Workdir paths on different remote hosts', () => {
+    const config = withProject(devProject({
+      agent: [[
+        makeAgent({
+          id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent',
+          host: { hostname: 'dev.example.com', user: 'git' },
+        }),
+        makeAgent({
+          id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent',
+          host: { hostname: 'qa.example.com', user: 'git' },
+        }),
+      ]],
+    }));
+
+    expect(validateConfig(config)).toEqual([]);
+  });
+
+  it('treats an omitted SSH port and explicit port 22 as the same Workdir host', () => {
+    const config = withProject(devProject({
+      agent: [[
+        makeAgent({
+          id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent',
+          host: { hostname: 'box.example.com', user: 'git' },
+        }),
+        makeAgent({
+          id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent',
+          host: { hostname: 'box.example.com', user: 'git', port: 22 },
+        }),
+      ]],
+    }));
+
+    const error = validateConfig(config).find(item => item.path.endsWith('[1].workdir'));
+    expect(error?.message).toContain('must not share a directory');
+  });
+
+  it('allows equal Workdir paths on distinct explicit SSH ports', () => {
+    const config = withProject(devProject({
+      agent: [[
+        makeAgent({
+          id: 'd1', role: 'dev', mode: 'remote', workdir: '/srv/baxian/agent',
+          host: { hostname: 'box.example.com', user: 'git', port: 22 },
+        }),
+        makeAgent({
+          id: 'q1', role: 'qa', mode: 'remote', workdir: '/srv/baxian/agent',
+          host: { hostname: 'box.example.com', user: 'git', port: 2222 },
+        }),
+      ]],
+    }));
+
+    expect(validateConfig(config)).toEqual([]);
+  });
+
   it('rejects project.repo with shell metacharacters', () => {
     const cases = [
       'foo/bar;rm',
@@ -472,10 +536,9 @@ describe('agent.yolo field', () => {
     expect(validateConfig(config)).toEqual([]);
   });
 
-  it('rejects yolo: false (interactive REPL only supports YOLO/bypass)', () => {
+  it('accepts yolo: false (issue #475: runtime launches in its default permission mode)', () => {
     const config = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', yolo: false })]] }));
-    const errors = validateConfig(config);
-    expect(errors.some(e => e.path.includes('yolo') && /yolo=false is rejected/.test(e.message))).toBe(true);
+    expect(validateConfig(config)).toEqual([]);
   });
 
   it('rejects non-boolean yolo', () => {

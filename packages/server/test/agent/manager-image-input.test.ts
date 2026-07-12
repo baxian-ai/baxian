@@ -66,7 +66,7 @@ beforeEach(async () => {
     ...CONFIG,
     project: CONFIG.project.map(p => ({
       ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: tempDir }))),
+      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
     })),
   };
 
@@ -205,7 +205,7 @@ describe('createAndStartTask image ordering + rollback', () => {
 
     expect(await taskStore.list()).toHaveLength(0);
     expect(startSpy).not.toHaveBeenCalled();
-    expect(await lockManager.acquire('dev-1')).toBeTruthy();
+    expect(await lockManager.acquire('dev-1', 'test:probe')).toBeTruthy();
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
@@ -261,6 +261,6 @@ describe('retryTask image preservation', () => {
     expect(await taskStore.list()).toHaveLength(1);
     expect((await taskStore.get('task-001'))?.status).toBe('failed');
     expect(startSpy).not.toHaveBeenCalled();
-    expect(await lockManager.acquire('dev-1')).toBeTruthy();
+    expect(await lockManager.acquire('dev-1', 'test:probe')).toBeTruthy();
   });
 });

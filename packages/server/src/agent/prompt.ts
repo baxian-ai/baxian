@@ -41,7 +41,7 @@ export interface BuildPromptOpts {
   task: TaskState;
   phase: string;
   agent: AgentConfig;
-  worktreePath: string;
+  workdir: string;
   skillRegistry: SkillRegistry;
   signalToken?: string;
   postApproveRedispatchCount?: number;
@@ -53,7 +53,7 @@ export interface BuildPromptOpts {
   serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
-  serverReviewWorktree?: 'head' | 'base';
+  serverReviewCheckout?: 'head' | 'base';
   serverReviewFallbackReason?: string;
   serverBaseSha?: string;
   serverHeadSha?: string;
@@ -77,7 +77,7 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
   const taskBody = buildTaskBody({
     task: opts.task,
     phase: opts.phase,
-    worktreePath: opts.worktreePath,
+    workdir: opts.workdir,
     signalToken: opts.signalToken,
     postApproveRedispatchCount: opts.postApproveRedispatchCount,
     currentSpecRound: opts.currentSpecRound,
@@ -88,7 +88,7 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     serverDiffstatFile: opts.serverDiffstatFile,
     serverInterdiff: opts.serverInterdiff,
     serverInterdiffFile: opts.serverInterdiffFile,
-    serverReviewWorktree: opts.serverReviewWorktree,
+    serverReviewCheckout: opts.serverReviewCheckout,
     serverReviewFallbackReason: opts.serverReviewFallbackReason,
     serverBaseSha: opts.serverBaseSha,
     serverHeadSha: opts.serverHeadSha,
@@ -119,7 +119,7 @@ export function buildGreetingPrompt(token: string, runtime: AgentRuntime): strin
 interface TaskBodyArgs {
   task: TaskState;
   phase: string;
-  worktreePath: string;
+  workdir: string;
   signalToken?: string;
   postApproveRedispatchCount?: number;
   currentSpecRound?: number;
@@ -130,7 +130,7 @@ interface TaskBodyArgs {
   serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
-  serverReviewWorktree?: 'head' | 'base';
+  serverReviewCheckout?: 'head' | 'base';
   serverReviewFallbackReason?: string;
   serverBaseSha?: string;
   serverHeadSha?: string;
@@ -155,7 +155,7 @@ interface PhasePromptCtx {
   serverDiffstatFile?: ReviewContentFileRef;
   serverInterdiff?: string;
   serverInterdiffFile?: ReviewContentFileRef;
-  serverReviewWorktree?: 'head' | 'base';
+  serverReviewCheckout?: 'head' | 'base';
   serverReviewFallbackReason?: string;
   serverBaseSha?: string;
   serverHeadSha?: string;
@@ -270,7 +270,7 @@ function buildServerReviewInstructions(
     serverDiffstatFile,
     serverInterdiff,
     serverInterdiffFile,
-    serverReviewWorktree,
+    serverReviewCheckout,
     serverReviewFallbackReason,
     serverBaseSha,
     serverHeadSha,
@@ -286,7 +286,7 @@ function buildServerReviewInstructions(
   return {
     fields: [
       `round: ${round}`,
-      ...(serverReviewWorktree ? [`review-worktree: ${serverReviewWorktree}`] : []),
+      ...(serverReviewCheckout ? [`review-checkout: ${serverReviewCheckout}`] : []),
       ...(serverBaseSha ? [`base-sha: ${serverBaseSha}`] : []),
       ...(serverHeadSha ? [`head-sha: ${serverHeadSha}`] : []),
       ...(serverHeadTree ? [`head-tree: ${serverHeadTree}`] : []),
@@ -311,10 +311,10 @@ function buildServerReviewInstructions(
 
 function buildTaskBody(args: TaskBodyArgs): string {
   const {
-    task, phase, worktreePath, signalToken, postApproveRedispatchCount,
+    task, phase, workdir, signalToken, postApproveRedispatchCount,
     currentSpecRound, imagePaths,
     serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
-    serverReviewWorktree, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
+    serverReviewCheckout, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   } = args;
@@ -342,7 +342,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
   const { fields, blocks } = phaseBuilder({
     task, signalToken, currentSpecRound, postApproveRedispatchCount,
     serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
-    serverReviewWorktree, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
+    serverReviewCheckout, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   });
@@ -352,7 +352,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
   const exchange = task.reviewMode === 'server' ? 'server-files' : 'github-pr';
   const descriptor = [
     `phase: ${phase}`,
-    `worktree: ${worktreePath}`,
+    `workdir: ${workdir}`,
     ...(carriesExchange ? [`exchange: ${exchange}`] : []),
     ...fields,
     ...(signalToken ? [`token: ${signalToken}`] : []),

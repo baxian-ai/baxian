@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -10,7 +10,7 @@ import {
   validateReviewResponse,
 } from '../../src/agent/review-transport.js';
 import { MAX_INLINE_CONTENT_BYTES } from '../../src/shared/index.js';
-import { LocalRunner } from '../../src/agent/runner.js';
+import { LocalRunner, shellQuote } from '../../src/agent/runner.js';
 import type { ExecOptions, ExecResult } from '../../src/agent/runner.js';
 import { GIT_NET_ENV, NET_EXEC_TIMEOUT_MS, __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
 import type { AgentConfig, TaskState } from '../../src/shared/index.js';
@@ -54,7 +54,7 @@ function makeTransport(rules: Rule[], worktree = '/wt/dev') {
   };
   const transport = new ReviewTransport({
     createRunnerFor: () => runner,
-    resolveWorktree: () => worktree,
+    resolveWorkdir: () => worktree,
   });
   return { transport, calls, execOptions, writes };
 }
@@ -171,7 +171,7 @@ describe('readContent (code)', () => {
     };
     const transport = new ReviewTransport({
       createRunnerFor: () => runner,
-      resolveWorktree: () => '/wt/dev',
+      resolveWorkdir: () => '/wt/dev',
     });
     await transport.readContent(task(), DEV, 'code');
     const fetch = seen.find(c => c.cmd.includes('git fetch origin'));
@@ -203,7 +203,7 @@ describe('readContent (code)', () => {
       };
       const transport = new ReviewTransport({
         createRunnerFor: () => runner,
-        resolveWorktree: () => '/wt/dev',
+        resolveWorkdir: () => '/wt/dev',
       });
       await expect(transport.readContent(task(), DEV, 'code')).resolves.toBeDefined();
       expect(fetchAttempts).toBe(2);
@@ -225,7 +225,7 @@ describe('readContent (code)', () => {
       };
       const transport = new ReviewTransport({
         createRunnerFor: () => runner,
-        resolveWorktree: () => '/wt/dev',
+        resolveWorkdir: () => '/wt/dev',
       });
       await expect(transport.readContent(task(), DEV, 'code')).rejects.toThrow(
         expect.objectContaining({ reason: 'fetch-failed' }),
@@ -243,7 +243,7 @@ describe('readContent (spec)', () => {
     ]);
     const result = await transport.readContent(task(), DEV, 'spec');
     expect(result.content).toBe('# Spec\nbody');
-    expect(calls[0]).toContain('.baxian/spec.md');
+    expect(calls.find(call => call.startsWith('cat '))).toContain('.baxian/spec.md');
   });
 
   it('throws when the spec doc is missing', async () => {
@@ -315,7 +315,7 @@ describe('readInterdiff (e2e: real git, rewritten review head)', () => {
 
       const transport = new ReviewTransport({
         createRunnerFor: () => runner,
-        resolveWorktree: () => worktree,
+        resolveWorkdir: () => worktree,
       });
       const diff = await transport.readInterdiff(DEV, prev, cur);
       // only beta.txt changed this round; alpha.txt was already reviewed last round
@@ -364,6 +364,28 @@ describe('readFindings / readResponse', () => {
     expect(response?.responses[0].action).toBe('fix');
     await transport.deleteResponse(DEV);
     expect(calls.some(c => c.startsWith('rm -f') && c.includes('response.json'))).toBe(true);
+  });
+});
+
+describe('clearDispatchOutputs', () => {
+  it('clears stale review outputs before every dispatch and the spec output before develop', async () => {
+    const { transport, calls } = makeTransport([]);
+
+    await transport.clearDispatchOutputs(DEV, '/wt/dev', 'develop');
+
+    const command = calls.at(-1)!;
+    expect(command).toContain("'/wt/dev/.baxian/review/findings.json'");
+    expect(command).toContain("'/wt/dev/.baxian/review/response.json'");
+    expect(command).toContain("'/wt/dev/.baxian/spec.md'");
+  });
+
+  it('fails closed when stale output cleanup fails', async () => {
+    const { transport } = makeTransport([
+      { match: command => command.startsWith('rm -f'), result: { exitCode: 1, stderr: 'permission denied' } },
+    ]);
+
+    await expect(transport.clearDispatchOutputs(QA, '/wt/qa', 'server-review'))
+      .rejects.toThrow(expect.objectContaining({ reason: 'artifact-cleanup-failed' }));
   });
 });
 
@@ -525,7 +547,7 @@ describe('deliverToInbox', () => {
         writeFile: async () => { throw new Error('ssh down'); },
         execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
       }),
-      resolveWorktree: () => '/wt/qa',
+      resolveWorkdir: () => '/wt/qa',
     });
     await expect(
       failing.deliverToInbox(QA, QA_WT, 'spec-round-1.md', 'x'),
@@ -549,9 +571,11 @@ describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
   it('delivers a >10KB multibyte payload byte-identical to the final file, with a clean inbox dir', async () => {
     const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-e2e-'));
     try {
+      const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
+      expect(initialized.exitCode).toBe(0);
       const transport = new ReviewTransport({
         createRunnerFor: () => new LocalRunner(),
-        resolveWorktree: () => worktree,
+        resolveWorkdir: () => worktree,
       });
       const content = `${'哈'.repeat(8000)}ascii-tail-${'x'.repeat(2000)}`;
       expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(10 * 1024);
@@ -571,6 +595,28 @@ describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
       expect(entries).toEqual(['findings-round-1.json']);
     } finally {
       await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a .baxian symlink before writing outside the Workdir', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-symlink-'));
+    const outside = await mkdtemp(join(tmpdir(), 'review-inbox-outside-'));
+    try {
+      const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
+      expect(initialized.exitCode).toBe(0);
+      await symlink(outside, join(worktree, '.baxian'));
+      const transport = new ReviewTransport({
+        createRunnerFor: () => new LocalRunner(),
+        resolveWorkdir: () => worktree,
+      });
+
+      await expect(
+        transport.deliverToInbox(QA, worktree, 'findings-round-1.json', 'secret'),
+      ).rejects.toMatchObject({ reason: 'unsafe-runtime-path' });
+      expect(await readdir(outside)).toEqual([]);
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
     }
   });
 });

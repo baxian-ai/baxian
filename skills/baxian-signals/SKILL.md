@@ -71,7 +71,7 @@ Server review flow (no PR; exchange via `.baxian/review/*.json`):
 
 ## Context-request side-channel
 
-During server review, request file context only when the prompt says `review-worktree: base`, or during server spec review / legacy batch continuation when the prompt context is insufficient:
+During server review, request file context only when the prompt says `review-checkout: base`, or during server spec review / legacy batch continuation when the prompt context is insufficient:
 
 ```
 [bx:read-file:<path>:<start>-<end>]

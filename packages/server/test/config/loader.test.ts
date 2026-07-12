@@ -36,7 +36,7 @@ const VALID_CONFIG = {
       agent: [
         [
           { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-1' },
         ],
       ],
     },
@@ -47,7 +47,7 @@ const PROJECT = {
   id: 'pp', repo: 'u/r',
   agent: [[
     { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-    { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+    { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
   ]],
 };
 
@@ -73,7 +73,7 @@ describe('loadConfig', () => {
           repo: 'u/r',
           agent: [[
             { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-            { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+            { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
           ]],
         },
       ],
@@ -98,7 +98,7 @@ describe('loadConfig', () => {
           repo: 'u/r',
           agents: [[
             { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-            { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+            { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
           ]],
         },
       ],
@@ -331,7 +331,7 @@ describe('prepareConfig type guards', () => {
         ...PROJECT,
         agent: [[
           { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-          { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp' },
+          { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
         ]],
       }],
     });

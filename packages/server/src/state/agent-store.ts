@@ -120,8 +120,8 @@ function normalizeBinding(raw: Record<string, unknown>, fallbackId: string): Age
   const updatedAt = typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date(0).toISOString();
   const binding: AgentBindingFacts = { id, projectId, updatedAt };
   if (typeof raw.taskId === 'string') binding.taskId = raw.taskId;
-  if (typeof raw.worktreePath === 'string') binding.worktreePath = raw.worktreePath;
-  if (typeof raw.repoPath === 'string') binding.repoPath = raw.repoPath;
+  if (typeof raw.lockToken === 'string') binding.lockToken = raw.lockToken;
+  if (typeof raw.workdir === 'string') binding.workdir = raw.workdir;
   if (typeof raw.startedAt === 'string') binding.startedAt = raw.startedAt;
   if (typeof raw.bootstrappingTaskId === 'string') binding.bootstrappingTaskId = raw.bootstrappingTaskId;
   if (typeof raw.paneId === 'string') binding.paneId = raw.paneId;

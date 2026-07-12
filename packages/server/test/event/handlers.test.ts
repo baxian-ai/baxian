@@ -79,7 +79,7 @@ beforeEach(async () => {
     ...BASE_CONFIG,
     project: BASE_CONFIG.project.map(p => ({
       ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: tempDir }))),
+      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
     })),
   };
 
@@ -128,7 +128,7 @@ async function seedDevAgent(taskId: string, agentId = 'dev-1'): Promise<void> {
     projectId: 'proj',
     status: 'running',
     taskId,
-    worktreePath: join(tempDir, 'worktrees', `${taskId}-dev`),
+    workdir: join(tempDir, 'worktrees', `${taskId}-dev`),
     updatedAt: new Date().toISOString(),
   });
   await mkdir(join(tempDir, 'worktrees', `${taskId}-dev`), { recursive: true });
@@ -1082,7 +1082,7 @@ describe('pr.updated handler', () => {
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
-      worktreePath: join(tempDir, 'worktrees', 'task-up-waiting-redispatch'),
+      workdir: join(tempDir, 'worktrees', 'task-up-waiting-redispatch'),
       updatedAt: new Date().toISOString(),
     });
     await mkdir(join(tempDir, 'worktrees', 'task-up-waiting-redispatch'), { recursive: true });
@@ -3011,7 +3011,7 @@ describe('event-driven release does not interrupt agent mid-action', () => {
   it('review.submitted REQUEST_CHANGES on approved task with busy dev pane: no C-c, dev binding preserved through waiting release', async () => {
     await seedTask({ id: 'task-busy-redispatch', status: 'approved', reviewRound: 1, prNumber: 113, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
     await seedDevAgent('task-busy-redispatch');
-    await lockManager.acquire('dev-1');
+    await lockManager.acquire('dev-1', 'task-busy-redispatch');
 
     const sentCommands: string[] = [];
     (mockRunner.exec as ReturnType<typeof vi.fn>).mockImplementation(
@@ -3068,7 +3068,7 @@ describe('event-driven release does not interrupt agent mid-action', () => {
   it('REQUEST_CHANGES on approved + post-approve completion still active: emits intervention + skips fix dispatch (avoid prompt collision)', async () => {
     await seedTask({ id: 'task-postapprove-busy', status: 'approved', reviewRound: 1, prNumber: 200, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
     await seedDevAgent('task-postapprove-busy');
-    await lockManager.acquire('dev-1');
+    await lockManager.acquire('dev-1', 'task-postapprove-busy');
     await manager.setPostApproveCompletion('task-postapprove-busy', { token: 'tok-pa', approvedHeadSha: HEAD_SHA });
 
     const { acquireAgentForTask: acquireSpy, continueSession: continueSpy, releaseAgentForTask: releaseSpy } = stubManager({ acquireAgentForTask: true, continueSession: true, releaseAgentForTask: true });

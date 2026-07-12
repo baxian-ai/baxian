@@ -110,8 +110,8 @@ export interface AgentBindingFacts {
   id: string;
   projectId: string;
   taskId?: string;
-  worktreePath?: string;
-  repoPath?: string;
+  lockToken?: string;
+  workdir?: string;
   startedAt?: string;
   updatedAt: string;
   paneId?: string;
@@ -167,6 +167,17 @@ export interface TaskState {
   prNumber?: number;
   prUrl?: string;
   branch?: string;
+  branchCreatedByBaxian?: boolean;
+  branchCleanupPending?: {
+    agentId: string;
+    reason: string;
+    updatedAt: string;
+  };
+  branchCleanupSkipped?: {
+    agentId: string;
+    reason: string;
+    updatedAt: string;
+  };
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;

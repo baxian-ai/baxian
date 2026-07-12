@@ -264,7 +264,7 @@ describe('ReviewRoundPage', () => {
 
     const btn = screen.getByText('This round only') as HTMLButtonElement;
     await waitFor(() => expect(btn.disabled).toBe(true));
-    expect(btn.title).toMatch(/worktree released/i);
+    expect(btn.title).toMatch(/no longer bound to this task/i);
     expect(Array.from(document.querySelectorAll('div')).find((d) => d.textContent === '+new')).toBeTruthy();
   });
 

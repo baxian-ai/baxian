@@ -125,6 +125,7 @@ it('hides Workdir/Model/Additional Dirs behind a collapsed Advanced options togg
   expect(toggle.getAttribute('aria-controls')).toBe('advanced-options');
   expect(document.getElementById('advanced-options')).toBeTruthy();
   expect(screen.getByLabelText(/Workdir/)).toBeTruthy();
+  expect(screen.getByText(/Do not share the same directory between agents/)).toBeTruthy();
   expect(screen.getByLabelText(/Model/)).toBeTruthy();
   expect(screen.getByLabelText(/Additional Dirs/)).toBeTruthy();
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractRegion, type DetectionInput } from '../../../src/agent/detect/region.js';
+import { extractRegion, tailNonEmpty, type DetectionInput } from '../../../src/agent/detect/region.js';
 
 function input(screen: string, oscTitle = ''): DetectionInput {
   return { screen, oscTitle };
@@ -39,5 +39,11 @@ describe('extractRegion', () => {
     expect(result).toContain('line3');
     expect(result).toContain('line4');
     expect(result).not.toContain('line1');
+  });
+
+  it('tailNonEmpty(0) is an empty window, matching tail(0) semantics', () => {
+    expect(extractRegion(input('a\nb\n'), 'tailNonEmpty(0)')).toBe('');
+    expect(tailNonEmpty('a\nb\n', 0)).toBe('');
+    expect(tailNonEmpty('a\nb\n', -1)).toBe('');
   });
 });

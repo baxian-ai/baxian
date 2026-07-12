@@ -103,7 +103,7 @@ beforeEach(async () => {
     ...CONFIG,
     project: CONFIG.project.map(p => ({
       ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: tempDir }))),
+      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
     })),
   };
 
@@ -329,4 +329,3 @@ describe('dispatchPendingTask', () => {
     expect(setSpy).not.toHaveBeenCalled();
   });
 });
-

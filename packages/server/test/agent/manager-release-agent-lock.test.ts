@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import type { BaxianConfig } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager } from '../../src/agent/manager.js';
+import { BranchManager } from '../../src/agent/branch.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -34,15 +35,11 @@ let agentStore: AgentStore;
 let taskStore: TaskStore;
 let lockManager: LockManager;
 let manager: AgentManager;
-let onWorktreeRemove: (() => Promise<void>) | undefined;
+let onBranchCleanup: (() => Promise<void>) | undefined;
 
 function readyRunner(): CommandRunner {
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('git worktree remove')) {
-        await onWorktreeRemove?.();
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
       if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
         return { stdout: 'claude\n', stderr: '', exitCode: 0 };
       }
@@ -64,6 +61,7 @@ async function seedActiveBinding(): Promise<void> {
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     branch: 'bx/task-001',
+    branchCreatedByBaxian: true,
     reviewRound: 0,
     status: 'in_progress',
     createdAt: NOW,
@@ -73,17 +71,16 @@ async function seedActiveBinding(): Promise<void> {
     id: 'dev-1',
     projectId: 'proj',
     taskId: 'task-001',
-    worktreePath: '/tmp/repo/.baxian-worktrees/task-001',
-    repoPath: '/tmp/repo',
+    workdir: '/tmp/repo',
     paneId: '%0',
     startedAt: NOW,
     updatedAt: NOW,
   });
-  await lockManager.acquire('dev-1');
+  await lockManager.acquire('dev-1', 'task-001');
 }
 
 beforeEach(async () => {
-  onWorktreeRemove = undefined;
+  onBranchCleanup = undefined;
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-release-lock-'));
   await initStateDir(tempDir);
 
@@ -101,9 +98,15 @@ beforeEach(async () => {
     skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
     runnerFactory: () => readyRunner(),
   });
+  vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
+    await onBranchCleanup?.();
+    return { status: 'deleted' };
+  });
+  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -115,32 +118,32 @@ describe('releaseAgentForTask binding transitions', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBe('task-001');
-    expect(state?.worktreePath).toBe('/tmp/repo/.baxian-worktrees/task-001');
+    expect(state?.workdir).toBe('/tmp/repo');
     expect(state?.startedAt).toBe(NOW);
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('idle mode clears task/worktree binding and releases the lock', async () => {
+  it('idle mode clears the task binding, keeps the fixed Workdir, and releases the lock', async () => {
     await seedActiveBinding();
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(true);
 
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBeUndefined();
-    expect(state?.worktreePath).toBeUndefined();
+    expect(state?.workdir).toBe('/tmp/repo');
     expect(state?.startedAt).toBeUndefined();
     expect(state?.paneId).toBe('%0');
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('idle mode preserves latest pane and repo facts from the update closure', async () => {
+  it('idle mode preserves the latest pane and Workdir facts from the update closure', async () => {
     await seedActiveBinding();
-    onWorktreeRemove = async () => {
+    onBranchCleanup = async () => {
       await agentStore.update('dev-1', (state) => state
         ? {
             ...state,
             paneId: '%9',
-            repoPath: '/tmp/repo-new',
+            workdir: '/tmp/repo-new',
             updatedAt: new Date().toISOString(),
           }
         : state);
@@ -150,14 +153,13 @@ describe('releaseAgentForTask binding transitions', () => {
 
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBeUndefined();
-    expect(state?.worktreePath).toBeUndefined();
     expect(state?.startedAt).toBeUndefined();
     expect(state?.paneId).toBe('%9');
-    expect(state?.repoPath).toBe('/tmp/repo-new');
+    expect(state?.workdir).toBe('/tmp/repo-new');
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('absent-tmux reconciliation can clear a binding without deadlocking against release', async () => {
+  it('absent-tmux reconciliation holds the binding without deadlocking against a waiting transition', async () => {
     await seedActiveBinding();
 
     const release = manager.releaseAgentForTask('dev-1', 'task-001', 'waiting');
@@ -165,9 +167,38 @@ describe('releaseAgentForTask binding transitions', () => {
     await Promise.all([release, reconcile]);
 
     const state = await agentStore.get('dev-1');
-    expect(state?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(state?.taskId).toBe('task-001');
+    expect(state).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'runtime-missing' });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect((await taskStore.get('task-001'))?.status).toBe('failed');
+  });
+
+  it('idle release proceeds without a pane after confirming the tmux session is absent', async () => {
+    await seedActiveBinding();
+    await agentStore.update('dev-1', state => ({ ...state!, paneId: undefined }));
+    const absentRunner = readyRunner();
+    vi.mocked(absentRunner.exec).mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('tmux has-session')) {
+        return { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
+      }
+      if (cmd.includes('tmux list-panes')) {
+        return { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    });
+    manager = new AgentManager({
+      config: CONFIG,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: new EventBus(new EventLog(join(tempDir, 'events'))),
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => absentRunner,
+    });
+
+    expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 });
 
@@ -177,10 +208,6 @@ describe('releaseAgentForTask does not interrupt the REPL', () => {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('send-keys')) {
           sentKeys.push(cmd);
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('git worktree remove')) {
-          await onWorktreeRemove?.();
           return { stdout: '', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
@@ -204,19 +231,24 @@ describe('releaseAgentForTask does not interrupt the REPL', () => {
       agentStore,
       taskStore,
       lockManager,
-      eventBus: new EventBus(new EventLog(join(tempDir, 'events-busy'))),
+      eventBus: new EventBus(new EventLog(join(tempDir, 'events'))),
       skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
       runnerFactory: () => busyRunner(sentKeys),
     });
   });
 
-  it('idle release on busy pane: clears binding, no C-c sent', async () => {
+  it('idle release on busy pane: keeps binding and lock, no C-c sent', async () => {
     await seedActiveBinding();
+    Object.assign(manager, { cleanComposerWaitMs: 10, compactIdlePollMs: 1 });
 
-    expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(true);
+    expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(false);
 
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-001',
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(sentKeys.filter(k => k.includes('C-c'))).toHaveLength(0);
   });
 

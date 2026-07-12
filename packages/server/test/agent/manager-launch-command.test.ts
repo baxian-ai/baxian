@@ -121,6 +121,34 @@ describe('buildLaunchCommand', () => {
       "qodercli --dangerously-skip-permissions --model 'efficient' --add-dir '/x'",
     );
   });
+
+  describe('yolo: false launches the runtime in its default permission mode (issue #475)', () => {
+    it.each<[AgentRuntime, string]>([
+      ['claude-code', 'env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude'],
+      ['codex', 'codex'],
+      ['opencode', 'env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode'],
+      ['qodercli', 'qodercli'],
+    ])('%s drops the bypass flag', (runtime, expected) => {
+      expect(buildLaunchCommand(agent({ runtime, yolo: false }))).toBe(expected);
+    });
+
+    it.each<[AgentRuntime]>([['claude-code'], ['codex'], ['opencode'], ['qodercli']])(
+      '%s: explicit yolo: true matches the undefined default',
+      (runtime) => {
+        expect(buildLaunchCommand(agent({ runtime, yolo: true }))).toBe(
+          buildLaunchCommand(agent({ runtime })),
+        );
+      },
+    );
+
+    it('keeps --model and --add-dir appended without the bypass flag', () => {
+      expect(
+        buildLaunchCommand(agent({ runtime: 'claude-code', yolo: false, model: 'opus', addDirs: ['/x'] })),
+      ).toBe(
+        "env CLAUDE_CODE_NO_FLICKER=1 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 claude --model 'opus' --add-dir '/x'",
+      );
+    });
+  });
 });
 
 describe('skillSubdirFor', () => {

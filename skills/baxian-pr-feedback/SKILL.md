@@ -4,7 +4,7 @@ description: Dev processes PR review feedback (fix phase) and the pre-merge feed
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields. Work in `worktree:`; the PR is in `pr:`. Communicate via the GitHub PR; stay in scope (out-of-scope work goes to a new Issue). Route on `phase:`: follow §Fix for `fix`, §Post-Approve for `post-approve`.
+baxian dispatches you with a block of `key: value` dispatch fields. `workdir:` is your fixed current directory with the task branch already checked out; do not change directories or branches. The PR is in `pr:`. Communicate via the GitHub PR; stay in scope (out-of-scope work goes to a new Issue). Route on `phase:`: follow §Fix for `fix`, §Post-Approve for `post-approve`.
 
 ## Fetch Feedback
 

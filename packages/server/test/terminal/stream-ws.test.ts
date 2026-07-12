@@ -22,7 +22,9 @@ afterEach(async () => {
     await runningApp.close();
     runningApp = null;
   }
-  await rm(tempDir, { recursive: true });
+  // stream-ws fires void emitIntervention(...) whose event-log append can land in
+  // events/ after app.close(); retries absorb that race (see #494).
+  await rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 });
 
 function createFakePty(): MinimalPty {

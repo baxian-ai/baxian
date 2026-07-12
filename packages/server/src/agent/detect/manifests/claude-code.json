@@ -206,7 +206,7 @@
       "region": "afterLastHorizontalRule",
       "regex": ["[eE]sc to interru(?:pt|p(?:…|\\.{3})?)"],
       "notAfter": [
-        { "lineRegex": ["^[ \\t]*[❯>][ \\t]*$"] },
+        { "lineRegex": ["^[ \\t\\u00a0]*[❯>][ \\t\\u00a0]*$"] },
         { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     },
@@ -225,7 +225,7 @@
       "region": "tail(6)",
       "visibleIdle": true,
       "any": [
-        { "regex": ["(?:^|\\n)[ \\t]*[❯>][ \\t]*(?:\\n[ \\t]*)*$"] },
+        { "regex": ["(?:^|\\n)[ \\t\\u00a0]*[❯>][ \\t\\u00a0]*(?:\\n[ \\t]*)*$"] },
         { "regex": ["(?:^|\\n)[ \\t]*⏵⏵ bypass permissions on[^\\n]*(?:\\n[ \\t]*)*$"] }
       ]
     }

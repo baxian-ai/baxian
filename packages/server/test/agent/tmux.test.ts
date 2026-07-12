@@ -709,6 +709,34 @@ describe('TmuxManager', () => {
       expect(resend).not.toHaveBeenCalled();
     });
 
+    it('does NOT re-send Enter when a non-yolo claude-code bash permission prompt is up (real capture)', async () => {
+      const baseline = buildBaseline('❯ \n', 0);
+      runner.exec.mockResolvedValue({
+        stdout: composeSnapStdout(`${CC_NONYOLO_BASH_PERMISSION}\n`, 0),
+        stderr: '',
+        exitCode: 0,
+      });
+      const resend = vi.fn(async () => undefined);
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).rejects.toThrow(/runtime ack timeout/);
+      expect(resend).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-send Enter when a non-yolo codex escalation prompt is up (real capture)', async () => {
+      const baseline = buildBaseline('› \n\n  gpt-5.5 xhigh · /w\n', 0);
+      runner.exec.mockResolvedValue({
+        stdout: composeSnapStdout(`${CODEX_NONYOLO_ESCALATION}\n`, 0),
+        stderr: '',
+        exitCode: 0,
+      });
+      const resend = vi.fn(async () => undefined);
+      await expect(
+        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+      ).rejects.toThrow(/runtime ack timeout/);
+      expect(resend).not.toHaveBeenCalled();
+    });
+
     it('re-sends Enter when the prompt body quotes a menu footer but the composer is held below it', async () => {
       const held = '› $baxian-task\n  describe a menu: Enter to select · Esc to cancel\n'
         + Array.from({ length: 20 }, (_, i) => `  detail line ${i}`).join('\n')
@@ -1616,6 +1644,239 @@ describe('runtimeBusyCheck (opencode/qodercli screen-only busy)', () => {
 
   it('opencode: ctrl+c interrupt hint alone (progress bar wrapped out of tail) is busy', () => {
     expect(runtimeBusyCheck('running a long tool call\n  ctrl+c to interrupt          ctrl+p commands\n', 'opencode')).toBe(true);
+  });
+});
+
+
+// ————— 真实截屏 fixture（issue #475 探针，tmux 200×50 底部窗口，spec 附录 A）—————
+// 非 YOLO（无 bypass 旗标）与 YOLO fresh 屏的就绪/忙碌几何回归：
+// opencode 垂直居中、qodercli 顶部锚定，标记与窗口底部之间隔着空行海；
+// claude-code 空 composer 行是 ❯ + no-break space。
+const blank = (n: number): string[] => Array(n).fill('');
+
+const CC_NONYOLO_IDLE = [
+  " ▎ Run /model and select Fable to use it. Learn more",
+  ...blank(27),
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯\u00a0",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  wd-cc Fable 5",
+  "  ⏸ manual mode on · ← for agents",
+].join('\n');
+
+const CODEX_NONYOLO_IDLE = [
+  "│                                                          │",
+  "│ model:     gpt-5.5 xhigh   /model to change              │",
+  "│ directory: /private/tmp/claude-501/…/yolo-probe/wd-codex │",
+  "╰──────────────────────────────────────────────────────────╯",
+  "",
+  "  Tip: New Use /fast to enable our fastest inference with increased plan usage.",
+  "",
+  "• You have 2 usage limit resets available. Run /usage to use one.",
+  "",
+  "",
+  "› Run /review on my current changes",
+  "",
+  "  gpt-5.5 xhigh · /private/tmp/claude-501/-Users-devuser--baxian-repos-example-baxian/f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/scratchpad/yolo-probe/wd-codex",
+  ...blank(35),
+].join('\n');
+
+const OC_NONYOLO_FRESH_IDLE = [
+  "                                                                                 ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
+  "",
+  "",
+  "                                                               ┃",
+  "                                                               ┃  Ask anything... \"What is the tech stack of this project?\"",
+  "                                                               ┃",
+  "                                                               ┃  Build · GLM-5.2 Alibaba (China) · max",
+  "                                                               ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+  "                                                                                                               tab agents  ctrl+p commands",
+  ...blank(18),
+  "  /private/tmp/claude-501/-Users-devuser--baxian-repos-example-baxian/f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/scratchpad/yolo-probe/wd-oc                                                         1.17.16",
+  "",
+].join('\n');
+
+const OC_YOLO_FRESH_IDLE = [
+  "                                                                                 ▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
+  "",
+  "",
+  "                                                               ┃",
+  "                                                               ┃  Ask anything... \"What is the tech stack of this project?\"",
+  "                                                               ┃",
+  "                                                               ┃  Build auto · GLM-5.2 Alibaba (China) · max",
+  "                                                               ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+  "                                                                                                               tab agents  ctrl+p commands",
+  ...blank(18),
+  "  /private/tmp/claude-501/-Users-devuser--baxian-repos-example-baxian/f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/scratchpad/yolo-probe/wd-oc2                                                        1.17.17",
+  "",
+].join('\n');
+
+const QODER_NONYOLO_FRESH_IDLE = [
+  " ██      ██                            │ 1. Create AGENTS.md files to customize interactions          │",
+  " ██  ██  ██  Qoder CLI v1.0.41         │ 2. /help for more information                                │",
+  " ██    ██                              │ 3. Ask coding questions, edit code or run commands           │",
+  "   ████  ██  Signed in Browser Login   │ 4. Be specific for the best results                          │",
+  "                                       ╰──────────────────────────────────────────────────────────────╯",
+  "",
+  "",
+  "                                                                                                                                                                                        ? for shortcuts",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  " Shift+Tab to Accept Edits                                                                                                                                                  Try /model to switch models",
+  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+  " >   Type your message or @path/to/file",
+  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+  " GLM-5.2 (Alibaba Cloud Model Studio - China) Model · ctx ░░░░░░░░░░ 0%",
+  ...blank(34),
+].join('\n');
+
+const QODER_YOLO_FRESH_IDLE = [
+  " ██      ██                            │ 1. Create AGENTS.md files to customize interactions          │",
+  " ██  ██  ██  Qoder CLI v1.0.41         │ 2. /help for more information                                │",
+  " ██    ██                              │ 3. Ask coding questions, edit code or run commands           │",
+  "   ████  ██  Signed in Browser Login   │ 4. Be specific for the best results                          │",
+  "                                       ╰──────────────────────────────────────────────────────────────╯",
+  "",
+  "",
+  "                                                                                                                                                                                        ? for shortcuts",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  " YOLO Shift+Tab to Auto Mode                                                                                                                                                Try /model to switch models",
+  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+  " *   Type your message or @path/to/file",
+  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+  " GLM-5.2 (Alibaba Cloud Model Studio - China) Model · ctx ░░░░░░░░░░ 0%",
+  ...blank(34),
+].join('\n');
+
+const CC_NONYOLO_BASH_PERMISSION = [
+  "⏺ bx475",
+  "",
+  "✻ Churned for 10s",
+  "",
+  "❯ Run this exact bash command: touch /tmp/bx475-perm-probe",
+  "",
+  "⏺ Running 1 shell command…",
+  "  ⎿  $ touch /tmp/bx475-perm-probe",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  " Bash command",
+  "",
+  "   touch /tmp/bx475-perm-probe",
+  "   Create empty file /tmp/bx475-perm-probe",
+  "",
+  " Do you want to proceed?",
+  " ❯ 1. Yes",
+  "   2. Yes, and always allow access to tmp/ from this project",
+  "   3. No",
+  "",
+  " Esc to cancel · Tab to amend · ctrl+e to explain",
+  ...blank(6),
+].join('\n');
+
+const CODEX_NONYOLO_ESCALATION = [
+  "• Done.",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "",
+  "",
+  "› Run this exact bash command: touch ~/bx475-perm-probe",
+  "",
+  "",
+  "• Running touch ~/bx475-perm-probe",
+  "",
+  "",
+  "  Would you like to run the following command?",
+  "",
+  "  Environment: local",
+  "",
+  "  Reason: Do you want to allow creating /Users/devuser/bx475-perm-probe in your home directory?",
+  "",
+  "  $ touch ~/bx475-perm-probe",
+  "",
+  "› 1. Yes, proceed (y)",
+  "  2. Yes, and don't ask again for commands that start with `touch '~/bx475-perm-probe'` (p)",
+  "  3. No, and tell Codex what to do differently (esc)",
+  "",
+  "  Press enter to confirm or esc to cancel",
+].join('\n');
+
+const OC_NONYOLO_EXTERNAL_DIR_PERMISSION = [
+  "  ┃",
+  "  ┃  Run this exact bash command: touch /tmp/bx475-perm-probe",
+  "  ┃",
+  "",
+  "     $ touch /tmp/bx475-perm-probe",
+  "",
+  "     ▣  Build · GLM-5.2",
+  ...blank(14),
+  "  ┃",
+  "  ┃  △ Permission required",
+  "  ┃    ← Access external directory /tmp",
+  "  ┃",
+  "  ┃  Patterns",
+  "  ┃                                                                                                                                                             /private/tmp/claude-501/-Users-",
+  "  ┃  - /tmp/*                                                                                                                                                   devuser--baxian-repos-example-baxian/",
+  "  ┃                                                                                                                                                             f2fbbf50-44f3-4478-b9b7-2f1da4c55fad/",
+  "  ┃                                                                                                                                                             scratchpad/yolo-probe/wd-oc",
+  "  ┃   Allow once   Allow always   Reject                                                                       ctrl+f fullscreen  ⇆ select  enter confirm",
+  "  ┃                                                                                                                                                             • OpenCode 1.17.16",
+  "",
+].join('\n');
+
+const QODER_NONYOLO_SHELL_PERMISSION = [
+  "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+  " > Run this exact bash command: echo bx475",
+  "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+  "",
+  " Thinking",
+  " │ The user wants me to run a specific bash command.",
+  " ? Bash(echo bx475)",
+  "",
+  " Permission Required",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  " Tool: Bash",
+  "",
+  " Print bx475",
+  " Command: echo bx475",
+  "",
+  " Allow this command to run?",
+  "",
+  "  ❯ 1. Allow once",
+  "    2. Always allow \"echo\" for future sessions [local]",
+  "    3. Reject and type something",
+  "    4. No",
+  ...blank(20),
+].join('\n');
+describe('non-yolo & fresh-screen geometry (real captures, issue #475)', () => {
+  it.each([
+    ['claude-code non-yolo idle (❯ + NBSP composer)', CC_NONYOLO_IDLE, 'claude-code'],
+    ['codex non-yolo idle (generic footer anchor)', CODEX_NONYOLO_IDLE, 'codex'],
+    ['opencode non-yolo fresh idle (footer above blank sea)', OC_NONYOLO_FRESH_IDLE, 'opencode'],
+    ['opencode --auto fresh idle', OC_YOLO_FRESH_IDLE, 'opencode'],
+    ['qodercli non-yolo fresh idle (top-anchored, 34 trailing blanks)', QODER_NONYOLO_FRESH_IDLE, 'qodercli'],
+    ['qodercli --dangerously-skip-permissions fresh idle', QODER_YOLO_FRESH_IDLE, 'qodercli'],
+  ] as const)('%s is ready and not busy', (_name, screen, runtime) => {
+    expect(runtimeBusyCheck(screen, runtime)).toBe(false);
+    expect(hasRuntimeReadyView(screen, runtime)).toBe(true);
+  });
+
+  it.each([
+    ['claude-code bash permission prompt', CC_NONYOLO_BASH_PERMISSION, 'claude-code'],
+    ['codex escalation prompt', CODEX_NONYOLO_ESCALATION, 'codex'],
+    ['opencode external-directory permission prompt', OC_NONYOLO_EXTERNAL_DIR_PERMISSION, 'opencode'],
+    ['qodercli shell permission prompt', QODER_NONYOLO_SHELL_PERMISSION, 'qodercli'],
+  ] as const)('%s blocks the ready gate', (_name, screen, runtime) => {
+    expect(hasRuntimeReadyView(screen, runtime)).toBe(false);
+  });
+
+  // 按实测 fresh 屏几何构造：busy 标记与底部之间同样隔着空行海
+  it('opencode: busy bar above the blank sea is still busy', () => {
+    const screen = ['  ┃  ■■■■⬝⬝⬝⬝  esc interrupt', ...blank(12), '  /w  1.17.17'].join('\n');
+    expect(runtimeBusyCheck(screen, 'opencode')).toBe(true);
+  });
+
+  it('qodercli: spinner above 34 trailing blank rows is still busy', () => {
+    const screen = [' ⠼ Thinking... (esc to cancel, 3s)', ...blank(34)].join('\n');
+    expect(runtimeBusyCheck(screen, 'qodercli')).toBe(true);
   });
 });
 

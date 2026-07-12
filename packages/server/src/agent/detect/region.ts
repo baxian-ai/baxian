@@ -19,6 +19,31 @@ export function isHorizontalRule(line: string): boolean {
   return dashCount >= 3 || (allDashes && dashCount > 0);
 }
 
+// 自底部起覆盖 count 个非空行的窗口（保留行间空行、剥除尾部空行）。
+// 供 tmux.ts 对 opencode/qodercli 取样：其 fresh 屏顶部锚定/垂直居中，
+// idle/busy 标记会落在物理 tail(N) 之外（尾随空行海），非空行窗口与几何无关。
+export function tailNonEmpty(screen: string, count: number): string {
+  if (count <= 0) return '';
+  const lines = screen.split('\n');
+  let lastNonEmptyIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim() !== '') {
+      lastNonEmptyIdx = i;
+      break;
+    }
+  }
+  if (lastNonEmptyIdx < 0) return '';
+  let startIdx = lastNonEmptyIdx;
+  let found = 1;
+  for (let i = lastNonEmptyIdx - 1; i >= 0 && found < count; i--) {
+    if (lines[i].trim() !== '') {
+      found++;
+      startIdx = i;
+    }
+  }
+  return lines.slice(startIdx, lastNonEmptyIdx + 1).join('\n');
+}
+
 export function extractRegion(input: DetectionInput, spec: string): string {
   const trimmed = spec.trim();
 
@@ -92,24 +117,7 @@ export function extractRegion(input: DetectionInput, spec: string): string {
 
   const tailNonEmptyMatch = trimmed.match(/^tailNonEmpty\((\d+)\)$/);
   if (tailNonEmptyMatch) {
-    const count = parseInt(tailNonEmptyMatch[1], 10);
-    let lastNonEmptyIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].trim() !== '') {
-        lastNonEmptyIdx = i;
-        break;
-      }
-    }
-    if (lastNonEmptyIdx < 0) return '';
-    let startIdx = lastNonEmptyIdx;
-    let found = 1;
-    for (let i = lastNonEmptyIdx - 1; i >= 0 && found < count; i--) {
-      if (lines[i].trim() !== '') {
-        found++;
-        startIdx = i;
-      }
-    }
-    return lines.slice(startIdx, lastNonEmptyIdx + 1).join('\n');
+    return tailNonEmpty(input.screen, parseInt(tailNonEmptyMatch[1], 10));
   }
 
   return '';

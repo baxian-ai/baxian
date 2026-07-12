@@ -4,7 +4,7 @@ import type { AgentStore } from '../state/agent-store.js';
 import type { ErrorRecordStore } from '../state/error-record-store.js';
 import type { EventBus } from '../event/bus.js';
 import type { CommandRunner } from './runner.js';
-import { createRunner, resolveAgentHost, hostGroupKey } from './runner.js';
+import { createRunner, resolveAgentHost } from './runner.js';
 import { RepoStore, type RepoStoreCache } from './repo-store.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
 
@@ -21,6 +21,8 @@ export interface BootstrapDeps {
     mode: AgentConfig['mode'],
     host: HostConfig | undefined,
     cache: RepoStoreCache,
+    agentId: string,
+    workdir?: string,
   ) => RepoStore;
   onAgentAffected?: (agentIds: string[]) => void;
 }
@@ -63,23 +65,17 @@ export function autoBootstrapAgentIds(config: BaxianConfig): Set<string> {
 }
 
 export function collectTargets(config: BaxianConfig): BootstrapTarget[] {
-  const groups = new Map<string, BootstrapTarget>();
+  const targets: BootstrapTarget[] = [];
   for (const project of config.project) {
     for (const pair of project.agent) {
       for (const agent of pair) {
         if (agent.workdir) continue;
         const resolvedHost = resolveAgentHost(config.host, agent.host);
-        const key = `${project.id}::${hostGroupKey(agent.mode, resolvedHost)}`;
-        const existing = groups.get(key);
-        if (existing) {
-          existing.agents.push(agent);
-        } else {
-          groups.set(key, { project, agents: [agent], representativeAgent: agent, resolvedHost });
-        }
+        targets.push({ project, agents: [agent], representativeAgent: agent, resolvedHost });
       }
     }
   }
-  return Array.from(groups.values());
+  return targets;
 }
 
 export async function runSingleTarget(
@@ -87,17 +83,21 @@ export async function runSingleTarget(
   deps: BootstrapDeps,
   opts: RunSingleTargetOptions,
 ): Promise<RunSingleTargetResult> {
-  let repoPath: string | null = null;
+  let workdir: string | null = null;
   let ensureError: Error | null = null;
+  const rep = target.representativeAgent;
   try {
-    const rep = target.representativeAgent;
     const runner = deps.runnerFactory
       ? deps.runnerFactory(rep)
       : createRunner(rep.mode, target.resolvedHost);
     const repoStore = deps.repoStoreFactory
-      ? deps.repoStoreFactory(runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache)
-      : new RepoStore(runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache);
-    repoPath = await repoStore.ensure();
+      ? deps.repoStoreFactory(
+          runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache, rep.id, rep.workdir,
+        )
+      : new RepoStore(
+          runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache, rep.id, rep.workdir,
+        );
+    workdir = await repoStore.ensure();
   } catch (err) {
     ensureError = err instanceof Error ? err : new Error(String(err));
   }
@@ -113,11 +113,11 @@ export async function runSingleTarget(
         await deps.agentStore.update(agent.id, (existing) => {
           if (!existing) return AGENT_STORE_NOOP;
           wasUpdated = true;
-          return { ...existing, ...(repoPath ? { repoPath } : {}), updatedAt: now };
+          return { ...existing, ...(workdir ? { workdir } : {}), updatedAt: now };
         });
         if (wasUpdated) updated++;
       } catch (writeErr) {
-        console.error(`[bootstrap] failed to write repoPath for ${agent.id}:`, writeErr);
+        console.error(`[bootstrap] failed to write workdir for ${agent.id}:`, writeErr);
       }
     }
     if (updated > 0 || opts.emitOnUnchanged) {
@@ -126,7 +126,7 @@ export async function runSingleTarget(
         type: 'agent.bootstrap_succeeded',
         timestamp: now,
         projectId: target.project.id,
-        data: { repoPath, agentIds: affectedAgentIds, updated },
+        data: { workdir, agentIds: affectedAgentIds, updated },
       });
     }
     let bootstrapErrorPurged = 0;

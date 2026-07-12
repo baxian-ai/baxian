@@ -21,8 +21,11 @@ export interface BootstrapPollerOptions {
     mode: AgentConfig['mode'],
     host: AgentConfig['host'],
     cache: RepoStoreCache,
+    agentId: string,
+    workdir?: string,
   ) => RepoStore;
   onAgentAffected?: (agentIds: string[]) => void;
+  onPollComplete?: () => Promise<void>;
   intervalMs?: number;
 }
 
@@ -86,6 +89,7 @@ export class BootstrapPoller {
         }
       }),
     );
+    await this.opts.onPollComplete?.();
     return { ok: allOk, ran: targets.length, knownProject: true };
   }
 
@@ -105,10 +109,11 @@ export class BootstrapPoller {
         }
       }),
     );
+    await this.opts.onPollComplete?.();
   }
 }
 
 function targetKey(target: ReturnType<typeof collectTargets>[number]): string {
   const agent = target.representativeAgent;
-  return `${target.project.id}:${target.project.repo}:${agent.mode}:${hostGroupKey(agent.mode, target.resolvedHost)}`;
+  return `${target.project.id}:${target.project.repo}:${agent.id}:${agent.mode}:${hostGroupKey(agent.mode, target.resolvedHost)}`;
 }

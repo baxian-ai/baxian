@@ -16,6 +16,7 @@ import {
 } from '../shared/index.js';
 import { shellQuote, type CommandRunner, type ExecResult } from './runner.js';
 import { GIT_NET_ENV, execNetwork } from './net-exec.js';
+import { ensureBaxianRuntimeDirsSafe } from './repo-store.js';
 
 
 export class ReviewExchangeError extends Error {
@@ -39,7 +40,7 @@ export interface ReadContentResult {
 
 export interface ReviewTransportDeps {
   createRunnerFor(agent: AgentConfig): CommandRunner;
-  resolveWorktree(agentId: string): string | undefined;
+  resolveWorkdir(agentId: string): string | undefined;
 }
 
 
@@ -128,10 +129,30 @@ function truncateUtf8(text: string, maxBytes: number): { text: string; truncated
 export class ReviewTransport {
   constructor(private readonly deps: ReviewTransportDeps) {}
 
+  async clearDispatchOutputs(agent: AgentConfig, workdir: string, phase: string): Promise<void> {
+    const paths = [
+      `${workdir}/${REVIEW_EXCHANGE_DIR}/findings.json`,
+      `${workdir}/${REVIEW_EXCHANGE_DIR}/response.json`,
+      ...(phase === 'develop' ? [`${workdir}/${SPEC_DOC_RELPATH}`] : []),
+    ];
+    const runner = this.deps.createRunnerFor(agent);
+    await this.ensureRuntimeDirs(runner, workdir);
+    const result = await runner.exec(
+      `rm -f ${paths.map(shellQuote).join(' ')}`,
+    );
+    if (result.exitCode !== 0) {
+      throw new ReviewExchangeError(
+        'artifact-cleanup-failed',
+        `failed to clear stale dispatch outputs: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
+      );
+    }
+  }
+
   async readContent(task: TaskState, devAgent: AgentConfig, phase: TaskPhase): Promise<ReadContentResult> {
-    const wt = this.requireWorktree(devAgent.id);
+    const wt = this.requireWorkdir(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
     if (phase === 'spec') {
+      await this.ensureRuntimeDirs(runner, wt);
       const r = await runner.exec(`cat ${shellQuote(`${wt}/${SPEC_DOC_RELPATH}`)}`);
       if (r.exitCode !== 0) {
         throw new ReviewExchangeError('spec-missing', `spec doc unreadable: ${r.stderr.trim()}`);
@@ -216,7 +237,7 @@ export class ReviewTransport {
   }
 
   async readHeadSha(devAgent: AgentConfig): Promise<string> {
-    const wt = this.requireWorktree(devAgent.id);
+    const wt = this.requireWorkdir(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
     const r = await runner.exec(`cd ${shellQuote(wt)} && git rev-parse HEAD`);
     if (r.exitCode !== 0 || r.stdout.trim() === '') {
@@ -226,7 +247,7 @@ export class ReviewTransport {
   }
 
   async readInterdiff(devAgent: AgentConfig, prevSha: string, curSha: string): Promise<string> {
-    const wt = this.requireWorktree(devAgent.id);
+    const wt = this.requireWorkdir(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
     // two-arg tree diff, not prev...cur — three-dot regresses to the whole patchset when the review head was rewritten (amend/squash/rebase, #515)
     const r = await runner.exec(
@@ -252,7 +273,7 @@ export class ReviewTransport {
       || startLine < 1 || endLine < startLine || endLine - startLine > 200) {
       throw new ReviewExchangeError('range', `${startLine}-${endLine}`);
     }
-    const wt = this.requireWorktree(devAgent.id);
+    const wt = this.requireWorkdir(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
     const symlinkWalk =
       `p=${shellQuote(`${wt}/${file}`)}; ` +
@@ -274,18 +295,19 @@ export class ReviewTransport {
 
   async deliverToInbox(
     agent: AgentConfig,
-    worktreePath: string,
+    workdir: string,
     filename: string,
     content: string,
   ): Promise<ReviewContentFileRef> {
     if (filename === '' || filename.includes('/') || filename.startsWith('.')) {
       throw new ReviewExchangeError('bad-filename', JSON.stringify(filename));
     }
-    const wt = worktreePath.endsWith('/') ? worktreePath.slice(0, -1) : worktreePath;
+    const wt = workdir.endsWith('/') ? workdir.slice(0, -1) : workdir;
     const dir = `${wt}/${REVIEW_INBOX_DIR}`;
     const tmp = `${dir}/.tmp-${randomBytes(6).toString('hex')}`;
     const final = `${dir}/${filename}`;
     const runner = this.deps.createRunnerFor(agent);
+    await this.ensureRuntimeDirs(runner, wt);
     try {
       await runner.writeFile(tmp, content);
     } catch (err) {
@@ -303,8 +325,9 @@ export class ReviewTransport {
   }
 
   private async readExchangeFile(agent: AgentConfig, name: string): Promise<string | null> {
-    const wt = this.requireWorktree(agent.id);
+    const wt = this.requireWorkdir(agent.id);
     const runner = this.deps.createRunnerFor(agent);
+    await this.ensureRuntimeDirs(runner, wt);
     const r = await runner.exec(`cat ${shellQuote(`${wt}/${REVIEW_EXCHANGE_DIR}/${name}`)}`);
     if (r.exitCode !== 0) {
       if (/no such file/i.test(r.stderr)) return null;
@@ -314,9 +337,21 @@ export class ReviewTransport {
   }
 
   private async deleteExchangeFile(agent: AgentConfig, name: string): Promise<void> {
-    const wt = this.requireWorktree(agent.id);
+    const wt = this.requireWorkdir(agent.id);
     const runner = this.deps.createRunnerFor(agent);
+    await this.ensureRuntimeDirs(runner, wt);
     await runner.exec(`rm -f ${shellQuote(`${wt}/${REVIEW_EXCHANGE_DIR}/${name}`)}`);
+  }
+
+  private async ensureRuntimeDirs(runner: CommandRunner, workdir: string): Promise<void> {
+    try {
+      await ensureBaxianRuntimeDirsSafe(runner, workdir);
+    } catch (err) {
+      throw new ReviewExchangeError(
+        'unsafe-runtime-path',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 
   private parseJson(raw: string, label: string): unknown {
@@ -327,9 +362,9 @@ export class ReviewTransport {
     }
   }
 
-  private requireWorktree(agentId: string): string {
-    const wt = this.deps.resolveWorktree(agentId);
-    if (!wt) throw new ReviewExchangeError('no-worktree', `agent ${agentId} has no worktree`);
+  private requireWorkdir(agentId: string): string {
+    const wt = this.deps.resolveWorkdir(agentId);
+    if (!wt) throw new ReviewExchangeError('no-workdir', `agent ${agentId} has no Workdir`);
     return wt.endsWith('/') ? wt.slice(0, -1) : wt;
   }
 }
@@ -375,7 +410,7 @@ function contentFilename(phase: string, round: number, batch?: { index: number; 
 export async function resolveServerPayloads(
   transport: ReviewTransport,
   agent: AgentConfig,
-  worktreePath: string,
+  workdir: string,
   input: ServerPayloadInput,
 ): Promise<ServerPayloadPromptOpts> {
   if (input.phase === 'server-feedback' && input.serverContent !== undefined) {
@@ -395,7 +430,7 @@ export async function resolveServerPayloads(
       out[inlineKey] = value;
       return;
     }
-    out[fileKey] = await transport.deliverToInbox(agent, worktreePath, filename, value);
+    out[fileKey] = await transport.deliverToInbox(agent, workdir, filename, value);
   };
   await place(
     input.serverContent,

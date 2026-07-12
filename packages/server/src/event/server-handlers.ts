@@ -249,7 +249,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await emitIntervention(bus, task, { phase: 'server-code-auto-approve-no-dev-agent' });
       return;
     }
-    await manager.refreshWorktreeCacheFor(task.agentId);
+    await manager.refreshWorkdirCacheFor(task.agentId);
     let reviewHeadAnchorSha: string;
     try {
       reviewHeadAnchorSha = await transport().readHeadSha(dev);
@@ -341,7 +341,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return false;
     }
 
-    await manager.refreshWorktreeCacheFor(task.agentId);
+    await manager.refreshWorkdirCacheFor(task.agentId);
     let content;
     let reviewHeadAnchorSha: string;
     try {
@@ -497,7 +497,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return;
     }
 
-    await manager.refreshWorktreeCacheFor(qa.id);
+    await manager.refreshWorkdirCacheFor(qa.id);
     let findings: ReviewFindings | null;
     try {
       findings = await transport().readFindings(task, qa);
@@ -644,7 +644,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return false;
     }
 
-    await manager.refreshWorktreeCacheFor(task.agentId);
+    await manager.refreshWorkdirCacheFor(task.agentId);
     let response;
     try {
       response = await transport().readResponse(task, dev);
@@ -734,7 +734,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await emitIntervention(bus, task, { phase: 'server-code-published-no-dev-agent' });
       return;
     }
-    await manager.refreshWorktreeCacheFor(task.agentId);
+    await manager.refreshWorkdirCacheFor(task.agentId);
     let publishedHead: string;
     try {
       publishedHead = await transport().readHeadSha(dev);
@@ -800,7 +800,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       if (paused.agentId) await releaseAndClearAtCap(paused, paused.agentId, 'agentId');
       return false;
     }
-    await manager.refreshWorktreeCacheFor(task.agentId);
+    await manager.refreshWorkdirCacheFor(task.agentId);
     let content;
     try {
       content = await transport().readContent(task, dev, 'spec');
@@ -866,7 +866,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await manager.setupPhaseSignal(task.id, qa.id, 'spec-reviewed', { skipSnapshot: true });
       return;
     }
-    await manager.refreshWorktreeCacheFor(qa.id);
+    await manager.refreshWorkdirCacheFor(qa.id);
     let findings: ReviewFindings | null;
     try {
       findings = await transport().readFindings(task, qa);
@@ -937,7 +937,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       await manager.setupPhaseSignal(task.id, task.agentId, 'spec-fixed', { skipSnapshot: true });
       return false;
     }
-    await manager.refreshWorktreeCacheFor(task.agentId);
+    await manager.refreshWorkdirCacheFor(task.agentId);
     let response;
     try {
       response = await transport().readResponse(task, dev);

@@ -242,6 +242,32 @@ describe('TaskDetail page — header & info', () => {
     expect(screen.getByText('Created 2026-05-10 20:00 · Updated')).toBeTruthy();
   });
 
+  it('shows why local branch cleanup is pending', () => {
+    open({
+      branchCleanupPending: {
+        agentId: 'bx-dev',
+        reason: 'runtime is not idle; local branch cleanup deferred',
+        updatedAt: '2026-05-10T13:05:00.000Z',
+      },
+    });
+
+    expect(screen.getByText('Local branch cleanup is pending')).toBeTruthy();
+    expect(screen.getByText('runtime is not idle; local branch cleanup deferred')).toBeTruthy();
+  });
+
+  it('shows when baxian deliberately preserves a local branch', () => {
+    open({
+      branchCleanupSkipped: {
+        agentId: 'bx-dev',
+        reason: 'remote branch is absent; preserving the local branch without retry',
+        updatedAt: '2026-05-10T13:05:00.000Z',
+      },
+    });
+
+    expect(screen.getByText('Local branch was preserved')).toBeTruthy();
+    expect(screen.getByText('remote branch is absent; preserving the local branch without retry')).toBeTruthy();
+  });
+
   it('places the action buttons on their own row below the status capsule, not in the title', () => {
     const { container } = open({ status: 'pending' });
     const section = container.querySelector('section')!;

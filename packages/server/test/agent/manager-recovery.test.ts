@@ -10,7 +10,7 @@ import { buildPhaseSignal } from '../../src/agent/phase-signal.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
 import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
-import { WorktreeManager } from '../../src/agent/worktree.js';
+import { BranchManager } from '../../src/agent/branch.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -33,7 +33,7 @@ const CONFIG: BaxianConfig = {
     merge: 'auto',
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo' },
+      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
     ]],
   }],
 };
@@ -48,13 +48,27 @@ const events: BaxianEvent[] = [];
 
 function noopRunner(): CommandRunner {
   return {
-    exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
+    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
+        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
   };
 }
 
-function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
-  return agentStore.set({ projectId: 'proj', updatedAt: NOW, ...overrides });
+async function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
+  await agentStore.set({ projectId: 'proj', updatedAt: NOW, ...overrides });
+  if (!overrides.taskId || await lockManager.isLocked(overrides.id)) return;
+  const token = await lockManager.acquire(overrides.id, overrides.taskId);
+  if (!token) return;
+  await agentStore.update(overrides.id, latest => latest?.taskId === overrides.taskId
+    ? { ...latest, lockToken: token, updatedAt: new Date().toISOString() }
+    : latest);
 }
 
 function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void> {
@@ -86,11 +100,11 @@ interface RecoveryScenario {
   locks?: string[];
   emit?: BaxianEvent[];
   ensureSession?: Record<string, unknown> | { reject: EnsureSessionError };
-  removeImpl?: () => Promise<void>;
+  cleanupImpl?: () => Promise<void>;
 }
 
 interface RecoveryHandles {
-  removeSpy: ReturnType<typeof vi.spyOn>;
+  cleanupSpy: ReturnType<typeof vi.spyOn>;
   watchSpy: ReturnType<typeof vi.spyOn>;
 }
 
@@ -98,7 +112,7 @@ async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles>
   for (const agent of scenario.agents) await seedAgent(agent);
   for (const task of scenario.tasks ?? []) await seedTask(task);
   for (const event of scenario.emit ?? []) await eventBus.emit(event);
-  for (const id of scenario.locks ?? []) await lockManager.acquire(id);
+  for (const id of scenario.locks ?? []) await acquireBoundLock(id);
 
   const session = scenario.ensureSession;
   if (session && 'reject' in session) {
@@ -107,19 +121,29 @@ async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles>
     mockEnsureSessionOk(session ?? {});
   }
 
-  const removeSpy = scenario.removeImpl
-    ? vi.spyOn(WorktreeManager.prototype, 'remove').mockImplementation(scenario.removeImpl)
-    : vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
+  const cleanupSpy = vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch')
+    .mockImplementation(async () => {
+      await scenario.cleanupImpl?.();
+      return { status: 'deleted' };
+    });
   const watchSpy = vi.spyOn(manager, 'startRuntimeMenuWatch');
 
   await manager.recover();
-  return { removeSpy, watchSpy };
+  return { cleanupSpy, watchSpy };
 }
 
 async function expectRolledBack(taskId: string, agentId: string): Promise<void> {
   expect((await taskStore.get(taskId))?.status).toBe('pending');
   expect((await agentStore.get(agentId))?.taskId).toBeUndefined();
   expect(await lockManager.isLocked(agentId)).toBe(false);
+}
+
+async function acquireBoundLock(agentId: string, taskId?: string): Promise<string | null> {
+  const binding = await agentStore.get(agentId);
+  const owner = taskId ?? binding?.taskId ?? 'task-1';
+  const existing = await lockManager.claimOf(agentId);
+  if (existing?.taskId === owner) return existing.token;
+  return lockManager.acquire(agentId, owner);
 }
 
 beforeEach(async () => {
@@ -151,6 +175,39 @@ afterEach(async () => {
 });
 
 describe('recover()', () => {
+  it('reclaims orphaned maintenance and task locks but preserves an exactly bound task lock', async () => {
+    const maintenanceToken = await lockManager.acquire('dev-1', 'maintenance:branch-reconcile');
+    const orphanedTaskToken = await lockManager.acquire('orphan-1', 'task-orphaned');
+    await seedTask({ id: 'task-live', status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: 'task-live' });
+    const boundTaskToken = (await agentStore.get('qa-1'))?.lockToken;
+    mockEnsureSessionOk();
+
+    await manager.recover();
+
+    expect(await lockManager.isOwner('dev-1', 'maintenance:branch-reconcile', maintenanceToken!)).toBe(false);
+    expect(await lockManager.isOwner('orphan-1', 'task-orphaned', orphanedTaskToken!)).toBe(false);
+    expect(await lockManager.isOwner('qa-1', 'task-live', boundTaskToken!)).toBe(true);
+  });
+
+  it('holds a bound agent without touching tmux when exclusive lock ownership is stale', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'task-stale-lock', paneId: '%1' });
+    await seedTask({ id: 'task-stale-lock' });
+    const before = (await agentStore.get('dev-1'))!;
+    await lockManager.releaseIfOwner('dev-1', 'task-stale-lock', before.lockToken!);
+    const ensureSpy = vi.spyOn(manager, 'ensureSession');
+
+    await manager.recover();
+
+    expect(ensureSpy).not.toHaveBeenCalled();
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-stale-lock',
+      status: 'awaiting_human',
+      awaitingPhase: 'recovery-lock-invalid',
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
   it('revalidates persisted bindings and clears creationToken on success', async () => {
     const { watchSpy } = await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-1', creationToken: 'tok' }],
@@ -316,21 +373,21 @@ describe('recover()', () => {
     expect(watchSpy).not.toHaveBeenCalled();
   });
 
-  it('does NOT roll back / remove worktree for a delivered task whose REPL was lost (freshRuntime=true, no marker)', async () => {
-    const { removeSpy, watchSpy } = await runRecovery({
+  it('does not roll back a delivered fixed-Workdir task whose REPL was lost', async () => {
+    const { cleanupSpy, watchSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW,
-        worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+        workdir: '/tmp/repo',
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
       ensureSession: { createdSession: true, freshRuntime: true },
     });
 
-    expect(removeSpy).not.toHaveBeenCalled();
+    expect(cleanupSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     expect((await agentStore.get('dev-1'))?.taskId).toBe('task-1');
-    expect((await agentStore.get('dev-1'))?.worktreePath).toBe('/tmp/repo/.baxian-worktrees/task-1');
+    expect((await agentStore.get('dev-1'))?.workdir).toBe('/tmp/repo');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(watchSpy).toHaveBeenCalledWith('dev-1');
   });
@@ -347,35 +404,32 @@ describe('recover()', () => {
     expect(watchSpy).not.toHaveBeenCalled();
   });
 
-  it('removes the orphaned worktree before rolling back a mid-bootstrap recovery task (else re-dispatch hits a busy branch)', async () => {
-    let boundWhenRemoved: string | undefined;
-    const { removeSpy } = await runRecovery({
+  it('rolls back a mid-bootstrap task without deleting the fixed Workdir', async () => {
+    const { cleanupSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-        bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+        bootstrappingTaskId: 'task-1', workdir: '/tmp/repo',
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
       ensureSession: { paneId: '%0' },
-      removeImpl: async () => { boundWhenRemoved = (await agentStore.get('dev-1'))?.taskId; },
     });
 
-    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/task-1');
-    expect(boundWhenRemoved).toBe('task-1');
+    expect(cleanupSpy).not.toHaveBeenCalled();
     await expectRolledBack('task-1', 'dev-1');
   });
 
-  it('does NOT roll back a legacy in_progress binding (no bootstrap marker) on a live REPL — leaves worktree + binding intact', async () => {
-    const { removeSpy, watchSpy } = await runRecovery({
+  it('does not roll back a delivered in_progress binding on a live REPL', async () => {
+    const { cleanupSpy, watchSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-        worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+        workdir: '/tmp/repo',
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
     });
 
-    expect(removeSpy).not.toHaveBeenCalled();
+    expect(cleanupSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     expect((await taskStore.get('task-1'))?.agentId).toBe('dev-1');
     expect((await agentStore.get('dev-1'))?.taskId).toBe('task-1');
@@ -387,10 +441,10 @@ describe('recover()', () => {
     const dialogSpy = vi.spyOn(
       manager as never as { markDialogPending: (...a: unknown[]) => Promise<void> }, 'markDialogPending',
     ).mockResolvedValue(undefined);
-    const { removeSpy } = await runRecovery({
+    const { cleanupSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-        bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+        bootstrappingTaskId: 'task-1', workdir: '/tmp/repo',
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
@@ -400,7 +454,7 @@ describe('recover()', () => {
     });
 
     expect(dialogSpy).not.toHaveBeenCalled();
-    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/task-1');
+    expect(cleanupSpy).not.toHaveBeenCalled();
     await expectRolledBack('task-1', 'dev-1');
   });
 
@@ -423,10 +477,10 @@ describe('recover()', () => {
   });
 
   it('does NOT roll back a mid-bootstrap task when a session.started event proves delivery (stale marker)', async () => {
-    const { removeSpy, watchSpy } = await runRecovery({
+    const { cleanupSpy, watchSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
-        bootstrappingTaskId: 'task-1', worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+        bootstrappingTaskId: 'task-1', workdir: '/tmp/repo',
       }],
       tasks: [{ id: 'task-1' }],
       emit: [{
@@ -436,7 +490,7 @@ describe('recover()', () => {
       locks: ['dev-1'],
     });
 
-    expect(removeSpy).not.toHaveBeenCalled();
+    expect(cleanupSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     const reattached = await agentStore.get('dev-1');
     expect(reattached?.taskId).toBe('task-1');
@@ -446,24 +500,24 @@ describe('recover()', () => {
   });
 
   it('does NOT roll back a delivered task held on a failed marker-clear (bootstrap-marker-clear-failed)', async () => {
-    const { removeSpy } = await runRecovery({
+    const { cleanupSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
         bootstrappingTaskId: 'task-1', status: 'awaiting_human', awaitingPhase: 'bootstrap-marker-clear-failed',
         awaitingReason: 'clear failed', awaitingSince: NOW,
-        worktreePath: '/tmp/repo/.baxian-worktrees/task-1',
+        workdir: '/tmp/repo',
       }],
       tasks: [{ id: 'task-1' }],
       locks: ['dev-1'],
     });
 
-    expect(removeSpy).not.toHaveBeenCalled();
+    expect(cleanupSpy).not.toHaveBeenCalled();
     expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
     expect((await agentStore.get('dev-1'))?.taskId).toBe('task-1');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('clears unsafe runtime facts and fails active tasks when recovery cannot validate the session', async () => {
+  it('clears unsafe runtime facts but preserves the binding lock when recovery cannot validate the session', async () => {
     await runRecovery({
       agents: [{ id: 'dev-1', taskId: 'task-1', paneId: '%0', creationToken: 'tok' }],
       tasks: [{ id: 'task-1' }],
@@ -476,8 +530,13 @@ describe('recover()', () => {
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBeUndefined();
     expect(state?.creationToken).toBeUndefined();
+    expect(state).toMatchObject({
+      taskId: 'task-1',
+      status: 'awaiting_human',
+      awaitingPhase: 'recovery-failed',
+    });
     expect((await taskStore.get('task-1'))?.status).toBe('failed');
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(events.some(e => e.type === 'human.intervention' && e.agentId === 'dev-1')).toBe(true);
   });
 });
@@ -763,7 +822,7 @@ describe('setupRecoveredSpecSignals()', () => {
     expect('onReadFile' in args).toBe(false);
   });
 
-  it('recovers read-file for legacy server batch continuations', async () => {
+  it('recovers read-file for server batch continuations', async () => {
     await seedTask({
       id: 'task-server-code-batch',
       qaAgentId: 'qa-1',
@@ -794,7 +853,7 @@ describe('setupRecoveredSpecSignals()', () => {
       reviewMode: 'server',
       status: 'review',
       reviewRound: 1,
-      reviewWorktreeMode: 'base',
+      reviewCheckoutMode: 'base',
       signalToken: 'tok-code-base',
     });
     const { watcher } = await buildManagerWithSpecWatcher();
@@ -816,7 +875,7 @@ describe('setupRecoveredSpecSignals()', () => {
       reviewMode: 'server',
       status: 'review',
       reviewRound: 1,
-      reviewWorktreeMode: 'head',
+      reviewCheckoutMode: 'head',
       signalToken: 'tok-code-head',
     });
     const { watcher } = await buildManagerWithSpecWatcher();
@@ -853,7 +912,6 @@ describe('recover() deferred branches', () => {
     mockEnsureSessionOk();
     vi.spyOn(agentStore, 'update').mockImplementationOnce(async () => {});
     const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
-    vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
 
     await manager.recover();
 
@@ -863,10 +921,9 @@ describe('recover() deferred branches', () => {
   it('falls through to the release path when the post-merge redrive throws', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
     await seedTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
-    await lockManager.acquire('dev-1');
+    await acquireBoundLock('dev-1');
     mockEnsureSessionOk();
     vi.spyOn(manager, 'dispatchPostMergeCleanup').mockRejectedValue(new Error('cleanup exploded'));
-    vi.spyOn(WorktreeManager.prototype, 'remove').mockResolvedValue(undefined);
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await manager.recover();
@@ -877,37 +934,43 @@ describe('recover() deferred branches', () => {
     warnSpy.mockRestore();
   });
 
-  it('removes the reserved worktree when releasing a binding to a terminal task', async () => {
-    const { removeSpy } = await runRecovery({
+  it('cleans the exact baxian branch when releasing a binding to a terminal task', async () => {
+    const { cleanupSpy } = await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-dead', paneId: '%0',
-        worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+        workdir: '/tmp/repo',
       }],
-      tasks: [{ id: 'task-dead', status: 'cancelled' }],
+      tasks: [{ id: 'task-dead', status: 'cancelled', branchCreatedByBaxian: true }],
       locks: ['dev-1'],
     });
 
-    expect(removeSpy).toHaveBeenCalledWith('/tmp/repo', '/tmp/repo/.baxian-worktrees/wt');
+    expect(cleanupSpy).toHaveBeenCalledWith('/tmp/repo', expect.objectContaining({
+      taskId: 'task-dead',
+      taskBranch: 'bx/task-dead',
+      branchCreatedByBaxian: true,
+    }), expect.any(Function));
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('still releases the binding when the worktree removal fails', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('keeps the binding and lock when fixed-Workdir branch cleanup fails', async () => {
     await runRecovery({
       agents: [{
         id: 'dev-1', taskId: 'task-dead', paneId: '%0',
-        worktreePath: '/tmp/repo/.baxian-worktrees/wt',
+        workdir: '/tmp/repo',
       }],
-      tasks: [{ id: 'task-dead', status: 'cancelled' }],
+      tasks: [{ id: 'task-dead', status: 'cancelled', branchCreatedByBaxian: true }],
       locks: ['dev-1'],
-      removeImpl: async () => { throw new Error('worktree locked'); },
+      cleanupImpl: async () => { throw new Error('branch cleanup failed'); },
     });
 
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('worktree.remove failed'))).toBe(true);
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
-    warnSpy.mockRestore();
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-dead',
+      status: 'awaiting_human',
+      awaitingPhase: 'branch-cleanup-pending',
+      awaitingReason: expect.stringContaining('branch cleanup failed'),
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
   it('marks the agent dialog-pending and survives a crashing slow poll', async () => {
@@ -935,7 +998,7 @@ describe('recover() deferred branches', () => {
     warnSpy.mockRestore();
   });
 
-  it('rolls back an orphan session on recovery failure even when killSession fails, then fails the bound task', async () => {
+  it('holds the orphan binding on recovery failure even when killSession fails, then fails the bound task', async () => {
     const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockRejectedValue(new Error('kill refused'));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
@@ -955,7 +1018,8 @@ describe('recover() deferred branches', () => {
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes('killSession rollback failed'))).toBe(true);
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(state).toMatchObject({ taskId: 'task-1', status: 'awaiting_human' });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect((await taskStore.get('task-1'))?.status).toBe('failed');
     expect(events.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'recovery-failed')).toBe(true);

@@ -1,735 +1,390 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { homedir } from 'node:os';
-import { RepoStore, createRepoStoreCache, nonGitHubSubpath, accessMethodDiffers, type RepoStoreCache } from '../../src/agent/repo-store.js';
-import { LocalRunner, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { lstat, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
-  CLONE_EXEC_TIMEOUT_MS,
-  GIT_NET_ENV,
-  NET_EXEC_TIMEOUT_MS,
-  __setNetExecSleepForTests,
-} from '../../src/agent/net-exec.js';
+  RepoStore,
+  accessMethodDiffers,
+  createRepoStoreCache,
+} from '../../src/agent/repo-store.js';
+import { LocalRunner, shellQuote, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
 
-type ExecMock = ReturnType<typeof vi.fn<(cmd: string, options?: ExecOptions) => Promise<ExecResult>>>;
+const PROJECT_REPO = 'https://git.example.com/group/project.git';
+const local = new LocalRunner();
+let tempDir: string;
+let origin: string;
 
-function makeRunner(handler: (cmd: string) => ExecResult): CommandRunner & { exec: ExecMock } {
-  return { exec: vi.fn(async (cmd: string, _options?: ExecOptions) => handler(cmd)) };
+async function run(command: string): Promise<string> {
+  const result = await local.exec(command);
+  if (result.exitCode !== 0) throw new Error(`${command}: ${result.stderr}`);
+  return result.stdout.trim();
 }
 
-const OK: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
-const FAIL: ExecResult = { stdout: '', stderr: 'fail', exitCode: 1 };
+class TestRunner implements CommandRunner {
+  readonly commands: string[] = [];
+  failFetch = false;
+  failOriginHead = false;
+  emptyRemoteRefs = false;
 
-function originStdout(url: string): ExecResult {
-  return { stdout: `${url}\n`, stderr: '', exitCode: 0 };
-}
+  constructor(
+    private home: string,
+    private cloneSource: string,
+    private cloneOrigin = PROJECT_REPO,
+  ) {}
 
-function existingOrigin(originUrl: string): (cmd: string) => ExecResult {
-  return cmd => {
-    if (cmd.includes('test -d')) return OK;
-    if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-    if (cmd.includes('config --get-all remote.origin.fetch')) {
-      return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
+  async exec(command: string, options?: ExecOptions): Promise<ExecResult> {
+    this.commands.push(command);
+    if (command === 'printf %s "$HOME"') {
+      return { stdout: this.home, stderr: '', exitCode: 0 };
     }
-    if (cmd.includes('remote get-url origin')) return originStdout(originUrl);
-    if (cmd.includes('config --replace-all')) return OK;
-    if (cmd.includes('config --unset-all')) return OK;
-    if (cmd.includes('git fetch')) return OK;
-    return FAIL;
-  };
+    if (command.includes('git fetch --all --prune')) {
+      if (this.failOriginHead) {
+        return { stdout: '', stderr: 'cannot determine remote HEAD', exitCode: 1 };
+      }
+      return this.failFetch
+        ? { stdout: '', stderr: 'network down', exitCode: 1 }
+        : { stdout: '', stderr: '', exitCode: 0 };
+    }
+    if (this.emptyRemoteRefs && command.includes('for-each-ref') && command.includes('refs/remotes/')) {
+      return { stdout: '', stderr: '', exitCode: 0 };
+    }
+    const cloneTarget = command.match(/(?:git clone|gh repo clone) (?:'[^']+'|\S+) '([^']+)'/)?.[1];
+    if (cloneTarget) {
+      const cloned = await local.exec(
+        `git clone -q ${shellQuote(this.cloneSource)} ${shellQuote(cloneTarget)} && ` +
+        `git -C ${shellQuote(cloneTarget)} remote set-url origin ${shellQuote(this.cloneOrigin)}`,
+        options,
+      );
+      return cloned;
+    }
+    return local.exec(command, options);
+  }
+
+  writeFile(path: string, content: Buffer | string): Promise<void> {
+    return local.writeFile(path, content);
+  }
+
+  execWithStdin(command: string, stdin: Buffer, options?: ExecOptions): Promise<ExecResult> {
+    return local.execWithStdin(command, stdin, options);
+  }
 }
 
-const GH_ORIGIN = 'https://github.com/user/repo.git';
-const fetchCount = (runner: { exec: ExecMock }): number =>
-  runner.exec.mock.calls.filter(c => c[0].includes('git fetch')).length;
-
-function existingGitHubOriginAllOk(cmd: string): ExecResult {
-  if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
-  return OK;
+async function cloneAt(path: string, remote = PROJECT_REPO): Promise<void> {
+  await run(
+    `git clone -q ${shellQuote(origin)} ${shellQuote(path)} && ` +
+    `git -C ${shellQuote(path)} remote set-url origin ${shellQuote(remote)}`,
+  );
 }
 
-describe('RepoStore.ensure (clone path)', () => {
-  let cache: RepoStoreCache;
-  beforeEach(() => { cache = createRepoStoreCache(); });
-
-  it('clones bare with gh repo clone --no-upstream and installs the fetch refspec', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return OK;
-      if (cmd.includes('config remote.origin.fetch')) return OK;
-      if (cmd.includes('git fetch')) return OK;
-      if (cmd.includes('git remote set-head')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    const path = await store.ensure();
-    expect(path).toBe(`${homedir()}/.baxian/repos/user/repo`);
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    const clone = cmds.find(c => c.includes('gh repo clone'));
-    expect(clone).toContain('--no-upstream');
-    expect(clone).toMatch(/ -- --bare$/);
-    const cloneIdx = cmds.findIndex(c => c.includes('gh repo clone'));
-    const refspecIdx = cmds.findIndex(c =>
-      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*:refs/remotes/origin/*'));
-    expect(refspecIdx).toBeGreaterThan(cloneIdx);
-    expect(cmds.some(c => c.includes('remote get-url origin'))).toBe(false);
-  });
-
-  it('installs the fetch refspec on an existing store that lacks one', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-      if (cmd.includes('config --get-all remote.origin.fetch')) return FAIL;
-      if (cmd.includes('config remote.origin.fetch')) return OK;
-      if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    const getIdx = cmds.findIndex(c => c.includes('config --get-all remote.origin.fetch'));
-    const setIdx = cmds.findIndex(c =>
-      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*:refs/remotes/origin/*'));
-    expect(getIdx).toBeGreaterThanOrEqual(0);
-    expect(setIdx).toBeGreaterThan(getIdx);
-  });
-
-  it('leaves an existing custom fetch refspec untouched', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-      if (cmd.includes('config --get-all remote.origin.fetch')) {
-        return { stdout: '+refs/heads/main:refs/remotes/origin/main\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('remote get-url origin')) return originStdout(GH_ORIGIN);
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c =>
-      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*'))).toBe(false);
-  });
-
-  it('fails ensure when the fetch refspec cannot be installed after a bare clone', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return OK;
-      if (cmd.includes('config remote.origin.fetch')) return { stdout: '', stderr: 'locked', exitCode: 1 };
-      return OK;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/refspec/i);
-  });
-
-  it('syncs origin immediately when a full GitHub URL is cloned through gh', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return OK;
-      if (cmd.includes('config remote.origin.fetch')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('config --replace-all')) return OK;
-      if (cmd.includes('config --unset-all')) return OK;
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'git@github.com:user/repo.git', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('gh repo clone') && c.includes('user/repo'))).toBe(true);
-    const replaceCmd = cmds.find(c => c.includes('config --replace-all remote.origin.url'));
-    expect(replaceCmd).toContain('git@github.com:user/repo.git');
-    expect(cmds.some(c => c.includes('config --unset-all remote.origin.pushurl'))).toBe(true);
-    expect(cmds.some(c => c.includes('git fetch'))).toBe(true);
-  });
-
-  it('rejects a mismatched origin immediately after a full GitHub URL clone', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return OK;
-      if (cmd.includes('config remote.origin.fetch')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/other/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'git@github.com:user/repo.git', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/does not match/i);
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('git fetch'))).toBe(false);
-  });
-
-  it('skips clone when the path is already a git repo (bare or with a working tree) and origin matches', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('git -C') && cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('git fetch')) return OK;
-      if (cmd.includes('git remote set-head')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('gh repo clone'))).toBe(false);
-  });
-
-  it('throws when origin URL does not match repoSlug', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://github.com/other/different.git\n', stderr: '', exitCode: 0 };
-      }
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/origin.*does not match|mismatch/i);
-  });
-
-  it('accepts case-insensitive slug match (GitHub repo names are case-insensitive)', async () => {
-    const runner = makeRunner(existingOrigin(GH_ORIGIN));
-    const store = new RepoStore(runner, 'User/Repo', 'local', undefined, cache);
-    const path = await store.ensure();
-    expect(path).toBe(`${homedir()}/.baxian/repos/user/repo`);
-  });
-
-  it('updates origin when GitHub config is a full SSH URL but clone uses HTTPS', async () => {
-    const runner = makeRunner(existingOrigin(GH_ORIGIN));
-    const store = new RepoStore(runner, 'git@github.com:user/repo.git', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    const replaceCmd = cmds.find(c => c.includes('config --replace-all remote.origin.url'));
-    expect(replaceCmd).toContain('git@github.com:user/repo.git');
-    expect(cmds.some(c => c.includes('config --unset-all remote.origin.pushurl'))).toBe(true);
-  });
-
-  it('does not update origin when GitHub config is a bare slug', async () => {
-    const runner = makeRunner(existingOrigin(GH_ORIGIN));
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('config --replace-all remote.origin.url'))).toBe(false);
-  });
-
-  it('throws when dir exists but is not a git repository (unsafe to overwrite)', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('rev-parse --resolve-git-dir')) return FAIL;
-      if (cmd.includes('test -d')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/not a git|exists.*not.*git/i);
-  });
+beforeEach(async () => {
+  tempDir = await mkdtemp(join(tmpdir(), 'baxian-repo-store-'));
+  origin = join(tempDir, 'origin.git');
+  const seed = join(tempDir, 'seed');
+  await run(
+    `git init -q --bare ${shellQuote(origin)} && ` +
+    `git init -q ${shellQuote(seed)} && ` +
+    `git -C ${shellQuote(seed)} config user.name test && ` +
+    `git -C ${shellQuote(seed)} config user.email test@example.com && ` +
+    `printf base > ${shellQuote(join(seed, 'file.txt'))} && ` +
+    `git -C ${shellQuote(seed)} add file.txt && ` +
+    `git -C ${shellQuote(seed)} commit -q -m base && ` +
+    `git -C ${shellQuote(seed)} branch -M main && ` +
+    `git -C ${shellQuote(seed)} remote add origin ${shellQuote(origin)} && ` +
+    `git -C ${shellQuote(seed)} push -q origin main && ` +
+    `git -C ${shellQuote(origin)} symbolic-ref HEAD refs/heads/main`,
+  );
 });
 
-describe('RepoStore.refresh — throttle', () => {
-  let cache: RepoStoreCache;
-  beforeEach(() => { cache = createRepoStoreCache(); });
-
-  it('skips fetch when called within 30s of last fetch', async () => {
-    const runner = makeRunner(existingGitHubOriginAllOk);
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    const absPath = await store.ensure();
-    const fetchCallsBefore = fetchCount(runner);
-    await store.refresh(absPath);
-    expect(fetchCount(runner)).toBe(fetchCallsBefore);
-  });
-
-  it('refetches once throttle window passes', async () => {
-    const runner = makeRunner(existingGitHubOriginAllOk);
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    const absPath = await store.ensure();
-    const before = fetchCount(runner);
-    cache.lastFetchAt.set(`local:${absPath}`, Date.now() - 31_000);
-    await store.refresh(absPath);
-    expect(fetchCount(runner)).toBe(before + 1);
-  });
-
-  it('fetch command pairs set-head with || true so empty repos do not block ensure', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return OK;
-      return OK;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await store.ensure();
-    const fetchCmd = runner.exec.mock.calls.map(c => c[0]).find(c => c.includes('git fetch'));
-    expect(fetchCmd).toContain('git fetch --all --prune');
-    expect(fetchCmd).toContain('git remote set-head origin --auto || true');
-  });
+afterEach(async () => {
+  await rm(tempDir, { recursive: true, force: true });
 });
 
-describe('RepoStore — mutex serialization', () => {
-  it('two concurrent ensure() calls on same (host, repo) run sequentially', async () => {
+describe('RepoStore per-agent Workdir', () => {
+  it('auto-creates an ordinary clone at ~/.baxian/agents/<agentId>/repo', async () => {
+    const home = join(tempDir, 'home');
+    await run(`mkdir -p ${shellQuote(home)}`);
+    const canonicalHome = await run(`cd ${shellQuote(home)} && pwd -P`);
+    const runner = new TestRunner(home, origin);
+    const store = new RepoStore(
+      runner,
+      PROJECT_REPO,
+      'remote',
+      { hostname: 'box-a' },
+      createRepoStoreCache(),
+      'dev-1',
+    );
+
+    const path = await store.ensure();
+
+    expect(path).toBe(join(canonicalHome, '.baxian/agents/dev-1/repo'));
+    expect(await run(`git -C ${shellQuote(path)} rev-parse --is-bare-repository`)).toBe('false');
+    expect(await run(`git -C ${shellQuote(path)} rev-parse --show-toplevel`)).toBe(path);
+    expect(runner.commands.some(command => command.includes('--bare'))).toBe(false);
+  });
+
+  it('gives two agents independent clones, branches, and object databases', async () => {
+    const home = join(tempDir, 'home');
+    await run(`mkdir -p ${shellQuote(home)}`);
     const cache = createRepoStoreCache();
-    let running = 0;
-    let maxRunning = 0;
-    const runner = makeRunner(_cmd => {
-      running++;
-      maxRunning = Math.max(maxRunning, running);
-      const result: ExecResult = { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
-      queueMicrotask(() => { running--; });
-      return result;
-    });
-    const store1 = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    const store2 = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await Promise.all([store1.ensure(), store2.ensure()]);
-    expect(maxRunning).toBeLessThanOrEqual(1);
-  });
-});
+    const runner = new TestRunner(home, origin);
+    const dev = new RepoStore(runner, PROJECT_REPO, 'remote', { hostname: 'box-a' }, cache, 'dev-1');
+    const qa = new RepoStore(runner, PROJECT_REPO, 'remote', { hostname: 'box-a' }, cache, 'qa-1');
 
-describe('RepoStore — network resilience', () => {
-  let cache: RepoStoreCache;
-  beforeEach(() => {
-    cache = createRepoStoreCache();
-    __setNetExecSleepForTests(async () => {});
-  });
-  afterEach(() => {
-    __setNetExecSleepForTests();
+    const [devPath, qaPath] = await Promise.all([dev.ensure(), qa.ensure()]);
+
+    expect(devPath).not.toBe(qaPath);
+    expect(await run(`git -C ${shellQuote(devPath)} rev-parse --absolute-git-dir`)).not.toBe(
+      await run(`git -C ${shellQuote(qaPath)} rev-parse --absolute-git-dir`),
+    );
   });
 
-  const DNS_FAIL: ExecResult = {
-    stdout: '',
-    stderr: 'fatal: unable to access: Could not resolve host: github.com',
-    exitCode: 128,
-  };
+  it('adopts an existing custom Workdir only when it is the exact ordinary clone root', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const store = new RepoStore(
+      new TestRunner(tempDir, origin),
+      PROJECT_REPO,
+      'local',
+      undefined,
+      createRepoStoreCache(),
+      'dev-1',
+      path,
+    );
 
-  it('runs gh repo clone under the clone timeout with the low-speed guard', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      return OK;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
+    await expect(store.ensure()).resolves.toBe(await run(`cd ${shellQuote(path)} && pwd -P`));
+  });
+
+  it('creates real directories for every baxian runtime path', async () => {
+    const path = join(tempDir, 'custom-runtime-dirs');
+    await cloneAt(path);
+    const store = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'dev-1', path,
+    );
+
     await store.ensure();
-    const clone = runner.exec.mock.calls.find(c => c[0].includes('gh repo clone'));
-    expect(clone).toBeDefined();
-    expect(clone![0].startsWith(`${GIT_NET_ENV} gh repo clone`)).toBe(true);
-    expect(clone![1]?.timeout).toBe(CLONE_EXEC_TIMEOUT_MS);
+
+    for (const relative of ['.baxian', '.baxian/review', '.baxian/review/inbox', '.baxian/review-inbox']) {
+      const stat = await lstat(join(path, relative));
+      expect(stat.isDirectory()).toBe(true);
+      expect(stat.isSymbolicLink()).toBe(false);
+    }
   });
 
-  it('runs plain git clone under the clone timeout with the low-speed guard', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      return OK;
-    });
-    const store = new RepoStore(runner, 'git@git.example.com:team/repo.git', 'local', undefined, cache);
-    await store.ensure();
-    const clone = runner.exec.mock.calls.find(c => c[0].includes('git clone --bare'));
-    expect(clone).toBeDefined();
-    expect(clone![0].startsWith(`${GIT_NET_ENV} git clone --bare`)).toBe(true);
-    expect(clone![1]?.timeout).toBe(CLONE_EXEC_TIMEOUT_MS);
+  it.each(['.baxian', '.baxian/review'])('rejects a symbolic-link runtime directory at %s', async (relative) => {
+    const path = join(tempDir, `custom-symlink-${relative.replaceAll('/', '-')}`);
+    const outside = join(tempDir, `outside-${relative.replaceAll('/', '-')}`);
+    await cloneAt(path);
+    await run(`mkdir -p ${shellQuote(outside)}`);
+    if (relative.includes('/')) await run(`mkdir -p ${shellQuote(join(path, '.baxian'))}`);
+    await symlink(outside, join(path, relative));
+    const store = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await expect(store.ensure()).rejects.toThrow(/unsafe \.baxian runtime path/i);
+    expect((await lstat(join(path, relative))).isSymbolicLink()).toBe(true);
   });
 
-  it('removes the partial directory when clone exits non-zero', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return { stdout: '', stderr: 'fatal: fetch failed', exitCode: 128 };
-      return OK;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/gh repo clone .* failed/);
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.startsWith('rm -rf ') && c.includes('/.baxian/repos/user/repo'))).toBe(true);
+  it('fails fast instead of creating a missing custom Workdir', async () => {
+    const path = join(tempDir, 'missing');
+    const store = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await expect(store.ensure()).rejects.toThrow(/never creates a user-specified Workdir/i);
+    await expect(lstat(path)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('removes the partial directory when clone is killed by the exec timeout', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) throw new Error('Command timed out after 600000ms');
-      return OK;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/timed out/);
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.startsWith('rm -rf ') && c.includes('/.baxian/repos/user/repo'))).toBe(true);
-  });
-
-  it('does not retry a clone that fails with a transient error', async () => {
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('gh repo clone')) return DNS_FAIL;
-      return OK;
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow();
-    const clones = runner.exec.mock.calls.filter(c => c[0].includes('gh repo clone'));
-    expect(clones).toHaveLength(1);
-  });
-
-  it('fetches under the default network timeout with the low-speed guard', async () => {
-    const runner = makeRunner(existingGitHubOriginAllOk);
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await store.ensure();
-    const fetch = runner.exec.mock.calls.find(c => c[0].includes('git fetch --all --prune'));
-    expect(fetch).toBeDefined();
-    expect(fetch![0]).toContain(`${GIT_NET_ENV} git fetch --all --prune`);
-    expect(fetch![1]?.timeout).toBe(NET_EXEC_TIMEOUT_MS);
-  });
-
-  it('retries a transient fetch failure and succeeds', async () => {
-    let fetchAttempts = 0;
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('git fetch --all --prune')) {
-        fetchAttempts++;
-        return fetchAttempts === 1 ? DNS_FAIL : OK;
-      }
-      return existingGitHubOriginAllOk(cmd);
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).resolves.toBeDefined();
-    expect(fetchAttempts).toBe(2);
-  });
-
-  it('fails fetch immediately on a non-transient error', async () => {
-    let fetchAttempts = 0;
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('git fetch --all --prune')) {
-        fetchAttempts++;
-        return { stdout: '', stderr: 'fatal: Authentication failed', exitCode: 128 };
-      }
-      return existingGitHubOriginAllOk(cmd);
-    });
-    const store = new RepoStore(runner, 'user/repo', 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/git fetch failed/);
-    expect(fetchAttempts).toBe(1);
-  });
-});
-
-describe('RepoStore — hostKey isolation', () => {
-  type Host = ConstructorParameters<typeof RepoStore>[3];
-  it.each<{ name: string; homeKeys: string[]; first: ['local' | 'remote', Host]; second: ['local' | 'remote', Host] }>([
-    {
-      name: 'local and remote with same $HOME do NOT share fetch throttle',
-      homeKeys: ['remote:rock@host:default'],
-      first: ['local', undefined],
-      second: ['remote', { hostname: 'host', user: 'rock' }],
-    },
-    {
-      name: 'local mode and remote mode with hostname literally "local" do NOT share cache',
-      homeKeys: ['remote:local:default'],
-      first: ['local', undefined],
-      second: ['remote', { hostname: 'local' }],
-    },
-    {
-      name: 'same hostname/user on different ports do NOT share fetch throttle (port in hostKey)',
-      homeKeys: ['remote:u@h:22', 'remote:u@h:2222'],
-      first: ['remote', { hostname: 'h', user: 'u', port: 22 }],
-      second: ['remote', { hostname: 'h', user: 'u', port: 2222 }],
-    },
-    {
-      name: 'inline host without a port (:default) does NOT share cache with an explicit-22 registry host',
-      homeKeys: ['remote:u@h:default', 'remote:u@h:22'],
-      first: ['remote', { hostname: 'h', user: 'u' }],
-      second: ['remote', { hostname: 'h', user: 'u', port: 22 }],
-    },
-  ])('$name', async ({ homeKeys, first, second }) => {
+  it('rejects a repository subdirectory and a bare repository', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    await run(`mkdir -p ${shellQuote(join(path, 'subdir'))}`);
     const cache = createRepoStoreCache();
-    for (const key of homeKeys) cache.homes.set(key, homedir());
+    const subdir = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      cache, 'dev-1', join(path, 'subdir'),
+    );
+    const bare = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      cache, 'qa-1', origin,
+    );
 
-    const firstRunner = makeRunner(existingGitHubOriginAllOk);
-    const secondRunner = makeRunner(existingGitHubOriginAllOk);
-    const firstStore = new RepoStore(firstRunner, 'user/repo', first[0], first[1], cache);
-    const secondStore = new RepoStore(secondRunner, 'user/repo', second[0], second[1], cache);
-
-    await firstStore.ensure();
-    await secondStore.ensure();
-
-    expect(fetchCount(secondRunner)).toBeGreaterThanOrEqual(1);
-  });
-});
-
-describe('RepoStore.ensure — non-GitHub (generic git) repos', () => {
-  let cache: RepoStoreCache;
-  beforeEach(() => { cache = createRepoStoreCache(); });
-
-  it('clones bare with plain `git clone` at repos-ext/<host>/<path> (case-preserved path)', async () => {
-    const url = 'https://gitlab.example.com/Group/Sub/Proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('git clone')) return OK;
-      if (cmd.includes('config remote.origin.fetch')) return OK;
-      if (cmd.includes('git fetch')) return OK;
-      if (cmd.includes('git remote set-head')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    const path = await store.ensure();
-    expect(path).toBe(`${homedir()}/.baxian/repos-ext/gitlab.example.com/Group/Sub/Proj`);
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('git clone --bare') && c.includes(url))).toBe(true);
-    expect(cmds.some(c =>
-      c.includes('config remote.origin.fetch') && c.includes('+refs/heads/*:refs/remotes/origin/*'))).toBe(true);
-    expect(cmds.some(c => c.includes('gh repo clone'))).toBe(false);
+    await expect(subdir.ensure()).rejects.toThrow(/exact top-level/i);
+    await expect(bare.ensure()).rejects.toThrow(/non-bare/i);
   });
 
-  it('sanitizes ":" to "_" for a non-default-port host dir', async () => {
-    const url = 'https://gitlab.example.com:8443/group/proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      return OK;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    const path = await store.ensure();
-    expect(path).toBe(`${homedir()}/.baxian/repos-ext/gitlab.example.com_8443/group/proj`);
+  it('rejects linked worktrees and clones that share objects through alternates', async () => {
+    const clone = join(tempDir, 'clone');
+    const linked = join(tempDir, 'linked');
+    const alternate = join(tempDir, 'alternate');
+    await cloneAt(clone);
+    await run(`git -C ${shellQuote(clone)} worktree add -q -b linked-test ${shellQuote(linked)}`);
+    await cloneAt(alternate);
+    await run(
+      `mkdir -p ${shellQuote(join(alternate, '.git/objects/info'))} && ` +
+      `printf '%s\n' ${shellQuote(join(clone, '.git/objects'))} > ` +
+      `${shellQuote(join(alternate, '.git/objects/info/alternates'))}`,
+    );
+
+    const linkedStore = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'dev-1', linked,
+    );
+    const alternateStore = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'qa-1', alternate,
+    );
+
+    await expect(linkedStore.ensure()).rejects.toThrow(/independent ordinary clone/i);
+    await expect(alternateStore.ensure()).rejects.toThrow(/independent ordinary clone/i);
   });
 
-  it('origin matches by host (case-insensitive) + path (case-sensitive) — no sync for cosmetic difference', async () => {
-    const url = 'https://gitlab.example.com/Group/Proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://GITLAB.example.com/Group/Proj.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('git fetch')) return OK;
-      return FAIL;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
+  it('rejects an origin that does not match the project repository', async () => {
+    const path = join(tempDir, 'wrong-origin');
+    await cloneAt(path, 'https://git.example.com/other/project.git');
+    const store = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await expect(store.ensure()).rejects.toThrow(/does not match project\.repo/i);
+  });
+
+  it('validates but does not rewrite the origin access method in a user-specified Workdir', async () => {
+    const path = join(tempDir, 'custom-ssh-origin');
+    const sshOrigin = 'git@git.example.com:group/project.git';
+    await cloneAt(path, sshOrigin);
+    const store = new RepoStore(
+      new TestRunner(tempDir, origin), PROJECT_REPO, 'local', undefined,
+      createRepoStoreCache(), 'dev-1', path,
+    );
+
     await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('git clone'))).toBe(false);
-    expect(cmds.some(c => c.includes('config --replace-all remote.origin.url'))).toBe(false);
+
+    expect(await run(`git -C ${shellQuote(path)} remote get-url origin`)).toBe(sshOrigin);
   });
 
-  it('rejects an origin that differs only by path case (generic remotes are case-sensitive)', async () => {
-    const url = 'https://gitlab.example.com/Group/Proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('rev-parse --resolve-git-dir')) return OK;
-      if (cmd.includes('config --get-all remote.origin.fetch')) return { stdout: '+refs/heads/*:refs/remotes/origin/*\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://gitlab.example.com/group/proj.git\n', stderr: '', exitCode: 0 };
-      }
-      return FAIL;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    await expect(store.ensure()).rejects.toThrow(/does not match/i);
+  it('rejects two agents that resolve to the same canonical path on one host', async () => {
+    const path = join(tempDir, 'custom');
+    const alias = join(tempDir, 'custom-link');
+    await cloneAt(path);
+    await symlink(path, alias);
+    const cache = createRepoStoreCache();
+    const runner = new TestRunner(tempDir, origin);
+    const first = new RepoStore(runner, PROJECT_REPO, 'local', undefined, cache, 'dev-1', path);
+    const second = new RepoStore(runner, PROJECT_REPO, 'local', undefined, cache, 'qa-1', alias);
+
+    await first.ensure();
+    await expect(second.ensure()).rejects.toThrow(/already owned by agent "dev-1"/i);
   });
 
-  it('does not leak embedded credentials into the local clone path', async () => {
-    const url = 'https://oauth2:TOKEN@gitlab.example.com/group/proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      return OK;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    const path = await store.ensure();
-    expect(path).toBe(`${homedir()}/.baxian/repos-ext/gitlab.example.com/group/proj`);
-    expect(path).not.toContain('TOKEN');
+  it('atomically rejects concurrent agents that resolve to the same canonical path', async () => {
+    const path = join(tempDir, 'concurrent-custom');
+    const alias = join(tempDir, 'concurrent-link');
+    await cloneAt(path);
+    await symlink(path, alias);
+    const cache = createRepoStoreCache();
+    const runner = new TestRunner(tempDir, origin);
+    const first = new RepoStore(runner, PROJECT_REPO, 'local', undefined, cache, 'dev-1', path);
+    const second = new RepoStore(runner, PROJECT_REPO, 'local', undefined, cache, 'qa-1', alias);
+
+    const results = await Promise.allSettled([first.ensure(), second.ensure()]);
+
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find(result => result.status === 'rejected') as PromiseRejectedResult;
+    expect(String(rejected.reason)).toMatch(/already owned by agent/i);
   });
 
-  it('redacts embedded credentials from a clone failure message (repo + git stderr)', async () => {
-    const url = 'https://oauth2:SECRETTOKEN@gitlab.example.com/group/proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      if (cmd.includes('git clone')) return {
-        stdout: '',
-        stderr: "fatal: Authentication failed for 'https://oauth2:SECRETTOKEN@gitlab.example.com/group/proj.git/'",
-        exitCode: 128,
-      };
-      return FAIL;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    const err = await store.ensure().then(() => null, (e: Error) => e.message);
-    expect(err).toBeTruthy();
-    expect(err).not.toContain('SECRETTOKEN');
-    expect(err).toContain('gitlab.example.com');
+  it('does not confuse the same path text on different hosts', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const cache = createRepoStoreCache();
+    const runner = new TestRunner(tempDir, origin);
+    const first = new RepoStore(runner, PROJECT_REPO, 'remote', { hostname: 'box-a' }, cache, 'dev-1', path);
+    const second = new RepoStore(runner, PROJECT_REPO, 'remote', { hostname: 'box-b' }, cache, 'qa-1', path);
+
+    const canonical = await run(`cd ${shellQuote(path)} && pwd -P`);
+    await expect(first.ensure()).resolves.toBe(canonical);
+    await expect(second.ensure()).resolves.toBe(canonical);
   });
 
-  it('updates origin when access method changes (https→ssh)', async () => {
-    const runner = makeRunner(existingOrigin('https://gitlab.example.com/group/proj.git'));
-    const store = new RepoStore(runner, 'ssh://git@gitlab.example.com/group/proj.git', 'local', undefined, cache);
+  it('treats omitted and explicit default SSH ports as one Workdir owner scope', async () => {
+    const path = join(tempDir, 'same-default-port');
+    await cloneAt(path);
+    const cache = createRepoStoreCache();
+    const runner = new TestRunner(tempDir, origin);
+    const first = new RepoStore(
+      runner, PROJECT_REPO, 'remote', { hostname: 'box-a', user: 'git' },
+      cache, 'dev-1', path,
+    );
+    const second = new RepoStore(
+      runner, PROJECT_REPO, 'remote', { hostname: 'box-a', user: 'git', port: 22 },
+      cache, 'qa-1', path,
+    );
+
+    await first.ensure();
+    await expect(second.ensure()).rejects.toThrow(/already owned by agent "dev-1"/i);
+  });
+
+  it('surfaces fetch failures and does not cache a successful refresh', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const runner = new TestRunner(tempDir, origin);
+    runner.failFetch = true;
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await expect(store.ensure()).rejects.toThrow(/git fetch failed/i);
+  });
+
+  it('fails when origin/HEAD cannot be refreshed instead of hiding the warning', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const runner = new TestRunner(tempDir, origin);
+    runner.failOriginHead = true;
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await expect(store.ensure()).rejects.toThrow(/origin\/HEAD could not be refreshed/i);
+  });
+
+  it('rejects a clone whose remote-tracking ref listing succeeds but is empty', async () => {
+    const path = join(tempDir, 'custom');
+    await cloneAt(path);
+    const runner = new TestRunner(tempDir, origin);
+    runner.emptyRemoteRefs = true;
+    const store = new RepoStore(
+      runner, PROJECT_REPO, 'local', undefined, createRepoStoreCache(), 'dev-1', path,
+    );
+
+    await expect(store.ensure()).rejects.toThrow(/no readable remote-tracking refs/i);
+  });
+
+  it('GitHub auto clone command never requests a bare repository', async () => {
+    const home = join(tempDir, 'home');
+    await run(`mkdir -p ${shellQuote(home)}`);
+    const runner = new TestRunner(home, origin, 'https://github.com/owner/repo.git');
+    const store = new RepoStore(
+      runner, 'owner/repo', 'remote', { hostname: 'box-a' },
+      createRepoStoreCache(), 'dev-1',
+    );
+
     await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    const replaceCmd = cmds.find(c => c.includes('config --replace-all remote.origin.url'));
-    expect(replaceCmd).toContain('ssh://git@gitlab.example.com/group/proj.git');
-    expect(cmds.some(c => c.includes('config --unset-all remote.origin.pushurl'))).toBe(true);
-  });
 
-  it('skips sync when origin already matches the configured URL', async () => {
-    const url = 'https://gitlab.example.com/group/proj.git';
-    const runner = makeRunner(existingOrigin(url));
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('config --replace-all remote.origin.url'))).toBe(false);
-  });
-
-  it('redacts credentials in sync failure message', async () => {
-    const url = 'https://oauth2:SECRETTOKEN@gitlab.example.com/group/proj.git';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return OK;
-      if (cmd.includes('remote get-url origin')) {
-        return { stdout: 'https://gitlab.example.com/group/proj.git\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('config --replace-all remote.origin.url')) return {
-        stdout: '', stderr: 'error: could not set url', exitCode: 1,
-      };
-      return FAIL;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    const err = await store.ensure().then(() => null, (e: Error) => e.message);
-    expect(err).toBeTruthy();
-    expect(err).not.toContain('SECRETTOKEN');
-  });
-
-  it('trims a whitespace-padded repo URL before cloning', async () => {
-    const url = '  https://gitlab.example.com/group/proj.git  ';
-    const runner = makeRunner(cmd => {
-      if (cmd.includes('test -d')) return FAIL;
-      if (cmd.startsWith('mkdir -p ')) return OK;
-      return OK;
-    });
-    const store = new RepoStore(runner, url, 'local', undefined, cache);
-    const path = await store.ensure();
-    expect(path).toBe(`${homedir()}/.baxian/repos-ext/gitlab.example.com/group/proj`);
-    const cloneCmd = runner.exec.mock.calls.map(c => c[0]).find(c => c.includes('git clone'));
-    expect(cloneCmd).toContain("git clone --bare 'https://gitlab.example.com/group/proj.git'");
-  });
-
-  it('skips sync for cosmetic .git suffix difference (same access method)', async () => {
-    const runner = makeRunner(existingOrigin('https://gitlab.example.com/group/proj.git'));
-    const store = new RepoStore(runner, 'https://gitlab.example.com/group/proj', 'local', undefined, cache);
-    await store.ensure();
-    const cmds = runner.exec.mock.calls.map(c => c[0]);
-    expect(cmds.some(c => c.includes('config --replace-all remote.origin.url'))).toBe(false);
-    expect(cmds.some(c => c.includes('config --unset-all'))).toBe(false);
-  });
-
-  it('clears fetch throttle when origin URL changes so new URL is validated immediately', async () => {
-    const runner = makeRunner(existingOrigin('https://gitlab.example.com/group/proj.git'));
-    const absPath = `${homedir()}/.baxian/repos-ext/gitlab.example.com/group/proj`;
-    const cacheKey = `local:${absPath}`;
-    cache.lastFetchAt.set(cacheKey, Date.now());
-    const store = new RepoStore(runner, 'ssh://git@gitlab.example.com/group/proj.git', 'local', undefined, cache);
-    await store.ensure();
-    expect(fetchCount(runner)).toBeGreaterThanOrEqual(1);
-  });
-});
-
-describe('nonGitHubSubpath', () => {
-  it('builds repos-ext/<host>/<path> with the port sanitized', () => {
-    expect(nonGitHubSubpath('https://gitlab.example.com:8443/g/p.git'))
-      .toBe('repos-ext/gitlab.example.com_8443/g/p');
-  });
-
-  it('refuses path-traversal / empty segments (defense-in-depth)', () => {
-    expect(() => nonGitHubSubpath('https://gitlab.example.com/group/../proj.git')).toThrow(/unsafe path/i);
-    expect(() => nonGitHubSubpath('https://gitlab.example.com/group//proj')).toThrow(/unsafe path/i);
-  });
-
-  it('refuses an unsafe host (traversal / shell metacharacters) — defense-in-depth', () => {
-    expect(() => nonGitHubSubpath('https://../group/proj.git')).toThrow(/unsafe host/i);
-    expect(() => nonGitHubSubpath('https://gitlab.example.com;touch x/g/p.git')).toThrow(/unsafe host/i);
-    expect(() => nonGitHubSubpath('https://gitlab.example.com$(id)/g/p.git')).toThrow(/unsafe host/i);
+    const clone = runner.commands.find(command => command.includes('gh repo clone'));
+    expect(clone).toContain("gh repo clone 'owner/repo'");
+    expect(clone).not.toContain('--bare');
   });
 });
 
 describe('accessMethodDiffers', () => {
-  it.each<[string, string, string, boolean]>([
-    ['detects https↔ssh scheme change', 'https://gitlab.example.com/g/p.git', 'ssh://git@gitlab.example.com/g/p.git', true],
-    ['detects https↔scp scheme change', 'https://gitlab.example.com/g/p.git', 'git@gitlab.example.com:g/p.git', true],
-    ['detects ssh user change', 'ssh://git@host/g/p.git', 'ssh://deploy@host/g/p.git', true],
-    ['detects userinfo addition (https with token)', 'https://oauth2:token@host/g/p.git', 'https://host/g/p.git', true],
-    ['returns false for .git suffix difference', 'https://host/g/p.git', 'https://host/g/p', false],
-    ['returns false for host case difference', 'https://HOST.example.com/g/p.git', 'https://host.example.com/g/p.git', false],
-    ['returns false for scp↔ssh URL with same user (both are SSH)', 'git@gitlab.example.com:group/proj.git', 'ssh://git@gitlab.example.com/group/proj.git', false],
-    ['returns false for identical URLs', 'https://host/g/p.git', 'https://host/g/p.git', false],
-  ])('%s', (_name, a, b, expected) => {
-    expect(accessMethodDiffers(a, b)).toBe(expected);
+  it('distinguishes HTTPS and SSH while treating equivalent SSH forms alike', () => {
+    expect(accessMethodDiffers('https://git.example.com/g/p.git', 'git@git.example.com:g/p.git')).toBe(true);
+    expect(accessMethodDiffers('ssh://git@git.example.com/g/p.git', 'git@git.example.com:g/p.git')).toBe(false);
   });
-});
-
-describe('syncOriginUrl — real git integration', () => {
-  it('replaces origin URL including multi-URL and insteadOf scenarios', async () => {
-    const { execSync } = await import('node:child_process');
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { join } = await import('node:path');
-    const { tmpdir } = await import('node:os');
-
-    const tmp = mkdtempSync(join(tmpdir(), 'repo-store-'));
-    try {
-      const run = (cmd: string) => execSync(cmd, { cwd: tmp, encoding: 'utf8', stdio: 'pipe' });
-      run('git init bare.git --bare');
-      run(`git clone bare.git work`);
-      const work = join(tmp, 'work');
-      const runW = (cmd: string) => execSync(cmd, { cwd: work, encoding: 'utf8', stdio: 'pipe' });
-
-      runW('git remote set-url --add origin https://backup.example.com/proj.git');
-      runW(`git remote set-url --push origin ${join(tmp, 'bare.git')}`);
-      runW('git remote set-url --push --add origin https://push-backup.example.com/proj.git');
-
-      const newUrl = 'ssh://git@gitlab.example.com/group/proj.git';
-      runW(`git config --replace-all remote.origin.url '${newUrl}'`);
-      try { runW('git config --unset-all remote.origin.pushurl'); } catch { }
-
-      const fetchUrl = runW('git remote get-url origin').trim();
-      const pushUrl = runW('git remote get-url --push origin').trim();
-      const allFetch = runW('git remote get-url --all origin').trim().split('\n');
-
-      expect(fetchUrl).toBe(newUrl);
-      expect(pushUrl).toBe(newUrl);
-      expect(allFetch).toEqual([newUrl]);
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-});
-
-describe('repo detection — real git integration', () => {
-  async function withHome(run: (home: string, sh: (cmd: string) => string) => Promise<void>): Promise<void> {
-    const { execSync } = await import('node:child_process');
-    const { mkdtempSync, rmSync } = await import('node:fs');
-    const { join } = await import('node:path');
-    const { tmpdir } = await import('node:os');
-    const home = mkdtempSync(join(tmpdir(), 'repo-store-home-'));
-    try {
-      await run(home, (cmd: string) => execSync(cmd, { cwd: home, encoding: 'utf8', stdio: 'pipe' }));
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  }
-
-  function storeAt(home: string): RepoStore {
-    const cache = createRepoStoreCache();
-    cache.homes.set('local', home);
-    return new RepoStore(new LocalRunner(), 'user/repo', 'local', undefined, cache);
-  }
-
-  it('does not mistake a plain directory for a repo when an ancestor directory is one', () =>
-    withHome(async (home, sh) => {
-      sh('git init -q .');
-      sh('mkdir -p .baxian/repos/user/repo');
-      await expect(storeAt(home).ensure()).rejects.toThrow(/not a git repository/i);
-    }), 20_000);
-
-  it('recognizes an existing bare store and proceeds to origin validation', () =>
-    withHome(async (home, sh) => {
-      sh('git init -q --bare seed.git');
-      sh('mkdir -p .baxian/repos/user');
-      sh('git clone -q --bare seed.git .baxian/repos/user/repo');
-      await expect(storeAt(home).ensure()).rejects.toThrow(/does not match/i);
-    }), 20_000);
 });

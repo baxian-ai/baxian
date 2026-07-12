@@ -73,13 +73,12 @@ afterEach(async () => {
 });
 
 describe('AgentManager.reconcileFailedAgent', () => {
-  it('clears volatile binding facts, fails active task, releases lock, and emits recovery', async () => {
+  it('holds the task binding and exact lock when tmux is missing, then fails the active task', async () => {
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
       taskId: 'task-old',
-      worktreePath: '/tmp/wt',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
       startedAt: NOW,
       paneId: 'P-1',
       updatedAt: NOW,
@@ -97,21 +96,22 @@ describe('AgentManager.reconcileFailedAgent', () => {
       createdAt: NOW,
       updatedAt: NOW,
     });
-    await lockManager.acquire('dev-1');
+    await lockManager.acquire('dev-1', 'task-old');
 
     expect(await manager.reconcileFailedAgent('dev-1')).toBe(true);
 
     expect(await agentStore.get('dev-1')).toMatchObject({
       id: 'dev-1',
       projectId: 'proj',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
     });
     const state = await agentStore.get('dev-1');
-    expect(state?.taskId).toBeUndefined();
-    expect(state?.worktreePath).toBeUndefined();
+    expect(state?.taskId).toBe('task-old');
+    expect(state?.workdir).toBe('/tmp/repo');
     expect(state?.paneId).toBeUndefined();
     expect(state?.creationToken).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(state).toMatchObject({ status: 'awaiting_human', awaitingPhase: 'runtime-missing' });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect((await taskStore.get('task-old'))?.status).toBe('failed');
     expect(events.some(e => e.type === 'agent.recovered' && e.agentId === 'dev-1')).toBe(true);
     expect(await errorRecordStore.latestForAgent('dev-1')).toMatchObject({
@@ -136,7 +136,7 @@ describe('AgentManager.reconcileFailedAgent', () => {
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
       paneId: 'P-1',
       updatedAt: NOW,
     });
@@ -151,7 +151,7 @@ describe('AgentManager.reconcileFailedAgent', () => {
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
       updatedAt: NOW,
     });
     const stalePrecheck = await agentStore.get('dev-1');
@@ -159,7 +159,7 @@ describe('AgentManager.reconcileFailedAgent', () => {
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
       creationToken: 'create-new',
       paneId: 'P-new',
       updatedAt: NOW,
@@ -170,7 +170,7 @@ describe('AgentManager.reconcileFailedAgent', () => {
     expect(await agentStore.get('dev-1')).toMatchObject({
       creationToken: 'create-new',
       paneId: 'P-new',
-      repoPath: '/tmp/repo',
+      workdir: '/tmp/repo',
     });
     expect(events.filter(e => e.type === 'agent.recovered')).toHaveLength(0);
     expect(await errorRecordStore.latestForAgent('dev-1')).toBeUndefined();

@@ -222,6 +222,11 @@ export function hostGroupKey(mode: AgentMode, host: HostConfig | undefined): str
     : `remote:${host.hostname}:${port}`;
 }
 
+export function workdirHostGroupKey(mode: AgentMode, host: HostConfig | undefined): string {
+  if (mode !== 'remote' || !host || host.port !== undefined) return hostGroupKey(mode, host);
+  return hostGroupKey(mode, { ...host, port: 22 });
+}
+
 export function sshTarget(host: HostConfig): string {
   return host.user ? `${host.user}@${host.hostname}` : host.hostname;
 }

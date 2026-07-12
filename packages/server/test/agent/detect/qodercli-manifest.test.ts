@@ -17,6 +17,33 @@ interface Case {
 
 const cases: Case[] = [
   {
+    name: '非 YOLO shell 权限 prompt（真实截屏 perm-qoder，issue #475）',
+    lines: [
+      "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+      " > Run this exact bash command: echo bx475",
+      "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+      "",
+      " Thinking",
+      " │ The user wants me to run a specific bash command.",
+      " ? Bash(echo bx475)",
+      "",
+      " Permission Required",
+      "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+      " Tool: Bash",
+      "",
+      " Print bx475",
+      " Command: echo bx475",
+      "",
+      " Allow this command to run?",
+      "",
+      "  ❯ 1. Allow once",
+      "    2. Always allow \"echo\" for future sessions [local]",
+      "    3. Reject and type something",
+      "    4. No",
+    ],
+    expect: { state: 'pending', rule: 'confirmation_blocker', visibleBlocker: true },
+  },
+  {
     name: 'braille spinner with "(esc to cancel," is working',
     lines: ['⠼ Thinking... (esc to cancel, 3s)'],
     expect: { state: 'working', rule: 'cancel_hint_working', visibleWorking: true },

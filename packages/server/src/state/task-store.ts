@@ -13,14 +13,17 @@ export interface TaskFilter {
 
 const TASK_FIELDS = [
   'id', 'projectId', 'title', 'description', 'preferredAgentId',
-  'agentId', 'qaAgentId', 'prNumber', 'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha',
+  'agentId', 'qaAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'latestHeadSha', 'reviewHeadAnchorSha',
   'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'specReviewRound', 'phase', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
-  'reviewMode', 'batchIndex', 'batchTotal', 'reviewWorktreeMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
+  'reviewMode', 'batchIndex', 'batchTotal', 'reviewCheckoutMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
 ] as const;
 
 function sanitizeTask(state: unknown): TaskState {
-  const raw = (state ?? {}) as Partial<TaskState> & { specMarkerToken?: string };
+  const raw = (state ?? {}) as Partial<TaskState> & {
+    specMarkerToken?: string;
+    reviewWorktreeMode?: 'head' | 'base';
+  };
   const out: Partial<TaskState> = {};
   for (const k of TASK_FIELDS) {
     const value = raw[k];
@@ -31,6 +34,9 @@ function sanitizeTask(state: unknown): TaskState {
   // dormant pre-rename task files on disk still carry specMarkerToken; map it on read
   if (out.signalToken === undefined && typeof raw.specMarkerToken === 'string') {
     out.signalToken = raw.specMarkerToken;
+  }
+  if (out.reviewCheckoutMode === undefined && raw.reviewWorktreeMode !== undefined) {
+    out.reviewCheckoutMode = raw.reviewWorktreeMode;
   }
 
   if (typeof out.title !== 'string' || out.title.trim() === '') {

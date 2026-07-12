@@ -511,7 +511,7 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
     } : null);
 
     const failSpy = vi.spyOn(manager, 'failTasksForAgent').mockResolvedValue({ failedCount: 0, releasedPartners: 0 });
-    const releaseSpy = vi.spyOn(lockManager, 'release');
+    const releaseSpy = vi.spyOn(lockManager, 'releaseIfOwner');
     const realSetTimeout = globalThis.setTimeout;
     const fastSetTimeout = ((fn: () => void) => realSetTimeout(fn, 0)) as unknown as typeof globalThis.setTimeout;
     globalThis.setTimeout = fastSetTimeout;

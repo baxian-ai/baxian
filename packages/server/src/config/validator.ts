@@ -1,4 +1,4 @@
-import { isAbsolute } from 'node:path';
+import { isAbsolute, normalize } from 'node:path';
 import {
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoSlug,
   type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
@@ -40,6 +40,7 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateProjectIds(config, errors);
   validateAgentFields(config, errors);
   validateAgentIds(config, errors);
+  validateAgentWorkdirUniqueness(config, errors);
   validateAgentPairs(config, errors);
   validateRemoteHosts(config, errors);
 
@@ -287,6 +288,8 @@ function validateAgentFields(config: BaxianConfig, errors: ValidationError[]): v
         }
         if (agent.workdir !== undefined && !nonEmptyString(agent.workdir)) {
           errors.push({ path: `${path}.workdir`, message: 'agent.workdir, when set, must be a non-empty string' });
+        } else if (agent.workdir !== undefined && !isAbsolute(agent.workdir)) {
+          errors.push({ path: `${path}.workdir`, message: 'agent.workdir must be an absolute path' });
         }
         if (agent.model !== undefined && !nonEmptyString(agent.model)) {
           errors.push({
@@ -322,13 +325,6 @@ function validateAgentFields(config: BaxianConfig, errors: ValidationError[]): v
             path: `${path}.yolo`,
             message: 'agent.yolo must be a boolean if present',
           });
-        } else if (agent.yolo === false) {
-          errors.push({
-            path: `${path}.yolo`,
-            message:
-              'agent.yolo=false is rejected: interactive REPL only supports ' +
-              'YOLO/bypass-permission mode. Either omit yolo (defaults to true) or set true.',
-          });
         }
       }
     }
@@ -350,6 +346,51 @@ function validateAgentIds(config: BaxianConfig, errors: ValidationError[]): void
       }
     }
   }
+}
+
+function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
+  const seen = new Map<string, string>();
+  for (const project of config.project) {
+    if (!Array.isArray(project.agent)) continue;
+    for (let i = 0; i < project.agent.length; i++) {
+      const pair = project.agent[i];
+      if (!Array.isArray(pair)) continue;
+      for (let j = 0; j < pair.length; j++) {
+        const agent = pair[j];
+        if (!nonEmptyString(agent.workdir) || !isAbsolute(agent.workdir!)) continue;
+        const host = configuredAgentHostKey(config, agent.mode, agent.host);
+        if (!host) continue;
+        const key = `${host}\0${normalize(agent.workdir!)}`;
+        const existing = seen.get(key);
+        const path = `project.${project.id}.agent[${i}][${j}].workdir`;
+        if (existing) {
+          errors.push({
+            path,
+            message: `Workdir is already used by agent "${existing}" on the same host; different agents must not share a directory`,
+          });
+        } else if (nonEmptyString(agent.id)) {
+          seen.set(key, agent.id);
+        }
+      }
+    }
+  }
+}
+
+function configuredAgentHostKey(
+  config: BaxianConfig,
+  mode: unknown,
+  hostRef: unknown,
+): string | null {
+  if (mode === 'local') return 'local';
+  if (mode !== 'remote') return null;
+  const host = typeof hostRef === 'string'
+    ? (Array.isArray(config.host) ? config.host : []).find(item => item.id === hostRef)
+    : hostRef;
+  if (!isRecord(host) || !nonEmptyString(host.hostname)) return null;
+  const port = host.port === undefined ? '22' : String(host.port);
+  return nonEmptyString(host.user)
+    ? `remote:${host.user}@${host.hostname}:${port}`
+    : `remote:${host.hostname}:${port}`;
 }
 
 function validateAgentPairs(config: BaxianConfig, errors: ValidationError[]): void {

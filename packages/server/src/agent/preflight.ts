@@ -3,7 +3,6 @@ import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshE
 import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
 import { isGitHubRepo, redactGitCredentials, repoSlug } from '../shared/index.js';
-import { nonGitHubSubpath } from './repo-store.js';
 
 export interface PreflightResult {
   step: string;
@@ -148,7 +147,7 @@ export async function runPreflight(
 
   const isAuto = !agent.workdir;
   if (isAuto) {
-    await runAutoModePreflight(runner, repo, results);
+    await runAutoModePreflight(runner, agent.id, repo, results);
   } else {
     await runManualModePreflight(runner, agent.workdir!, repo, results);
   }
@@ -182,14 +181,18 @@ async function runManualModePreflight(
   results: PreflightResult[],
 ): Promise<void> {
   const workdirCheck = await runner.exec(
-    `cd ${shellQuote(workdir)} && git rev-parse --is-inside-work-tree`,
+    `cd ${shellQuote(workdir)} && ` +
+    `test "$(pwd -P)" = "$(cd "$(git rev-parse --show-toplevel)" && pwd -P)" && ` +
+    `test "$(git rev-parse --is-bare-repository)" = false && ` +
+    `test -d .git && test "$(git rev-parse --git-common-dir)" = .git && ` +
+    `test ! -s .git/objects/info/alternates`,
   );
   results.push({
     step: 'workdir',
-    ok: workdirCheck.exitCode === 0 && workdirCheck.stdout.trim() === 'true',
+    ok: workdirCheck.exitCode === 0,
     message: workdirCheck.exitCode === 0
-      ? `${workdir} is a git workdir`
-      : `${workdir} is not accessible or not a git repository`,
+      ? `${workdir} is an independent ordinary Git clone root`
+      : `${workdir} is not accessible or is not an independent ordinary Git clone root`,
   });
 
   const lsRemoteUrl = isGitHubRepo(repo) ? `https://github.com/${repoSlug(repo)}.git` : repo;
@@ -205,13 +208,13 @@ async function runManualModePreflight(
 
 async function runAutoModePreflight(
   runner: CommandRunner,
+  agentId: string,
   repo: string,
   results: PreflightResult[],
 ): Promise<void> {
   const gh = isGitHubRepo(repo);
-  const relPath = gh ? `repos/${repoSlug(repo).toLowerCase()}` : nonGitHubSubpath(repo);
-  const root = `~/.baxian/${relPath.split('/')[0]}`;
-  const absRepoPath = `~/.baxian/${relPath}`;
+  const root = `~/.baxian/agents/${agentId}`;
+  const absRepoPath = `${root}/repo`;
   const mk = await runner.exec(`mkdir -p ${root} && test -w ${root}`);
   if (mk.exitCode !== 0) {
     results.push({
@@ -224,23 +227,25 @@ async function runAutoModePreflight(
 
   const dirCheck = await runner.exec(`test -d ${absRepoPath}`);
   if (dirCheck.exitCode === 0) {
-    // Same probe as RepoStore: accepts both bare stores and working-tree clones
-    // without git's upward discovery matching an ancestor repo.
     const gitCheck = await runner.exec(
-      `git rev-parse --resolve-git-dir ${absRepoPath} || git rev-parse --resolve-git-dir ${absRepoPath}/.git`,
+      `cd ${absRepoPath} && ` +
+      `test "$(pwd -P)" = "$(cd "$(git rev-parse --show-toplevel)" && pwd -P)" && ` +
+      `test "$(git rev-parse --is-bare-repository)" = false && ` +
+      `test -d .git && test "$(git rev-parse --git-common-dir)" = .git && ` +
+      `test ! -s .git/objects/info/alternates`,
     );
     if (gitCheck.exitCode !== 0) {
       results.push({
         step: 'workdir',
         ok: false,
-        message: `${absRepoPath} exists but is not a git repository — remove it manually before running`,
+        message: `${absRepoPath} exists but is not an independent ordinary Git clone root — move it aside before retrying`,
       });
       return;
     }
     results.push({
       step: 'workdir',
       ok: true,
-      message: `${absRepoPath} is a git workdir`,
+      message: `${absRepoPath} is an independent ordinary Git clone root`,
     });
   } else {
     results.push({

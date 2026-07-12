@@ -83,6 +83,7 @@ describe('TaskStore', () => {
   it('preserves server review mode fields across persistence round-trip', async () => {
     const task = makeTask('task-srv', {
       reviewMode: 'server',
+      reviewCheckoutMode: 'base',
       batchIndex: 1,
       batchTotal: 3,
       maxRoundsContinues: 2,
@@ -90,6 +91,7 @@ describe('TaskStore', () => {
     await store.set(task);
     const loaded = await store.get('task-srv');
     expect(loaded?.reviewMode).toBe('server');
+    expect(loaded?.reviewCheckoutMode).toBe('base');
     expect(loaded?.batchIndex).toBe(1);
     expect(loaded?.batchTotal).toBe(3);
     expect(loaded?.maxRoundsContinues).toBe(2);
@@ -266,6 +268,18 @@ describe('TaskStore sanitize', () => {
     const loaded = await store.get('task-smt');
     expect(loaded!.signalToken).toBe('tok-123');
     expect(loaded!).not.toHaveProperty('specMarkerToken');
+  });
+
+  it('maps the legacy reviewWorktreeMode field to reviewCheckoutMode on read', async () => {
+    await writeUnsanitizedTask('task-review-checkout', {
+      title: 'legacy review checkout',
+      reviewWorktreeMode: 'base',
+    });
+
+    const loaded = await store.get('task-review-checkout');
+
+    expect(loaded?.reviewCheckoutMode).toBe('base');
+    expect(loaded).not.toHaveProperty('reviewWorktreeMode');
   });
 
   it('keeps signalToken when both signalToken and specMarkerToken are on disk', async () => {
