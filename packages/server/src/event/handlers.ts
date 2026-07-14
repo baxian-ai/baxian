@@ -1,5 +1,12 @@
 import { createSignalToken, type PhaseSignalKind } from '../agent/phase-signal.js';
-import { BRANCH_PREFIX, TASK_TERMINAL_STATUS_SET, isValidBranchName, type BaxianEvent, type TaskState } from '../shared/index.js';
+import {
+  BRANCH_PREFIX,
+  TASK_TERMINAL_STATUS_SET,
+  isSpecStagePhase,
+  isValidBranchName,
+  type BaxianEvent,
+  type TaskState,
+} from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import { type AgentManager, DispatchTerminalError, EnsureSessionError } from '../agent/manager.js';
 
@@ -16,8 +23,11 @@ async function reArmDevelopWatcher(
   agentId: string,
   opts: { skipSnapshot?: boolean } = {},
 ): Promise<void> {
-  const kinds: readonly PhaseSignalKind[] =
-    task.phase === 'code' ? ['pr-created'] : ['spec-done', 'pr-created'];
+  const kinds: readonly PhaseSignalKind[] = task.phase === 'research'
+    ? ['spec-done']
+    : task.phase === 'code'
+      ? ['pr-created']
+      : ['spec-done', 'pr-created'];
   await manager.setupPhaseSignal(task.id, agentId, kinds, { skipSnapshot: opts.skipSnapshot ?? true });
 }
 
@@ -460,13 +470,22 @@ async function handlePrCodePush(
       ? 'recheck'
       : 'review';
 
-  const qa = manager.findQaPartner(agentId);
-  if (!qa) {
+  const qaId = transitioned.qaAgentId;
+  if (!qaId) {
     if (!devAlreadyWaiting && !(await manager.markAgentWaiting(agentId, transitioned.id))) {
       await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
         phase: 'dev-wait-gate-failed-no-qa',
       });
     }
+    return;
+  }
+  const qa = manager.getAgentConfig(qaId);
+  if (!qa || qa.role !== 'qa') {
+    if (!devAlreadyWaiting) await manager.markAgentWaiting(agentId, transitioned.id).catch(() => false);
+    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+      phase: 'qa-config-missing',
+      qaAgentId: qaId,
+    });
     return;
   }
 
@@ -479,8 +498,6 @@ async function handlePrCodePush(
     });
     return;
   }
-
-  await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
 
   const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
     transitioned.id,
@@ -502,8 +519,6 @@ async function handlePrCodePush(
         await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated arm-failure');
         return;
       }
-    } else {
-      await manager.updateTask(transitioned.id, { qaAgentId: undefined });
     }
     await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
       console.error(`[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
@@ -556,7 +571,6 @@ async function handlePrCodePush(
         await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated recheck');
       }
     } else {
-      await manager.updateTask(transitioned.id, { qaAgentId: undefined });
       await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
         .catch(err => {
           console.error(
@@ -863,7 +877,7 @@ async function handleMaxRounds(
   if (transitioned.qaAgentId) {
     const qaState = await manager.getAgentState(transitioned.qaAgentId);
     if (qaState?.taskId === transitioned.id) {
-      const qaReleased = await manager
+      await manager
         .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
         .catch(err => {
           console.error(
@@ -872,17 +886,6 @@ async function handleMaxRounds(
           );
           return false;
         });
-      if (qaReleased) {
-        await manager.updateTask(transitioned.id, { qaAgentId: undefined })
-          .catch(err =>
-            console.error(`[EventHandler] max_rounds clear qaAgentId(${transitioned.id}) failed:`, err),
-          );
-      }
-    } else {
-      await manager.updateTask(transitioned.id, { qaAgentId: undefined })
-        .catch(err =>
-          console.error(`[EventHandler] max_rounds clear stale qaAgentId(${transitioned.id}) failed:`, err),
-        );
     }
   }
 
@@ -909,7 +912,7 @@ export function registerEventHandlers(
     if (!event.taskId || !event.agentId) return;
     const taskAtEntry = await manager.getTask(event.taskId);
     if (taskAtEntry?.reviewMode === 'server') return;
-    if (taskAtEntry?.phase === 'spec') {
+    if (taskAtEntry && isSpecStagePhase(taskAtEntry.phase)) {
       console.warn(
         `[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`,
       );
@@ -1034,14 +1037,23 @@ export function registerEventHandlers(
     }
     const expectedRound = transitioned.reviewRound;
 
-    const qa = manager.findQaPartner(event.agentId);
-    if (!qa) {
+    const qaId = transitioned.qaAgentId;
+    if (!qaId) {
       const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
       if (!ok) {
         await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
           phase: 'dev-wait-gate-failed-no-qa',
         });
       }
+      return;
+    }
+    const qa = manager.getAgentConfig(qaId);
+    if (!qa || qa.role !== 'qa') {
+      await manager.markAgentWaiting(event.agentId, transitioned.id).catch(() => false);
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-config-missing',
+        qaAgentId: qaId,
+      });
       return;
     }
 
@@ -1053,8 +1065,6 @@ export function registerEventHandlers(
       });
       return;
     }
-
-    await manager.updateTask(transitioned.id, { qaAgentId: qa.id });
 
     const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
       transitioned.id,
@@ -1102,7 +1112,6 @@ export function registerEventHandlers(
         await manager.failTaskForDispatchError(transitioned.id, 'review', qa.id, dispatchErr);
       } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
       } else {
-        await manager.updateTask(transitioned.id, { qaAgentId: undefined });
         await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
           .catch(err => {
             console.error(
@@ -1147,7 +1156,7 @@ export function registerEventHandlers(
     const eventKind = event.data.kind as
       | 'push' | 'comment' | 'review-comment' | 'pr-edit' | 'pr-merge-ready' | undefined;
 
-    if (eventKind !== 'pr-merge-ready' && taskAtEntry?.phase === 'spec') {
+    if (taskAtEntry && isSpecStagePhase(taskAtEntry.phase)) {
       console.warn(
         `[EventHandler] pr.updated (kind=${eventKind ?? 'push'}) ignored for task ${event.taskId}: task in spec phase`,
       );
@@ -1172,6 +1181,7 @@ export function registerEventHandlers(
     // reused custom branch name could prematurely finish an active task.
     const taskBefore = await manager.getTask(event.taskId);
     if (!taskBefore) return;
+    if (isSpecStagePhase(taskBefore.phase)) return;
     const mergedOwnBxBranch = (event.data.branch as string | undefined) === BRANCH_PREFIX + event.taskId;
     if (!mergedOwnBxBranch && typeof eventPrNumber === 'number' && taskBefore.prNumber !== eventPrNumber) return;
 
@@ -1251,7 +1261,7 @@ export function registerEventHandlers(
       }
     }
 
-    if (task.phase === 'spec') {
+    if (isSpecStagePhase(task.phase)) {
       console.warn(
         `[EventHandler] review.submitted (action=${action}) ignored for task ${task.id}: task in spec phase`,
       );
@@ -1340,7 +1350,7 @@ export function registerEventHandlers(
   bus.on('pr.fix.submitted', async (event) => {
     if (!event.taskId || !event.agentId) return;
     const task = await manager.getTask(event.taskId);
-    if (!task || task.reviewMode === 'server' || task.status !== 'fixing' || task.phase === 'spec') return;
+    if (!task || task.reviewMode === 'server' || task.status !== 'fixing' || isSpecStagePhase(task.phase)) return;
     const { projectId, agentId } = task;
 
     const stayFixing = async (data: { phase: string; [key: string]: unknown }): Promise<void> => {

@@ -166,18 +166,23 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       });
   };
 
-  const unpairedDevs: AgentConfig[] = project?.agent
-    .filter(pair => pair.length === 1 && pair[0].role === 'dev')
-    .map(pair => pair[0]) ?? [];
+  const devGroups: AgentConfig[][] = project?.agent.filter(group => group.some(a => a.role === 'dev')) ?? [];
+  const eligibleDevs = (role: 'qa' | 'research'): AgentConfig[] => devGroups
+    .filter(group => !group.some(a => a.role === role))
+    .map(group => group.find(a => a.role === 'dev')!);
+  const qaEligibleDevs = eligibleDevs('qa');
+  const researchEligibleDevs = eligibleDevs('research');
 
-  const canSelectQa = unpairedDevs.length > 0;
+  const canSelectQa = qaEligibleDevs.length > 0;
+  const canSelectResearch = researchEligibleDevs.length > 0;
 
   const idValid = ID_PATTERN.test(form.id) && !allAgentIds.has(form.id);
   const hostValid = form.mode === 'local' || (form.mode === 'remote' && form.host !== '');
   const runtimeValid = form.runtime !== '' && !!probe?.runtimes[form.runtime]?.ok;
   const tmuxValid = !!probe?.tmux.ok;
   const sshValid = form.mode === 'local' || !!probe?.ssh?.ok;
-  const pairValid = form.role === 'dev' || (form.role === 'qa' && form.pairWith !== '');
+  const pairValid = form.role === 'dev'
+    || ((form.role === 'qa' || form.role === 'research') && form.pairWith !== '');
   const canSubmit = !submitting && idValid && hostValid && pairValid && runtimeValid && tmuxValid && sshValid;
 
   const handleSubmit = async (e: FormEvent) => {
@@ -200,7 +205,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
         yolo: form.yolo,
         ...(form.model.trim() ? { model: form.model.trim() } : {}),
         ...(trimmedAddDirs.length > 0 ? { addDirs: trimmedAddDirs } : {}),
-        ...(form.role === 'qa' ? { pairWith: form.pairWith } : {}),
+        ...(form.role === 'qa' || form.role === 'research' ? { pairWith: form.pairWith } : {}),
       };
       const result = await api.projects.addAgent(projectId, body);
       if (result.restartRequired) flagDirty();
@@ -314,21 +319,28 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
               onChange={() => setForm({ ...form, role: 'dev', pairWith: '' })} disabled={submitting} />
             <span className="text-sm text-og-800">Dev agent</span>
           </label>
-          <label className="inline-flex items-center gap-2" title={!canSelectQa ? t.createAgent.createDevFirstHint : ''}>
+          <label className="mr-4 inline-flex items-center gap-2" title={!canSelectQa ? t.createAgent.createDevFirstHint : ''}>
             <input type="radio" name="role" checked={form.role === 'qa'} className={radioCls}
-              onChange={() => setForm({ ...form, role: 'qa' })} disabled={submitting || !canSelectQa} />
+              onChange={() => setForm({ ...form, role: 'qa', pairWith: '' })} disabled={submitting || !canSelectQa} />
             <span className={`text-sm ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA agent</span>
+          </label>
+          <label className="inline-flex items-center gap-2" title={!canSelectResearch ? t.createAgent.createDevFirstHint : ''}>
+            <input type="radio" name="role" checked={form.role === 'research'} className={radioCls}
+              onChange={() => setForm({ ...form, role: 'research', pairWith: '' })} disabled={submitting || !canSelectResearch} />
+            <span className={`text-sm ${!canSelectResearch ? 'text-og-400' : 'text-og-800'}`}>
+              {t.createAgent.roleResearch}
+            </span>
           </label>
         </div>
 
-        {form.role === 'qa' && (
+        {(form.role === 'qa' || form.role === 'research') && (
           <div>
             <label className={labelCls} htmlFor="pair-with">{t.createAgent.pairWithLabel}</label>
             <select id="pair-with" value={form.pairWith}
               onChange={e => setForm({ ...form, pairWith: e.target.value })}
               className={inputCls} disabled={submitting}>
               <option value="">{t.createAgent.pairWithPlaceholder}</option>
-              {unpairedDevs.map(d => (
+              {(form.role === 'qa' ? qaEligibleDevs : researchEligibleDevs).map(d => (
                 <option key={d.id} value={d.id}>{t.createAgent.pairOptionLabel(d.id, d.mode)}</option>
               ))}
             </select>

@@ -178,44 +178,45 @@ export function CreateTaskModal(props: Props) {
     [projects, selectedProjectId],
   );
 
-  const projectDevs = useMemo(
-    () => (project ? project.agent.flat().filter(a => a.role === 'dev') : []),
+  const projectTargets = useMemo(
+    () => (project ? project.agent.flat().filter(a => a.role === 'dev' || a.role === 'research') : []),
     [project],
   );
 
   const runtimeIds = useMemo(() => new Set(agents.map(a => a.id)), [agents]);
 
-  const visibleDevs = useMemo(
-    () => projectDevs.filter(a => runtimeIds.has(a.id)),
-    [projectDevs, runtimeIds],
+  const visibleTargets = useMemo(
+    () => projectTargets.filter(a => runtimeIds.has(a.id)),
+    [projectTargets, runtimeIds],
   );
 
-  const pendingRestartDevs = useMemo(
-    () => projectDevs.filter(a => !runtimeIds.has(a.id)),
-    [projectDevs, runtimeIds],
+  const pendingRestartTargets = useMemo(
+    () => projectTargets.filter(a => !runtimeIds.has(a.id)),
+    [projectTargets, runtimeIds],
   );
 
   useEffect(() => {
     if (isEdit) return;
     if (project === null) return;
-    if (preferredAgentId !== '' && !visibleDevs.find(d => d.id === preferredAgentId)) {
+    if (preferredAgentId !== '' && !visibleTargets.find(target => target.id === preferredAgentId)) {
       setPreferredAgentId('');
     }
-  }, [project, visibleDevs, preferredAgentId, isEdit]);
+  }, [project, visibleTargets, preferredAgentId, isEdit]);
 
   useEffect(() => {
     if (isEdit) return;
     if (!project) return;
-    if (visibleDevs.length === 0) return;
+    const firstDev = visibleTargets.find(agent => agent.role === 'dev');
+    if (!firstDev) return;
     if (devDefaultSettledRef.current.has(project.id)) return;
     devDefaultSettledRef.current.add(project.id);
-    setPreferredAgentId(prev => (prev === '' ? visibleDevs[0].id : prev));
-  }, [isEdit, project, visibleDevs]);
+    setPreferredAgentId(prev => (prev === '' ? firstDev.id : prev));
+  }, [isEdit, project, visibleTargets]);
 
-  const editPreferredVisible = !isEdit || visibleDevs.find(d => d.id === preferredAgentId);
+  const editPreferredVisible = !isEdit || visibleTargets.find(target => target.id === preferredAgentId);
   const editPreferredPending = isEdit && !editPreferredVisible && !!preferredAgentId;
   const editPreferredInPendingRestart = editPreferredPending
-    && pendingRestartDevs.some(d => d.id === preferredAgentId);
+    && pendingRestartTargets.some(target => target.id === preferredAgentId);
 
   const noDevHint = (() => {
     if (editPreferredInPendingRestart) {
@@ -225,8 +226,8 @@ export function CreateTaskModal(props: Props) {
       return t.createTask.noDevNotInRuntimeHint(preferredAgentId);
     }
     if (!selectedProjectId) return null;
-    if (visibleDevs.length > 0) return null;
-    if (pendingRestartDevs.length > 0) return t.createTask.noDevGlobalPendingRestartHint;
+    if (visibleTargets.length > 0) return null;
+    if (pendingRestartTargets.length > 0) return t.createTask.noDevGlobalPendingRestartHint;
     return null;
   })();
 
@@ -377,7 +378,7 @@ export function CreateTaskModal(props: Props) {
         )}
 
         <div>
-          <label className={labelCls} htmlFor="task-dev">Dev agent</label>
+          <label className={labelCls} htmlFor="task-dev">{t.createTask.targetAgentLabel}</label>
           <select
             id="task-dev"
             value={preferredAgentId}
@@ -391,8 +392,10 @@ export function CreateTaskModal(props: Props) {
                 {preferredAgentId} {editPreferredInPendingRestart ? t.createTask.pendingRestartSuffix : t.createTask.notInRuntimeSuffix}
               </option>
             )}
-            {visibleDevs.map(d => (
-              <option key={d.id} value={d.id}>{d.id}</option>
+            {visibleTargets.map(target => (
+              <option key={target.id} value={target.id}>
+                {target.role === 'research' ? t.createTask.researchTargetOption(target.id) : target.id}
+              </option>
             ))}
           </select>
           {noDevHint && <div className="mt-1 text-xs text-accent">{noDevHint}</div>}

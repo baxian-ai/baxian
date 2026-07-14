@@ -275,7 +275,7 @@ export const api = {
     review: (id: string) => post<TaskState>(`/tasks/${enc(id)}/review`),
     complete: (id: string) => post<TaskState>(`/tasks/${enc(id)}/complete`),
     continue: (id: string) => post<TaskState>(`/tasks/${enc(id)}/continue`),
-    spec: (id: string, body: { verdict: 'approve' | 'request-changes'; comments?: string }) =>
+    spec: (id: string, body: { verdict: 'approve' | 'request-changes' | 'archive'; comments?: string }) =>
       post<TaskState>(`/tasks/${enc(id)}/spec`, body),
     code: (id: string, body: { verdict: 'request-changes'; comments: string }) =>
       post<TaskState>(`/tasks/${enc(id)}/code`, body),

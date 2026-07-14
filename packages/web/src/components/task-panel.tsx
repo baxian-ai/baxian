@@ -3,7 +3,13 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api.ts';
 import { TaskStatusDot, shortTaskId, taskDetailPath } from './task-status.tsx';
 import { useT } from '../i18n/index.tsx';
-import { TASK_ACTIVE_STATUS_SET, REVIEW_VERDICT_TIMEOUT_MS, TASK_LIST_PAGE_SIZE, type TaskState } from '../shared/index.js';
+import {
+  TASK_ACTIVE_STATUS_SET,
+  REVIEW_VERDICT_TIMEOUT_MS,
+  TASK_LIST_PAGE_SIZE,
+  isSpecStagePhase,
+  type TaskState,
+} from '../shared/index.js';
 
 interface TaskPanelProps {
   projectId: string;
@@ -241,7 +247,7 @@ function useVerdictOverdue(task: TaskState): boolean {
 function TaskRow({ task }: { task: TaskState }) {
   const t = useT();
   const navigate = useNavigate();
-  const round = task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+  const round = isSpecStagePhase(task.phase) ? (task.specReviewRound ?? 0) : task.reviewRound;
   const overdue = useVerdictOverdue(task);
   return (
     <button
@@ -251,7 +257,7 @@ function TaskRow({ task }: { task: TaskState }) {
     >
       <span className="shrink-0 font-mono text-xs text-og-500" title={task.id}>{shortTaskId(task.id)}</span>
       <span className="min-w-0 flex-1 truncate text-og-1000" title={task.title}>{task.title}</span>
-      {task.phase === 'spec' && <span className="pill pill-review shrink-0">spec</span>}
+      {isSpecStagePhase(task.phase) && <span className="pill pill-review shrink-0">{task.phase}</span>}
       {overdue && <span className="pill pill-warn shrink-0" title="Review verdict missing">!</span>}
       <span aria-label={t.agents.round(round)} className="shrink-0 text-xs text-og-400">R{round}</span>
       <TaskStatusDot status={task.status} />

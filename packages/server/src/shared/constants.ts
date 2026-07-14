@@ -51,12 +51,14 @@ export const MAX_READ_FILE_BYTES = 50 * 1024;
 export const REVIEW_EXCHANGE_DIR = '.baxian/review';
 export const REVIEW_INBOX_DIR = '.baxian/review/inbox';
 export const SPEC_DOC_RELPATH = '.baxian/spec.md';
+export const RESEARCH_DOCS_DIR = '.baxian/research';
 
 export const USER_CONFIG_REL = '.baxian/config.json';
 export const USER_STATE_REL = '.baxian';
 
 export type DispatchPhase =
   | 'develop'
+  | 'research'
   | 'code'
   | 'fix'
   | 'post-approve'
@@ -87,10 +89,15 @@ export const AGENT_PHASES: Record<AgentRole, Record<string, { skills: string[] }
     'server-recheck': { skills: ['baxian-server-review'] },
     'server-spec-review': { skills: ['baxian-server-review'] },
   },
+  research: {
+    research: { skills: ['baxian-research'] },
+    'server-feedback': { skills: ['baxian-server-feedback'] },
+  },
 };
 
 export const PHASE_EXPECTED_STATUS: Record<string, TaskStatus[]> = {
   develop: ['in_progress'],
+  research: ['in_progress'],
   review: ['review'],
   recheck: ['review'],
   fix: ['fixing'],
@@ -106,6 +113,7 @@ export const PHASE_EXPECTED_STATUS: Record<string, TaskStatus[]> = {
 
 export const PHASE_REQUIRES_AGENT_BOUND_TO_TASK: Record<string, boolean> = {
   develop: true,
+  research: true,
   fix: true,
   'post-approve': true,
   review: false,
@@ -118,6 +126,8 @@ export const PHASE_REQUIRES_AGENT_BOUND_TO_TASK: Record<string, boolean> = {
   'server-feedback': true,
   'server-after-done': true,
 };
+
+export const TASK_OWNER_ROLES: ReadonlySet<AgentRole> = new Set(['dev', 'research']);
 
 export const TASK_TERMINAL_STATUSES: readonly TaskStatus[] = [
   'merged',

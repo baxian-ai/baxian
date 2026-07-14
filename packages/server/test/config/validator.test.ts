@@ -97,18 +97,38 @@ describe('validateConfig', () => {
     expect(errors.some(e => e.message.includes('Duplicate'))).toBe(true);
   });
 
+  it('accepts a three-role group in any order', () => {
+    const config = withProject(devProject({ agent: [[
+      makeAgent({ id: 'q1', role: 'qa' }),
+      makeAgent({ id: 'r1', role: 'research' }),
+      makeAgent({ id: 'd1', role: 'dev' }),
+    ]] }));
+    expect(validateConfig(config)).toEqual([]);
+  });
+
   it.each<[string, AgentConfig[][], string]>([
-    ['detects first agent in pair not being dev', [[makeAgent({ id: 'q1', role: 'qa' })]], 'first'],
-    ['detects second agent in pair not being qa', [[
+    ['detects a group without dev', [[makeAgent({ id: 'q1', role: 'qa' })]], 'exactly one dev'],
+    ['detects multiple dev agents', [[
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'd2', role: 'dev' }),
-    ]], 'second'],
-    ['detects more than 2 agents in a pair', [[
+    ]], 'exactly one dev'],
+    ['detects more than 3 agents in a group', [[
+      makeAgent({ id: 'd1', role: 'dev' }),
+      makeAgent({ id: 'q1', role: 'qa' }),
+      makeAgent({ id: 'r1', role: 'research' }),
+      makeAgent({ id: 'q2', role: 'qa' }),
+    ]], 'at most 3'],
+    ['detects duplicate qa agents', [[
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'q1', role: 'qa' }),
       makeAgent({ id: 'q2', role: 'qa' }),
-    ]], 'at most 2'],
-    ['detects empty agent pair', [[]], 'empty'],
+    ]], 'at most one qa'],
+    ['detects duplicate research agents', [[
+      makeAgent({ id: 'd1', role: 'dev' }),
+      makeAgent({ id: 'r1', role: 'research' }),
+      makeAgent({ id: 'r2', role: 'research' }),
+    ]], 'at most one research'],
+    ['detects empty agent group', [[]], 'empty'],
   ])('%s', (_label, agent, messagePart) => {
     const config = withProject(devProject({ agent }));
     expect(validateConfig(config).some(e => e.message.includes(messagePart))).toBe(true);

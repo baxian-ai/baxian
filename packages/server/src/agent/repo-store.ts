@@ -22,6 +22,7 @@ const BAXIAN_RUNTIME_DIRS = [
   '.baxian/review',
   '.baxian/review/inbox',
   '.baxian/review-inbox',
+  '.baxian/research',
 ] as const;
 
 export async function ensureBaxianRuntimeDirsSafe(

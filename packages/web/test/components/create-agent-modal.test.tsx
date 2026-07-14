@@ -202,6 +202,31 @@ it('submits a QA agent paired with an unpaired dev, with trimmed advanced option
   });
 });
 
+it('submits a Research agent independently when the dev already has QA', async () => {
+  const dev: AgentConfig = { id: 'dev-a', runtime: 'claude-code', role: 'dev', mode: 'local' };
+  const qa: AgentConfig = { id: 'qa-a', runtime: 'codex', role: 'qa', mode: 'local' };
+  await renderReady(cfgWithAgents([[dev, qa]]));
+
+  fireEvent.change(screen.getByLabelText('Agent ID'), { target: { value: 'research-a' } });
+  fireEvent.click(screen.getByRole('radio', { name: 'Research agent' }));
+  fireEvent.change(await screen.findByLabelText('Paired Dev agent'), { target: { value: 'dev-a' } });
+  fireEvent.click(screen.getByRole('radio', { name: /Claude Code/ }));
+  await waitFor(() => expect(submitButton().disabled).toBe(false));
+
+  await act(async () => {
+    fireEvent.click(submitButton());
+  });
+
+  expect(addAgentMock).toHaveBeenCalledWith('baxian', {
+    id: 'research-a',
+    role: 'research',
+    runtime: 'claude-code',
+    mode: 'local',
+    yolo: true,
+    pairWith: 'dev-a',
+  });
+});
+
 it('keeps the QA radio disabled when the project has no unpaired dev', async () => {
   await renderReady();
   expect((screen.getByRole('radio', { name: 'QA agent' }) as HTMLInputElement).disabled).toBe(true);
@@ -338,6 +363,9 @@ it('prefills the Agent ID placeholder as <project>-<role> and tracks role switch
 
   fireEvent.click(screen.getByRole('radio', { name: 'QA agent' }));
   expect(input.placeholder).toBe('baxian-qa');
+
+  fireEvent.click(screen.getByRole('radio', { name: 'Research agent' }));
+  expect(input.placeholder).toBe('baxian-research');
 
   fireEvent.click(screen.getByRole('radio', { name: 'Dev agent' }));
   expect(input.placeholder).toBe('baxian-dev');

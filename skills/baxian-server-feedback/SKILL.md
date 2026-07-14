@@ -1,10 +1,10 @@
 ---
 name: baxian-server-feedback
-description: Dev responds to QA's server-review findings (response.json) and publishes the reviewed branch (server-after-done). Covers code findings, spec findings, and publish.
+description: The task owner responds to QA's server-review findings (response.json); Dev also publishes reviewed code in server-after-done.
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields. `workdir:` is your fixed current directory with the task branch already checked out; do not change directories or branches. Route on `phase:`: follow §Feedback for `server-feedback`, §Publish for `server-after-done`.
+baxian dispatches you with a block of `key: value` dispatch fields. `workdir:` is your fixed current directory; do not change directories or branches. A Dev receives code feedback on its task branch. A Research agent receives only spec feedback on a detached default-branch checkout. Route on `phase:`: follow §Feedback for `server-feedback`, §Publish for `server-after-done`.
 
 ## Feedback
 
@@ -13,7 +13,7 @@ QA's findings ride in the `findings:` block, or in a `findings-file:` referenced
 Do NOT push to any remote and do NOT open a PR in this phase — baxian reads your Workdir directly; publishing is deferred to the `server-after-done` phase.
 
 For each finding:
-- `fix` — for `feedback: code`, change the code (or spec), commit, include the `commitSha` in your response item; for `feedback: spec`, revise `.baxian/spec.md` in place. Do NOT commit or push it — baxian reads the file directly.
+- `fix` — for `feedback: code`, change the code, commit, and include the `commitSha` in your response item; for `feedback: spec`, revise `.baxian/spec.md` and any affected `.baxian/research/*.md` in place. Do NOT commit or push spec documents — baxian reads them directly.
 - `reject` — concrete rationale why the finding is wrong or not applicable. Never reject just to save effort.
 - `out-of-scope` — rationale plus where it is tracked (issue link or task note).
 

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { normalize } from 'node:path';
 import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig } from '../shared/index.js';
 import { autoBootstrapAgentIds } from '../agent/bootstrap.js';
 import {
@@ -20,6 +21,20 @@ function agentHostRefs(projects: ProjectConfig[] | undefined): Map<string, strin
     for (const pair of project?.agent ?? []) {
       for (const agent of pair ?? []) {
         if (agent && typeof agent.id === 'string') refs.set(agent.id, hostRefKey(agent.host));
+      }
+    }
+  }
+  return refs;
+}
+
+function agentWorkdirRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
+  const refs = new Map<string, string>();
+  for (const project of projects ?? []) {
+    for (const pair of project?.agent ?? []) {
+      for (const agent of pair ?? []) {
+        if (agent && typeof agent.id === 'string') {
+          refs.set(agent.id, agent.workdir === undefined ? '' : normalize(agent.workdir));
+        }
       }
     }
   }
@@ -142,17 +157,35 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (incoming.project !== undefined) {
-        const currentRefs = agentHostRefs(current.project);
-        const blocked: string[] = [];
-        for (const [agentId, ref] of agentHostRefs(validated.project)) {
-          const prev = currentRefs.get(agentId);
-          if (prev !== undefined && prev !== ref && await agentIsLive(app.ctx, agentId)) {
-            blocked.push(agentId);
+        const currentHosts = agentHostRefs(current.project);
+        const currentWorkdirs = agentWorkdirRefs(current.project);
+        const nextHosts = agentHostRefs(validated.project);
+        const nextWorkdirs = agentWorkdirRefs(validated.project);
+        const blockedHosts: string[] = [];
+        const blockedWorkdirs: string[] = [];
+        const blockedRemovals: string[] = [];
+        for (const [agentId, nextHost] of nextHosts) {
+          if (!currentHosts.has(agentId)) continue;
+          const hostChanged = currentHosts.get(agentId) !== nextHost;
+          const workdirChanged = currentWorkdirs.get(agentId) !== nextWorkdirs.get(agentId);
+          if (!hostChanged && !workdirChanged) continue;
+          if (!await agentIsLive(app.ctx, agentId)) continue;
+          if (hostChanged) blockedHosts.push(agentId);
+          if (workdirChanged) blockedWorkdirs.push(agentId);
+        }
+        for (const agentId of currentHosts.keys()) {
+          if (!nextHosts.has(agentId) && await agentIsLive(app.ctx, agentId)) {
+            blockedRemovals.push(agentId);
           }
         }
-        if (blocked.length > 0) {
+        if (blockedHosts.length > 0 || blockedWorkdirs.length > 0 || blockedRemovals.length > 0) {
+          const changes = [
+            ...(blockedHosts.length > 0 ? [`host of ${blockedHosts.join(', ')}`] : []),
+            ...(blockedWorkdirs.length > 0 ? [`Workdir of ${blockedWorkdirs.join(', ')}`] : []),
+            ...(blockedRemovals.length > 0 ? [`configuration entry for ${blockedRemovals.join(', ')}`] : []),
+          ].join(' or ');
           return reply.status(409).send({
-            error: `cannot change the host of live agent(s) ${blocked.join(', ')}; stop their sessions first`,
+            error: `cannot change the ${changes} while the agent is live; stop its session first`,
           });
         }
       }

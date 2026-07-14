@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSignalToken, type ReadFileSignal } from './phase-signal.js';
 import { tmuxInstallHint } from './preflight.js';
@@ -13,7 +13,9 @@ import type {
   ProjectConfig,
   ReviewFindings,
   ReviewMode,
+  ReviewPhase,
   ReviewRound,
+  SpecDocument,
   TaskPhase,
   TaskState,
   TaskStatus,
@@ -25,6 +27,8 @@ import {
   PHASE_REQUIRES_AGENT_BOUND_TO_TASK,
   TASK_TERMINAL_STATUSES as TERMINAL_STATUSES,
   TASK_ACTIVE_STATUS_SET as ACTIVE_TASK_STATUSES,
+  TASK_OWNER_ROLES,
+  isSpecStagePhase,
   isGitHubRepo,
   parseGitRemote,
   repoSlug,
@@ -38,7 +42,14 @@ import type { EventBus } from '../event/bus.js';
 import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-store.js';
 import { SkillRegistry } from '../skill/registry.js';
 import type { CommandRunner } from './runner.js';
-import { createRunner, LocalRunner, shellQuote, resolveAgentHost, hostGroupKey } from './runner.js';
+import {
+  createRunner,
+  LocalRunner,
+  shellQuote,
+  resolveAgentHost,
+  hostGroupKey,
+  workdirHostGroupKey,
+} from './runner.js';
 import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
 import { findForeignTaskTip, type LineageViolation } from './lineage.js';
 import { imageFilename, agentHostPath, writeImageToHost } from './image-input.js';
@@ -182,6 +193,11 @@ const REPL_EXIT_COMMAND: Record<AgentConfig['runtime'], string> = {
 
 const WORKDIR_SESSION_OPTION = '@baxian-workdir';
 
+type ReleaseRuntime =
+  | { kind: 'absent' }
+  | { kind: 'pane'; paneId: string }
+  | { kind: 'hold'; reason: string };
+
 function normalizedDir(left: string | null | undefined): string | null {
   if (!left) return null;
   return left.replace(/\/+$/, '') || '/';
@@ -266,9 +282,8 @@ export interface TransitionResult {
   previousStatus: TaskStatus;
 }
 
-export interface ContinueSessionOpts {
+interface SessionDispatchOpts {
   signalToken?: string;
-  postApproveRedispatchCount?: number;
   currentSpecRound?: number;
   bypassTaskStatusGate?: boolean;
   dialogFailFromStatuses?: TaskStatus[];
@@ -281,8 +296,18 @@ export interface ContinueSessionOpts {
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorResponse?: string;
-  serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
+  specDocuments?: readonly SpecDocument[];
   armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean>;
+}
+
+interface StartSessionOpts extends SessionDispatchOpts {
+  preserveBindingOnFailure?: boolean;
+}
+
+export interface ContinueSessionOpts extends SessionDispatchOpts {
+  postApproveRedispatchCount?: number;
+  serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
+  preserveDispatchOutputs?: boolean;
 }
 
 export interface DispatchArmContext {
@@ -312,7 +337,7 @@ export interface ServerReviewDriver {
 
 const MANUAL_SERVER_REVIEW_STATUSES: readonly TaskStatus[] = ['in_progress', 'review', 'fixing'];
 
-const IMAGE_DISPATCH_PHASES = new Set<string>(['develop', 'code', 'fix', 'server-feedback']);
+const IMAGE_DISPATCH_PHASES = new Set<string>(['develop', 'research', 'code', 'fix', 'server-feedback']);
 
 const RUNTIME_LIVENESS_SAMPLES = 3;
 
@@ -461,6 +486,25 @@ export class AgentManager {
     }
   }
 
+  private async assertTaskGeneration(
+    agentId: string,
+    taskId: string,
+    lockToken: string,
+    workdir: string,
+  ): Promise<AgentBindingFacts> {
+    const state = await this.agentStore.get(agentId);
+    if (
+      !state
+      || state.taskId !== taskId
+      || state.lockToken !== lockToken
+      || state.workdir !== workdir
+    ) {
+      throw new Error(`Agent ${agentId} task generation changed for ${taskId}; operation aborted`);
+    }
+    await this.assertTaskLockOwner(agentId, taskId, lockToken);
+    return state;
+  }
+
   getReviewStore(): ReviewStore | undefined {
     return this.reviewStore;
   }
@@ -494,6 +538,23 @@ export class AgentManager {
       resolveWorkdir: (agentId) => this.bindingWorkdirCache.get(agentId),
     });
     return this.reviewTransportInstance;
+  }
+
+  private async prepareDispatchArtifacts(
+    agent: AgentConfig,
+    workdir: string,
+    phase: string,
+    opts: {
+      specDocuments: readonly SpecDocument[] | undefined;
+      preserveOutputs: boolean;
+      assertOwner: () => Promise<void>;
+    },
+  ): Promise<void> {
+    const transport = this.getReviewTransport();
+    if (!opts.preserveOutputs) await transport.clearDispatchOutputs(agent, workdir, phase);
+    if (opts.specDocuments) {
+      await transport.replaceSpecDocuments(agent, workdir, opts.specDocuments, opts.assertOwner);
+    }
   }
 
   private bindingWorkdirCache = new Map<string, string>();
@@ -548,9 +609,28 @@ export class AgentManager {
 
   replaceConfig(validated: BaxianConfig): void {
     const config = prepareConfig(validated);
+    const previousConfig = this.config;
+    const previousIndex = this.agentIndex;
+    const nextIndex = buildAgentIndex(config);
+    for (const [ownerKey, agentId] of this.repoCache.owners) {
+      const previous = previousIndex.get(agentId);
+      const next = nextIndex.get(agentId);
+      const previousHost = previous
+        ? resolveAgentHost(previousConfig.host, previous.host)
+        : undefined;
+      const nextHost = next ? resolveAgentHost(config.host, next.host) : undefined;
+      const previousOwnerConfig = previous
+        ? `${workdirHostGroupKey(previous.mode, previousHost)}\0${previous.workdir ? normalize(previous.workdir) : ''}`
+        : null;
+      const nextOwnerConfig = next
+        ? `${workdirHostGroupKey(next.mode, nextHost)}\0${next.workdir ? normalize(next.workdir) : ''}`
+        : null;
+      if (previousOwnerConfig === null || previousOwnerConfig !== nextOwnerConfig) {
+        this.repoCache.owners.delete(ownerKey);
+      }
+    }
     this.config = config;
-    this.agentIndex = buildAgentIndex(config);
-    this.repoCache.owners.clear();
+    this.agentIndex = nextIndex;
   }
 
   getConfig(): BaxianConfig {
@@ -1640,6 +1720,7 @@ export class AgentManager {
       projectId: cfg.projectId,
       taskId,
       lockToken: token,
+      ...(phase === 'code' && !sameTaskReentry ? { bootstrappingTaskId: taskId } : {}),
       updatedAt: now,
     }));
     return true;
@@ -1719,10 +1800,21 @@ export class AgentManager {
         return true;
       }
 
+      let sessionConfirmedAbsent = false;
       if (state.workdir) {
+        const releaseWorkdir = state.workdir;
         const runner = this.createRunnerFor(cfg);
         const tmux = new TmuxManager(runner);
         const hold = async (reason: string): Promise<boolean> => {
+          const latest = await this.agentStore.get(agentId);
+          if (
+            !latest
+            || latest.taskId !== expectedTaskId
+            || latest.lockToken !== lockToken
+            || !await this.lockManager.isOwner(agentId, expectedTaskId, lockToken)
+          ) {
+            return false;
+          }
           const pendingAt = new Date().toISOString();
           if (boundTask && cfg.role === 'dev') {
             boundTask.branchCleanupPending = { agentId, reason, updatedAt: pendingAt };
@@ -1749,37 +1841,55 @@ export class AgentManager {
           return false;
         };
         try {
-          await this.assertTaskLockOwner(agentId, expectedTaskId, lockToken);
-          const paneId = await this.resolvePaneId(state, cfg);
-          if (paneId) {
+          await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
+          const runtime = await this.inspectReleaseRuntime(tmux, agentId);
+          if (runtime.kind === 'hold') return hold(runtime.reason);
+          await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
+          if (runtime.kind === 'pane') {
+            if (state.paneId !== runtime.paneId) {
+              await this.agentStore.update(agentId, (latest) => {
+                if (
+                  !latest
+                  || latest.taskId !== expectedTaskId
+                  || latest.lockToken !== lockToken
+                  || latest.workdir !== releaseWorkdir
+                ) {
+                  return AGENT_STORE_NOOP;
+                }
+                return { ...latest, paneId: runtime.paneId, updatedAt: new Date().toISOString() };
+              });
+              const refreshed = await this.assertTaskGeneration(
+                agentId,
+                expectedTaskId,
+                lockToken,
+                releaseWorkdir,
+              );
+              if (refreshed.paneId !== runtime.paneId) {
+                throw new Error(`Agent ${agentId} runtime pane changed during release; operation aborted`);
+              }
+            }
             await this.waitForReplPromptReady(
               tmux,
-              paneId,
+              runtime.paneId,
               agentRuntimeKindFor(cfg),
               this.cleanComposerWaitMs,
             );
           } else {
-            let sessionAlive: boolean;
-            try {
-              sessionAlive = await tmux.hasSession(agentId);
-            } catch (err) {
-              return hold(
-                `Runtime availability probe failed; refusing checkout cleanup: ` +
-                `${err instanceof Error ? err.message : String(err)}`,
-              );
-            }
-            if (sessionAlive) {
-              return hold('Runtime session still exists but its pane is unavailable; refusing checkout cleanup');
-            }
+            sessionConfirmedAbsent = true;
           }
-          await this.assertTaskLockOwner(agentId, expectedTaskId, lockToken);
+          await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
           if (cfg.role === 'dev' && boundTask) {
             const branches = new BranchManager(runner);
-            const cleanup = await branches.cleanupTaskBranch(state.workdir, {
+            const cleanup = await branches.cleanupTaskBranch(releaseWorkdir, {
               taskId: boundTask.id,
               taskBranch: boundTask.branch,
               branchCreatedByBaxian: boundTask.branchCreatedByBaxian,
-            }, () => this.assertTaskLockOwner(agentId, expectedTaskId, lockToken));
+            }, () => this.assertTaskGeneration(
+              agentId,
+              expectedTaskId,
+              lockToken,
+              releaseWorkdir,
+            ).then(() => undefined));
             let cleanupStateChanged = false;
             if (cleanup.status === 'pending') {
               if (
@@ -1823,10 +1933,11 @@ export class AgentManager {
               boundTask.updatedAt = new Date().toISOString();
               await this.taskStore.set(boundTask);
             }
-            if (cleanup.status !== 'deleted') await branches.parkOnDefaultDetached(state.workdir);
+            if (cleanup.status !== 'deleted') await branches.parkOnDefaultDetached(releaseWorkdir);
           } else {
-            await new BranchManager(runner).parkOnDefaultDetached(state.workdir);
+            await new BranchManager(runner).parkOnDefaultDetached(releaseWorkdir);
           }
+          await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
         } catch (err) {
           const reason = err instanceof DirtyWorkdirError
             ? err.message
@@ -1834,21 +1945,45 @@ export class AgentManager {
           return hold(reason);
         }
       }
-      await this.assertTaskLockOwner(agentId, expectedTaskId, lockToken);
+      if (state.workdir) {
+        await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, state.workdir);
+      } else {
+        await this.assertTaskLockOwner(agentId, expectedTaskId, lockToken);
+      }
       await this.agentStore.update(agentId, (existing) => {
         if (!existing) return AGENT_STORE_NOOP;
-        if (existing.taskId !== expectedTaskId) return AGENT_STORE_NOOP;
+        if (
+          existing.taskId !== expectedTaskId
+          || existing.lockToken !== lockToken
+          || (state.workdir !== undefined && existing.workdir !== state.workdir)
+        ) {
+          return AGENT_STORE_NOOP;
+        }
         return {
           id: existing.id,
           projectId: existing.projectId,
           ...(existing.workdir !== undefined ? { workdir: existing.workdir } : {}),
-          ...(existing.paneId !== undefined ? { paneId: existing.paneId } : {}),
+          ...(!sessionConfirmedAbsent && existing.paneId !== undefined ? { paneId: existing.paneId } : {}),
           ...(existing.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
           updatedAt: now,
         };
       });
       return this.lockManager.releaseIfOwner(agentId, expectedTaskId, lockToken);
     });
+  }
+
+  private async releaseAgentIfBound(
+    agentId: string,
+    expectedTaskId: string,
+    opts?: { allowAwaitingHuman?: boolean },
+  ): Promise<boolean> {
+    const state = await this.agentStore.get(agentId);
+    if (state?.taskId !== expectedTaskId) return true;
+    const released = opts
+      ? await this.releaseAgentForTask(agentId, expectedTaskId, 'idle', opts)
+      : await this.releaseAgentForTask(agentId, expectedTaskId, 'idle');
+    if (released) return true;
+    return (await this.agentStore.get(agentId))?.taskId !== expectedTaskId;
   }
 
   async reconcileTaskBranches(): Promise<void> {
@@ -2295,23 +2430,47 @@ export class AgentManager {
     }
     if (result.redispatchCodeTaskId) {
       try {
-        const resumed = await this.continueSession(result.redispatchCodeTaskId, agentId, 'code');
-        if (!resumed) {
+        const task = await this.taskStore.get(result.redispatchCodeTaskId);
+        const round = task?.specReviewRound;
+        const stored = round === undefined
+          ? null
+          : await this.reviewStore?.getRound(result.redispatchCodeTaskId, 'spec', round);
+        if (!task || task.phase !== 'code' || !task.signalToken || !stored || stored.phase !== 'spec') {
           await this.markAwaitingHuman(
             agentId,
             'code-dispatch-failed',
-            'Code-phase redispatch on Resume was not delivered; Resume again to retry or cancel the task.',
+            'Code-phase redispatch cannot continue because the persisted Spec handoff is missing or invalid. Restore the review record or cancel the task.',
             { expectedTaskId: result.redispatchCodeTaskId },
           ).catch(() => undefined);
+          return { resumed: false, releasedBinding: false, reason: 'Persisted Spec handoff is missing or invalid.' };
+        }
+        const resumed = await this.dispatchCodePhasePrompt(
+          task,
+          agentId,
+          task.signalToken,
+          stored.documents,
+          round,
+        );
+        if (!resumed) {
+          const reason = 'Code-phase redispatch on Resume was not delivered; Resume again to retry or cancel the task.';
+          await this.markAwaitingHuman(
+            agentId,
+            'code-dispatch-failed',
+            reason,
+            { expectedTaskId: result.redispatchCodeTaskId },
+          ).catch(() => undefined);
+          return { resumed: false, releasedBinding: false, reason };
         }
       } catch (err) {
         console.error(`[AgentManager] resumeAgent code redispatch failed for ${agentId}:`, err);
+        const reason = `Code-phase redispatch on Resume failed: ${err instanceof Error ? err.message : String(err)}`;
         await this.markAwaitingHuman(
           agentId,
           'code-dispatch-failed',
-          'Code-phase redispatch on Resume failed; Resume again to retry or cancel the task.',
+          reason,
           { expectedTaskId: result.redispatchCodeTaskId },
         ).catch(() => undefined);
+        return { resumed: false, releasedBinding: false, reason };
       }
     }
     return {
@@ -2331,6 +2490,54 @@ export class AgentManager {
     } catch (err) {
       console.warn(`[AgentManager] resolvePaneId: getSinglePaneId failed for ${cfg.id}:`, err);
       return null;
+    }
+  }
+
+  private async inspectReleaseRuntime(
+    tmux: TmuxManager,
+    agentId: string,
+  ): Promise<ReleaseRuntime> {
+    let sessionAlive: boolean;
+    try {
+      sessionAlive = await tmux.hasSession(agentId);
+    } catch (err) {
+      return {
+        kind: 'hold',
+        reason:
+          `Runtime availability probe failed; refusing checkout cleanup: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (!sessionAlive) return { kind: 'absent' };
+
+    let claim: string | null;
+    try {
+      claim = await tmux.getOption(agentId, '@baxian-agent-id');
+    } catch (err) {
+      return {
+        kind: 'hold',
+        reason:
+          `Runtime session claim probe failed; refusing checkout cleanup: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (claim !== agentId) {
+      return {
+        kind: 'hold',
+        reason:
+          `Runtime session claim mismatch (got "${claim ?? 'null'}"); refusing checkout cleanup`,
+      };
+    }
+
+    try {
+      return { kind: 'pane', paneId: await tmux.getSinglePaneId(agentId) };
+    } catch (err) {
+      return {
+        kind: 'hold',
+        reason:
+          `Runtime pane probe failed; refusing checkout cleanup: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      };
     }
   }
 
@@ -2676,20 +2883,54 @@ export class AgentManager {
     });
   }
 
+  async redispatchResearchAfterReplRestart(agentId: string, taskId: string): Promise<boolean> {
+    const agent = this.getAgentConfig(agentId);
+    const task = await this.taskStore.get(taskId);
+    if (!agent || agent.role !== 'research' || !task) return false;
+    if (task.researchAgentId !== agentId || task.agentId !== agentId || !task.signalToken) return false;
+
+    let phase: 'research' | 'server-feedback';
+    let expectedKind: PhaseSignalKind;
+    let findings: string | undefined;
+    if (task.phase === 'research' && task.status === 'in_progress') {
+      phase = 'research';
+      expectedKind = 'spec-done';
+    } else if (task.phase === 'spec' && task.status === 'fixing') {
+      const round = task.specReviewRound ?? 1;
+      const stored = await this.reviewStore?.getRound(taskId, 'spec', round);
+      if (!stored?.findings) return false;
+      phase = 'server-feedback';
+      expectedKind = 'spec-fixed';
+      findings = JSON.stringify(stored.findings);
+    } else {
+      return false;
+    }
+
+    await this.clearAwaitingHuman(agentId);
+    return this.continueSession(taskId, agentId, phase, {
+      bypassTaskStatusGate: true,
+      signalToken: task.signalToken,
+      preserveDispatchOutputs: true,
+      ...(findings ? { serverPriorFindings: findings } : {}),
+      ...(task.specReviewRound !== undefined ? { currentSpecRound: task.specReviewRound } : {}),
+      armBeforeInject: () => this.setupPhaseSignalWatcher(
+        taskId,
+        agentId,
+        expectedKind,
+        task.signalToken!,
+      ),
+    });
+  }
+
   prepareRemoveTargets(agentId: string): { targets: string[] } {
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new Error(`Unknown agent: ${agentId}`);
     const project = this.getProjectConfig(cfg.projectId);
     if (!project) throw new Error(`Unknown project: ${cfg.projectId}`);
 
-    if (cfg.role === 'qa') return { targets: [agentId] };
-    for (const pair of project.agent) {
-      if (pair[0]?.id === agentId) {
-        const qa = pair[1];
-        return { targets: qa ? [agentId, qa.id] : [agentId] };
-      }
-    }
-    return { targets: [agentId] };
+    if (cfg.role !== 'dev') return { targets: [agentId] };
+    const group = this.findAgentGroup(agentId);
+    return { targets: group?.map(agent => agent.id) ?? [agentId] };
   }
 
   async cleanupRemovedAgentRuntime(targets: string[]): Promise<void> {
@@ -2784,6 +3025,11 @@ export class AgentManager {
     }
     const workdirGuess = workdirForEstimate ?? '/'.padEnd(64, 'x');
     const now = new Date().toISOString();
+    const isResearch = cfg.role === 'research';
+    const group = this.findAgentGroup(cfg.id);
+    const devAgentId = isResearch ? group?.find(agent => agent.role === 'dev')?.id : cfg.id;
+    if (!devAgentId) throw new Error(`Agent ${cfg.id} has no dev agent in its group`);
+    const qaAgentId = group?.find(agent => agent.role === 'qa')?.id;
     const fakeTask: TaskState = {
       id: 'task-9999999999',
       projectId,
@@ -2791,6 +3037,9 @@ export class AgentManager {
       description: input.description,
       preferredAgentId: input.preferredAgentId,
       agentId: cfg.id,
+      devAgentId,
+      ...(qaAgentId ? { qaAgentId } : {}),
+      ...(isResearch ? { researchAgentId: cfg.id, phase: 'research' as const } : {}),
       branch: `${BRANCH_PREFIX}task-9999999999`,
       reviewRound: 0,
       status: 'in_progress',
@@ -2799,11 +3048,12 @@ export class AgentManager {
     };
     const fullPrompt = buildPromptInline({
       task: fakeTask,
-      phase: 'develop',
+      phase: isResearch ? 'research' : 'develop',
       agent: cfg,
       workdir: workdirGuess,
       skillRegistry: this.skillRegistry,
       signalToken: 'preview-signal-token',
+      hasQaPartner: qaAgentId !== undefined,
     });
     return Buffer.byteLength(fullPrompt, 'utf8');
   }
@@ -2820,12 +3070,10 @@ export class AgentManager {
     return this.config.project.find(p => repoSlug(p.repo) === repo);
   }
 
-  findQaPartner(devAgentId: string): AgentConfig | undefined {
+  private findAgentGroup(anchorAgentId: string): AgentConfig[] | undefined {
     for (const project of this.config.project) {
-      for (const pair of project.agent) {
-        if (pair[0]?.id === devAgentId) {
-          return pair[1];
-        }
+      for (const group of project.agent) {
+        if (group.some(agent => agent.id === anchorAgentId)) return group;
       }
     }
     return undefined;
@@ -2933,18 +3181,19 @@ export class AgentManager {
       const mapped = this.mapTaskStateToExpectedWatcher(task);
       if (!mapped) continue;
       const { expectedKinds, agentId } = mapped;
+      const specStage = isSpecStagePhase(task.phase);
       const interventionKindLabel: string | undefined =
-        task.phase === 'spec' && task.status === 'review' ? 'spec-reviewed'
-        : task.phase === 'spec' && task.status === 'fixing' ? 'spec-fixed'
-        : task.phase !== 'spec' && task.status === 'review' ? 'pr-approved|pr-changes-requested'
-        : task.phase !== 'spec' && task.status === 'fixing' ? 'pr-fixed'
+        specStage && task.status === 'review' ? 'spec-reviewed'
+        : specStage && task.status === 'fixing' ? 'spec-fixed'
+        : !specStage && task.status === 'review' ? 'pr-approved|pr-changes-requested'
+        : !specStage && task.status === 'fixing' ? 'pr-fixed'
         : undefined;
-      const isServerProtocol = task.reviewMode === 'server' || task.phase === 'spec';
+      const isServerProtocol = task.reviewMode === 'server' || specStage;
       const scanSnapshotOnRecover = isServerProtocol
         || (task.phase === undefined && task.status === 'in_progress')
-        || (task.phase !== 'spec' && (task.status === 'review' || task.status === 'fixing'));
+        || (!specStage && (task.status === 'review' || task.status === 'fixing'));
       const allowRecoveredReadFile = task.status === 'review'
-        && (task.phase === 'spec'
+        && (specStage
           || (task.reviewMode === 'server' && task.batchTotal !== undefined)
           || (task.reviewMode === 'server' && task.reviewCheckoutMode === 'base'));
       try {
@@ -3130,6 +3379,7 @@ export class AgentManager {
     patch?: Partial<Pick<
       TaskState,
       | 'reviewRound'
+      | 'agentId'
       | 'prNumber'
       | 'prUrl'
       | 'qaAgentId'
@@ -3299,13 +3549,34 @@ export class AgentManager {
     if (cfg.projectId !== projectId) {
       throw new ApiError(400, `Agent ${preferredAgentId} not in project ${projectId}`);
     }
-    if (cfg.role !== 'dev') {
-      throw new ApiError(400, `Agent ${preferredAgentId} is not dev role`);
+    if (!TASK_OWNER_ROLES.has(cfg.role)) {
+      throw new ApiError(400, `Agent ${preferredAgentId} is not dev or research role`);
     }
     const state = await this.agentStore.get(preferredAgentId);
     if (!canDispatchWithBinding(state)) return null;
     const { projectId: _projectId, ...rest } = cfg;
     return rest;
+  }
+
+  private async persistQueuedTask(
+    task: TaskState,
+    queueReason: 'unassigned' | 'preferred_agent_busy' | 'agent_locked',
+    agentId?: string,
+  ): Promise<TaskState> {
+    await this.taskStore.set(task);
+    await this.safeEmit({
+      id: '',
+      type: 'task.created',
+      timestamp: task.createdAt,
+      projectId: task.projectId,
+      taskId: task.id,
+      data: {
+        queued: true,
+        queueReason,
+        ...(agentId ? { agentId } : {}),
+      },
+    });
+    return task;
   }
 
   async createTask(
@@ -3342,118 +3613,13 @@ export class AgentManager {
       const imageFilenames = input.images?.length
         ? await this.persistTaskImages(taskId, input.images)
         : undefined;
-
-      if (input.preferredAgentId === '') {
-        const unassigned: TaskState = {
-          id: taskId,
-          projectId,
-          title: input.title,
-          description: input.description,
-          preferredAgentId: '',
-          agentId: '',
-          reviewRound: 0,
-          status: 'pending',
-          branch: taskBranch,
-          branchCreatedByBaxian,
-          reviewMode: this.effectiveReviewMode(projectId),
-          createdAt: now,
-          updatedAt: now,
-          ...(imageFilenames ? { images: imageFilenames } : {}),
-        };
-        await this.taskStore.set(unassigned);
-        await this.safeEmit({
-          id: '',
-          type: 'task.created',
-          timestamp: now,
-          projectId,
-          taskId,
-          data: { queued: true, queueReason: 'unassigned' },
-        });
-        return unassigned;
-      }
-
-      const dev = await this.pickAgent(projectId, input.preferredAgentId);
-      const qa = this.findQaPartner(input.preferredAgentId);
-
-      if (!dev) {
-        const queued: TaskState = {
-          id: taskId,
-          projectId,
-          title: input.title,
-          description: input.description,
-          preferredAgentId: input.preferredAgentId,
-          agentId: '',
-          reviewRound: 0,
-          status: 'pending',
-          branch: taskBranch,
-          branchCreatedByBaxian,
-          reviewMode: this.effectiveReviewMode(projectId),
-          createdAt: now,
-          updatedAt: now,
-          ...(qa ? { qaAgentId: qa.id } : {}),
-          ...(imageFilenames ? { images: imageFilenames } : {}),
-        };
-        await this.taskStore.set(queued);
-        await this.safeEmit({
-          id: '',
-          type: 'task.created',
-          timestamp: now,
-          projectId,
-          taskId,
-          data: {
-            queued: true,
-            queueReason: 'preferred_agent_busy',
-            agentId: input.preferredAgentId,
-          },
-        });
-        return queued;
-      }
-
-      const lockToken = await this.lockManager.acquire(dev.id, taskId);
-      if (!lockToken) {
-        const queued: TaskState = {
-          id: taskId,
-          projectId,
-          title: input.title,
-          description: input.description,
-          preferredAgentId: input.preferredAgentId,
-          agentId: '',
-          reviewRound: 0,
-          status: 'pending',
-          branch: taskBranch,
-          branchCreatedByBaxian,
-          reviewMode: this.effectiveReviewMode(projectId),
-          createdAt: now,
-          updatedAt: now,
-          ...(qa ? { qaAgentId: qa.id } : {}),
-          ...(imageFilenames ? { images: imageFilenames } : {}),
-        };
-        await this.taskStore.set(queued);
-        await this.safeEmit({
-          id: '',
-          type: 'task.created',
-          timestamp: now,
-          projectId,
-          taskId,
-          data: {
-            queued: true,
-            queueReason: 'agent_locked',
-            agentId: input.preferredAgentId,
-          },
-        });
-        return queued;
-      }
-
-      const task: TaskState = {
+      const taskBase = {
         id: taskId,
         projectId,
         title: input.title,
         description: input.description,
         preferredAgentId: input.preferredAgentId,
-        agentId: dev.id,
-        ...(qa ? { qaAgentId: qa.id } : {}),
         reviewRound: 0,
-        status: 'in_progress',
         branch: taskBranch,
         branchCreatedByBaxian,
         reviewMode: this.effectiveReviewMode(projectId),
@@ -3461,9 +3627,56 @@ export class AgentManager {
         updatedAt: now,
         ...(imageFilenames ? { images: imageFilenames } : {}),
       };
+
+      if (input.preferredAgentId === '') {
+        const unassigned: TaskState = {
+          ...taskBase,
+          agentId: '',
+          devAgentId: '',
+          status: 'pending',
+        };
+        return this.persistQueuedTask(unassigned, 'unassigned');
+      }
+
+      const target = await this.pickAgent(projectId, input.preferredAgentId);
+      const targetConfig = this.getAgentConfig(input.preferredAgentId)!;
+      const group = this.findAgentGroup(input.preferredAgentId);
+      const dev = group?.find(agent => agent.role === 'dev');
+      if (!dev) throw new ApiError(409, `Agent ${input.preferredAgentId} has no dev agent in its group`);
+      const qa = group?.find(agent => agent.role === 'qa');
+      const research = targetConfig.role === 'research' ? targetConfig : undefined;
+      const researchFields = research
+        ? { researchAgentId: research.id, phase: 'research' as const }
+        : {};
+      const queued: TaskState = {
+        ...taskBase,
+        agentId: '',
+        devAgentId: dev.id,
+        ...researchFields,
+        status: 'pending',
+        ...(qa ? { qaAgentId: qa.id } : {}),
+      };
+
+      if (!target) {
+        return this.persistQueuedTask(queued, 'preferred_agent_busy', input.preferredAgentId);
+      }
+
+      const lockToken = await this.lockManager.acquire(target.id, taskId);
+      if (!lockToken) {
+        return this.persistQueuedTask(queued, 'agent_locked', input.preferredAgentId);
+      }
+
+      const task: TaskState = {
+        ...taskBase,
+        agentId: target.id,
+        devAgentId: dev.id,
+        ...(qa ? { qaAgentId: qa.id } : {}),
+        ...researchFields,
+        status: 'in_progress',
+      };
       await this.taskStore.set(task);
-      await this.agentStore.update(dev.id, (existing) => ({
-        id: dev.id,
+      await this.agentStore.update(target.id, (existing) => ({
+        id: target.id,
         projectId,
         taskId,
         lockToken,
@@ -3478,9 +3691,9 @@ export class AgentManager {
         type: 'task.assigned',
         timestamp: now,
         projectId,
-        agentId: dev.id,
+        agentId: target.id,
         taskId,
-        data: { agentId: dev.id },
+        data: { agentId: target.id },
       });
       return task;
     });
@@ -3529,10 +3742,14 @@ export class AgentManager {
     signalToken: string,
     dispatchLockToken?: string,
   ): Promise<TaskState | null> {
+    const initialTask = await this.taskStore.get(taskId);
+    if (!initialTask) return null;
+    const initialDispatch = this.resolveInitialDispatch(initialTask);
+    const dispatchPhase = initialDispatch.phase;
     let started = false;
     let dispatchErr: unknown = null;
     try {
-      started = await this.startSession(taskId, agentId, 'develop');
+      started = await this.startSession(taskId, agentId, dispatchPhase);
     } catch (err) {
       dispatchErr = err;
       console.error(
@@ -3568,7 +3785,7 @@ export class AgentManager {
         await this.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true });
         return null;
       }
-      const initialKinds = this.devInitialSignalKinds(fresh.reviewMode);
+      const initialKinds = this.resolveInitialDispatch(fresh).kinds;
       try {
         await this.armPostDispatchSignalOrHold(taskId, agentId, initialKinds, signalToken);
       } catch (armErr) {
@@ -3584,7 +3801,7 @@ export class AgentManager {
       return null;
     }
     if (dispatchErr instanceof DispatchTerminalError) {
-      await this.failTaskForDispatchError(taskId, 'develop', agentId, dispatchErr);
+      await this.failTaskForDispatchError(taskId, dispatchPhase, agentId, dispatchErr);
     } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
     } else {
       const fresh = await this.taskStore.get(taskId);
@@ -3826,8 +4043,8 @@ export class AgentManager {
       if (cfg.projectId !== fresh.projectId) {
         return { task: fresh, errorCode: 400 as const, error: `Agent ${agentId} not in project ${fresh.projectId}` };
       }
-      if (cfg.role !== 'dev') {
-        return { task: fresh, errorCode: 400 as const, error: `Agent ${agentId} is not dev role` };
+      if (!TASK_OWNER_ROLES.has(cfg.role)) {
+        return { task: fresh, errorCode: 400 as const, error: `Agent ${agentId} is not dev or research role` };
       }
       if (fresh.preferredAgentId !== '' && fresh.preferredAgentId !== agentId) {
         return {
@@ -3846,14 +4063,29 @@ export class AgentManager {
       }
 
       const now = new Date().toISOString();
-      const qaId = fresh.qaAgentId ?? this.findQaPartner(agentId)?.id;
+      const initiallyUnassigned = fresh.preferredAgentId === '';
+      const group = initiallyUnassigned ? this.findAgentGroup(agentId) : undefined;
+      const devId = initiallyUnassigned
+        ? group?.find(agent => agent.role === 'dev')?.id
+        : fresh.devAgentId;
+      if (!devId) {
+        await this.lockManager.releaseIfOwner(agentId, taskId, lockToken);
+        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} has no dev agent in its group` };
+      }
+      const qaId = initiallyUnassigned
+        ? group?.find(agent => agent.role === 'qa')?.id
+        : fresh.qaAgentId;
+      const researchId = initiallyUnassigned && cfg.role === 'research' ? cfg.id : fresh.researchAgentId;
       const claimedTask: TaskState = {
         ...fresh,
         preferredAgentId: agentId,
         agentId,
+        devAgentId: devId,
+        researchAgentId: researchId,
+        qaAgentId: qaId,
+        phase: researchId ? 'research' : undefined,
         status: 'in_progress',
         updatedAt: now,
-        ...(qaId ? { qaAgentId: qaId } : {}),
       };
       await this.taskStore.set(claimedTask);
       await this.agentStore.update(agentId, (existing) => ({
@@ -3888,8 +4120,13 @@ export class AgentManager {
 
     let started = false;
     let dispatchErr: unknown = null;
+    const initialDispatch = this.resolveInitialDispatch(claimed);
     try {
-      started = await this.startSession(claimed.id, claimed.agentId, 'develop');
+      started = await this.startSession(
+        claimed.id,
+        claimed.agentId,
+        initialDispatch.phase,
+      );
     } catch (err) {
       dispatchErr = err;
       console.error(
@@ -3898,13 +4135,23 @@ export class AgentManager {
       );
     }
     if (started) {
-      await this.armPostDispatchSignalOrHold(claimed.id, claimed.agentId, this.devInitialSignalKinds(claimed.reviewMode), signalToken);
+      await this.armPostDispatchSignalOrHold(
+        claimed.id,
+        claimed.agentId,
+        initialDispatch.kinds,
+        signalToken,
+      );
       const refreshed = await this.taskStore.get(claimed.id);
       return { task: refreshed ?? claimed };
     }
 
     if (dispatchErr instanceof DispatchTerminalError) {
-      await this.failTaskForDispatchError(claimed.id, 'develop', claimed.agentId, dispatchErr);
+      await this.failTaskForDispatchError(
+        claimed.id,
+        initialDispatch.phase,
+        claimed.agentId,
+        dispatchErr,
+      );
     } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
     } else {
       await this.rollbackFailedDispatch(claimed.id, claimed.agentId, dispatchErr ? {
@@ -3975,22 +4222,7 @@ export class AgentManager {
     taskId: string,
     agentId: string,
     phase: string,
-    opts: {
-      bypassTaskStatusGate?: boolean;
-      signalToken?: string;
-      currentSpecRound?: number;
-      dialogFailFromStatuses?: TaskStatus[];
-      serverContent?: string;
-      serverInterdiff?: string;
-      serverDiffstat?: string;
-      serverBaseSha?: string;
-      serverHeadSha?: string;
-      serverHeadTree?: string;
-      serverBatch?: { index: number; total: number };
-      serverPriorFindings?: string;
-      serverPriorResponse?: string;
-      armBeforeInject?: (ctx: DispatchArmContext) => Promise<boolean>;
-    } = {},
+    opts: StartSessionOpts = {},
   ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) throw new Error(`Unknown agent: ${agentId}`);
@@ -4119,6 +4351,8 @@ export class AgentManager {
       } else if (phase === 'review' || phase === 'recheck') {
         if (!task.branch) throw new Error(`Task ${taskId} has no review branch`);
         await this.switchToVerifiedReviewHead(branchManager, workdir, task, assertOwner);
+      } else if (phase === 'research') {
+        await branchManager.switchToDefaultDetached(workdir);
       } else {
         if (!task.branch) throw new Error(`Task ${taskId} has no task branch`);
         await branchManager.switchToTaskBranch(
@@ -4199,16 +4433,20 @@ export class AgentManager {
 
     const promptSignalToken = opts.signalToken ?? task.signalToken;
     const promptSpecRound = opts.currentSpecRound ?? task.specReviewRound;
-    const hasQaPartner = !!(task.qaAgentId ?? this.findQaPartner(agentId)?.id);
+    const hasQaPartner = task.qaAgentId !== undefined;
     let prompt: string;
     try {
-      await this.getReviewTransport().clearDispatchOutputs(agent, dispatchWorkdir, phase);
+      await this.prepareDispatchArtifacts(agent, dispatchWorkdir, phase, {
+        specDocuments: opts.specDocuments,
+        preserveOutputs: false,
+        assertOwner,
+      });
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
       if (opts.serverContent !== undefined || opts.serverDiffstat !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
         payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, dispatchWorkdir, {
           phase,
-          ...(task.phase ? { taskPhase: task.phase } : {}),
+          taskPhase: task.phase,
           ...(promptSpecRound !== undefined ? { specRound: promptSpecRound } : {}),
           reviewRound: task.reviewRound,
           ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
@@ -4358,7 +4596,7 @@ export class AgentManager {
       const isAckUnknown = err instanceof DispatchTerminalError && err.reason === 'ack_unknown';
       if (!isAckUnknown) {
         await cleanupCheckoutOrHold();
-        if (agentMarkedRunning) {
+        if (agentMarkedRunning && !opts.preserveBindingOnFailure) {
           try {
             let released = false;
             let releaseToken: string | undefined;
@@ -4651,6 +4889,24 @@ export class AgentManager {
       return false;
     }
     await this.assertTaskLockOwner(agentId, taskId, lockToken);
+    const verifiedWorkdir = stateAfterEnsure.workdir;
+    if (
+      !verifiedWorkdir
+      || verifiedWorkdir !== ensure.workdir
+      || verifiedWorkdir !== taskWorkdir
+    ) {
+      const reason =
+        `Workdir changed during continueSession: ` +
+        `before=${taskWorkdir}, ensure=${ensure.workdir}, state=${verifiedWorkdir ?? 'missing'}`;
+      console.warn(`[AgentManager] continueSession[${phase}]: ${reason}; holding`);
+      await this.markAwaitingHuman(
+        agentId,
+        'workdir-changed-during-dispatch',
+        `${reason}. The prompt was not delivered; verify the agent runtime and Workdir before resuming.`,
+        { expectedTaskId: taskId },
+      );
+      return false;
+    }
     const expectedStatuses = PHASE_EXPECTED_STATUS[phase] ?? [];
     const taskAfterEnsure = await this.taskStore.get(taskId);
     if (!taskAfterEnsure || TERMINAL_STATUSES.includes(taskAfterEnsure.status)) {
@@ -4666,22 +4922,32 @@ export class AgentManager {
       );
       return false;
     }
-    if (agentState.workdir && agent.role === 'dev' && task.branch) {
+    if (agent.role === 'dev' && task.branch) {
       const branches = new BranchManager(runner);
-      await branches.assertClean(taskWorkdir);
-      const actualRef = await branches.currentRef(taskWorkdir);
+      await branches.assertClean(verifiedWorkdir);
+      const actualRef = await branches.currentRef(verifiedWorkdir);
       if (actualRef !== `refs/heads/${task.branch}`) {
         throw new Error(
           `Agent ${agentId} checkout mismatch for task ${taskId}: ` +
           `expected refs/heads/${task.branch}, got ${actualRef ?? 'detached HEAD'}`,
         );
       }
+    } else if (agent.role === 'research') {
+      await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
+      await new BranchManager(runner).switchToDefaultDetached(verifiedWorkdir);
+      await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
     }
 
     const promptSpecRound = opts.currentSpecRound ?? task.specReviewRound;
     let prompt: string;
     try {
-      await this.getReviewTransport().clearDispatchOutputs(agent, taskWorkdir, phase);
+      await this.prepareDispatchArtifacts(agent, verifiedWorkdir, phase, {
+        specDocuments: opts.specDocuments,
+        preserveOutputs: opts.preserveDispatchOutputs ?? false,
+        assertOwner: async () => {
+          await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
+        },
+      });
       const useIncrementalNudge =
         typeof opts.postApproveRedispatchCount === 'number'
         && opts.postApproveRedispatchCount > 0
@@ -4689,9 +4955,9 @@ export class AgentManager {
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
       if (opts.serverContent !== undefined || opts.serverDiffstat !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
-        payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, taskWorkdir, {
+        payloadOpts = await resolveServerPayloads(this.getReviewTransport(), agent, verifiedWorkdir, {
           phase,
-          ...(task.phase ? { taskPhase: task.phase } : {}),
+          taskPhase: task.phase,
           ...(promptSpecRound !== undefined ? { specRound: promptSpecRound } : {}),
           reviewRound: task.reviewRound,
           ...(opts.serverBatch ? { batch: opts.serverBatch } : {}),
@@ -4706,7 +4972,7 @@ export class AgentManager {
         task,
         phase,
         agent,
-        workdir: taskWorkdir,
+        workdir: verifiedWorkdir,
         skillRegistry: this.skillRegistry,
         ...(signalToken ? { signalToken } : {}),
         ...(useIncrementalNudge
@@ -4763,6 +5029,19 @@ export class AgentManager {
       console.warn(`[AgentManager] continueSession[${phase}]: ownership token changed; skipping`);
       return false;
     }
+    if (agentFresh.workdir !== verifiedWorkdir) {
+      const reason =
+        `Workdir changed before prompt injection: ` +
+        `verified=${verifiedWorkdir}, current=${agentFresh.workdir ?? 'missing'}`;
+      console.warn(`[AgentManager] continueSession[${phase}]: ${reason}; holding`);
+      await this.markAwaitingHuman(
+        agentId,
+        'workdir-changed-during-dispatch',
+        `${reason}. The prompt was not delivered; verify the agent runtime and Workdir before resuming.`,
+        { expectedTaskId: taskId },
+      );
+      return false;
+    }
     await this.assertTaskLockOwner(agentId, taskId, lockToken);
 
     if (phase === 'post-approve') {
@@ -4781,17 +5060,43 @@ export class AgentManager {
 
     const now = new Date().toISOString();
     await this.agentStore.update(agentId, (latest) => {
-      if (!latest) return AGENT_STORE_NOOP;
+      if (
+        !latest
+        || latest.taskId !== taskId
+        || latest.lockToken !== lockToken
+        || latest.workdir !== verifiedWorkdir
+      ) {
+        return AGENT_STORE_NOOP;
+      }
       // The continuation prompt supersedes any question asked under the previous one.
       const { needInputAt: _needInputAt, ...rest } = latest;
       return {
         ...rest,
         paneId,
-        workdir: taskWorkdir,
+        workdir: verifiedWorkdir,
         lockToken,
         updatedAt: now,
       };
     });
+    const stateBeforeInject = await this.agentStore.get(agentId);
+    if (stateBeforeInject?.taskId !== taskId || stateBeforeInject.lockToken !== lockToken) {
+      console.warn(`[AgentManager] continueSession[${phase}]: ownership changed before prompt injection; skipping`);
+      return false;
+    }
+    if (stateBeforeInject.workdir !== verifiedWorkdir) {
+      const reason =
+        `Workdir changed before prompt injection: ` +
+        `verified=${verifiedWorkdir}, current=${stateBeforeInject.workdir ?? 'missing'}`;
+      console.warn(`[AgentManager] continueSession[${phase}]: ${reason}; holding`);
+      await this.markAwaitingHuman(
+        agentId,
+        'workdir-changed-during-dispatch',
+        `${reason}. The prompt was not delivered; verify the agent runtime and Workdir before resuming.`,
+        { expectedTaskId: taskId },
+      );
+      return false;
+    }
+    await this.assertTaskLockOwner(agentId, taskId, lockToken);
 
     await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
     return true;
@@ -4808,12 +5113,58 @@ export class AgentManager {
       return false;
     }
     const boundTask = await this.taskStore.get(state.taskId);
-    if (!boundTask || boundTask.phase || boundTask.status !== 'in_progress' || boundTask.agentId !== state.id) {
-      return false;
-    }
-    if (await this.bootstrapPromptWasDelivered(state.taskId, boundTask.createdAt)) {
+    if (!boundTask) return false;
+
+    if (boundTask.status === 'spec-ready' && isSpecStagePhase(boundTask.phase)) {
+      if (state.id === boundTask.devAgentId && state.id !== boundTask.agentId) {
+        const lockToken = state.lockToken;
+        await this.agentStore.update(state.id, (latest) => {
+          if (
+            !latest
+            || latest.taskId !== state.taskId
+            || latest.bootstrappingTaskId !== state.taskId
+            || latest.lockToken !== lockToken
+          ) {
+            return AGENT_STORE_NOOP;
+          }
+          return {
+            id: latest.id,
+            projectId: latest.projectId,
+            ...(latest.paneId !== undefined ? { paneId: latest.paneId } : {}),
+            ...(latest.workdir !== undefined ? { workdir: latest.workdir } : {}),
+            ...(latest.creationToken !== undefined ? { creationToken: latest.creationToken } : {}),
+            updatedAt: new Date().toISOString(),
+          };
+        });
+        if (lockToken) await this.lockManager.releaseIfOwner(state.id, state.taskId, lockToken);
+        return true;
+      }
       await this.clearBootstrapMarker(state.id, state.taskId);
       return false;
+    }
+
+    if (boundTask.status !== 'in_progress' || boundTask.agentId !== state.id) return false;
+    const dispatchPhase = boundTask.phase === 'research'
+      ? 'research'
+      : boundTask.specReviewRound !== undefined ? 'code' : 'develop';
+    if (await this.bootstrapPromptWasDelivered(
+      state.taskId,
+      boundTask.createdAt,
+      state.id,
+      dispatchPhase,
+    )) {
+      await this.clearBootstrapMarker(state.id, state.taskId);
+      return false;
+    }
+
+    if (dispatchPhase === 'code') {
+      await this.markAwaitingHuman(
+        state.id,
+        'code-dispatch-failed',
+        'Code-phase handoff was interrupted before the prompt was delivered. Resume to replay the persisted Spec documents.',
+        { expectedTaskId: state.taskId },
+      );
+      return true;
     }
     console.warn(
       `[recover] agent ${state.id} was mid-bootstrap for in_progress task ${state.taskId} ` +
@@ -4828,12 +5179,20 @@ export class AgentManager {
     return true;
   }
 
-  private async bootstrapPromptWasDelivered(taskId: string, createdAtIso: string): Promise<boolean> {
+  private async bootstrapPromptWasDelivered(
+    taskId: string,
+    createdAtIso: string,
+    agentId: string,
+    phase: 'develop' | 'research' | 'code',
+  ): Promise<boolean> {
     const today = new Date().toISOString().slice(0, 10);
     const from = createdAtIso.slice(0, 10);
     try {
       const events = await this.eventBus.readRange(from, today);
-      return events.some((e) => e.type === 'session.started' && e.taskId === taskId);
+      return events.some((event) => event.type === 'session.started'
+        && event.taskId === taskId
+        && event.agentId === agentId
+        && event.data.phase === phase);
     } catch (err) {
       console.warn(`[recover] bootstrapPromptWasDelivered read failed for task=${taskId}:`, err);
       return false;
@@ -5326,8 +5685,8 @@ export class AgentManager {
       if (cfg.projectId !== projectId) {
         throw new ApiError(400, `Agent ${input.preferredAgentId} not in project ${projectId}`);
       }
-      if (cfg.role !== 'dev') {
-        throw new ApiError(400, `Agent ${input.preferredAgentId} is not dev role`);
+      if (!TASK_OWNER_ROLES.has(cfg.role)) {
+        throw new ApiError(400, `Agent ${input.preferredAgentId} is not dev or research role`);
       }
     }
     let previewBytes: number;
@@ -5373,7 +5732,7 @@ export class AgentManager {
           `Task ${taskId} review pass changed during redispatch (signalToken rotated); aborting`,
         );
       }
-      if (task.reviewMode === 'server' || task.phase === 'spec') {
+      if (task.reviewMode === 'server' || isSpecStagePhase(task.phase)) {
         if (!MANUAL_SERVER_REVIEW_STATUSES.includes(task.status)) {
           throw new ApiError(
             409,
@@ -5383,7 +5742,6 @@ export class AgentManager {
         if (!this.serverReviewDriver) {
           throw new ApiError(409, `Server review pipeline is not configured; cannot dispatch review for ${taskId}`);
         }
-        // in_progress 且 phase 未定：dev 既可能交 spec-done 也可能交 code-done，评审对象无从判定
         if (task.status === 'in_progress' && task.phase === undefined) {
           throw new ApiError(
             409,
@@ -5391,12 +5749,12 @@ export class AgentManager {
           );
         }
         // 手工发起=明确要求跑一次 QA 评审；无 QA 时必须拒绝，不得落入自动通过/停驻兜底
-        const qaAvailable = (task.qaAgentId !== undefined && !!this.getAgentConfig(task.qaAgentId))
-          || !!this.findQaPartner(task.agentId);
+        const qaAvailable = task.qaAgentId !== undefined
+          && this.getAgentConfig(task.qaAgentId)?.role === 'qa';
         if (!qaAvailable) {
           throw new ApiError(400, `Task ${taskId} has no QA partner configured; manual review requires a QA agent`);
         }
-        const isSpec = task.phase === 'spec';
+        const isSpec = isSpecStagePhase(task.phase);
         const cap = this.config.review.rounds + (task.maxRoundsContinues ?? 0);
         const round = isSpec ? (task.specReviewRound ?? 0) : task.reviewRound;
         if (round + 1 > cap) {
@@ -5411,23 +5769,12 @@ export class AgentManager {
       if (!task.branch) {
         throw new ApiError(400, `Task ${taskId} has no branch; cannot dispatch review`);
       }
-      let qaId = task.qaAgentId;
-      if (qaId && !this.getAgentConfig(qaId)) {
-        console.warn(
-          `[dispatchReviewToQa] task ${taskId}.qaAgentId="${qaId}" no longer in config; ` +
-          `falling back to findQaPartner(${task.agentId})`,
-        );
-        qaId = undefined;
-      }
+      const qaId = task.qaAgentId;
       if (!qaId) {
-        const qa = this.findQaPartner(task.agentId);
-        if (!qa) {
-          throw new ApiError(
-            400,
-            `Dev ${task.agentId} has no QA partner configured; cannot dispatch review`,
-          );
-        }
-        qaId = qa.id;
+        throw new ApiError(400, `Task ${taskId} has no QA participant; cannot dispatch review`);
+      }
+      if (this.getAgentConfig(qaId)?.role !== 'qa') {
+        throw new ApiError(409, `Task ${taskId} QA participant ${qaId} is unavailable`);
       }
       this.manualReviewInFlight.add(taskId);
       return { mode: 'github' as const, qaId, devAgentId: task.agentId, taskStatusAtClaim: task.status };
@@ -5529,7 +5876,6 @@ export class AgentManager {
         await this.taskStore.set({
           ...fresh,
           reviewRound: bumpRound ? fresh.reviewRound + 1 : fresh.reviewRound,
-          qaAgentId: qaId,
           signalToken: armedToken,
           updatedAt: new Date().toISOString(),
         });
@@ -5620,7 +5966,7 @@ export class AgentManager {
     if (task.status !== 'max_rounds') {
       throw new ApiError(409, `Task ${taskId} is not at max_rounds (status=${task.status})`);
     }
-    if (task.phase === 'spec') {
+    if (isSpecStagePhase(task.phase)) {
       throw new ApiError(409, `Continue one round is only supported for code-phase tasks`);
     }
     if (task.reviewMode === 'server') {
@@ -5852,28 +6198,38 @@ export class AgentManager {
       : (['spec-done', 'pr-created'] as const);
   }
 
+  private resolveInitialDispatch(task: Pick<TaskState, 'phase' | 'reviewMode'>): {
+    phase: 'develop' | 'research';
+    kinds: readonly PhaseSignalKind[];
+  } {
+    if (task.phase === 'research') return { phase: 'research', kinds: ['spec-done'] };
+    return { phase: 'develop', kinds: this.devInitialSignalKinds(task.reviewMode) };
+  }
+
   private mapTaskStateToExpectedWatcher(task: TaskState): {
     expectedKinds: readonly PhaseSignalKind[];
     agentId: string;
   } | undefined {
     if (task.reviewMode === 'server') return this.mapServerTaskToExpectedWatcher(task);
-    if (task.phase === 'spec' && task.status === 'review' && task.qaAgentId) {
-      return { expectedKinds: ['spec-reviewed'], agentId: task.qaAgentId };
+    const specStage = isSpecStagePhase(task.phase);
+    if (task.status === 'review' && task.qaAgentId) {
+      return {
+        expectedKinds: specStage ? ['spec-reviewed'] : ['pr-approved', 'pr-changes-requested'],
+        agentId: task.qaAgentId,
+      };
     }
-    if (task.phase === 'spec' && task.status === 'fixing' && task.agentId) {
-      return { expectedKinds: ['spec-fixed'], agentId: task.agentId };
+    if (task.status === 'fixing' && task.agentId) {
+      return {
+        expectedKinds: [specStage ? 'spec-fixed' : 'pr-fixed'],
+        agentId: task.agentId,
+      };
     }
-    if (task.phase !== 'spec' && task.status === 'fixing' && task.agentId) {
-      return { expectedKinds: ['pr-fixed'], agentId: task.agentId };
-    }
-    if (task.phase === undefined && task.status === 'in_progress' && task.agentId) {
-      return { expectedKinds: ['spec-done', 'pr-created'], agentId: task.agentId };
-    }
-    if (task.phase === 'code' && task.status === 'in_progress' && task.agentId) {
-      return { expectedKinds: ['pr-created'], agentId: task.agentId };
-    }
-    if (task.phase !== 'spec' && task.status === 'review' && task.qaAgentId) {
-      return { expectedKinds: ['pr-approved', 'pr-changes-requested'], agentId: task.qaAgentId };
+    if (task.status === 'in_progress' && task.agentId) {
+      if (task.phase === 'research') return { expectedKinds: ['spec-done'], agentId: task.agentId };
+      if (task.phase === 'code') return { expectedKinds: ['pr-created'], agentId: task.agentId };
+      if (task.phase === undefined) {
+        return { expectedKinds: ['spec-done', 'pr-created'], agentId: task.agentId };
+      }
     }
     return undefined;
   }
@@ -5882,7 +6238,7 @@ export class AgentManager {
     expectedKinds: readonly PhaseSignalKind[];
     agentId: string;
   } | undefined {
-    const isSpec = task.phase === 'spec';
+    const isSpec = isSpecStagePhase(task.phase);
     if (task.status === 'review' && task.qaAgentId) {
       return { expectedKinds: [isSpec ? 'spec-reviewed' : 'code-reviewed'], agentId: task.qaAgentId };
     }
@@ -5890,7 +6246,10 @@ export class AgentManager {
       return { expectedKinds: [isSpec ? 'spec-fixed' : 'code-fixed'], agentId: task.agentId };
     }
     if (task.status === 'in_progress' && task.agentId) {
-      if (task.phase === 'code') return { expectedKinds: ['code-done'], agentId: task.agentId };
+      if (task.phase === 'research') return { expectedKinds: ['spec-done'], agentId: task.agentId };
+      if (task.phase === 'code') {
+        return { expectedKinds: ['code-done'], agentId: task.agentId };
+      }
       return { expectedKinds: ['spec-done', 'code-done'], agentId: task.agentId };
     }
     if (task.status === 'approved' && task.agentId) {
@@ -5931,7 +6290,7 @@ export class AgentManager {
       if (!t) throw new ApiError(404, 'Task not found');
       const retryable =
         TERMINAL_STATUSES.includes(t.status)
-        || (t.status === 'max_rounds' && t.phase === 'spec');
+        || (t.status === 'max_rounds' && isSpecStagePhase(t.phase));
       if (!retryable) {
         throw new ApiError(
           409,
@@ -5976,16 +6335,31 @@ export class AgentManager {
       if (patch.preferredAgentId !== undefined && patch.preferredAgentId !== task.preferredAgentId) {
         if (patch.preferredAgentId === '') {
           task.preferredAgentId = '';
+          task.agentId = '';
+          task.devAgentId = '';
+          delete task.phase;
           delete task.qaAgentId;
+          delete task.researchAgentId;
         } else {
           const cfg = this.getAgentConfig(patch.preferredAgentId);
           if (!cfg) throw new ApiError(400, `Unknown agent: ${patch.preferredAgentId}`);
           if (cfg.projectId !== task.projectId) {
             throw new ApiError(400, `Agent not in project ${task.projectId}`);
           }
-          if (cfg.role !== 'dev') throw new ApiError(400, `Agent is not dev role`);
+          if (!TASK_OWNER_ROLES.has(cfg.role)) throw new ApiError(400, `Agent is not dev or research role`);
+          const group = this.findAgentGroup(cfg.id);
+          const dev = group?.find(agent => agent.role === 'dev');
+          if (!dev) throw new ApiError(409, `Agent ${cfg.id} has no dev agent in its group`);
           task.preferredAgentId = patch.preferredAgentId;
-          const qaId = this.findQaPartner(patch.preferredAgentId)?.id;
+          task.devAgentId = dev.id;
+          if (cfg.role === 'research') {
+            task.phase = 'research';
+            task.researchAgentId = cfg.id;
+          } else {
+            delete task.phase;
+            delete task.researchAgentId;
+          }
+          const qaId = group?.find(agent => agent.role === 'qa')?.id;
           if (qaId) {
             task.qaAgentId = qaId;
           } else {
@@ -6040,7 +6414,7 @@ export class AgentManager {
       if (!serverApprovedRetry && task.status !== 'max_rounds') {
         throw new ApiError(409, `Task ${taskId} is not at max_rounds (status=${task.status})`);
       }
-      if (task.phase === 'spec') {
+      if (isSpecStagePhase(task.phase)) {
         throw new ApiError(409, `Mark complete is only supported for code-phase tasks`);
       }
       if (task.reviewMode !== 'server' && (!task.prNumber || !task.branch)) {
@@ -6556,7 +6930,6 @@ export class AgentManager {
         signalToken: restore.signalToken,
         reviewHeadAnchorSha: restore.reviewHeadAnchorSha,
         reviewDispatchedAt: restore.reviewDispatchedAt,
-        qaAgentId: undefined,
         updatedAt: new Date().toISOString(),
       });
       return true;
@@ -6589,10 +6962,8 @@ export class AgentManager {
       taskId,
       'spec-ready',
       { fromStatus: ['review', 'in_progress', 'fixing'] },
-      // QA 在停驻期解绑，残留 qaAgentId 会让后续 approve/打回误发释放；复审经 findQaPartner 回绑
       {
         phase: 'spec',
-        qaAgentId: undefined,
         ...(opts.specReviewRound !== undefined ? { specReviewRound: opts.specReviewRound } : {}),
       },
     );
@@ -6616,7 +6987,7 @@ export class AgentManager {
 
   async submitSpecVerdict(
     taskId: string,
-    verdict: 'approve' | 'request-changes',
+    verdict: 'approve' | 'request-changes' | 'archive',
     comments?: string,
   ): Promise<TaskState> {
     const trimmed = comments?.trim();
@@ -6628,6 +6999,9 @@ export class AgentManager {
       if (!fresh) throw new ApiError(404, `Task ${taskId} not found`);
       if (fresh.status !== 'spec-ready') {
         throw new ApiError(409, `Task ${taskId} is ${fresh.status}; spec verdict requires spec-ready`);
+      }
+      if (verdict === 'archive' && !fresh.researchAgentId) {
+        throw new ApiError(409, `Task ${taskId} is not a Research task; only Research specs can be archived`);
       }
       if (this.specVerdictInFlight.has(taskId)) {
         throw new ApiError(409, `Task ${taskId} spec verdict is already being processed`);
@@ -6644,7 +7018,7 @@ export class AgentManager {
 
   private async executeSpecVerdict(
     task: TaskState,
-    verdict: 'approve' | 'request-changes',
+    verdict: 'approve' | 'request-changes' | 'archive',
     trimmed: string | undefined,
   ): Promise<TaskState> {
     const taskId = task.id;
@@ -6653,14 +7027,54 @@ export class AgentManager {
     const round = task.specReviewRound ?? 1;
     const at = new Date().toISOString();
     const roundData = await store.getRound(taskId, 'spec', round);
+    if (!roundData || roundData.phase !== 'spec') {
+      throw new ApiError(409, `Task ${taskId} has no persisted spec review round ${round}`);
+    }
+    const base: ReviewRound = roundData;
 
-    // 停驻路径必然已存轮次；缺失时补一条空轮次，保证 userDecision 留痕与 fix 闭环
-    const base: ReviewRound = roundData ?? { round, phase: 'spec', content: '', startedAt: at };
+    if (verdict === 'archive') {
+      await store.putRound(taskId, 'spec', {
+        ...base,
+        userDecision: { verdict, ...(trimmed ? { comments: trimmed } : {}), at },
+      });
+      const transition = await this.transitionTaskStatus(
+        taskId,
+        'done',
+        { fromStatus: ['spec-ready'] },
+      );
+      if (!transition) throw new ApiError(409, `Task ${taskId} changed while archiving`);
+      this.stopPhaseSignalWatcher(taskId);
+      const participants = new Set([
+        task.agentId,
+        task.devAgentId,
+        task.qaAgentId,
+        task.researchAgentId,
+      ].filter((id): id is string => typeof id === 'string' && id !== ''));
+      for (const agentId of participants) {
+        const state = await this.agentStore.get(agentId);
+        if (state?.taskId !== taskId) continue;
+        const released = await this.releaseAgentForTask(
+          agentId,
+          taskId,
+          'idle',
+          { allowAwaitingHuman: true },
+        ).catch(() => false);
+        if (!released) {
+          await this.emitIntervention(task.projectId, agentId, taskId, {
+            phase: 'spec-archive-agent-release-failed',
+            agentId,
+          });
+        }
+      }
+      return (await this.taskStore.get(taskId))!;
+    }
 
     if (verdict === 'approve') {
       await store.putRound(taskId, 'spec', { ...base, userDecision: { verdict, at } });
       const result = await this.transitionToCodePhase(taskId);
-      if (!result) throw new ApiError(500, `Failed to dispatch code phase for task ${taskId}`);
+      if (!result) {
+        throw new ApiError(409, `Dev is unavailable for task ${taskId}; approval was recorded and can be retried`);
+      }
       return result;
     }
 
@@ -6702,7 +7116,7 @@ export class AgentManager {
       if (fresh.status !== 'ready') {
         throw new ApiError(409, `Task ${taskId} is ${fresh.status}; code verdict requires ready`);
       }
-      if (fresh.phase === 'spec') {
+      if (isSpecStagePhase(fresh.phase)) {
         throw new ApiError(409, `Task ${taskId} is in the spec phase; reject the spec via the spec verdict instead`);
       }
       if (fresh.reviewMode !== 'server') {
@@ -6799,50 +7213,110 @@ export class AgentManager {
     }
   }
 
+  private isResearchHandoff(
+    task: Pick<TaskState, 'researchAgentId'>,
+    devAgentId: string,
+  ): boolean {
+    return task.researchAgentId !== undefined && task.researchAgentId !== devAgentId;
+  }
+
+  private dispatchCodePhasePrompt(
+    task: Pick<TaskState, 'id' | 'reviewMode' | 'researchAgentId'>,
+    devAgentId: string,
+    signalToken: string,
+    specDocuments: readonly SpecDocument[],
+    currentSpecRound?: number,
+  ): Promise<boolean> {
+    const expectedKind: PhaseSignalKind = task.reviewMode === 'server' ? 'code-done' : 'pr-created';
+    const dispatchOpts: SessionDispatchOpts = {
+      signalToken,
+      specDocuments,
+      ...(currentSpecRound !== undefined ? { currentSpecRound } : {}),
+      armBeforeInject: () => this.setupPhaseSignalWatcher(
+        task.id,
+        devAgentId,
+        expectedKind,
+        signalToken,
+      ),
+    };
+    return this.isResearchHandoff(task, devAgentId)
+      ? this.startSession(task.id, devAgentId, 'code', {
+          ...dispatchOpts,
+          preserveBindingOnFailure: true,
+        })
+      : this.continueSession(task.id, devAgentId, 'code', dispatchOpts);
+  }
+
   async transitionToCodePhase(taskId: string): Promise<TaskState | null> {
     const task = await this.taskStore.get(taskId);
     if (!task) return null;
-    const devAgentId = task.agentId;
-    if (!devAgentId) return null;
+    const devAgentId = task.devAgentId;
+    const dev = devAgentId ? this.getAgentConfig(devAgentId) : undefined;
+    if (!devAgentId || dev?.role !== 'dev') {
+      await this.emitIntervention(task.projectId, task.agentId, taskId, {
+        phase: 'code-dev-missing',
+        devAgentId,
+      });
+      return null;
+    }
+    const round = task.specReviewRound ?? 1;
+    const stored = await this.reviewStore?.getRound(taskId, 'spec', round);
+    if (!stored || stored.phase !== 'spec') {
+      await this.emitIntervention(task.projectId, task.agentId, taskId, {
+        phase: 'code-spec-round-missing',
+        round,
+      });
+      return null;
+    }
+    const researchAgentId = task.researchAgentId;
+    const researchHandoff = this.isResearchHandoff(task, devAgentId);
+
+    const releaseParticipant = async (agentId: string, failurePhase: string): Promise<boolean> => {
+      const released = await this.releaseAgentIfBound(agentId, taskId, { allowAwaitingHuman: true })
+        .catch(() => false);
+      if (!released) {
+        await this.emitIntervention(task.projectId, agentId, taskId, { phase: failurePhase, agentId });
+      }
+      return released;
+    };
+
+    if (researchHandoff && researchAgentId) {
+      if (!await releaseParticipant(researchAgentId, 'code-phase-research-release-failed')) return null;
+    }
+    if (task.qaAgentId && !await releaseParticipant(task.qaAgentId, 'code-phase-qa-release-failed')) {
+      return null;
+    }
+
+    const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'code');
+    if (!acquired) {
+      await this.emitIntervention(task.projectId, devAgentId, taskId, {
+        phase: 'code-dev-acquire-failed',
+        devAgentId,
+      });
+      return null;
+    }
+
     const newToken = createSignalToken();
     const transition = await this.transitionTaskStatus(
       taskId,
       'in_progress',
       { fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready'] },
-      { phase: 'code', signalToken: newToken },
+      { agentId: devAgentId, phase: 'code', signalToken: newToken },
     );
-    if (!transition) return null;
+    if (!transition) {
+      await this.releaseAgentForTask(devAgentId, taskId, 'idle', { allowAwaitingHuman: true })
+        .catch(() => undefined);
+      return null;
+    }
     this.stopPhaseSignalWatcher(taskId);
-    const codeKind: PhaseSignalKind = task.reviewMode === 'server' ? 'code-done' : 'pr-created';
-    const codeArmed = await this.setupPhaseSignalWatcher(taskId, devAgentId, codeKind, newToken);
-    if (!codeArmed && task.reviewMode === 'server') {
-      await this.holdAgentForUnarmedSignal(taskId, devAgentId, codeKind);
-      return null;
-    }
-
-    if (task.qaAgentId) {
-      const released = await this.releaseAgentForTask(task.qaAgentId, taskId, 'idle')
-        .catch(() => false);
-      if (!released) {
-        await this.emitIntervention(task.projectId, task.qaAgentId, taskId, { phase: 'code-phase-qa-release-failed', qaAgentId: task.qaAgentId });
-      }
-    }
-
-    const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'code');
-    if (!acquired) {
-      await this.markAwaitingHuman(
-        devAgentId,
-        'code-dispatch-failed',
-        'Dev could not be acquired for the code phase after spec approval; the task looks in_progress but the code prompt was never dispatched. Resume the agent to redispatch or cancel the task.',
-        { expectedTaskId: taskId },
-      ).catch(() => undefined);
-      await this.emitIntervention(task.projectId, devAgentId, taskId, { phase: 'code-dev-acquire-failed', devAgentId });
-      return null;
-    }
-
-    let resumed = false;
+    let started = false;
     try {
-      resumed = await this.continueSession(taskId, devAgentId, 'code');
+      started = await this.dispatchCodePhasePrompt(
+        task,
+        devAgentId,
+        newToken,
+        stored.documents,
+      );
     } catch (err) {
       if (err instanceof DispatchTerminalError) {
         await this.failTaskForDispatchError(taskId, 'code', devAgentId, err);
@@ -6855,19 +7329,22 @@ export class AgentManager {
         ).catch(() => undefined);
       }
       console.error(
-        `[AgentManager] transitionToCodePhase continueSession(dev=${devAgentId}) failed:`,
+        `[AgentManager] transitionToCodePhase dispatch(dev=${devAgentId}) failed:`,
         err,
       );
       throw err;
     }
-    if (!resumed) {
+    if (!started) {
       await this.markAwaitingHuman(
         devAgentId,
         'code-dispatch-failed',
         'Code-phase prompt was not delivered after spec approval; the task looks in_progress but the dev never received it. Resume/restart the agent or cancel the task.',
         { expectedTaskId: taskId },
       ).catch(() => undefined);
-      await this.emitIntervention(task.projectId, devAgentId, taskId, { phase: 'code-resume-failed', devAgentId });
+      await this.emitIntervention(task.projectId, devAgentId, taskId, {
+        phase: researchHandoff ? 'code-start-failed' : 'code-resume-failed',
+        devAgentId,
+      });
       return null;
     }
     return await this.taskStore.get(taskId);
@@ -6877,7 +7354,7 @@ export class AgentManager {
   async dispatchServerReviewToQa(
     taskId: string,
     opts: {
-      phase: TaskPhase;
+      phase: ReviewPhase;
       recheck?: boolean;
       continuation?: boolean;
       content: string;
@@ -6902,21 +7379,24 @@ export class AgentManager {
       if (task.reviewMode !== 'server' && opts.phase !== 'spec') {
         throw new Error(`dispatchServerReviewToQa: task ${taskId} is not in server review mode`);
       }
-      let recordedQaId = task.qaAgentId;
-      if (recordedQaId && !this.getAgentConfig(recordedQaId)) {
-        console.warn(
-          `[dispatchServerReviewToQa] task ${taskId}.qaAgentId="${recordedQaId}" no longer in config; ` +
-          `falling back to findQaPartner(${task.agentId})`,
-        );
-        recordedQaId = undefined;
-      }
-      const qaId = recordedQaId ?? this.findQaPartner(task.agentId)?.id;
+      const qaId = task.qaAgentId;
       if (!qaId) {
         const entryKind: PhaseSignalKind = task.status === 'fixing'
           ? (opts.phase === 'spec' ? 'spec-fixed' : 'code-fixed')
           : (opts.phase === 'spec' ? 'spec-done' : 'code-done');
         await this.setupPhaseSignal(taskId, task.agentId, entryKind, { skipSnapshot: true });
         await this.emitIntervention(task.projectId, task.agentId, taskId, { phase: 'server-review-no-qa-partner', devAgentId: task.agentId });
+        return null;
+      }
+      if (this.getAgentConfig(qaId)?.role !== 'qa') {
+        const entryKind: PhaseSignalKind = task.status === 'fixing'
+          ? (opts.phase === 'spec' ? 'spec-fixed' : 'code-fixed')
+          : (opts.phase === 'spec' ? 'spec-done' : 'code-done');
+        await this.setupPhaseSignal(taskId, task.agentId, entryKind, { skipSnapshot: true });
+        await this.emitIntervention(task.projectId, task.agentId, taskId, {
+          phase: 'server-review-qa-unavailable',
+          qaAgentId: qaId,
+        });
         return null;
       }
       const roundField = opts.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
@@ -7002,7 +7482,6 @@ export class AgentManager {
       { fromStatus: ['in_progress', 'fixing', 'review'] },
       {
         signalToken: newToken,
-        qaAgentId: qaId,
         reviewDispatchedAt: new Date().toISOString(),
         ...(opts.reviewHeadAnchorSha ? { reviewHeadAnchorSha: opts.reviewHeadAnchorSha } : {}),
         ...(opts.batch
@@ -7105,7 +7584,7 @@ export class AgentManager {
     const claim = await this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task) throw new Error(`dispatchServerFixToDev: task ${taskId} not found`);
-      if (task.reviewMode !== 'server' && task.phase !== 'spec') {
+      if (task.reviewMode !== 'server' && !isSpecStagePhase(task.phase)) {
         throw new Error(`dispatchServerFixToDev: task ${taskId} is not in server review mode`);
       }
       if (!task.agentId) throw new Error(`dispatchServerFixToDev: task ${taskId} has no dev agent`);
@@ -7114,7 +7593,7 @@ export class AgentManager {
         qaAgentId: task.qaAgentId,
         projectId: task.projectId,
         newToken: createSignalToken(),
-        taskPhase: (task.phase ?? 'code') as TaskPhase,
+        taskPhase: task.phase,
         currentSpecRound: task.specReviewRound,
         originalStatus: task.status as TaskStatus,
         originalToken: task.signalToken,
@@ -7145,7 +7624,7 @@ export class AgentManager {
     }
 
     if (qaAgentId) {
-      const released = await this.releaseAgentForTask(qaAgentId, taskId, 'idle')
+      const released = await this.releaseAgentIfBound(qaAgentId, taskId)
         .catch(() => false);
       if (!released) {
         await rearmReviewedSignal();

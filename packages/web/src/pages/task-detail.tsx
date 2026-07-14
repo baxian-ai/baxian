@@ -13,6 +13,7 @@ import { useAgents, useTask } from '../hooks/use-events.ts';
 import { useProjects } from '../hooks/use-projects.ts';
 import { useT } from '../i18n/index.tsx';
 import {
+  isSpecStagePhase,
   REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
   type AgentConfig,
@@ -138,7 +139,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     try {
       const updated = await api.tasks.review(task.id);
       commitTaskExternal(updated);
-      const round = updated.phase === 'spec' ? (updated.specReviewRound ?? 0) : updated.reviewRound;
+      const round = isSpecStagePhase(updated.phase) ? (updated.specReviewRound ?? 0) : updated.reviewRound;
       show({ kind: 'success', title: t.agents.reReviewStarted(round) });
     } catch (err) {
       show({ kind: 'error', title: t.agents.reReviewStartFailed, body: err instanceof Error ? err.message : String(err) });
@@ -199,37 +200,59 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     }
   };
 
-  const handleSpecApprove = async () => {
+  const submitSpecVerdict = async (
+    body: { verdict: 'approve' | 'request-changes' | 'archive'; comments?: string },
+    toast: { success: string; failure: string },
+  ) => {
     if (!task) return;
-    if (!(await confirmDialog({ title: t.taskDetail.specApproveConfirmTitle, body: t.taskDetail.specApproveConfirmBody(task.id), confirmLabel: t.taskDetail.specApprove }))) return;
     setSpecSubmitting(true);
     try {
-      const updated = await api.tasks.spec(task.id, { verdict: 'approve' });
+      const updated = await api.tasks.spec(task.id, body);
       commitTaskExternal(updated);
       setSpecComments('');
-      show({ kind: 'success', title: t.taskDetail.specApprovedToastTitle });
+      show({ kind: 'success', title: toast.success });
     } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.specApproveFailedTitle, body: err instanceof Error ? err.message : String(err) });
+      show({ kind: 'error', title: toast.failure, body: err instanceof Error ? err.message : String(err) });
     } finally {
       setSpecSubmitting(false);
     }
   };
 
-  const handleSpecReject = async () => {
+  const handleSpecApprove = async () => {
     if (!task) return;
+    if (!(await confirmDialog({ title: t.taskDetail.specApproveConfirmTitle, body: t.taskDetail.specApproveConfirmBody(task.id), confirmLabel: t.taskDetail.specApprove }))) return;
+    await submitSpecVerdict(
+      { verdict: 'approve' },
+      { success: t.taskDetail.specApprovedToastTitle, failure: t.taskDetail.specApproveFailedTitle },
+    );
+  };
+
+  const handleSpecReject = async () => {
     const comments = specComments.trim();
     if (!comments) return;
-    setSpecSubmitting(true);
-    try {
-      const updated = await api.tasks.spec(task.id, { verdict: 'request-changes', comments });
-      commitTaskExternal(updated);
-      setSpecComments('');
-      show({ kind: 'success', title: t.taskDetail.specRejectedToastTitle });
-    } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.specRejectFailedTitle, body: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setSpecSubmitting(false);
-    }
+    await submitSpecVerdict(
+      { verdict: 'request-changes', comments },
+      {
+        success: task?.researchAgentId
+          ? t.taskDetail.specRejectedToastTitleResearch
+          : t.taskDetail.specRejectedToastTitle,
+        failure: t.taskDetail.specRejectFailedTitle,
+      },
+    );
+  };
+
+  const handleSpecArchive = async () => {
+    if (!task) return;
+    const confirmed = await confirmDialog({
+      title: t.taskDetail.specArchiveConfirmTitle,
+      body: t.taskDetail.specArchiveConfirmBody(task.id),
+      confirmLabel: t.taskDetail.specArchive,
+    });
+    if (!confirmed) return;
+    await submitSpecVerdict(
+      { verdict: 'archive' },
+      { success: t.taskDetail.specArchivedToastTitle, failure: t.taskDetail.specArchiveFailedTitle },
+    );
   };
 
   const handleCodeReject = async () => {
@@ -308,8 +331,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showMergeReadyAction = task.status === 'merge-ready' && task.prNumber !== undefined;
     const showSpecReadyAction = task.status === 'spec-ready';
     const showReadyGate = task.status === 'ready';
-    const showCodeMaxRounds = task.status === 'max_rounds' && task.phase !== 'spec';
-    const showSpecMaxRounds = task.status === 'max_rounds' && task.phase === 'spec';
+    const showCodeMaxRounds = task.status === 'max_rounds' && !isSpecStagePhase(task.phase);
+    const showSpecMaxRounds = task.status === 'max_rounds' && isSpecStagePhase(task.phase);
     const branchUrl = branchTreeUrl(task.prUrl, task.branch ?? '');
 
     return (
@@ -390,7 +413,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 {t.taskDetail.viewPr(task.prNumber ?? 0)}
               </a>
             )}
-            {task.reviewMode === 'server' && task.phase !== 'spec' && (
+            {task.reviewMode === 'server' && !isSpecStagePhase(task.phase) && (
               <div className="mt-3 flex flex-col gap-2">
                 <div className="text-og-700">{t.taskDetail.readyGateRejectHint}</div>
                 <textarea
@@ -440,7 +463,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           <div className="mb-4 rounded-lg border border-accent-soft bg-accent-soft/40 p-4 text-sm text-accent">
             <div className="font-semibold">{t.taskDetail.specReadyBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              {t.taskDetail.specReadyNotice(task.specReviewRound ?? 0)}
+              {task.researchAgentId
+                ? t.taskDetail.specReadyNoticeResearch(task.specReviewRound ?? 0)
+                : t.taskDetail.specReadyNotice(task.specReviewRound ?? 0)}
             </div>
             <div className="mt-3 flex flex-col gap-2">
               <textarea
@@ -464,11 +489,23 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                   type="button"
                   disabled={specSubmitting || specComments.trim() === ''}
                   onClick={handleSpecReject}
-                  title={specComments.trim() === '' ? t.taskDetail.specRejectTitleEmpty : t.taskDetail.specRejectTitleReady}
+                  title={specComments.trim() === ''
+                    ? t.taskDetail.specRejectTitleEmpty
+                    : t.taskDetail.specRejectTitleReady(task.researchAgentId ? 'Research' : 'Dev')}
                   className="btn-secondary"
                 >
                   {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specReject}
                 </button>
+                {task.researchAgentId && (
+                  <button
+                    type="button"
+                    disabled={specSubmitting}
+                    onClick={handleSpecArchive}
+                    className="btn-secondary"
+                  >
+                    {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specArchiveButton}
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -534,18 +571,24 @@ function TaskDetailView({ taskId }: { taskId: string }) {
       return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">{t.common.loading}</div>;
     }
     const project = projects.find((p) => p.id === task.projectId);
-    const devId = task.agentId || task.preferredAgentId;
-    const group = project?.agent.find((g) => g.some((a) => a.id === devId))
-      ?? (task.qaAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.qaAgentId)) : undefined);
-    const devConfig = group?.find((a) => a.role === 'dev');
-    const qaConfig = group?.find((a) => a.role === 'qa');
+    const group = project?.agent.find((g) => g.some((a) => a.id === task.devAgentId))
+      ?? (task.qaAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.qaAgentId)) : undefined)
+      ?? (task.researchAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.researchAgentId)) : undefined);
+    const devConfig = group?.find((a) => a.role === 'dev' && a.id === task.devAgentId);
+    const qaConfig = task.qaAgentId
+      ? group?.find((a) => a.role === 'qa' && a.id === task.qaAgentId)
+      : undefined;
+    const researchConfig = task.researchAgentId
+      ? group?.find((a) => a.role === 'research' && a.id === task.researchAgentId)
+      : undefined;
 
-    if (!devConfig && !qaConfig) {
+    if (!devConfig && !qaConfig && !researchConfig) {
       return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">{t.taskDetail.noLinkedAgent}</div>;
     }
 
     return (
       <>
+        {researchConfig ? renderAgentCard(task, researchConfig) : null}
         {devConfig ? renderAgentCard(task, devConfig) : <AgentSlotPlaceholder role="dev" />}
         {qaConfig ? renderAgentCard(task, qaConfig) : <AgentSlotPlaceholder role="qa" />}
       </>
@@ -581,14 +624,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
 
   function renderActions(task: TaskState) {
     const isMaxRounds = task.status === 'max_rounds';
-    const isCodeMaxRounds = isMaxRounds && task.phase !== 'spec';
-    const isSpecMaxRounds = isMaxRounds && task.phase === 'spec';
+    const isCodeMaxRounds = isMaxRounds && !isSpecStagePhase(task.phase);
+    const isSpecMaxRounds = isMaxRounds && isSpecStagePhase(task.phase);
     const isGate = task.status === 'ready' || task.status === 'merge-ready';
     const editEnabled = task.status === 'pending';
     const retryEnabled =
       (RETRYABLE_STATUSES.has(task.status) || isSpecMaxRounds) && !!task.preferredAgentId;
     const isServerMode = task.reviewMode === 'server';
-    const serverStyleReview = isServerMode || task.phase === 'spec';
+    const serverStyleReview = isServerMode || isSpecStagePhase(task.phase);
     const serverReviewUnphased = task.status === 'in_progress' && task.phase === undefined;
     const serverReviewableNow = !serverReviewUnphased && (task.status === 'in_progress'
       || task.status === 'review' || task.status === 'fixing');

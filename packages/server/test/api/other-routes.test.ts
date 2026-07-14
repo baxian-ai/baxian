@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import type { BaxianConfig, BaxianEvent, ProjectConfig } from '../../src/shared/index.js';
@@ -180,6 +180,147 @@ describe('PATCH /api/config', () => {
     }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(409);
     expect((app.ctx.config.project[0].agent[0][0]).host).toBe('box');
+  });
+
+  it('rejects changing the Workdir of a task-bound agent and leaves memory and disk unchanged', async () => {
+    const configPath = await seedConfigPath(app, tempDir);
+    const currentWorkdir = app.ctx.config.project[0].agent[0][0].workdir!;
+    await app.ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      taskId: 'task-1',
+      workdir: currentWorkdir,
+      updatedAt: new Date().toISOString(),
+    });
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(pair => pair.map(agent =>
+        agent.id === 'dev-1' ? { ...agent, workdir: `${currentWorkdir}-new` } : agent)),
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/Workdir.*dev-1/i);
+    expect(app.ctx.config.project[0].agent[0][0].workdir).toBe(currentWorkdir);
+    expect(await readFile(configPath, 'utf8')).toBe('{}');
+  });
+
+  it.each([
+    ['bootstrap', { creationToken: 'creating' }, false],
+    ['persisted pane', { paneId: '%9' }, false],
+    ['tmux session', {}, true],
+  ])('rejects changing Workdir while the agent has a live %s fact', async (_label, facts, liveTmux) => {
+    await seedConfigPath(app, tempDir);
+    const currentWorkdir = app.ctx.config.project[0].agent[0][0].workdir!;
+    await app.ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      workdir: currentWorkdir,
+      ...facts,
+      updatedAt: new Date().toISOString(),
+    });
+    if (liveTmux) {
+      app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'present' });
+    }
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(pair => pair.map(agent =>
+        agent.id === 'dev-1' ? { ...agent, workdir: `${currentWorkdir}-new` } : agent)),
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(app.ctx.config.project[0].agent[0][0].workdir).toBe(currentWorkdir);
+  });
+
+  it('rejects changing the Workdir of a live remote agent', async () => {
+    await seedConfigPath(app, tempDir);
+    app.ctx.config = {
+      ...app.ctx.config,
+      host: [{ id: 'box', hostname: 'remote.example', user: 'runner' }],
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[{
+          id: 'rdev',
+          runtime: 'claude-code',
+          role: 'dev',
+          mode: 'remote',
+          host: 'box',
+          workdir: '/srv/repo',
+        }]],
+      }],
+    };
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
+    await app.ctx.agentStore.set({
+      id: 'rdev',
+      projectId: 'proj',
+      taskId: 'task-remote',
+      workdir: '/srv/repo',
+      updatedAt: new Date().toISOString(),
+    });
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(pair => pair.map(agent => ({ ...agent, workdir: '/srv/repo-new' }))),
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(app.ctx.config.project[0].agent[0][0].workdir).toBe('/srv/repo');
+  });
+
+  it('rejects removing a live agent through bulk config replacement', async () => {
+    await seedConfigPath(app, tempDir);
+    const currentProjects = app.ctx.config.project;
+    await app.ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      taskId: 'task-1',
+      workdir: currentProjects[0].agent[0][0].workdir,
+      updatedAt: new Date().toISOString(),
+    });
+    const nextProjects = currentProjects.map(project => ({
+      ...project,
+      agent: [],
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/configuration entry.*dev-1/i);
+    expect(app.ctx.config.project[0].agent.flat().some(agent => agent.id === 'dev-1')).toBe(true);
+  });
+
+  it('allows an idle agent to change Workdir and releases only its old canonical owner claim', async () => {
+    const configPath = await seedConfigPath(app, tempDir);
+    const currentWorkdir = app.ctx.config.project[0].agent[0][0].workdir!;
+    const nextWorkdir = `${currentWorkdir}-new`;
+    await app.ctx.agentStore.set({
+      id: 'dev-1',
+      projectId: 'proj',
+      workdir: currentWorkdir,
+      updatedAt: new Date().toISOString(),
+    });
+    app.ctx.agentManager.getRepoCache().owners.set(`local:${currentWorkdir}`, 'dev-1');
+    app.ctx.agentManager.getRepoCache().owners.set('local:/qa', 'qa-1');
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: project.agent.map(pair => pair.map(agent =>
+        agent.id === 'dev-1' ? { ...agent, workdir: nextWorkdir } : agent)),
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(200);
+    expect(app.ctx.config.project[0].agent[0][0].workdir).toBe(nextWorkdir);
+    expect(app.ctx.agentManager.getConfig().project[0].agent[0][0].workdir).toBe(nextWorkdir);
+    expect(app.ctx.agentManager.getRepoCache().owners.has(`local:${currentWorkdir}`)).toBe(false);
+    expect(app.ctx.agentManager.getRepoCache().owners.get('local:/qa')).toBe('qa-1');
+    expect(JSON.parse(await readFile(configPath, 'utf8')).project[0].agent[0][0].workdir).toBe(nextWorkdir);
   });
 
   it('rejects PATCH with out-of-range server.githubPollIntervalMs and preserves existing valid value', async () => {

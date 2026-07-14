@@ -1,5 +1,5 @@
 export type AgentRuntime = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
-export type AgentRole = 'dev' | 'qa';
+export type AgentRole = 'dev' | 'qa' | 'research';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
@@ -102,7 +102,12 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled';
 
-export type TaskPhase = 'spec' | 'code';
+export type TaskPhase = 'research' | 'spec' | 'code';
+export type ReviewPhase = 'spec' | 'code';
+
+export function isSpecStagePhase(phase: TaskPhase | undefined): boolean {
+  return phase === 'research' || phase === 'spec';
+}
 
 type AgentLifecycleStatus = 'ok' | 'awaiting_human';
 
@@ -163,7 +168,9 @@ export interface TaskState {
   description: string;
   preferredAgentId: string;
   agentId: string;
+  devAgentId: string;
   qaAgentId?: string;
+  researchAgentId?: string;
   prNumber?: number;
   prUrl?: string;
   branch?: string;
@@ -228,14 +235,23 @@ export interface ReviewResponse {
 }
 
 interface SpecUserDecision {
-  verdict: 'approve' | 'request-changes';
+  verdict: 'approve' | 'request-changes' | 'archive';
   comments?: string;
   at: string;
 }
 
-export interface ReviewRound {
+export interface SpecDocument {
+  relPath: string;
+  content: string;
+}
+
+export function renderSpecDocuments(documents: readonly SpecDocument[]): string {
+  if (documents.length === 1) return documents[0]!.content;
+  return documents.map(document => `=== ${document.relPath} ===\n${document.content}`).join('\n');
+}
+
+interface ReviewRoundBase {
   round: number;
-  phase: TaskPhase;
   content: string;
   contentTruncated?: boolean;
   diffstat?: string;
@@ -249,6 +265,17 @@ export interface ReviewRound {
   startedAt: string;
   completedAt?: string;
 }
+
+export interface SpecReviewRound extends ReviewRoundBase {
+  phase: 'spec';
+  documents: SpecDocument[];
+}
+
+export interface CodeReviewRound extends ReviewRoundBase {
+  phase: 'code';
+}
+
+export type ReviewRound = SpecReviewRound | CodeReviewRound;
 
 type GithubReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
 

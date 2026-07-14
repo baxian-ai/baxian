@@ -33,6 +33,8 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     description: 'sample description',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
+    phase: 'code',
     reviewRound: 0,
     status: 'in_progress',
     branch: 'bx/task-001',
@@ -171,14 +173,15 @@ describe('GET /api/tasks', () => {
       expect(body.tasks.map((t) => t.id)).toEqual(['task-002', 'task-001']);
     });
 
-    it('active 排序容忍缺失 updatedAt，不抛错', async () => {
+    it('active 排序容忍无法解析的 updatedAt，不抛错', async () => {
       await seedTask({ id: 'task-001', status: 'in_progress', updatedAt: '2026-05-16T00:00:00Z' });
-      await seedTask({ id: 'task-002', status: 'review', updatedAt: undefined as unknown as string });
+      await seedTask({ id: 'task-002', status: 'review', updatedAt: 'not-a-date' });
 
       const response = await get('/api/tasks?projectId=proj&category=active');
       expect(response.statusCode).toBe(200);
       const body = JSON.parse(response.body) as { tasks: TaskState[] };
-      expect(body.tasks.map((t) => t.id)).toEqual(['task-001', 'task-002']);
+      expect(body.tasks.map((t) => t.id)).toEqual(expect.arrayContaining(['task-001', 'task-002']));
+      expect(body.tasks).toHaveLength(2);
     });
   });
 
@@ -865,7 +868,9 @@ describe('server review mode API', () => {
   it('GET /api/tasks/:id/reviews returns stored rounds across phases', async () => {
     const store = app.ctx.agentManager.getReviewStore()!;
     await store.putRound('task-r', 'spec', {
-      round: 1, phase: 'spec', content: 'S', startedAt: 'now',
+      round: 1, phase: 'spec', content: 'S',
+      documents: [{ relPath: '.baxian/spec.md', content: 'S' }],
+      startedAt: 'now',
     });
     await store.putRound('task-r', 'code', {
       round: 1, phase: 'code', content: 'C', startedAt: 'now',

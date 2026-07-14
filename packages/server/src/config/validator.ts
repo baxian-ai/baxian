@@ -10,7 +10,7 @@ export interface ValidationError {
 }
 
 const VALID_RUNTIMES: AgentRuntime[] = ['claude-code', 'codex', 'opencode', 'qodercli'];
-const VALID_ROLES: AgentRole[] = ['dev', 'qa'];
+const VALID_ROLES: AgentRole[] = ['dev', 'qa', 'research'];
 const VALID_MODES: AgentMode[] = ['local', 'remote'];
 const VALID_MERGE: MergeStrategy[] = ['auto', null];
 const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', null, undefined];
@@ -236,7 +236,7 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
       errors.push({ path: `${path}.specApproval`, message: 'project.specApproval must be "human" or null' });
     }
     if (!Array.isArray(project.agent)) {
-      errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of pairs' });
+      errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of agent groups' });
     }
   }
 }
@@ -395,25 +395,32 @@ function configuredAgentHostKey(
 
 function validateAgentPairs(config: BaxianConfig, errors: ValidationError[]): void {
   for (const project of config.project) {
+    if (!Array.isArray(project.agent)) continue;
     for (let i = 0; i < project.agent.length; i++) {
-      const pair = project.agent[i];
+      const group = project.agent[i];
       const path = `project.${project.id}.agent[${i}]`;
 
-      if (pair.length === 0) {
-        errors.push({ path, message: 'Agent pair cannot be empty' });
+      if (!Array.isArray(group)) {
+        errors.push({ path, message: 'Agent group must be an array' });
         continue;
       }
-
-      if (pair[0].role !== 'dev') {
-        errors.push({ path: `${path}[0]`, message: 'The first agent in a pair must have role "dev"' });
+      if (group.length === 0) {
+        errors.push({ path, message: 'Agent group cannot be empty' });
+        continue;
       }
-
-      if (pair.length > 1 && pair[1].role !== 'qa') {
-        errors.push({ path: `${path}[1]`, message: 'The second agent in a pair must have role "qa"' });
+      if (group.length > 3) {
+        errors.push({ path, message: 'Agent group can have at most 3 agents' });
       }
-
-      if (pair.length > 2) {
-        errors.push({ path, message: 'Agent pair can have at most 2 agents' });
+      const counts = new Map<AgentRole, number>();
+      for (const agent of group) counts.set(agent.role, (counts.get(agent.role) ?? 0) + 1);
+      if (counts.get('dev') !== 1) {
+        errors.push({ path, message: 'Agent group must contain exactly one dev agent' });
+      }
+      if ((counts.get('qa') ?? 0) > 1) {
+        errors.push({ path, message: 'Agent group can contain at most one qa agent' });
+      }
+      if ((counts.get('research') ?? 0) > 1) {
+        errors.push({ path, message: 'Agent group can contain at most one research agent' });
       }
     }
   }

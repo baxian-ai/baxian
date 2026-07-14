@@ -50,6 +50,8 @@ async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise
     description: 'seeded task',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
+    phase: 'code',
     reviewRound: 0,
     status: 'in_progress',
     branch: `bx/${overrides.id}`,
@@ -178,7 +180,7 @@ describe('dispatchPendingTask', () => {
     expect(result.error).toMatch(/agentId is required/);
   });
 
-  it('falls back to current QA partner when fresh.qaAgentId is missing (task created before QA was paired)', async () => {
+  it('keeps the snapshotted participants when a pending task has no QA', async () => {
     stubStartSession(true);
 
     const task = await seedTask({
@@ -193,7 +195,7 @@ describe('dispatchPendingTask', () => {
 
     expect(result.errorCode).toBeUndefined();
     const updated = await taskStore.get(task.id);
-    expect(updated!.qaAgentId).toBe('qa-1');
+    expect(updated!.qaAgentId).toBeUndefined();
   });
 
   it('returns 409 when agent is busy (canDispatchWithBinding=false), leaves task untouched', async () => {
@@ -243,11 +245,11 @@ describe('dispatchPendingTask', () => {
     expect(result.errorCode).toBe(400);
   });
 
-  it('returns 400 when the requested agent is not dev role', async () => {
+  it('returns 400 when the requested agent is neither dev nor research role', async () => {
     const task = await seedPending('task-role', '');
     const result = await manager.dispatchPendingTask(task.id, 'qa-1');
     expect(result.errorCode).toBe(400);
-    expect(result.error).toMatch(/not dev role/);
+    expect(result.error).toMatch(/not dev or research role/);
   });
 
   it('returns 400 when a known dev is requested for a task preferring another dev', async () => {

@@ -25,6 +25,9 @@ function devAgent(id: string, extra: Record<string, unknown> = {}): Record<strin
 function qaAgent(id: string, pairWith: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return { id, runtime: 'codex', role: 'qa', mode: 'local', yolo: true, pairWith, ...extra };
 }
+function researchAgent(id: string, pairWith: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { id, runtime: 'claude-code', role: 'research', mode: 'local', yolo: true, pairWith, ...extra };
+}
 
 function createProject(id: string, extra: Record<string, unknown> = {}): ReturnType<typeof post> {
   return post('/api/projects', { id, repo: 'a/b', ...extra });
@@ -52,8 +55,11 @@ function seedAgent(id: string, projectId: string, extra: Partial<AgentFacts> = {
 }
 
 function seedTask(id: string, projectId: string, extra: Partial<TaskFacts> = {}): Promise<void> {
+  const devAgentId = extra.devAgentId ?? extra.agentId ?? extra.preferredAgentId ?? '';
   return app.ctx.taskStore.set({
     id, projectId, title: 't', description: 'd', reviewRound: 0,
+    preferredAgentId: devAgentId, agentId: devAgentId, devAgentId,
+    phase: 'code', status: 'pending',
     createdAt: now(), updatedAt: now(), ...extra,
   } as TaskFacts);
 }
@@ -389,6 +395,31 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(proj.agent[0][1].id).toBe('pp3-qa');
   });
 
+  it('adds QA and Research independently to the same dev group', async () => {
+    await projectWithDev('prg', 'prg-dev');
+    expect((await addAgent('prg', qaAgent('prg-qa', 'prg-dev'))).statusCode).toBe(201);
+
+    const response = await addAgent('prg', researchAgent('prg-research', 'prg-dev'));
+
+    expect(response.statusCode).toBe(201);
+    expect(findProject('prg').agent[0]).toEqual([
+      expect.objectContaining({ id: 'prg-dev', role: 'dev' }),
+      expect.objectContaining({ id: 'prg-qa', role: 'qa' }),
+      expect.objectContaining({ id: 'prg-research', role: 'research' }),
+    ]);
+  });
+
+  it('rejects a second Research agent in the same dev group', async () => {
+    await projectWithDev('pr2', 'pr2-dev');
+    expect((await addAgent('pr2', researchAgent('pr2-research-1', 'pr2-dev'))).statusCode).toBe(201);
+
+    const response = await addAgent('pr2', researchAgent('pr2-research-2', 'pr2-dev'));
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(/has no research yet/);
+    expect(findProject('pr2').agent[0].filter(agent => agent.role === 'research')).toHaveLength(1);
+  });
+
   it('returns 404 when project does not exist', async () => {
     const response = await addAgent('no-such', { id: 'xx', runtime: 'codex', role: 'dev', mode: 'local', yolo: true });
     expect(response.statusCode).toBe(404);
@@ -496,7 +527,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     await projectWithDev('pdp', 'pdp-dev');
     const response = await addAgent('pdp', devAgent('pdp-dev2', { pairWith: 'pdp-dev' }));
     expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/pairWith only valid for role=qa/);
+    expect(JSON.parse(response.body).error).toMatch(/pairWith is only valid for qa or research agents/);
   });
 
   it('adding a qa leaves unrelated pairs untouched (multi-pair project)', async () => {
@@ -891,6 +922,44 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-q/);
     expect(findProject('ref-q').agent[0]).toHaveLength(2);
+  });
+
+  it('refuses deleting an unbound Dev referenced only via devAgentId by an active task', async () => {
+    await projectWithDev('ref-d', 'ref-d-dev');
+    await seedAgent('ref-d-dev', 'ref-d', { status: 'idle' });
+    await seedTask('task-ref-d', 'ref-d', {
+      preferredAgentId: '',
+      agentId: '',
+      devAgentId: 'ref-d-dev',
+      status: 'in_progress',
+    });
+
+    const response = await del('/api/projects/ref-d/agents/ref-d-dev');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-d/);
+    expect(findProject('ref-d').agent[0][0].id).toBe('ref-d-dev');
+  });
+
+  it('refuses deleting an unbound Research referenced via researchAgentId by an active code task', async () => {
+    await projectWithDev('ref-r', 'ref-r-dev');
+    await addAgent('ref-r', researchAgent('ref-r-research', 'ref-r-dev'));
+    await seedAgent('ref-r-research', 'ref-r', { status: 'idle' });
+    await seedTask('task-ref-r', 'ref-r', {
+      preferredAgentId: 'ref-r-research',
+      agentId: 'ref-r-dev',
+      devAgentId: 'ref-r-dev',
+      researchAgentId: 'ref-r-research',
+      phase: 'code',
+      status: 'in_progress',
+    });
+
+    const response = await del('/api/projects/ref-r/agents/ref-r-research');
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-r/);
+    expect(findProject('ref-r').agent[0]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'ref-r-dev' }),
+      expect.objectContaining({ id: 'ref-r-research' }),
+    ]));
   });
 
   it('409 when a non-awaiting agent is locked by another op', async () => {

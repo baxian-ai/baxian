@@ -34,6 +34,7 @@ const CONFIG: BaxianConfig = {
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
       { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+      { id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: '/tmp/research-repo' },
     ]],
   }],
 };
@@ -49,6 +50,14 @@ const events: BaxianEvent[] = [];
 function noopRunner(): CommandRunner {
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+      const agentId = cmd.match(/=([^':\s]+)/)?.[1];
+      if (agentId && cmd.includes('tmux show-option') && cmd.includes('@baxian-agent-id')) {
+        return { stdout: `${agentId}\n`, stderr: '', exitCode: 0 };
+      }
+      if (agentId && cmd.includes('tmux list-panes')) {
+        const runtime = agentId === 'qa-1' ? 'codex' : 'claude';
+        return { stdout: `%1 ${runtime}\n`, stderr: '', exitCode: 0 };
+      }
       if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
         return { stdout: 'claude\n', stderr: '', exitCode: 0 };
       }
@@ -78,6 +87,7 @@ function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void>
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     branch: `bx/${overrides.id}`,
     reviewRound: 0,
     status: 'in_progress',
@@ -313,7 +323,7 @@ describe('recover()', () => {
         id: 'qa-1', taskId: 'task-active', paneId: '%0', status: 'awaiting_human',
         awaitingPhase: 'dispatch-failed:ack_unknown', awaitingReason: 'simulated ack_unknown', awaitingSince: NOW,
       }],
-      tasks: [{ id: 'task-active', preferredAgentId: 'qa-1', agentId: 'qa-1', reviewRound: 1, status: 'review' }],
+      tasks: [{ id: 'task-active', qaAgentId: 'qa-1', reviewRound: 1, status: 'review' }],
       locks: ['qa-1'],
     });
 
@@ -402,6 +412,77 @@ describe('recover()', () => {
 
     await expectRolledBack('task-1', 'dev-1');
     expect(watchSpy).not.toHaveBeenCalled();
+  });
+
+  it('holds an interrupted code handoff for an explicit Resume instead of rolling it back', async () => {
+    await runRecovery({
+      agents: [{ id: 'dev-1', taskId: 'task-code', bootstrappingTaskId: 'task-code' }],
+      tasks: [{ id: 'task-code', phase: 'code', specReviewRound: 1 }],
+    });
+
+    expect(await taskStore.get('task-code')).toMatchObject({
+      status: 'in_progress',
+      agentId: 'dev-1',
+      phase: 'code',
+    });
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      taskId: 'task-code',
+      status: 'awaiting_human',
+      awaitingPhase: 'code-dispatch-failed',
+      awaitingReason: expect.stringContaining('Code-phase handoff was interrupted'),
+    });
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
+  });
+
+  it('rolls back an undelivered Research bootstrap without changing its stable participants', async () => {
+    await runRecovery({
+      agents: [{ id: 'research-1', taskId: 'task-research', bootstrappingTaskId: 'task-research' }],
+      tasks: [{
+        id: 'task-research',
+        preferredAgentId: 'research-1',
+        agentId: 'research-1',
+        devAgentId: 'dev-1',
+        researchAgentId: 'research-1',
+        phase: 'research',
+      }],
+    });
+
+    await expectRolledBack('task-research', 'research-1');
+    expect(await taskStore.get('task-research')).toMatchObject({
+      devAgentId: 'dev-1',
+      researchAgentId: 'research-1',
+      phase: 'research',
+    });
+  });
+
+  it('releases a Dev bootstrap marker left behind before a spec-ready code transition', async () => {
+    await runRecovery({
+      agents: [{
+        id: 'dev-1',
+        taskId: 'task-spec-ready',
+        bootstrappingTaskId: 'task-spec-ready',
+        workdir: '/tmp/repo',
+      }],
+      tasks: [{
+        id: 'task-spec-ready',
+        preferredAgentId: 'research-1',
+        agentId: 'research-1',
+        devAgentId: 'dev-1',
+        researchAgentId: 'research-1',
+        phase: 'spec',
+        status: 'spec-ready',
+      }],
+    });
+
+    expect(await taskStore.get('task-spec-ready')).toMatchObject({
+      status: 'spec-ready',
+      agentId: 'research-1',
+      devAgentId: 'dev-1',
+    });
+    expect(await agentStore.get('dev-1')).toMatchObject({ workdir: '/tmp/repo' });
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
   it('rolls back a mid-bootstrap task without deleting the fixed Workdir', async () => {
@@ -694,11 +775,25 @@ describe('setupRecoveredSpecSignals()', () => {
   }
 
   it.each<[string, Partial<TaskState> & { id: string }, unknown]>([
-    ['sets up spec-done|pr-created when phase is undefined (pre-spec-review) and status is in_progress',
+    ['sets up spec-done|pr-created when Dev-SDD has not chosen a path yet',
       { id: 'task-1', signalToken: 'tok-ready' },
       {
         taskId: 'task-1', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-done', 'pr-created'], token: 'tok-ready',
+        skipSnapshot: false, recovered: true, onNeedInput: expect.any(Function),
+      }],
+    ['sets up spec-done for an in-progress Research task',
+      {
+        id: 'task-research',
+        preferredAgentId: 'research-1',
+        agentId: 'research-1',
+        researchAgentId: 'research-1',
+        phase: 'research',
+        signalToken: 'tok-research',
+      },
+      {
+        taskId: 'task-research', projectId: 'proj', agentId: 'research-1',
+        expectedKinds: ['spec-done'], token: 'tok-research',
         skipSnapshot: false, recovered: true, onNeedInput: expect.any(Function),
       }],
     ['sets up pr-created for code-phase tasks (dispatched after spec approval)',
@@ -886,7 +981,7 @@ describe('setupRecoveredSpecSignals()', () => {
     expect('onReadFile' in args).toBe(false);
   });
 
-  it('does NOT emit intervention for pre-spec (spec-done|pr-created) recovered tasks', async () => {
+  it('does NOT emit intervention for recovered pre-spec Dev-SDD tasks', async () => {
     await seedTask({ id: 'task-pre-spec', signalToken: 'tok-pre-spec' });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
 

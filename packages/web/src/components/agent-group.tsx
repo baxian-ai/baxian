@@ -1,5 +1,5 @@
 import type { AgentConfig, AgentSnapshot, TaskState } from '../shared/index.js';
-import { TASK_ACTIVE_STATUS_SET } from '../shared/index.js';
+import { TASK_ACTIVE_STATUS_SET, isSpecStagePhase } from '../shared/index.js';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AgentCard, type TerminalMode } from './agent-card.tsx';
@@ -32,19 +32,13 @@ export function AgentGroup({
 }: AgentGroupProps) {
   const t = useT();
   const dev = group.find(agent => agent.role === 'dev') ?? group[0];
-  const qa = group.find(agent => agent.role === 'qa');
-  const activeTasks = tasks.filter(task => taskBelongsToGroup(task, dev?.id, qa?.id));
+  const research = group.find(agent => agent.role === 'research');
+  const activeTasks = tasks.filter(task => taskBelongsToGroup(task, dev?.id));
   const claimableTasks = dev
     ? tasks
-        .filter(task => claimableForDev(task, projectId, dev.id))
+        .filter(task => claimableForGroup(task, projectId, dev.id, research?.id))
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     : [];
-  const devSnapshot = dev ? agentsById.get(dev.id) : undefined;
-  const devDispatchReady = !!devSnapshot
-    && devSnapshot.runtimeStatus === 'idle'
-    && devSnapshot.binding?.status !== 'awaiting_human'
-    && !devSnapshot.binding?.creationToken
-    && !devSnapshot.binding?.taskId;
 
   const label = `Agent group ${group.map(agent => agent.id).join(' / ')}`;
   const navigate = useNavigate();
@@ -72,14 +66,14 @@ export function AgentGroup({
         <ClaimableList
           tasks={claimableTasks}
           devId={dev.id}
-          dispatchReady={devDispatchReady}
+          agentsById={agentsById}
           label={label}
         />
       )}
       {activeTasks.length > 0 && (
         <div className="card mb-2 max-h-28 overflow-y-auto divide-y divide-hairline">
           {activeTasks.map(task => {
-            const round = task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+            const round = isSpecStagePhase(task.phase) ? (task.specReviewRound ?? 0) : task.reviewRound;
             return (
               <button
                 key={task.id}
@@ -145,21 +139,29 @@ export function AgentGroup({
 interface ClaimableListProps {
   tasks: TaskState[];
   devId: string;
-  dispatchReady: boolean;
+  agentsById: Map<string, AgentSnapshot>;
   label: string;
 }
 
-function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProps) {
+function isAgentDispatchReady(agent: AgentSnapshot | undefined): boolean {
+  return !!agent
+    && agent.runtimeStatus === 'idle'
+    && agent.binding?.status !== 'awaiting_human'
+    && !agent.binding?.creationToken
+    && !agent.binding?.taskId;
+}
+
+function ClaimableList({ tasks, devId, agentsById, label }: ClaimableListProps) {
   const t = useT();
   const { show } = useToast();
   const navigate = useNavigate();
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
 
-  const handleDispatch = async (taskId: string) => {
+  const handleDispatch = async (taskId: string, targetId: string) => {
     setBusyTaskId(taskId);
     try {
-      await api.tasks.dispatch(taskId, { agentId: devId });
-      show({ kind: 'success', title: t.agents.taskHandedTo(taskId, devId) });
+      await api.tasks.dispatch(taskId, { agentId: targetId });
+      show({ kind: 'success', title: t.agents.taskHandedTo(taskId, targetId) });
     } catch (err) {
       show({
         kind: 'error',
@@ -178,6 +180,8 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
       aria-label={`${label} claimable tasks for ${devId}`}
     >
       {tasks.map(task => {
+        const targetId = task.preferredAgentId || devId;
+        const dispatchReady = isAgentDispatchReady(agentsById.get(targetId));
         const unassigned = task.preferredAgentId === '';
         const busy = busyTaskId !== null;
         return (
@@ -196,9 +200,9 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
             </button>
             <button
               type="button"
-              onClick={() => void handleDispatch(task.id)}
+              onClick={() => void handleDispatch(task.id, targetId)}
               disabled={!dispatchReady || busy}
-              title={dispatchReady ? t.agents.handToAndStart(devId) : t.agents.devAgentUnavailable}
+              title={dispatchReady ? t.agents.handToAndStart(targetId) : t.agents.agentUnavailable(targetId)}
               className="shrink-0 text-sm font-medium text-accent transition-colors hover:text-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {busyTaskId === task.id ? t.agents.starting : t.agents.start}
@@ -210,16 +214,20 @@ function ClaimableList({ tasks, devId, dispatchReady, label }: ClaimableListProp
   );
 }
 
-function taskBelongsToGroup(task: TaskState, devId: string | undefined, qaId: string | undefined): boolean {
+function taskBelongsToGroup(task: TaskState, devId: string | undefined): boolean {
   if (!devId || !TASK_ACTIVE_STATUS_SET.has(task.status)) return false;
-  const devMatches = task.agentId === devId || task.preferredAgentId === devId;
-  if (!devMatches) return false;
-  if (qaId && task.qaAgentId && task.qaAgentId !== qaId) return false;
-  return true;
+  return task.devAgentId === devId;
 }
 
-function claimableForDev(task: TaskState, projectId: string, devId: string): boolean {
+function claimableForGroup(
+  task: TaskState,
+  projectId: string,
+  devId: string,
+  researchId: string | undefined,
+): boolean {
   if (task.projectId !== projectId) return false;
   if (task.status !== 'pending') return false;
-  return task.preferredAgentId === devId || task.preferredAgentId === '';
+  return task.preferredAgentId === devId
+    || task.preferredAgentId === researchId
+    || task.preferredAgentId === '';
 }

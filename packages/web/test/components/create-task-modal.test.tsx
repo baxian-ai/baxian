@@ -105,7 +105,7 @@ function descriptionInput(): HTMLTextAreaElement {
 }
 
 function devSelect(): HTMLSelectElement {
-  return screen.getByLabelText('Dev agent') as HTMLSelectElement;
+  return screen.getByLabelText('Target agent') as HTMLSelectElement;
 }
 
 function restoreHint(): HTMLElement | null {
@@ -460,6 +460,43 @@ describe('CreateTaskModal — images', () => {
 });
 
 describe('CreateTaskModal — Dev agent defaults to the first available dev', () => {
+  it('lists Research as an explicit target and submits the selected Research agent', async () => {
+    projectsListMock.mockResolvedValue([
+      makeProject({
+        agent: [[
+          { id: 'bx-dev', runtime: 'claude-code', role: 'dev', mode: 'local' },
+          { id: 'bx-qa', runtime: 'codex', role: 'qa', mode: 'local' },
+          { id: 'bx-research', runtime: 'claude-code', role: 'research', mode: 'local' },
+        ]],
+      }),
+    ]);
+    agentsListMock.mockResolvedValue([
+      makeAgent('bx-dev'),
+      makeAgent('bx-qa'),
+      makeAgent('bx-research'),
+    ]);
+    tasksCreateMock.mockResolvedValue(makeTask({
+      id: 'task-research',
+      preferredAgentId: 'bx-research',
+      agentId: 'bx-research',
+      researchAgentId: 'bx-research',
+      phase: 'research',
+      status: 'in_progress',
+    }));
+    await mountModal({ projectId: 'baxian' });
+
+    expect(screen.getByRole('option', { name: 'bx-research (Research first)' })).toBeTruthy();
+    fireEvent.change(devSelect(), { target: { value: 'bx-research' } });
+    fireEvent.change(titleInput(), { target: { value: '调研存储方案' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await flushApi();
+
+    expect(tasksCreateMock).toHaveBeenCalledWith(expect.objectContaining({
+      preferredAgentId: 'bx-research',
+      projectId: 'baxian',
+    }));
+  });
+
   it('defaults the Dev select to the first available dev once agents load, with "Not assigned yet" as the first option', async () => {
     projectsListMock.mockResolvedValue([
       makeProject({

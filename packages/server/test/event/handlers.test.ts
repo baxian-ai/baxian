@@ -110,6 +110,8 @@ async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise
     description: 'seeded task',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     prNumber: 58,
     branch: `bx/${overrides.id}`,
     reviewRound: 0,
@@ -262,7 +264,7 @@ describe('pr.created handler', () => {
     expect(task!.prUrl).toBe('https://github.com/user/repo/pull/58');
     expect(startSpy).toHaveBeenCalledWith('task-001', 'qa-1', 'review');
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-001');
-    expect(updateSpy).toHaveBeenCalledWith('task-001', { qaAgentId: 'qa-1' });
+    expect(updateSpy).not.toHaveBeenCalledWith('task-001', { qaAgentId: 'qa-1' });
   });
 
   it('verdict watcher fails to arm → atomically rolls back to in_progress (status+token+anchor), releases QA + intervention', async () => {
@@ -278,7 +280,7 @@ describe('pr.created handler', () => {
     const task = await taskStore.get('task-noarm');
     expect(task!.status).toBe('in_progress');
     expect(task!.signalToken).toBe('dev-token');
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
     expect(findInterventionByPhase('qa-review-arm-failed')).toBeDefined();
   });
 
@@ -529,7 +531,7 @@ describe('pr.created handler', () => {
     };
     const { manager: lonelyManager, bus: localBus } = await makeLocalHandlers(noQaConfig, 'events-lonely');
 
-    await seedTask({ id: 'task-noqa', status: 'in_progress', reviewRound: 0 });
+    await seedTask({ id: 'task-noqa', status: 'in_progress', reviewRound: 0, qaAgentId: undefined });
     const startSpy = vi.spyOn(lonelyManager, 'startSession').mockResolvedValue(true);
     const markWaitSpy = vi.spyOn(lonelyManager, 'markAgentWaiting').mockResolvedValue(true);
     const updateSpy = vi.spyOn(lonelyManager, 'updateTask').mockResolvedValue();
@@ -555,7 +557,7 @@ describe('pr.created handler', () => {
     expect(task!.reviewRound).toBe(0);
   });
 
-  it('startSession resolve(false) from in_progress → stay in review + emit human.intervention (qaAgentId pre-arm rolled back)', async () => {
+  it('startSession resolve(false) from in_progress → stay in review, retain QA participant, and emit intervention', async () => {
     await seedTask({ id: 'task-rb1', status: 'in_progress', reviewRound: 0 });
     const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: false, markAgentWaiting: true, updateTask: undefined });
 
@@ -568,10 +570,7 @@ describe('pr.created handler', () => {
     const qaWrites = updateSpy.mock.calls.filter(([_id, patch]) =>
       patch && 'qaAgentId' in patch,
     );
-    expect(qaWrites).toEqual([
-      ['task-rb1', { qaAgentId: 'qa-1' }],
-      ['task-rb1', { qaAgentId: undefined }],
-    ]);
+    expect(qaWrites).toEqual([]);
     const intervention = findIntervention('task-rb1');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
@@ -604,7 +603,7 @@ describe('pr.created handler', () => {
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
   });
 
-  it('startSession hard error from fixing → stay in review + emit human.intervention (qaAgentId pre-arm rolled back)', async () => {
+  it('startSession hard error from fixing → stay in review, retain QA participant, and emit intervention', async () => {
     await seedTask({ id: 'task-rb2', status: 'fixing', reviewRound: 1, prNumber: 30 });
     vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('boom'));
     const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ markAgentWaiting: true, updateTask: undefined });
@@ -617,10 +616,7 @@ describe('pr.created handler', () => {
     const qaWrites = updateSpy.mock.calls.filter(([_id, patch]) =>
       patch && 'qaAgentId' in patch,
     );
-    expect(qaWrites).toEqual([
-      ['task-rb2', { qaAgentId: 'qa-1' }],
-      ['task-rb2', { qaAgentId: undefined }],
-    ]);
+    expect(qaWrites).toEqual([]);
     const intervention = findIntervention('task-rb2');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
@@ -652,7 +648,9 @@ describe('pr.created handler', () => {
       noQaConfig, `events-lonely-${Date.now()}`,
     );
 
-    await seedTask({ id: 'task-no-qa-fail', status: 'in_progress', reviewRound: 0 });
+    await seedTask({
+      id: 'task-no-qa-fail', status: 'in_progress', reviewRound: 0, qaAgentId: undefined,
+    });
     vi.spyOn(lonelyManager, 'markAgentWaiting').mockResolvedValue(false);
 
     await localBus.emit({
@@ -687,7 +685,7 @@ describe('pr.created handler', () => {
     );
   });
 
-  it('order: updateTask(qaAgentId) BEFORE startSession, markAgentWaiting after startSession resolves true', async () => {
+  it('starts the snapshotted QA before parking the dev', async () => {
     await seedTask({ id: 'task-order', status: 'in_progress', reviewRound: 0 });
     const calls: string[] = [];
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
@@ -698,13 +696,9 @@ describe('pr.created handler', () => {
       calls.push('markAgentWaiting');
       return true;
     });
-    vi.spyOn(manager, 'updateTask').mockImplementation(async (_id, patch) => {
-      if (patch && 'qaAgentId' in patch) calls.push('updateTask(qaAgentId)');
-    });
-
     await emitPrCreated('task-order', { prNumber: 1 });
 
-    expect(calls).toEqual(['updateTask(qaAgentId)', 'startSession', 'markAgentWaiting']);
+    expect(calls).toEqual(['startSession', 'markAgentWaiting']);
   });
 
   it('spec phase: pr.created early-exits — no transition, no QA dispatch', async () => {
@@ -1343,7 +1337,7 @@ describe('pr.updated handler', () => {
     expect(startSpy).not.toHaveBeenCalled();
     const task = await taskStore.get('task-up-approved-noarm');
     expect(task!.status).toBe('review');
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
     expect(findInterventionByPhase('qa-recheck-arm-failed-after-approved-push')).toBeDefined();
   });
 
@@ -1516,19 +1510,19 @@ describe('pr.updated handler', () => {
     expect(startSpy).toHaveBeenCalledWith('task-fix-no-pr', 'qa-1', 'recheck');
   });
 
-  it('startSession success → markAgentWaiting + updateTask qaAgentId', async () => {
+  it('startSession success → markAgentWaiting without rewriting the QA participant', async () => {
     await seedTask({ id: 'task-up-ok', status: 'fixing', reviewRound: 1, prNumber: 70 });
     const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: true, markAgentWaiting: true, updateTask: undefined });
 
     await emitPrUpdated('task-up-ok', { prNumber: 70, prUrl: 'https://github.com/user/repo/pull/70' });
 
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-up-ok');
-    expect(updateSpy).toHaveBeenCalledWith('task-up-ok', { qaAgentId: 'qa-1' });
+    expect(updateSpy).not.toHaveBeenCalledWith('task-up-ok', { qaAgentId: 'qa-1' });
     const task = await taskStore.get('task-up-ok');
     expect(task!.prUrl).toBe('https://github.com/user/repo/pull/70');
   });
 
-  it('startSession resolve(false) from fixing → rollback to fixing, qaAgentId pre-arm rolled back, no other side effects', async () => {
+  it('startSession resolve(false) from fixing → rollback to fixing and retain the QA participant', async () => {
     await seedTask({ id: 'task-up-rb', status: 'fixing', reviewRound: 1, prNumber: 71 });
     const { markAgentWaiting: markWaitSpy, updateTask: updateSpy } = stubManager({ startSession: false, markAgentWaiting: true, updateTask: undefined });
     stubRotateSignalWritingStore('task-up-rb', 'rotated-rb', true);
@@ -1537,14 +1531,12 @@ describe('pr.updated handler', () => {
 
     const task = await taskStore.get('task-up-rb');
     expect(task!.status).toBe('fixing');
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
     expect(markWaitSpy).not.toHaveBeenCalled();
     const qaWrites = updateSpy.mock.calls.filter(([_id, patch]) =>
       patch && 'qaAgentId' in patch,
     );
-    expect(qaWrites).toEqual([
-      ['task-up-rb', { qaAgentId: 'qa-1' }],
-    ]);
+    expect(qaWrites).toEqual([]);
   });
 
   it('recheck verdict watcher fails to arm → rolls back to fixing + restores token, releases QA + intervention', async () => {
@@ -1560,7 +1552,7 @@ describe('pr.updated handler', () => {
     const task = await taskStore.get('task-up-noarm');
     expect(task!.status).toBe('fixing');
     expect(task!.signalToken).toBe('fixing-token');
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
     expect(findInterventionByPhase('qa-recheck-arm-failed')).toBeDefined();
   });
 
@@ -1595,7 +1587,7 @@ describe('pr.updated handler', () => {
     expect(task!.reviewHeadAnchorSha).toBe(HEAD_SHA);
     expect(task!.reviewDispatchedAt).toBe(dispatchedAt);
     expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
     expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-rb3', 'idle');
   });
 
@@ -1616,7 +1608,7 @@ describe('pr.updated handler', () => {
       await taskStore.set({
         ...fresh!, status: 'fixing', signalToken: 'next-fix-token',
         reviewHeadAnchorSha: NEXT_HEAD_SHA, reviewDispatchedAt: takeoverDispatchedAt,
-        qaAgentId: undefined, updatedAt: new Date().toISOString(),
+        qaAgentId: 'qa-1', updatedAt: new Date().toISOString(),
       });
       throw new Error('dispatch raced');
     });
@@ -2893,14 +2885,14 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(continueSpy).not.toHaveBeenCalled();
     expect(stopSpy).not.toHaveBeenCalledWith('dev-1', 'task-r3', 'idle');
     expect(stopSpy).not.toHaveBeenCalledWith('dev-1', 'task-r3', 'idle', { allowAwaitingHuman: true });
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
 
     const maxEvent = emittedEvents.find(e => e.type === 'review.max_rounds');
     expect(maxEvent).toBeTruthy();
     expect(maxEvent!.taskId).toBe('task-r3');
   });
 
-  it('exceeds rounds → does NOT clear qaAgentId when the QA release is refused', async () => {
+  it('exceeds rounds → retains qaAgentId when the QA release is refused', async () => {
     await seedTask({ id: 'task-r3b', status: 'review', reviewRound: 3, prNumber: 33, qaAgentId: 'qa-1' });
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'awaiting_human', taskId: 'task-r3b', paneId: '%2', updatedAt: new Date().toISOString() });
     stubManager({ releaseAgentForTask: false, continueSession: true });
@@ -2912,7 +2904,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(task!.qaAgentId).toBe('qa-1');
   });
 
-  it('merge-ready → max_rounds clears the stale qaAgentId of an already-released QA', async () => {
+  it('merge-ready → max_rounds retains the snapshotted QA participant after runtime release', async () => {
     await seedTask({ id: 'task-mr-cap', status: 'merge-ready', reviewRound: 3, prNumber: 34, qaAgentId: 'qa-1' });
     await agentStore.set({ id: 'qa-1', projectId: 'proj', status: 'idle', paneId: '%2', updatedAt: new Date().toISOString() });
 
@@ -2920,7 +2912,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
 
     const task = await taskStore.get('task-mr-cap');
     expect(task!.status).toBe('max_rounds');
-    expect(task!.qaAgentId).toBeUndefined();
+    expect(task!.qaAgentId).toBe('qa-1');
   });
 
   it('max_rounds emit failure → handler swallows emit error', async () => {

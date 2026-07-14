@@ -189,6 +189,7 @@ function fileField(name: string, ref: ReviewContentFileRef): string {
 
 const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
   merge: () => ({ fields: [] }),
+  research: () => ({ fields: ['signal: spec-done'] }),
   develop: ({ task, signalToken, hasQaPartner }) => {
     if (!signalToken) return { fields: [] };
     return {
@@ -321,7 +322,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
   if (phase === 'post-approve' && !signalToken) {
     throw new Error('post-approve prompt requires signalToken');
   }
-  if ((phase === 'code' || phase === 'review' || phase === 'recheck' || phase === 'fix') && !signalToken) {
+  if ((phase === 'research' || phase === 'code' || phase === 'review' || phase === 'recheck' || phase === 'fix') && !signalToken) {
     throw new Error(`${phase} prompt requires signalToken`);
   }
   if (phase.startsWith('server-') && !signalToken) {

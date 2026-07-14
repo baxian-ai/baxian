@@ -37,6 +37,8 @@ export function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     description: '',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
+    phase: 'code',
     reviewRound: 0,
     status: 'pending',
     createdAt: now,

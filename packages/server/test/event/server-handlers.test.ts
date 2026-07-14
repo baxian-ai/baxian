@@ -11,10 +11,11 @@ import type {
   ReviewRound,
   TaskState,
 } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
+import { DEFAULT_SERVER_CONFIG, renderSpecDocuments } from '../../src/shared/index.js';
 
 const DEV = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', projectId: 'proj' };
 const QA = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', projectId: 'proj' };
+const RESEARCH = { id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', projectId: 'proj' };
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   return {
@@ -24,6 +25,7 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     qaAgentId: 'qa-1',
     reviewRound: 0,
     reviewMode: 'server',
@@ -94,14 +96,19 @@ function makeFixture(
     releaseAgentForTask: [],
   };
   const transport = {
-    readContent: vi.fn(async () => ({
-      content: 'diff --git a/a.ts b/a.ts\n+x',
-      diffstat: ' a.ts | 1 +',
-      baseSha: 'base123',
-      headSha: 'head123',
-      headTree: 'tree123',
-      defaultBranch: 'main',
-    })),
+    readContent: vi.fn(async (_task: TaskState, _agent: typeof DEV, phase: 'code' | 'spec') => {
+      const content = 'diff --git a/a.ts b/a.ts\n+x';
+      const documents = [{ relPath: '.baxian/spec.md', content }];
+      return {
+        content: phase === 'spec' ? renderSpecDocuments(documents) : content,
+        documents,
+        diffstat: ' a.ts | 1 +',
+        baseSha: 'base123',
+        headSha: 'head123',
+        headTree: 'tree123',
+        defaultBranch: 'main',
+      };
+    }),
     readFindings: vi.fn(async (): Promise<ReviewFindings | null> => null),
     readResponse: vi.fn(async (): Promise<ReviewResponse | null> => null),
     deleteFindings: vi.fn(async () => undefined),
@@ -134,7 +141,6 @@ function makeFixture(
   const parkTaskAtSpecReady = vi.fn(async (id: string, opts?: { specReviewRound?: number }) => {
     calls.parkTaskAtSpecReady.push(opts === undefined ? [id] : [id, opts]);
     task.status = 'spec-ready';
-    task.qaAgentId = undefined;
     if (opts?.specReviewRound !== undefined) task.specReviewRound = opts.specReviewRound;
     return task;
   });
@@ -149,7 +155,12 @@ function makeFixture(
     parkTaskAtSpecReady,
     getReviewTransport: () => transport,
     getTask: async () => task,
-    getAgentConfig: (id: string) => (id === DEV.id ? DEV : id === QA.id ? QA : undefined),
+    getAgentConfig: (id: string) => (
+      id === DEV.id ? DEV
+      : id === RESEARCH.id ? RESEARCH
+      : id === QA.id && hasQaPartner ? QA
+      : undefined
+    ),
     findQaPartner: (devId: string) => (devId === DEV.id && hasQaPartner ? QA : undefined),
     getConfig: () => ({
       review: { rounds: config.rounds ?? 10, mode: 'server', afterDone: config.afterDone ?? null },
@@ -226,8 +237,17 @@ function putRound(
   round: number,
   extra: Partial<ReviewRound> = {},
 ): Promise<void> {
-  const content = phase === 'spec' ? 's' : 'd';
-  return store.putRound('t1', phase, { round, phase, content, startedAt: 'now', ...extra });
+  const content = extra.content ?? (phase === 'spec' ? 's' : 'd');
+  return store.putRound('t1', phase, {
+    round,
+    phase,
+    ...extra,
+    content,
+    ...(phase === 'spec' ? {
+      documents: extra.documents ?? [{ relPath: '.baxian/spec.md', content }],
+    } : {}),
+    startedAt: 'now',
+  });
 }
 
 type SeedRound = { phase: 'code' | 'spec'; round: number; extra?: Partial<ReviewRound> };
@@ -261,6 +281,29 @@ const TWO_BATCH_DIFF = [
 ].join('\n');
 
 describe('server.code.ready', () => {
+  it('accepts code-done when an unphased Dev-SDD task chose direct implementation', async () => {
+    const fx = makeFixture({ phase: undefined });
+
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+  });
+
+  it('rejects code-done while a Research participant still owns the spec stage', async () => {
+    const fx = makeFixture({
+      preferredAgentId: 'research-1',
+      agentId: 'research-1',
+      researchAgentId: 'research-1',
+      phase: 'research',
+    });
+
+    await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
+
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.emitted.some(event => event.type === 'human.intervention'
+      && event.data?.phase === 'server.code.ready-stale')).toBe(true);
+  });
+
   it('reads diff, persists round with baseSha, dispatches review', async () => {
     const fx = makeFixture();
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
@@ -384,6 +427,11 @@ describe('no-QA auto-approve', () => {
     const fx = makeFixture({ qaAgentId: undefined, phase: undefined });
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    const round = await fx.store.getRound('t1', 'spec', 1);
+    expect(round?.documents).toEqual([
+      { relPath: '.baxian/spec.md', content: 'diff --git a/a.ts b/a.ts\n+x' },
+    ]);
+    expect(round?.content).toBe(renderSpecDocuments(round!.documents!));
     expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
   });
 
@@ -615,7 +663,7 @@ describe('server.code.fix.submitted', () => {
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
   });
 
-  it('stale qaAgentId without a configured QA partner auto-approves after code-fixed', async () => {
+  it('an unavailable snapshotted QA pauses after code-fixed instead of silently auto-approving', async () => {
     const fx = makeFixture(
       { status: 'fixing', reviewRound: 1, qaAgentId: 'ghost-qa' },
       { hasQaPartner: false },
@@ -627,7 +675,12 @@ describe('server.code.fix.submitted', () => {
     });
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
-    expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
+    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expect(fx.emitted.some(event =>
+      event.type === 'human.intervention'
+      && (event.data as { phase?: string }).phase === 'server-code-qa-unavailable-after-fix'
+    )).toBe(true);
   });
 
   it('no QA: full coverage → approved + dispatchServerAfterDone (afterDone branch)', async () => {
@@ -707,9 +760,22 @@ describe('server.code.published', () => {
 });
 
 describe('server.spec flow', () => {
+  it('rejects spec-done after the task has entered the code phase', async () => {
+    const fx = makeFixture({ phase: 'code', status: 'in_progress' });
+
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.emitted.some(event => event.type === 'human.intervention'
+      && event.data?.phase === 'server.spec.ready-stale')).toBe(true);
+  });
+
   it('spec-done → spec content dispatched for review', async () => {
     const fx = makeFixture({ phase: undefined, status: 'in_progress' });
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
+    });
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
     const round = await fx.store.getRound('t1', 'spec', 1);
     expect(round?.content).toBe('# Spec');
@@ -744,9 +810,57 @@ describe('server.spec flow', () => {
     expect(fx.calls.parkTaskAtSpecReady).toHaveLength(0);
   });
 
+  it('Research spec approval always parks for a human even when project specApproval is null', async () => {
+    const fx = makeFixture({
+      preferredAgentId: 'research-1',
+      agentId: 'research-1',
+      researchAgentId: 'research-1',
+      phase: 'spec',
+      status: 'review',
+      specReviewRound: 1,
+    }, { specApproval: null });
+    await putRound(fx.store, 'spec', 1);
+    fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
+
+    await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
+
+    expect(fx.calls.parkTaskAtSpecReady).toContainEqual(['t1']);
+    expect(fx.calls.transitionToCodePhase).toHaveLength(0);
+  });
+
+  it('Research without QA persists its documents and parks at the mandatory human gate', async () => {
+    const fx = makeFixture({
+      preferredAgentId: 'research-1',
+      agentId: 'research-1',
+      researchAgentId: 'research-1',
+      qaAgentId: undefined,
+      phase: 'research',
+      status: 'in_progress',
+    }, { specApproval: null });
+    const documents = [
+      { relPath: '.baxian/spec.md', content: '# Research Spec' },
+      { relPath: '.baxian/research/options.md', content: '# Options' },
+    ];
+    fx.transport.readContent.mockResolvedValue({ content: renderSpecDocuments(documents), documents });
+
+    await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
+
+    const round = await fx.store.getRound('t1', 'spec', 1);
+    expect(round?.documents).toEqual([
+      { relPath: '.baxian/spec.md', content: '# Research Spec' },
+      { relPath: '.baxian/research/options.md', content: '# Options' },
+    ]);
+    expect(fx.calls.parkTaskAtSpecReady).toContainEqual(['t1', { specReviewRound: 1 }]);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.calls.transitionToCodePhase).toHaveLength(0);
+  });
+
   it('spec-done without QA partner + specApproval human → stores the spec round then parks', async () => {
     const fx = makeFixture({ phase: undefined, status: 'in_progress', qaAgentId: undefined }, { specApproval: 'human' });
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec no-QA' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec no-QA',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec no-QA' }],
+    });
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
     const round = await fx.store.getRound('t1', 'spec', 1);
     expect(round?.content).toBe('# Spec no-QA');
@@ -764,7 +878,10 @@ describe('server.spec flow', () => {
       round: 1,
       responses: [{ findingId: 'u-1', action: 'fix', rationale: 'added' }],
     });
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec v2' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec v2',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
+    });
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     const round2 = await fx.store.getRound('t1', 'spec', 2);
     expect(round2?.content).toBe('# Spec v2');
@@ -781,7 +898,10 @@ describe('server.spec flow', () => {
       round: 1,
       responses: [{ findingId: 'u-1', action: 'fix', rationale: 'added' }],
     });
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec v2' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec v2',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
+    });
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     expect(fx.calls.transitionToCodePhase).toContainEqual(['t1']);
     expect(fx.calls.parkTaskAtSpecReady).toHaveLength(0);
@@ -796,7 +916,10 @@ describe('server.spec flow', () => {
       round: 1,
       responses: [{ findingId: 'f-1', action: 'fix', rationale: 'added' }],
     });
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec v2' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec v2',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
+    });
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     const round2 = await fx.store.getRound('t1', 'spec', 2);
     expect(round2?.content).toBe('# Spec v2');
@@ -877,7 +1000,10 @@ describe('crash-replay recovery from stored exchange artifacts', () => {
       response: { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] },
     });
     fx.transport.readResponse.mockResolvedValue(null);
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec v2' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec v2',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
+    });
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
   });
@@ -1216,7 +1342,7 @@ describe('Codex: cap at verdict', () => {
   });
 });
 
-describe('max_rounds releases agents and clears references', () => {
+describe('max_rounds releases runtime bindings and preserves participants', () => {
   const SPEC_FINDINGS_RC: ReviewFindings = {
     round: 3,
     verdict: 'request-changes',
@@ -1229,23 +1355,23 @@ describe('max_rounds releases agents and clears references', () => {
       .flatMap(c => Object.keys(c[1] as Record<string, unknown>));
   }
 
-  it('code dispatch cap clears the lingering QA reference even when release is refused', async () => {
+  it('code dispatch cap preserves the QA participant even when no runtime binding exists', async () => {
     const fx = makeFixture({ reviewRound: 3 }, { rounds: 3 });
     fx.releaseAgentForTask.mockResolvedValue(false);
     fx.getAgentState.mockResolvedValue({ id: 'qa-1', projectId: 'proj', updatedAt: 'now' });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'max_rounds']);
-    expect(clearedFields(fx)).toContain('qaAgentId');
+    expect(clearedFields(fx)).not.toContain('qaAgentId');
     expect(clearedFields(fx)).not.toContain('agentId');
   });
 
-  it('code verdict cap releases QA with allowAwaitingHuman and retains dev', async () => {
+  it('code verdict cap releases QA with allowAwaitingHuman and retains both participants', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 3 }, { rounds: 3 });
     await putRound(fx.store, 'code', 3);
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 3 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
     expect(fx.calls.releaseAgentForTask).toContainEqual(['qa-1', 't1', 'idle', { allowAwaitingHuman: true }]);
-    expect(clearedFields(fx)).toContain('qaAgentId');
+    expect(clearedFields(fx)).not.toContain('qaAgentId');
     expect(clearedFields(fx)).not.toContain('agentId');
   });
 
@@ -1262,23 +1388,23 @@ describe('max_rounds releases agents and clears references', () => {
     expect(intervention).toBeDefined();
   });
 
-  it('spec dispatch cap releases and clears BOTH dev and QA references', async () => {
+  it('spec dispatch cap releases both runtimes, clears active agentId, and retains QA', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'in_progress', specReviewRound: 3 }, { rounds: 3 });
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'max_rounds']);
     expect(fx.calls.releaseAgentForTask).toContainEqual(['qa-1', 't1', 'idle', {}]);
     expect(fx.calls.releaseAgentForTask).toContainEqual(['dev-1', 't1', 'idle', {}]);
-    expect(clearedFields(fx)).toContain('qaAgentId');
+    expect(clearedFields(fx)).not.toContain('qaAgentId');
     expect(clearedFields(fx)).toContain('agentId');
   });
 
-  it('spec verdict cap on request-changes releases and clears BOTH dev and QA references', async () => {
+  it('spec verdict cap releases both runtimes, clears active agentId, and retains QA', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 3 }, { rounds: 3 });
     await putRound(fx.store, 'spec', 3);
     fx.transport.readFindings.mockResolvedValue(SPEC_FINDINGS_RC);
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'max_rounds']);
-    expect(clearedFields(fx)).toContain('qaAgentId');
+    expect(clearedFields(fx)).not.toContain('qaAgentId');
     expect(clearedFields(fx)).toContain('agentId');
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
   });
@@ -1591,7 +1717,10 @@ describe('prompt content passthrough', () => {
   it('oversized spec reaches dispatch untruncated', async () => {
     const fx = makeFixture({ phase: undefined, status: 'in_progress', specReviewRound: 0 });
     const hugeSpec = `# spec\n${'内容'.repeat(20000)}`;
-    fx.transport.readContent.mockResolvedValue({ content: hugeSpec });
+    fx.transport.readContent.mockResolvedValue({
+      content: hugeSpec,
+      documents: [{ relPath: '.baxian/spec.md', content: hugeSpec }],
+    });
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
 
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
@@ -1717,7 +1846,10 @@ describe('spec review failure paths', () => {
 
   it('spec round store failure → intervention + spec-done re-arm', async () => {
     const fx = makeFixture({ phase: undefined, status: 'in_progress' });
-    fx.transport.readContent.mockResolvedValue({ content: '# Spec' });
+    fx.transport.readContent.mockResolvedValue({
+      content: '# Spec',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
+    });
     const failing = fx.store as unknown as { putRound: (...a: unknown[]) => Promise<void> };
     failing.putRound = async () => { throw new Error('disk full'); };
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });

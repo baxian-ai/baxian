@@ -518,7 +518,7 @@ describe('BranchManager', () => {
     const now = new Date().toISOString();
     const autoTask: TaskState = {
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1',
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
       branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
     };
     const customTask: TaskState = {
@@ -579,7 +579,7 @@ describe('BranchManager', () => {
     const now = new Date().toISOString();
     const task: TaskState = {
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1',
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
       branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
     };
     await run(
@@ -658,7 +658,7 @@ describe('BranchManager', () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
     await taskStore.set({
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', branch: 'bx/task-1',
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
       branchCreatedByBaxian: true, reviewRound: 0, status: 'merged',
       branchCleanupSkipped: {
         agentId: 'dev-1',

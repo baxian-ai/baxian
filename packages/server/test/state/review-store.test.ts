@@ -15,6 +15,16 @@ function round(overrides: Partial<ReviewRound> = {}): ReviewRound {
   };
 }
 
+function specRound(roundNumber = 1, content = 'SPEC'): ReviewRound {
+  return {
+    round: roundNumber,
+    phase: 'spec',
+    content,
+    documents: [{ relPath: '.baxian/spec.md', content }],
+    startedAt: '2026-06-10T00:00:00.000Z',
+  };
+}
+
 describe.each([
   { label: 'disk', useDir: true },
   { label: 'memory', useDir: false },
@@ -38,7 +48,7 @@ describe.each([
   });
 
   it('same round number in spec vs code does not collide', async () => {
-    await store.putRound('t1', 'spec', round({ phase: 'spec', content: 'SPEC' }));
+    await store.putRound('t1', 'spec', specRound());
     await store.putRound('t1', 'code', round({ phase: 'code', content: 'CODE' }));
     expect((await store.getRound('t1', 'spec', 1))?.content).toBe('SPEC');
     expect((await store.getRound('t1', 'code', 1))?.content).toBe('CODE');
@@ -59,7 +69,7 @@ describe.each([
   it('listRounds filters by phase and sorts by round', async () => {
     await store.putRound('t1', 'code', round({ round: 2 }));
     await store.putRound('t1', 'code', round({ round: 1 }));
-    await store.putRound('t1', 'spec', round({ phase: 'spec', round: 1 }));
+    await store.putRound('t1', 'spec', specRound());
     const codeRounds = await store.listRounds('t1', 'code');
     expect(codeRounds.map(r => r.round)).toEqual([1, 2]);
     expect(codeRounds.every(r => r.phase === 'code')).toBe(true);
@@ -67,8 +77,8 @@ describe.each([
 
   it('listRounds without phase merges spec first then code', async () => {
     await store.putRound('t1', 'code', round({ round: 1 }));
-    await store.putRound('t1', 'spec', round({ phase: 'spec', round: 2 }));
-    await store.putRound('t1', 'spec', round({ phase: 'spec', round: 1 }));
+    await store.putRound('t1', 'spec', specRound(2));
+    await store.putRound('t1', 'spec', specRound(1));
     const all = await store.listRounds('t1');
     expect(all.map(r => `${r.phase}-${r.round}`)).toEqual(['spec-1', 'spec-2', 'code-1']);
   });
@@ -83,6 +93,24 @@ describe.each([
     await store.clear('t1');
     expect(await store.getRound('t1', 'code', 1)).toBeNull();
     expect((await store.getRound('t2', 'code', 1))?.content).toBeTruthy();
+  });
+
+  it('round-trips structured spec documents in deterministic order', async () => {
+    const documents = [
+      { relPath: '.baxian/spec.md', content: '# Spec' },
+      { relPath: '.baxian/research/options.md', content: '# Options' },
+    ];
+    const content = '=== .baxian/spec.md ===\n# Spec\n=== .baxian/research/options.md ===\n# Options';
+    await store.putRound('t1', 'spec', { ...specRound(), content, documents });
+
+    expect(await store.getRound('t1', 'spec', 1)).toMatchObject({ content, documents });
+  });
+
+  it('rejects a spec round whose rendered content diverges from its documents', async () => {
+    await expect(store.putRound('t1', 'spec', {
+      ...specRound(),
+      content: 'tampered',
+    })).rejects.toThrow('does not match documents');
   });
 });
 

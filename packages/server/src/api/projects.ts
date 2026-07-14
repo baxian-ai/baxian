@@ -10,7 +10,7 @@ import type {
   SpecApprovalStrategy,
   AgentConfig,
 } from '../shared/index.js';
-import { TASK_ACTIVE_STATUS_SET, TASK_TERMINAL_STATUS_SET } from '../shared/index.js';
+import { TASK_ACTIVE_STATUS_SET, TASK_OWNER_ROLES, TASK_TERMINAL_STATUS_SET } from '../shared/index.js';
 import { probeTmux, runPreflight, type PreflightResult } from '../agent/preflight.js';
 import { installTmux } from '../agent/tmux-install.js';
 import {
@@ -271,8 +271,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const body = request.body ?? ({} as AgentConfig & { pairWith?: string });
     const { pairWith, ...agentInput } = body;
 
-    if (agentInput.role !== 'dev' && agentInput.role !== 'qa') {
-      return reply.status(400).send({ error: 'role must be "dev" or "qa"' });
+    if (agentInput.role !== 'dev' && agentInput.role !== 'qa' && agentInput.role !== 'research') {
+      return reply.status(400).send({ error: 'role must be "dev", "qa", or "research"' });
     }
     if (typeof agentInput.id !== 'string' || agentInput.id.trim().length === 0) {
       return reply.status(400).send({ error: 'agent id is required' });
@@ -301,16 +301,17 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      if (agentInput.role === 'qa') {
+      if (agentInput.role !== 'dev') {
         if (!pairWith) {
-          return reply.status(400).send({ error: 'pairWith required when role=qa' });
+          return reply.status(400).send({ error: `pairWith required when role=${agentInput.role}` });
         }
-        const targetPair = project.agent.find(
-          pair => pair.length === 1 && pair[0].id === pairWith && pair[0].role === 'dev',
+        const targetGroup = project.agent.find(
+          group => group.some(agent => agent.id === pairWith && agent.role === 'dev')
+            && !group.some(agent => agent.role === agentInput.role),
         );
-        if (!targetPair) {
+        if (!targetGroup) {
           return reply.status(400).send({
-            error: `pairWith "${pairWith}" must reference a dev agent in this project that has no qa yet`,
+            error: `pairWith "${pairWith}" must reference a dev group in this project that has no ${agentInput.role} yet`,
           });
         }
         const devState = await app.ctx.agentStore.get(pairWith);
@@ -321,7 +322,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
       }
       if (agentInput.role === 'dev' && pairWith) {
-        return reply.status(400).send({ error: 'pairWith only valid for role=qa' });
+        return reply.status(400).send({ error: 'pairWith is only valid for qa or research agents' });
       }
 
       const newProjects = app.ctx.config.project.map((p) => {
@@ -329,11 +330,11 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         if (agentInput.role === 'dev') {
           return { ...p, agent: [...p.agent, [agentInput as AgentConfig]] };
         }
-        const newAgent = p.agent.map(pair => {
-          if (pair.length === 1 && pair[0].id === pairWith) {
-            return [...pair, agentInput as AgentConfig];
+        const newAgent = p.agent.map(group => {
+          if (group.some(agent => agent.id === pairWith && agent.role === 'dev')) {
+            return [...group, agentInput as AgentConfig];
           }
-          return pair;
+          return group;
         });
         return { ...p, agent: newAgent };
       });
@@ -463,7 +464,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           TASK_ACTIVE_STATUS_SET.has(t.status)
           && ((t.preferredAgentId !== '' && targetSet.has(t.preferredAgentId))
             || (!!t.agentId && targetSet.has(t.agentId))
-            || (!!t.qaAgentId && targetSet.has(t.qaAgentId))),
+            || (!!t.devAgentId && targetSet.has(t.devAgentId))
+            || (!!t.qaAgentId && targetSet.has(t.qaAgentId))
+            || (!!t.researchAgentId && targetSet.has(t.researchAgentId))),
         );
         if (referencing) {
           return reply.status(409).send({
@@ -865,7 +868,7 @@ async function resolveLockOwnership(
   agentId: string,
 ): Promise<LockOwner> {
   const cfg = app.ctx.agentManager.getAgentConfig(agentId);
-  if (!cfg || cfg.role !== 'dev') return { takeover: false };
+  if (!cfg || !TASK_OWNER_ROLES.has(cfg.role)) return { takeover: false };
   const state = await app.ctx.agentStore.get(agentId);
   if (!state?.taskId) return { takeover: false };
   const task = await app.ctx.taskStore.get(state.taskId);
@@ -931,6 +934,20 @@ async function pendingCleanupAfterReplReady(
     await app.ctx.agentManager.releaseAgentForTask(agentId, taskId, 'idle', { allowAwaitingHuman: true })
       .catch(err => app.log.warn({ err, agentId, taskId }, 'restart/retry idle-release failed'));
     return;
+  }
+  if (takeover) {
+    try {
+      if (await app.ctx.agentManager.redispatchResearchAfterReplRestart(agentId, taskId)) return;
+    } catch (err) {
+      app.log.error({ err, agentId, taskId }, 'restart/retry research redispatch failed');
+      await app.ctx.agentManager.markAwaitingHuman(
+        agentId,
+        'restart-redispatch-failed',
+        `REPL restarted but the active task prompt could not be restored: ${err instanceof Error ? err.message : String(err)}`,
+        { expectedTaskId: taskId },
+      );
+      return;
+    }
   }
   await app.ctx.agentManager.markAgentWaiting(agentId, taskId, {
     allowAwaitingHuman: true,

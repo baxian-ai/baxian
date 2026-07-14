@@ -101,7 +101,20 @@ async function makeFixture(
   return { manager, taskStore, agentStore, execCalls, events };
 }
 
+function claimedSessionExec(cmd: string): Partial<ExecResult> {
+  const agentId = cmd.match(/=([^':\s]+)/)?.[1];
+  if (agentId && cmd.includes('tmux show-option') && cmd.includes('@baxian-agent-id')) {
+    return { stdout: `${agentId}\n` };
+  }
+  if (agentId && cmd.includes('tmux list-panes')) {
+    return { stdout: `${agentId === 'qa-1' ? '%2 codex' : '%1 claude'}\n` };
+  }
+  return {};
+}
+
 function readyPaneExec(cmd: string): Partial<ExecResult> {
+  const runtimeFact = claimedSessionExec(cmd);
+  if (runtimeFact.stdout !== undefined) return runtimeFact;
   if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
     return { stdout: 'claude\n' };
   }
@@ -154,7 +167,9 @@ function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     qaAgentId: 'qa-1',
+    phase: 'code',
     reviewRound: 2,
     reviewMode: 'server',
     branch: 'bx/task-1',
@@ -302,7 +317,10 @@ describe('terminal confirm clears agent context before release', () => {
     taskOverrides: Partial<TaskState> = {},
     execImpl?: (cmd: string) => Partial<ExecResult>,
   ): Promise<Fixture> {
-    const fx = await makeFixture(merge, afterDone, execImpl);
+    const fx = await makeFixture(merge, afterDone, cmd => ({
+      ...claimedSessionExec(cmd),
+      ...(execImpl?.(cmd) ?? {}),
+    }));
     const now = new Date().toISOString();
     await bindToTask(fx.agentStore, 'dev-1', now);
     await bindToTask(fx.agentStore, 'qa-1', now);
@@ -389,21 +407,32 @@ describe('snapshot + resume semantics', () => {
   });
 
   it('resumeAgent redispatches the code prompt for code-dispatch-failed', async () => {
-    const { manager, taskStore, agentStore: agents } = await makeFixture(null, null);
-    await taskStore.set(taskFixture({ status: 'in_progress', phase: 'code' }));
+    const reviewStore = new ReviewStore();
+    const { manager, taskStore, agentStore: agents } = await makeFixture(null, null, undefined, reviewStore);
+    const documents = [{ relPath: '.baxian/spec.md', content: '# Approved spec' }];
+    await reviewStore.putRound('task-1', 'spec', {
+      round: 1,
+      phase: 'spec',
+      content: '# Approved spec',
+      documents,
+      startedAt: '2026-06-10T00:00:00.000Z',
+    });
+    await taskStore.set(taskFixture({
+      status: 'in_progress', phase: 'code', specReviewRound: 1, signalToken: 'code-token',
+    }));
     await bindAgent(agents, 'dev-1', {
       taskId: 'task-1', paneId: '%1',
       status: 'awaiting_human', awaitingPhase: 'code-dispatch-failed',
       awaitingReason: 'x', awaitingSince: 'now',
     });
     const continued: string[] = [];
-    stubMethod(manager, 'continueSession', async (t: string, a: string, p: string) => {
-      continued.push(`${t}:${a}:${p}`);
+    vi.spyOn(manager, 'continueSession').mockImplementation(async (taskId, agentId, phase, opts) => {
+      continued.push(`${taskId}:${agentId}:${phase}:${opts.specDocuments?.[0]?.content}`);
       return true;
     });
     const result = await manager.resumeAgent('dev-1');
     expect(result.resumed).toBe(true);
-    expect(continued).toEqual(['task-1:dev-1:code']);
+    expect(continued).toEqual(['task-1:dev-1:code:# Approved spec']);
     const state = await agents.get('dev-1');
     expect(state?.status).toBeUndefined();
     expect(state?.taskId).toBe('task-1');
@@ -466,7 +495,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     {
       label: 'the dev config hot-removed → skips gh pr close (pane outlives the config)',
       seed: (agentStore: AgentStore) => bindAgent(agentStore, 'ghost', { taskId: 'task-1', paneId: '%5' }),
-      task: { agentId: 'ghost' } as Partial<TaskState>,
+      task: { agentId: 'ghost', devAgentId: 'ghost' } as Partial<TaskState>,
       checkCancelled: true,
       devAwaiting: false,
     },
@@ -511,11 +540,11 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     expect(hasRemotePrClose(execCalls)).toBe(false);
   });
 
-  it('approved with a hand-edited null marker → treated as not dispatched, no remote retirement', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
-    await taskStore.set(approvedPrMarkerFixture({ publishDispatchedAt: null as unknown as string }));
-    await manager.cancelTask('task-1');
-    expect(hasRemotePrClose(execCalls)).toBe(false);
+  it('rejects a hand-edited null delivery marker at the store boundary', async () => {
+    const { taskStore } = await makeFixture('auto', 'pr');
+    await expect(taskStore.set(
+      approvedPrMarkerFixture({ publishDispatchedAt: null as unknown as string }),
+    )).rejects.toThrow(/publishDispatchedAt/);
   });
 });
 
@@ -609,21 +638,27 @@ describe('Codex: dispatch failure recovery + continue/complete race', () => {
     findings: [{ id: 'f-1', severity: 'major' as const, message: 'bug', file: 'a.ts', line: 1 }],
   };
 
-  it('transitionToCodePhase holds the dev (code-dispatch-failed) when acquire fails', async () => {
-    const { manager, taskStore, agentStore } = await makeFixture(null, 'pr');
-    await taskStore.set(taskFixture({ status: 'review', phase: 'spec', qaAgentId: undefined, signalToken: 'tok' }));
-    await bindToTask(agentStore, 'dev-1', NOW);
-    vi.spyOn(manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> }, 'setupPhaseSignalWatcher')
-      .mockResolvedValue(true);
+  it('transitionToCodePhase stays at the spec gate when the dev cannot be acquired', async () => {
+    const reviewStore = new ReviewStore();
+    const { manager, taskStore, events } = await makeFixture(null, 'pr', undefined, reviewStore);
+    await reviewStore.putRound('task-1', 'spec', {
+      round: 1,
+      phase: 'spec',
+      content: '# Spec',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
+      startedAt: NOW,
+    });
+    await taskStore.set(taskFixture({
+      status: 'spec-ready', phase: 'spec', qaAgentId: undefined,
+      specReviewRound: 1, signalToken: 'tok',
+    }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
-    const holdSpy = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue();
 
     const result = await manager.transitionToCodePhase('task-1');
 
     expect(result).toBeNull();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1', 'code-dispatch-failed', expect.any(String), { expectedTaskId: 'task-1' },
-    );
+    expect((await taskStore.get('task-1'))?.status).toBe('spec-ready');
+    expect(events.some(event => event.data?.phase === 'code-dev-acquire-failed')).toBe(true);
   });
 
   it('dispatchServerFixToDev resume failure re-arms the QA reviewed watcher after rollback', async () => {

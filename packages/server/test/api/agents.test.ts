@@ -208,6 +208,8 @@ describe('DELETE /api/agents/:id/session', () => {
       description: 'd',
       preferredAgentId: 'dev-1',
       agentId: 'dev-1',
+      devAgentId: 'dev-1',
+      phase: 'code',
       reviewRound: 0,
       status: 'in_progress',
       branch: 'bx/task-001',

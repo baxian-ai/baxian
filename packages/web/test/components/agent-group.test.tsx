@@ -129,6 +129,22 @@ describe('AgentGroup', () => {
     expect(navigateMock).toHaveBeenCalledWith('/project/proj/task/task-001');
   });
 
+  it('keeps an active task visible when the configured QA differs from its stable QA participant', () => {
+    renderGroup([task()], {
+      group: [
+        GROUP[0]!,
+        { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local' },
+      ],
+      agentsById: new Map([
+        ['dev-1', agent('dev-1')],
+        ['qa-2', agent('qa-2')],
+      ]),
+    });
+
+    const region = screen.getByRole('group', { name: 'Agent group dev-1 / qa-2' });
+    expect(within(region).getByText('梳理绑定逻辑')).toBeTruthy();
+  });
+
   it('passes configured runtime labels to the paired agent card names', () => {
     renderGroup([]);
 

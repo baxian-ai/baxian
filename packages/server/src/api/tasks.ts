@@ -313,8 +313,8 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     '/tasks/:id/spec',
     async (request, reply) => {
       const { verdict, comments } = request.body ?? {};
-      if (verdict !== 'approve' && verdict !== 'request-changes') {
-        return reply.status(400).send({ error: 'verdict must be "approve" or "request-changes"' });
+      if (verdict !== 'approve' && verdict !== 'request-changes' && verdict !== 'archive') {
+        return reply.status(400).send({ error: 'verdict must be "approve", "request-changes", or "archive"' });
       }
       if (comments !== undefined && typeof comments !== 'string') {
         return reply.status(400).send({ error: 'comments must be a string' });

@@ -2,9 +2,9 @@ import { type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type {
   ReviewFindings,
+  ReviewPhase,
   ReviewResponse,
   ReviewRound,
-  TaskPhase,
   TaskState,
 } from '../shared/index.js';
 import { useReviewRounds, reviewRevision } from '../hooks/use-review-rounds.ts';
@@ -16,9 +16,10 @@ interface Props {
   task: TaskState;
 }
 
-const VERDICT_CLASS: Record<ReviewFindings['verdict'], string> = {
+const VERDICT_CLASS: Record<'approve' | 'request-changes' | 'archive', string> = {
   approve: 'pill pill-live',
   'request-changes': 'pill pill-warn',
+  archive: 'pill',
 };
 
 function lineCount(content: string): number {
@@ -87,7 +88,7 @@ function ReviewRounds({ task }: Props) {
   const navigate = useNavigate();
   const { rounds, loaded, error } = useReviewRounds(task.id, reviewRevision(task));
 
-  function openRound(phase: TaskPhase, round: number, hash: string) {
+  function openRound(phase: ReviewPhase, round: number, hash: string) {
     navigate(`/tasks/${encodeURIComponent(task.id)}/rounds/${phase}/${round}${hash}`);
   }
 
@@ -97,7 +98,7 @@ function ReviewRounds({ task }: Props) {
 
   return (
     <>
-      {(['spec', 'code'] as TaskPhase[]).map((phase) => {
+      {(['spec', 'code'] as ReviewPhase[]).map((phase) => {
         const phaseRounds = (rounds ?? [])
           .filter((r) => r.phase === phase)
           .sort((a, b) => a.round - b.round);
@@ -130,7 +131,7 @@ function RoundBlock({
 }: {
   round: ReviewRound;
   task: TaskState;
-  onOpen: (phase: TaskPhase, round: number, hash: string) => void;
+  onOpen: (phase: ReviewPhase, round: number, hash: string) => void;
 }) {
   const t = useT();
   const isSpec = round.phase === 'spec';
@@ -181,7 +182,9 @@ function RoundBlock({
             role="user"
             label={round.userDecision.verdict === 'approve'
               ? t.taskDetail.specApprove
-              : (round.phase === 'spec' ? t.taskDetail.specReject : t.taskDetail.codeReject)}
+              : round.userDecision.verdict === 'archive'
+                ? t.taskDetail.specArchive
+                : (round.phase === 'spec' ? t.taskDetail.specReject : t.taskDetail.codeReject)}
             badge={<span className={VERDICT_CLASS[round.userDecision.verdict]}>{round.userDecision.verdict}</span>}
             summary={round.userDecision.comments ?? ''}
             onClick={() => onOpen(round.phase, round.round, '#review')}

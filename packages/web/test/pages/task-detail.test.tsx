@@ -81,6 +81,7 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     description: 'Task body here',
     preferredAgentId: 'bx-dev',
     agentId: 'bx-dev',
+    devAgentId: 'bx-dev',
     qaAgentId: 'bx-qa',
     prNumber: 55,
     prUrl: 'https://github.com/baxian-ai/baxian/pull/55',
@@ -320,6 +321,37 @@ describe('TaskDetail page — layout & agent cards', () => {
     }
   });
 
+  it('renders the stable Research participant before Dev and QA', () => {
+    setProjects([{
+      ...PROJECT,
+      agent: [[
+        ...PROJECT.agent[0],
+        { id: 'bx-research', runtime: 'claude-code', role: 'research', mode: 'local' },
+      ]],
+    }]);
+    useAgentsMock.mockReturnValue({
+      data: [
+        { id: 'bx-dev', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+        { id: 'bx-qa', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+        { id: 'bx-research', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
+      ],
+      loaded: true,
+      error: null,
+    });
+
+    const { container } = open({
+      preferredAgentId: 'bx-research',
+      agentId: 'bx-research',
+      researchAgentId: 'bx-research',
+      phase: 'research',
+      status: 'in_progress',
+    });
+
+    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
+    expect(cards.map(card => card.getAttribute('data-role'))).toEqual(['research', 'dev', 'qa']);
+    expect(cards[0].getAttribute('data-agent-id')).toBe('bx-research');
+  });
+
   it('activates one task detail agent card at a time and clears it on outside click', () => {
     const { container } = open();
     const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
@@ -373,8 +405,8 @@ describe('TaskDetail page — layout & agent cards', () => {
     expect(devCard.getAttribute('data-active')).toBe('true');
   });
 
-  it('resolves the dev/qa pair from the project group even before agentId is assigned', () => {
-    setTask(makeTask({ status: 'pending', agentId: '', qaAgentId: undefined, preferredAgentId: 'bx-dev' }));
+  it('resolves the snapshotted dev and QA participants before agentId is assigned', () => {
+    setTask(makeTask({ status: 'pending', agentId: '', preferredAgentId: 'bx-dev' }));
     const { container } = renderPage();
     const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
     expect(cards.map((c) => c.getAttribute('data-agent-id'))).toEqual(['bx-dev', 'bx-qa']);
@@ -387,8 +419,8 @@ describe('TaskDetail page — layout & agent cards', () => {
     expect(screen.queryByTestId('agent-card')).toBeNull();
   });
 
-  it('shows a placeholder for a legacy task with no resolvable agent group', () => {
-    setTask(makeTask({ agentId: '', preferredAgentId: '', qaAgentId: undefined }));
+  it('shows a placeholder for an unassigned task with no participant group', () => {
+    setTask(makeTask({ agentId: '', devAgentId: 'unassigned', preferredAgentId: '', qaAgentId: undefined }));
     renderPage();
     expect(screen.getByText('No linked agent')).toBeTruthy();
     expect(screen.queryByTestId('agent-card')).toBeNull();
@@ -603,6 +635,32 @@ describe('TaskDetail page — actions & states', () => {
 
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '边界场景没有覆盖' });
       expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec rejected; Dev agent is revising' });
+    });
+
+    it('Research spec-ready explains the handoff and can be archived without coding', async () => {
+      tasksSpecMock.mockResolvedValue(makeTask({
+        status: 'done',
+        phase: 'spec',
+        preferredAgentId: 'bx-research',
+        agentId: 'bx-research',
+        researchAgentId: 'bx-research',
+      }));
+      openSpecReady({
+        preferredAgentId: 'bx-research',
+        agentId: 'bx-research',
+        researchAgentId: 'bx-research',
+      });
+
+      expect(screen.getByText(/Approving hands the exact documents to the Dev agent/)).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'Archive research' }));
+      const dialog = await findConfirmDialog();
+      expect(within(dialog).getByText('Archive this research task?')).toBeTruthy();
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Archive research' }));
+      });
+
+      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'archive' });
+      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Research task archived' });
     });
 
     it('verdict failure surfaces an error toast', async () => {
@@ -969,6 +1027,14 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     const { container } = renderPage();
     expect(screen.getByText('No QA agent')).toBeTruthy();
     expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
+  });
+
+  it('does not attach a group QA that was not snapshotted on the task', () => {
+    setTask(makeTask({ qaAgentId: undefined }));
+    const { container } = renderPage();
+    expect(screen.getByText('No QA agent')).toBeTruthy();
+    const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));
+    expect(cards.map((card) => card.getAttribute('data-role'))).toEqual(['dev']);
   });
 
   it('shows the Dev slot placeholder when only the QA agent resolves via qaAgentId', () => {

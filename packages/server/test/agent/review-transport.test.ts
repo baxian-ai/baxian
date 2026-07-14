@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -26,7 +26,9 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     reviewRound: 0,
+    phase: 'code',
     status: 'review',
     createdAt: '2026-06-10T00:00:00.000Z',
     updatedAt: '2026-06-10T00:00:00.000Z',
@@ -237,20 +239,55 @@ describe('readContent (code)', () => {
 });
 
 describe('readContent (spec)', () => {
-  it('cats the spec doc from the worktree', async () => {
+  it('reads the spec doc from the worktree', async () => {
     const { transport, calls } = makeTransport([
-      { match: c => c.startsWith('cat '), result: { stdout: '# Spec\nbody' } },
+      { match: c => c.startsWith('if [ -f') && c.includes('.baxian/spec.md'), result: { stdout: '# Spec\nbody' } },
     ]);
-    const result = await transport.readContent(task(), DEV, 'spec');
+    const result = await transport.readContent(task({ phase: 'spec' }), DEV, 'spec');
     expect(result.content).toBe('# Spec\nbody');
-    expect(calls.find(call => call.startsWith('cat '))).toContain('.baxian/spec.md');
+    expect(result.documents).toEqual([{ relPath: '.baxian/spec.md', content: '# Spec\nbody' }]);
+    expect(calls.find(call => call.startsWith('if [ -f'))).toContain('.baxian/spec.md');
   });
 
   it('throws when the spec doc is missing', async () => {
     const { transport } = makeTransport([
-      { match: c => c.startsWith('cat '), result: { exitCode: 1, stderr: 'No such file' } },
+      { match: c => c.startsWith('if [ -f') && c.includes('.baxian/spec.md'), result: { exitCode: 4, stderr: 'No such file' } },
     ]);
-    await expect(transport.readContent(task(), DEV, 'spec')).rejects.toThrow(ReviewExchangeError);
+    await expect(transport.readContent(task({ phase: 'spec' }), DEV, 'spec')).rejects.toThrow(
+      expect.objectContaining({ reason: 'spec-missing' }),
+    );
+  });
+
+  it('reads sorted research documents and renders them with path headings', async () => {
+    const { transport } = makeTransport([
+      { match: c => c.startsWith('if [ -f') && c.includes('.baxian/spec.md'), result: { stdout: '# Spec' } },
+      {
+        match: c => c.includes("find '/wt/dev/.baxian/research'") && c.includes('-print0'),
+        result: { stdout: '/wt/dev/.baxian/research/z.md\0/wt/dev/.baxian/research/a.md\0' },
+      },
+      { match: c => c === "cat '/wt/dev/.baxian/research/a.md'", result: { stdout: '# A' } },
+      { match: c => c === "cat '/wt/dev/.baxian/research/z.md'", result: { stdout: '# Z' } },
+    ]);
+
+    const result = await transport.readContent(task({ phase: 'spec' }), DEV, 'spec');
+
+    expect(result.documents).toEqual([
+      { relPath: '.baxian/spec.md', content: '# Spec' },
+      { relPath: '.baxian/research/a.md', content: '# A' },
+      { relPath: '.baxian/research/z.md', content: '# Z' },
+    ]);
+    expect(result.content).toContain('=== .baxian/research/a.md ===\n# A');
+  });
+
+  it('rejects symlinked research markdown files', async () => {
+    const { transport } = makeTransport([
+      { match: c => c.startsWith('if [ -f') && c.includes('.baxian/spec.md'), result: { stdout: '# Spec' } },
+      { match: c => c.includes('-type l'), result: { exitCode: 5 } },
+    ]);
+
+    await expect(transport.readSpecDocuments(DEV)).rejects.toThrow(
+      expect.objectContaining({ reason: 'research-docs-list-failed' }),
+    );
   });
 });
 
@@ -368,15 +405,41 @@ describe('readFindings / readResponse', () => {
 });
 
 describe('clearDispatchOutputs', () => {
-  it('clears stale review outputs before every dispatch and the spec output before develop', async () => {
+  it('clears stale review outputs and all spec documents before develop', async () => {
     const { transport, calls } = makeTransport([]);
 
     await transport.clearDispatchOutputs(DEV, '/wt/dev', 'develop');
 
-    const command = calls.at(-1)!;
+    const command = calls.find(call => call.startsWith('rm -f '))!;
     expect(command).toContain("'/wt/dev/.baxian/review/findings.json'");
     expect(command).toContain("'/wt/dev/.baxian/review/response.json'");
     expect(command).toContain("'/wt/dev/.baxian/spec.md'");
+    expect(calls).toContain("rm -rf -- '/wt/dev/.baxian/research'");
+  });
+
+  it('removes Research handoff documents before the next real develop dispatch', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'review-develop-cleanup-'));
+    const runner = new LocalRunner();
+    const specPath = join(worktree, '.baxian', 'spec.md');
+    const researchDir = join(worktree, '.baxian', 'research');
+    try {
+      const initialized = await runner.exec(`git -C ${shellQuote(worktree)} init -q`);
+      expect(initialized.exitCode).toBe(0);
+      await mkdir(researchDir, { recursive: true });
+      await writeFile(specPath, '# Previous Spec');
+      await writeFile(join(researchDir, 'previous-task.md'), '# Previous Research');
+      const transport = new ReviewTransport({
+        createRunnerFor: () => runner,
+        resolveWorkdir: () => worktree,
+      });
+
+      await transport.clearDispatchOutputs(DEV, worktree, 'develop');
+
+      await expect(readFile(specPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readdir(researchDir)).toEqual([]);
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
   });
 
   it('fails closed when stale output cleanup fails', async () => {
@@ -386,6 +449,21 @@ describe('clearDispatchOutputs', () => {
 
     await expect(transport.clearDispatchOutputs(QA, '/wt/qa', 'server-review'))
       .rejects.toThrow(expect.objectContaining({ reason: 'artifact-cleanup-failed' }));
+  });
+
+  it('fails closed when stale Research document cleanup fails before develop', async () => {
+    const { transport } = makeTransport([
+      {
+        match: command => command.startsWith("rm -rf -- '/wt/dev/.baxian/research'"),
+        result: { exitCode: 1, stderr: 'permission denied' },
+      },
+    ]);
+
+    await expect(transport.clearDispatchOutputs(DEV, '/wt/dev', 'develop'))
+      .rejects.toThrow(expect.objectContaining({
+        reason: 'artifact-cleanup-failed',
+        message: expect.stringContaining('failed to clear stale research docs'),
+      }));
   });
 });
 

@@ -21,6 +21,8 @@ const TASK: TaskState = {
   description: 'Reproduce on Safari and adjust router guard.',
   preferredAgentId: 'dev-1',
   agentId: 'dev-1',
+  devAgentId: 'dev-1',
+  phase: 'code',
   reviewRound: 0,
   status: 'pending',
   createdAt: '2026-04-28T10:00:00Z',
@@ -71,6 +73,7 @@ describe('buildPromptInline', () => {
 
   async function seedAllPhaseSkills(): Promise<void> {
     await makeSkill('baxian-task-check', 'task-check stub');
+    await makeSkill('baxian-research', 'research stub');
     await makeSkill('baxian-pr-feedback', 'pr-feedback stub');
     await makeSkill('baxian-pr-review', 'pr-review stub');
     await makeSkill('baxian-pr-recheck', 'pr-recheck stub');
@@ -106,6 +109,9 @@ describe('buildPromptInline', () => {
   }
 
   const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/repo' };
+  const RESEARCH_AGENT: AgentConfig = {
+    id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: '/tmp/research-repo',
+  };
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'baxian-prompt-skills-'));
@@ -128,6 +134,30 @@ describe('buildPromptInline', () => {
     expect(prompt).not.toContain('<skills>');
     expect(prompt).not.toContain('<task>');
     expect(prompt).not.toContain('<![CDATA[');
+  });
+
+  it('research dispatch loads only the Research workflow and exposes only spec completion', async () => {
+    await seedAndScan();
+    const prompt = build({
+      task: {
+        ...TASK,
+        preferredAgentId: 'research-1',
+        agentId: 'research-1',
+        researchAgentId: 'research-1',
+        phase: 'research',
+        status: 'in_progress',
+      },
+      phase: 'research',
+      agent: RESEARCH_AGENT,
+      workdir: '/tmp/research-repo',
+      signalToken: 'research-token-1',
+    });
+
+    expect(prompt.startsWith('/baxian-research\nphase: research\n')).toBe(true);
+    expect(prompt).toContain('signal: spec-done');
+    expect(prompt).toContain('token: research-token-1');
+    expect(prompt).not.toContain('signal: pr-created');
+    expect(prompt).not.toContain('signal: code-done');
   });
 
   it('codex runtime uses the $ sigil to force-load the primary skill', async () => {
@@ -310,7 +340,7 @@ describe('buildPromptInline', () => {
     expect(prompt.endsWith(`title: ${TASK.title}\n`)).toBe(true);
   });
 
-  it('develop descriptor with a QA partner carries spec-signal + the done signal', async () => {
+  it('develop descriptor carries both spec and code completion signals when the task has QA', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress' },
@@ -348,7 +378,7 @@ describe('buildPromptInline', () => {
   it.each([
     ['github chain', undefined, 'pr-created' as const],
     ['server chain', 'server' as const, 'code-done' as const],
-  ])('develop drops the spec-signal when hasQaPartner is false (%s)', async (_label, reviewMode, replacementSignal) => {
+  ])('develop drops the spec route when the task has no QA partner (%s)', async (_label, reviewMode, replacementSignal) => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress', reviewMode },
@@ -360,7 +390,7 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain('token: spec-token-1');
   });
 
-  it('develop keeps the spec-signal when hasQaPartner is true or omitted', async () => {
+  it('develop keeps the spec route when hasQaPartner is true or omitted', async () => {
     await seedAndScan();
     for (const extra of [{ hasQaPartner: true }, {}]) {
       const prompt = build({

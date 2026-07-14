@@ -79,6 +79,8 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     description: '',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
+    phase: 'code',
     reviewRound: 0,
     status: 'in_progress',
     createdAt: now,

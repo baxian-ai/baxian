@@ -6,6 +6,7 @@ import type {
   ReviewRound,
   TaskState,
 } from '../shared/index.js';
+import { isSpecStagePhase } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import type { AgentManager } from '../agent/manager.js';
 import { ReviewExchangeError } from '../agent/review-transport.js';
@@ -160,7 +161,7 @@ async function gate(
   }
   const token = event.data?.token as string | undefined;
   const phaseOk = expect.phase === 'any'
-    || (expect.phase === 'spec' ? task.phase === 'spec' : task.phase !== 'spec');
+    || (expect.phase === 'spec' ? task.phase !== 'code' : !isSpecStagePhase(task.phase));
   if (task.status !== expect.status || !phaseOk || !token || token !== task.signalToken) {
     await emitIntervention(bus, task, {
       phase: `${event.type}-stale`,
@@ -181,7 +182,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   const reviewStore = configured;
   const transport = () => manager.getReviewTransport();
 
-  async function releaseAndClearAtCap(
+  async function releaseAtCap(
     task: TaskState,
     agentId: string,
     field: 'agentId' | 'qaAgentId',
@@ -200,8 +201,10 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         return;
       }
     }
-    await manager.updateTask(task.id, { [field]: undefined })
-      .catch(err => console.error(`[ServerHandler] max_rounds clear ${field}(${task.id}) failed:`, err));
+    if (field === 'agentId') {
+      await manager.updateTask(task.id, { agentId: '' })
+        .catch(err => console.error(`[ServerHandler] max_rounds clear agentId(${task.id}) failed:`, err));
+    }
   }
 
   async function putVerdictRound(
@@ -230,8 +233,20 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   }
 
   function resolveActiveQa(task: TaskState): AgentConfig | undefined {
-    const recorded = task.qaAgentId ? manager.getAgentConfig(task.qaAgentId) : undefined;
-    return recorded ?? manager.findQaPartner(task.agentId);
+    if (!task.qaAgentId) return undefined;
+    const recorded = manager.getAgentConfig(task.qaAgentId);
+    return recorded?.role === 'qa' ? recorded : undefined;
+  }
+
+  async function pauseForUnavailableQa(
+    task: TaskState,
+    entryKind: PhaseSignalKind,
+    phase: string,
+  ): Promise<boolean> {
+    if (!task.qaAgentId || resolveActiveQa(task)) return false;
+    await emitIntervention(bus, task, { phase, qaAgentId: task.qaAgentId });
+    if (task.agentId) await rearmOrHold(task, task.agentId, entryKind);
+    return true;
   }
 
   async function autoApproveCode(task: TaskState, entryKind: PhaseSignalKind = 'code-done'): Promise<void> {
@@ -273,7 +288,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   }
 
   function specApprovalIsHuman(task: TaskState): boolean {
-    return manager.getProjectConfig(task.projectId)?.specApproval === 'human';
+    return task.researchAgentId !== undefined
+      || manager.getProjectConfig(task.projectId)?.specApproval === 'human';
   }
 
   async function advanceApprovedSpec(task: TaskState, failurePhase: string): Promise<void> {
@@ -328,7 +344,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
       if (!capResult) return false;
       const paused = capResult.task;
-      if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
+      if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
       await bus.emit({
         id: '',
         type: 'review.max_rounds',
@@ -470,7 +486,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'code', requireServerMode: true });
     if (!gated) return;
     const { task } = gated;
-    if (!resolveActiveQa(task)) {
+    if (await pauseForUnavailableQa(task, 'code-done', 'server-code-qa-unavailable')) return;
+    if (!task.qaAgentId) {
       await autoApproveCode(task);
       return;
     }
@@ -598,7 +615,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       if (!capResult) return;
       const paused = capResult.task;
       if (paused.qaAgentId) {
-        await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId', { allowAwaitingHuman: true });
+        await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId', { allowAwaitingHuman: true });
       }
       await bus.emit({
         id: '',
@@ -619,8 +636,10 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     priorFindingsJson: string,
     priorResponseJson: string,
   ): Promise<boolean> {
-    // 无 QA（含循环中途配置被关闭）：修复提交后自动通过回 ready，人机循环闭合，不派 QA 复审
-    if (!resolveActiveQa(task)) {
+    if (await pauseForUnavailableQa(task, 'code-fixed', 'server-code-qa-unavailable-after-fix')) {
+      return false;
+    }
+    if (!task.qaAgentId) {
       await autoApproveCode(task, 'code-fixed');
       return true;
     }
@@ -769,15 +788,9 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   });
 
   bus.on('server.spec.ready', async (event) => {
-    const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'any', requireServerMode: false });
+    const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'spec', requireServerMode: false });
     if (!gated) return;
-    const { task } = gated;
-    if (!resolveActiveQa(task) && !specApprovalIsHuman(task)) {
-      await autoApproveSpec(task);
-      return;
-    }
-    // 无 QA 但需人类审核：仍走 dispatchSpecReview 存 spec 内容，再由其停驻
-    await dispatchSpecReview(task);
+    await dispatchSpecReview(gated.task);
   });
 
   async function dispatchSpecReview(task: TaskState, prior?: { findingsJson: string; responseJson?: string }): Promise<boolean> {
@@ -796,8 +809,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
       if (!capResult) return false;
       const paused = capResult.task;
-      if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
-      if (paused.agentId) await releaseAndClearAtCap(paused, paused.agentId, 'agentId');
+      if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
+      if (paused.agentId) await releaseAtCap(paused, paused.agentId, 'agentId');
       return false;
     }
     await manager.refreshWorkdirCacheFor(task.agentId);
@@ -814,10 +827,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return false;
     }
     try {
+      if (!content.documents) throw new Error('spec transport returned no documents');
       await reviewStore.putRound(task.id, 'spec', {
         round: nextRound,
         phase: 'spec',
         content: content.content,
+        documents: content.documents,
         startedAt: new Date().toISOString(),
       });
     } catch (err) {
@@ -830,12 +845,17 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return false;
     }
     if (!resolveActiveQa(task)) {
-      if (specApprovalIsHuman(task)) {
+      if (task.qaAgentId) {
+        await emitIntervention(bus, task, {
+          phase: 'server-spec-qa-unavailable',
+          qaAgentId: task.qaAgentId,
+        });
+      }
+      if (specApprovalIsHuman(task) || task.qaAgentId) {
         const parked = await manager.parkTaskAtSpecReady(task.id, { specReviewRound: nextRound });
         if (!parked) await emitIntervention(bus, task, { phase: 'server-spec-park-transition-failed' });
         return !!parked;
       }
-      // 循环中途配置被关闭：退回无 QA 的自动通过
       return autoApproveSpec(task);
     }
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
@@ -914,8 +934,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
       if (!capResult) return;
       const paused = capResult.task;
-      if (paused.qaAgentId) await releaseAndClearAtCap(paused, paused.qaAgentId, 'qaAgentId');
-      if (paused.agentId) await releaseAndClearAtCap(paused, paused.agentId, 'agentId');
+      if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
+      if (paused.agentId) await releaseAtCap(paused, paused.agentId, 'agentId');
       return;
     }
     await manager.dispatchServerFixToDev(task.id, JSON.stringify(effective));

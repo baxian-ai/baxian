@@ -19,6 +19,7 @@ function makeTask(id: string, overrides: Partial<TaskState> = {}): TaskState {
     description: 'sample',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     reviewRound: 0,
     status: 'pending',
     createdAt: NOW,
@@ -35,8 +36,11 @@ async function writeUnsanitizedTask(id: string, overrides: Record<string, unknow
   const raw: Record<string, unknown> = {
     id,
     projectId: 'proj',
+    title: `Task ${id}`,
+    description: 'sample',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
+    devAgentId: 'dev-1',
     reviewRound: 0,
     status: 'pending',
     createdAt: NOW,
@@ -244,33 +248,31 @@ describe('TaskStore sanitize', () => {
       expect(t).not.toHaveProperty('strayField');
     }
     const sanitized = all.find((t) => t.id === 'task-103')!;
-    expect(sanitized.title).toBe('task-103');
+    expect(sanitized.title).toBe('Task task-103');
   });
 
-  it('falls back title to the task id when title missing', async () => {
-    await writeUnsanitizedTask('task-201');
-    const loaded = await store.get('task-201');
-    expect(loaded!.title).toBe('task-201');
+  it('rejects a task whose required title is missing', async () => {
+    await writeUnsanitizedTask('task-201', { title: undefined });
+    await expect(store.get('task-201')).rejects.toThrow('title');
   });
 
-  it('falls back description to empty string when missing', async () => {
-    await writeUnsanitizedTask('task-203', { title: 'has title' });
-    const loaded = await store.get('task-203');
-    expect(loaded!.description).toBe('');
+  it('rejects a task whose required description is missing', async () => {
+    await writeUnsanitizedTask('task-203', { description: undefined });
+    await expect(store.get('task-203')).rejects.toThrow('description');
   });
 
-  it('maps on-disk specMarkerToken to signalToken on read', async () => {
+  it('does not map the removed specMarkerToken field', async () => {
     await writeUnsanitizedTask('task-smt', {
       title: 'dormant pre-rename task',
       description: '',
       specMarkerToken: 'tok-123',
     });
     const loaded = await store.get('task-smt');
-    expect(loaded!.signalToken).toBe('tok-123');
+    expect(loaded!.signalToken).toBeUndefined();
     expect(loaded!).not.toHaveProperty('specMarkerToken');
   });
 
-  it('maps the legacy reviewWorktreeMode field to reviewCheckoutMode on read', async () => {
+  it('does not map the removed reviewWorktreeMode field', async () => {
     await writeUnsanitizedTask('task-review-checkout', {
       title: 'legacy review checkout',
       reviewWorktreeMode: 'base',
@@ -278,7 +280,7 @@ describe('TaskStore sanitize', () => {
 
     const loaded = await store.get('task-review-checkout');
 
-    expect(loaded?.reviewCheckoutMode).toBe('base');
+    expect(loaded?.reviewCheckoutMode).toBeUndefined();
     expect(loaded).not.toHaveProperty('reviewWorktreeMode');
   });
 
@@ -294,10 +296,10 @@ describe('TaskStore sanitize', () => {
   });
 
   it('get treats the filename as the authoritative id when the file body omits it', async () => {
-    await writeUnsanitizedTask('task-noid', { id: undefined, title: '' });
+    await writeUnsanitizedTask('task-noid', { id: undefined, title: 'has title' });
     const loaded = await store.get('task-noid');
     expect(loaded!.id).toBe('task-noid');
-    expect(loaded!.title).toBe('task-noid');
+    expect(loaded!.title).toBe('has title');
   });
 
   it('get overrides a mismatching id in the file body with the filename id', async () => {
@@ -314,7 +316,7 @@ describe('TaskStore sanitize', () => {
     expect(await store.nextId()).toBe('task-008');
   });
 
-  it('falls back preferredAgentId to agentId when preferredAgentId missing', async () => {
+  it('rejects a task whose preferredAgentId is missing', async () => {
     await writeUnsanitizedTask('task-204', {
       title: 'has title',
       description: 'desc',
@@ -322,42 +324,94 @@ describe('TaskStore sanitize', () => {
       agentId: 'dev1',
       status: 'in_progress',
     });
-    const loaded = await store.get('task-204');
-    expect(loaded!.preferredAgentId).toBe('dev1');
+    await expect(store.get('task-204')).rejects.toThrow('preferredAgentId');
   });
 
-  it('coerces whitespace-only title/preferredAgentId via fallback', async () => {
+  it('rejects a whitespace-only title', async () => {
     await writeUnsanitizedTask('task-ws', {
       title: '   ',
       description: '',
       preferredAgentId: '   ',
     });
-    const loaded = await store.get('task-ws');
-    expect(loaded!.title).toBe('task-ws');
-    expect(loaded!.preferredAgentId).toBe('dev-1');
+    await expect(store.get('task-ws')).rejects.toThrow('title');
   });
 
-  it('coerces null/wrong-typed fields via fallback (hand-edit corruption)', async () => {
+  it('rejects null or wrongly typed required fields', async () => {
     await writeUnsanitizedTask('task-corrupt', {
       title: null,
       description: 42,
       preferredAgentId: null,
     });
-    const loaded = await store.get('task-corrupt');
-    expect(loaded!.title).toBe('task-corrupt');
-    expect(loaded!.description).toBe('');
-    expect(loaded!.preferredAgentId).toBe('dev-1');
+    await expect(store.get('task-corrupt')).rejects.toThrow('title');
   });
 
-  it('falls back preferredAgentId to empty when both preferredAgentId and agentId empty', async () => {
+  it('rejects a missing preferredAgentId even when agentId is empty', async () => {
     await writeUnsanitizedTask('task-205', {
       title: 'has title',
       description: 'desc',
       preferredAgentId: undefined,
       agentId: '',
     });
-    const loaded = await store.get('task-205');
-    expect(loaded!.preferredAgentId).toBe('');
+    await expect(store.get('task-205')).rejects.toThrow('preferredAgentId');
+  });
+
+  it.each([
+    ['unknown phase', { phase: 'analysis' }, 'phase'],
+    ['missing devAgentId', { devAgentId: undefined }, 'devAgentId'],
+    ['duplicate participants', { qaAgentId: 'dev-1' }, 'participants'],
+    ['non-participant agentId', { agentId: 'qa-1' }, 'agentId'],
+    ['research phase without Research', { phase: 'research', researchAgentId: undefined }, 'researchAgentId'],
+  ])('rejects strict task schema violation: %s', async (_case, overrides, field) => {
+    await writeUnsanitizedTask(`task-strict-${field}`, overrides);
+    await expect(store.get(`task-strict-${field}`)).rejects.toThrow(field);
+  });
+
+  it('accepts an unphased Dev task as the initial Dev-SDD state', async () => {
+    await writeUnsanitizedTask('task-dev-sdd', {
+      qaAgentId: 'qa-1',
+      phase: undefined,
+      status: 'in_progress',
+    });
+
+    await expect(store.get('task-dev-sdd')).resolves.toMatchObject({
+      agentId: 'dev-1',
+      devAgentId: 'dev-1',
+      qaAgentId: 'qa-1',
+      status: 'in_progress',
+    });
+    expect((await store.get('task-dev-sdd'))?.phase).toBeUndefined();
+  });
+
+  it('rejects an unphased task that records a Research participant', async () => {
+    await writeUnsanitizedTask('task-research-no-phase', {
+      preferredAgentId: 'research-1',
+      agentId: 'research-1',
+      researchAgentId: 'research-1',
+      phase: undefined,
+      status: 'in_progress',
+    });
+
+    await expect(store.get('task-research-no-phase')).rejects.toThrow('phase');
+  });
+
+  it('accepts a Research task with distinct stable participants', async () => {
+    await writeUnsanitizedTask('task-research', {
+      preferredAgentId: 'research-1',
+      agentId: 'research-1',
+      devAgentId: 'dev-1',
+      qaAgentId: 'qa-1',
+      researchAgentId: 'research-1',
+      phase: 'research',
+      status: 'in_progress',
+    });
+
+    await expect(store.get('task-research')).resolves.toMatchObject({
+      agentId: 'research-1',
+      devAgentId: 'dev-1',
+      qaAgentId: 'qa-1',
+      researchAgentId: 'research-1',
+      phase: 'research',
+    });
   });
 
   it('preserves all schema fields on set for a fresh task', async () => {
@@ -368,6 +422,7 @@ describe('TaskStore sanitize', () => {
       description: 'desc',
       preferredAgentId: 'dev-1',
       agentId: 'dev-1',
+      devAgentId: 'dev-1',
       qaAgentId: 'qa-1',
       prNumber: 123,
       prUrl: 'https://github.com/foo/bar/pull/123',
@@ -378,6 +433,7 @@ describe('TaskStore sanitize', () => {
       prFeedbackReceivedAt: '2026-04-28T10:02:00Z',
       fixDispatchedAt: '2026-04-28T10:03:00Z',
       reviewRound: 1,
+      phase: 'code',
       status: 'in_progress',
       createdAt: NOW,
       updatedAt: NOW,

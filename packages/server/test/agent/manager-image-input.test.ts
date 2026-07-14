@@ -229,7 +229,7 @@ describe('retryTask image preservation', () => {
     const now = new Date().toISOString();
     await taskStore.set({
       id, projectId: 'proj', title: `Task ${id}`, description: 'd',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', reviewRound: 0,
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', reviewRound: 0,
       status: 'failed', branch: `bx/${id}`, createdAt: now, updatedAt: now,
       images: [filename],
     });

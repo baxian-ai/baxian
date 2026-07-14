@@ -90,6 +90,8 @@ describe('AgentManager.reconcileFailedAgent', () => {
       description: 'D',
       preferredAgentId: 'dev-1',
       agentId: 'dev-1',
+      devAgentId: 'dev-1',
+      phase: 'code',
       branch: 'bx/task-old',
       reviewRound: 0,
       status: 'in_progress',

@@ -5,12 +5,17 @@ import {
   MAX_READ_FILE_BYTES,
   REVIEW_EXCHANGE_DIR,
   REVIEW_INBOX_DIR,
+  RESEARCH_DOCS_DIR,
   SPEC_DOC_RELPATH,
+  mapWithConcurrency,
+  FS_READ_CONCURRENCY,
+  renderSpecDocuments,
   type AgentConfig,
   type Finding,
   type ReviewContentFileRef,
   type ReviewFindings,
   type ReviewResponse,
+  type SpecDocument,
   type TaskPhase,
   type TaskState,
 } from '../shared/index.js';
@@ -31,6 +36,7 @@ export class ReviewExchangeError extends Error {
 
 export interface ReadContentResult {
   content: string;
+  documents?: SpecDocument[];
   diffstat?: string;
   baseSha?: string;
   headSha?: string;
@@ -48,6 +54,10 @@ const SEVERITIES = new Set(['critical', 'major', 'minor']);
 const VERDICTS = new Set(['approve', 'request-changes']);
 const ACTIONS = new Set(['fix', 'reject', 'out-of-scope']);
 const REVIEW_DIFF_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
+const SPEC_DOC_MAX_BYTES = 8 * 1024 * 1024;
+const RESEARCH_DOC_MAX_BYTES = 1024 * 1024;
+const RESEARCH_DOCS_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
+const RESEARCH_DOCS_MAX_COUNT = 64;
 
 export function validateReviewFindings(raw: unknown): ReviewFindings {
   if (!isRecord(raw)) throw new ReviewExchangeError('schema', 'findings: not an object');
@@ -130,10 +140,11 @@ export class ReviewTransport {
   constructor(private readonly deps: ReviewTransportDeps) {}
 
   async clearDispatchOutputs(agent: AgentConfig, workdir: string, phase: string): Promise<void> {
+    const resetsSpecDocuments = phase === 'develop' || phase === 'research';
     const paths = [
       `${workdir}/${REVIEW_EXCHANGE_DIR}/findings.json`,
       `${workdir}/${REVIEW_EXCHANGE_DIR}/response.json`,
-      ...(phase === 'develop' ? [`${workdir}/${SPEC_DOC_RELPATH}`] : []),
+      ...(resetsSpecDocuments ? [`${workdir}/${SPEC_DOC_RELPATH}`] : []),
     ];
     const runner = this.deps.createRunnerFor(agent);
     await this.ensureRuntimeDirs(runner, workdir);
@@ -146,18 +157,25 @@ export class ReviewTransport {
         `failed to clear stale dispatch outputs: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
       );
     }
+    if (resetsSpecDocuments) {
+      const researchDir = `${workdir}/${RESEARCH_DOCS_DIR}`;
+      const cleared = await runner.exec(`rm -rf -- ${shellQuote(researchDir)}`);
+      if (cleared.exitCode !== 0) {
+        throw new ReviewExchangeError(
+          'artifact-cleanup-failed',
+          `failed to clear stale research docs: ${cleared.stderr.trim() || `exit ${cleared.exitCode}`}`,
+        );
+      }
+      await this.ensureRuntimeDirs(runner, workdir);
+    }
   }
 
   async readContent(task: TaskState, devAgent: AgentConfig, phase: TaskPhase): Promise<ReadContentResult> {
     const wt = this.requireWorkdir(devAgent.id);
     const runner = this.deps.createRunnerFor(devAgent);
     if (phase === 'spec') {
-      await this.ensureRuntimeDirs(runner, wt);
-      const r = await runner.exec(`cat ${shellQuote(`${wt}/${SPEC_DOC_RELPATH}`)}`);
-      if (r.exitCode !== 0) {
-        throw new ReviewExchangeError('spec-missing', `spec doc unreadable: ${r.stderr.trim()}`);
-      }
-      return { content: r.stdout };
+      const documents = await this.readSpecDocuments(devAgent);
+      return { content: renderSpecDocuments(documents), documents };
     }
     const cd = `cd ${shellQuote(wt)} && `;
     let fetch: ExecResult;
@@ -214,6 +232,122 @@ export class ReviewTransport {
       headTree,
       defaultBranch,
     };
+  }
+
+  async readSpecDocuments(agent: AgentConfig): Promise<SpecDocument[]> {
+    const workdir = this.requireWorkdir(agent.id);
+    const runner = this.deps.createRunnerFor(agent);
+    await this.ensureRuntimeDirs(runner, workdir);
+    const specPath = `${workdir}/${SPEC_DOC_RELPATH}`;
+    const researchDir = `${workdir}/${RESEARCH_DOCS_DIR}`;
+    const [spec, listing] = await Promise.all([
+      runner.exec(
+        `if [ -f ${shellQuote(specPath)} ] && [ ! -L ${shellQuote(specPath)} ]; then cat ${shellQuote(specPath)}; else exit 4; fi`,
+        { maxBuffer: SPEC_DOC_MAX_BYTES },
+      ).catch((err: unknown) => {
+        throw new ReviewExchangeError(
+          'spec-too-large',
+          `spec doc unreadable or too large: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }),
+      runner.exec(
+        `if find ${shellQuote(researchDir)} -maxdepth 1 -type l -name '*.md' -print -quit | grep -q .; then exit 5; fi; `
+        + `find ${shellQuote(researchDir)} -maxdepth 1 -type f -name '*.md' -print0`,
+      ),
+    ]);
+    if (spec.exitCode !== 0) {
+      throw new ReviewExchangeError('spec-missing', `spec doc missing, unreadable, or a symlink: ${spec.stderr.trim()}`);
+    }
+    if (listing.exitCode !== 0) {
+      throw new ReviewExchangeError(
+        'research-docs-list-failed',
+        `research docs listing failed or contains symlinks: ${listing.stderr.trim()}`,
+      );
+    }
+    const relPaths = listing.stdout
+      .split('\0')
+      .filter(Boolean)
+      .map(path => path.startsWith(`${workdir}/`) ? path.slice(workdir.length + 1) : path)
+      .sort();
+    if (relPaths.length > RESEARCH_DOCS_MAX_COUNT) {
+      throw new ReviewExchangeError(
+        'research-docs-too-many',
+        `research docs exceed the ${RESEARCH_DOCS_MAX_COUNT}-file limit (${relPaths.length})`,
+      );
+    }
+    const reads = await mapWithConcurrency(relPaths, FS_READ_CONCURRENCY, relPath =>
+      runner.exec(`cat ${shellQuote(`${workdir}/${relPath}`)}`, { maxBuffer: RESEARCH_DOC_MAX_BYTES })
+        .catch((err: unknown) => {
+          throw new ReviewExchangeError(
+            'research-doc-too-large',
+            `research doc unreadable or too large: ${relPath}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }),
+    );
+    let totalBytes = 0;
+    const documents: SpecDocument[] = [{ relPath: SPEC_DOC_RELPATH, content: spec.stdout }];
+    relPaths.forEach((relPath, index) => {
+      const result = reads[index]!;
+      if (result.exitCode !== 0) {
+        throw new ReviewExchangeError('research-doc-unreadable', `research doc unreadable: ${relPath}`);
+      }
+      totalBytes += Buffer.byteLength(result.stdout, 'utf8');
+      if (totalBytes > RESEARCH_DOCS_TOTAL_MAX_BYTES) {
+        throw new ReviewExchangeError(
+          'research-docs-too-large',
+          `research docs exceed the ${RESEARCH_DOCS_TOTAL_MAX_BYTES}-byte total limit`,
+        );
+      }
+      documents.push({ relPath, content: result.stdout });
+    });
+    return documents;
+  }
+
+  async replaceSpecDocuments(
+    agent: AgentConfig,
+    workdir: string,
+    documents: readonly SpecDocument[],
+    assertOwner: () => Promise<void>,
+  ): Promise<void> {
+    this.validateSpecDocuments(documents);
+    const runner = this.deps.createRunnerFor(agent);
+    const specPath = `${workdir}/${SPEC_DOC_RELPATH}`;
+    const researchDir = `${workdir}/${RESEARCH_DOCS_DIR}`;
+    await assertOwner();
+    await this.ensureRuntimeDirs(runner, workdir);
+    const cleared = await runner.exec(
+      `rm -f -- ${shellQuote(specPath)} && rm -rf -- ${shellQuote(researchDir)}`,
+    );
+    if (cleared.exitCode !== 0) {
+      throw new ReviewExchangeError(
+        'spec-seed-failed',
+        `failed to clear old spec documents: ${cleared.stderr.trim() || `exit ${cleared.exitCode}`}`,
+      );
+    }
+    await assertOwner();
+    await this.ensureRuntimeDirs(runner, workdir);
+    await mapWithConcurrency(documents, FS_READ_CONCURRENCY, async (document) => {
+      await assertOwner();
+      const final = `${workdir}/${document.relPath}`;
+      const dir = final.slice(0, final.lastIndexOf('/'));
+      const tmp = `${dir}/.tmp-${randomBytes(8).toString('hex')}`;
+      try {
+        await runner.writeFile(tmp, document.content);
+        await assertOwner();
+        const moved = await runner.exec(`mv -f -- ${shellQuote(tmp)} ${shellQuote(final)}`);
+        if (moved.exitCode !== 0) {
+          throw new Error(moved.stderr.trim() || `exit ${moved.exitCode}`);
+        }
+        await assertOwner();
+      } catch (err) {
+        await runner.exec(`rm -f -- ${shellQuote(tmp)}`).catch(() => undefined);
+        if (err instanceof ReviewExchangeError) throw err;
+        throw new ReviewExchangeError(
+          'spec-seed-failed',
+          `failed to write ${document.relPath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
   }
 
   async readFindings(task: TaskState, qaAgent: AgentConfig): Promise<ReviewFindings | null> {
@@ -351,6 +485,42 @@ export class ReviewTransport {
         'unsafe-runtime-path',
         err instanceof Error ? err.message : String(err),
       );
+    }
+  }
+
+  private validateSpecDocuments(documents: readonly SpecDocument[]): void {
+    if (documents.length === 0 || documents[0]?.relPath !== SPEC_DOC_RELPATH) {
+      throw new ReviewExchangeError('spec-seed-invalid', `documents must start with ${SPEC_DOC_RELPATH}`);
+    }
+    if (documents.length - 1 > RESEARCH_DOCS_MAX_COUNT) {
+      throw new ReviewExchangeError('spec-seed-invalid', 'too many research documents');
+    }
+    const paths = documents.map(document => document.relPath);
+    if (new Set(paths).size !== paths.length) {
+      throw new ReviewExchangeError('spec-seed-invalid', 'document paths must be unique');
+    }
+    if (Buffer.byteLength(documents[0]!.content, 'utf8') > SPEC_DOC_MAX_BYTES) {
+      throw new ReviewExchangeError('spec-seed-invalid', 'spec document exceeds the size limit');
+    }
+    let researchBytes = 0;
+    const prefix = `${RESEARCH_DOCS_DIR}/`;
+    for (const document of documents.slice(1)) {
+      const name = document.relPath.slice(prefix.length);
+      if (!document.relPath.startsWith(prefix) || name === '' || name.includes('/') || !name.endsWith('.md')) {
+        throw new ReviewExchangeError('spec-seed-invalid', `invalid research document path: ${document.relPath}`);
+      }
+      const bytes = Buffer.byteLength(document.content, 'utf8');
+      if (bytes > RESEARCH_DOC_MAX_BYTES) {
+        throw new ReviewExchangeError('spec-seed-invalid', `${document.relPath} exceeds the size limit`);
+      }
+      researchBytes += bytes;
+    }
+    const sorted = [...paths.slice(1)].sort();
+    if (paths.slice(1).some((path, index) => path !== sorted[index])) {
+      throw new ReviewExchangeError('spec-seed-invalid', 'research document paths must be sorted');
+    }
+    if (researchBytes > RESEARCH_DOCS_TOTAL_MAX_BYTES) {
+      throw new ReviewExchangeError('spec-seed-invalid', 'research documents exceed the total size limit');
     }
   }
 

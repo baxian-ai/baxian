@@ -341,7 +341,9 @@ export function AgentCard({
       )}
       <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">{role === 'qa' ? 'QA' : 'Dev'}</span>
+          <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">
+            {role === 'qa' ? 'QA' : role === 'research' ? 'Research' : 'Dev'}
+          </span>
           <span
             className="min-w-0 truncate whitespace-nowrap font-display text-sm font-semibold text-og-1000"
             title={agentRuntimeTitle(agent.id, runtime, model)}
@@ -523,7 +525,7 @@ export function AgentCard({
               >
                 {clearing ? t.agents.clearing : t.agents.clear}
               </MenuItem>
-              {!pendingRestart && taskId && role === 'dev' && (
+              {!pendingRestart && taskId && (role === 'dev' || role === 'research') && (
                 <MenuItem
                   onClick={() => { close(); void handleRequestReview(); }}
                   disabled={reviewing || deleting}

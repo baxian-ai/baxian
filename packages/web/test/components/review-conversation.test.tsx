@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import type { ReviewRound, TaskState } from '../../src/shared/index.js';
+import type { CodeReviewRound, ReviewRound, SpecReviewRound, TaskState } from '../../src/shared/index.js';
 
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
 
@@ -21,16 +21,27 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
   const now = '2026-06-29T10:00:00Z';
   return makeTaskFixture({
     id: 'task-1', projectId: 'p', title: 't', description: 'd',
-    preferredAgentId: 'dev', agentId: 'dev', reviewRound: 1,
+    preferredAgentId: 'dev', agentId: 'dev', devAgentId: 'dev', reviewRound: 1,
     status: 'review', reviewMode: 'server', createdAt: now, updatedAt: now,
     ...overrides,
   });
 }
 
-function codeRound(round: number, extra: Partial<ReviewRound> = {}): ReviewRound {
+function codeRound(round: number, extra: Partial<CodeReviewRound> = {}): CodeReviewRound {
   return {
     round, phase: 'code', content: '@@ -1 +1 @@\n-a\n+b',
     diffstat: '1 file changed, 1 insertion(+), 1 deletion(-)', startedAt: 'now', ...extra,
+  };
+}
+
+function specRound(round: number, content: string, extra: Partial<SpecReviewRound> = {}): SpecReviewRound {
+  return {
+    round,
+    phase: 'spec',
+    content,
+    documents: [{ relPath: '.baxian/spec.md', content }],
+    startedAt: 'now',
+    ...extra,
   };
 }
 
@@ -74,8 +85,8 @@ describe('ReviewConversation gating', () => {
 
   it('still renders for a github-mode SDD task that has spec rounds (specReviewRound > 0)', async () => {
     reviewsMock.mockResolvedValue([
-      { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
-    ] as ReviewRound[]);
+      specRound(1, 'spec', { findings: { round: 1, verdict: 'approve', findings: [] } }),
+    ]);
     renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
     expect(await screen.findByText('Spec review')).toBeTruthy();
     expect(reviewsMock).toHaveBeenCalled();
@@ -106,8 +117,8 @@ describe('ReviewConversation github code-review group', () => {
 
   it('shows Spec review and Code review together for a github SDD task with spec rounds + PR', async () => {
     reviewsMock.mockResolvedValue([
-      { round: 1, phase: 'spec', content: 'spec', startedAt: 'now', findings: { round: 1, verdict: 'approve', findings: [] } },
-    ] as ReviewRound[]);
+      specRound(1, 'spec', { findings: { round: 1, verdict: 'approve', findings: [] } }),
+    ]);
     githubReviewMock.mockResolvedValue({
       available: true,
       prNumber: 7,
@@ -129,13 +140,12 @@ describe('ReviewConversation server mode', () => {
 
   it('groups rounds by phase and renders dev/QA/dev turns', async () => {
     reviewsMock.mockResolvedValue([
-      {
-        round: 1, phase: 'spec', content: 'spec body\nline2', startedAt: 'now',
+      specRound(1, 'spec body\nline2', {
         findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'm', location: 'Section 1' }] },
         response: { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] },
-      },
+      }),
       codeRound(1, { findings: { round: 1, verdict: 'approve', findings: [] } }),
-    ] as ReviewRound[]);
+    ]);
     renderConv(makeTask());
     expect(await screen.findByText('Spec review')).toBeTruthy();
     expect(screen.getByText('Review records')).toBeTruthy();
@@ -149,12 +159,11 @@ describe('ReviewConversation server mode', () => {
 
   it('renders the User turn when a spec round carries a userDecision', async () => {
     reviewsMock.mockResolvedValue([
-      {
-        round: 1, phase: 'spec', content: 'spec body', startedAt: 'now',
+      specRound(1, 'spec body', {
         findings: { round: 1, verdict: 'approve', findings: [] },
         userDecision: { verdict: 'request-changes', comments: '边界场景没有覆盖', at: 'now' },
-      },
-    ] as ReviewRound[]);
+      }),
+    ]);
     renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
     expect(await screen.findByText('User')).toBeTruthy();
     expect(screen.getByText('Reject Spec')).toBeTruthy();
@@ -241,6 +250,12 @@ describe('ReviewConversation server mode', () => {
     expect(await screen.findByText('QA reviewing…')).toBeTruthy();
   });
 
+  it('shows the reviewing row for a direct Dev task whose phase remains undecided', async () => {
+    reviewsMock.mockResolvedValue([codeRound(1)] as ReviewRound[]);
+    renderConv(makeTask({ phase: undefined, reviewRound: 1, status: 'review' }));
+    expect(await screen.findByText('QA reviewing…')).toBeTruthy();
+  });
+
   it('shows a fixing row with the pending finding count', async () => {
     reviewsMock.mockResolvedValue([
       codeRound(1, { findings: { round: 1, verdict: 'request-changes', findings: [
@@ -250,6 +265,16 @@ describe('ReviewConversation server mode', () => {
     ] as ReviewRound[]);
     renderConv(makeTask({ reviewRound: 1, status: 'fixing' }));
     expect(await screen.findByText('Dev fixing… (2 to respond)')).toBeTruthy();
+  });
+
+  it('shows the fixing row for a direct Dev task whose phase remains undecided', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, { findings: { round: 1, verdict: 'request-changes', findings: [
+        { id: 'f-1', severity: 'major', message: 'a' },
+      ] } }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ phase: undefined, reviewRound: 1, status: 'fixing' }));
+    expect(await screen.findByText('Dev fixing… (1 to respond)')).toBeTruthy();
   });
 
   it('renders per-batch partial review turns before aggregation', async () => {

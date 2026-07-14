@@ -9,6 +9,7 @@ import {
   CleanupFailedError,
   EnsureSessionError,
 } from '../../src/agent/manager.js';
+import { RepoStore } from '../../src/agent/repo-store.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -137,6 +138,8 @@ describe('AgentManager.ensureSession', () => {
       description: 'D',
       preferredAgentId: 'dev-1',
       agentId: 'dev-1',
+      devAgentId: 'dev-1',
+      phase: 'code',
       branch: `bx/${id}`,
       reviewRound: 0,
       status: 'in_progress',
@@ -586,12 +589,48 @@ describe('AgentManager.ensureSession', () => {
     expect(manager.getAgentConfig('qa-1')).toBeDefined();
   });
 
-  it('replaceConfig clears stale canonical Workdir ownership claims', () => {
-    manager.getRepoCache().owners.set('local:/old/repo', 'dev-1');
+  it('replaceConfig preserves canonical ownership and rejects a newly configured alias', async () => {
+    manager.getRepoCache().owners.set('local:/tmp/repo', 'dev-1');
+    const config = expandedConfig();
+    config.project[0].agent[0][1] = {
+      ...config.project[0].agent[0][1],
+      workdir: '/tmp/repo-link',
+    };
+    overrideExec(
+      cmd => cmd.includes("cd '/tmp/repo-link'"),
+      { stdout: '/tmp/repo\n' },
+    );
 
-    manager.replaceConfig(expandedConfig());
+    manager.replaceConfig(config);
 
-    expect(manager.getRepoCache().owners.size).toBe(0);
+    expect(manager.getRepoCache().owners.get('local:/tmp/repo')).toBe('dev-1');
+    const alias = new RepoStore(
+      runner as unknown as CommandRunner,
+      'owner/repo',
+      'local',
+      undefined,
+      manager.getRepoCache(),
+      'qa-1',
+      '/tmp/repo-link',
+    );
+    await expect(alias.ensure()).rejects.toThrow(/already owned by agent "dev-1"/i);
+  });
+
+  it.each([
+    ['agent removal', []],
+    ['idle Workdir change', [[{
+      id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local',
+      workdir: '/tmp/repo-new', yolo: true,
+    }]]],
+  ] as const)('replaceConfig releases the old canonical owner on %s', (_label, agent) => {
+    manager.getRepoCache().owners.set('local:/tmp/repo', 'dev-1');
+
+    manager.replaceConfig({
+      ...CONFIG,
+      project: [{ ...CONFIG.project[0], agent: agent as BaxianConfig['project'][number]['agent'] }],
+    });
+
+    expect(manager.getRepoCache().owners.has('local:/tmp/repo')).toBe(false);
   });
 
   type RestartReplPrivates = {
