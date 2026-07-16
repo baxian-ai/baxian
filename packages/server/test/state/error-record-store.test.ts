@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -195,6 +195,7 @@ describe('ErrorRecordStore', () => {
     const dir = errorsDir();
     const path = jsonlPath('2026-05-14');
     const before = await readFile(path, 'utf-8');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await chmod(dir, 0o555);
     try {
@@ -206,6 +207,30 @@ describe('ErrorRecordStore', () => {
     }
     const files = await readdir(dir);
     expect(files.filter(f => f.endsWith('.tmp'))).toHaveLength(0);
+    expect(warn.mock.calls.some(c => String(c[0]).includes('atomic rewrite failed'))).toBe(true);
+    // The tmp never existed here; its ENOENT is not a cleanup failure.
+    expect(warn.mock.calls.some(c => String(c[0]).includes('failed to remove tmp'))).toBe(false);
+    warn.mockRestore();
+  });
+
+  it('purgeAgent surfaces an unreadable errors directory instead of reporting a clean sweep', async () => {
+    await appendRecord();
+    const dir = errorsDir();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await chmod(dir, 0o000);
+    try {
+      await expect(store.purgeAgent('dev-1')).rejects.toThrow(/EACCES|permission denied/i);
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    expect(warn.mock.calls.some(c => String(c[0]).includes('cannot list'))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('purgeAgent treats a missing errors directory as zero records', async () => {
+    await rm(errorsDir(), { recursive: true, force: true });
+    await expect(store.purgeAgent('dev-1')).resolves.toEqual({ removed: 0 });
   });
 
   it('purgeAgent rewrites via tmp+rename, surviving partial state of in-place writes', async () => {

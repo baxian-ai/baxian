@@ -1612,39 +1612,79 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(JSON.parse(response.body).error).toMatch(/locked by another op/);
   });
 
-  it('ensureSession failure after creating a session → rollback killSession + 500 + lock released', async () => {
+  it('ensureSession failure after creating a session → rollback by ref + 500 + lock released', async () => {
     await seedAgent('dev-1', 'proj');
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
     vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'repl never became ready'),
+      new EnsureSessionError(
+        { createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 },
+        'repl never became ready',
+      ),
     );
     vi.spyOn(app.ctx.agentManager, 'handleDialogPendingFromRuntime').mockResolvedValue(false);
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockResolvedValue();
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const response = await post('/api/projects/proj/agents/dev-1/retry');
 
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('repl never became ready');
-    expect(killSpy).toHaveBeenCalledWith('dev-1');
+    expect(killSpy).toHaveBeenCalledWith(REF);
     expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+    warn.mockRestore();
   });
 
-  it('rollback killSession failure is swallowed with a warning; retry still returns 500', async () => {
+  it('retry rollback stands down when the session was adopted after create', async () => {
     await seedAgent('dev-1', 'proj');
     app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    const mgr = app.ctx.agentManager as unknown as { adoptGeneration: Map<string, number> };
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementationOnce(async () => {
+      mgr.adoptGeneration.set('dev-1', (mgr.adoptGeneration.get('dev-1') ?? 0) + 1);
+      throw new EnsureSessionError(
+        {
+          createdSession: true,
+          agentId: 'dev-1',
+          sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' },
+          genAtCreate: mgr.adoptGeneration.get('dev-1')! - 1,
+        },
+        'repl never became ready',
+      );
+    });
+    vi.spyOn(app.ctx.agentManager, 'handleDialogPendingFromRuntime').mockResolvedValue(false);
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(500);
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some(c => String(c[0]).includes('session adopted since create'))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('rollback kill failure is swallowed with a warning; retry still returns 500', async () => {
+    await seedAgent('dev-1', 'proj');
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
     vi.spyOn(app.ctx.agentManager, 'ensureSession').mockRejectedValueOnce(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'repl never became ready'),
+      new EnsureSessionError(
+        { createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 },
+        'repl never became ready',
+      ),
     );
     vi.spyOn(app.ctx.agentManager, 'handleDialogPendingFromRuntime').mockResolvedValue(false);
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession')
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef')
       .mockRejectedValue(new Error('tmux server unreachable'));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const response = await post('/api/projects/proj/agents/dev-1/retry');
 
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('repl never became ready');
-    expect(killSpy).toHaveBeenCalledWith('dev-1');
+    expect(killSpy).toHaveBeenCalledWith(REF);
     expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
+    warn.mockRestore();
   });
 });
 

@@ -1,11 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { lstat, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RepoStore,
   accessMethodDiffers,
+  ancestorSymlinkGuard,
   createRepoStoreCache,
+  moveFileIntoPlace,
+  stageFileGuarded,
 } from '../../src/agent/repo-store.js';
 import { LocalRunner, shellQuote, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
 
@@ -96,6 +99,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -386,5 +390,506 @@ describe('accessMethodDiffers', () => {
   it('distinguishes HTTPS and SSH while treating equivalent SSH forms alike', () => {
     expect(accessMethodDiffers('https://git.example.com/g/p.git', 'git@git.example.com:g/p.git')).toBe(true);
     expect(accessMethodDiffers('ssh://git@git.example.com/g/p.git', 'git@git.example.com:g/p.git')).toBe(false);
+  });
+});
+
+class ScriptedRunner implements CommandRunner {
+  readonly commands: string[] = [];
+  private queues = new Map<RegExp, ExecResult[]>();
+
+  constructor(
+    private home: string,
+    private rules: Array<[RegExp, ExecResult | ExecResult[]]>,
+  ) {}
+
+  async exec(command: string): Promise<ExecResult> {
+    this.commands.push(command);
+    if (command === 'printf %s "$HOME"' || command === `cd ${shellQuote(this.home)} && pwd -P`) {
+      return { stdout: this.home, stderr: '', exitCode: 0 };
+    }
+    for (const [pattern, result] of this.rules) {
+      if (!pattern.test(command)) continue;
+      if (!Array.isArray(result)) return result;
+      let queue = this.queues.get(pattern);
+      if (!queue) {
+        queue = [...result];
+        this.queues.set(pattern, queue);
+      }
+      return queue.length > 1 ? queue.shift()! : queue[0];
+    }
+    return { stdout: '', stderr: '', exitCode: 0 };
+  }
+
+  writeFile(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  execWithStdin(): Promise<ExecResult> {
+    return Promise.resolve({ stdout: '', stderr: '', exitCode: 0 });
+  }
+}
+
+const ok: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
+
+function scriptedStore(runner: ScriptedRunner): RepoStore {
+  return new RepoStore(
+    runner, PROJECT_REPO, 'remote', { hostname: 'box-a' },
+    createRepoStoreCache(), 'dev-1',
+  );
+}
+
+describe('RepoStore destructive-cleanup guards', () => {
+  it('aborts ensure when the existence probe fails at the exec layer, without cloning or removing', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: 'Connection timed out during banner exchange', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe workdir/);
+
+    expect(runner.commands.some(c => c.includes('clone'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+  });
+
+  it('clones into a unique staging name and only ever deletes that name on failure', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^mkdir -p /, ok],
+      [/^mkdir '/, ok],
+      [/git clone /, { stdout: '', stderr: 'fatal: unable to access remote', exitCode: 128 }],
+      [/^rm -rf /, ok],
+      [/^rmdir /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/git clone .* failed/);
+
+    const final = '/home/u/.baxian/agents/dev-1/repo';
+    const cloneCmd = runner.commands.find(c => c.includes('git clone '));
+    expect(cloneCmd).toMatch(/repo\.claim-[0-9a-f-]+'/);
+    expect(cloneCmd).not.toContain(`${final}'`);
+    const removal = runner.commands.find(c => c.startsWith('rm -rf '));
+    expect(removal).toMatch(new RegExp(`^rm -rf '${final}\\.claim-[0-9a-f-]+'$`));
+    expect(runner.commands.some(c => c.startsWith('rmdir '))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+  });
+
+  it('discards the staging by its unique name when promotion fails, leaving nothing behind', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^mkdir -p /, ok],
+      [/git clone /, ok],
+      [/&& mv '/, { stdout: '', stderr: 'mv: rename failed', exitCode: 1 }],
+      [/^rm -rf /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot promote staged clone/);
+
+    const removal = runner.commands.find(c => c.startsWith('rm -rf '));
+    expect(removal).toMatch(/^rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-[0-9a-f-]+'$/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+  });
+
+  it('discards a nested staging by its unique name when the final path was recreated mid-promote', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^mkdir -p /, ok],
+      [/git clone /, ok],
+      [/&& mv '[^']*claim[^']*' '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, ok],
+      [/^test -e /, ok],
+      [/^rm -rf /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/recreated while promoting/);
+
+    const removal = runner.commands.find(c => c.includes('rm -rf '));
+    expect(removal).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-[0-9a-f-]+'; fi$/);
+    expect(runner.commands.some(c => /^mv '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-/.test(c))).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('recreated concurrently'));
+  });
+
+  it('sweeps both possible staging homes when the promote mv itself is transport-uncertain', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^mkdir -p /, ok],
+      [/git clone /, ok],
+      [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
+      [/^rm -rf /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot promote staged clone/);
+
+    const removals = runner.commands.filter(c => c.includes('rm -rf '));
+    expect(removals).toHaveLength(2);
+    expect(removals[0]).toMatch(/^rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\.claim-[0-9a-f-]+'$/);
+    expect(removals[1]).toMatch(/^if \[ -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo' \] && \[ ! -L '\/home\/u\/\.baxian\/agents\/dev-1\/repo' \]; then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-[0-9a-f-]+'; fi$/);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removing staged clone'));
+  });
+
+  it('sweeps both staging homes and fails loud when the nested probe is transport-uncertain', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
+      [/^mkdir -p /, ok],
+      [/git clone /, ok],
+      [/&& mv '/, ok],
+      [/^test -e /, { stdout: '', stderr: 'Connection reset by peer', exitCode: 255 }],
+      [/^rm -rf /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot verify promoted clone/);
+
+    const removals = runner.commands.filter(c => c.includes('rm -rf '));
+    expect(removals).toHaveLength(2);
+    expect(removals.some(c => /repo\.claim-[0-9a-f-]+'$/.test(c) && !c.includes('/repo/repo.claim'))).toBe(true);
+    expect(removals.some(c => c.includes('/repo/repo.claim'))).toBe(true);
+  });
+
+  it('treats exit 1 with transient noise as a failed existence probe, not absence', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, { stdout: '', stderr: 'kex_exchange_identification: Connection closed by remote host', exitCode: 1 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe workdir/);
+
+    expect(runner.commands.some(c => c.includes('clone'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+  });
+
+  it('aborts leftover-dir recovery when rmdir fails at the transport layer', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/rev-parse --show-toplevel/, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/^rmdir /, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe leftover dir/);
+
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+    expect(runner.commands.some(c => c.includes('git clone'))).toBe(false);
+  });
+
+  it('still reports non-empty leftovers as unrecoverable after a clean rmdir refusal', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/rev-parse --show-toplevel/, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/^rmdir /, { stdout: '', stderr: 'rmdir: failed to remove: Directory not empty', exitCode: 1 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/not a git repository\. Remove it manually/);
+  });
+
+  it('recovers a leftover empty dir with rmdir and retries the clone', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, [
+        { stdout: '', stderr: '', exitCode: 0 },
+        { stdout: '', stderr: '', exitCode: 1 },
+      ]],
+      [/rev-parse --resolve-git-dir '[^']*\.git'/, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/rev-parse --show-toplevel/, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/rev-parse --resolve-git-dir /, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/^rmdir /, ok],
+      [/^mkdir -p /, ok],
+      [/git clone /, { stdout: '', stderr: 'fatal: early EOF', exitCode: 128 }],
+      [/^rm -rf /, ok],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/git clone .* failed/);
+
+    expect(runner.commands.find(c => c.startsWith('rmdir '))).toBe("rmdir '/home/u/.baxian/agents/dev-1/repo'");
+    expect(runner.commands.some(c => c.includes('git clone '))).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('removed leftover empty dir'));
+  });
+
+  it('tolerates pushurl-unset exit 5 (key absent) and moves on', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, ok],
+      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/--unset-all remote\.origin\.pushurl/, { stdout: '', stderr: '', exitCode: 5 }],
+    ]);
+
+    const rejection = await scriptedStore(runner).ensure().catch((err: Error) => err);
+
+    expect(runner.commands.some(c => c.includes('--unset-all remote.origin.pushurl'))).toBe(true);
+    expect(String(rejection)).not.toMatch(/pushurl/);
+  });
+
+  it('clears pushurl before flipping the URL, so a failed unset stays retryable', async () => {
+    const rules: Array<[RegExp, ExecResult | ExecResult[]]> = [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, ok],
+      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/--unset-all remote\.origin\.pushurl/, [
+        { stdout: '', stderr: 'error: could not lock config file', exitCode: 4 },
+        { stdout: '', stderr: '', exitCode: 5 },
+      ]],
+      [/--replace-all remote\.origin\.url/, ok],
+    ];
+    const runner = new ScriptedRunner('/home/u', rules);
+    const store = scriptedStore(runner);
+
+    await expect(store.ensure()).rejects.toThrow(/Failed to clear remote\.origin\.pushurl/);
+    expect(runner.commands.some(c => c.includes('--replace-all remote.origin.url'))).toBe(false);
+
+    await store.ensure().catch(() => undefined);
+    const unsets = runner.commands.filter(c => c.includes('--unset-all remote.origin.pushurl'));
+    const replaceIdx = runner.commands.findIndex(c => c.includes('--replace-all remote.origin.url'));
+    expect(unsets).toHaveLength(2);
+    expect(replaceIdx).toBeGreaterThan(runner.commands.findIndex(c => c.includes('--unset-all')));
+  });
+
+  it('fails loud when pushurl-unset reports a config write failure', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, ok],
+      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/--unset-all remote\.origin\.pushurl/, { stdout: '', stderr: 'error: could not lock config file', exitCode: 4 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Failed to clear remote\.origin\.pushurl/);
+  });
+
+  it('aborts when pushurl-unset fails at the transport layer', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, ok],
+      [/remote get-url origin/, { stdout: 'git@git.example.com:group/project.git\n', stderr: '', exitCode: 0 }],
+      [/--unset-all remote\.origin\.pushurl/, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe remote\.origin\.pushurl removal/);
+  });
+
+  it('validate-stage probes fail closed on transport errors', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir '[^']*\.git'/, ok],
+      [/remote get-url origin/, { stdout: 'https://git.example.com/group/project.git\n', stderr: '', exitCode: 0 }],
+      [/rev-parse --show-toplevel/, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe worktree top/);
+
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+  });
+
+  it('aborts instead of advising manual removal when the git-dir probe fails in transit', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe git dir/);
+
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+  });
+
+  it('treats transient noise on stdout as a failed git-dir probe too', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir /, { stdout: 'kex_exchange_identification: Connection closed by remote host', stderr: '', exitCode: 1 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe git dir/);
+  });
+
+  it('fails closed when the subdirectory probe dies in transit after a legitimate git-dir "no"', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir '[^']*\.git'/, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/rev-parse --show-toplevel/, { stdout: '', stderr: 'ssh: connect to host box-a: Connection timed out', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe repo layout/);
+
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+  });
+
+  it('fails closed when the bare probe dies in transit instead of advising manual removal', async () => {
+    const runner = new ScriptedRunner('/home/u', [
+      [/^test -d /, ok],
+      [/rev-parse --resolve-git-dir '[^']*\.git'/, { stdout: '', stderr: 'fatal: not a git repository', exitCode: 128 }],
+      [/rev-parse --show-toplevel/, { stdout: '', stderr: 'fatal: not a git repository (or any of the parent directories)', exitCode: 128 }],
+      [/rev-parse --resolve-git-dir /, { stdout: '', stderr: 'Connection reset by peer', exitCode: 255 }],
+    ]);
+
+    await expect(scriptedStore(runner).ensure()).rejects.toThrow(/Cannot probe repo layout/);
+
+    expect(runner.commands.some(c => c.includes('rm -rf'))).toBe(false);
+  });
+});
+
+describe('moveFileIntoPlace (real filesystem)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'bx-mvip-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const write = async (path: string, content: string): Promise<void> => {
+    await run(`printf %s ${shellQuote(content)} > ${shellQuote(path)}`);
+  };
+
+  it('replaces a plain-file target atomically', async () => {
+    await write(`${dir}/tmp1`, 'new');
+    await write(`${dir}/final`, 'old');
+    await moveFileIntoPlace(local, `${dir}/tmp1`, `${dir}/final`);
+    expect(await run(`cat ${shellQuote(`${dir}/final`)}`)).toBe('new');
+  });
+
+  it('fails closed before mv when the target is a directory — no nested tmp ever lands', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/final`)}`);
+    await write(`${dir}/tmp2`, 'payload');
+
+    await expect(moveFileIntoPlace(local, `${dir}/tmp2`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+
+    expect(await run(`ls -A ${shellQuote(`${dir}/final`)}`)).toBe('');
+    const tmpLeft = await local.exec(`test -e ${shellQuote(`${dir}/tmp2`)}`);
+    expect(tmpLeft.exitCode).toBe(1);
+    warn.mockRestore();
+  });
+
+  it('fails closed when the target is a symlink to a directory', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/real`)}`);
+    await symlink(`${dir}/real`, `${dir}/final`);
+    await write(`${dir}/tmp3`, 'payload');
+
+    await expect(moveFileIntoPlace(local, `${dir}/tmp3`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+
+    expect(await run(`ls -A ${shellQuote(`${dir}/real`)}`)).toBe('');
+  });
+
+  it('sweeps a tmp already nested under a directory target', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/final`)}`);
+    await write(`${dir}/final/tmp4`, 'nested-stray');
+
+    await expect(moveFileIntoPlace(local, `${dir}/tmp4`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+
+    const nested = await local.exec(`test -e ${shellQuote(`${dir}/final/tmp4`)}`);
+    expect(nested.exitCode).toBe(1);
+  });
+
+  it('refuses to walk through a symlinked ancestor when guardRoot is set', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/outside`)}`);
+    await write(`${dir}/outside/keep`, 'safe');
+    await symlink(`${dir}/outside`, `${dir}/sub`);
+    await write(`${dir}/tmp5`, 'payload');
+
+    await expect(
+      moveFileIntoPlace(local, `${dir}/tmp5`, `${dir}/sub/keep`, { guardRoot: dir }),
+    ).rejects.toThrow(/atomic replace/);
+
+    expect(await run(`cat ${shellQuote(`${dir}/outside/keep`)}`)).toBe('safe');
+  });
+
+  it('refuses when the guard root itself is a symlink — external files stay intact', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/outside/.baxian/research`)}`);
+    await write(`${dir}/outside/.baxian/research/evidence`, 'precious');
+    const rootLink = `${dir}/work`;
+    await symlink(`${dir}/outside`, rootLink);
+    await write(`${dir}/tmp6`, 'payload');
+
+    await expect(
+      moveFileIntoPlace(local, `${dir}/tmp6`, `${rootLink}/.baxian/research/evidence`, { guardRoot: rootLink }),
+    ).rejects.toThrow(/atomic replace/);
+
+    expect(await run(`cat ${shellQuote(`${dir}/outside/.baxian/research/evidence`)}`)).toBe('precious');
+  });
+
+  it('never sweeps a nested tmp through a symlinked final — foreign same-name files survive', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/outside`)}`);
+    await write(`${dir}/outside/tmp7`, 'foreign-precious');
+    await symlink(`${dir}/outside`, `${dir}/final`);
+    await write(`${dir}/tmp7`, 'payload');
+
+    await expect(moveFileIntoPlace(local, `${dir}/tmp7`, `${dir}/final`)).rejects.toThrow(/atomic replace/);
+
+    expect(await run(`cat ${shellQuote(`${dir}/outside/tmp7`)}`)).toBe('foreign-precious');
+  });
+});
+
+describe('ancestorSymlinkGuard', () => {
+  it('checks the root itself, then one symlink check per component below it', () => {
+    expect(ancestorSymlinkGuard('/wt', '/wt/.baxian/review/inbox/f.md')).toBe(
+      "[ ! -L '/wt' ] && [ -d '/wt' ] && [ ! -L '/wt/.baxian' ] && [ ! -L '/wt/.baxian/review' ] && [ ! -L '/wt/.baxian/review/inbox' ] && [ ! -L '/wt/.baxian/review/inbox/f.md' ]",
+    );
+  });
+
+  it('rejects targets outside the root', () => {
+    expect(() => ancestorSymlinkGuard('/wt', '/elsewhere/f')).toThrow(/is not under/);
+  });
+});
+
+describe('stageFileGuarded (real filesystem)', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'bx-stage-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('writes the tmp when the ancestor chain is clean', async () => {
+    await run(`mkdir -p ${shellQuote(`${dir}/sub`)}`);
+    await stageFileGuarded(local, dir, `${dir}/sub/.tmp-abc`, 'payload');
+    expect(await run(`cat ${shellQuote(`${dir}/sub/.tmp-abc`)}`)).toBe('payload');
+  });
+
+  it('refuses to write through a symlinked ancestor — the victim never sees staging bytes', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/outside`)}`);
+    await run(`printf original > ${shellQuote(`${dir}/outside/victim.baxian-tmp`)}`);
+    await symlink(`${dir}/outside`, `${dir}/skills`);
+
+    await expect(
+      stageFileGuarded(local, dir, `${dir}/skills/victim.baxian-tmp`, 'attacker-content'),
+    ).rejects.toThrow(/staged write/);
+
+    expect(await run(`cat ${shellQuote(`${dir}/outside/victim.baxian-tmp`)}`)).toBe('original');
+  });
+
+  it('refuses when the root itself has been swapped for a symlink', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await run(`mkdir -p ${shellQuote(`${dir}/outside/sub`)}`);
+    await run(`printf keep > ${shellQuote(`${dir}/outside/sub/f`)}`);
+    const rootLink = `${dir}/work`;
+    await symlink(`${dir}/outside`, rootLink);
+
+    await expect(
+      stageFileGuarded(local, rootLink, `${rootLink}/sub/f`, 'overwrite'),
+    ).rejects.toThrow(/staged write/);
+
+    expect(await run(`cat ${shellQuote(`${dir}/outside/sub/f`)}`)).toBe('keep');
+  });
+});
+
+describe('stageFileGuarded parent directories (real filesystem)', () => {
+  it('creates missing parent directories inside the guarded command (fresh skill dirs)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bx-stage-mkdir-'));
+    try {
+      const tmp = `${dir}/.claude/skills/baxian-new/SKILL.md.baxian-tmp-abc123`;
+      await stageFileGuarded(local, dir, tmp, 'skill-body');
+      expect(await run(`cat ${shellQuote(tmp)}`)).toBe('skill-body');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

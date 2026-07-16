@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildLaunchCommand, skillSubdirFor } from '../../src/agent/manager.js';
+import { buildLaunchCommand, launchCommandIn, skillSubdirFor } from '../../src/agent/manager.js';
 import type { AgentConfig, AgentRuntime } from '../../src/shared/index.js';
 
 function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -159,5 +159,19 @@ describe('skillSubdirFor', () => {
     ['qodercli', '.qoder/skills'],
   ])('%s materializes skills under %s', (runtime, dir) => {
     expect(skillSubdirFor(runtime)).toBe(dir);
+  });
+});
+
+describe('launchCommandIn', () => {
+  it('prefixes a quoted cd so a reused shell re-resolves a stale cwd before launch', () => {
+    expect(launchCommandIn('/home/u/.baxian/agents/qa-1/repo', agent({ runtime: 'codex' }))).toBe(
+      "cd '/home/u/.baxian/agents/qa-1/repo' && codex --dangerously-bypass-approvals-and-sandbox",
+    );
+  });
+
+  it('shell-quotes directories with spaces', () => {
+    expect(launchCommandIn('/tmp/my repo', agent({ runtime: 'claude-code' }))).toContain(
+      "cd '/tmp/my repo' && ",
+    );
   });
 });

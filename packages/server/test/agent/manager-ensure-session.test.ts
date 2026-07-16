@@ -35,9 +35,10 @@ const CONFIG: BaxianConfig = {
 describe('AgentManager.ensureSession', () => {
   let tempDir: string;
   let manager: AgentManager;
-  let runner: { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn> };
+  let runner: { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn>; execWithStdin: ReturnType<typeof vi.fn> };
 
-  let tmuxSessions: Map<string, { claim: string; readyOnce: boolean }>;
+  let tmuxSessions: Map<string, { claim: string; readyOnce: boolean; sessionId: string }>;
+  let nextSessionId: number;
   let currentSkillsVersion = '';
 
   function execCmds(): string[] {
@@ -52,7 +53,7 @@ describe('AgentManager.ensureSession', () => {
 
   function runEnsure(path: 'create' | 'adopt'): Promise<unknown> {
     if (path === 'adopt') {
-      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
       return manager.ensureSession('dev-1', 'runtime');
     }
     return manager.ensureSession('dev-1', 'create');
@@ -74,9 +75,16 @@ describe('AgentManager.ensureSession', () => {
 
   function mockCleanupExec(onKill: () => void): void {
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('kill-session')) {
+      if (cmd.includes('if-shell')) {
         onKill();
         return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('list-sessions')) {
+        const name = cmd.match(/#\{==:#\{session_name\},([^}]+)\}/)?.[1] ?? '';
+        const sess = tmuxSessions.get(name);
+        return sess
+          ? { stdout: `9999|1700000000|${sess.sessionId}|${sess.claim}\n`, stderr: '', exitCode: 0 }
+          : { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('has-session')) {
         const name = cmd.match(/'=([^']+)'/)?.[1] ?? '';
@@ -162,8 +170,34 @@ describe('AgentManager.ensureSession', () => {
       if (cmd.includes('new-session')) {
         const m = cmd.match(/-s '([^']+)'/);
         const name = m?.[1] ?? '';
-        tmuxSessions.set(name, { claim: name, readyOnce: false });
+        const sessionId = `$${nextSessionId++}`;
+        tmuxSessions.set(name, { claim: name, readyOnce: false, sessionId });
+        return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('list-sessions')) {
+        const name = cmd.match(/#\{==:#\{session_name\},([^}]+)\}/)?.[1] ?? '';
+        const sess = tmuxSessions.get(name);
+        return sess
+          ? { stdout: `9999|1700000000|${sess.sessionId}|${sess.claim}\n`, stderr: '', exitCode: 0 }
+          : { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('if-shell')) {
+        const sid = cmd.match(/\$\d+/)?.[0];
+        const entry = [...tmuxSessions.entries()].find(([, sess]) => sess.sessionId === sid);
+        if (cmd.includes('BX_TARGET_GONE')) {
+          if (!entry) return { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 };
+          const claimM = cmd.match(/@baxian-agent-id '\\''([^']+)'/);
+          if (claimM) entry[1].claim = claimM[1];
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('BX_KILL_REFUSED') && entry && entry[1].claim !== '') {
+          return { stdout: 'BX_KILL_REFUSED\n', stderr: '', exitCode: 0 };
+        }
+        if (entry) tmuxSessions.delete(entry[0]);
         return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('show-environment')) {
+        return { stdout: '', stderr: 'unknown variable: BAXIAN_CREATION_NONCE', exitCode: 1 };
       }
       if (cmd.includes('set-option')) {
         const m = cmd.match(/'=([^']+):'/);
@@ -191,6 +225,13 @@ describe('AgentManager.ensureSession', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('list-panes')) {
+        if (cmd.includes('-a -F')) {
+          const sid = cmd.match(/session_id\},(\$\d+)\}/)?.[1];
+          const exists = [...tmuxSessions.values()].some(sess => sess.sessionId === sid);
+          return exists
+            ? { stdout: '%0 zsh\n', stderr: '', exitCode: 0 }
+            : { stdout: '', stderr: '', exitCode: 0 };
+        }
         return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('send-keys')) {
@@ -230,9 +271,14 @@ describe('AgentManager.ensureSession', () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'baxian-ensure-session-'));
     await initStateDir(tempDir);
-    tmuxSessions = new Map<string, { claim: string; readyOnce: boolean }>();
+    tmuxSessions = new Map<string, { claim: string; readyOnce: boolean; sessionId: string }>();
+    nextSessionId = 1;
 
-    runner = { exec: vi.fn(), writeFile: vi.fn().mockResolvedValue(undefined) };
+    runner = {
+      exec: vi.fn(),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      execWithStdin: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
+    };
     runner.exec.mockImplementation(makeMockExec({ trustDialogReady: true }));
 
     const agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
@@ -280,7 +326,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('create mode, session already exists → throws (createdSession=false)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true, sessionId: `$${nextSessionId++}` });
     await expect(manager.ensureSession('dev-1', 'create'))
       .rejects.toThrow(/already exists/);
     try {
@@ -291,20 +337,109 @@ describe('AgentManager.ensureSession', () => {
     }
   });
 
+  it('create mode reclaims a half-created leftover (nonce present, claim never written) and boots fresh', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const leftoverId = `$${nextSessionId++}`;
+    tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: leftoverId });
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('show-environment')) {
+        return tmuxSessions.get('dev-1')?.sessionId === leftoverId
+          ? { stdout: 'BAXIAN_CREATION_NONCE=stranded-nonce\n', stderr: '', exitCode: 0 }
+          : { stdout: '', stderr: 'unknown variable: BAXIAN_CREATION_NONCE', exitCode: 1 };
+      }
+      return makeMockExec({ trustDialogReady: true })(cmd);
+    });
+
+    const result = await manager.ensureSession('dev-1', 'create');
+
+    expect(result.createdSession).toBe(true);
+    expect(tmuxSessions.get('dev-1')?.sessionId).not.toBe(leftoverId);
+    expect(warn.mock.calls.some(c => String(c[0]).includes('half-created leftover'))).toBe(true);
+  });
+
+  it('create mode leaves a claimless session without the nonce to the operator', async () => {
+    tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: `$${nextSessionId++}` });
+    await expect(manager.ensureSession('dev-1', 'create')).rejects.toThrow(/already exists/);
+    expect(tmuxSessions.has('dev-1')).toBe(true);
+  });
+
+  it('a same-name replacement between create and configuration never receives the claim', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let replacementId: string | undefined;
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('new-session')) {
+        const result = await makeMockExec({ trustDialogReady: true })(cmd);
+        // The freshly created session dies and an outsider recreates the name
+        // before the first option write — the classic rebind window.
+        replacementId = `$${nextSessionId++}`;
+        tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: replacementId });
+        return result;
+      }
+      return makeMockExec({ trustDialogReady: true })(cmd);
+    });
+
+    await expect(manager.ensureSession('dev-1', 'create')).rejects.toThrow(/vanished before its options/);
+
+    const survivor = tmuxSessions.get('dev-1');
+    expect(survivor?.sessionId).toBe(replacementId);
+    expect(survivor?.claim).toBe('');
+  });
+
+  it('reclaim logs already-gone instead of a fabricated kill when the session vanished', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const leftoverId = `$${nextSessionId++}`;
+    tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: leftoverId });
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('show-environment')) {
+        return { stdout: 'BAXIAN_CREATION_NONCE=stranded\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('if-shell') && cmd.includes('BX_KILL_REFUSED')) {
+        tmuxSessions.delete('dev-1');
+        return { stdout: '', stderr: `can't find session: ${leftoverId}`, exitCode: 1 };
+      }
+      return makeMockExec({ trustDialogReady: true })(cmd);
+    });
+
+    const result = await manager.ensureSession('dev-1', 'create');
+
+    expect(result.createdSession).toBe(true);
+    expect(warn.mock.calls.some(c => String(c[0]).includes('already gone'))).toBe(true);
+    expect(warn.mock.calls.some(c => String(c[0]).includes('killed half-created'))).toBe(false);
+  });
+
+  it('reclaim stands down when a claim lands between the probes and the kill', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const leftoverId = `$${nextSessionId++}`;
+    tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: leftoverId });
+    runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
+      if (cmd.includes('show-environment')) {
+        // The nonce probe is the last read before the kill: a concurrent
+        // bootstrap claims the session right after it, inside the race window.
+        const sess = tmuxSessions.get('dev-1');
+        if (sess) sess.claim = 'dev-1';
+        return { stdout: 'BAXIAN_CREATION_NONCE=stranded-nonce\n', stderr: '', exitCode: 0 };
+      }
+      return makeMockExec({ trustDialogReady: true })(cmd);
+    });
+
+    await expect(manager.ensureSession('dev-1', 'create'))
+      .rejects.toThrow(/claimed .*while reclaiming|retry to observe/);
+
+    expect(tmuxSessions.get('dev-1')?.sessionId).toBe(leftoverId);
+    expect(tmuxSessions.get('dev-1')?.claim).toBe('dev-1');
+  });
+
   it('new-session ok but post-create setOption fails → partial.createdSession=true so caller can rollback orphan', async () => {
-    let setOptionCalls = 0;
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('new-session')) {
         const m = cmd.match(/-s '([^']+)'/);
         const name = m?.[1] ?? '';
-        tmuxSessions.set(name, { claim: name, readyOnce: false });
-        return { stdout: '', stderr: '', exitCode: 0 };
+        const sessionId = `$${nextSessionId++}`;
+        tmuxSessions.set(name, { claim: name, readyOnce: false, sessionId });
+        return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('set-option') && !cmd.includes('-s ')) {
-        setOptionCalls += 1;
-        if (setOptionCalls === 3) {
-          return { stdout: '', stderr: 'tmux command failed: bad option', exitCode: 1 };
-        }
+        return { stdout: '', stderr: 'tmux command failed: bad option', exitCode: 1 };
       }
       return makeMockExec({ trustDialogReady: true })(cmd);
     });
@@ -320,14 +455,14 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('runtime mode, claim matches → adopts existing session', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     const result = await manager.ensureSession('dev-1', 'runtime');
     expect(result.createdSession).toBe(false);
     expect(result.paneId).toBe('%0');
   });
 
   it('runtime mode, shell relaunch path tags the session with the skills version (so the next adopt is not seen stale)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
       c => c.includes('display-message') && c.includes('capture-pane'),
       { stdout: 'zsh\n___bx-classify-sep___\n' },
@@ -337,7 +472,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('runtime mode, live REPL with stale skills defers retagging until task-boundary /clear succeeds', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
       c => c.includes('show-option') && c.includes('@baxian-skills-version'),
       { stdout: 'stale-version\n' },
@@ -352,7 +487,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('runtime mode, a tmux probe failure during the skills-version check surfaces as EnsureSessionError (does NOT kill the live REPL)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
       c => c.includes('show-option') && c.includes('@baxian-skills-version'),
       { stderr: 'tmux probe boom', exitCode: 2 },
@@ -365,7 +500,7 @@ describe('AgentManager.ensureSession', () => {
     await runEnsure('create');
     const windowSizeCalls = setOptionCalls('window-size', 'latest');
     expect(windowSizeCalls).toHaveLength(1);
-    expect(windowSizeCalls[0]).toContain("'=dev-1:'");
+    expect(windowSizeCalls[0]).toMatch(/set-option -t '\\''\$\d+'\\'' window-size/);
   });
 
   it('adopt path preserves the existing window-size owner', async () => {
@@ -375,22 +510,22 @@ describe('AgentManager.ensureSession', () => {
 
   it.each(['create', 'adopt'] as const)('%s path locks prefix=C-b + prefix2=None', async (path) => {
     await runEnsure(path);
-    expect(setOptionCalls("'prefix'", "'C-b'")).toHaveLength(1);
-    expect(setOptionCalls("'prefix2'", "'None'")).toHaveLength(1);
+    expect(setOptionCalls('prefix ', "C-b")).toHaveLength(1);
+    expect(setOptionCalls('prefix2 ', "None")).toHaveLength(1);
   });
 
   it.each(['create', 'adopt'] as const)('%s path pins mouse=on', async (path) => {
     await runEnsure(path);
-    const mouseOn = setOptionCalls("'mouse'", "'on'");
+    const mouseOn = setOptionCalls('mouse ');
     expect(mouseOn).toHaveLength(1);
-    expect(mouseOn[0]).toContain("'=dev-1:'");
-    if (path === 'create') expect(setOptionCalls("'mouse'", "'off'")).toHaveLength(0);
+    expect(mouseOn[0]).toMatch(/mouse '\\''on'\\''/);
+    expect(mouseOn[0]).toMatch(/-t '\\''\$\d+'\\''/);
   });
 
   it('adopt path: runtime option failure surfaces as EnsureSessionError (preserves partial contract)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
-      c => c.includes('set-option') && c.includes("'prefix'") && c.includes("'C-b'"),
+      c => c.includes('set-option') && c.includes('prefix ') && c.includes('C-b'),
       { stderr: 'tmux command failed: bad option', exitCode: 1 },
     );
     try {
@@ -401,12 +536,12 @@ describe('AgentManager.ensureSession', () => {
       const e = err as EnsureSessionError;
       expect(e.partial.createdSession).toBe(false);
       expect(e.partial.agentId).toBe('dev-1');
-      expect(e.message).toContain('pinRuntimeSessionOptions failed');
+      expect(e.message).toContain('pinning runtime session options failed');
     }
   });
 
   it('runtime mode, claim mismatch → throws (createdSession=false)', async () => {
-    tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true, sessionId: `$${nextSessionId++}` });
     try {
       await manager.ensureSession('dev-1', 'runtime');
       throw new Error('expected throw');
@@ -445,8 +580,9 @@ describe('AgentManager.ensureSession', () => {
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('new-session')) {
         const name = cmd.match(/-s '([^']+)'/)?.[1] ?? '';
-        tmuxSessions.set(name, { claim: name, readyOnce: false });
-        return { stdout: '', stderr: '', exitCode: 0 };
+        const sessionId = `$${nextSessionId++}`;
+        tmuxSessions.set(name, { claim: name, readyOnce: false, sessionId });
+        return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('list-panes')) return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
       if (cmd.includes('capture-pane')) return { stdout: screen, stderr: '', exitCode: 0 };
@@ -497,7 +633,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('releaseAgentForTask mode=waiting keeps the binding without releasing lock', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     await seedRunningTask('task-1');
     await manager.acquireAgentForTask('dev-1', 'task-1', 'develop');
     const ensure = await manager.ensureSession('dev-1', 'runtime');
@@ -509,7 +645,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('release on a non-ready pane (mode=idle): keeps the binding and lock without touching checkout', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     await seedRunningTask('task-r1');
     await manager.acquireAgentForTask('dev-1', 'task-r1', 'develop');
     await setPaneId('dev-1', '%0');
@@ -534,7 +670,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('cleanupRemovedAgentRuntime: destroys streamer BEFORE tmux kill', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: false });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: false, sessionId: '$1' });
     const callOrder: string[] = [];
     const destroyMock = vi.fn(async (id: string) => { callOrder.push(`destroy:${id}`); });
     mockCleanupExec(() => { callOrder.push('kill-session'); });
@@ -550,7 +686,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('cleanupRemovedAgentRuntime: streamer destroy failure is logged but does NOT skip tmux kill', async () => {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: false });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: false, sessionId: '$1' });
     let killCalled = false;
     const destroyMock = vi.fn(async () => { throw new Error('streamer boom'); });
     mockCleanupExec(() => { killCalled = true; });
@@ -640,7 +776,7 @@ describe('AgentManager.ensureSession', () => {
     tagSessionSkillsVersion: (...a: unknown[]) => Promise<void>;
   };
   function stubRestartRepl(): RestartReplPrivates {
-    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+    tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     const m = manager as unknown as RestartReplPrivates;
     vi.spyOn(m, 'pollPaneCommandStable').mockResolvedValue('zsh');
     vi.spyOn(m, 'ensureWorkdir').mockResolvedValue({ workdir: '/tmp/repo' });
@@ -708,15 +844,15 @@ describe('AgentManager.ensureSession', () => {
 
   describe('adoptOrRestartSession probe failures & pane states', () => {
     beforeEach(() => {
-      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     });
 
-    it('surfaces a @baxian-agent-id probe failure without adopting', async () => {
+    it('surfaces a claim-snapshot probe failure without adopting', async () => {
       overrideExec(
-        c => c.includes('show-option') && c.includes('@baxian-agent-id'),
-        { stderr: 'tmux option probe boom', exitCode: 2 },
+        c => c.includes('list-sessions'),
+        { stderr: 'tmux snapshot probe boom', exitCode: 2 },
       );
-      const err = await expectAdoptError(/getOption\(@baxian-agent-id\) failed/);
+      const err = await expectAdoptError(/session snapshot failed/);
       expect(err.partial.createdSession).toBe(false);
     });
 
@@ -893,7 +1029,7 @@ describe('AgentManager.ensureSession', () => {
     });
 
     it('records the auto-managed repo path on the binding when a repoStore resolves the workdir', async () => {
-      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
       await manager['agentStore'].set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
       vi.spyOn(
         manager as unknown as { ensureWorkdir: () => Promise<unknown> },
@@ -910,7 +1046,8 @@ describe('AgentManager.ensureSession', () => {
     });
 
     it('wraps a skill provisioning failure', async () => {
-      runner.writeFile.mockRejectedValue(new Error('remote write refused'));
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.execWithStdin.mockRejectedValue(new Error('remote write refused'));
       await expect(manager.ensureSession('dev-1', 'runtime'))
         .rejects.toThrow(/skill provisioning failed/);
     });
@@ -931,12 +1068,12 @@ describe('AgentManager.ensureSession', () => {
     });
 
     it('refuses a foreign session claim', async () => {
-      tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'someone-else', readyOnce: true, sessionId: `$${nextSessionId++}` });
       await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/claim mismatch/);
     });
 
     it('exits a live runtime before relaunching and refreshes the binding paneId', async () => {
-      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
       await manager['agentStore'].set({ id: 'dev-1', projectId: 'proj', updatedAt: new Date().toISOString() });
       let exited = false;
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
@@ -962,7 +1099,7 @@ describe('AgentManager.ensureSession', () => {
     });
 
     it('throws on an unexpected foreground process instead of relaunching over it', async () => {
-      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
       overrideExec(
         c => c.includes('display-message') && !c.includes('capture-pane'),
         { stdout: 'vim\n' },
@@ -971,7 +1108,7 @@ describe('AgentManager.ensureSession', () => {
     });
 
     it('fails closed without relaunching when the Workdir cannot be resolved', async () => {
-      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
       const m = manager as unknown as {
         pollPaneCommandStable: (...a: unknown[]) => Promise<string>;
         ensureWorkdir: (...a: unknown[]) => Promise<unknown>;
@@ -988,7 +1125,7 @@ describe('AgentManager.ensureSession', () => {
 
   describe('cleanupRemovedAgentRuntime failure aggregation', () => {
     it('skips the kill (warn only) when the session claim belongs to someone else', async () => {
-      tmuxSessions.set('dev-1', { claim: 'foreign-owner', readyOnce: true });
+      tmuxSessions.set('dev-1', { claim: 'foreign-owner', readyOnce: true, sessionId: `$${nextSessionId++}` });
       let killed = false;
       mockCleanupExec(() => { killed = true; });
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -1002,7 +1139,7 @@ describe('AgentManager.ensureSession', () => {
 
     it('aggregates a tmux probe failure into CleanupFailedError', async () => {
       overrideExec(
-        c => c.includes('has-session'),
+        c => c.includes('list-sessions'),
         { stderr: 'socket exploded', exitCode: 2 },
       );
       try {

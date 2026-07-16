@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { AgentManager, EnsureSessionError, DispatchTerminalError } from '../../src/agent/manager.js';
+import { TmuxManager } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
@@ -82,6 +83,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -147,6 +149,122 @@ describe('AgentManager.startBootstrapAsync', () => {
       e.type === 'agent.bootstrap_failed'
       && String(e.data.error).includes('repl not ready'),
     )).toBe(true);
+  });
+
+  const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+
+  // killSession-by-name no longer exists on TmuxManager, so a regression to
+  // name-based kills cannot even compile; only the ref path needs watching.
+  function spyKills(): { byRef: ReturnType<typeof vi.spyOn> } {
+    return {
+      byRef: vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed'),
+    };
+  }
+
+  it('hard failure with the same token rolls back by generation-bound session ref', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
+    );
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const kills = spyKills();
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(kills.byRef).toHaveBeenCalledWith(REF);
+    expect(warn.mock.calls.some(c => String(c[0]).includes('killed created session $7'))).toBe(true);
+  });
+
+  it('hard failure with a rotated token leaves the session to its successor', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
+    );
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
+    const kills = spyKills();
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(kills.byRef).not.toHaveBeenCalled();
+    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
+  });
+
+  it('rollback stands down when the session was adopted after create', async () => {
+    vi.spyOn(manager, 'ensureSession').mockImplementation(async () => {
+      (manager as unknown as { adoptGeneration: Map<string, number> }).adoptGeneration.set('dev-1', 1);
+      throw new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom');
+    });
+    const kills = spyKills();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(kills.byRef).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some(c => String(c[0]).includes('session adopted since create'))).toBe(true);
+  });
+
+  it('rollback is skipped when no session ref was recorded', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', genAtCreate: 0 }, 'boot boom'),
+    );
+    const kills = spyKills();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(kills.byRef).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some(c => String(c[0]).includes('no session ref recorded'))).toBe(true);
+  });
+
+  it('skips rollback with the original failure visible when the agent store read rejects', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
+    );
+    vi.spyOn(agentStore, 'get').mockRejectedValueOnce(new Error('EACCES: permission denied'));
+    const kills = spyKills();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(kills.byRef).not.toHaveBeenCalled();
+    const storeSkip = warn.mock.calls.find(c => String(c[0]).includes('agent store read failed'));
+    expect(storeSkip).toBeDefined();
+    expect(String(storeSkip![1])).toContain('EACCES');
+    expect(warn.mock.calls.some(c => String(c[0]).includes('creationToken rotated'))).toBe(false);
+  });
+
+  it('an in-flight ref kill is not retracted by a token rotation and can never reach a successor session', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: REF, genAtCreate: 0 }, 'boot boom'),
+    );
+    let resolveKill!: (v: 'killed') => void;
+    const killByRef = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockImplementation(
+      () => new Promise((resolve) => { resolveKill = resolve; }),
+    );
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const bootstrap = manager.startBootstrapAsync('dev-1', 'token-abc');
+    await vi.waitFor(() => expect(killByRef).toHaveBeenCalled());
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-successor' } : null);
+    resolveKill('killed');
+    await bootstrap;
+
+    expect(killByRef).toHaveBeenCalledTimes(1);
+    expect(killByRef).toHaveBeenCalledWith(REF);
+  });
+
+  it('leaves a created dialog-blocked session untouched when the token has rotated', async () => {
+    vi.spyOn(manager, 'ensureSession').mockRejectedValue(
+      new EnsureSessionError(
+        { createdSession: true, agentId: 'dev-1', dialogPending: true, lastScreen: 'Do you trust this folder?' },
+        'blocked on startup dialog',
+      ),
+    );
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
+    const killRefSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+
+    await manager.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(killRefSpy).not.toHaveBeenCalled();
+    expect((await agentStore.get('dev-1'))?.creationToken).toBe('token-newer');
   });
 
   it('dialog-pending bootstrap keeps the creation token and asks for human intervention', async () => {
@@ -302,16 +420,32 @@ describe('AgentManager greeting capability gate', () => {
     expect(awaitOnce).not.toHaveBeenCalled();
   });
 
-  it('only kills the orphan session (no greeting_failed hold) when creationToken rotates mid-greeting', async () => {
+  it('leaves the session untouched (no kill, no greeting_failed hold) when creationToken rotates mid-greeting', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('timeout');
     const { mgr } = makeManagerWithWatcher(awaitOnce);
     await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
+    const killRefSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
 
     await mgr.startBootstrapAsync('dev-1', 'token-abc');
 
+    expect(killRefSpy).not.toHaveBeenCalled();
     const state = await agentStore.get('dev-1');
     expect(state?.creationToken).toBe('token-newer');
     expect(state?.awaitingPhase).not.toBe('greeting_failed');
+  });
+
+  it('leaves the session untouched when the token rotates between greeting success and the store write', async () => {
+    const awaitOnce = vi.fn().mockResolvedValue('matched');
+    const { mgr } = makeManagerWithWatcher(awaitOnce);
+    await agentStore.update('dev-1', (s) => s ? { ...s, creationToken: 'token-newer' } : null);
+    const killRefSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
+
+    await mgr.startBootstrapAsync('dev-1', 'token-abc');
+
+    expect(killRefSpy).not.toHaveBeenCalled();
+    const state = await agentStore.get('dev-1');
+    expect(state?.creationToken).toBe('token-newer');
+    expect(state?.paneId).toBeUndefined();
   });
 
   it('recover() preserves a greeting_failed hold instead of releasing it to ok', async () => {

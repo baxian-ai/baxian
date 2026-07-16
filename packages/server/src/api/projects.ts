@@ -23,8 +23,7 @@ import {
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
 import { redactProjects } from './config.js';
-import { CleanupFailedError, EnsureSessionError } from '../agent/manager.js';
-import { TmuxManager } from '../agent/tmux.js';
+import { CleanupFailedError } from '../agent/manager.js';
 import { applyConfigHotReload } from '../config/hot-reload.js';
 
 interface CheckRun {
@@ -791,15 +790,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
               'terminal to dismiss — baxian will auto-detect ready and resume',
           });
         }
-        if (err instanceof EnsureSessionError && err.partial.createdSession) {
-          try {
-            const runner = createRunner(cfg.mode, resolveAgentHost(app.ctx.config.host, cfg.host));
-            await new TmuxManager(runner).killSession(agentId);
-          } catch (cleanupErr) {
-            app.log.warn({ err: cleanupErr, agentId },
-              'POST /retry ensureSession rollback killSession failed');
-          }
-        }
+        await app.ctx.agentManager.rollbackEnsureSessionFailure(agentId, err, 'POST /retry ensure rollback');
         if (maintenanceToken && acquiredMaintenanceLock) {
           await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
         }

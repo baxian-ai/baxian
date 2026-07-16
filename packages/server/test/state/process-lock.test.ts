@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile, access } from 'node:fs/promises';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { chmod, mkdtemp, readFile, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ProcessLock, ProcessLockError } from '../../src/state/process-lock.js';
 
 function probeDeadPid(): number {
@@ -199,13 +199,31 @@ describe('ProcessLock', () => {
       );
     });
 
-    it('preserves the file when malformed (best-effort, cannot prove ownership)', async () => {
+    it('preserves the file when malformed and warns about the failed ownership probe', async () => {
       const lock = new ProcessLock(stateDir);
       await lock.acquire();
       await writeFile(lock.getPath(), 'not-json{garbage');
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       lock.releaseSync();
       const raw = await readFile(lock.getPath(), 'utf-8');
       expect(raw).toBe('not-json{garbage');
+      expect(warn.mock.calls.some(c => String(c[0]).includes('malformed'))).toBe(true);
+      warn.mockRestore();
+    });
+
+    it('warns when the ownership probe cannot read the lock file at all', async () => {
+      const lock = new ProcessLock(stateDir);
+      await lock.acquire();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await chmod(lock.getPath(), 0o000);
+      try {
+        lock.releaseSync();
+      } finally {
+        await chmod(lock.getPath(), 0o644);
+      }
+      expect(warn.mock.calls.some(c => String(c[0]).includes('cannot read'))).toBe(true);
+      warn.mockRestore();
+      lock.releaseSync();
     });
 
     it('clears state when the file was already removed externally', async () => {
@@ -220,6 +238,22 @@ describe('ProcessLock', () => {
       const lock = new ProcessLock(stateDir);
       expect(() => lock.releaseSync()).not.toThrow();
       expect(lock.isAcquired()).toBe(false);
+    });
+
+    it('warns instead of swallowing a non-ENOENT unlink failure', async () => {
+      const lock = new ProcessLock(stateDir);
+      await lock.acquire();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const dir = dirname(lock.getPath());
+      await chmod(dir, 0o555);
+      try {
+        expect(() => lock.releaseSync()).not.toThrow();
+      } finally {
+        await chmod(dir, 0o755);
+      }
+      expect(warn.mock.calls.some(c => String(c[0]).includes('failed to release'))).toBe(true);
+      warn.mockRestore();
+      lock.releaseSync();
     });
   });
 });

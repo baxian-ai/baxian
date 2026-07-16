@@ -113,8 +113,11 @@ export class ErrorRecordStore {
       let files: string[];
       try {
         files = await readdir(this.dir);
-      } catch {
-        return { removed: 0 };
+      } catch (err) {
+        // ENOENT means zero records; anything else means the sweep never ran.
+        if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { removed: 0 };
+        console.warn(`[ErrorRecordStore] rewriteFiltered: cannot list ${this.dir}:`, err);
+        throw err;
       }
       let removed = 0;
       for (const file of files.filter(f => f.endsWith('.jsonl'))) {
@@ -153,7 +156,14 @@ export class ErrorRecordStore {
           removed += fileRemoved;
         } catch (err) {
           console.warn(`[ErrorRecordStore] rewriteFiltered: atomic rewrite failed for ${file}:`, err);
-          try { await unlink(tmp); } catch { }
+          try {
+            await unlink(tmp);
+          } catch (rmErr) {
+            // A write that failed before creating tmp leaves nothing to remove.
+            if ((rmErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+              console.warn(`[error-record-store] failed to remove tmp ${tmp}:`, rmErr);
+            }
+          }
         }
       }
       return { removed };

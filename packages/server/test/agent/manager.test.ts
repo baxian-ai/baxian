@@ -3306,7 +3306,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
   });
 
   it('provisionRepoSkills materializes skills under .claude/skills for claude-code and .agents/skills for codex', async () => {
-    function capturingRunner(): { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn> } {
+    function capturingRunner(): { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn>; execWithStdin: ReturnType<typeof vi.fn> } {
       return {
         exec: vi.fn(async (cmd: string): Promise<ExecResult> => ({
           stdout: cmd.includes('BX_SKILLS_NON_GIT') ? 'BX_SKILLS_OK\n' : '',
@@ -3314,17 +3314,24 @@ describe('AgentManager dispatch & skill provisioning', () => {
           exitCode: 0,
         })),
         writeFile: vi.fn(async (): Promise<void> => undefined),
+        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
       };
     }
+    const stagedPaths = (r: ReturnType<typeof capturingRunner>): string[] =>
+      r.execWithStdin.mock.calls
+        .map(c => /cat > '([^']+)'/.exec(c[0] as string)?.[1])
+        .filter((p): p is string => p !== undefined);
     const devAgent = agentConfig({ id: 'dev-1' });
     const devRunner = capturingRunner();
     await provision(manager)(devRunner as unknown as CommandRunner, devAgent, '/tmp/repo');
-    const devStaged = devRunner.writeFile.mock.calls.map(c => c[0] as string);
-    expect(devStaged).toContain('/tmp/repo/.claude/skills/baxian-task-check/SKILL.md.baxian-tmp');
-    expect(devStaged.every(p => p.endsWith('.baxian-tmp'))).toBe(true);
+    const devStaged = stagedPaths(devRunner);
+    expect(devStaged.some(p => /^\/tmp\/repo\/\.claude\/skills\/baxian-task-check\/SKILL\.md\.baxian-tmp-[0-9a-f]{12}$/.test(p))).toBe(true);
+    expect(devStaged.every(p => /\.baxian-tmp-[0-9a-f]{12}$/.test(p))).toBe(true);
     expect(devStaged.every(p => !p.includes('/.agents/skills/'))).toBe(true);
+    const devStageCmds = devRunner.execWithStdin.mock.calls.map(c => c[0] as string).filter(c => c.includes('cat > '));
+    expect(devStageCmds.every(c => c.includes("[ ! -L '/tmp/repo' ]"))).toBe(true);
     const devMv = devRunner.exec.mock.calls.map(c => c[0] as string).filter(c => c.includes('mv -f'));
-    expect(devMv.some(c => c.includes('.claude/skills/baxian-task-check/SKILL.md.baxian-tmp'))).toBe(true);
+    expect(devMv.some(c => /\.claude\/skills\/baxian-task-check\/SKILL\.md\.baxian-tmp-[0-9a-f]{12}/.test(c))).toBe(true);
     expect(devMv.length).toBe(devStaged.length);
     const excludeCmd = devRunner.exec.mock.calls.map(c => c[0] as string).find(c => c.includes('info/exclude'));
     expect(excludeCmd).toBeDefined();
@@ -3346,8 +3353,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
     const qaAgent = agentConfig({ id: 'qa-1', runtime: 'codex', role: 'qa' });
     const qaRunner = capturingRunner();
     await provision(manager)(qaRunner as unknown as CommandRunner, qaAgent, '/tmp/repo');
-    const qaStaged = qaRunner.writeFile.mock.calls.map(c => c[0] as string);
-    expect(qaStaged).toContain('/tmp/repo/.agents/skills/baxian-pr-review/SKILL.md.baxian-tmp');
+    const qaStaged = stagedPaths(qaRunner);
+    expect(qaStaged.some(p => p.startsWith('/tmp/repo/.agents/skills/baxian-pr-review/SKILL.md.baxian-tmp-'))).toBe(true);
     expect(qaStaged.every(p => !p.includes('/.claude/skills/'))).toBe(true);
   });
 
@@ -3373,13 +3380,14 @@ describe('AgentManager dispatch & skill provisioning', () => {
         exitCode: 0,
       })),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const agent = agentConfig({ id: 'dev-nocache', workdir: '/repo-a' });
     await provision(manager)(runner as unknown as CommandRunner, agent, '/repo-a');
-    expect(runner.writeFile.mock.calls.length).toBeGreaterThan(0);
-    runner.writeFile.mockClear();
+    expect(runner.execWithStdin.mock.calls.length).toBeGreaterThan(0);
+    runner.execWithStdin.mockClear();
     await provision(manager)(runner as unknown as CommandRunner, agent, '/repo-b');
-    const written = runner.writeFile.mock.calls.map(c => c[0] as string);
+    const written = runner.execWithStdin.mock.calls.map(c => c[0] as string);
     expect(written.some(p => p.includes('/repo-b/.claude/skills/baxian-task-check/SKILL.md'))).toBe(true);
   });
 
@@ -3401,6 +3409,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
         };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const agent = agentConfig({ id: 'dev-race', workdir: '/repo' });
     await Promise.all([
@@ -3423,6 +3432,28 @@ describe('AgentManager dispatch & skill provisioning', () => {
     const agent = agentConfig({ id: 'dev-sym' });
     await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).rejects.toThrow(/symlink-safe/);
     expect(runner.writeFile.mock.calls.length).toBe(0);
+  });
+
+  it('skill cleanup refuses a symlinked workdir root — external skills survive (real fs)', async () => {
+    const { mkdtemp: mkTemp, rm: rmTemp, symlink: mkLink, readFile: readF } = await import('node:fs/promises');
+    const { tmpdir: osTmp } = await import('node:os');
+    const { LocalRunner } = await import('../../src/agent/runner.js');
+    const base = await mkTemp(join(osTmp(), 'bx-skillroot-'));
+    try {
+      const outside = join(base, 'outside');
+      const local = new LocalRunner();
+      await local.exec(`mkdir -p '${join(outside, '.claude/skills/baxian-old')}'`);
+      await local.exec(`printf victim > '${join(outside, '.claude/skills/baxian-old/SKILL.md')}'`);
+      const workLink = join(base, 'work');
+      await mkLink(outside, workLink);
+
+      await expect(provision(manager)(local, agentConfig({ id: 'dev-rootlink' }), workLink))
+        .rejects.toThrow(/skill exclusion probe failed|cannot make injected skills invisible|symlink-safe/);
+
+      expect(await readF(join(outside, '.claude/skills/baxian-old/SKILL.md'), 'utf-8')).toBe('victim');
+    } finally {
+      await rmTemp(base, { recursive: true, force: true });
+    }
   });
 
   it('skillDirLockKey canonicalizes host + workdir so equivalent agents serialize', async () => {
@@ -6807,25 +6838,25 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id });
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'session boot boom'),
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 }, 'session boot boom'),
     );
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockResolvedValue();
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow('session boot boom');
-    expect(killSpy).toHaveBeenCalledWith('dev-1');
+    expect(killSpy).toHaveBeenCalledWith({ sessionId: '$7', serverPid: '4242', serverStart: '1700000000' });
   });
 
   it('still rethrows the ensureSession error when the rollback killSession also fails', async () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id });
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'session boot boom'),
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 }, 'session boot boom'),
     );
-    vi.spyOn(TmuxManager.prototype, 'killSession').mockRejectedValue(new Error('kill failed'));
+    vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockRejectedValue(new Error('kill failed'));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow('session boot boom');
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('rollback killSession failed'))).toBe(true);
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('created-session rollback') && String(c[0]).includes('failed'))).toBe(true);
     warnSpy.mockRestore();
   });
 
@@ -6833,10 +6864,10 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     const t = await seedTask();
     await seedAgent({ id: 'dev-1', taskId: t.id });
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'dialog blocked'),
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 }, 'dialog blocked'),
     );
     vi.spyOn(manager, 'handleDialogPendingFromRuntime').mockResolvedValue(true);
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockResolvedValue();
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow('dialog blocked');
     expect(killSpy).not.toHaveBeenCalled();
@@ -7231,10 +7262,10 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   it('rethrows without killSession when the dialog handler claims the ensureSession failure', async () => {
     const t = await seedContinueFix();
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'dialog blocked'),
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 }, 'dialog blocked'),
     );
     vi.spyOn(manager, 'handleDialogPendingFromRuntime').mockResolvedValue(true);
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockResolvedValue();
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
 
     await expect(manager.continueSession(t.id, 'dev-1', 'fix')).rejects.toThrow('dialog blocked');
     expect(killSpy).not.toHaveBeenCalled();
@@ -7243,14 +7274,14 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   it('kills the orphan session when ensureSession fails after creating one', async () => {
     const t = await seedContinueFix();
     vi.spyOn(manager, 'ensureSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: true, agentId: 'dev-1' }, 'session boot boom'),
+      new EnsureSessionError({ createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 }, 'session boot boom'),
     );
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockRejectedValue(new Error('kill failed'));
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockRejectedValue(new Error('kill failed'));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await expect(manager.continueSession(t.id, 'dev-1', 'fix')).rejects.toThrow('session boot boom');
-    expect(killSpy).toHaveBeenCalledWith('dev-1');
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('rollback killSession failed'))).toBe(true);
+    expect(killSpy).toHaveBeenCalledWith({ sessionId: '$7', serverPid: '4242', serverStart: '1700000000' });
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('created-session rollback') && String(c[0]).includes('failed'))).toBe(true);
     warnSpy.mockRestore();
   });
 

@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { chmod, mkdtemp, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { rm } from 'node:fs/promises';
@@ -96,13 +96,32 @@ describe('consumeRestartSentinel', () => {
 });
 
 describe('clearRestartSentinelSync', () => {
-  it('does not throw when file is absent', () => {
+  it('does not throw and does not warn when file is absent', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     expect(() => clearRestartSentinelSync(tempDir)).not.toThrow();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it('removes existing file', async () => {
     writeRestartSentinelSync({ stateDir: tempDir, restartId: 'x', parentPid: 1, actor: 'u' });
     clearRestartSentinelSync(tempDir);
     await expect(stat(sentinelFile())).rejects.toThrow();
+  });
+
+  it('warns with the target path when removal fails for a non-ENOENT reason', async () => {
+    writeRestartSentinelSync({ stateDir: tempDir, restartId: 'x', parentPid: 1, actor: 'u' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const stateSubdir = join(tempDir, 'state');
+    await chmod(stateSubdir, 0o555);
+    try {
+      expect(() => clearRestartSentinelSync(tempDir)).not.toThrow();
+    } finally {
+      await chmod(stateSubdir, 0o755);
+    }
+    expect(warn.mock.calls.some(c =>
+      String(c[0]).includes('failed to remove') && String(c[0]).includes('restart-intent.json'),
+    )).toBe(true);
+    warn.mockRestore();
   });
 });

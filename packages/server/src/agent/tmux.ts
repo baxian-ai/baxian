@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
 import { shellQuote, SshRunner } from './runner.js';
+import { execOutcomeUnknown } from './net-exec.js';
 import { isHorizontalRule, tailNonEmpty } from './detect/region.js';
 import { MAX_PROMPT_BYTES } from './prompt.js';
 
@@ -8,6 +9,53 @@ const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<Ex
   runner['exec'](cmd, opts);
 
 export type AgentRuntimeKind = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
+
+// $n is reused across tmux server restarts; the ref pins the server generation too.
+export interface TmuxSessionRef {
+  sessionId: string;
+  serverPid: string;
+  serverStart: string;
+}
+
+export interface TmuxSessionSnapshot {
+  ref: TmuxSessionRef;
+  claim: string | null;
+}
+
+export type KillSessionOutcome = 'killed' | 'absent' | 'stale-server' | 'refused';
+
+export const CREATION_NONCE_ENV = 'BAXIAN_CREATION_NONCE';
+const SESSION_REF_FORMAT = '#{pid}|#{start_time}|#{session_id}';
+const STALE_SERVER_MARKER = 'BX_STALE_SERVER';
+const REFUSED_MARKER = 'BX_KILL_REFUSED';
+const TARGET_GONE_MARKER = 'BX_TARGET_GONE';
+
+// Values embedded in tmux command strings; reject rather than escape what tmux quoting can't hold.
+function tmuxSingleQuote(value: string): string {
+  if (value.includes("'") || value.includes('\n')) {
+    throw new Error(`tmux option value ${JSON.stringify(value)} contains unsupported characters`);
+  }
+  return `'${value}'`;
+}
+
+function assertSessionRef(ref: TmuxSessionRef): void {
+  if (!/^\$\d+$/.test(ref.sessionId) || !/^\d+$/.test(ref.serverPid) || !/^\d+$/.test(ref.serverStart)) {
+    throw new Error(`tmux: malformed session ref ${JSON.stringify(ref)}`);
+  }
+}
+
+function parseSessionRef(line: string): TmuxSessionRef | null {
+  const m = /^(\d+)\|(\d+)\|(\$\d+)$/.exec(line.trim());
+  if (!m) return null;
+  return { serverPid: m[1], serverStart: m[2], sessionId: m[3] };
+}
+
+// Names land inside tmux format filters — reject syntax-altering characters outright.
+function assertPlainSessionName(name: string): void {
+  if (!/^[A-Za-z0-9_@=[\]-]+$/.test(name)) {
+    throw new Error(`tmux session name ${JSON.stringify(name)} contains unsupported characters`);
+  }
+}
 
 export interface PaneInfo {
   paneId: string;
@@ -431,17 +479,211 @@ export class TmuxManager {
     return { major: parseInt(match[1], 10), minor: parseInt(match[2], 10) };
   }
 
-  async createSession(name: string, workdir: string): Promise<void> {
+  async createSession(name: string, workdir: string): Promise<TmuxSessionRef> {
+    assertPlainSessionName(name);
     const PATH = '/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
+    // -e lands the nonce atomically with the session itself — the post-disconnect ownership proof.
+    const nonce = randomUUID();
+    let result: ExecResult;
+    try {
+      result = await run(
+        this.runner,
+        `tmux new-session -d -s ${shellQuote(name)} ` +
+          `-e ${shellQuote(`PATH=${PATH}`)} ` +
+          `-e ${shellQuote(`${CREATION_NONCE_ENV}=${nonce}`)} ` +
+          `-x 200 -y 50 -c ${shellQuote(workdir)} ` +
+          `-PF '${SESSION_REF_FORMAT}'`,
+      );
+    } catch (err) {
+      return this.reconcileCreatedSession(
+        name,
+        nonce,
+        `new-session exec rejected: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (result.exitCode === 0) {
+      const ref = parseSessionRef(result.stdout);
+      if (ref) return ref;
+      return this.reconcileCreatedSession(
+        name,
+        nonce,
+        `new-session succeeded but returned unparseable ref ${JSON.stringify(result.stdout.trim())}`,
+      );
+    }
+    // "No success seen" is not "not created" — a session may be live behind a dropped connection.
+    if (execOutcomeUnknown(result)) {
+      return this.reconcileCreatedSession(
+        name,
+        nonce,
+        `new-session outcome unknown (exit ${result.exitCode}): ${result.stderr.trim()}`,
+      );
+    }
+    throw new Error(`Failed to create tmux session ${name}: ${result.stderr}`);
+  }
+
+  private async reconcileCreatedSession(
+    name: string,
+    nonce: string,
+    cause: string,
+  ): Promise<TmuxSessionRef> {
+    let snapshot: TmuxSessionSnapshot | null;
+    try {
+      snapshot = await this.getSessionSnapshot(name);
+    } catch (err) {
+      throw new Error(
+        `tmux createSession ${name}: outcome unknown and reconcile probe failed ` +
+          `(${err instanceof Error ? err.message : String(err)}); original cause: ${cause}`,
+      );
+    }
+    if (!snapshot) {
+      throw new Error(`Failed to create tmux session ${name}: ${cause}`);
+    }
+    let survivorNonce: string | null;
+    try {
+      survivorNonce = await this.readCreationNonce(name);
+    } catch (err) {
+      throw new Error(
+        `tmux createSession ${name}: outcome unknown and nonce probe failed ` +
+          `(${err instanceof Error ? err.message : String(err)}); original cause: ${cause}`,
+      );
+    }
+    if (survivorNonce === nonce) {
+      console.warn(`[tmux] createSession ${name}: reconciled after uncertain outcome (${cause})`);
+      return snapshot.ref;
+    }
+    throw new Error(
+      `tmux session ${name} exists but was not created by this call (nonce mismatch) — leaving it untouched; cause: ${cause}`,
+    );
+  }
+
+  private async readCreationNonce(name: string): Promise<string | null> {
+    assertPlainSessionName(name);
     const result = await run(
       this.runner,
-      `tmux new-session -d -s ${shellQuote(name)} ` +
-        `-e ${shellQuote(`PATH=${PATH}`)} ` +
-        `-x 200 -y 50 -c ${shellQuote(workdir)}`,
+      `tmux show-environment -t ${shellQuote(`=${name}:`)} ${CREATION_NONCE_ENV}`,
     );
-    if (result.exitCode !== 0) {
-      throw new Error(`Failed to create tmux session ${name}: ${result.stderr}`);
+    if (result.exitCode === 0) {
+      const line = result.stdout.trim();
+      return line.startsWith(`${CREATION_NONCE_ENV}=`) ? line.slice(CREATION_NONCE_ENV.length + 1) : null;
     }
+    if (result.exitCode === 1 && (isUnknownTmuxVariable(result.stderr) || isSessionAbsent(result.stderr))) {
+      return null;
+    }
+    throw new Error(`tmux creation-nonce probe for ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
+  }
+
+  // Ref and claim come from one round trip — the claim can't belong to a different session.
+  async getSessionSnapshot(name: string): Promise<TmuxSessionSnapshot | null> {
+    assertPlainSessionName(name);
+    const result = await run(
+      this.runner,
+      `tmux list-sessions -F '${SESSION_REF_FORMAT}|#{@baxian-agent-id}' ` +
+        `-f ${shellQuote(`#{==:#{session_name},${name}}`)}`,
+    );
+    if (result.exitCode === 0) {
+      const line = result.stdout.trim();
+      if (line === '') return null;
+      const sep = line.lastIndexOf('|');
+      const ref = sep === -1 ? null : parseSessionRef(line.slice(0, sep));
+      if (!ref) {
+        throw new Error(`tmux getSessionSnapshot ${name}: unparseable output ${JSON.stringify(line)}`);
+      }
+      const claim = line.slice(sep + 1);
+      return { ref, claim: claim === '' ? null : claim };
+    }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return null;
+    throw new Error(`tmux getSessionSnapshot ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
+  }
+
+  async hasCreationNonce(name: string): Promise<boolean> {
+    return (await this.readCreationNonce(name)) !== null;
+  }
+
+  // With a dead id and a single surviving session, tmux target lookup silently
+  // falls back to that survivor — and a fresh server reissues the same $n. Every
+  // by-ref write re-proves id AND server generation inside the server itself.
+  async setSessionOptionsIfAlive(
+    ref: TmuxSessionRef,
+    entries: ReadonlyArray<readonly [string, string]>,
+  ): Promise<'applied' | 'gone'> {
+    assertSessionRef(ref);
+    if (entries.length === 0) return 'applied';
+    const sets = entries
+      .map(([key, value]) => `set-option -t '${ref.sessionId}' ${key} ${tmuxSingleQuote(value)}`)
+      .join(' ; ');
+    const generation = `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
+    const cond = `#{&&:${generation},#{==:#{session_id},${ref.sessionId}}}`;
+    const result = await run(
+      this.runner,
+      `tmux if-shell -t ${shellQuote(ref.sessionId)} ` +
+        `-F ${shellQuote(cond)} ` +
+        `${shellQuote(sets)} ` +
+        `${shellQuote(`display-message -p ${TARGET_GONE_MARKER}`)}`,
+    );
+    if (result.exitCode === 0) {
+      return result.stdout.includes(TARGET_GONE_MARKER) ? 'gone' : 'applied';
+    }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return 'gone';
+    throw new Error(
+      `tmux setSessionOptionsIfAlive ${ref.sessionId} failed (exit ${result.exitCode}): ${result.stderr}`,
+    );
+  }
+
+  // list-panes -a with an exact id+generation filter cannot fall back to another
+  // session, and a fresh server reissuing the same $n fails the generation half.
+  async getSinglePaneIdByRef(ref: TmuxSessionRef): Promise<string> {
+    assertSessionRef(ref);
+    const generation = `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
+    const result = await run(
+      this.runner,
+      `tmux list-panes -a -F '#{pane_id} #{pane_current_command}' ` +
+        `-f ${shellQuote(`#{&&:${generation},#{==:#{session_id},${ref.sessionId}}}`)}`,
+    );
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
+      throw new Error(`tmux session ${ref.sessionId} is gone (no server)`);
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(`tmux getSinglePaneIdByRef ${ref.sessionId} failed: ${result.stderr}`);
+    }
+    const panes = result.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+    if (panes.length === 0) {
+      throw new Error(`tmux session ${ref.sessionId} is gone (no panes match)`);
+    }
+    if (panes.length > 1) {
+      throw new Error(
+        `tmux session ${ref.sessionId} has ${panes.length} panes; baxian expects exactly one — external split-window not supported`,
+      );
+    }
+    return panes[0].split(' ')[0];
+  }
+
+  // Generation (and opted-in claim-still-empty) are evaluated inside the killing server itself.
+  async killSessionRef(
+    ref: TmuxSessionRef,
+    opts: { onlyIfUnclaimed?: boolean } = {},
+  ): Promise<KillSessionOutcome> {
+    assertSessionRef(ref);
+    const generation = `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
+    const cond = opts.onlyIfUnclaimed
+      ? `#{&&:${generation},#{==:#{@baxian-agent-id},}}`
+      : generation;
+    const marker = opts.onlyIfUnclaimed ? REFUSED_MARKER : STALE_SERVER_MARKER;
+    const target = opts.onlyIfUnclaimed ? `-t ${shellQuote(ref.sessionId)} ` : '';
+    const result = await run(
+      this.runner,
+      `tmux if-shell ${target}-F ${shellQuote(cond)} ` +
+        `${shellQuote(`kill-session -t '${ref.sessionId}'`)} ` +
+        `${shellQuote(`display-message -p ${marker}`)}`,
+    );
+    if (result.exitCode === 0) {
+      if (result.stdout.includes(REFUSED_MARKER)) return 'refused';
+      return result.stdout.includes(STALE_SERVER_MARKER) ? 'stale-server' : 'killed';
+    }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return 'absent';
+    if (result.exitCode === 255) {
+      throw new Error(`tmux killSessionRef ${ref.sessionId} runner error (ssh/exec layer): ${result.stderr}`);
+    }
+    throw new Error(`tmux killSessionRef ${ref.sessionId} unexpected exit ${result.exitCode}: ${result.stderr}`);
   }
 
   async sendInput(name: string, data: string): Promise<void> {
@@ -464,7 +706,15 @@ export class TmuxManager {
         throw new Error(`tmux sendInput ${name} paste-buffer failed: ${r2.stderr || 'unknown error'}`);
       }
     } finally {
-      await run(this.runner, deleteCmd).catch(() => undefined);
+      try {
+        const del = await run(this.runner, deleteCmd);
+        // paste -d already deleted it on success; absent is the norm, not a leak.
+        if (del.exitCode !== 0 && !isUnknownTmuxBuffer(del.stderr)) {
+          console.warn(`[tmux] sendInput ${name}: delete-buffer failed (input may linger in tmux): ${del.stderr.trim() || `exit ${del.exitCode}`}`);
+        }
+      } catch (err) {
+        console.warn(`[tmux] sendInput ${name}: delete-buffer failed (input may linger in tmux):`, err);
+      }
     }
   }
 
@@ -476,19 +726,6 @@ export class TmuxManager {
     if (result.exitCode !== 0) {
       throw new Error(`tmux resizeWindow ${name} failed: ${result.stderr}`);
     }
-  }
-
-  async killSession(name: string): Promise<void> {
-    const result = await run(
-      this.runner,
-      `tmux kill-session -t ${shellQuote(`=${name}`)}`,
-    );
-    if (result.exitCode === 0) return;
-    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return;
-    if (result.exitCode === 255) {
-      throw new Error(`tmux killSession ${name} runner error (ssh/exec layer): ${result.stderr}`);
-    }
-    throw new Error(`tmux killSession ${name} unexpected exit ${result.exitCode}: ${result.stderr}`);
   }
 
   async hasSession(name: string, opts?: ExecOptions): Promise<boolean> {
@@ -889,6 +1126,14 @@ export class TmuxManager {
       lastTitle === undefined ? undefined : `paneTitle=${JSON.stringify(lastTitle)}`,
     );
   }
+}
+
+function isUnknownTmuxVariable(stderr: string): boolean {
+  return /unknown variable/i.test(stderr);
+}
+
+function isUnknownTmuxBuffer(stderr: string): boolean {
+  return /unknown buffer/i.test(stderr);
 }
 
 function isSessionAbsent(stderr: string): boolean {

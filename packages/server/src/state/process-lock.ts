@@ -119,13 +119,16 @@ export class ProcessLock {
       if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
         this.acquired = false;
         this.ownerId = null;
+        return;
       }
+      console.warn(`[process-lock] cannot read ${this.path} to prove ownership — lock left in place:`, err);
       return;
     }
     let parsed: Partial<ProcessLockInfo>;
     try {
       parsed = JSON.parse(raw) as Partial<ProcessLockInfo>;
-    } catch {
+    } catch (err) {
+      console.warn(`[process-lock] lock file ${this.path} is malformed — leaving it in place:`, err);
       return;
     }
     if (typeof parsed.ownerId !== 'string' || parsed.ownerId !== this.ownerId) {
@@ -135,7 +138,13 @@ export class ProcessLock {
       unlinkSync(this.path);
       this.acquired = false;
       this.ownerId = null;
-    } catch {
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        this.acquired = false;
+        this.ownerId = null;
+        return;
+      }
+      console.warn(`[process-lock] failed to release ${this.path}:`, err);
     }
   }
 

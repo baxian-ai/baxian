@@ -21,7 +21,7 @@ import {
 } from '../shared/index.js';
 import { shellQuote, type CommandRunner, type ExecResult } from './runner.js';
 import { GIT_NET_ENV, execNetwork } from './net-exec.js';
-import { ensureBaxianRuntimeDirsSafe } from './repo-store.js';
+import { ancestorSymlinkGuard, ensureBaxianRuntimeDirsSafe, guardedRemoveClause, moveFileIntoPlace, stageFileGuarded, sweepStrayFile } from './repo-store.js';
 
 
 export class ReviewExchangeError extends Error {
@@ -149,7 +149,7 @@ export class ReviewTransport {
     const runner = this.deps.createRunnerFor(agent);
     await this.ensureRuntimeDirs(runner, workdir);
     const result = await runner.exec(
-      `rm -f ${paths.map(shellQuote).join(' ')}`,
+      paths.map(p => guardedRemoveClause(workdir, p)).join(' && '),
     );
     if (result.exitCode !== 0) {
       throw new ReviewExchangeError(
@@ -159,7 +159,7 @@ export class ReviewTransport {
     }
     if (resetsSpecDocuments) {
       const researchDir = `${workdir}/${RESEARCH_DOCS_DIR}`;
-      const cleared = await runner.exec(`rm -rf -- ${shellQuote(researchDir)}`);
+      const cleared = await runner.exec(guardedRemoveClause(workdir, researchDir, { recursive: true }));
       if (cleared.exitCode !== 0) {
         throw new ReviewExchangeError(
           'artifact-cleanup-failed',
@@ -316,7 +316,7 @@ export class ReviewTransport {
     await assertOwner();
     await this.ensureRuntimeDirs(runner, workdir);
     const cleared = await runner.exec(
-      `rm -f -- ${shellQuote(specPath)} && rm -rf -- ${shellQuote(researchDir)}`,
+      `${guardedRemoveClause(workdir, specPath)} && ${guardedRemoveClause(workdir, researchDir, { recursive: true })}`,
     );
     if (cleared.exitCode !== 0) {
       throw new ReviewExchangeError(
@@ -332,15 +332,12 @@ export class ReviewTransport {
       const dir = final.slice(0, final.lastIndexOf('/'));
       const tmp = `${dir}/.tmp-${randomBytes(8).toString('hex')}`;
       try {
-        await runner.writeFile(tmp, document.content);
+        await stageFileGuarded(runner, workdir, tmp, document.content);
         await assertOwner();
-        const moved = await runner.exec(`mv -f -- ${shellQuote(tmp)} ${shellQuote(final)}`);
-        if (moved.exitCode !== 0) {
-          throw new Error(moved.stderr.trim() || `exit ${moved.exitCode}`);
-        }
+        await moveFileIntoPlace(runner, tmp, final, { guardRoot: workdir });
         await assertOwner();
       } catch (err) {
-        await runner.exec(`rm -f -- ${shellQuote(tmp)}`).catch(() => undefined);
+        await sweepStrayFile(runner, tmp, ancestorSymlinkGuard(workdir, tmp));
         if (err instanceof ReviewExchangeError) throw err;
         throw new ReviewExchangeError(
           'spec-seed-failed',
@@ -443,17 +440,13 @@ export class ReviewTransport {
     const runner = this.deps.createRunnerFor(agent);
     await this.ensureRuntimeDirs(runner, wt);
     try {
-      await runner.writeFile(tmp, content);
+      await stageFileGuarded(runner, wt, tmp, content);
+      await moveFileIntoPlace(runner, tmp, final, { guardRoot: wt });
     } catch (err) {
       throw new ReviewExchangeError(
         'deliver-failed',
-        `${filename}: write failed: ${err instanceof Error ? err.message : String(err)}`,
+        `${filename}: ${err instanceof Error ? err.message : String(err)}`,
       );
-    }
-    const mv = await runner.exec(`mv -f ${shellQuote(tmp)} ${shellQuote(final)}`);
-    if (mv.exitCode !== 0) {
-      await runner.exec(`rm -f ${shellQuote(tmp)}`).catch(() => undefined);
-      throw new ReviewExchangeError('deliver-failed', `${filename}: mv failed: ${mv.stderr.trim()}`);
     }
     return { path: `${REVIEW_INBOX_DIR}/${filename}`, bytes: Buffer.byteLength(content, 'utf8') };
   }
@@ -474,7 +467,14 @@ export class ReviewTransport {
     const wt = this.requireWorkdir(agent.id);
     const runner = this.deps.createRunnerFor(agent);
     await this.ensureRuntimeDirs(runner, wt);
-    await runner.exec(`rm -f ${shellQuote(`${wt}/${REVIEW_EXCHANGE_DIR}/${name}`)}`);
+    const target = `${wt}/${REVIEW_EXCHANGE_DIR}/${name}`;
+    const rm = await runner.exec(guardedRemoveClause(wt, target));
+    if (rm.exitCode !== 0) {
+      throw new ReviewExchangeError(
+        'artifact-cleanup-failed',
+        `failed to delete ${target}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`,
+      );
+    }
   }
 
   private async ensureRuntimeDirs(runner: CommandRunner, workdir: string): Promise<void> {

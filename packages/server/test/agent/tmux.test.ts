@@ -43,7 +43,10 @@ describe('TmuxManager', () => {
   };
 
   describe('createSession', () => {
+    const REF_OUT = '4242|1700000000|$1\n';
+
     it('runs tmux new-session with raw session name (no exact-match prefix needed for new sessions)', async () => {
+      primeExec(REF_OUT);
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
       expect(cmd).toContain('tmux new-session -d');
@@ -52,6 +55,7 @@ describe('TmuxManager', () => {
     });
 
     it('sets default pane size 200x50 via -x/-y', async () => {
+      primeExec(REF_OUT);
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
       expect(cmd).toContain('-x 200');
@@ -59,6 +63,7 @@ describe('TmuxManager', () => {
     });
 
     it('injects literal PATH via tmux -e (no shell-side $PATH expansion → fish-safe)', async () => {
+      primeExec(REF_OUT);
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
       expect(cmd).toContain(
@@ -68,6 +73,7 @@ describe('TmuxManager', () => {
     });
 
     it('does NOT chain post-create options (those live in buildFreshSession for rollback safety)', async () => {
+      primeExec(REF_OUT);
       await tmux.createSession('kk-dev-1', '/home/user/code');
       const cmd = lastCmd(runner);
       expect(cmd).not.toContain('set-option');
@@ -195,6 +201,24 @@ describe('TmuxManager', () => {
       expect(runner.exec).not.toHaveBeenCalled();
     });
 
+    it('does not warn when delete-buffer finds the buffer already consumed by paste -d', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      primeExec('');
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'unknown buffer: bx-input-x', exitCode: 1 });
+      await tmux.sendInput('dev', 'data');
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it('warns when delete-buffer fails for any other reason', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      primeExec('');
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'server exited unexpectedly', exitCode: 1 });
+      await tmux.sendInput('dev', 'data');
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('input may linger in tmux'));
+      warn.mockRestore();
+    });
+
     it('uses unique buffer names per call (random uuid prefix)', async () => {
       await tmux.sendInput('dev', 'a');
       await tmux.sendInput('dev', 'b');
@@ -231,28 +255,234 @@ describe('TmuxManager', () => {
     });
   });
 
-  describe('killSession', () => {
-    it('uses exact-match `=name` target so prefix collisions are not killed', async () => {
-      await tmux.killSession('dev');
+  describe('killSessionRef', () => {
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+
+    it('kills through a server-generation-checked if-shell, never a bare name', async () => {
+      primeExec('');
+      expect(await tmux.killSessionRef(REF)).toBe('killed');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux kill-session');
-      expect(cmd).toContain("-t '=dev'");
+      expect(cmd).toContain('tmux if-shell -F');
+      expect(cmd).toContain('#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}');
+      expect(cmd).toContain(`kill-session -t '\\''$7'\\'`);
+      expect(cmd).toContain('BX_STALE_SERVER');
     });
 
-    it.each([
-      ['"session not found"', "can't find session: dev"],
-      ['"no server running"', 'no server running on /tmp/tmux-501/default'],
-    ])('treats %s as success (idempotent)', async (_label, stderr) => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode: 1 });
-      await expect(tmux.killSession('dev')).resolves.toBeUndefined();
+    it('reports stale-server without killing when the generation check fails', async () => {
+      primeExec('BX_STALE_SERVER\n');
+      expect(await tmux.killSessionRef(REF)).toBe('stale-server');
     });
 
-    it.each([
-      ['ssh-layer error (exit 255)', 'ssh: connect: connection refused', 255, /runner error/],
-      ['unexpected exit code', 'wat', 42, /unexpected exit 42/],
-    ])('throws on %s', async (_label, stderr, exitCode, pattern) => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode });
-      await expect(tmux.killSession('dev')).rejects.toThrow(pattern);
+    it('treats a vanished session as absent (idempotent)', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $7", exitCode: 1 });
+      expect(await tmux.killSessionRef(REF)).toBe('absent');
+    });
+
+    it('treats a dead server as absent', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
+      expect(await tmux.killSessionRef(REF)).toBe('absent');
+    });
+
+    it('throws on an ssh-layer failure instead of guessing', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
+      await expect(tmux.killSessionRef(REF)).rejects.toThrow(/runner error/);
+    });
+
+    it('refuses to run with a malformed ref (defense against credential corruption)', async () => {
+      await expect(tmux.killSessionRef({ sessionId: 'dev', serverPid: '1', serverStart: '2' }))
+        .rejects.toThrow(/malformed session ref/);
+      expect(runner.exec).not.toHaveBeenCalled();
+    });
+
+    it('onlyIfUnclaimed adds the claim-empty condition, a session target, and its own marker', async () => {
+      primeExec('');
+      expect(await tmux.killSessionRef(REF, { onlyIfUnclaimed: true })).toBe('killed');
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("-t '$7'");
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},}');
+      expect(cmd).toContain('#{&&:#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}');
+      expect(cmd).toContain('BX_KILL_REFUSED');
+    });
+
+    it('onlyIfUnclaimed reports refused without killing when the server declines', async () => {
+      primeExec('BX_KILL_REFUSED\n');
+      expect(await tmux.killSessionRef(REF, { onlyIfUnclaimed: true })).toBe('refused');
+    });
+  });
+
+  describe('createSession credential', () => {
+    it('returns the generation-bound ref printed atomically by -PF', async () => {
+      primeExec('4242|1700000000|$12\n');
+      expect(await tmux.createSession('dev', '/wt')).toEqual({
+        serverPid: '4242', serverStart: '1700000000', sessionId: '$12',
+      });
+      expect(lastCmd(runner)).toContain("-PF '#{pid}|#{start_time}|#{session_id}'");
+    });
+
+    it('injects the creation nonce atomically via -e', async () => {
+      primeExec('4242|1700000000|$12\n');
+      await tmux.createSession('dev', '/wt');
+      expect(lastCmd(runner)).toMatch(/-e 'BAXIAN_CREATION_NONCE=[0-9a-f-]{36}'/);
+    });
+
+    it('reconciles an uncertain outcome by matching the nonce and returns the surviving ref', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
+      primeExec('4242|1700000000|$12|\n');
+      runner.exec.mockImplementationOnce(async () => {
+        const createCmd = String(runner.exec.mock.calls[0][0]);
+        const nonce = /BAXIAN_CREATION_NONCE=([0-9a-f-]{36})/.exec(createCmd);
+        return { stdout: `BAXIAN_CREATION_NONCE=${nonce?.[1] ?? 'missing'}\n`, stderr: '', exitCode: 0 };
+      });
+      expect(await tmux.createSession('dev', '/wt')).toEqual({
+        serverPid: '4242', serverStart: '1700000000', sessionId: '$12',
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled after uncertain outcome'));
+      warn.mockRestore();
+    });
+
+    it('fails cleanly when reconcile finds no surviving session', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'Connection reset by peer', exitCode: 255 });
+      primeExec('');
+      await expect(tmux.createSession('dev', '/wt')).rejects.toThrow(/Failed to create tmux session dev/);
+    });
+
+    it('reconciles after an exec-layer rejection too — a rejected client call may hide a live session', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockRejectedValueOnce(new Error('socket hang up'));
+      primeExec('4242|1700000000|$12|\n');
+      runner.exec.mockImplementationOnce(async () => {
+        const createCmd = String(runner.exec.mock.calls[0][0]);
+        const nonce = /BAXIAN_CREATION_NONCE=([0-9a-f-]{36})/.exec(createCmd);
+        return { stdout: `BAXIAN_CREATION_NONCE=${nonce?.[1] ?? 'missing'}\n`, stderr: '', exitCode: 0 };
+      });
+      expect(await tmux.createSession('dev', '/wt')).toEqual({
+        serverPid: '4242', serverStart: '1700000000', sessionId: '$12',
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled after uncertain outcome'));
+      warn.mockRestore();
+    });
+
+    it('refuses to touch a same-name session whose nonce does not match', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'Connection reset by peer', exitCode: 255 });
+      primeExec('4242|1700000000|$12|\n');
+      primeExec('BAXIAN_CREATION_NONCE=someone-elses-nonce\n');
+      await expect(tmux.createSession('dev', '/wt')).rejects.toThrow(/not created by this call/);
+    });
+
+    it('fails closed instead of trusting an unparseable -PF ref on exit 0', async () => {
+      primeExec('\n');
+      primeExec('');
+      await expect(tmux.createSession('dev', '/wt')).rejects.toThrow(/Failed to create tmux session dev/);
+    });
+
+    it('rejects session names that could alter tmux filter syntax', async () => {
+      await expect(tmux.createSession('a,b}', '/wt')).rejects.toThrow(/unsupported characters/);
+      expect(runner.exec).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getSessionSnapshot', () => {
+    it('returns ref and claim from one exact-name filtered round trip', async () => {
+      primeExec('4242|1700000000|$3|dev\n');
+      expect(await tmux.getSessionSnapshot('dev')).toEqual({
+        ref: { serverPid: '4242', serverStart: '1700000000', sessionId: '$3' },
+        claim: 'dev',
+      });
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain('tmux list-sessions -F');
+      expect(cmd).toContain("'#{==:#{session_name},dev}'");
+    });
+
+    it('maps an unset claim option to null', async () => {
+      primeExec('4242|1700000000|$3|\n');
+      expect((await tmux.getSessionSnapshot('dev'))?.claim).toBeNull();
+    });
+
+    it('returns null when no session matches', async () => {
+      primeExec('');
+      expect(await tmux.getSessionSnapshot('dev')).toBeNull();
+    });
+
+    it('returns null when the server is not running', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
+      expect(await tmux.getSessionSnapshot('dev')).toBeNull();
+    });
+
+    it('throws on transport failure instead of reporting absence', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
+      await expect(tmux.getSessionSnapshot('dev')).rejects.toThrow(/getSessionSnapshot/);
+    });
+  });
+
+  describe('setSessionOptionsIfAlive', () => {
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+
+    it('batches all options into one identity-checked if-shell command', async () => {
+      primeExec('');
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['@baxian-agent-id', 'dev'], ['mouse', 'on']])).toBe('applied');
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("tmux if-shell -t '$7'");
+      expect(cmd).toContain('#{&&:#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}},#{==:#{session_id},$7}}');
+      expect(cmd).toContain("set-option -t '\\''$7'\\'' @baxian-agent-id '\\''dev'\\''");
+      expect(cmd).toContain("set-option -t '\\''$7'\\'' mouse '\\''on'\\''");
+      expect(cmd).toContain('BX_TARGET_GONE');
+    });
+
+    it('reports gone instead of configuring a fallback session', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']])).toBe('gone');
+    });
+
+    it('treats a dead server as gone', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']])).toBe('gone');
+    });
+
+    it('rejects option values tmux quoting cannot hold', async () => {
+      await expect(tmux.setSessionOptionsIfAlive(REF, [['@k', "a'b"]])).rejects.toThrow(/unsupported characters/);
+      expect(runner.exec).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getSinglePaneIdByRef', () => {
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+
+    it('resolves the pane through an exact session_id filter', async () => {
+      primeExec('%3 zsh\n');
+      expect(await tmux.getSinglePaneIdByRef(REF)).toBe('%3');
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain('list-panes -a');
+      expect(cmd).toContain('#{==:#{session_id},$7}');
+      expect(cmd).toContain('#{==:#{pid},4242}');
+    });
+
+    it('reports the session gone when nothing matches the filter', async () => {
+      primeExec('');
+      await expect(tmux.getSinglePaneIdByRef(REF)).rejects.toThrow(/gone/);
+    });
+
+    it('refuses multi-pane sessions', async () => {
+      primeExec('%1 zsh\n%2 zsh\n');
+      await expect(tmux.getSinglePaneIdByRef(REF)).rejects.toThrow(/expects exactly one/);
+    });
+  });
+
+  describe('hasCreationNonce', () => {
+    it('detects the nonce env var on a half-created session', async () => {
+      primeExec('BAXIAN_CREATION_NONCE=abc\n');
+      expect(await tmux.hasCreationNonce('dev')).toBe(true);
+    });
+
+    it('returns false when the variable is unknown', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'unknown variable: BAXIAN_CREATION_NONCE', exitCode: 1 });
+      expect(await tmux.hasCreationNonce('dev')).toBe(false);
+    });
+
+    it('throws on transport failure', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
+      await expect(tmux.hasCreationNonce('dev')).rejects.toThrow(/creation-nonce probe/);
     });
   });
 

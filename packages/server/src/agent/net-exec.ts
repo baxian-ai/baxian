@@ -49,6 +49,13 @@ export function isTransientNetworkFailure(text: string): boolean {
   return TRANSIENT_PATTERNS.some((p) => p.test(text));
 }
 
+// exit 255 or transient noise on either stream: the command's outcome is unknown, not negative.
+export function execOutcomeUnknown(result: Pick<ExecResult, 'exitCode' | 'stdout' | 'stderr'>): boolean {
+  return result.exitCode === 255
+    || isTransientNetworkFailure(result.stderr)
+    || isTransientNetworkFailure(result.stdout);
+}
+
 export interface NetExecOptions {
   timeout?: number;
   retries?: number;

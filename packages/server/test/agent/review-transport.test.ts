@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   ReviewExchangeError,
   ReviewTransport,
@@ -52,7 +52,14 @@ function makeTransport(rules: Rule[], worktree = '/wt/dev') {
     writeFile: async (path: string, content: string | Buffer) => {
       writes.push({ path, content: content.toString() });
     },
-    execWithStdin: async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 }),
+    execWithStdin: async (cmd: string, stdin: Buffer): Promise<ExecResult> => {
+      calls.push(cmd);
+      const staged = /cat > '([^']+)'/.exec(cmd);
+      const rule = rules.find(r => r.match(cmd));
+      const result = { stdout: '', stderr: '', exitCode: 0, ...(rule?.result ?? {}) };
+      if (staged && result.exitCode === 0) writes.push({ path: staged[1], content: stdin.toString() });
+      return result;
+    },
   };
   const transport = new ReviewTransport({
     createRunnerFor: () => runner,
@@ -393,14 +400,41 @@ describe('readFindings / readResponse', () => {
     await expect(transport.readFindings(task(), QA)).rejects.toThrow(ReviewExchangeError);
   });
 
-  it('parses response.json and delete issues rm -f', async () => {
+  it('parses response.json and delete issues an ancestor-guarded rm -f', async () => {
     const { transport, calls } = makeTransport([
       { match: c => c.includes('response.json') && c.startsWith('cat'), result: { stdout: RESPONSE_JSON } },
     ]);
     const response = await transport.readResponse(task(), DEV);
     expect(response?.responses[0].action).toBe('fix');
     await transport.deleteResponse(DEV);
-    expect(calls.some(c => c.startsWith('rm -f') && c.includes('response.json'))).toBe(true);
+    const rm = calls.find(c => c.includes('rm -f --') && c.includes('response.json'));
+    expect(rm).toBeDefined();
+    expect(rm).toContain("[ ! -L '/wt/dev' ]");
+    expect(rm).toContain("[ ! -L '/wt/dev/.baxian/review' ]");
+    expect(rm).toContain("[ ! -L '/wt/dev/.baxian/review/response.json' ] && rm -f --");
+  });
+
+  it('fails closed instead of deleting when the exchange dir has been swapped for a symlink (real fs)', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'review-exchange-symlink-'));
+    const outside = await mkdtemp(join(tmpdir(), 'review-exchange-outside-'));
+    try {
+      const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
+      expect(initialized.exitCode).toBe(0);
+      await writeFile(join(outside, 'response.json'), 'foreign-precious');
+      await mkdir(join(worktree, '.baxian'), { recursive: true });
+      await symlink(outside, join(worktree, '.baxian', 'review'));
+      const transport = new ReviewTransport({
+        createRunnerFor: () => new LocalRunner(),
+        resolveWorkdir: () => worktree,
+      });
+
+      await expect(transport.deleteResponse(DEV)).rejects.toThrow(ReviewExchangeError);
+
+      expect(await readFile(join(outside, 'response.json'), 'utf-8')).toBe('foreign-precious');
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 });
 
@@ -410,11 +444,11 @@ describe('clearDispatchOutputs', () => {
 
     await transport.clearDispatchOutputs(DEV, '/wt/dev', 'develop');
 
-    const command = calls.find(call => call.startsWith('rm -f '))!;
+    const command = calls.find(call => call.includes("rm -f -- '/wt/dev/.baxian/review/findings.json'"))!;
     expect(command).toContain("'/wt/dev/.baxian/review/findings.json'");
     expect(command).toContain("'/wt/dev/.baxian/review/response.json'");
     expect(command).toContain("'/wt/dev/.baxian/spec.md'");
-    expect(calls).toContain("rm -rf -- '/wt/dev/.baxian/research'");
+    expect(calls.some(c => c.includes("rm -rf -- '/wt/dev/.baxian/research'"))).toBe(true);
   });
 
   it('removes Research handoff documents before the next real develop dispatch', async () => {
@@ -444,7 +478,7 @@ describe('clearDispatchOutputs', () => {
 
   it('fails closed when stale output cleanup fails', async () => {
     const { transport } = makeTransport([
-      { match: command => command.startsWith('rm -f'), result: { exitCode: 1, stderr: 'permission denied' } },
+      { match: command => command.includes('rm -f --'), result: { exitCode: 1, stderr: 'permission denied' } },
     ]);
 
     await expect(transport.clearDispatchOutputs(QA, '/wt/qa', 'server-review'))
@@ -454,7 +488,7 @@ describe('clearDispatchOutputs', () => {
   it('fails closed when stale Research document cleanup fails before develop', async () => {
     const { transport } = makeTransport([
       {
-        match: command => command.startsWith("rm -rf -- '/wt/dev/.baxian/research'"),
+        match: command => command.includes("rm -rf -- '/wt/dev/.baxian/research'"),
         result: { exitCode: 1, stderr: 'permission denied' },
       },
     ]);
@@ -596,7 +630,7 @@ describe('deliverToInbox', () => {
     expect(writes).toHaveLength(1);
     expect(writes[0].path).toMatch(/^\/wt\/qa\/\.baxian\/review\/inbox\/\.tmp-[0-9a-f]{12}$/);
     expect(writes[0].content).toBe(content);
-    const mv = calls.find(c => c.startsWith('mv -f'));
+    const mv = calls.find(c => c.includes('mv -f --'));
     expect(mv).toBeDefined();
     expect(mv).toContain(writes[0].path);
     expect(mv).toContain("'/wt/qa/.baxian/review/inbox/spec-round-2.md'");
@@ -610,26 +644,84 @@ describe('deliverToInbox', () => {
 
   it('mv failure removes the temp file and throws deliver-failed, final name never targeted twice', async () => {
     const { transport, calls } = makeTransport([
-      { match: c => c.startsWith('mv -f'), result: { exitCode: 1, stderr: 'disk full' } },
+      { match: c => c.includes('mv -f --'), result: { exitCode: 1, stderr: 'disk full' } },
     ]);
     await expect(
       transport.deliverToInbox(QA, QA_WT, 'diff-round-1.patch', 'x'),
     ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
-    expect(calls.some(c => c.startsWith('rm -f') && c.includes('.tmp-'))).toBe(true);
+    expect(calls.some(c => c.includes('rm -f --') && c.includes('.tmp-'))).toBe(true);
   });
 
-  it('writeFile failure surfaces as deliver-failed', async () => {
+  it('logs a resolved non-zero rm while cleaning the temp file after mv failure', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { transport } = makeTransport([
+        { match: c => c.includes('mv -f --'), result: { exitCode: 1, stderr: 'disk full' } },
+        { match: c => c.includes('rm -f --') && c.includes('/.tmp-'), result: { exitCode: 255, stderr: 'Connection timed out during banner exchange' } },
+      ]);
+      await expect(
+        transport.deliverToInbox(QA, QA_WT, 'diff-round-1.patch', 'x'),
+      ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+      expect(warn.mock.calls.some(c => String(c[0]).includes('failed to remove stray tmp'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs a resolved non-zero rm while cleaning the spec temp after a failed replace', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { transport } = makeTransport([
+        { match: c => c.includes('mv -f --'), result: { exitCode: 1, stderr: 'disk full' } },
+        { match: c => c.includes('rm -f --') && c.includes('/.tmp-'), result: { exitCode: 1, stderr: 'rm: permission denied' } },
+      ]);
+      await expect(
+        transport.replaceSpecDocuments(QA, '/wt/qa', [{ relPath: '.baxian/spec.md', content: 'x' }], async () => {}),
+      ).rejects.toThrow(expect.objectContaining({ reason: 'spec-seed-failed' }));
+      expect(warn.mock.calls.some(c => String(c[0]).includes('failed to remove stray tmp'))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a staging-write failure surfaces as deliver-failed and sweeps the partially-written tmp', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const calls: string[] = [];
     const failing = new ReviewTransport({
       createRunnerFor: () => ({
-        exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-        writeFile: async () => { throw new Error('ssh down'); },
-        execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+        exec: async (cmd: string) => { calls.push(cmd); return { stdout: '', stderr: '', exitCode: 0 }; },
+        writeFile: async () => {},
+        execWithStdin: async () => { throw new Error('ssh down'); },
       }),
       resolveWorkdir: () => '/wt/qa',
     });
     await expect(
       failing.deliverToInbox(QA, QA_WT, 'spec-round-1.md', 'x'),
     ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+    expect(calls.some(c => c.includes('rm -f --') && /\/wt\/qa\/\.baxian\/review\/inbox\/\.tmp-[0-9a-f]{12}/.test(c))).toBe(true);
+  });
+
+  it('an exec-layer rejection on mv still sweeps the tmp and maps to deliver-failed', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const calls: string[] = [];
+    const rejecting = new ReviewTransport({
+      createRunnerFor: () => ({
+        exec: async (cmd: string) => {
+          calls.push(cmd);
+          if (cmd.includes('mv -f --')) throw new Error('socket hang up');
+          return { stdout: '', stderr: '', exitCode: 0 };
+        },
+        writeFile: async () => {},
+        execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      }),
+      resolveWorkdir: () => '/wt/qa',
+    });
+    await expect(
+      rejecting.deliverToInbox(QA, QA_WT, 'diff-round-1.patch', 'x'),
+    ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+    const sweeps = calls.filter(c => c.includes('rm -f --'));
+    expect(sweeps.some(c => /\/wt\/qa\/\.baxian\/review\/inbox\/\.tmp-[0-9a-f]{12}'/.test(c))).toBe(true);
+    expect(sweeps.some(c => /\/wt\/qa\/\.baxian\/review\/inbox\/diff-round-1\.patch\/\.tmp-[0-9a-f]{12}'/.test(c))).toBe(true);
   });
 
   it.each([
@@ -671,6 +763,31 @@ describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
       const inboxDir = join(worktree, '.baxian', 'review', 'inbox');
       const entries = await readdir(inboxDir);
       expect(entries).toEqual(['findings-round-1.json']);
+    } finally {
+      await rm(worktree, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed on a directory-shaped inbox filename and leaves no nested tmp behind (real fs)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-dirfinal-'));
+    try {
+      const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
+      expect(initialized.exitCode).toBe(0);
+      const transport = new ReviewTransport({
+        createRunnerFor: () => new LocalRunner(),
+        resolveWorkdir: () => worktree,
+      });
+      const trap = join(worktree, '.baxian', 'review', 'inbox', 'findings-round-1.json');
+      await new LocalRunner().exec(`mkdir -p ${shellQuote(trap)}`);
+
+      await expect(
+        transport.deliverToInbox(QA, worktree, 'findings-round-1.json', 'payload'),
+      ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
+
+      expect(await readdir(trap)).toEqual([]);
+      const inbox = await readdir(join(worktree, '.baxian', 'review', 'inbox'));
+      expect(inbox).toEqual(['findings-round-1.json']);
     } finally {
       await rm(worktree, { recursive: true, force: true });
     }
@@ -849,7 +966,7 @@ describe('resolveServerPayloads', () => {
 
   it('propagates deliver failure', async () => {
     const { transport } = makeTransport([
-      { match: c => c.startsWith('mv -f'), result: { exitCode: 1, stderr: 'nope' } },
+      { match: c => c.includes('mv -f --'), result: { exitCode: 1, stderr: 'nope' } },
     ]);
     await expect(resolveServerPayloads(transport, QA, QA_WT, {
       phase: 'server-spec-review', specRound: 1, reviewRound: 0, serverContent: big('s'),

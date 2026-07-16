@@ -1094,7 +1094,7 @@ describe('recover() deferred branches', () => {
   });
 
   it('holds the orphan binding on recovery failure even when killSession fails, then fails the bound task', async () => {
-    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSession').mockRejectedValue(new Error('kill refused'));
+    const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockRejectedValue(new Error('kill refused'));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await runRecovery({
@@ -1103,14 +1103,14 @@ describe('recover() deferred branches', () => {
       locks: ['dev-1'],
       ensureSession: {
         reject: new EnsureSessionError(
-          { createdSession: true, agentId: 'dev-1' },
+          { createdSession: true, agentId: 'dev-1', sessionRef: { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' }, genAtCreate: 0 },
           'boot exploded mid-recovery',
         ),
       },
     });
 
-    expect(killSpy).toHaveBeenCalledWith('dev-1');
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('killSession rollback failed'))).toBe(true);
+    expect(killSpy).toHaveBeenCalledWith({ sessionId: '$7', serverPid: '4242', serverStart: '1700000000' });
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('created-session rollback') && String(c[0]).includes('failed'))).toBe(true);
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBeUndefined();
     expect(state).toMatchObject({ taskId: 'task-1', status: 'awaiting_human' });

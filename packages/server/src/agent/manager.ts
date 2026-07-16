@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import { join, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSignalToken, type ReadFileSignal } from './phase-signal.js';
@@ -66,9 +67,10 @@ import {
   screenAllowsTitleIdle,
   type AdoptPaneState,
   type AgentRuntimeKind,
+  type TmuxSessionRef,
 } from './tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from './branch.js';
-import { RepoStore, createRepoStoreCache, type RepoStoreCache } from './repo-store.js';
+import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFileGuarded, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import { PhaseSignalWatcher, type PhaseSignalWatcherStartArgs } from './phase-signal-watcher.js';
 import type { PhaseSignalKind } from './phase-signal.js';
@@ -92,6 +94,7 @@ export interface EnsureSessionResult {
   skillsStale?: true;
   paneId: string;
   workdir: string;
+  sessionRef: TmuxSessionRef;
 }
 
 export class EnsureSessionError extends Error {
@@ -99,6 +102,8 @@ export class EnsureSessionError extends Error {
     public readonly partial: {
       createdSession: boolean;
       agentId: string;
+      sessionRef?: TmuxSessionRef;
+      genAtCreate?: number;
       dialogPending?: boolean;
       handled?: boolean;
       lastScreen?: string;
@@ -176,6 +181,11 @@ export function buildLaunchCommand(agent: AgentConfig): string {
     }
   }
   return segments.join(' ');
+}
+
+// cd re-resolves by pathname: a reused pane shell may sit on a deleted-and-recreated cwd inode.
+export function launchCommandIn(dir: string, agent: AgentConfig): string {
+  return `cd ${shellQuote(dir)} && ${buildLaunchCommand(agent)}`;
 }
 
 function agentRuntimeKindFor(agent: AgentConfig): AgentConfig['runtime'] {
@@ -712,11 +722,16 @@ export class AgentManager {
     }
 
     if (mode === 'create' && alive) {
-      throw new EnsureSessionError(
-        { createdSession: false, agentId },
-        `tmux session "${agentId}" already exists on host; baxian only manages sessions ` +
-          `it creates itself — kill it manually or pick a different agent id`,
+      const reclaimed = await this.runUnderSessionLifecycle(agentId, () =>
+        this.reclaimHalfCreatedSession(tmux, agentId),
       );
+      if (!reclaimed) {
+        throw new EnsureSessionError(
+          { createdSession: false, agentId },
+          `tmux session "${agentId}" already exists on host; baxian only manages sessions ` +
+            `it creates itself — kill it manually or pick a different agent id`,
+        );
+      }
     }
 
     if (alive && (mode === 'runtime' || mode === 'recover')) {
@@ -743,10 +758,95 @@ export class AgentManager {
     await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
       await this.ensureSkillDirSafe(runner, workdir, subdir);
       await this.skillRegistry.materialize(
-        (path, content) => this.atomicWriteFile(runner, path, content),
+        (path, content) => this.atomicWriteFile(runner, workdir, path, content),
         destRoot,
       );
     });
+  }
+
+  // A rollback only kills if no adoption bumped the generation since its create.
+  private sessionLifecycleChain = new Map<string, Promise<unknown>>();
+  private adoptGeneration = new Map<string, number>();
+
+  private runUnderSessionLifecycle<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.sessionLifecycleChain.get(agentId) ?? Promise.resolve();
+    const cur = prev.then(fn, fn);
+    const settled = cur.then(() => undefined, () => undefined);
+    this.sessionLifecycleChain.set(agentId, settled);
+    void settled.finally(() => {
+      if (this.sessionLifecycleChain.get(agentId) === settled) this.sessionLifecycleChain.delete(agentId);
+    });
+    return cur;
+  }
+
+  // Inside the lifecycle lock, a generation bump since create means handoff — stand down.
+  private async rollbackCreatedSession(
+    agentId: string,
+    partial: { sessionRef?: TmuxSessionRef; genAtCreate?: number },
+    reason: string,
+    opts: { expectCreationToken?: string } = {},
+  ): Promise<void> {
+    await this.runUnderSessionLifecycle(agentId, async () => {
+      try {
+        const ref = partial.sessionRef;
+        if (!ref) {
+          console.warn(`[AgentManager] ${agentId} rollback (${reason}) skipped: no session ref recorded`);
+          return;
+        }
+        if ((this.adoptGeneration.get(agentId) ?? 0) !== (partial.genAtCreate ?? 0)) {
+          console.warn(
+            `[AgentManager] ${agentId} rollback (${reason}) skipped: session adopted since create — leaving it to its successor`,
+          );
+          return;
+        }
+        if (opts.expectCreationToken !== undefined) {
+          let fresh;
+          try {
+            fresh = await this.agentStore.get(agentId);
+          } catch (storeErr) {
+            console.warn(
+              `[AgentManager] ${agentId} rollback (${reason}) skipped: agent store read failed — session left in place:`,
+              storeErr,
+            );
+            return;
+          }
+          if (!fresh) {
+            console.warn(`[AgentManager] ${agentId} rollback (${reason}) skipped: agent record gone`);
+            return;
+          }
+          if (fresh.creationToken !== opts.expectCreationToken) {
+            console.warn(
+              `[AgentManager] ${agentId} rollback (${reason}) skipped: creationToken rotated — leaving the session to its successor`,
+            );
+            return;
+          }
+        }
+        const cfg = this.getAgentConfig(agentId);
+        if (!cfg) {
+          console.warn(`[AgentManager] ${agentId} rollback (${reason}) skipped: agent no longer in config`);
+          return;
+        }
+        const runner = this.createRunnerFor(cfg);
+        const outcome = await new TmuxManager(runner).killSessionRef(ref);
+        if (outcome === 'stale-server') {
+          console.warn(
+            `[AgentManager] ${agentId} rollback (${reason}): tmux server generation changed — leaving session ${ref.sessionId} untouched`,
+          );
+        } else if (outcome === 'killed') {
+          console.warn(`[AgentManager] ${agentId} rollback (${reason}): killed created session ${ref.sessionId}`);
+        }
+      } catch (cleanupErr) {
+        console.warn(
+          `[AgentManager] created-session rollback (${reason}) failed for ${agentId}:`,
+          cleanupErr,
+        );
+      }
+    });
+  }
+
+  async rollbackEnsureSessionFailure(agentId: string, err: unknown, reason: string): Promise<void> {
+    if (!(err instanceof EnsureSessionError) || !err.partial.createdSession) return;
+    await this.rollbackCreatedSession(agentId, err.partial, reason);
   }
 
   private skillDirChain = new Map<string, Promise<unknown>>();
@@ -769,15 +869,16 @@ export class AgentManager {
 
   private async atomicWriteFile(
     runner: CommandRunner,
+    workdir: string,
     finalPath: string,
     content: Buffer,
   ): Promise<void> {
-    const tmp = `${finalPath}.baxian-tmp`;
-    await runner.writeFile(tmp, content);
-    const mv = `mv -f ${shellQuote(tmp)} ${shellQuote(finalPath)}`;
-    const res = await runner.exec(`sh -c ${shellQuote(mv)}`);
-    if (res.exitCode !== 0) {
-      throw new Error(`atomic skill write failed (${finalPath}): ${res.stderr || 'unknown error'}`);
+    const tmp = `${finalPath}.baxian-tmp-${randomBytes(6).toString('hex')}`;
+    try {
+      await stageFileGuarded(runner, workdir, tmp, content);
+      await moveFileIntoPlace(runner, tmp, finalPath, { guardRoot: workdir });
+    } catch (err) {
+      throw new Error(`atomic skill write failed (${finalPath}): ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -789,6 +890,7 @@ export class AgentManager {
     const top = subdir.split('/')[0];
     const keep = this.skillRegistry.names().map((n) => `! -name ${shellQuote(n)}`).join(' ');
     const inner =
+      `[ ! -L ${shellQuote(workdir)} ] && [ -d ${shellQuote(workdir)} ] && ` +
       `cd ${shellQuote(workdir)} && ` +
       `for d in ${top} ${subdir}; do if [ -L "$d" ]; then ` +
       `printf 'baxian: %s is a symlink -> %s; replace it with a real directory\\n' "$d" "$(readlink "$d")" >&2; ` +
@@ -805,9 +907,15 @@ export class AgentManager {
     }
   }
 
-  private async tagSessionSkillsVersion(tmux: TmuxManager, agentId: string): Promise<void> {
+  private async tagSessionSkillsVersion(
+    tmux: TmuxManager,
+    agentId: string,
+    ref: TmuxSessionRef,
+  ): Promise<void> {
     if (this.skillRegistry.names().length === 0) return;
-    await tmux.setOption(agentId, '@baxian-skills-version', this.skillRegistry.contentHash());
+    await this.setSessionOptions(tmux, agentId, ref, [
+      ['@baxian-skills-version', this.skillRegistry.contentHash()],
+    ]);
   }
 
   private async replSkillsStale(tmux: TmuxManager, agentId: string): Promise<boolean> {
@@ -822,6 +930,7 @@ export class AgentManager {
     subdir: string,
   ): Promise<void> {
     const inner =
+      `[ ! -L ${shellQuote(workdir)} ] && [ -d ${shellQuote(workdir)} ] && ` +
       `cd ${shellQuote(workdir)} && ` +
       `if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo BX_SKILLS_NON_GIT; exit 0; fi; ` +
       `tracked="$(git ls-files -- ${shellQuote(`${subdir}/baxian-*`)} 2>/dev/null | head -5)"; ` +
@@ -851,15 +960,28 @@ export class AgentManager {
     );
   }
 
-  private async pinRuntimeSessionOptions(tmux: TmuxManager, agentId: string): Promise<void> {
-    await tmux.setOption(agentId, 'prefix', 'C-b');
-    await tmux.setOption(agentId, 'prefix2', 'None');
-    await tmux.setOption(agentId, 'mouse', 'on');
+  private runtimePinEntries(): Array<[string, string]> {
+    return [
+      ['prefix', 'C-b'],
+      ['prefix2', 'None'],
+      ['mouse', 'on'],
+    ];
   }
 
-  private async pinFreshSessionOptions(tmux: TmuxManager, agentId: string): Promise<void> {
-    await tmux.setOption(agentId, 'window-size', 'latest');
-    await this.pinRuntimeSessionOptions(tmux, agentId);
+  // A name (or even a bare $id) can rebind to a same-name successor mid-flight;
+  // every option write goes through the identity-checked by-ref batch.
+  private async setSessionOptions(
+    tmux: TmuxManager,
+    agentId: string,
+    ref: TmuxSessionRef,
+    entries: Array<[string, string]>,
+  ): Promise<void> {
+    const outcome = await tmux.setSessionOptionsIfAlive(ref, entries);
+    if (outcome === 'gone') {
+      throw new Error(
+        `tmux session ${ref.sessionId} (${agentId}) vanished before its options could be applied`,
+      );
+    }
   }
 
   private async buildFreshSession(
@@ -883,21 +1005,26 @@ export class AgentManager {
     sessionDir: string,
   ): Promise<EnsureSessionResult> {
     let createdSession = false;
+    let createdRef: TmuxSessionRef | undefined;
+    const genAtCreate = this.adoptGeneration.get(agentId) ?? 0;
     const runtime = agentRuntimeKindFor(agent);
     try {
-      await tmux.createSession(agentId, sessionDir);
+      createdRef = await tmux.createSession(agentId, sessionDir);
       createdSession = true;
-      await tmux.setOption(agentId, '@baxian-agent-id', agentId);
-      await tmux.setOption(agentId, '@baxian-runtime', agent.runtime);
-      await tmux.setOption(agentId, WORKDIR_SESSION_OPTION, sessionDir);
-      await tmux.setOption(agentId, 'allow-passthrough', 'on');
-      await tmux.setOption(agentId, 'set-titles', 'on');
-      await this.pinFreshSessionOptions(tmux, agentId);
-      await tmux.setOption(agentId, 'status-right', '');
+      await this.setSessionOptions(tmux, agentId, createdRef, [
+        ['@baxian-agent-id', agentId],
+        ['@baxian-runtime', agent.runtime],
+        [WORKDIR_SESSION_OPTION, sessionDir],
+        ['allow-passthrough', 'on'],
+        ['set-titles', 'on'],
+        ['window-size', 'latest'],
+        ...this.runtimePinEntries(),
+        ['status-right', ''],
+      ]);
       await tmux.setServerOption('extended-keys', 'on');
       await tmux.appendServerOptionIfMissing('terminal-features', 'xterm*:extkeys');
-      const paneId = await tmux.getSinglePaneId(agentId);
-      await tmux.sendKeysToPane(paneId, `${buildLaunchCommand(agent)}\n`);
+      const paneId = await tmux.getSinglePaneIdByRef(createdRef);
+      await tmux.sendKeysToPane(paneId, `${launchCommandIn(sessionDir, agent)}\n`);
       await tmux.handleTrustDialog(paneId, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
       });
@@ -905,15 +1032,18 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
-      await this.tagSessionSkillsVersion(tmux, agentId);
-      return { ok: true, createdSession: true, freshRuntime: true, paneId, workdir };
+      await this.tagSessionSkillsVersion(tmux, agentId, createdRef);
+      return { ok: true, createdSession: true, freshRuntime: true, paneId, workdir, sessionRef: createdRef };
     } catch (err) {
       const partial: {
         createdSession: boolean;
         agentId: string;
+        sessionRef?: TmuxSessionRef;
+        genAtCreate?: number;
         dialogPending?: boolean;
         lastScreen?: string;
-      } = { createdSession, agentId };
+      } = { createdSession, agentId, genAtCreate };
+      if (createdRef) partial.sessionRef = createdRef;
       if (err instanceof ReplNotReadyError) {
         partial.lastScreen = err.lastScreen;
         if (createdSession && detectStartupDialog(err.lastScreen, runtime)) {
@@ -935,27 +1065,14 @@ export class AgentManager {
       );
       return;
     }
-    const tryKillOrphanSession = async (reason: string): Promise<void> => {
-      try {
-        const runner = this.createRunnerFor(cfgAtStart);
-        await new TmuxManager(runner).killSession(agentId);
-      } catch (cleanupErr) {
-        console.warn(
-          `[bootstrap] orphan killSession (${reason}) failed for ${agentId}:`,
-          cleanupErr,
-        );
-      }
-    };
-
     try {
       const result = await this.ensureSession(agentId, 'create');
       if (!(await this.runGreetingHandshake(agentId, cfgAtStart, result.paneId))) {
         const current = await this.agentStore.get(agentId);
         if (current && current.creationToken !== creationToken) {
           console.warn(
-            `[bootstrap] ${agentId} creationToken changed during greeting — killing orphan session`,
+            `[bootstrap] ${agentId} creationToken changed during greeting — leaving the session to its successor`,
           );
-          await tryKillOrphanSession('greeting-failure token mismatch');
           return;
         }
         await this.markGreetingFailed(agentId, creationToken);
@@ -982,9 +1099,8 @@ export class AgentManager {
       });
       if (!resolvedExisting) {
         console.warn(
-          `[bootstrap] ${agentId} creationToken mismatch on success — killing orphan session`,
+          `[bootstrap] ${agentId} creationToken mismatch on success — leaving the session to its successor`,
         );
-        await tryKillOrphanSession('post-success token mismatch');
         return;
       }
       await this.safeEmit({
@@ -1002,9 +1118,8 @@ export class AgentManager {
           const fresh = await this.agentStore.get(agentId);
           if (!fresh || fresh.creationToken !== creationToken) {
             console.warn(
-              `[bootstrap] ${agentId} dialog-path token mismatch — killing orphan session`,
+              `[bootstrap] ${agentId} dialog-path token mismatch — leaving the session to its successor`,
             );
-            await tryKillOrphanSession('dialog-path token mismatch');
             return;
           }
         }
@@ -1015,7 +1130,9 @@ export class AgentManager {
         return;
       }
       if (err instanceof EnsureSessionError && err.partial.createdSession) {
-        await tryKillOrphanSession('hard-failure rollback');
+        await this.rollbackCreatedSession(agentId, err.partial, 'hard-failure rollback', {
+          expectCreationToken: creationToken,
+        });
       }
       const message = err instanceof Error ? err.message : String(err);
       await this.markBootstrapFailed(agentId, creationToken, message);
@@ -1490,6 +1607,7 @@ export class AgentManager {
     });
   }
 
+  // Claim snapshot and adoption declaration share one critical section with rollbacks.
   private async adoptOrRestartSession(
     tmux: TmuxManager,
     runner: CommandRunner,
@@ -1498,33 +1616,54 @@ export class AgentManager {
     workdir: string,
     sessionDir: string,
   ): Promise<EnsureSessionResult> {
-    let claim: string | null;
+    return this.runUnderSessionLifecycle(agentId, () =>
+      this.adoptOrRestartSessionLocked(tmux, runner, agent, agentId, workdir, sessionDir),
+    );
+  }
+
+  private async adoptOrRestartSessionLocked(
+    tmux: TmuxManager,
+    runner: CommandRunner,
+    agent: AgentConfig & { projectId: string },
+    agentId: string,
+    workdir: string,
+    sessionDir: string,
+  ): Promise<EnsureSessionResult> {
+    let snapshot: Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>;
     try {
-      claim = await tmux.getOption(agentId, '@baxian-agent-id');
+      snapshot = await tmux.getSessionSnapshot(agentId);
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
-        `getOption(@baxian-agent-id) failed: ${err instanceof Error ? err.message : String(err)}`,
+        `session snapshot failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    if (claim !== agentId) {
+    if (!snapshot) {
+      return this.buildFreshSession(tmux, agent, agentId, workdir, sessionDir);
+    }
+    const sessionRef = snapshot.ref;
+    if (snapshot.claim !== agentId) {
+      if (snapshot.claim === null && await this.reclaimHalfCreatedSession(tmux, agentId, snapshot)) {
+        return this.buildFreshSession(tmux, agent, agentId, workdir, sessionDir);
+      }
       throw new EnsureSessionError(
         { createdSession: false, agentId },
         `tmux session "${agentId}" exists but @baxian-agent-id session claim mismatch ` +
-          `(got "${claim ?? 'null'}"); baxian will not adopt foreign session — operator must intervene`,
+          `(got "${snapshot.claim ?? 'null'}"); baxian will not adopt foreign session — operator must intervene`,
       );
     }
+    this.adoptGeneration.set(agentId, (this.adoptGeneration.get(agentId) ?? 0) + 1);
     try {
-      await this.pinRuntimeSessionOptions(tmux, agentId);
+      await this.setSessionOptions(tmux, agentId, sessionRef, this.runtimePinEntries());
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
-        `pinRuntimeSessionOptions failed: ${err instanceof Error ? err.message : String(err)}`,
+        `pinning runtime session options failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
     let paneId: string;
     try {
-      paneId = await tmux.getSinglePaneId(agentId);
+      paneId = await tmux.getSinglePaneIdByRef(sessionRef);
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
@@ -1580,10 +1719,10 @@ export class AgentManager {
           `tmux pane path ${currentPath} differs from Workdir ${sessionDir}, but runtime is not safely idle`,
         );
       }
-      await tmux.killSession(agentId);
+      await this.killAdoptTarget(tmux, agentId, sessionRef, 'workdir change');
       return this.buildFreshSession(tmux, agent, agentId, workdir, sessionDir);
     }
-    await tmux.setOption(agentId, WORKDIR_SESSION_OPTION, sessionDir);
+    await this.setSessionOptions(tmux, agentId, sessionRef, [[WORKDIR_SESSION_OPTION, sessionDir]]);
     switch (state.kind) {
       case 'live-runtime': {
         let stale: boolean;
@@ -1603,9 +1742,10 @@ export class AgentManager {
             skillsStale: true,
             paneId,
             workdir,
+            sessionRef,
           };
         }
-        return { ok: true, createdSession: false, freshRuntime: false, paneId, workdir };
+        return { ok: true, createdSession: false, freshRuntime: false, paneId, workdir, sessionRef };
       }
       case 'startup-dialog':
         throw new EnsureSessionError(
@@ -1633,8 +1773,8 @@ export class AgentManager {
             timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
             scrollback: 0,
           });
-          await this.tagSessionSkillsVersion(tmux, agentId);
-          return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir };
+          await this.tagSessionSkillsVersion(tmux, agentId, sessionRef);
+          return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir, sessionRef };
         } catch (trustErr) {
           if (trustErr instanceof ReplNotReadyError && detectStartupDialog(trustErr.lastScreen, runtime)) {
             throw new EnsureSessionError(
@@ -1657,7 +1797,7 @@ export class AgentManager {
         break;
     }
     try {
-      await tmux.sendKeysToPane(paneId, `${buildLaunchCommand(agent)}\n`);
+      await tmux.sendKeysToPane(paneId, `${launchCommandIn(sessionDir, agent)}\n`);
       await tmux.handleTrustDialog(paneId, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
       });
@@ -1665,8 +1805,8 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
-      await this.tagSessionSkillsVersion(tmux, agentId);
-      return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir };
+      await this.tagSessionSkillsVersion(tmux, agentId, sessionRef);
+      return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir, sessionRef };
     } catch (relErr) {
       if (relErr instanceof ReplNotReadyError && detectStartupDialog(relErr.lastScreen, runtime)) {
         throw new EnsureSessionError(
@@ -1683,6 +1823,90 @@ export class AgentManager {
         { createdSession: false, agentId },
         `REPL relaunch failed: ${relErr instanceof Error ? relErr.message : String(relErr)}`,
       );
+    }
+  }
+
+  // Frees a bootstrap blocked on its predecessor's half-created session (nonce
+  // env present but claim never written); anything else is left alone.
+  private async reclaimHalfCreatedSession(
+    tmux: TmuxManager,
+    agentId: string,
+    knownSnapshot?: Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>,
+  ): Promise<boolean> {
+    let snapshot: Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>;
+    try {
+      snapshot = knownSnapshot ?? await tmux.getSessionSnapshot(agentId);
+    } catch (err) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `session snapshot failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!snapshot) return true;
+    if (snapshot.claim !== null) return false;
+    let halfCreated: boolean;
+    try {
+      halfCreated = await tmux.hasCreationNonce(agentId);
+    } catch (err) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `creation-nonce probe failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!halfCreated) return false;
+    let outcome: Awaited<ReturnType<TmuxManager['killSessionRef']>>;
+    try {
+      // claim-still-empty rides the kill itself — a claim racing the probes makes the server refuse.
+      outcome = await tmux.killSessionRef(snapshot.ref, { onlyIfUnclaimed: true });
+    } catch (err) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `killSessionRef (half-created leftover) failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (outcome === 'refused' || outcome === 'stale-server') {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `session ${snapshot.ref.sessionId} was claimed (or its server changed) while reclaiming the half-created leftover — retry to observe the new state`,
+      );
+    }
+    if (outcome === 'killed') {
+      console.warn(
+        `[AgentManager] ${agentId}: killed half-created leftover session ${snapshot.ref.sessionId} (creation nonce present, claim never written)`,
+      );
+    } else {
+      console.warn(
+        `[AgentManager] ${agentId}: half-created leftover session ${snapshot.ref.sessionId} already gone`,
+      );
+    }
+    return true;
+  }
+
+  private async killAdoptTarget(
+    tmux: TmuxManager,
+    agentId: string,
+    sessionRef: TmuxSessionRef,
+    reason: string,
+  ): Promise<void> {
+    let outcome: Awaited<ReturnType<TmuxManager['killSessionRef']>>;
+    try {
+      outcome = await tmux.killSessionRef(sessionRef);
+    } catch (err) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `killSessionRef (${reason}) failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (outcome === 'stale-server') {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `tmux server generation changed while replacing session (${reason}); retry to observe the new state`,
+      );
+    }
+    if (outcome === 'killed') {
+      console.warn(`[AgentManager] ${agentId}: killed session ${sessionRef.sessionId} (${reason})`);
+    } else {
+      console.warn(`[AgentManager] ${agentId}: session ${sessionRef.sessionId} already gone (${reason})`);
     }
   }
 
@@ -2824,17 +3048,16 @@ export class AgentManager {
     const runner = this.createRunnerFor(cfg);
     const tmux = new TmuxManager(runner);
 
-    const alive = await tmux.hasSession(agentId);
-    if (!alive) {
+    const snapshot = await tmux.getSessionSnapshot(agentId);
+    if (!snapshot) {
       throw new Error(`restart-repl: tmux session ${agentId} does not exist; use retry to rebuild`);
     }
-    const claim = await tmux.getOption(agentId, '@baxian-agent-id');
-    if (claim !== agentId) {
+    if (snapshot.claim !== agentId) {
       throw new Error(
-        `restart-repl: session claim mismatch (got "${claim ?? 'null'}"); refusing to touch foreign session`,
+        `restart-repl: session claim mismatch (got "${snapshot.claim ?? 'null'}"); refusing to touch foreign session`,
       );
     }
-    const paneId = await tmux.getSinglePaneId(agentId);
+    const paneId = await tmux.getSinglePaneIdByRef(snapshot.ref);
     await tmux.sendKeysToPane(paneId, 'C-c');
     const cmd = await this.pollPaneCommandStable(tmux, paneId, { timeoutMs: 2_000 });
     const RUNTIME = /^(?:claude|codex|node|opencode|qodercli(?:-[\d.]+)?|\d+\.\d+\.\d+)$/;
@@ -2857,11 +3080,11 @@ export class AgentManager {
       );
     }
     await this.provisionRepoSkills(runner, cfg, workdir);
-    await tmux.setOption(agentId, WORKDIR_SESSION_OPTION, workdir);
+    await this.setSessionOptions(tmux, agentId, snapshot.ref, [[WORKDIR_SESSION_OPTION, workdir]]);
 
     const runtime = agentRuntimeKindFor(cfg);
     const relaunch = async (): Promise<void> => {
-      await tmux.sendKeysToPane(paneId, `${buildLaunchCommand(cfg)}\n`);
+      await tmux.sendKeysToPane(paneId, `${launchCommandIn(workdir, cfg)}\n`);
       await tmux.handleTrustDialog(paneId, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
       });
@@ -2869,7 +3092,7 @@ export class AgentManager {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
-      await this.tagSessionSkillsVersion(tmux, agentId);
+      await this.tagSessionSkillsVersion(tmux, agentId, snapshot.ref);
     };
     await this.runUnderSkillDirLock(this.skillDirLockKey(cfg, workdir), relaunch);
 
@@ -2971,18 +3194,25 @@ export class AgentManager {
       }
 
       try {
-        const alive = await tmux.hasSession(id);
-        if (alive) {
-          const claim = await tmux.getOption(id, '@baxian-agent-id');
-          if (claim === id) {
-            await tmux.killSession(id);
-          } else {
+        await this.runUnderSessionLifecycle(id, async () => {
+          const snapshot = await tmux.getSessionSnapshot(id);
+          if (!snapshot) return;
+          if (snapshot.claim !== id) {
             console.warn(
               `[AgentManager] cleanupRemovedAgentRuntime: skipping kill for ${id} ` +
-              `(claim=${claim ?? 'null'}; not baxian-managed)`,
+              `(claim=${snapshot.claim ?? 'null'}; not baxian-managed)`,
             );
+            return;
           }
-        }
+          const outcome = await tmux.killSessionRef(snapshot.ref);
+          if (outcome === 'stale-server') {
+            console.warn(
+              `[AgentManager] cleanupRemovedAgentRuntime: tmux server generation changed for ${id} — leaving session untouched`,
+            );
+          } else if (outcome === 'killed') {
+            console.warn(`[AgentManager] cleanupRemovedAgentRuntime: killed session ${snapshot.ref.sessionId} for removed agent ${id}`);
+          }
+        });
       } catch (err) {
         failures.push({ agentId: id, step: 'tmux', error: err });
       }
@@ -4305,20 +4535,12 @@ export class AgentManager {
         const stillOwner = stateNow?.taskId === taskId
           && stateNow.lockToken === lockToken
           && await this.lockManager.isOwner(agentId, taskId, lockToken);
-        try {
-          if (stillOwner) {
-            const runner = this.createRunnerFor(agent);
-            await new TmuxManager(runner).killSession(agentId);
-          } else {
-            console.warn(
-              `[AgentManager] startSession ensureSession rollback skipped killSession for stale owner ` +
-              `${agentId}/${taskId}`,
-            );
-          }
-        } catch (cleanupErr) {
+        if (stillOwner) {
+          await this.rollbackCreatedSession(agentId, err.partial, 'startSession ensure rollback');
+        } else {
           console.warn(
-            `[AgentManager] startSession ensureSession rollback killSession failed:`,
-            cleanupErr,
+            `[AgentManager] startSession ensureSession rollback skipped for stale owner ` +
+            `${agentId}/${taskId}`,
           );
         }
       }
@@ -4365,7 +4587,7 @@ export class AgentManager {
       await assertOwner();
       if (!ensure.freshRuntime) {
         await this.clearRuntimeForTaskBoundary(tmux, paneId, agentId, agent.runtime, assertOwner);
-        if (ensure.skillsStale) await this.tagSessionSkillsVersion(tmux, agentId);
+        if (ensure.skillsStale) await this.tagSessionSkillsVersion(tmux, agentId, ensure.sessionRef);
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -4860,20 +5082,12 @@ export class AgentManager {
         const stillOwner = stateNow?.taskId === taskId
           && stateNow.lockToken === lockToken
           && await this.lockManager.isOwner(agentId, taskId, lockToken);
-        try {
-          if (stillOwner) {
-            const runner = this.createRunnerFor(agent);
-            await new TmuxManager(runner).killSession(agentId);
-          } else {
-            console.warn(
-              `[AgentManager] continueSession ensureSession rollback skipped killSession for stale owner ` +
-              `${agentId}/${taskId}`,
-            );
-          }
-        } catch (cleanupErr) {
+        if (stillOwner) {
+          await this.rollbackCreatedSession(agentId, err.partial, 'continueSession ensure rollback');
+        } else {
           console.warn(
-            `[AgentManager] continueSession ensureSession rollback killSession failed:`,
-            cleanupErr,
+            `[AgentManager] continueSession ensureSession rollback skipped for stale owner ` +
+            `${agentId}/${taskId}`,
           );
         }
       }
@@ -5386,15 +5600,7 @@ export class AgentManager {
           continue;
         }
         if (err instanceof EnsureSessionError && err.partial.createdSession) {
-          try {
-            const runner = this.createRunnerFor(agentConfig);
-            await new TmuxManager(runner).killSession(state.id);
-          } catch (cleanupErr) {
-            console.warn(
-              `[recover] killSession rollback failed for agent=${state.id}:`,
-              cleanupErr,
-            );
-          }
+          await this.rollbackCreatedSession(state.id, err.partial, 'recover ensure rollback');
         }
         const message = err instanceof Error ? err.message : String(err);
         console.warn(`[recover] ensureSession failed for agent=${state.id}: ${message}`);

@@ -37,9 +37,13 @@ export function writeRestartSentinelSync(opts: {
 }
 
 export function clearRestartSentinelSync(stateDir: string): void {
+  const target = sentinelPath(stateDir);
   try {
-    fs.unlinkSync(sentinelPath(stateDir));
-  } catch {
+    fs.unlinkSync(target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      console.warn(`[restart-sentinel] failed to remove ${target}:`, err);
+    }
   }
 }
 
@@ -53,7 +57,9 @@ export async function consumeRestartSentinel(
   } catch {
     return null;
   }
-  await fs.promises.unlink(target).catch(() => {});
+  await fs.promises.unlink(target).catch((err: NodeJS.ErrnoException) => {
+    if (err?.code !== 'ENOENT') console.warn(`[restart-sentinel] failed to remove ${target}:`, err);
+  });
 
   let parsed: Partial<RestartSentinel>;
   try {
