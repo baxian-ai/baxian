@@ -78,6 +78,33 @@ function makeWatcher() {
   return { watcher, streamer, emit, captured };
 }
 
+const QA_AGENT: AgentConfig = {
+  id: 'qa-1',
+  runtime: 'claude-code',
+  role: 'qa',
+  mode: 'local',
+};
+
+function makeDualWatcher() {
+  const streamers: Record<string, FakeStreamer> = {
+    [DEV_AGENT.id]: createFakeStreamer(),
+    [QA_AGENT.id]: createFakeStreamer(),
+  };
+  const paneStreamerManager = {
+    ensure: vi.fn((agent: AgentConfig) => streamers[agent.id]),
+  } as unknown as PaneStreamerManager;
+  const captured: BaxianEvent[] = [];
+  const eventBus = {
+    emit: async (event: BaxianEvent) => { captured.push(event); },
+  } as unknown as EventBus;
+  const watcher = new PhaseSignalWatcher({
+    paneStreamerManager,
+    eventBus,
+    resolveAgent: (id) => (id === DEV_AGENT.id ? DEV_AGENT : id === QA_AGENT.id ? QA_AGENT : undefined),
+  });
+  return { watcher, streamers, captured };
+}
+
 describe('PhaseSignalWatcher', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -259,6 +286,79 @@ describe('PhaseSignalWatcher', () => {
     watcher.stop('t1');
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     expect(captured).toHaveLength(0);
+  });
+
+  it('agent-scoped arms coexist per (taskId, agentId) and fire independently', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: ['pr-approved', 'pr-changes-requested'],
+      token: 'qatok1234567', replaceScope: 'agent',
+    });
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    expect(captured).toHaveLength(1);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
+    expect(captured).toHaveLength(2);
+    expect(captured.map(e => e.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
+  });
+
+  it('a default-scope arm still replaces every entry of the task', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qatok1234567',
+    });
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
+    expect(captured).toHaveLength(0);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('stopAgent removes only the addressed entry while stop clears the task', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qatok1234567', replaceScope: 'agent',
+    });
+    watcher.stopAgent('t1', DEV_AGENT.id);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+    watcher.stop('t1');
+    expect(watcher.has('t1')).toBe(false);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    expect(captured).toHaveLength(0);
+  });
+
+  it('an agent-scoped fenced arm ignores a sibling entry holding a rotated token', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qarotated456', replaceScope: 'agent',
+    });
+    const armed = await startWatch(watcher, {
+      expectedKinds: 'pr-created', token: 'devtok123456',
+      replaceScope: 'agent', onlyReplaceOwnToken: true,
+    });
+    expect(armed).toBe(true);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 7)}\n`);
+    expect(captured).toHaveLength(1);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+  });
+
+  it('stopIfToken tears down only the entries holding that token', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qatok1234567', replaceScope: 'agent',
+    });
+    watcher.stopIfToken('t1', 'devtok123456');
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    expect(captured).toHaveLength(1);
   });
 
   it('stopIfToken removes the entry only when the token matches', async () => {

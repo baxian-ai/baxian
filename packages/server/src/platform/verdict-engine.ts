@@ -65,7 +65,7 @@ function isProtocolCarrier(row: NormalizedRow): boolean {
 
 // 令牌一经发布即公开可复制：某令牌只要存在任一 DISMISSED 的 reviews 源承载行，
 // 即在全部载体上失效——只跳行会让被撤销的 pass 借复制行复活（spec §7 撤销过滤）。
-function deadTokens(sources: VerdictSourceScan[]): Set<string> {
+export function deadTokens(sources: VerdictSourceScan[]): Set<string> {
   const dead = new Set<string>();
   for (const s of sources) {
     if (s.sourceClass !== 'reviews') continue;
@@ -75,6 +75,36 @@ function deadTokens(sources: VerdictSourceScan[]): Set<string> {
     }
   }
   return dead;
+}
+
+// 无状态：merge 前复核由 manager 独立调用，不依赖 poller 的 engine 实例（spec §6 merge 条）。
+export function recheckPassProvenance(
+  record: PassProvenanceRecord,
+  sources: VerdictSourceScan[],
+): { ok: true } | { ok: false; reason: string } {
+  if (sources.some(s => !s.ok)) return { ok: false, reason: 'source-scan-incomplete' };
+  const row = sources.find(s => s.key === record.carrier.sourceKey)?.rows.find(r => String(r.id) === record.carrier.id);
+  if (row === undefined) return { ok: false, reason: 'carrier-row-missing' };
+  if (rowBodyDigest(row) !== record.carrier.bodyDigest) return { ok: false, reason: 'carrier-body-edited' };
+  // digest 相同不代表载体真的携带该 pass 对：malformed provenance（普通评论行）不得复核通过
+  if (!rowTokens(row).some(m => m.kind === 'pass' && m.token === record.token
+    && m.anchorSha === record.anchorSha.toLowerCase())) {
+    return { ok: false, reason: 'carrier-token-missing' };
+  }
+  const dead = deadTokens(sources);
+  if (dead.has(record.token)) return { ok: false, reason: 'token-dismissed' };
+  const anchor = record.anchorSha.toLowerCase();
+  for (const s of sources) {
+    for (const r of s.rows) {
+      if (!isProtocolCarrier(r)) continue;
+      for (const m of rowTokens(r)) {
+        if (m.kind === 'fail' && m.token === record.failToken && m.anchorSha === anchor && !dead.has(m.token)) {
+          return { ok: false, reason: 'fail-token-present' };
+        }
+      }
+    }
+  }
+  return { ok: true };
 }
 
 export class VerdictEngine {
@@ -135,24 +165,7 @@ export class VerdictEngine {
     record: PassProvenanceRecord,
     sources: VerdictSourceScan[],
   ): { ok: true } | { ok: false; reason: string } {
-    if (sources.some(s => !s.ok)) return { ok: false, reason: 'source-scan-incomplete' };
-    const row = sources.find(s => s.key === record.carrier.sourceKey)?.rows.find(r => String(r.id) === record.carrier.id);
-    if (row === undefined) return { ok: false, reason: 'carrier-row-missing' };
-    if (rowBodyDigest(row) !== record.carrier.bodyDigest) return { ok: false, reason: 'carrier-body-edited' };
-    const dead = deadTokens(sources);
-    if (dead.has(record.token)) return { ok: false, reason: 'token-dismissed' };
-    const anchor = record.anchorSha.toLowerCase();
-    for (const s of sources) {
-      for (const r of s.rows) {
-        if (!isProtocolCarrier(r)) continue;
-        for (const m of rowTokens(r)) {
-          if (m.kind === 'fail' && m.token === record.failToken && m.anchorSha === anchor && !dead.has(m.token)) {
-            return { ok: false, reason: 'fail-token-present' };
-          }
-        }
-      }
-    }
-    return { ok: true };
+    return recheckPassProvenance(record, sources);
   }
 
   // 裁决资格门失败（draft/closed/绑定失配/head 偏离锚点/令牌或 signal 缺失）时由调用方显式

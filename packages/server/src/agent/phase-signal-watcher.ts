@@ -64,6 +64,9 @@ export interface PhaseSignalWatcherStartArgs {
   recovered?: boolean;
   // A fenced (re)arm may replace its own token's watch but never a successor's rotated one.
   onlyReplaceOwnToken?: boolean;
+  // 'task' (default) evicts every entry of the task on arm; 'agent' touches only the
+  // same (taskId, agentId) entry so a sibling watch (git dev reconciliation) survives.
+  replaceScope?: 'task' | 'agent';
 }
 
 function normalizeKinds(
@@ -74,14 +77,30 @@ function normalizeKinds(
   return new Set([input as PhaseSignalKind]);
 }
 
+function entryKey(taskId: string, agentId: string): string {
+  return `${taskId}:${agentId}`;
+}
+
 export class PhaseSignalWatcher {
   private readonly entries = new Map<string, WatchEntry>();
 
   constructor(private readonly deps: PhaseSignalWatcherDeps) {}
 
+  private taskEntries(taskId: string): WatchEntry[] {
+    return [...this.entries.values()].filter(entry => entry.taskId === taskId);
+  }
+
+  private replaceTargets(args: PhaseSignalWatcherStartArgs): WatchEntry[] {
+    if (args.replaceScope === 'agent') {
+      const own = this.entries.get(entryKey(args.taskId, args.agentId));
+      return own ? [own] : [];
+    }
+    return this.taskEntries(args.taskId);
+  }
+
   async start(args: PhaseSignalWatcherStartArgs): Promise<boolean> {
-    const preexisting = this.entries.get(args.taskId);
-    if (args.onlyReplaceOwnToken && preexisting && preexisting.expectedToken !== args.token) {
+    if (args.onlyReplaceOwnToken
+      && this.replaceTargets(args).some(entry => entry.expectedToken !== args.token)) {
       return false;
     }
     // The old entry keeps consuming until the replacement subscription exists; a failed start must not orphan the signal.
@@ -142,16 +161,16 @@ export class PhaseSignalWatcher {
     }
 
     // A successor may have armed while the subscription was in flight.
-    const raced = this.entries.get(args.taskId);
-    if (raced) {
-      if (args.onlyReplaceOwnToken && raced.expectedToken !== args.token) {
+    const raced = this.replaceTargets(args);
+    if (raced.length > 0) {
+      if (args.onlyReplaceOwnToken && raced.some(existing => existing.expectedToken !== args.token)) {
         try { sub.unsubscribe(); } catch {}
         return false;
       }
-      this.stop(args.taskId);
+      for (const existing of raced) this.dropEntry(existing);
     }
     entry.unsubscribe = sub.unsubscribe;
-    this.entries.set(args.taskId, entry);
+    this.entries.set(entryKey(args.taskId, args.agentId), entry);
 
     if (!args.skipSnapshot) {
       this.onPaneData(entry, sub.snapshot.data, true);
@@ -159,31 +178,42 @@ export class PhaseSignalWatcher {
     return true;
   }
 
-  stop(taskId: string): void {
-    const entry = this.entries.get(taskId);
-    if (!entry) return;
-    this.entries.delete(taskId);
+  private dropEntry(entry: WatchEntry): void {
+    this.entries.delete(entryKey(entry.taskId, entry.agentId));
     try { entry.unsubscribe(); } catch {}
+  }
+
+  stop(taskId: string): void {
+    for (const entry of this.taskEntries(taskId)) this.dropEntry(entry);
+  }
+
+  stopAgent(taskId: string, agentId: string): void {
+    const entry = this.entries.get(entryKey(taskId, agentId));
+    if (entry) this.dropEntry(entry);
   }
 
   // Token-fenced teardown: a stale pass undoing its own arm must never kill a successor's watcher.
   stopIfToken(taskId: string, expectedToken: string): void {
-    const entry = this.entries.get(taskId);
-    if (!entry || entry.expectedToken !== expectedToken) return;
-    this.entries.delete(taskId);
-    try { entry.unsubscribe(); } catch {}
+    for (const entry of this.taskEntries(taskId)) {
+      if (entry.expectedToken === expectedToken) this.dropEntry(entry);
+    }
   }
 
-  has(taskId: string): boolean {
-    return this.entries.has(taskId);
+  has(taskId: string, agentId?: string): boolean {
+    if (agentId !== undefined) return this.entries.has(entryKey(taskId, agentId));
+    return this.taskEntries(taskId).length > 0;
   }
 
   expectedKindsFor(taskId: string): ReadonlySet<PhaseSignalKind> {
-    return this.entries.get(taskId)?.expectedKinds ?? new Set();
+    const union = new Set<PhaseSignalKind>();
+    for (const entry of this.taskEntries(taskId)) {
+      for (const kind of entry.expectedKinds) union.add(kind);
+    }
+    return union;
   }
 
   isRecovered(taskId: string): boolean {
-    return this.entries.get(taskId)?.recovered ?? false;
+    return this.taskEntries(taskId).some(entry => entry.recovered);
   }
 
   async awaitOnce(args: {
@@ -256,7 +286,7 @@ export class PhaseSignalWatcher {
   }
 
   private onPaneData(entry: WatchEntry, chunk: string, isSnapshot = false): void {
-    if (this.entries.get(entry.taskId) !== entry) return;
+    if (this.entries.get(entryKey(entry.taskId, entry.agentId)) !== entry) return;
     if (entry.fired) return;
     const rawCombined = entry.buffer + chunk;
     if (entry.onReadFile) {
@@ -274,7 +304,7 @@ export class PhaseSignalWatcher {
     if (!signal) return;
     if (signal.kind === 'greeting') return;
     entry.fired = true;
-    this.entries.delete(entry.taskId);
+    this.entries.delete(entryKey(entry.taskId, entry.agentId));
     try { entry.unsubscribe(); } catch {}
     // Unconditional: a recovered watch may not have rebuilt needInputFired even though
     // the persisted badge is set — the phase signal ends the dispatch either way.
@@ -296,6 +326,7 @@ export class PhaseSignalWatcher {
         verdictAgentId: entry.agentId,
         source: 'pane-signal',
         ...(signal.kind === 'pr-created' ? { prNumber: signal.prNumber } : {}),
+        ...(signal.kind === 'pr-created' && signal.actorB64 !== undefined ? { actorB64: signal.actorB64 } : {}),
         ...(signal.kind === 'code-ready' && signal.prNumber !== undefined
           ? { prNumber: signal.prNumber }
           : {}),
@@ -324,8 +355,8 @@ export class PhaseSignalWatcher {
   }
 
   private onSessionGone(entry: WatchEntry): void {
-    if (this.entries.get(entry.taskId) !== entry) return;
-    this.entries.delete(entry.taskId);
+    if (this.entries.get(entryKey(entry.taskId, entry.agentId)) !== entry) return;
+    this.entries.delete(entryKey(entry.taskId, entry.agentId));
     if (entry.fired) return;
     entry.onNeedInput?.(false);
     const kindsLabel = [...entry.expectedKinds].join(',');

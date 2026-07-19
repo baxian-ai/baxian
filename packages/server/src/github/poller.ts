@@ -1,6 +1,7 @@
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import type { BaxianConfig, PollerHealth, PollerSnapshot, ProjectConfig } from '../shared/index.js';
+import type { BaxianConfig, PollerSnapshot, ProjectConfig } from '../shared/index.js';
+import { computePollerHealth } from '../platform/poller-health.js';
 import { isGitHubRepo, repoSlug } from '../shared/index.js';
 import type { CommandRunner } from '../agent/runner.js';
 import type { MappedEvent } from './mapper.js';
@@ -27,18 +28,7 @@ export function pollerStatePathFor(stateDir: string, repo: string): string {
   return join(stateDir, 'state', `poller-${encodeURIComponent(repoSlug(repo).toLowerCase())}.json`);
 }
 
-const DEGRADED_FAILURE_THRESHOLD = 1;
-const FAILED_FAILURE_THRESHOLD = 3;
-
-export function computePollerHealth(
-  consecutiveFailures: number,
-  lastPollEndedAt: string | undefined,
-): PollerHealth {
-  if (!lastPollEndedAt && consecutiveFailures === 0) return 'unknown';
-  if (consecutiveFailures >= FAILED_FAILURE_THRESHOLD) return 'failed';
-  if (consecutiveFailures >= DEGRADED_FAILURE_THRESHOLD) return 'degraded';
-  return 'healthy';
-}
+export { computePollerHealth };
 
 interface EntryStatus {
   isPolling: boolean;

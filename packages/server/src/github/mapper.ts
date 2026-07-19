@@ -1,11 +1,6 @@
-import type { EventType } from '../shared/index.js';
 import { BRANCH_PREFIX } from '../shared/index.js';
 
-export interface MappedEvent {
-  type: EventType;
-  repo: string;
-  data: Record<string, unknown>;
-}
+export type { MappedEvent } from '../platform/types.js';
 
 export function reviewVerdict(args: {
   state: string;

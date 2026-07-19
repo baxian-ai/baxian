@@ -32,8 +32,17 @@ import {
   isSpecStagePhase,
   isGitHubRepo,
   parseGitRemote,
+  repoIdentityKey,
   repoSlug,
 } from '../shared/index.js';
+import { buildProjectDriver, makeDriverExec } from '../platform/driver-host.js';
+import { DriverOpError } from '../platform/git-driver.js';
+import type { GitDriver, DriverExec } from '../platform/git-driver.js';
+import type { PluginRegistry } from '../platform/plugin-registry.js';
+import type { NormalizedRow } from '../platform/row-schema.js';
+import { checkOpenPrBinding, type PrRejection } from '../platform/pr-binding.js';
+import { collectPendingFeedback, scanCommentSourcesOnce, type PendingFeedbackResult } from '../platform/feedback.js';
+import { recheckPassProvenance, type VerdictSourceScan } from '../platform/verdict-engine.js';
 import type { AgentStore } from '../state/agent-store.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
 import type { TaskStore } from '../state/task-store.js';
@@ -69,7 +78,7 @@ import {
   type AgentRuntimeKind,
   type TmuxSessionRef,
 } from './tmux.js';
-import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from './branch.js';
+import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError, isAutoDeletableTaskBranch } from './branch.js';
 import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFileGuarded, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import { PhaseSignalWatcher, type PhaseSignalWatcherStartArgs } from './phase-signal-watcher.js';
@@ -86,6 +95,8 @@ import {
 } from './prompt.js';
 import { ApiError } from '../errors.js';
 import { prepareConfig } from '../config/loader.js';
+import { resolveProjectTool } from '../config/validator.js';
+import { SHA_HEX_SOURCE } from '../platform/types.js';
 
 export interface EnsureSessionResult {
   ok: true;
@@ -271,6 +282,7 @@ export interface AgentManagerDeps {
   ) => RepoStore;
   paneStreamerManager?: PaneStreamerManager;
   postApproveStore?: PostApproveStore;
+  pluginRegistry?: PluginRegistry;
   phaseSignalWatcher?: PhaseSignalWatcher;
   errorRecordStore?: ErrorRecordStore;
   reviewStore?: ReviewStore;
@@ -286,6 +298,22 @@ export interface AgentManagerDeps {
 const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
 const GH_NET = { timeout: GH_EXEC_TIMEOUT_MS, retries: 1 } as const;
+const PLATFORM_HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
+
+// 复核类失败（provenance/ack）与平台/瞬态失败分型：前者调用方退回 approved 重入闭环（计划 Task 8）
+export class PlatformCloseError extends Error {
+  constructor(readonly step: 'close' | 'deleteBranch', cause: unknown) {
+    super(`platform ${step} failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'PlatformCloseError';
+  }
+}
+
+export class PlatformMergeRecheckError extends Error {
+  constructor(readonly reason: string) {
+    super(`merge blocked: ${reason}`);
+    this.name = 'PlatformMergeRecheckError';
+  }
+}
 
 export interface TransitionResult {
   task: TaskState;
@@ -332,6 +360,7 @@ export interface DispatchArmContext {
 
 export interface MergePrOpts {
   matchHeadSha?: string;
+  humanOverride?: boolean;
 }
 
 export type CodeInterdiffResult =
@@ -344,6 +373,8 @@ interface DispatchReviewSnapshot {
   signalToken?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
+  passToken?: string;
+  failToken?: string;
 }
 
 export interface ServerReviewDriver {
@@ -430,6 +461,8 @@ export class AgentManager {
   protected repoCache: RepoStoreCache;
   protected paneStreamerManager?: PaneStreamerManager;
   protected postApproveStore: PostApproveStore;
+  protected pluginRegistry?: PluginRegistry;
+  private readonly platformDriverExec: DriverExec;
   protected phaseSignalWatcher?: PhaseSignalWatcher;
   protected errorRecordStore?: ErrorRecordStore;
   protected reviewStore?: ReviewStore;
@@ -474,6 +507,7 @@ export class AgentManager {
     this.repoStoreFactory = deps.repoStoreFactory;
     this.paneStreamerManager = deps.paneStreamerManager;
     this.postApproveStore = deps.postApproveStore ?? new PostApproveStore();
+    this.pluginRegistry = deps.pluginRegistry;
     this.errorRecordStore = deps.errorRecordStore;
     this.phaseSignalWatcher = deps.phaseSignalWatcher
       ?? (deps.paneStreamerManager
@@ -489,6 +523,7 @@ export class AgentManager {
     this.cancelInterruptGuardWaitMs = this.dispatchAckTimeoutMs + 5_000;
     this.agentIndex = buildAgentIndex(config);
     this.platformRunner = deps.platformRunner ?? new LocalRunner();
+    this.platformDriverExec = makeDriverExec(this.platformRunner);
     this.imageStagingRoot = deps.imageStagingRoot ?? join(tmpdir(), 'baxian-task-images');
     this.repoCache = createRepoStoreCache();
     this.bootstrapTimeoutsMs = {
@@ -3575,6 +3610,9 @@ export class AgentManager {
           const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, {
             skipSnapshot: true,
             onlyReplaceOwnToken: true,
+            // git 双 watcher 下 fence 只应比较自己的 (taskId, agentId) 条目：task 域会拿
+            // sibling（reconciliation）的不同 token 否决本应合法的重布防
+            ...(task.reviewMode === 'git' ? { replaceScope: 'agent' as const } : {}),
           });
           if (!armed) {
             if (!(await stillCurrent())) return false;
@@ -3596,6 +3634,8 @@ export class AgentManager {
         );
       }
 
+      // reconciliation 条目不是 replay 目标：它没有对应的可重放 prompt，误选会以 QA 轮换 token
+      // 重注 dev 的 publish 提示（spec §5.3 ④ 只允许一次 actor 归位）
       const mapped = this.mapTaskStateToExpectedWatcher(task);
       if (!mapped || mapped.agentId !== agentId) return false;
       if (!task.signalToken) {
@@ -3840,6 +3880,9 @@ export class AgentManager {
       if (completion.rebuilt) await this.clearPostApproveCompletionIfMatches(taskId, completion.token);
       throw err;
     }
+    if (resumed && task.reviewMode === 'git') {
+      await this.confirmPostApprovePromptDelivered(taskId, completion.token);
+    }
     if (!resumed && completion.rebuilt) {
       await this.clearPostApproveCompletionIfMatches(taskId, completion.token);
       const fresh = await this.taskStore.get(taskId);
@@ -3887,6 +3930,18 @@ export class AgentManager {
         || fresh.postApproveHeadSha !== approvedHeadSha
       ) {
         return false;
+      }
+      if (fresh.reviewMode === 'git') {
+        if (fresh.postApproveToken !== undefined) return false;
+        // rebuild 与常规安装同一 installed→delivered 协议：写后崩溃由 sweep 按 pending 补派
+        await this.taskStore.set({
+          ...fresh,
+          postApproveToken: token,
+          postApprovePhase: 'installed',
+          pendingRedispatch: true,
+          updatedAt: new Date().toISOString(),
+        });
+        return true;
       }
       if (await this.postApproveStore.get(task.id)) return false;
       await this.postApproveStore.set(task.id, { token, approvedHeadSha });
@@ -4051,6 +4106,17 @@ export class AgentManager {
     return this.config.project.find(p => repoSlug(p.repo) === repo);
   }
 
+  getProjectByRepoIdentity(repoKey: string): ProjectConfig | undefined {
+    return this.config.project.find(p => repoIdentityKey(p.repo) === repoKey);
+  }
+
+  platformDriverFor(projectId: string): GitDriver | undefined {
+    if (!this.pluginRegistry) return undefined;
+    const project = this.getProjectConfig(projectId);
+    if (!project) return undefined;
+    return buildProjectDriver(project, this.pluginRegistry, this.platformDriverExec);
+  }
+
   private findAgentGroup(anchorAgentId: string): AgentConfig[] | undefined {
     for (const project of this.config.project) {
       for (const group of project.agent) {
@@ -4087,7 +4153,27 @@ export class AgentManager {
   }
 
   async getPostApproveCompletion(taskId: string): Promise<PostApproveCompletion | null> {
+    const task = await this.taskStore.get(taskId);
+    if (task?.reviewMode === 'git') return this.gitCompletionOf(task);
     return this.postApproveStore.get(taskId);
+  }
+
+  // 'git' 的 completion 与效果字段同居 TaskState：consumedFeedback/pendingRedispatch 与
+  // token CAS 必须同一次持久化（spec §6 双写协议）；legacy github 沿 PostApproveStore 至 M3c。
+  private gitCompletionOf(task: TaskState): PostApproveCompletion | null {
+    if (task.postApproveToken === undefined || task.postApproveHeadSha === undefined) return null;
+    return {
+      token: task.postApproveToken,
+      approvedHeadSha: task.postApproveHeadSha,
+      updatedAt: task.updatedAt,
+      ...(task.redispatchCount !== undefined ? { redispatchCount: task.redispatchCount } : {}),
+      ...(task.pendingRedispatch !== undefined ? { pendingRedispatch: task.pendingRedispatch } : {}),
+    };
+  }
+
+  private stripGitCompletionFields(task: TaskState): TaskState {
+    const { postApproveToken: _t, pendingRedispatch: _p, redispatchCount: _r, postApprovePhase: _ph, ...rest } = task;
+    return rest as TaskState;
   }
 
   // Install CASes on the current approved episode; only a fresh human verdict (clearRevocation) unlocks a standing marker.
@@ -4108,27 +4194,84 @@ export class AgentManager {
         if (task.postApproveRevoked && !opts.clearRevocation) return false;
         if (task.postApproveHeadSha !== undefined && task.postApproveHeadSha !== value.approvedHeadSha) return false;
       }
-      await this.postApproveStore.set(taskId, value);
+      if (task?.reviewMode === 'git') {
+        const { postApproveRevoked: _revoked, ...rest } = task;
+        // 全量替换语义与 PostApproveStore.set 一致：未携带的 pending/redispatch 字段清空
+        await this.taskStore.set({
+          ...this.stripGitCompletionFields(opts.clearRevocation ? (rest as TaskState) : task),
+          postApproveToken: value.token,
+          postApprovePhase: 'installed',
+          ...(value.redispatchCount !== undefined ? { redispatchCount: value.redispatchCount } : {}),
+          ...(value.pendingRedispatch !== undefined ? { pendingRedispatch: value.pendingRedispatch } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+      } else {
+        await this.postApproveStore.set(taskId, value);
+      }
       if (!task) return true;
-      if (task.postApproveRevoked) {
+      if (task.postApproveRevoked && task.reviewMode !== 'git') {
         const { postApproveRevoked: _revoked, ...rest } = task;
         await this.taskStore.set({ ...rest, updatedAt: new Date().toISOString() });
       }
       if (!this.phaseSignalWatcher) return true;
-      await this.startPhaseSignalWatch({
+      const armed = await this.startPhaseSignalWatch({
         taskId,
         projectId: task.projectId,
         agentId: task.agentId,
         expectedKinds: 'pr-merge-ready',
         token: value.token,
       });
+      if (!armed) {
+        // completion 没有 consumer 就不算安装成功：撤销本次写，durable pending（若有）随原状保留
+        if (task.reviewMode === 'git') {
+          await this.taskStore.set({ ...task, updatedAt: new Date().toISOString() });
+        } else {
+          await this.postApproveStore.clear(taskId);
+        }
+        return false;
+      }
       return true;
+    });
+  }
+
+  // post-approve prompt 的至少一次投递（spec §6）：pendingRedispatch 随 completion 安装保持 true，
+  // 仅在 continueSession 确认送达后清除——安装与投递之间的崩溃由恢复扫描按 pending 补派。
+  async confirmPostApprovePromptDelivered(taskId: string, token: string): Promise<void> {
+    await this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.reviewMode !== 'git' || task.postApproveToken !== token) return;
+      await this.taskStore.set({
+        ...task,
+        pendingRedispatch: false,
+        postApprovePhase: 'delivered',
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  async markPostApproveSignalReceived(taskId: string, token: string): Promise<void> {
+    await this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.reviewMode !== 'git' || task.postApproveToken !== token) return;
+      if (task.postApprovePhase === 'signaled') return;
+      await this.taskStore.set({ ...task, postApprovePhase: 'signaled', updatedAt: new Date().toISOString() });
     });
   }
 
   async clearPostApproveCompletion(taskId: string): Promise<void> {
     await this.withTaskLock(async () => {
-      await this.postApproveStore.clear(taskId);
+      const task = await this.taskStore.get(taskId);
+      if (task?.reviewMode === 'git') {
+        if (task.postApproveToken !== undefined || task.pendingRedispatch !== undefined
+          || task.redispatchCount !== undefined) {
+          await this.taskStore.set({
+            ...this.stripGitCompletionFields(task),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+      } else {
+        await this.postApproveStore.clear(taskId);
+      }
       this.phaseSignalWatcher?.stop(taskId);
     });
   }
@@ -4138,10 +4281,23 @@ export class AgentManager {
     taskId: string,
     expectedToken: string,
     patch: { redispatchCount?: number; pendingRedispatch?: boolean },
+    opts: { consumeRevision?: { key: string; versionTime: number } } = {},
   ): Promise<boolean> {
     return this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (task?.postApproveRevoked) return false;
+      if (task?.reviewMode === 'git') {
+        if (task.postApproveToken !== expectedToken) return false;
+        await this.taskStore.set({
+          ...task,
+          ...patch,
+          ...(opts.consumeRevision
+            ? { consumedFeedback: { ...task.consumedFeedback, [opts.consumeRevision.key]: opts.consumeRevision.versionTime } }
+            : {}),
+          updatedAt: new Date().toISOString(),
+        });
+        return true;
+      }
       const current = await this.postApproveStore.get(taskId);
       if (!current || current.token !== expectedToken) return false;
       await this.postApproveStore.set(taskId, { ...current, ...patch });
@@ -4165,8 +4321,21 @@ export class AgentManager {
         && task.postApproveHeadSha !== opts.expectedHeadSha
       ) return false;
       if (opts.expectedToken !== undefined) {
-        const current = await this.postApproveStore.get(taskId);
-        if (current?.token !== opts.expectedToken) return false;
+        if (task.reviewMode === 'git') {
+          if (task.postApproveToken !== opts.expectedToken) return false;
+        } else {
+          const current = await this.postApproveStore.get(taskId);
+          if (current?.token !== opts.expectedToken) return false;
+        }
+      }
+      if (task.reviewMode === 'git') {
+        await this.taskStore.set({
+          ...this.stripGitCompletionFields(task),
+          postApproveRevoked: { reason, at: new Date().toISOString() },
+          updatedAt: new Date().toISOString(),
+        });
+        this.phaseSignalWatcher?.stop(taskId);
+        return true;
       }
       // Marker lands first: a crash before the clear leaves marker+completion, which every consumer fences on.
       await this.taskStore.set({
@@ -4182,6 +4351,16 @@ export class AgentManager {
 
   async clearPostApproveCompletionIfMatches(taskId: string, token: string): Promise<boolean> {
     return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (task?.reviewMode === 'git') {
+        if (task.postApproveToken !== token) return false;
+        await this.taskStore.set({
+          ...this.stripGitCompletionFields(task),
+          updatedAt: new Date().toISOString(),
+        });
+        this.phaseSignalWatcher?.stop(taskId);
+        return true;
+      }
       const cleared = await this.postApproveStore.clearIfMatches(taskId, token);
       if (cleared) this.phaseSignalWatcher?.stop(taskId);
       return cleared;
@@ -4198,7 +4377,9 @@ export class AgentManager {
       if (!task || task.status !== 'approved' || task.postApproveRevoked) {
         return { refused: 'stale' as const };
       }
-      const completion = await this.postApproveStore.get(taskId);
+      const completion = task.reviewMode === 'git'
+        ? this.gitCompletionOf(task)
+        : await this.postApproveStore.get(taskId);
       if (
         !completion
         || completion.token !== expectedToken
@@ -4208,16 +4389,316 @@ export class AgentManager {
         return { refused: 'stale' as const };
       }
       if (completion.pendingRedispatch) return { refused: 'pending' as const };
-      delete task.postApproveHeadSha;
-      Object.assign(task, {
+      const next = task.reviewMode === 'git' ? this.stripGitCompletionFields(task) : task;
+      delete next.postApproveHeadSha;
+      Object.assign(next, {
         status: 'merge-ready' as TaskStatus,
         latestHeadSha: completion.approvedHeadSha,
         updatedAt: new Date().toISOString(),
       });
-      await this.taskStore.set(task);
-      await this.postApproveStore.clear(taskId);
+      await this.taskStore.set(next);
+      if (task.reviewMode !== 'git') await this.postApproveStore.clear(taskId);
       this.phaseSignalWatcher?.stop(taskId);
-      return { task };
+      return { task: next };
+    });
+  }
+
+  // 修剪顺序单向（spec §6）：仅在对应源 cursor durable 落盘后调用；水位停滞的源不修剪，
+  // 有界性由水位前进保证，禁止按容量淘汰未覆盖键。
+  async pruneConsumedFeedback(taskId: string, sourceKey: string, watermarkTime: number): Promise<void> {
+    await this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task?.consumedFeedback) return;
+      const prefix = `${sourceKey}:`;
+      const kept = Object.entries(task.consumedFeedback)
+        .filter(([key, time]) => !key.startsWith(prefix) || time >= watermarkTime);
+      if (kept.length === Object.keys(task.consumedFeedback).length) return;
+      await this.taskStore.set({
+        ...task,
+        consumedFeedback: Object.fromEntries(kept),
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  // TaskState 效果+outbox 先 durable、投递成功再清（spec §6 双写协议）：崩溃于任一侧，
+  // 重启从未清 outbox 重投，事件携确定性 key 供展示端去重——效果恰一次、通知至少一次。
+  async recordClosedUnmergedAnchor(taskId: string, prNumber: number): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.reviewMode !== 'git' || TERMINAL_STATUSES.includes(task.status)) return false;
+      const anchor = task.closedUnmergedAnchor;
+      if (anchor?.prNumber === prNumber && anchor.cleared !== true) return false;
+      const generation = (anchor?.generation ?? 0) + 1;
+      const eventKey = `${taskId}:${prNumber}:mr-closed-unmerged:${generation}`;
+      await this.taskStore.set({
+        ...task,
+        closedUnmergedAnchor: { prNumber, generation },
+        outbox: [...(task.outbox ?? []), {
+          key: eventKey,
+          type: 'human.intervention',
+          data: { phase: 'mr-closed-unmerged', prNumber, eventKey },
+        }],
+        updatedAt: new Date().toISOString(),
+      });
+      return true;
+    });
+  }
+
+  async clearClosedUnmergedAnchor(taskId: string, prNumber: number): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      const anchor = task?.closedUnmergedAnchor;
+      if (!task || anchor?.prNumber !== prNumber || anchor.cleared === true) return false;
+      const generation = anchor.generation;
+      const eventKey = `${taskId}:${prNumber}:mr-reopened:${generation}`;
+      await this.taskStore.set({
+        ...task,
+        closedUnmergedAnchor: { ...anchor, cleared: true },
+        outbox: [...(task.outbox ?? []), {
+          key: eventKey,
+          type: 'human.intervention',
+          data: { phase: 'mr-reopened', prNumber, eventKey },
+        }],
+        updatedAt: new Date().toISOString(),
+      });
+      return true;
+    });
+  }
+
+  async deliverTaskOutbox(taskId: string): Promise<void> {
+    const task = await this.taskStore.get(taskId);
+    if (!task?.outbox?.length) return;
+    for (const entry of task.outbox) {
+      try {
+        await this.eventBus.emit({
+          // 确定性 id（spec §6 outbox）：重投/并发 flush 的重复条目同 id，消费/展示端可去重
+          id: `outbox:${entry.key}`,
+          type: entry.type,
+          timestamp: new Date().toISOString(),
+          projectId: task.projectId,
+          agentId: task.agentId,
+          taskId: task.id,
+          data: entry.data,
+        });
+      } catch (err) {
+        console.warn(`[AgentManager] outbox delivery failed for task=${taskId} key=${entry.key}:`, err);
+        continue;
+      }
+      await this.withTaskLock(async () => {
+        const fresh = await this.taskStore.get(taskId);
+        if (!fresh?.outbox?.some(e => e.key === entry.key)) return;
+        const remaining = fresh.outbox.filter(e => e.key !== entry.key);
+        const { outbox: _outbox, ...rest } = fresh;
+        await this.taskStore.set({
+          ...(rest as TaskState),
+          ...(remaining.length > 0 ? { outbox: remaining } : {}),
+          updatedAt: new Date().toISOString(),
+        });
+      });
+    }
+  }
+
+  // merge-ready 信号是单发消费：git 分支在消费点引入网络复核，失败时必须重 arm（skipSnapshot
+  // false 让仍在面板上的信号立即重放），否则一次瞬态失败吞掉整轮完成信号。
+  async rearmPostApproveSignal(taskId: string, opts: { skipSnapshot?: boolean } = {}): Promise<boolean> {
+    const task = await this.taskStore.get(taskId);
+    if (!task || task.status !== 'approved') return false;
+    const completion = task.reviewMode === 'git'
+      ? this.gitCompletionOf(task)
+      : await this.postApproveStore.get(taskId);
+    if (!completion) return false;
+    if (!this.phaseSignalWatcher) return true;
+    return this.startPhaseSignalWatch({
+      taskId,
+      projectId: task.projectId,
+      agentId: task.agentId,
+      expectedKinds: 'pr-merge-ready',
+      token: completion.token,
+      // 刚消费的信号仍在滚动区：扫描失败路径必须 live-only，否则与持续失败叠加成无退避热循环
+      ...(opts.skipSnapshot ? { skipSnapshot: true } : {}),
+    });
+  }
+
+  // 配置身份切换与任务创建共栅栏（TOCTOU）：blocker 扫描与提交在 withTaskLock 内执行，
+  // createTask 的「读配置快照+落任务」同经该锁，扫描时不可见的并发新任务不存在。
+  async guardGitConfigCommit(
+    current: BaxianConfig,
+    next: BaxianConfig,
+    scan: (manager: AgentManager, current: BaxianConfig, next: BaxianConfig) => Promise<Array<{ projectId: string; taskIds: string[] }>>,
+    commit: () => Promise<void>,
+  ): Promise<{ ok: true } | { ok: false; blockers: Array<{ projectId: string; taskIds: string[] }> }> {
+    return this.withTaskLock(async () => {
+      const blockers = await scan(this, current, next);
+      if (blockers.length > 0) return { ok: false as const, blockers };
+      await commit();
+      return { ok: true as const };
+    });
+  }
+
+  async flushGitOutbox(): Promise<void> {
+    const tasks = await this.taskStore.list();
+    for (const task of tasks) {
+      if (task.reviewMode !== 'git' || !task.outbox?.length) continue;
+      try {
+        await this.deliverTaskOutbox(task.id);
+      } catch (err) {
+        // 单任务失败不得饿死其后的 durable outbox（至少一次的重启保证）
+        console.warn(`[AgentManager] flushGitOutbox: task=${task.id} failed, continuing:`, err);
+      }
+    }
+  }
+
+  // cancel 清理的部分成功可重试（spec §6 close 条 + 破坏性清理不静默失败）：close 已成而
+  // deleteBranch 瞬态失败时任务已终态，重启在守卫成立的前提下幂等补删（REF_NOT_FOUND 即成功）。
+  // 只清本代 pending：A 的 start 晚于 B 的失败返回时，无条件清除会吞掉 B 留下的重试锚
+  async clearReviewDispatchPending(taskId: string, expectedToken: string): Promise<void> {
+    await this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.reviewDispatchPending !== true) return;
+      if (task.status !== 'review' || task.signalToken !== expectedToken) return;
+      const { reviewDispatchPending: _p, ...rest } = task;
+      await this.taskStore.set({ ...(rest as TaskState), updatedAt: new Date().toISOString() });
+    });
+  }
+
+  // 评审派发的至少一次（sweep 消费）：transition 落 pending、QA session 启动成功才清——
+  // QA 缺失/忙/arm/start 失败的每条早退路径都由此在 60s 内自愈，无需依赖事件重放。
+  async retryPendingGitReviewDispatches(): Promise<void> {
+    const tasks = await this.listActiveGitTasks();
+    for (const task of tasks) {
+      if (task.reviewDispatchPending !== true) continue;
+      // arm/start 失败回滚会退到 in_progress/fixing 且无第二触发源（poller 已记 pushSha、
+      // watcher 已消费）：pending 在场即重新拉入 review
+      if (!['review', 'in_progress', 'fixing'].includes(task.status)) continue;
+      try {
+        await this.dispatchReviewToQa(task.id, { bumpRound: false });
+      } catch (err) {
+        console.warn(`[AgentManager] retryPendingGitReviewDispatches: task=${task.id} still failing:`, err);
+      }
+    }
+  }
+
+  async retryGitRemoteBranchCleanup(): Promise<void> {
+    const tasks = await this.taskStore.list({ status: 'cancelled' });
+    for (const task of tasks) {
+      const reason = task.branchCleanupPending?.reason;
+      if (task.reviewMode !== 'git'
+        || (reason !== 'remote-delete-failed' && reason !== 'remote-close-failed')) continue;
+      try {
+        const driver = this.platformDriverFor(task.projectId);
+        const branch = task.branch;
+        if (!driver || branch === undefined) continue;
+        // close 先补（幂等：closed PR 再 PATCH state=closed 为 no-op），再按守卫补删分支
+        if (reason === 'remote-close-failed' && task.prNumber !== undefined) {
+          await driver.runOp('close', { prNumber: task.prNumber });
+        }
+        if (!isAutoDeletableTaskBranch({
+          taskId: task.id,
+          taskBranch: branch,
+          branchCreatedByBaxian: task.branchCreatedByBaxian,
+          actualRef: `refs/heads/${branch}`,
+        })) {
+          if (reason !== 'remote-close-failed') continue;
+        } else {
+          await driver.runOp('deleteBranch', { branch });
+        }
+        await this.withTaskLock(async () => {
+          const fresh = await this.taskStore.get(task.id);
+          const freshReason = fresh?.branchCleanupPending?.reason;
+          if (freshReason !== 'remote-delete-failed' && freshReason !== 'remote-close-failed') return;
+          const { branchCleanupPending: _pending, ...rest } = fresh!;
+          await this.taskStore.set({ ...(rest as TaskState), updatedAt: new Date().toISOString() });
+        });
+      } catch (err) {
+        console.warn(`[AgentManager] retryGitRemoteBranchCleanup: task=${task.id} still failing:`, err);
+      }
+    }
+  }
+
+  // 反馈消费的唯一状态机（spec §6 双写协议 + merge 条）：锁内按实时状态决定效果，效果字段
+  // 与消费键同一次持久化——入口快照与提交之间的并发状态迁移不再能让 revision 落空。
+  async consumeGitFeedbackRevision(
+    taskId: string,
+    consume: { key: string; versionTime: number },
+    opts: { feedbackAt?: string } = {},
+  ): Promise<
+    | { kind: 'duplicate' | 'gone' | 'consumed' }
+    | { kind: 'returned' | 'pending'; task: TaskState }
+  > {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.reviewMode !== 'git') return { kind: 'gone' as const };
+      if (task.consumedFeedback?.[consume.key] !== undefined) return { kind: 'duplicate' as const };
+      const consumed = { ...task.consumedFeedback, [consume.key]: consume.versionTime };
+      const stamp = { updatedAt: new Date().toISOString() };
+      if (TERMINAL_STATUSES.includes(task.status)) {
+        await this.taskStore.set({ ...task, consumedFeedback: consumed, ...stamp });
+        return { kind: 'consumed' as const };
+      }
+      if (task.status === 'merge-ready') {
+        const approvedHead = typeof task.latestHeadSha === 'string' && PLATFORM_HEAD_SHA_RE.test(task.latestHeadSha)
+          ? task.latestHeadSha
+          : undefined;
+        if (approvedHead !== undefined) {
+          const next: TaskState = {
+            ...task,
+            status: 'approved',
+            postApproveHeadSha: approvedHead,
+            pendingRedispatch: true,
+            consumedFeedback: consumed,
+            ...(opts.feedbackAt !== undefined ? { prFeedbackReceivedAt: opts.feedbackAt } : {}),
+            ...stamp,
+          };
+          await this.taskStore.set(next);
+          return { kind: 'returned' as const, task: next };
+        }
+      }
+      if (task.status === 'approved' && task.postApproveRevoked === undefined) {
+        const next: TaskState = {
+          ...task,
+          pendingRedispatch: true,
+          consumedFeedback: consumed,
+          ...(opts.feedbackAt !== undefined ? { prFeedbackReceivedAt: opts.feedbackAt } : {}),
+          ...stamp,
+        };
+        await this.taskStore.set(next);
+        return { kind: 'pending' as const, task: next };
+      }
+      await this.taskStore.set({
+        ...task,
+        consumedFeedback: consumed,
+        ...(opts.feedbackAt !== undefined ? { prFeedbackReceivedAt: opts.feedbackAt } : {}),
+        ...stamp,
+      });
+      return { kind: 'consumed' as const };
+    });
+  }
+
+  // merge-ready 不是评论面的冻结点（spec §6 merge 条）：新反馈单写退回 approved + 消费键，
+  // 与 push 使 merge-ready 失效的既有语义对称。
+  async returnMergeReadyToApproved(
+    taskId: string,
+    consume: { key: string; versionTime: number },
+  ): Promise<TaskState | null> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.reviewMode !== 'git' || task.status !== 'merge-ready') return null;
+      const approvedHead = typeof task.latestHeadSha === 'string' && PLATFORM_HEAD_SHA_RE.test(task.latestHeadSha)
+        ? task.latestHeadSha
+        : undefined;
+      if (!approvedHead) return null;
+      // pendingRedispatch 与状态翻转/消费键同写：崩溃于派发前，恢复扫描凭它补派（spec §6 至少一次）
+      const next: TaskState = {
+        ...task,
+        status: 'approved',
+        postApproveHeadSha: approvedHead,
+        pendingRedispatch: true,
+        consumedFeedback: { ...task.consumedFeedback, [consume.key]: consume.versionTime },
+        updatedAt: new Date().toISOString(),
+      };
+      await this.taskStore.set(next);
+      return next;
     });
   }
 
@@ -4227,7 +4708,16 @@ export class AgentManager {
       if (task.postApproveRevoked) {
         // Finish an interrupted revoke: the marker is authoritative, the leftover record must not re-arm.
         try {
-          await this.postApproveStore.clear(task.id);
+          if (task.reviewMode === 'git') {
+            if (task.postApproveToken !== undefined) {
+              await this.taskStore.set({
+                ...this.stripGitCompletionFields(task),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          } else {
+            await this.postApproveStore.clear(task.id);
+          }
         } catch (err) {
           console.warn(
             `[AgentManager] setupRecoveredPostApproveSignals: revoked completion cleanup failed for task=${task.id}:`,
@@ -4236,7 +4726,9 @@ export class AgentManager {
         }
         continue;
       }
-      const completion = await this.postApproveStore.get(task.id);
+      const completion = task.reviewMode === 'git'
+        ? this.gitCompletionOf(task)
+        : await this.postApproveStore.get(task.id);
       if (!completion) continue;
       if (task.postApproveHeadSha === undefined) {
         // A completion the task head cannot vouch for is another episode's residue until proven otherwise.
@@ -4247,7 +4739,12 @@ export class AgentManager {
       }
       if (completion.approvedHeadSha !== task.postApproveHeadSha) {
         try {
-          await this.postApproveStore.clear(task.id);
+          if (task.reviewMode === 'git') {
+            await this.taskStore.set({
+              ...this.stripGitCompletionFields(task),
+              updatedAt: new Date().toISOString(),
+            });
+          } else await this.postApproveStore.clear(task.id);
           console.warn(
             `[AgentManager] setupRecoveredPostApproveSignals: task=${task.id} retired a completion bound to head ${completion.approvedHeadSha} (persisted approved head ${task.postApproveHeadSha})`,
           );
@@ -4284,8 +4781,21 @@ export class AgentManager {
     const tasks = await this.taskStore.list();
     for (const task of tasks) {
       if (!task.signalToken) continue;
-      const mapped = this.mapTaskStateToExpectedWatcher(task);
-      if (!mapped) continue;
+      const mappings = this.mapTaskStateToExpectedWatchers(task);
+      if (mappings.length === 0) continue;
+      for (const mapped of mappings) {
+        await this.setupRecoveredWatcherForMapping(task, mapped.token ?? task.signalToken, mapped, mappings.length > 1);
+      }
+    }
+  }
+
+  private async setupRecoveredWatcherForMapping(
+    task: TaskState,
+    signalToken: string,
+    mapped: { expectedKinds: readonly PhaseSignalKind[]; agentId: string; token?: string },
+    hasSiblings: boolean,
+  ): Promise<void> {
+    {
       const { expectedKinds, agentId } = mapped;
       const specStage = isSpecStagePhase(task.phase);
       const interventionKindLabel: string | undefined =
@@ -4308,9 +4818,10 @@ export class AgentManager {
           projectId: task.projectId,
           agentId,
           expectedKinds,
-          token: task.signalToken,
+          token: signalToken,
           skipSnapshot: !scanSnapshotOnRecover,
           recovered: true,
+          ...(hasSiblings ? { replaceScope: 'agent' as const } : {}),
           ...(allowRecoveredReadFile
             ? { onReadFile: (req: ReadFileSignal) => { void this.handleReadFileRequest(task.id, agentId, req); } }
             : {}),
@@ -4443,6 +4954,253 @@ export class AgentManager {
     return { headRefName, headSha, body };
   }
 
+  platformBindingFields(projectId: string): Partial<TaskState> {
+    if (this.effectiveReviewMode(projectId) !== 'git') return {};
+    const project = this.getProjectConfig(projectId);
+    if (!project) return {};
+    const tool = resolveProjectTool(project);
+    if (tool === undefined) return {};
+    return { platformBinding: { mode: 'git', repoKey: repoIdentityKey(project.repo), tool } };
+  }
+
+  // 指纹为纯身份三元组（spec §4）：binary/env/skill 文本 live 解析可演进，身份失配即拒绝
+  private assertPlatformBinding(task: TaskState): void {
+    const binding = task.platformBinding;
+    if (!binding) {
+      if (task.reviewMode !== 'git') return;
+      // D11 无兼容负担：不存在合法的无快照 git 任务，缺失即损坏/手工恢复，按失配同级拒绝
+      void this.emitIntervention(task.projectId, task.agentId || undefined, task.id, {
+        phase: 'platform-binding-mismatch',
+        reason: 'missing-binding-snapshot',
+      });
+      throw new Error(`platform binding missing for git task ${task.id}; refusing platform operations`);
+    }
+    const project = this.getProjectConfig(task.projectId);
+    const live = project === undefined ? undefined : {
+      mode: this.effectiveReviewMode(task.projectId),
+      repoKey: repoIdentityKey(project.repo),
+      tool: resolveProjectTool(project),
+    };
+    if (live !== undefined && live.mode === binding.mode
+      && live.repoKey === binding.repoKey && live.tool === binding.tool) return;
+    void this.emitIntervention(task.projectId, task.agentId || undefined, task.id, {
+      phase: 'platform-binding-mismatch',
+      binding,
+      ...(live !== undefined ? { live: { mode: live.mode, repoKey: live.repoKey, tool: live.tool ?? '' } } : {}),
+    });
+    throw new Error(
+      `platform binding mismatch for task ${task.id}: snapshot ${binding.mode}/${binding.repoKey}/${binding.tool} no longer matches the live config`,
+    );
+  }
+
+  private async platformTaskAndDriver(taskId: string): Promise<{ task: TaskState; driver: GitDriver }> {
+    const task = await this.taskStore.get(taskId);
+    if (!task) throw new Error(`task ${taskId} not found`);
+    this.assertPlatformBinding(task);
+    const driver = this.platformDriverFor(task.projectId);
+    if (!driver) throw new Error(`no git driver resolvable for project ${task.projectId}`);
+    return { task, driver };
+  }
+
+  async listActiveGitTasks(projectId?: string): Promise<TaskState[]> {
+    const tasks = await this.taskStore.list(projectId !== undefined ? { projectId } : undefined);
+    return tasks.filter(t => t.reviewMode === 'git' && !TERMINAL_STATUSES.includes(t.status));
+  }
+
+  async platformFetchPrView(taskId: string): Promise<NormalizedRow> {
+    const { task, driver } = await this.platformTaskAndDriver(taskId);
+    if (task.prNumber === undefined) throw new Error(`task ${taskId} has no bound PR`);
+    const [row] = await driver.runOp('prView', { prNumber: task.prNumber });
+    return row!;
+  }
+
+  async platformVerifyPrBinding(
+    taskId: string,
+    prNumber: number,
+    opts: { branchOverride?: string } = {},
+  ): Promise<
+    { ok: true; headSha: string; branch: string; targetBranch: string }
+    | { ok: false; reason: PrRejection; prBranch?: string }
+  > {
+    const { task, driver } = await this.platformTaskAndDriver(taskId);
+    const [row] = await driver.runOp('prView', { prNumber });
+    let expectedBase = task.baseBranch;
+    if (expectedBase === undefined) {
+      try {
+        const [project] = await driver.runOp('projectView');
+        if (typeof project?.defaultBranch === 'string') expectedBase = project.defaultBranch;
+      } catch {
+        // 快照与实时默认分支都拿不到 → unverifiable：核验失败不是核验通过（fail closed）
+      }
+    }
+    const check = checkOpenPrBinding(row!, { branch: opts.branchOverride ?? task.branch, expectedBase });
+    if (!check.ok) {
+      return {
+        ...check,
+        ...(check.reason === 'branch' && typeof row!.branch === 'string' ? { prBranch: row!.branch } : {}),
+      };
+    }
+    return {
+      ok: true,
+      headSha: String(row!.headSha),
+      branch: String(row!.branch),
+      targetBranch: String(row!.targetBranch),
+    };
+  }
+
+  stopPhaseSignalWatcherAgent(taskId: string, agentId: string): void {
+    this.phaseSignalWatcher?.stopAgent(taskId, agentId);
+  }
+
+  async platformClosePr(taskId: string, opts: { deleteBranch: boolean }): Promise<void> {
+    const { task, driver } = await this.platformTaskAndDriver(taskId);
+    if (task.prNumber === undefined) throw new Error(`task ${taskId} has no bound PR`);
+    try {
+      await driver.runOp('close', { prNumber: task.prNumber });
+    } catch (err) {
+      throw new PlatformCloseError('close', err);
+    }
+    const branch = task.branch;
+    const deletable = opts.deleteBranch && branch !== undefined && isAutoDeletableTaskBranch({
+      taskId: task.id,
+      taskBranch: branch,
+      branchCreatedByBaxian: task.branchCreatedByBaxian,
+      actualRef: `refs/heads/${branch}`,
+    });
+    if (deletable) {
+      try {
+        await driver.runOp('deleteBranch', { branch });
+      } catch (err) {
+        throw new PlatformCloseError('deleteBranch', err);
+      }
+    }
+  }
+
+  private async platformScanComments(driver: GitDriver, prNumber: number): Promise<VerdictSourceScan[]> {
+    return scanCommentSourcesOnce(driver, prNumber, () => Date.now());
+  }
+
+  // merge-ready 迁移与 merge confirm 的 provenance/ack 双复核共用一次全源扫描（spec §6/§10）
+  async platformVerifyAcceptedPass(taskId: string): Promise<
+    { ok: true; pendingCount: number } | { ok: false; reason: string }
+  > {
+    const { task, driver } = await this.platformTaskAndDriver(taskId);
+    if (task.prNumber === undefined) return { ok: false, reason: 'no bound PR' };
+    const provenance = task.passProvenance;
+    if (!provenance) return { ok: false, reason: 'no accepted pass provenance' };
+    const scans = await this.platformScanComments(driver, task.prNumber);
+    const recheck = recheckPassProvenance({
+      token: provenance.token,
+      failToken: provenance.failToken,
+      anchorSha: provenance.anchorSha,
+      carrier: { sourceKey: provenance.sourceKey, id: provenance.id, bodyDigest: provenance.bodyDigest },
+    }, scans);
+    if (!recheck.ok) return { ok: false, reason: `provenance ${recheck.reason}` };
+    const pending = collectPendingFeedback(scans, {
+      replyActorId: task.replyActorId,
+      replyActorStatus: task.replyActorStatus,
+    });
+    if (!pending.allSourcesOk) return { ok: false, reason: 'source scan incomplete' };
+    return { ok: true, pendingCount: pending.pending.size };
+  }
+
+  async platformPendingFeedback(taskId: string): Promise<PendingFeedbackResult> {
+    const { task, driver } = await this.platformTaskAndDriver(taskId);
+    if (task.prNumber === undefined) throw new Error(`task ${taskId} has no bound PR`);
+    const scans = await this.platformScanComments(driver, task.prNumber);
+    const failed = scans.filter(s => !s.ok).map(s => s.key);
+    if (failed.length > 0) {
+      throw new Error(`pending-feedback scan incomplete; failed sources: ${failed.join(', ')}`);
+    }
+    return collectPendingFeedback(scans, {
+      replyActorId: task.replyActorId,
+      replyActorStatus: task.replyActorStatus,
+    });
+  }
+
+  async platformConfirmMerge(
+    taskId: string,
+    opts: { expectedHeadSha: string; humanOverride?: boolean },
+  ): Promise<void> {
+    const { task, driver } = await this.platformTaskAndDriver(taskId);
+    if (task.prNumber === undefined) throw new Error(`task ${taskId} has no bound PR`);
+    const prNumber = task.prNumber;
+    const [row] = await driver.runOp('prView', { prNumber });
+    const binding = checkOpenPrBinding(row!, { branch: task.branch, expectedBase: task.baseBranch });
+    if (!binding.ok) throw new Error(`merge blocked: binding ${binding.reason}`);
+    if (String(row!.headSha) !== opts.expectedHeadSha) {
+      throw new Error(`merge blocked: head moved (expected ${opts.expectedHeadSha}, saw ${String(row!.headSha)})`);
+    }
+    // 人工兜底（max_rounds Mark complete）绕过 QA 授权复核（该路径本就无 pass），
+    // binding/head/REST sha 的安全检查保留（spec §7 威胁模型：merge 有人工 confirm）
+    if (opts.humanOverride !== true) {
+      const provenance = task.passProvenance;
+      if (!provenance) throw new PlatformMergeRecheckError('no accepted pass provenance on task');
+      if (provenance.anchorSha.toLowerCase() !== opts.expectedHeadSha.toLowerCase()) {
+        throw new PlatformMergeRecheckError(
+          `pass provenance anchors ${provenance.anchorSha}, not the merge head ${opts.expectedHeadSha}`,
+        );
+      }
+      const scans = await this.platformScanComments(driver, prNumber);
+      const recheck = recheckPassProvenance({
+        token: provenance.token,
+        failToken: provenance.failToken,
+        anchorSha: provenance.anchorSha,
+        carrier: { sourceKey: provenance.sourceKey, id: provenance.id, bodyDigest: provenance.bodyDigest },
+      }, scans);
+      if (!recheck.ok) {
+        // 瞬态扫描不完整留在 gate 可重试；只有确定性失效（撤销/编辑/缺失）才退回 approved
+        if (recheck.reason === 'source-scan-incomplete') {
+          throw new Error('merge blocked: provenance source-scan-incomplete');
+        }
+        throw new PlatformMergeRecheckError(`provenance ${recheck.reason}`);
+      }
+      const pending = collectPendingFeedback(scans, {
+        replyActorId: task.replyActorId,
+        replyActorStatus: task.replyActorStatus,
+      });
+      if (!pending.allSourcesOk) throw new Error('merge blocked: pending-feedback scan incomplete');
+      if (pending.pending.size > 0) {
+        throw new PlatformMergeRecheckError(`${pending.pending.size} pending feedback revision(s) without ack`);
+      }
+    }
+    // 临门 CAS：扫描期间 durable 退回（approved/pendingRedispatch/fixing）必须使本次 Confirm 失效；
+    // REST sha 只保护 source head，保护不了评论面与 TaskState（残余网络窗口按 spec §6 如实声明）
+    const fresh = await this.taskStore.get(taskId);
+    if (!fresh
+      || (opts.humanOverride === true
+        // override 只绕过 provenance/ack，不绕过本次认领的 gate 代际：并发 RC 转 fixing 即失效
+        ? fresh.status !== 'merge-ready'
+        : (fresh.status !== 'merge-ready' && fresh.status !== 'ready'))
+      || fresh.latestHeadSha !== opts.expectedHeadSha
+      || fresh.pendingRedispatch === true) {
+      throw new Error(`merge blocked: task left its merge gate (status=${fresh?.status ?? 'gone'})`);
+    }
+    try {
+      await driver.runOp('merge', { prNumber, expectedHeadSha: opts.expectedHeadSha });
+    } catch (err) {
+      if (err instanceof DriverOpError && err.info.errorClass === 'MERGE_BLOCKED') {
+        let mergeStatus: string | undefined;
+        try {
+          const [fresh] = await driver.runOp('prView', { prNumber });
+          if (typeof fresh?.detailedMergeStatus === 'string') mergeStatus = fresh.detailedMergeStatus;
+        } catch {
+          // 归因查询失败不遮蔽原始错误
+        }
+        throw new Error(`merge blocked by platform${mergeStatus ? ` (${mergeStatus})` : ''}: ${err.message}`);
+      }
+      throw err;
+    }
+  }
+
+  mintReviewTokenPair(): { passToken: string; failToken: string } {
+
+    const passToken = createSignalToken();
+    let failToken = createSignalToken();
+    while (failToken === passToken) failToken = createSignalToken();
+    return { passToken, failToken };
+  }
+
   async listTasksByProject(projectId: string): Promise<TaskState[]> {
     return this.taskStore.list({ projectId });
   }
@@ -4512,6 +5270,8 @@ export class AgentManager {
       | 'fixDispatchedAt'
       | 'specReviewRound'
       | 'signalToken'
+      | 'passToken'
+      | 'failToken'
       | 'phase'
       | 'batchIndex'
       | 'batchTotal'
@@ -4525,6 +5285,7 @@ export class AgentManager {
       const previousStatus = task.status;
       if (TERMINAL_STATUSES.includes(previousStatus)) return null;
       if (!guard.fromStatus.includes(previousStatus)) return null;
+      // 代际 CAS（spec §7）：校验后提交前的并发换代（push/重派轮换 token+pair）使旧 verdict 失效
       if (guard.expectSignalToken !== undefined && task.signalToken !== guard.expectSignalToken) return null;
       if (patch?.branch && patch.branch !== task.branch) {
         const existing = await this.findTaskByBranch(patch.branch, task.projectId);
@@ -4753,6 +5514,7 @@ export class AgentManager {
         branch: taskBranch,
         branchCreatedByBaxian,
         reviewMode: this.effectiveReviewMode(projectId),
+        ...this.platformBindingFields(projectId),
         createdAt: now,
         updatedAt: now,
         ...(imageFilenames ? { images: imageFilenames } : {}),
@@ -4843,7 +5605,7 @@ export class AgentManager {
     const task = await this.createTask(projectId, input);
     if (task.status === 'in_progress' && task.agentId) {
       const signalToken = createSignalToken();
-      await this.updateTask(task.id, { signalToken });
+      await this.updateTask(task.id, this.dispatchTokenFields(task, signalToken));
       const dispatchLockToken = (await this.agentStore.get(task.agentId))?.lockToken;
       const start = this.startCreatedTaskSession(
         task.id,
@@ -5246,7 +6008,7 @@ export class AgentManager {
     const claimed = claim.task;
 
     const signalToken = createSignalToken();
-    await this.updateTask(claimed.id, { signalToken });
+    await this.updateTask(claimed.id, this.dispatchTokenFields(claimed, signalToken));
 
     let started = false;
     let dispatchErr: unknown = null;
@@ -6540,6 +7302,13 @@ export class AgentManager {
   }
 
   async recover(): Promise<void> {
+    // 'git' outbox 重投先行：崩溃于「效果已写、通知未达」的窗口由此闭合（spec §6），legacy 任务零涉
+    await this.flushGitOutbox().catch(err => {
+      console.warn('[AgentManager] recover: git outbox flush failed:', err);
+    });
+    await this.retryGitRemoteBranchCleanup().catch(err => {
+      console.warn('[AgentManager] recover: git remote branch cleanup retry failed:', err);
+    });
     const states = await this.agentStore.list();
     await this.releaseOrphanedLocks(states);
     const deferredCleanups: Array<{ failingAgentId: string; failedTaskIds: string[]; projectIds: string[] }> = [];
@@ -6953,7 +7722,10 @@ export class AgentManager {
       }
       const project = this.getProjectConfig(result.projectId);
       try {
-        if (project) {
+        if (project && result.reviewMode === 'git') {
+          // close 不附评论（spec §10 有意差异）；deleteBranch 由 isAutoDeletableTaskBranch 守卫
+          await this.platformClosePr(taskId, { deleteBranch: true });
+        } else if (project) {
           const close = await execNetwork(
             this.platformRunner,
             `gh pr close ${publishedCleanup.prNumber} --repo ${shellQuote(repoSlug(project.repo))} ` +
@@ -6964,6 +7736,25 @@ export class AgentManager {
         }
       } catch (err) {
         console.warn(`[AgentManager] cancelTask remote retirement failed for ${taskId}:`, err);
+        if (result.reviewMode === 'git') {
+          await this.withTaskLock(async () => {
+            const fresh = await this.taskStore.get(taskId);
+            if (!fresh) return;
+            await this.taskStore.set({
+              ...fresh,
+              branchCleanupPending: {
+                agentId: fresh.devAgentId,
+                reason: err instanceof PlatformCloseError && err.step === 'close'
+                  ? 'remote-close-failed'
+                  : 'remote-delete-failed',
+                updatedAt: new Date().toISOString(),
+              },
+              updatedAt: new Date().toISOString(),
+            });
+          }).catch(persistErr => {
+            console.warn(`[AgentManager] cancelTask cleanup marker persist failed for ${taskId}:`, persistErr);
+          });
+        }
         await this.emitIntervention(result.projectId, undefined, taskId, {
           phase: 'cancel-published-artifact-cleanup-failed',
           afterDone: publishedCleanup.afterDone,
@@ -7168,6 +7959,8 @@ export class AgentManager {
         signalToken: pre?.signalToken,
         reviewHeadAnchorSha: pre?.reviewHeadAnchorSha,
         reviewDispatchedAt: pre?.reviewDispatchedAt,
+        passToken: pre?.passToken,
+        failToken: pre?.failToken,
       };
 
       const isTerminalAtClaim = TERMINAL_STATUSES.includes(taskStatusAtClaim);
@@ -7184,8 +7977,44 @@ export class AgentManager {
       };
 
       let transitionToken: string | undefined;
+      let reviewAnchor: string | undefined;
       if (!isTerminalAtClaim) {
-        const reviewAnchor = await this.fetchPrHeadSha(taskId).catch(() => undefined);
+        let gitDispatchBlocked: string | undefined;
+        const anchorViaDriver = async (): Promise<string | undefined> => {
+          const preTask = await this.taskStore.get(taskId);
+          if (preTask?.prNumber === undefined) {
+            gitDispatchBlocked = 'no bound PR';
+            return undefined;
+          }
+          // 与收编/pr-fixed/merge 同一完整谓词：closed/draft/retarget 的 PR 派出去只会造出
+          // 不可裁决的评审轮（spec §6 统一谓词）
+          const verify = await this.platformVerifyPrBinding(taskId, preTask.prNumber);
+          if (!verify.ok) {
+            gitDispatchBlocked = `binding ${verify.reason}`;
+            return undefined;
+          }
+          return PLATFORM_HEAD_SHA_RE.test(verify.headSha) ? verify.headSha : undefined;
+        };
+        const isGitDispatch = (await this.taskStore.get(taskId))?.reviewMode === 'git';
+        reviewAnchor = await (isGitDispatch ? anchorViaDriver() : this.fetchPrHeadSha(taskId))
+          .catch(() => undefined);
+        if (isGitDispatch && reviewAnchor === undefined) {
+          // 无锚评审轮不可裁决（verdictEligible 要求 anchorSha 且 pane verdict 已退役）：
+          // 派出去只会卡死在 review，fail loud 让调用方看到确定性原因或重试瞬态失败
+          const released = await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => false);
+          if (!released) {
+            // 预检失败叠加释放失败：QA 仍绑定会让下一次派发报 busy，必须显式暴露
+            const blockedTask = await this.taskStore.get(taskId);
+            await this.emitIntervention(blockedTask?.projectId ?? '', qaId, taskId, {
+              phase: 'qa-release-failed-after-precheck',
+              qaAgentId: qaId,
+            }).catch(() => undefined);
+          }
+          if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
+          throw gitDispatchBlocked !== undefined
+            ? new ApiError(409, `Cannot dispatch git review for ${taskId}: ${gitDispatchBlocked}`)
+            : new ApiError(502, `Cannot anchor the review round for ${taskId}: platform prView failed`);
+        }
         const preDispatched = await this.transitionTaskStatus(
           taskId,
           'review',
@@ -7198,6 +8027,8 @@ export class AgentManager {
             reviewHeadAnchorSha: reviewAnchor,
             reviewDispatchedAt: new Date().toISOString(),
             signalToken: createSignalToken(),
+            // pair/pending 与新轮锚点同一原子写可见（spec §7）：两写之间崩溃不得留下无 pending 的新轮
+            ...(isGitDispatch ? { ...this.mintReviewTokenPair(), reviewDispatchPending: true } : {}),
           },
         );
         if (!preDispatched) {
@@ -7218,10 +8049,16 @@ export class AgentManager {
         if (!isTerminalAtClaim && (fresh.status !== 'review' || fresh.signalToken !== transitionToken)) {
           return { ok: false, reason: fresh.status !== 'review' ? `status=${fresh.status}` : 'pass superseded' };
         }
+        // 并发 push 在 prView 读取与本提交之间前进 head 时，本次手动锚点已陈旧（TOCTOU）
+        if (fresh.reviewMode === 'git' && fresh.latestHeadSha !== undefined
+          && reviewAnchor !== undefined && fresh.latestHeadSha !== reviewAnchor) {
+          return { ok: false, reason: 'head advanced past the manual anchor' };
+        }
         await this.taskStore.set({
           ...fresh,
           reviewRound: bumpRound ? fresh.reviewRound + 1 : fresh.reviewRound,
           signalToken: armedToken,
+          ...(fresh.reviewMode === 'git' ? { reviewDispatchPending: true } : {}),
           updatedAt: new Date().toISOString(),
         });
         return { ok: true };
@@ -7232,9 +8069,14 @@ export class AgentManager {
         throw new ApiError(409, `Task ${taskId} left its review pass during dispatch (${claim2.reason})`);
       }
 
+      const dispatchTaskAfterClaim = await this.taskStore.get(taskId);
       const armed = await this.setupPhaseSignalWatcher(
         taskId, qaId, ['pr-approved', 'pr-changes-requested'] as const, armedToken,
+        dispatchTaskAfterClaim?.reviewMode === 'git' ? { replaceScope: 'agent' } : {},
       );
+      if (armed && dispatchTaskAfterClaim?.reviewMode === 'git') {
+        await this.rearmGitReconciliationWatcher(taskId);
+      }
       if (!armed) {
         await abortDispatch(armedToken);
         throw new ApiError(500, `Failed to arm review verdict watcher for ${taskId}`);
@@ -7280,6 +8122,7 @@ export class AgentManager {
         await abortDispatch(armedToken);
         throw new ApiError(500, `Failed to start QA review session for ${taskId}`);
       }
+      await this.clearReviewDispatchPending(taskId, armedToken);
 
       const final = await this.taskStore.get(taskId);
       return final!;
@@ -7475,6 +8318,9 @@ export class AgentManager {
           qaAgentId: snapshot.qaAgentId,
           signalToken: snapshot.signalToken,
           reviewDispatchedAt: snapshot.reviewDispatchedAt,
+          // 本代新铸的 pair 从未交付 QA：不随快照恢复会让旧 QA 的在途 verdict 被拒、新 pair 无人知
+          passToken: snapshot.passToken,
+          failToken: snapshot.failToken,
           updatedAt: new Date().toISOString(),
         };
       if (!isTerminalAtClaim && !drifted) {
@@ -7494,8 +8340,10 @@ export class AgentManager {
     }
 
     if (afterRollback?.status === 'approved') {
-      const completion = await this.postApproveStore.get(taskId);
-      const task = await this.taskStore.get(taskId);
+      const completion = afterRollback.reviewMode === 'git'
+        ? this.gitCompletionOf(afterRollback)
+        : await this.postApproveStore.get(taskId);
+      const task = afterRollback;
       if (completion && task) {
         try {
           await this.startPhaseSignalWatch({
@@ -7518,22 +8366,30 @@ export class AgentManager {
 
     const restored = await this.taskStore.get(taskId);
     if (!restored || !restored.signalToken) return qaTakenOverInReview;
-    const mapped = this.mapTaskStateToExpectedWatcher(restored);
-    if (!mapped) return qaTakenOverInReview;
+    const mappings = this.mapTaskStateToExpectedWatchers(restored);
+    if (mappings.length === 0) return qaTakenOverInReview;
+    for (const mapped of mappings) {
+      try {
+        await this.startPhaseSignalWatch({
+          taskId,
+          projectId: restored.projectId,
+          agentId: mapped.agentId,
+          expectedKinds: mapped.expectedKinds,
+          token: mapped.token ?? restored.signalToken,
+          ...(mappings.length > 1 ? { replaceScope: 'agent' as const } : {}),
+        });
+      } catch (err) {
+        console.warn(
+          `[AgentManager] rollback: re-establish ${mapped.expectedKinds.join(',')} failed for task=${taskId}:`,
+          err,
+        );
+      }
+    }
+    // 回滚路径不得因 tearDown 探测失败上抛：那会顶替调用方本应抛出的 ApiError 并跳过 QA 释放
     try {
-      await this.startPhaseSignalWatch({
-        taskId,
-        projectId: restored.projectId,
-        agentId: mapped.agentId,
-        expectedKinds: mapped.expectedKinds,
-        token: restored.signalToken,
-      });
       await this.tearDownWatcherIfTaskTerminal(taskId);
     } catch (err) {
-      console.warn(
-        `[AgentManager] rollback: re-establish ${mapped.expectedKinds.join(',')} failed for task=${taskId}:`,
-        err,
-      );
+      console.warn(`[AgentManager] rollback: terminal watcher teardown failed for task=${taskId}:`, err);
     }
     return qaTakenOverInReview;
   }
@@ -7559,6 +8415,28 @@ export class AgentManager {
   } {
     if (task.phase === 'research') return { phase: 'research', kinds: ['spec-done'] };
     return { phase: 'develop', kinds: this.devInitialSignalKinds(task.reviewMode) };
+  }
+
+  private mapTaskStateToExpectedWatchers(task: TaskState): Array<{
+    expectedKinds: readonly PhaseSignalKind[];
+    agentId: string;
+    token?: string;
+  }> {
+    const single = this.mapTaskStateToExpectedWatcher(task);
+    const mappings: Array<{ expectedKinds: readonly PhaseSignalKind[]; agentId: string; token?: string }> =
+      single ? [single] : [];
+    // review 窗口内 dev/QA 双条目并存：review 之外 dev 侧另有 pr-fixed/pr-merge-ready 同 agent
+    // 期望，(taskId, agentId) 基数无法同 agent 双 token 并存——错过窗口按 fail-closed 交人工（spec §5.3 ④）
+    if (task.reviewMode === 'git' && task.status === 'review'
+      && task.replyActorStatus !== 'verified' && task.pendingPrSignalToken !== undefined
+      && task.devAgentId && task.prNumber !== undefined) {
+      mappings.push({
+        expectedKinds: ['pr-created'],
+        agentId: task.devAgentId,
+        token: task.pendingPrSignalToken,
+      });
+    }
+    return mappings;
   }
 
   private mapTaskStateToExpectedWatcher(task: TaskState): {
@@ -7617,12 +8495,13 @@ export class AgentManager {
     taskId: string,
     agentId: string,
     expectedKinds: PhaseSignalKind | readonly PhaseSignalKind[],
-    opts: { skipSnapshot?: boolean } = {},
+    opts: { skipSnapshot?: boolean; replaceScope?: 'task' | 'agent'; tokenOverride?: string } = {},
   ): Promise<boolean> {
     const task = await this.taskStore.get(taskId);
     if (!task?.signalToken) return false;
-    return this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, task.signalToken, {
+    return this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, opts.tokenOverride ?? task.signalToken, {
       skipSnapshot: opts.skipSnapshot ?? false,
+      ...(opts.replaceScope ? { replaceScope: opts.replaceScope } : {}),
     });
   }
 
@@ -7741,6 +8620,16 @@ export class AgentManager {
     if (!project) {
       throw new Error(`mergePr: unknown project ${task.projectId}`);
     }
+    if (task.reviewMode === 'git') {
+      const expectedHeadSha = opts.matchHeadSha ?? task.latestHeadSha;
+      if (!expectedHeadSha) throw new Error(`mergePr: no expected head sha for git task ${taskId}`);
+      // max_rounds 的 Mark complete 在调用前已被转成 merge-ready：override 必须显式随调用链传入
+      await this.platformConfirmMerge(taskId, {
+        expectedHeadSha,
+        ...(opts.humanOverride === true || task.status === 'max_rounds' ? { humanOverride: true } : {}),
+      });
+      return;
+    }
     const matchHead = opts.matchHeadSha
       ? ` --match-head-commit ${shellQuote(opts.matchHeadSha)}`
       : '';
@@ -7831,7 +8720,8 @@ export class AgentManager {
       }
 
       try {
-        await this.mergePr(taskId);
+        // 从 max_rounds 认领而来：人工兜底 override 必须显式随调用链传入（此刻 status 已是 merge-ready）
+        await this.mergePr(taskId, { humanOverride: true });
       } catch (err) {
         await this.transitionTaskStatus(taskId, 'max_rounds', { fromStatus: ['merge-ready'] })
           .catch(() => undefined);
@@ -8211,6 +9101,7 @@ export class AgentManager {
       skipSnapshot?: boolean;
       onReadFile?: (req: ReadFileSignal) => void;
       onlyReplaceOwnToken?: boolean;
+      replaceScope?: 'task' | 'agent';
     } = {},
   ): Promise<boolean> {
     if (!this.phaseSignalWatcher) return true;
@@ -8225,6 +9116,7 @@ export class AgentManager {
         token,
         skipSnapshot: opts.skipSnapshot ?? false,
         ...(opts.onlyReplaceOwnToken ? { onlyReplaceOwnToken: true } : {}),
+        ...(opts.replaceScope ? { replaceScope: opts.replaceScope } : {}),
         ...(opts.onReadFile ? { onReadFile: opts.onReadFile } : {}),
       });
     } catch (err) {
@@ -8265,20 +9157,52 @@ export class AgentManager {
     );
   }
 
+  // git 任务的初始 dev 派发把 pr-created 期望 token 独立持久化：评审轮轮换不得使 late
+  // publish 信号失去 reconciliation 凭据（spec §5.3 ④）。
+  dispatchTokenFields(task: TaskState, signalToken: string): Partial<TaskState> {
+    const wantsPrCreated = task.reviewMode === 'git'
+      && this.devInitialSignalKinds(task.reviewMode).includes('pr-created');
+    return { signalToken, ...(wantsPrCreated ? { pendingPrSignalToken: signalToken } : {}) };
+  }
+
+  // review 窗口内 QA verdict arm 之后重建 dev reconciliation 条目（spec §5.3 ④）：approval 路径的
+  // stop(taskId) 与 fix 轮的同键替换都会拆掉它，重入 review 时在此恢复；skipSnapshot=false 让仍在
+  // 面板滚动区的迟到信号立即重放。
+  async rearmGitReconciliationWatcher(taskId: string, opts: { skipSnapshot?: boolean } = {}): Promise<void> {
+    const task = await this.taskStore.get(taskId);
+    if (!task || task.reviewMode !== 'git' || task.status !== 'review') return;
+    if (task.replyActorStatus === 'verified' || task.pendingPrSignalToken === undefined) return;
+    if (!task.devAgentId || task.prNumber === undefined) return;
+    await this.setupPhaseSignalWatcher(taskId, task.devAgentId, ['pr-created'], task.pendingPrSignalToken, {
+      replaceScope: 'agent',
+      ...(opts.skipSnapshot ? { skipSnapshot: true } : {}),
+    }).catch(() => false);
+  }
+
   async rotateAndSetupPhaseSignal(
     taskId: string,
     agentId: string,
     expectedKinds: PhaseSignalKind | readonly PhaseSignalKind[],
   ): Promise<{ token: string; armed: boolean }> {
     const newToken = createSignalToken();
+    const task = await this.taskStore.get(taskId);
+    const kinds = typeof expectedKinds === 'string' ? [expectedKinds] : [...expectedKinds];
+    const isGit = task?.reviewMode === 'git';
+    // pair 的重铸已随「进入 review 的 transition」单写落盘（spec §7 与新轮可见性原子）；
+    // 这里只轮换 signal token 并布防
     await this.updateTask(taskId, { signalToken: newToken });
-    const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, newToken);
+    const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, newToken,
+      isGit ? { replaceScope: 'agent' } : {});
+    if (armed && isGit && kinds.includes('pr-approved')) await this.rearmGitReconciliationWatcher(taskId);
     return { token: newToken, armed };
   }
 
   async rollbackVerdictArmFailure(
     taskId: string,
-    restore: { status: TaskStatus; signalToken?: string; reviewHeadAnchorSha?: string; reviewDispatchedAt?: string },
+    restore: {
+      status: TaskStatus; signalToken?: string; reviewHeadAnchorSha?: string; reviewDispatchedAt?: string;
+      passToken?: string; failToken?: string; restorePair?: boolean;
+    },
     opts: { expect?: { status: TaskStatus; signalToken?: string }; rearmSkipSnapshot?: boolean } = {},
   ): Promise<boolean> {
     const expected = opts.expect;
@@ -8294,6 +9218,9 @@ export class AgentManager {
         signalToken: restore.signalToken,
         reviewHeadAnchorSha: restore.reviewHeadAnchorSha,
         reviewDispatchedAt: restore.reviewDispatchedAt,
+        ...(restore.restorePair === true
+          ? { passToken: restore.passToken, failToken: restore.failToken }
+          : {}),
         updatedAt: new Date().toISOString(),
       });
       return true;
@@ -8308,14 +9235,15 @@ export class AgentManager {
     const task = await this.taskStore.get(taskId);
     if (!task?.signalToken) return;
     if (TERMINAL_STATUSES.includes(task.status)) return;
-    const mapped = this.mapTaskStateToExpectedWatcher(task);
-    if (!mapped) return;
-    await this.setupPhaseSignal(
-      taskId,
-      mapped.agentId,
-      mapped.expectedKinds,
-      opts.skipSnapshot ? { skipSnapshot: true } : undefined,
-    );
+    const mappings = this.mapTaskStateToExpectedWatchers(task);
+    if (mappings.length === 0) return;
+    for (const mapped of mappings) {
+      await this.setupPhaseSignal(taskId, mapped.agentId, mapped.expectedKinds, {
+        ...(opts.skipSnapshot ? { skipSnapshot: true } : {}),
+        ...(mappings.length > 1 ? { replaceScope: 'agent' as const } : {}),
+        ...(mapped.token !== undefined ? { tokenOverride: mapped.token } : {}),
+      });
+    }
     await this.tearDownWatcherIfTaskTerminal(taskId);
   }
 
@@ -8812,7 +9740,7 @@ export class AgentManager {
       taskId,
       'in_progress',
       { fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready', 'max_rounds'] },
-      { agentId: devAgentId, phase: 'code', signalToken: newToken, maxRoundsContinues: 0 },
+      { agentId: devAgentId, phase: 'code', maxRoundsContinues: 0, ...this.dispatchTokenFields({ ...task, phase: 'code' }, newToken) },
     );
     if (!transition) {
       await this.releaseAgentForTask(devAgentId, taskId, 'idle', { allowAwaitingHuman: true })
@@ -9562,6 +10490,36 @@ export class AgentManager {
       await merge();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof PlatformMergeRecheckError && task.reviewMode === 'git' && task.status === 'merge-ready') {
+        // 复核类失效（provenance 撤销/未 ack 反馈）没有「再 Confirm」的出路：退回 approved 置
+        // durable pending 重入 post-approve 闭环（计划 Task 8），把失效授权留在 gate 只剩 Cancel
+        const retreated = await this.withTaskLock(async () => {
+          const fresh = await this.taskStore.get(task.id);
+          if (!fresh || fresh.status !== 'merge-ready') return false;
+          const approvedHead = typeof fresh.latestHeadSha === 'string' && PLATFORM_HEAD_SHA_RE.test(fresh.latestHeadSha)
+            ? fresh.latestHeadSha
+            : undefined;
+          if (approvedHead === undefined) return false;
+          await this.taskStore.set({
+            ...fresh,
+            status: 'approved',
+            postApproveHeadSha: approvedHead,
+            pendingRedispatch: true,
+            updatedAt: new Date().toISOString(),
+          });
+          return true;
+        });
+        await this.emitIntervention(task.projectId, undefined, task.id, {
+          phase: 'confirm-merge-recheck-failed',
+          gate: task.status,
+          error: message,
+          retreated,
+          note: retreated
+            ? 'Accepted pass no longer verifies; task returned to approved for the post-approve loop to re-settle.'
+            : 'Accepted pass no longer verifies and the task could not be returned automatically; inspect and re-dispatch.',
+        });
+        throw new ApiError(409, `Merge blocked for task ${task.id}: ${message}`);
+      }
       await this.emitIntervention(task.projectId, undefined, task.id, {
         phase: 'confirm-merge-failed',
         gate: task.status,

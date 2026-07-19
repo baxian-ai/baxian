@@ -2094,7 +2094,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
     await m.rearmPhaseSignalForCurrentPass('task-review');
 
-    expect(setupSpy).toHaveBeenCalledWith('task-review', expect.any(String), ['pr-fixed'], undefined);
+    expect(setupSpy).toHaveBeenCalledWith('task-review', expect.any(String), ['pr-fixed'], {});
   });
 
   it('rejects spec-phase max_rounds with 409 (server-style manual review only runs from in_progress/review/fixing)', async () => {
@@ -9109,7 +9109,7 @@ describe('AgentManager max_rounds manual actions', () => {
 
       const result = await manager.markTaskComplete('task-mr');
 
-      expect(mergeSpy).toHaveBeenCalledWith('task-mr');
+      expect(mergeSpy).toHaveBeenCalledWith('task-mr', { humanOverride: true });
       const merged = events.find(e => e.type === 'pr.merged' && e.taskId === 'task-mr');
       expect(merged).toBeTruthy();
       expect(merged!.data).toMatchObject({ prNumber: 42 });
@@ -9168,7 +9168,7 @@ describe('AgentManager max_rounds manual actions', () => {
       });
       const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
       await manager.markTaskComplete('task-mr');
-      expect(mergeSpy).toHaveBeenCalledWith('task-mr');
+      expect(mergeSpy).toHaveBeenCalledWith('task-mr', { humanOverride: true });
     });
 
     it('surfaces a merge failure as 409, rolls back to max_rounds, and does not emit pr.merged', async () => {

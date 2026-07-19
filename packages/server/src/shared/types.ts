@@ -225,6 +225,36 @@ export interface TaskState {
   postApproveRevoked?: { reason: 'request-changes' | 'redispatch-cap'; at: string };
   // Approved head persisted at post-approve dispatch; the only SHA a completion rebuild may trust.
   postApproveHeadSha?: string;
+  passToken?: string;
+  failToken?: string;
+  // Publish-dispatch pr-created expectation survives review-round token rotation until
+  // actor reconciliation completes or the task terminates (spec §5.3 ④).
+  pendingPrSignalToken?: string;
+  // 'git' post-approve completion token lives on the task so effect fields and consumption
+  // keys share one durable write (spec §6); legacy github keeps PostApproveStore until M3c.
+  postApproveToken?: string;
+  // installed → prompt injected (delivered) → merge-ready received (signaled): recovery/sweep
+  // must not re-inject into a mid-prompt dev, and must redispatch once the signal was consumed.
+  postApprovePhase?: 'installed' | 'delivered' | 'signaled';
+  // Set inside the review-entering transition, cleared after the QA session starts: the
+  // same-head/same-PR replay guards stay permeable until a QA round provably dispatched.
+  reviewDispatchPending?: boolean;
+  // Identity trio snapshot at creation (spec §4): the lock covers online edits, this
+  // fingerprint fails offline edits closed before any platform op runs.
+  platformBinding?: { mode: string; repoKey: string; tool: string };
+  // expectedBase snapshot taken at adoption/signal verification; immutable afterwards (spec §6).
+  baseBranch?: string;
+  replyActorId?: string;
+  replyActorStatus?: 'verified' | 'provisional';
+  // cleared keeps the generation counter across reopen so the next close mints a fresh event key.
+  closedUnmergedAnchor?: { prNumber: number; generation: number; cleared?: boolean };
+  // Self-contained pair snapshot at acceptance: recheck must see the round's failToken even after re-mints.
+  passProvenance?: { sourceKey: string; id: string; bodyDigest: string; token: string; failToken: string; anchorSha: string };
+  // revision key -> versionTime; effect fields and these keys persist in the same write (spec §6).
+  consumedFeedback?: Record<string, number>;
+  outbox?: Array<{ key: string; type: 'human.intervention'; data: Record<string, unknown> }>;
+  pendingRedispatch?: boolean;
+  redispatchCount?: number;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;

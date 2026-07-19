@@ -1,20 +1,18 @@
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
 import { computeBackoffMs } from '../timing/backoff.js';
-import type { MappedEvent } from '../github/mapper.js';
-import { computePollerHealth } from '../github/poller.js';
+import { computePollerHealth } from './poller-health.js';
 import type { PollerSnapshot } from '../shared/types.js';
 import { BRANCH_PREFIX } from '../shared/constants.js';
 import { repoIdentityKey } from '../shared/git-url.js';
-import type { CommentSourceOp } from './types.js';
+import type { CommentSourceOp, MappedEvent } from './types.js';
 import { DriverOpError, type OpVars } from './git-driver.js';
 import type { NormalizedRow } from './row-schema.js';
 import { versionTimeOf } from './row-schema.js';
 import { CommentCursorStore } from './comment-cursor.js';
 import { VerdictEngine, type VerdictSourceScan } from './verdict-engine.js';
-import {
-  ackCarrierKey, ackRevisionKey, classifyCommentSource, collectValidAcks, projectCommentRow,
-  rowAcks, rowBodyDigest, rowHasBody, rowTokens, type AckCarrierRow,
-} from './markers.js';
+import { collectValidAcks } from './markers.js';
+import { buildAckCarrierRows, feedbackEventTarget, scanCommentSourcesOnce } from './feedback.js';
+import { checkPrBinding, type BindingCheck } from './pr-binding.js';
 
 export interface PlatformTaskView {
   taskId: string;
@@ -30,6 +28,9 @@ export interface PlatformTaskView {
   replyActorId?: string;
   replyActorStatus?: 'verified' | 'provisional';
   closedUnmergedAnchor?: boolean;
+  // 裁决只在评审窗口内产出：fixing/approved 期间 pair 仍在（spec §7 pair 按轮轮换），
+  // 重启清空内存投递指纹后历史裁决不得借当前 signalToken 重新授权
+  inReview?: boolean;
 }
 
 export type PlatformTasksProvider = (projectId: string) => Promise<PlatformTaskView[]>;
@@ -58,6 +59,10 @@ export interface PlatformPollerOptions {
   onEvent: (projectId: string, event: MappedEvent) => void | Promise<void>;
   tasks: PlatformTasksProvider;
   now?: () => number;
+  // 消费键修剪单向（spec §6）：对应源 cursor durable 落盘成功后才通知，回调失败不影响本源
+  onCursorCommitted?: (
+    taskId: string, prNumber: number, sourceKey: string, watermarkTime: number,
+  ) => void | Promise<void>;
 }
 
 interface EntryStatus {
@@ -98,7 +103,6 @@ interface CycleFailure {
   errorClass?: string;
 }
 
-type BindingCheck = { kind: 'mismatch'; mismatch: string } | { kind: 'unverifiable' };
 
 // 限流后必须停止请求并退避（GitHub 平台要求，持续触发 secondary limit 会招致封禁）：
 // 命中即短路该 entry 本周期剩余工作，退避窗口内整周期跳过，成功周期重置。
@@ -376,17 +380,11 @@ export class PlatformPoller {
     prRow: NormalizedRow,
     defaultBranch: string | undefined,
   ): BindingCheck | undefined {
-    if (task.branch === undefined || String(prRow.branch) !== task.branch) {
-      return { kind: 'mismatch', mismatch: 'branch' };
-    }
-    if (prRow.sourceProjectId === null || prRow.sourceProjectId === undefined
-      || prRow.sourceProjectId !== prRow.targetProjectId) {
-      return { kind: 'mismatch', mismatch: 'fork' };
-    }
-    const expected = task.expectedBase ?? defaultBranch;
-    if (expected === undefined) return { kind: 'unverifiable' };
-    if (String(prRow.targetBranch) !== expected) return { kind: 'mismatch', mismatch: 'target' };
-    return undefined;
+    return checkPrBinding(prRow, {
+      branch: task.branch,
+      expectedBase: task.expectedBase,
+      ...(defaultBranch !== undefined ? { defaultBranch } : {}),
+    });
   }
 
   private async pollListPrs(
@@ -477,7 +475,10 @@ export class PlatformPoller {
             continue;
           }
         }
-        await this.emit(entry, 'pr.created', { ...base, headSha: String(row.headSha), targetBranch: target });
+        await this.emit(entry, 'pr.created', {
+          ...base, headSha: String(row.headSha), targetBranch: target,
+          ...(typeof row.prAuthorId === 'string' ? { prAuthorId: row.prAuthorId } : {}),
+        });
         entry.baseMismatch.delete(prNumber);
       } catch (e) {
         fail(`adopt pr#${prNumber}`, e);
@@ -578,7 +579,8 @@ export class PlatformPoller {
     // 缺失**或空白**的事件会绕过既有 handler 的令牌比对（guard 是 truthy 双与，两个空值照样
     // 通过）——缺任一资格即清候选，跨不可裁决状态存活的候选会把恢复后首个扫描当成第二个
     // 确认周期（spec §6 verdict ③）。
-    const verdictEligible = prRow.draft === false
+    const verdictEligible = task.inReview === true
+      && prRow.draft === false
       && task.passToken !== undefined && task.failToken !== undefined
       && anchorSha !== undefined
       && task.signalToken !== undefined && task.signalToken.trim() !== ''
@@ -618,6 +620,7 @@ export class PlatformPoller {
         currentHeadSha: String(freshRow.headSha),
         submittedAt: decision.submittedAt,
         reviewPassToken: task.signalToken,
+        verdictToken: decision.token,
         verdictConflict: decision.conflict,
         verdictCarrier: decision.carrier,
       });
@@ -633,39 +636,13 @@ export class PlatformPoller {
     base: { prNumber: number; prUrl: string; branch: string },
     fail: (context: string, e: unknown) => void,
   ): Promise<VerdictSourceScan[]> {
-    const scans: VerdictSourceScan[] = [];
-    for (const source of entry.driver.commentSources) {
-      const sourceClass = classifyCommentSource(source);
-      const scanStartedAt = this.now();
-      let rows: NormalizedRow[];
-      try {
-        rows = await entry.driver.runCommentSource(source, { prNumber: base.prNumber }, pageRows => {
-          for (const row of pageRows) projectCommentRow(row);
-          return pageRows;
-        });
-      } catch (e) {
-        fail(`listComments[${source.key}] pr#${base.prNumber}`, e);
-        scans.push({ key: source.key, sourceClass, ok: false, scanStartedAt, rows: [] });
-        continue;
-      }
-      // system note（GitLab push/label/state 类）不入裁决/ack/反馈任何通道（spec §6 过滤矩阵）；
-      // github 三源恒无该字段。fake driver 可能不走投影钩子，过滤统一收在此处。
-      scans.push({ key: source.key, sourceClass, ok: true, scanStartedAt, rows: rows.filter(r => r.system !== true) });
-    }
+    const scans = await scanCommentSourcesOnce(entry.driver, base.prNumber, this.now,
+      (key, error) => fail(`listComments[${key}] pr#${base.prNumber}`, error));
 
     // ack 完成集跨源计算一次：issue 类顶层 ack 可指向任意源的 revision，threaded 隶属
     // 也要全源行集解析；已 ack 的 revision 即 dev 已处置——cursor 重置/源删重加后再变 fresh
     // 也不得重发反馈事件（ack 是 durable 处置证据，ledger 只是投递优化）。
-    const ackRows: AckCarrierRow[] = scans.flatMap(scan => scan.rows.map(row => ({
-      sourceKey: scan.key,
-      sourceClass: scan.sourceClass,
-      id: String(row.id),
-      authorId: typeof row.authorId === 'string' ? row.authorId : undefined,
-      discussionId: row.discussionId === null || row.discussionId === undefined ? null : String(row.discussionId),
-      acks: rowAcks(row),
-      carriesToken: rowTokens(row).length > 0,
-    })));
-    const ackCollection = collectValidAcks(ackRows, {
+    const ackCollection = collectValidAcks(buildAckCarrierRows(scans), {
       replyActorId: task.replyActorId,
       replyActorStatus: task.replyActorStatus,
     });
@@ -686,20 +663,16 @@ export class PlatformPoller {
       }
       let delivered = true;
       for (const row of fresh) {
-        if (!rowHasBody(row)) continue;
-        // 携任何 verdict 令牌行走裁决通道；有效 ack 载体行是 dev 回复——两类都不合成反馈事件（spec §6 矩阵）。
-        if (rowTokens(row).length > 0) continue;
-        const id = String(row.id);
-        if (ackCollection.carrierRowKeys.has(ackCarrierKey(scan.key, id))) continue;
-        const digest = rowBodyDigest(row);
-        if (ackCollection.acks.has(ackRevisionKey(scan.key, id, digest))) continue;
+        const target = feedbackEventTarget(row, scan.key, ackCollection);
+        if (target === undefined) continue;
+        const { id, digest } = target;
         if (entry.cursor!.isDelivered(view, id, digest)) continue;
         try {
           await this.emit(entry, 'pr.updated', {
             ...base,
             kind: scan.sourceClass === 'threaded' ? 'review-comment' : 'comment',
             commentId: row.id,
-            revision: { sourceKey: scan.key, id, bodyDigest: digest },
+            revision: { sourceKey: scan.key, id, bodyDigest: digest, versionTime: versionTimeOf(row) },
             ...(scan.sourceClass === 'threaded' && row.discussionId !== null && row.discussionId !== undefined
               ? { reviewCommentReply: true }
               : {}),
@@ -715,6 +688,15 @@ export class PlatformPoller {
           await entry.cursor!.commitSource(task.taskId, base.prNumber, scan.key, scan.rows, cutoff);
         } catch (e) {
           fail(`listComments[${scan.key}] cursor commit pr#${base.prNumber}`, e);
+          continue;
+        }
+        const committed = entry.cursor!.source(task.taskId, base.prNumber, scan.key).watermarkTime;
+        if (committed !== null) {
+          try {
+            await this.opts.onCursorCommitted?.(task.taskId, base.prNumber, scan.key, committed);
+          } catch (e) {
+            console.warn(`[PlatformPoller] onCursorCommitted(${scan.key}) failed:`, e instanceof Error ? e.message : e);
+          }
         }
       }
     }

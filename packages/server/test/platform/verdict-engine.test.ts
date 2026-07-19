@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { VerdictEngine, type VerdictSourceScan } from '../../src/platform/verdict-engine.js';
-import { buildReviewTokenLine } from '../../src/platform/markers.js';
+import { VerdictEngine, recheckPassProvenance, type VerdictSourceScan } from '../../src/platform/verdict-engine.js';
+import { buildReviewTokenLine , projectCommentRow } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
 
@@ -249,5 +249,23 @@ describe('VerdictEngine: candidate stability', () => {
     engine.dropCandidate('task-1', 42);
     expect(engine.evaluate(at(NOW + 30_000))).toBe(undefined);
     expect(engine.evaluate(at(NOW + 60_000))).toMatchObject({ kind: 'pass' });
+  });
+});
+
+describe('provenance carrier token integrity', () => {
+  it('rejects a carrier row that no longer parses the recorded pass pair', () => {
+    const record = {
+      token: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', anchorSha: 'a'.repeat(40),
+      carrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: bodyDigest('just words, no marker') },
+    };
+    const row: Record<string, unknown> = {
+      id: 'r1', body: 'just words, no marker',
+      createdAt: '2026-07-17T01:02:03Z', updatedAt: '2026-07-17T01:02:03Z',
+    };
+    projectCommentRow(row);
+    const result = recheckPassProvenance(record, [
+      { key: 'reviews', sourceClass: 'reviews', ok: true, scanStartedAt: 0, rows: [row] },
+    ]);
+    expect(result).toEqual({ ok: false, reason: 'carrier-token-missing' });
   });
 });

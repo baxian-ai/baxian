@@ -50,6 +50,18 @@ describe('resolveEventRouting', () => {
     expect(result).toEqual({});
   });
 
+  it('routes a repo-identity-keyed event exactly like the legacy slug form', async () => {
+    const ctx = await createTestContext(tempDir);
+    await seedTask(ctx.taskStore, { id: 'task-009' });
+    expect(ctx.agentManager.getProjectByRepoIdentity('github.com/user/repo')?.id).toBe('proj');
+    const result = await resolveEventRouting(ctx.agentManager, {
+      type: 'pr.created',
+      repo: 'github.com/user/repo',
+      data: { branch: 'bx/task-009' },
+    });
+    expect(result.taskId).toBe('task-009');
+  });
+
   it('routes via bx/<task-id> branch when project matches', async () => {
     const ctx = await createTestContext(tempDir);
     await seedTask(ctx.taskStore, { id: 'task-007' });

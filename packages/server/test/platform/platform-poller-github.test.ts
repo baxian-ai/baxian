@@ -89,7 +89,7 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
     Object.assign(tasks[0]!, {
       prNumber: 42, latestHeadSha: SHA, anchorSha: ANCHOR,
       passToken: PASS, failToken: FAIL, signalToken: 'signal-tok-1',
-      replyActorId: '77', replyActorStatus: 'verified',
+      replyActorId: '77', replyActorStatus: 'verified', inReview: true,
     });
     world.reviews = [ghReview(900, `findings body\n${buildReviewTokenLine({ kind: 'fail', anchorSha: ANCHOR, token: FAIL })}`, 'CHANGES_REQUESTED')];
     world.issueComments = [ghIssueComment(300, 'please also fix naming')];

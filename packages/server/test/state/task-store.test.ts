@@ -443,3 +443,57 @@ describe('TaskStore sanitize', () => {
     expect(onDisk).toEqual(task);
   });
 });
+
+describe('TaskStore git review fields', () => {
+  const gitFields: Partial<TaskState> = {
+    reviewMode: 'git',
+    passToken: 'abcdef123456',
+    failToken: '123456abcdef',
+    baseBranch: 'main',
+    replyActorId: '77',
+    replyActorStatus: 'verified',
+    closedUnmergedAnchor: { prNumber: 42, generation: 1 },
+    passProvenance: {
+      sourceKey: 'reviews', id: '900', bodyDigest: 'a'.repeat(64),
+      token: 'abcdef123456', failToken: '123456abcdef', anchorSha: 'a'.repeat(40),
+    },
+    consumedFeedback: { 'issue-comments:100:aa': 1700000000000 },
+    outbox: [{ key: 't1:42:mr-closed-unmerged:1', type: 'human.intervention', data: { phase: 'mr-closed-unmerged' } }],
+    pendingRedispatch: true,
+    redispatchCount: 2,
+  };
+
+  it('round-trips the git field family through set and get', async () => {
+    await store.set(makeTask('task-400', gitFields));
+    const loaded = await store.get('task-400');
+    expect(loaded).toMatchObject(gitFields);
+  });
+
+  it('accepts reviewMode git on load', async () => {
+    await writeUnsanitizedTask('task-401', { reviewMode: 'git' });
+    const loaded = await store.get('task-401');
+    expect(loaded?.reviewMode).toBe('git');
+  });
+
+  it('rejects malformed git field shapes on load', async () => {
+    const bad: Array<[string, Record<string, unknown>]> = [
+      ['replyActorStatus', { replyActorStatus: 'trusted' }],
+      ['passToken', { passToken: 'short' }],
+      ['failToken', { failToken: 42 }],
+      ['closedUnmergedAnchor', { closedUnmergedAnchor: { prNumber: 0, generation: 1 } }],
+      ['closedUnmergedAnchor', { closedUnmergedAnchor: { prNumber: 42 } }],
+      ['passProvenance', { passProvenance: { sourceKey: 'reviews', id: '1' } }],
+      ['consumedFeedback', { consumedFeedback: { key: 'not-a-number' } }],
+      ['consumedFeedback', { consumedFeedback: ['issue-comments:1:aa'] }],
+      ['outbox', { outbox: [{ key: '', type: 'human.intervention', data: {} }] }],
+      ['outbox', { outbox: [{ key: 'k', type: 'other', data: {} }] }],
+      ['outbox', { outbox: { key: 'k' } }],
+      ['pendingRedispatch', { pendingRedispatch: 'yes' }],
+      ['redispatchCount', { redispatchCount: -1 }],
+    ];
+    for (const [field, raw] of bad) {
+      await writeUnsanitizedTask(`task-bad-${field}-${JSON.stringify(raw).length}`, raw);
+      await expect(store.get(`task-bad-${field}-${JSON.stringify(raw).length}`), field).rejects.toThrow(field);
+    }
+  });
+});

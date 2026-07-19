@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildPhaseSignal,
   createSignalToken,
+  decodeSignalActorId,
   PHASE_SIGNAL_KINDS,
   scanNeedInputSignals,
   scanPhaseSignals,
@@ -79,6 +80,53 @@ describe('phase signal protocol', () => {
     expect(scanPhaseSignals(wrapped)).toEqual([
       { kind: 'pr-created', prNumber: 123, token: 'abc123def456' },
     ]);
+  });
+
+  it('extracts the optional actor segment from a five-segment pr-created', () => {
+    expect(scanPhaseSignals('[bx:pr-created:42:Nzc:abcdef123456]')).toEqual([
+      { kind: 'pr-created', prNumber: 42, actorB64: 'Nzc', token: 'abcdef123456' },
+    ]);
+  });
+
+  it('keeps the last segment as token when actor and token share the charset', () => {
+    expect(scanPhaseSignals('[bx:pr-created:42:abcdef123456:bbbbbb123456]')).toEqual([
+      { kind: 'pr-created', prNumber: 42, actorB64: 'abcdef123456', token: 'bbbbbb123456' },
+    ]);
+  });
+
+  it('reassembles a soft-wrapped actor segment without loss', () => {
+    const wrapped = '[bx:pr-created:4\n  2:Nz\n  c:abc12\n  3def456]';
+    expect(scanPhaseSignals(wrapped)).toEqual([
+      { kind: 'pr-created', prNumber: 42, actorB64: 'Nzc', token: 'abc123def456' },
+    ]);
+  });
+
+  it('drops a pr-created whose actor segment carries out-of-charset bytes', () => {
+    expect(scanPhaseSignals('[bx:pr-created:42:has.dot:abcdef123456]')).toEqual([]);
+  });
+
+  it('builds a five-segment pr-created when an actor is supplied', () => {
+    expect(buildPhaseSignal('pr-created', 'abc123def456', 42, 'Nzc'))
+      .toBe('[bx:pr-created:42:Nzc:abc123def456]');
+    expect(buildPhaseSignal('pr-created', 'abc123def456', 42))
+      .toBe('[bx:pr-created:42:abc123def456]');
+  });
+
+  it('decodes base64url actor ids back to the exact byte string', () => {
+    expect(decodeSignalActorId('Nzc')).toBe('77');
+    expect(decodeSignalActorId('MDExMDU1NTQ4')).toBe('011055548');
+    expect(decodeSignalActorId(Buffer.from('bot[7]:x', 'utf8').toString('base64url'))).toBe('bot[7]:x');
+    expect(decodeSignalActorId(Buffer.from('机器人-77', 'utf8').toString('base64url'))).toBe('机器人-77');
+  });
+
+  it('rejects malformed, oversized, and control-character actor payloads', () => {
+    expect(decodeSignalActorId('')).toBeUndefined();
+    expect(decodeSignalActorId('abcde')).toBeUndefined();
+    expect(decodeSignalActorId('Nzc=')).toBeUndefined();
+    expect(decodeSignalActorId(Buffer.from('x'.repeat(129), 'utf8').toString('base64url'))).toBeUndefined();
+    expect(decodeSignalActorId(Buffer.from('x'.repeat(128), 'utf8').toString('base64url'))).toBe('x'.repeat(128));
+    expect(decodeSignalActorId(Buffer.from('a\tb', 'utf8').toString('base64url'))).toBeUndefined();
+    expect(decodeSignalActorId(Buffer.from([0x61, 0xff, 0x62]).toString('base64url'))).toBeUndefined();
   });
 
   it('strips ANSI escape sequences before matching', () => {

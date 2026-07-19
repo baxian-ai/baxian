@@ -11,7 +11,7 @@ export async function resolveEventRouting(
   manager: AgentManager,
   event: MappedEvent,
 ): Promise<ResolvedRouting> {
-  const projectId = manager.getProjectByRepo(event.repo)?.id;
+  const projectId = (manager.getProjectByRepo(event.repo) ?? manager.getProjectByRepoIdentity(event.repo))?.id;
   if (!projectId) return {};
 
   const branch = (event.data.branch as string | undefined) ?? '';

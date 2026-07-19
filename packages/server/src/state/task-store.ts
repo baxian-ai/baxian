@@ -18,7 +18,11 @@ const TASK_FIELDS = [
   'status', 'createdAt', 'updatedAt', 'images',
   'reviewMode', 'batchIndex', 'batchTotal', 'reviewCheckoutMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
   'postApproveRevoked', 'postApproveHeadSha', 'verdictOverdue',
+  'passToken', 'failToken', 'pendingPrSignalToken', 'postApproveToken', 'postApprovePhase', 'reviewDispatchPending', 'platformBinding', 'baseBranch', 'replyActorId', 'replyActorStatus',
+  'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'pendingRedispatch', 'redispatchCount',
 ] as const;
+
+const REVIEW_TOKEN_RE = /^[0-9a-f]{12}$/;
 
 const TASK_STATUSES = new Set<TaskStatus>([
   'pending', 'in_progress', 'review', 'fixing', 'spec-ready', 'approved', 'merge-ready',
@@ -105,8 +109,9 @@ function validateTask(raw: Record<string, unknown>): void {
   )) {
     throw taskSchemaError('images', 'an array of non-empty strings when present');
   }
-  if (raw.reviewMode !== undefined && raw.reviewMode !== 'github' && raw.reviewMode !== 'server') {
-    throw taskSchemaError('reviewMode', 'github or server when present');
+  if (raw.reviewMode !== undefined && raw.reviewMode !== 'github' && raw.reviewMode !== 'server'
+    && raw.reviewMode !== 'git') {
+    throw taskSchemaError('reviewMode', 'github, server, or git when present');
   }
   if (raw.reviewCheckoutMode !== undefined
     && raw.reviewCheckoutMode !== 'head' && raw.reviewCheckoutMode !== 'base') {
@@ -135,6 +140,7 @@ function validateTask(raw: Record<string, unknown>): void {
     }
     requireString(revoked, 'at');
   }
+  validateGitReviewFields(raw);
   const participantIds = [raw.devAgentId, raw.qaAgentId, raw.researchAgentId]
     .filter((value): value is string => typeof value === 'string' && value !== '');
   if (new Set(participantIds).size !== participantIds.length) {
@@ -149,6 +155,72 @@ function validateTask(raw: Record<string, unknown>): void {
   if (raw.phase === undefined && raw.researchAgentId !== undefined) {
     throw taskSchemaError('phase', 'research when a research participant is present');
   }
+}
+
+function validateGitReviewFields(raw: Record<string, unknown>): void {
+  for (const field of ['passToken', 'failToken']) {
+    const value = raw[field];
+    if (value !== undefined && (typeof value !== 'string' || !REVIEW_TOKEN_RE.test(value))) {
+      throw taskSchemaError(field, 'a 12-hex review token when present');
+    }
+  }
+  optionalString(raw, 'pendingPrSignalToken');
+  optionalString(raw, 'postApproveToken');
+  if (raw.postApprovePhase !== undefined
+    && raw.postApprovePhase !== 'installed' && raw.postApprovePhase !== 'delivered'
+    && raw.postApprovePhase !== 'signaled') {
+    throw taskSchemaError('postApprovePhase', 'installed, delivered, or signaled when present');
+  }
+  optionalBoolean(raw, 'reviewDispatchPending');
+  if (raw.platformBinding !== undefined) {
+    const binding = raw.platformBinding;
+    const keys = ['mode', 'repoKey', 'tool'];
+    if (!isRecord(binding) || keys.some(key => typeof binding[key] !== 'string' || (binding[key] as string).trim() === '')) {
+      throw taskSchemaError('platformBinding', 'a { mode, repoKey, tool } identity record when present');
+    }
+  }
+  optionalString(raw, 'baseBranch');
+  optionalString(raw, 'replyActorId');
+  if (raw.replyActorStatus !== undefined
+    && raw.replyActorStatus !== 'verified' && raw.replyActorStatus !== 'provisional') {
+    throw taskSchemaError('replyActorStatus', 'verified or provisional when present');
+  }
+  if (raw.closedUnmergedAnchor !== undefined) {
+    const anchor = raw.closedUnmergedAnchor;
+    if (!isRecord(anchor)
+      || !Number.isInteger(anchor.prNumber) || (anchor.prNumber as number) < 1
+      || !Number.isInteger(anchor.generation) || (anchor.generation as number) < 1
+      || (anchor.cleared !== undefined && typeof anchor.cleared !== 'boolean')) {
+      throw taskSchemaError('closedUnmergedAnchor', 'a { prNumber >= 1, generation >= 1 } record when present');
+    }
+  }
+  if (raw.passProvenance !== undefined) {
+    const prov = raw.passProvenance;
+    const keys = ['sourceKey', 'id', 'bodyDigest', 'token', 'failToken', 'anchorSha'];
+    if (!isRecord(prov) || keys.some(key => typeof prov[key] !== 'string' || (prov[key] as string).trim() === '')) {
+      throw taskSchemaError('passProvenance', 'a carrier provenance record when present');
+    }
+  }
+  if (raw.consumedFeedback !== undefined) {
+    const consumed = raw.consumedFeedback;
+    if (!isRecord(consumed) || Array.isArray(consumed)
+      || Object.values(consumed).some(v => typeof v !== 'number' || !Number.isFinite(v))) {
+      throw taskSchemaError('consumedFeedback', 'a record of finite versionTime numbers when present');
+    }
+  }
+  if (raw.outbox !== undefined) {
+    const outbox = raw.outbox;
+    const validEntry = (entry: unknown): boolean =>
+      isRecord(entry)
+      && typeof entry.key === 'string' && entry.key.trim() !== ''
+      && entry.type === 'human.intervention'
+      && isRecord(entry.data);
+    if (!Array.isArray(outbox) || !outbox.every(validEntry)) {
+      throw taskSchemaError('outbox', 'an array of pending notification entries when present');
+    }
+  }
+  optionalBoolean(raw, 'pendingRedispatch');
+  optionalInteger(raw, 'redispatchCount', 0);
 }
 
 function sanitizeTask(state: unknown): TaskState {

@@ -1,3 +1,11 @@
+import type { EventType } from '../shared/types.js';
+
+export interface MappedEvent {
+  type: EventType;
+  repo: string;
+  data: Record<string, unknown>;
+}
+
 export interface PluginManifest {
   name: string;
   version: string;

@@ -183,7 +183,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           agents: remaining.map(a => a.id),
         });
       }
-
       const next: BaxianConfig = {
         ...app.ctx.config,
         project: app.ctx.config.project.filter(p => p.id !== id),
@@ -199,9 +198,28 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         throw err;
       }
 
-      await saveConfig(app.ctx.configPath!, validated);
-      app.ctx.config = validated;
-      applyConfigHotReload(app.ctx, validated);
+      // 扫描与删除提交经 manager 任务锁同栅栏：并发 createTask 不能在检查后为该项目落新 git 任务
+      const guarded = await app.ctx.agentManager.guardGitConfigCommit(
+        app.ctx.config,
+        validated,
+        async (manager) => {
+          const active = await manager.listActiveGitTasks(id);
+          return active.length > 0 ? [{ projectId: id, taskIds: active.map(t => t.id) }] : [];
+        },
+        async () => {
+          await saveConfig(app.ctx.configPath!, validated);
+          app.ctx.config = validated;
+          applyConfigHotReload(app.ctx, validated);
+        },
+      );
+      if (!guarded.ok) {
+        return reply.status(409).send({
+          error:
+            `Project "${id}" still has ${guarded.blockers[0]!.taskIds.length} active git-mode task(s); ` +
+            `wait for them to finish or cancel them before deleting the project.`,
+          tasks: guarded.blockers[0]!.taskIds,
+        });
+      }
       return reply.status(200).send({ removed: id, restartRequired: false });
     });
   });

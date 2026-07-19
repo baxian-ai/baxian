@@ -106,7 +106,7 @@ let events: MappedEvent[];
 let failEventMatch: ((e: MappedEvent) => boolean) | undefined;
 let clockNow = T0;
 
-function makePoller() {
+function makePoller(extra: Partial<ConstructorParameters<typeof PlatformPoller>[0]> = {}) {
   const poller = new PlatformPoller({
     onEvent: (_projectId, event) => {
       if (failEventMatch?.(event)) throw new Error('delivery rejected');
@@ -114,6 +114,7 @@ function makePoller() {
     },
     tasks: async () => tasks,
     now: () => clockNow,
+    ...extra,
   });
   poller.add({ projectId: 'p1', repoUrl: REPO, driver, statePath: platformPollerStatePath(dir, REPO) });
   return poller;
@@ -144,7 +145,7 @@ describe('PlatformPoller: adoption predicate', () => {
       { taskId: 'task-5', terminal: false, branch: 'bx/task-5', expectedBase: 'release' },
     ];
     driver.listPrsRows = [
-      prRow(),
+      prRow({ prAuthorId: '77' }),
       prRow({ prNumber: 43, branch: 'bx/task-2', draft: true }),
       prRow({ prNumber: 44, branch: 'bx/task-3', sourceProjectId: null }),
       prRow({ prNumber: 45, branch: 'bx/task-4', sourceProjectId: '8' }),
@@ -153,8 +154,16 @@ describe('PlatformPoller: adoption predicate', () => {
     await makePoller().poll();
     expect(ofType('pr.created')).toHaveLength(1);
     expect(ofType('pr.created')[0]!.data).toMatchObject({
-      prNumber: 42, branch: 'bx/task-1', headSha: SHA1, targetBranch: 'main',
+      prNumber: 42, branch: 'bx/task-1', headSha: SHA1, targetBranch: 'main', prAuthorId: '77',
     });
+  });
+
+  it('omits prAuthorId from adoption when the row does not carry one', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' }];
+    driver.listPrsRows = [prRow()];
+    await makePoller().poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect('prAuthorId' in ofType('pr.created')[0]!.data).toBe(false);
   });
 
   it('without a base snapshot compares against the cycle default branch and escalates mismatches', async () => {
@@ -442,7 +451,7 @@ describe('PlatformPoller: verdict integration', () => {
   beforeEach(() => {
     tasks = [{
       taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
-      anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig-token-123',
+      anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig-token-123', inReview: true,
     }];
     driver.prViews.set(42, prRow());
   });
@@ -536,7 +545,7 @@ describe('PlatformPoller: durability and retention', () => {
   it('retries a failed pass delivery on the very next cycle', async () => {
     tasks = [{
       taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
-      anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig',
+      anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig', inReview: true,
     }];
     driver.prViews.set(42, prRow());
     driver.comments['reviews'] = [comment('r1', `LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`)];
@@ -649,7 +658,7 @@ describe('PlatformPoller: sub-poll binding predicate', () => {
   beforeEach(() => {
     tasks = [{
       taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
-      expectedBase: 'main', anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig',
+      expectedBase: 'main', anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig', inReview: true,
     }];
     driver.comments['reviews'] = [comment('r1', `LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`)];
   });
@@ -913,5 +922,33 @@ describe('PlatformPoller: reentrancy', () => {
     const poller = makePoller();
     await Promise.all([poller.poll(), poller.poll()]);
     expect(ofType('pr.updated')).toHaveLength(1);
+  });
+});
+
+describe('PlatformPoller: cursor commit notification', () => {
+  it('notifies per source only after the cursor is durably committed', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42,
+      expectedBase: 'main', replyActorId: '77', replyActorStatus: 'verified',
+    }];
+    driver.prViews.set(42, prRow());
+    driver.comments['issue-comments'] = [comment('c1', 'feedback', OLD_TS)];
+    driver.comments['inline-comments'] = [];
+    driver.comments['reviews'] = new Error('HTTP 500');
+    const committed: Array<[string, number, string, number]> = [];
+    const poller = makePoller({
+      onCursorCommitted: (taskId, prNumber, sourceKey, watermarkTime) => {
+        committed.push([taskId, prNumber, sourceKey, watermarkTime]);
+      },
+    });
+    await poller.poll();
+    const keys = committed.map(([, , key]) => key);
+    expect(keys).toContain('issue-comments');
+    expect(keys).not.toContain('reviews');
+    for (const [taskId, prNumber, , watermark] of committed) {
+      expect(taskId).toBe('task-1');
+      expect(prNumber).toBe(42);
+      expect(watermark).toBe(Date.parse(OLD_TS));
+    }
   });
 });

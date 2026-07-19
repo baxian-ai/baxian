@@ -9,6 +9,7 @@ import {
 } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
 import { applyConfigHotReload } from '../config/hot-reload.js';
+import { gitBindingBlockers } from './platform-guard.js';
 import { agentIsLive } from '../agent/liveness.js';
 
 function hostRefKey(host: unknown): string {
@@ -190,12 +191,28 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      await saveConfig(app.ctx.configPath!, validated);
-      app.ctx.config = validated;
-
       const mustRestart = requiresRestart(current.server, validated.server);
-      if (!mustRestart) {
-        applyConfigHotReload(app.ctx, validated);
+      // 扫描与提交经 manager 任务锁成栅栏：与 createTask 的「读配置快照+落任务」串行，
+      // 关闭「扫描时无任务 → 并发建任务 → 提交换身份」的 TOCTOU（spec §4 活动任务锁）
+      const committed = await app.ctx.agentManager.guardGitConfigCommit(
+        current,
+        validated,
+        (manager, cur, next) => gitBindingBlockers(manager, cur, next),
+        async () => {
+          await saveConfig(app.ctx.configPath!, validated);
+          app.ctx.config = validated;
+          if (!mustRestart) {
+            applyConfigHotReload(app.ctx, validated);
+          }
+        },
+      );
+      if (!committed.ok) {
+        return reply.status(409).send({
+          error:
+            'cannot change the review mode, repo, or gitCli tool of a project with active git-mode tasks; '
+            + 'wait for them to finish or cancel them first',
+          blockers: committed.blockers,
+        });
       }
 
       if (app.ctx.errorRecordStore) {

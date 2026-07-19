@@ -27,7 +27,7 @@ import { PaneStreamerManager } from './agent/pane-streamer-manager.js';
 import { EventBroker } from './event/broker.js';
 import { EventPublisher } from './event/publish.js';
 import { autoBootstrapAgentIds, bootstrapAutoRepos } from './agent/bootstrap.js';
-import { registerEventHandlers } from './event/handlers.js';
+import { registerEventHandlers, recoverGitPostApprovePending } from './event/handlers.js';
 import { registerServerEventHandlers } from './event/server-handlers.js';
 import { GitHubPoller, pollerStatePathFor } from './github/poller.js';
 import { resolveEventRouting } from './github/resolver.js';
@@ -35,6 +35,7 @@ import { createRunner, resolveAgentHost } from './agent/runner.js';
 import type { AgentConfig, HostConfig } from './shared/index.js';
 import { isGitHubRepo, repoSlug } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
+import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
 import { buildApp } from './app.js';
 import { RestartCoordinator } from './lifecycle/restart.js';
@@ -101,7 +102,8 @@ export async function startServer(configPath?: string): Promise<void> {
     for (const line of pluginsResult.fatal) console.error(line);
     process.exit(1);
   }
-  // M2 接线点：registry 交给 GitHubPoller/git-driver runner 消费；本里程碑只加载校验、fail-fast。
+  // M3a：registry 注入 AgentManager 供 'git' 路径 live 解析；poller 装配切换留 M3c。
+  const pluginRegistry = pluginsResult.registry;
 
   const processLock = new ProcessLock(stateDir);
   try {
@@ -121,12 +123,14 @@ export async function startServer(configPath?: string): Promise<void> {
     }
   };
   let appRef: Awaited<ReturnType<typeof buildApp>> | null = null;
+  let stopBackgroundRunners: () => void = () => undefined;
   let shuttingDown = false;
   const SHUTDOWN_GRACE_MS = 8000;
   const gracefulShutdown = async (exitCode: number): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     try {
+      stopBackgroundRunners();
       if (appRef) {
         await Promise.race([
           appRef.close(),
@@ -188,6 +192,7 @@ export async function startServer(configPath?: string): Promise<void> {
       skillRegistry: registry,
       paneStreamerManager,
       postApproveStore,
+      pluginRegistry,
       errorRecordStore,
       reviewStore,
       imageStagingRoot: `${stateDir}/state/task-images`,
@@ -203,6 +208,25 @@ export async function startServer(configPath?: string): Promise<void> {
     });
     await agentManager.recover();
     registerEventHandlers(eventBus, agentManager);
+    // 'git' 专属恢复（阀关下无任务恒 no-op）：durable pendingRedispatch 的补派
+    await recoverGitPostApprovePending(eventBus, agentManager).catch(err => {
+      console.warn('[index] recoverGitPostApprovePending failed:', err);
+    });
+    // outbox 的进程内重试（spec §6 至少一次）：closed-unmerged 锚会停子轮询、observed 缓存抑制
+    // 重复观察，滞留条目不能只等重启补投
+    const gitOutboxFlusher = new PeriodicTaskRunner({
+      name: 'GitMaintenance',
+      intervalMs: 60_000,
+      // durable pending 的运行时消费（spec §6 至少一次）：outbox 补投 + post-approve 补派 + 评审派发重试
+      run: async () => {
+        await agentManager.flushGitOutbox();
+        await recoverGitPostApprovePending(eventBus, agentManager);
+        await agentManager.retryPendingGitReviewDispatches();
+      },
+      onError: e => console.warn('[GitMaintenance] sweep failed:', e),
+    });
+    gitOutboxFlusher.start();
+    stopBackgroundRunners = () => gitOutboxFlusher.stop();
     registerServerEventHandlers(eventBus, agentManager);
     await agentManager.setupRecoveredPostApproveSignals();
     await agentManager.setupRecoveredSpecSignals();

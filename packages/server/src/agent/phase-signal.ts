@@ -34,7 +34,7 @@ export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
 
 export type PhaseSignal =
   | { kind: 'spec-fixed'; token: string }
-  | { kind: 'pr-created'; token: string; prNumber: number }
+  | { kind: 'pr-created'; token: string; prNumber: number; actorB64?: string }
   | { kind: 'pr-approved'; token: string }
   | { kind: 'pr-changes-requested'; token: string }
   | { kind: 'pr-fixed'; token: string }
@@ -53,8 +53,9 @@ const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const OSC_PATTERN = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;
 
 const TOKEN_RANGE = '[A-Za-z0-9_-]{6,64}';
+const ACTOR_B64_RANGE = '[A-Za-z0-9_-]{1,256}';
 const COMPACT_SIGNAL_RE_PR_CREATED = new RegExp(
-  `\\[bx:(pr-created):(\\d+):(${TOKEN_RANGE})\\]`,
+  `\\[bx:(pr-created):(\\d+)(?::(${ACTOR_B64_RANGE}))?:(${TOKEN_RANGE})\\]`,
   'g',
 );
 const COMPACT_SIGNAL_RE_PLAIN = new RegExp(
@@ -78,6 +79,7 @@ export function buildPhaseSignal(
   kind: 'pr-created',
   token: string,
   prNumber: number,
+  actorB64?: string,
 ): string;
 export function buildPhaseSignal(
   kind: 'code-ready',
@@ -88,12 +90,15 @@ export function buildPhaseSignal(
   kind: PhaseSignalKind,
   token: string,
   prNumber?: number,
+  actorB64?: string,
 ): string {
   if (kind === 'pr-created') {
     if (prNumber === undefined) {
       throw new Error('buildPhaseSignal(pr-created) requires prNumber');
     }
-    return `[bx:pr-created:${prNumber}:${token}]`;
+    return actorB64 === undefined
+      ? `[bx:pr-created:${prNumber}:${token}]`
+      : `[bx:pr-created:${prNumber}:${actorB64}:${token}]`;
   }
   if (kind === 'code-ready' && prNumber !== undefined) {
     return `[bx:code-ready:${prNumber}:${token}]`;
@@ -105,6 +110,20 @@ export function createSignalToken(): string {
   return randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
+export function decodeSignalActorId(actorB64: string): string | undefined {
+  if (!/^[A-Za-z0-9_-]+$/.test(actorB64) || actorB64.length % 4 === 1) return undefined;
+  const bytes = Buffer.from(actorB64, 'base64url');
+  if (bytes.length === 0 || bytes.length > 128) return undefined;
+  const text = bytes.toString('utf8');
+  // 精确相等比较要求无损解码：无效 UTF-8 会被替换字符吞掉差异，一律拒收
+  if (!Buffer.from(text, 'utf8').equals(bytes)) return undefined;
+  for (const ch of text) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return undefined;
+  }
+  return text;
+}
+
 export function scanPhaseSignals(text: string): PhaseSignal[] {
   const stripped = stripSignalAnsi(text);
   const compact = stripped.replace(/\s+/g, '');
@@ -112,7 +131,10 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
   for (const m of compact.matchAll(COMPACT_SIGNAL_RE_PR_CREATED)) {
     const prNumber = Number.parseInt(m[2], 10);
     if (!Number.isFinite(prNumber)) continue;
-    found.push({ index: m.index ?? 0, signal: { kind: 'pr-created', prNumber, token: m[3] } });
+    found.push({
+      index: m.index ?? 0,
+      signal: { kind: 'pr-created', prNumber, ...(m[3] !== undefined ? { actorB64: m[3] } : {}), token: m[4] },
+    });
   }
   for (const m of compact.matchAll(COMPACT_SIGNAL_RE_CODE_READY)) {
     const prNumber = m[2] === undefined ? undefined : Number.parseInt(m[2], 10);
