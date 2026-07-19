@@ -467,47 +467,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
                 ? t.taskDetail.specReadyNoticeResearch(task.specReviewRound ?? 0)
                 : t.taskDetail.specReadyNotice(task.specReviewRound ?? 0)}
             </div>
-            <div className="mt-3 flex flex-col gap-2">
-              <textarea
-                value={specComments}
-                onChange={e => setSpecComments(e.target.value)}
-                placeholder={t.taskDetail.specCommentsPlaceholder}
-                rows={3}
-                disabled={specSubmitting}
-                className={inputCls}
-              />
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={specSubmitting}
-                  onClick={handleSpecApprove}
-                  className="btn-primary"
-                >
-                  {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specApproveButton}
-                </button>
-                <button
-                  type="button"
-                  disabled={specSubmitting || specComments.trim() === ''}
-                  onClick={handleSpecReject}
-                  title={specComments.trim() === ''
-                    ? t.taskDetail.specRejectTitleEmpty
-                    : t.taskDetail.specRejectTitleReady(task.researchAgentId ? 'Research' : 'Dev')}
-                  className="btn-secondary"
-                >
-                  {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specReject}
-                </button>
-                {task.researchAgentId && (
-                  <button
-                    type="button"
-                    disabled={specSubmitting}
-                    onClick={handleSpecArchive}
-                    className="btn-secondary"
-                  >
-                    {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specArchiveButton}
-                  </button>
-                )}
-              </div>
-            </div>
+            {renderSpecVerdictControls(task)}
           </div>
         )}
 
@@ -527,6 +487,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
               {t.taskDetail.specMaxRoundsBody}
             </div>
             <ReviewSummary taskId={task.id} />
+            {renderSpecVerdictControls(task)}
           </div>
         )}
 
@@ -562,6 +523,52 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         </pre>
 
         <ReviewConversation task={task} />
+      </div>
+    );
+  }
+
+  function renderSpecVerdictControls(task: TaskState) {
+    return (
+      <div className="mt-3 flex flex-col gap-2">
+        <textarea
+          value={specComments}
+          onChange={e => setSpecComments(e.target.value)}
+          placeholder={t.taskDetail.specCommentsPlaceholder}
+          rows={3}
+          disabled={specSubmitting}
+          className={inputCls}
+        />
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={specSubmitting}
+            onClick={handleSpecApprove}
+            className="btn-primary"
+          >
+            {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specApproveButton}
+          </button>
+          <button
+            type="button"
+            disabled={specSubmitting || specComments.trim() === ''}
+            onClick={handleSpecReject}
+            title={specComments.trim() === ''
+              ? t.taskDetail.specRejectTitleEmpty
+              : t.taskDetail.specRejectTitleReady(task.researchAgentId ? 'Research' : 'Dev')}
+            className="btn-secondary"
+          >
+            {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specReject}
+          </button>
+          {task.researchAgentId && (
+            <button
+              type="button"
+              disabled={specSubmitting}
+              onClick={handleSpecArchive}
+              className="btn-secondary"
+            >
+              {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specArchiveButton}
+            </button>
+          )}
+        </div>
       </div>
     );
   }

@@ -9,6 +9,7 @@ import {
   userConfigPath,
   createDefaultConfig,
 } from './config/loader.js';
+import { loadPluginsOrExplain } from './platform/startup.js';
 import { initStateDir } from './state/init.js';
 import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
@@ -95,7 +96,12 @@ export async function startServer(configPath?: string): Promise<void> {
   const config = await loadConfig(cfgPath);
 
   const stateDir = resolveStateDir(cfgPath);
-  await initStateDir(stateDir);
+  const [pluginsResult] = await Promise.all([loadPluginsOrExplain(config), initStateDir(stateDir)]);
+  if ('fatal' in pluginsResult) {
+    for (const line of pluginsResult.fatal) console.error(line);
+    process.exit(1);
+  }
+  // M2 接线点：registry 交给 GitHubPoller/git-driver runner 消费；本里程碑只加载校验、fail-fast。
 
   const processLock = new ProcessLock(stateDir);
   try {

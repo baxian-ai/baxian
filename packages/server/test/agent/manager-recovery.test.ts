@@ -580,6 +580,23 @@ describe('recover()', () => {
     expect(watchSpy).toHaveBeenCalledWith('dev-1');
   });
 
+  it('does NOT roll back a develop pass replayed by a takeover restart (marker finalized before recover)', async () => {
+    await seedAgent({
+      id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
+      bootstrappingTaskId: 'task-1', workdir: '/tmp/repo',
+    });
+    await seedTask({ id: 'task-1', signalToken: 'replay-tok-1' });
+    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await expect(manager.redispatchTaskPromptAfterReplRestart('dev-1', 'task-1')).resolves.toBe(true);
+
+    const { cleanupSpy } = await runRecovery({ agents: [], tasks: [] });
+
+    expect(cleanupSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+    expect((await agentStore.get('dev-1'))?.taskId).toBe('task-1');
+    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
+  });
+
   it('does NOT roll back a delivered task held on a failed marker-clear (bootstrap-marker-clear-failed)', async () => {
     const { cleanupSpy } = await runRecovery({
       agents: [{
@@ -642,7 +659,10 @@ describe('setupRecoveredPostApproveSignals()', () => {
   }
 
   it('sets up approved tasks with stored completion records', async () => {
-    await seedTask({ id: 'task-approved', reviewRound: 1, status: 'approved' });
+    await seedTask({
+      id: 'task-approved', reviewRound: 1, status: 'approved',
+      postApproveHeadSha: 'a'.repeat(40),
+    });
     await manager.setPostApproveCompletion('task-approved', {
       token: 'tok',
       approvedHeadSha: 'a'.repeat(40),
@@ -704,9 +724,118 @@ describe('setupRecoveredPostApproveSignals()', () => {
     expect(watcher.start).not.toHaveBeenCalled();
   });
 
+  it('a stored completion without a persisted approved head is not re-armed', async () => {
+    await seedTask({ id: 'task-approved-headless', reviewRound: 1, status: 'approved' });
+    await manager.setPostApproveCompletion('task-approved-headless', {
+      token: 'tok-a',
+      approvedHeadSha: 'a'.repeat(40),
+    });
+    const watcher = {
+      start: vi.fn(async () => true),
+      stop: vi.fn(),
+    };
+    manager = new AgentManager({
+      config: CONFIG,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: new EventBus(new EventLog(join(tempDir, 'events-headless'))),
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => noopRunner(),
+      postApproveStore: manager['postApproveStore'],
+      phaseSignalWatcher: watcher as never,
+    });
+
+    await manager.setupRecoveredPostApproveSignals();
+
+    expect(watcher.start).not.toHaveBeenCalled();
+    await expect(manager.getPostApproveCompletion('task-approved-headless')).resolves.toMatchObject({
+      token: 'tok-a',
+    });
+  });
+
+  it('a stored completion bound to another episode head is retired without re-arming', async () => {
+    await seedTask({ id: 'task-approved-crossed', reviewRound: 1, status: 'approved' });
+    await manager.setPostApproveCompletion('task-approved-crossed', {
+      token: 'tok-a',
+      approvedHeadSha: 'a'.repeat(40),
+    });
+    const seeded = await taskStore.get('task-approved-crossed');
+    await taskStore.set({ ...seeded!, postApproveHeadSha: 'c'.repeat(40) });
+    const watcher = {
+      start: vi.fn(async () => true),
+      stop: vi.fn(),
+    };
+    manager = new AgentManager({
+      config: CONFIG,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: new EventBus(new EventLog(join(tempDir, 'events-crossed'))),
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => noopRunner(),
+      postApproveStore: manager['postApproveStore'],
+      phaseSignalWatcher: watcher as never,
+    });
+
+    await manager.setupRecoveredPostApproveSignals();
+
+    expect(watcher.start).not.toHaveBeenCalled();
+    await expect(manager.getPostApproveCompletion('task-approved-crossed')).resolves.toBeNull();
+  });
+
+  it('a leftover completion from a previous approved episode cannot push a rebooted approved task to merge-ready', async () => {
+    const token = 'stalepasstok';
+    // Episode A left its completion behind; episode B re-approved but crashed before persisting its head.
+    await seedTask({ id: 'task-approved-leftover', reviewRound: 2, status: 'approved' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-approved-leftover', paneId: '%1' });
+    await manager.setPostApproveCompletion('task-approved-leftover', {
+      token,
+      approvedHeadSha: 'a'.repeat(40),
+    });
+
+    const manualConfig: BaxianConfig = {
+      ...CONFIG,
+      project: CONFIG.project.map(p => ({ ...p, merge: null })),
+    };
+    const eventsDir = join(tempDir, 'events-post-approve-leftover');
+    await mkdir(eventsDir, { recursive: true });
+    const localBus = new EventBus(new EventLog(eventsDir));
+    const watcher = new PhaseSignalWatcher({
+      paneStreamerManager: snapshotPaneStreamerManager(`done\n${buildPhaseSignal('pr-merge-ready', token)}\n`),
+      eventBus: localBus,
+      resolveAgent: (id) => (
+        id === 'dev-1' ? { ...CONFIG.project[0]!.agent[0]![0]!, projectId: 'proj' } : undefined
+      ),
+    });
+    manager = new AgentManager({
+      config: manualConfig,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: localBus,
+      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
+      runnerFactory: () => noopRunner(),
+      postApproveStore: manager['postApproveStore'],
+      phaseSignalWatcher: watcher,
+    });
+    registerEventHandlers(localBus, manager);
+
+    await manager.setupRecoveredPostApproveSignals();
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    expect((await taskStore.get('task-approved-leftover'))?.status).toBe('approved');
+    await expect(manager.getPostApproveCompletion('task-approved-leftover')).resolves.toMatchObject({
+      token,
+    });
+  });
+
   it('replays a recovered pr-merge-ready snapshot for manual-merge projects', async () => {
     const token = 'posttok12345';
-    await seedTask({ id: 'task-approved-manual', reviewRound: 1, status: 'approved' });
+    await seedTask({
+      id: 'task-approved-manual', reviewRound: 1, status: 'approved',
+      postApproveHeadSha: 'b'.repeat(40),
+    });
     await seedAgent({ id: 'dev-1', taskId: 'task-approved-manual', paneId: '%1' });
     await manager.setPostApproveCompletion('task-approved-manual', {
       token,

@@ -696,8 +696,122 @@ describe('TmuxManager', () => {
     it('accepts a prompt at exactly 80KB (boundary inside the cap)', async () => {
       const cap = 80 * 1024;
       const prompt = 'x'.repeat(cap);
-      await expect(tmux.injectPrompt('%0', prompt, 'dev-1')).resolves.toBeUndefined();
+      await expect(tmux.injectPrompt('%0', prompt, 'dev-1')).resolves.toEqual({ pasted: true });
       expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('stagePromptBuffer + pasteStagedBuffer split the inject into separate execs on one named buffer', async () => {
+      const { buf } = await tmux.stagePromptBuffer('%0', 'hello world', 'dev-1');
+      expect(buf).toMatch(/^baxian-dev-1-[0-9a-f-]{36}$/);
+      await tmux.pasteStagedBuffer('%0', buf);
+
+      expect(runner.exec).toHaveBeenCalledTimes(2);
+      const [loadCmd, pasteCmd] = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(loadCmd).toContain('tmux load-buffer');
+      expect(loadCmd).not.toContain('paste-buffer');
+      expect(loadCmd).toContain(buf);
+      expect(pasteCmd).toContain('tmux paste-buffer');
+      expect(pasteCmd).toContain(buf);
+      expect(pasteCmd).toMatch(/-d -p -r/);
+    });
+
+    it('dropStagedBuffer deletes the staged buffer and surfaces failures', async () => {
+      await tmux.dropStagedBuffer('baxian-dev-1-buf');
+      expect(lastCmd(runner)).toContain("tmux delete-buffer -b 'baxian-dev-1-buf'");
+
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no buffer', exitCode: 1 });
+      await expect(tmux.dropStagedBuffer('baxian-dev-1-buf')).rejects.toThrow(/no buffer/);
+    });
+
+    it('reconciles an unknown-outcome staging by retiring the buffer before rethrowing', async () => {
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'connection reset', exitCode: 255 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/outcome unknown/);
+      const cmds = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(cmds.some(cmd => cmd.includes('delete-buffer'))).toBe(true);
+    });
+
+    it('staging transport failure retires the possibly-created buffer before rethrowing', async () => {
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('load-buffer')) throw new Error('ssh channel died');
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/ssh channel died/);
+      const cmds = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(cmds.some(cmd => cmd.includes('delete-buffer'))).toBe(true);
+    });
+
+    it('an unconfirmed cleanup is loud and keeps the buffer credential in the error', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'connection reset', exitCode: 255 };
+        if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'connection reset by peer', exitCode: 255 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      const err = await tmux.stagePromptBuffer('%0', 'prompt', 'dev-1').then(
+        () => { throw new Error('expected rejection'); },
+        (e: unknown) => e as Error,
+      );
+      expect(err.message).toMatch(/outcome unknown/);
+      const bufMatch = err.message.match(/staged buffer (baxian-dev-1-[0-9a-f-]{36}) may persist remotely/);
+      expect(bufMatch).not.toBeNull();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(bufMatch![1]!));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('exit 255'));
+      warn.mockRestore();
+    });
+
+    it('a definite missing-buffer answer counts as retired, not a cleanup failure', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'connection reset', exitCode: 255 };
+        if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'no buffer baxian-dev-1-x', exitCode: 1 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/outcome unknown/);
+      await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.not.toThrow(/may persist remotely/);
+      expect(warn).not.toHaveBeenCalled();
+      expect(info).toHaveBeenCalledWith(expect.stringContaining('retired staged buffer'));
+      warn.mockRestore();
+      info.mockRestore();
+    });
+
+    it('a transport-thrown load with an unprobeable cleanup logs the surviving credential', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('load-buffer')) throw new Error('ssh channel died');
+        if (cmd.includes('delete-buffer')) return { stdout: '', stderr: '', exitCode: 255 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/ssh channel died/);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(/buffer baxian-dev-1-[0-9a-f-]{36} may persist remotely.*exit 255/),
+      );
+      warn.mockRestore();
+    });
+
+    it('a definite staging failure does not probe the buffer', async () => {
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'bad option', exitCode: 1 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+
+      await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/bad option/);
+      const cmds = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
+      expect(cmds.some(cmd => cmd.includes('delete-buffer'))).toBe(false);
+    });
+
+    it('stagePromptBuffer rejects an oversized prompt before issuing any tmux command', async () => {
+      const prompt = 'x'.repeat(80 * 1024 + 1);
+      await expect(tmux.stagePromptBuffer('%0', prompt, 'dev-1')).rejects.toThrow(/prompt too large/);
+      expect(runner.exec).not.toHaveBeenCalled();
     });
 
     it('rejects a prompt over 80KB before issuing any tmux command (deterministic error)', async () => {

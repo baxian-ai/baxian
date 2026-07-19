@@ -399,7 +399,7 @@ export const zhCN: Messages = {
     codeMaxRoundsTitle: (round) => `评审已达 ${round} 轮上限`,
     codeMaxRoundsBody: '可「标记完成」先合并成果，或「继续一轮」再修订。剩余问题建议另开任务，轮次越多 agent 越容易偏题。',
     specMaxRoundsTitle: (round) => `Spec 评审已达 ${round} 轮上限`,
-    specMaxRoundsBody: '多轮未达成一致，任务已暂停。可「重试」新建任务从头跑，或「取消」。建议先看评审记录定位分歧、细化描述后再重试。',
+    specMaxRoundsBody: '多轮未达成一致，任务已暂停。可「批准」采用当前 Spec 进入编码，「打回」补充意见再评一轮（上限 +1），或「重试」/「取消」。建议先看评审记录定位分歧。',
     noDescription: '（无描述）',
     noLinkedAgent: '暂无关联 Agent',
     cancelling: '取消中…',

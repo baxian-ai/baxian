@@ -62,6 +62,8 @@ export interface PhaseSignalWatcherStartArgs {
   onNeedInput?: (pending: boolean) => void;
   skipSnapshot?: boolean;
   recovered?: boolean;
+  // A fenced (re)arm may replace its own token's watch but never a successor's rotated one.
+  onlyReplaceOwnToken?: boolean;
 }
 
 function normalizeKinds(
@@ -78,7 +80,11 @@ export class PhaseSignalWatcher {
   constructor(private readonly deps: PhaseSignalWatcherDeps) {}
 
   async start(args: PhaseSignalWatcherStartArgs): Promise<boolean> {
-    this.stop(args.taskId);
+    const preexisting = this.entries.get(args.taskId);
+    if (args.onlyReplaceOwnToken && preexisting && preexisting.expectedToken !== args.token) {
+      return false;
+    }
+    // The old entry keeps consuming until the replacement subscription exists; a failed start must not orphan the signal.
     const expectedKinds = normalizeKinds(args.expectedKinds);
     const kindsLabel = [...expectedKinds].join(',');
 
@@ -135,6 +141,15 @@ export class PhaseSignalWatcher {
       return false;
     }
 
+    // A successor may have armed while the subscription was in flight.
+    const raced = this.entries.get(args.taskId);
+    if (raced) {
+      if (args.onlyReplaceOwnToken && raced.expectedToken !== args.token) {
+        try { sub.unsubscribe(); } catch {}
+        return false;
+      }
+      this.stop(args.taskId);
+    }
     entry.unsubscribe = sub.unsubscribe;
     this.entries.set(args.taskId, entry);
 
@@ -147,6 +162,14 @@ export class PhaseSignalWatcher {
   stop(taskId: string): void {
     const entry = this.entries.get(taskId);
     if (!entry) return;
+    this.entries.delete(taskId);
+    try { entry.unsubscribe(); } catch {}
+  }
+
+  // Token-fenced teardown: a stale pass undoing its own arm must never kill a successor's watcher.
+  stopIfToken(taskId: string, expectedToken: string): void {
+    const entry = this.entries.get(taskId);
+    if (!entry || entry.expectedToken !== expectedToken) return;
     this.entries.delete(taskId);
     try { entry.unsubscribe(); } catch {}
   }

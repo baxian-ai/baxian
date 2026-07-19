@@ -56,6 +56,10 @@ export const RESEARCH_DOCS_DIR = '.baxian/research';
 export const USER_CONFIG_REL = '.baxian/config.json';
 export const USER_STATE_REL = '.baxian';
 
+export const TOOL_PATTERN = /^[a-z][a-z0-9-]*$/;
+// 行协议值防注入是同一不变量（spec §4）：config 的 repo/binary/notes 与插件 driver env 模板值共用此谓词，防多处字面量漂移。
+export const CONTROL_CHAR_RE = /\p{Cc}/u;
+
 export type DispatchPhase =
   | 'develop'
   | 'research'

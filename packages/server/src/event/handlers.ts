@@ -8,7 +8,7 @@ import {
   type TaskState,
 } from '../shared/index.js';
 import type { EventBus } from './bus.js';
-import { type AgentManager, DispatchTerminalError, EnsureSessionError } from '../agent/manager.js';
+import { type AgentManager, DispatchTerminalError, EnsureSessionError, isRecoverableQaDispatchHold } from '../agent/manager.js';
 
 type InterventionData = Record<string, unknown> & { phase: string };
 const HEAD_SHA_RE = /^[0-9a-f]{40}$/i;
@@ -130,12 +130,42 @@ async function dispatchDevPostApproveCheck(
     return;
   }
 
+  // Persisted after acquire and only while still approved: a stale write would forge rebuild evidence.
+  const headPersisted = await manager.updateTaskIfStatus(task.id, 'approved', {
+    postApproveHeadSha: approvedHeadSha,
+  }, { signalToken: task.signalToken, reviewRound: task.reviewRound });
+  if (!headPersisted) {
+    await manager.markAgentWaiting(task.agentId, task.id)
+      .catch(err => {
+        console.error(
+          `[EventHandler] post-approve head persist refused for task=${task.id}; release failed:`,
+          err,
+        );
+      });
+    return;
+  }
+
   const signalToken = createSignalToken();
-  await manager.setPostApproveCompletion(task.id, {
-    token: signalToken,
-    approvedHeadSha,
-    ...(typeof opts.redispatchCount === 'number' ? { redispatchCount: opts.redispatchCount } : {}),
-  });
+  const installed = await manager.setPostApproveCompletion(
+    task.id,
+    {
+      token: signalToken,
+      approvedHeadSha,
+      ...(typeof opts.redispatchCount === 'number' ? { redispatchCount: opts.redispatchCount } : {}),
+    },
+    // A fresh human verdict unlocks a standing revocation; automated redispatches never do.
+    { clearRevocation: typeof opts.redispatchCount !== 'number' },
+  );
+  if (!installed) {
+    await manager.markAgentWaiting(task.agentId, task.id)
+      .catch(err => {
+        console.error(
+          `[EventHandler] post-approve install refused by revocation for task=${task.id}; release failed:`,
+          err,
+        );
+      });
+    return;
+  }
 
   let resumed = false;
   let dispatchErr: unknown = null;
@@ -237,7 +267,7 @@ async function handlePrMergeReady(
     return;
   }
 
-  const [freshTask, freshCompletion] = await Promise.all([
+  const [freshTask, entryCompletion] = await Promise.all([
     manager.getTask(taskNow.id),
     manager.getPostApproveCompletion(taskNow.id),
   ]);
@@ -245,7 +275,10 @@ async function handlePrMergeReady(
     !freshTask
     || freshTask.status !== 'approved'
     || freshTask.agentId !== taskNow.agentId
-    || freshCompletion?.token !== signalToken
+    || freshTask.postApproveRevoked !== undefined
+    || entryCompletion?.token !== signalToken
+    || freshTask.postApproveHeadSha === undefined
+    || entryCompletion.approvedHeadSha !== freshTask.postApproveHeadSha
   ) {
     await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
       phase: 'post-approve-merge-skipped-stale-task',
@@ -253,35 +286,52 @@ async function handlePrMergeReady(
     return;
   }
 
-  if (freshCompletion.pendingRedispatch) {
-    const nextCount = (freshCompletion.redispatchCount ?? 0) + 1;
-    if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-      await manager.clearPostApproveCompletion(freshTask.id);
-      await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
-        phase: 'post-approve-redispatch-cap-exceeded',
-        redispatchCount: freshCompletion.redispatchCount ?? 0,
-        cap: POST_APPROVE_REDISPATCH_CAP,
-      });
+  // A pending flag landing between the check and the transition re-enters here instead of losing the feedback.
+  let freshCompletion = entryCompletion;
+  for (;;) {
+    if (freshCompletion.pendingRedispatch) {
+      const nextCount = (freshCompletion.redispatchCount ?? 0) + 1;
+      if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+        const revoked = await manager.revokePostApproveCompletion(freshTask.id, 'redispatch-cap', {
+          expectedToken: freshCompletion.token,
+        });
+        if (!revoked) {
+          // The pass rotated after the entry re-validation; this merge-ready and its cap decision are stale.
+          await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+            phase: 'post-approve-merge-skipped-stale-task',
+          });
+          return;
+        }
+        await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
+          phase: 'post-approve-redispatch-cap-exceeded',
+          redispatchCount: freshCompletion.redispatchCount ?? 0,
+          cap: POST_APPROVE_REDISPATCH_CAP,
+        });
+        return;
+      }
+      await dispatchDevPostApproveCheck(
+        bus,
+        manager,
+        freshTask,
+        freshCompletion.approvedHeadSha,
+        { redispatchCount: nextCount },
+      );
       return;
     }
-    await dispatchDevPostApproveCheck(
-      bus,
-      manager,
-      freshTask,
-      freshCompletion.approvedHeadSha,
-      { redispatchCount: nextCount },
-    );
-    return;
-  }
 
-  const readied = await manager.transitionTaskStatus(
-    freshTask.id,
-    'merge-ready',
-    { fromStatus: ['approved'] },
-    { latestHeadSha: freshCompletion.approvedHeadSha },
-  );
-  if (readied) {
-    await manager.clearPostApproveCompletionIfMatches(freshTask.id, signalToken);
+    const completed = await manager.completeApprovedPassToMergeReady(freshTask.id, signalToken);
+    if ('task' in completed) return;
+    if (completed.refused === 'pending') {
+      const latest = await manager.getPostApproveCompletion(freshTask.id);
+      if (latest?.token === signalToken) {
+        freshCompletion = latest;
+        continue;
+      }
+    }
+    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
+    return;
   }
 }
 
@@ -315,45 +365,72 @@ async function handlePrFeedback(
   if (taskNow.status !== 'approved') return;
   if (!isNewFeedback) return;
 
-  const completion = await manager.getPostApproveCompletion(taskNow.id);
+  let completion = await manager.getPostApproveCompletion(taskNow.id);
   if (!completion) {
     await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
       phase: 'post-approve-approved-head-unavailable',
     });
     return;
   }
-  const devState = await manager.getAgentState(taskNow.agentId);
-  if (devState?.taskId === taskNow.id) {
-    if (!completion.pendingRedispatch) {
-      await manager.setPostApproveCompletion(taskNow.id, {
-        token: completion.token,
-        approvedHeadSha: completion.approvedHeadSha,
-        ...(typeof completion.redispatchCount === 'number'
-          ? { redispatchCount: completion.redispatchCount } : {}),
-        pendingRedispatch: true,
-      });
-    }
-    return;
-  }
-  const nextCount = (completion.redispatchCount ?? 0) + 1;
-  if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-    await manager.clearPostApproveCompletion(taskNow.id);
+  // Rotated successors are installed under a head CAS, so only the entry snapshot needs this proof.
+  if (
+    taskNow.postApproveHeadSha === undefined
+    || completion.approvedHeadSha !== taskNow.postApproveHeadSha
+  ) {
     await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-      phase: 'post-approve-redispatch-cap-exceeded',
-      redispatchCount: completion.redispatchCount ?? 0,
-      cap: POST_APPROVE_REDISPATCH_CAP,
+      phase: 'post-approve-completion-episode-mismatch',
     });
     return;
   }
-  const ready = await gateDevForPostApproveRedispatch(bus, manager, taskNow);
-  if (!ready) return;
-  await dispatchDevPostApproveCheck(
-    bus,
-    manager,
-    { ...taskNow, ...taskPatch },
-    completion.approvedHeadSha,
-    { redispatchCount: nextCount },
-  );
+  // Every CAS miss below means the completion rotated mid-flight; re-decide against the live pass so the feedback is never dropped.
+  for (;;) {
+    const devState = await manager.getAgentState(taskNow.agentId);
+    if (devState?.taskId === taskNow.id) {
+      if (completion.pendingRedispatch) {
+        const fresh = await manager.getPostApproveCompletion(taskNow.id);
+        // Same token: the pending mark is already on the live pass.
+        if (!fresh || fresh.token === completion.token) return;
+        completion = fresh;
+        continue;
+      }
+      if (await manager.updatePostApproveCompletionIfToken(taskNow.id, completion.token, {
+        pendingRedispatch: true,
+      })) return;
+      const fresh = await manager.getPostApproveCompletion(taskNow.id);
+      // Same token: refused in place (revoked marker) — the successor fixing flow owns this feedback.
+      if (!fresh || fresh.token === completion.token) return;
+      completion = fresh;
+      continue;
+    }
+    const nextCount = (completion.redispatchCount ?? 0) + 1;
+    if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+      const revoked = await manager.revokePostApproveCompletion(taskNow.id, 'redispatch-cap', {
+        expectedToken: completion.token,
+      });
+      if (!revoked) {
+        const fresh = await manager.getPostApproveCompletion(taskNow.id);
+        if (!fresh || fresh.token === completion.token) return;
+        completion = fresh;
+        continue;
+      }
+      await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+        phase: 'post-approve-redispatch-cap-exceeded',
+        redispatchCount: completion.redispatchCount ?? 0,
+        cap: POST_APPROVE_REDISPATCH_CAP,
+      });
+      return;
+    }
+    const ready = await gateDevForPostApproveRedispatch(bus, manager, taskNow);
+    if (!ready) return;
+    await dispatchDevPostApproveCheck(
+      bus,
+      manager,
+      { ...taskNow, ...taskPatch },
+      completion.approvedHeadSha,
+      { redispatchCount: nextCount },
+    );
+    return;
+  }
 }
 
 async function releaseQaAfterSkippedRollback(
@@ -549,6 +626,22 @@ async function handlePrCodePush(
     if (dispatchErr instanceof DispatchTerminalError) {
       await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
     } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
+      // handled 不止代表可恢复派发 hold（checkout-cleanup-failed / dialog 等也走这里），指引须按实际相位分流
+      const qaState = await manager.getAgentState(qa.id).catch((stateErr: unknown) => {
+        console.warn(`[EventHandler] pr.updated could not read held QA state for ${qa.id}:`, stateErr);
+        return null;
+      });
+      const heldPhase = qaState?.status === 'awaiting_human' ? qaState.awaitingPhase : undefined;
+      const note = isRecoverableQaDispatchHold(qaState)
+        ? 'QA dispatch was held awaiting human; the task keeps the rotated review pass. Resume the QA agent or POST /tasks/:id/review to redispatch.'
+        : `QA dispatch was held awaiting human (${heldPhase ?? 'hold not persisted'}); this hold is not auto-redispatchable — inspect the QA agent's awaiting reason, resolve it, then redispatch via POST /tasks/:id/review.`;
+      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+        phase: 'qa-dispatch-held-awaiting-human',
+        qaAgentId: qa.id,
+        qaPhase,
+        ...(heldPhase !== undefined ? { awaitingPhase: heldPhase } : {}),
+        note,
+      });
     } else if (previousStatus === 'in_progress' || previousStatus === 'fixing') {
       // 仅回滚 status 会留下 transition 轮换后的 token，dev 在途 pass 的完成信号将永久失配；
       // startSession 窗口内 pass 可能已被并发接管，此时回滚与 QA 释放都要让位于接管方
@@ -620,9 +713,20 @@ async function redispatchReviewForStaleVerdict(
 ): Promise<boolean> {
   if (task.status !== 'review') return false;
   if (task.qaAgentId) {
-    // 当前 pass 的 QA 会话还在跑时，迟到的旧 verdict 只是噪音，不能重派打断
-    const qaState = await manager.getAgentState(task.qaAgentId);
-    if (qaState?.taskId === task.id) return false;
+    // 当前 pass 的 QA 会话还在跑时，迟到的旧 verdict 只是噪音，不能重派打断；
+    // 派发期 hold（checkout 未备好）意味着从未开工，等同无会话，可安全重派
+    let qaState: Awaited<ReturnType<AgentManager['getAgentState']>>;
+    try {
+      qaState = await manager.getAgentState(task.qaAgentId);
+    } catch (err) {
+      // 无状态证据时 fail closed：不自动重派，让调用方落 stale-verdict 兜底介入
+      console.warn(
+        `[EventHandler] stale-verdict QA state read failed for ${task.qaAgentId}; not redispatching:`,
+        err,
+      );
+      return false;
+    }
+    if (qaState?.taskId === task.id && !isRecoverableQaDispatchHold(qaState)) return false;
   }
   try {
     // fromStatus/expectSignalToken 在 dispatch 锁内复核：本地快照到这里的窗口里任务可能已离开 review
@@ -736,11 +840,21 @@ async function handleReviewRequestChanges(
     const devState = await manager.getAgentState(task.agentId);
     const postApproveActive = await manager.getPostApproveCompletion(task.id);
     if (devState?.taskId === task.id && postApproveActive) {
-      await manager.clearPostApproveCompletion(task.id);
+      let revoked = await manager.revokePostApproveCompletion(task.id, 'request-changes', {
+        expectedToken: postApproveActive.token,
+      });
+      if (!revoked) {
+        // Token rotation within the episode still gets blocked; a successor approved episode (fresh head) must not.
+        revoked = await manager.revokePostApproveCompletion(task.id, 'request-changes', {
+          expectedHeadSha: postApproveActive.approvedHeadSha,
+        });
+      }
       await emitIntervention(bus, task.projectId, task.agentId, task.id, {
         phase: 'request-changes-during-post-approve',
         devAgentId: task.agentId,
-        note: 'Dev is still running post-approve check; fix dispatch deferred to avoid prompt collision. PostApproveCompletion cleared to block auto-merge. Operator: wait for post-approve signal to complete, then re-trigger REQUEST_CHANGES manually or cancel the task.',
+        note: revoked
+          ? 'Dev is still running post-approve check; fix dispatch deferred to avoid prompt collision. PostApproveCompletion cleared to block auto-merge. Operator: wait for post-approve signal to complete, then re-trigger REQUEST_CHANGES manually or cancel the task.'
+          : 'Dev is still running post-approve check and the task moved past the reviewed approved episode before the block could apply; the verdict belongs to a superseded pass. Re-trigger REQUEST_CHANGES if it still applies, or cancel the task.',
       });
       return;
     }

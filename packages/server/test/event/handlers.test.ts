@@ -972,7 +972,7 @@ describe('pr.updated handler', () => {
   });
 
   it('comment-only kind=comment after approval preserves the approved head and re-dispatches dev check', async () => {
-    await seedTask({ id: 'task-up-approved-comment', status: 'approved', reviewRound: 1, prNumber: 63 });
+    await seedTask({ id: 'task-up-approved-comment', status: 'approved', reviewRound: 1, prNumber: 63, postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-approved-comment', { token: 'old-post-token', approvedHeadSha: HEAD_SHA });
     const { releaseAgentForTask: releaseSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
@@ -988,6 +988,7 @@ describe('pr.updated handler', () => {
     const completion = await manager.getPostApproveCompletion('task-up-approved-comment');
     expect(completion?.token).not.toBe('old-post-token');
     expect(completion?.approvedHeadSha).toBe(HEAD_SHA);
+    expect(task!.postApproveHeadSha).toBe(HEAD_SHA);
     expect(releaseSpy).toHaveBeenCalledWith(
       'dev-1',
       'task-up-approved-comment',
@@ -1001,8 +1002,41 @@ describe('pr.updated handler', () => {
     );
   });
 
+  it('a redispatch racing a revoke between acquire and install cannot resurrect the completion', async () => {
+    await seedTask({ id: 'task-up-acquire-race', status: 'approved', reviewRound: 1, prNumber: 97, postApproveHeadSha: HEAD_SHA });
+    await manager.setPostApproveCompletion('task-up-acquire-race', { token: 'race-old-token', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async () => {
+      await manager.revokePostApproveCompletion('task-up-acquire-race', 'request-changes');
+      return true;
+    });
+    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const waitingSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+
+    await emitPrUpdated('task-up-acquire-race', { prNumber: 97, kind: 'comment', headSha: NEXT_HEAD_SHA });
+
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(await manager.getPostApproveCompletion('task-up-acquire-race')).toBeNull();
+    expect((await taskStore.get('task-up-acquire-race'))?.postApproveRevoked?.reason).toBe('request-changes');
+    expect(waitingSpy).toHaveBeenCalled();
+  });
+
+  it('a pendingRedispatch update is fenced against a concurrent revoke (no resurrection)', async () => {
+    await seedTask({ id: 'task-up-revoke-race', status: 'approved', reviewRound: 1, prNumber: 98, postApproveHeadSha: HEAD_SHA });
+    await seedDevAgent('task-up-revoke-race', 'dev-1');
+    await manager.setPostApproveCompletion('task-up-revoke-race', { token: 'race-token', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'getPostApproveCompletion')
+      .mockResolvedValueOnce({ token: 'race-token', approvedHeadSha: HEAD_SHA });
+    await manager.revokePostApproveCompletion('task-up-revoke-race', 'request-changes');
+
+    await emitPrUpdated('task-up-revoke-race', { prNumber: 98, kind: 'review-comment', reviewCommentReply: true });
+
+    expect(await manager.getPostApproveCompletion('task-up-revoke-race')).toBeNull();
+    expect((await taskStore.get('task-up-revoke-race'))?.postApproveRevoked?.reason).toBe('request-changes');
+  });
+
   it('approved-window review-comment during RUNNING post-approve coalesces into pendingRedispatch (no interrupt, no dispatch, no count bump, token preserved)', async () => {
-    await seedTask({ id: 'task-up-running-skip', status: 'approved', reviewRound: 1, prNumber: 99 });
+    await seedTask({ id: 'task-up-running-skip', status: 'approved', reviewRound: 1, prNumber: 99, postApproveHeadSha: HEAD_SHA });
     await seedDevAgent('task-up-running-skip', 'dev-1');
     await manager.setPostApproveCompletion('task-up-running-skip', { token: 'active-token-skip', approvedHeadSha: HEAD_SHA, redispatchCount: 3 });
     const { releaseAgentForTask: releaseSpy, acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
@@ -1020,8 +1054,38 @@ describe('pr.updated handler', () => {
     expect(completion?.pendingRedispatch).toBe(true);
   });
 
+  it('a feedback pendingRedispatch retries onto the live completion when the token rotates mid-CAS', async () => {
+    await seedTask({ id: 'task-up-pending-retry', status: 'approved', reviewRound: 1, prNumber: 97, postApproveHeadSha: HEAD_SHA });
+    await seedDevAgent('task-up-pending-retry', 'dev-1');
+    await manager.setPostApproveCompletion('task-up-pending-retry', { token: 'rotated-token', approvedHeadSha: HEAD_SHA, redispatchCount: 1 });
+    vi.spyOn(manager, 'getPostApproveCompletion')
+      .mockResolvedValueOnce({ token: 'pre-rotation-token', approvedHeadSha: HEAD_SHA, redispatchCount: 1 });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
+
+    await emitPrUpdated('task-up-pending-retry', { prNumber: 97, kind: 'review-comment', reviewCommentReply: true });
+
+    const completion = await manager.getPostApproveCompletion('task-up-pending-retry');
+    expect(completion?.token).toBe('rotated-token');
+    expect(completion?.pendingRedispatch).toBe(true);
+  });
+
+  it('a feedback CAS refused in place by a revoked marker exits without spinning or resurrecting', async () => {
+    await seedTask({ id: 'task-up-refused-in-place', status: 'approved', reviewRound: 1, prNumber: 96, postApproveHeadSha: HEAD_SHA });
+    await seedDevAgent('task-up-refused-in-place', 'dev-1');
+    await manager.setPostApproveCompletion('task-up-refused-in-place', { token: 'orphan-token', approvedHeadSha: HEAD_SHA });
+    const orphaned = await taskStore.get('task-up-refused-in-place');
+    await taskStore.set({ ...orphaned!, postApproveRevoked: { reason: 'request-changes', at: new Date().toISOString() } });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
+
+    await emitPrUpdated('task-up-refused-in-place', { prNumber: 96, kind: 'review-comment', reviewCommentReply: true });
+
+    const completion = await manager.getPostApproveCompletion('task-up-refused-in-place');
+    expect(completion?.token).toBe('orphan-token');
+    expect(completion?.pendingRedispatch).toBeUndefined();
+  });
+
   it('pr-merge-ready with pendingRedispatch=true triggers redispatch instead of mergePr', async () => {
-    await seedTask({ id: 'task-up-pending-redispatch', status: 'approved', reviewRound: 1, prNumber: 101 });
+    await seedTask({ id: 'task-up-pending-redispatch', status: 'approved', reviewRound: 1, prNumber: 101, postApproveHeadSha: HEAD_SHA });
     await seedDevAgent('task-up-pending-redispatch', 'dev-1');
     await manager.setPostApproveCompletion('task-up-pending-redispatch', { token: 'token-with-pending', approvedHeadSha: HEAD_SHA, redispatchCount: 2, pendingRedispatch: true });
     const { markAgentWaiting: markWaitSpy, continueSession: continueSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, markAgentWaiting: true, continueSession: true, mergePr: undefined });
@@ -1050,7 +1114,7 @@ describe('pr.updated handler', () => {
   });
 
   it('pr-merge-ready with pendingRedispatch=true AT cap escalates to intervention (no merge, no dispatch)', async () => {
-    await seedTask({ id: 'task-up-pending-cap', status: 'approved', reviewRound: 1, prNumber: 102 });
+    await seedTask({ id: 'task-up-pending-cap', status: 'approved', reviewRound: 1, prNumber: 102, postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-pending-cap', { token: 'token-pending-cap', approvedHeadSha: HEAD_SHA, redispatchCount: 10, pendingRedispatch: true });
     const { continueSession: continueSpy, mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, continueSession: true, mergePr: undefined });
 
@@ -1071,8 +1135,29 @@ describe('pr.updated handler', () => {
     ).resolves.toBeNull();
   });
 
+  it('a merge-ready cap whose revoke lost the CAS reports stale-task instead of cap-exceeded', async () => {
+    await seedTask({ id: 'task-up-cap-lost-cas', status: 'approved', reviewRound: 1, prNumber: 94, postApproveHeadSha: HEAD_SHA });
+    await manager.setPostApproveCompletion('task-up-cap-lost-cas', { token: 'token-cap-lost', approvedHeadSha: HEAD_SHA, redispatchCount: 10, pendingRedispatch: true });
+    vi.spyOn(manager, 'revokePostApproveCompletion').mockResolvedValueOnce(false);
+    const { continueSession: continueSpy, mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, continueSession: true, mergePr: undefined });
+
+    await emitPrUpdated('task-up-cap-lost-cas', {
+      prNumber: 94,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'token-cap-lost',
+      source: 'pane-signal',
+    });
+
+    expect(mergeSpy).not.toHaveBeenCalled();
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(findIntervention('task-up-cap-lost-cas', 'post-approve-redispatch-cap-exceeded')).toBeUndefined();
+    expect(findIntervention('task-up-cap-lost-cas', 'post-approve-merge-skipped-stale-task')).toBeTruthy();
+    expect((await manager.getPostApproveCompletion('task-up-cap-lost-cas'))?.token).toBe('token-cap-lost');
+  });
+
   it('approved-window review-comment redispatches when Dev has no active task binding', async () => {
-    await seedTask({ id: 'task-up-waiting-redispatch', status: 'approved', reviewRound: 1, prNumber: 100 });
+    await seedTask({ id: 'task-up-waiting-redispatch', status: 'approved', reviewRound: 1, prNumber: 100, postApproveHeadSha: HEAD_SHA });
     await agentStore.set({
       id: 'dev-1',
       projectId: 'proj',
@@ -1092,7 +1177,7 @@ describe('pr.updated handler', () => {
   });
 
   it('human review-comment replies after approval invalidate token and re-dispatch dev check', async () => {
-    await seedTask({ id: 'task-up-approved-human-reply', status: 'approved', reviewRound: 1, prNumber: 65 });
+    await seedTask({ id: 'task-up-approved-human-reply', status: 'approved', reviewRound: 1, prNumber: 65, postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-approved-human-reply', { token: 'active-post-token', approvedHeadSha: HEAD_SHA });
     const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
 
@@ -1115,7 +1200,7 @@ describe('pr.updated handler', () => {
   });
 
   it('redispatch cap: 11th approved review-comment escalates AND clears completion token', async () => {
-    await seedTask({ id: 'task-up-redispatch-cap', status: 'approved', reviewRound: 1, prNumber: 88 });
+    await seedTask({ id: 'task-up-redispatch-cap', status: 'approved', reviewRound: 1, prNumber: 88, postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-redispatch-cap', { token: 'pre-cap-token', approvedHeadSha: HEAD_SHA, redispatchCount: 10 });
     const { releaseAgentForTask: releaseSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, continueSession: true });
 
@@ -1133,8 +1218,25 @@ describe('pr.updated handler', () => {
     ).resolves.toBeNull();
   });
 
+  it('a stale cap decision re-decides on the live completion instead of revoking it', async () => {
+    await seedTask({ id: 'task-up-cap-rotated', status: 'approved', reviewRound: 1, prNumber: 95, postApproveHeadSha: HEAD_SHA });
+    await manager.setPostApproveCompletion('task-up-cap-rotated', { token: 'live-low-count', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'getPostApproveCompletion')
+      .mockResolvedValueOnce({ token: 'capped-stale-token', approvedHeadSha: HEAD_SHA, redispatchCount: 10 });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
+
+    await emitPrUpdated('task-up-cap-rotated', { prNumber: 95, kind: 'review-comment' });
+
+    expect(findIntervention('task-up-cap-rotated', 'post-approve-redispatch-cap-exceeded')).toBeUndefined();
+    expect((await taskStore.get('task-up-cap-rotated'))?.postApproveRevoked).toBeUndefined();
+    expect(continueSpy).toHaveBeenCalledOnce();
+    const completion = await manager.getPostApproveCompletion('task-up-cap-rotated');
+    expect(completion?.token).not.toBe('capped-stale-token');
+    expect(completion?.redispatchCount).toBe(1);
+  });
+
   it('redispatch cap: signal arriving after cap-exceeded does NOT trigger mergePr', async () => {
-    await seedTask({ id: 'task-up-cap-late-marker', status: 'approved', reviewRound: 1, prNumber: 89 });
+    await seedTask({ id: 'task-up-cap-late-marker', status: 'approved', reviewRound: 1, prNumber: 89, postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-cap-late-marker', { token: 'live-token-pre-cap', approvedHeadSha: HEAD_SHA, redispatchCount: 10 });
     const { markAgentWaiting: markWaitSpy, mergePr: mergeSpy } = stubManager({ releaseAgentForTask: true, markAgentWaiting: true, mergePr: undefined });
 
@@ -1156,7 +1258,7 @@ describe('pr.updated handler', () => {
   });
 
   it('new feedback after approval keeps the old token if dev cannot be interrupted for redispatch', async () => {
-    await seedTask({ id: 'task-up-approved-redispatch-fail', status: 'approved', reviewRound: 1, prNumber: 66 });
+    await seedTask({ id: 'task-up-approved-redispatch-fail', status: 'approved', reviewRound: 1, prNumber: 66, postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-approved-redispatch-fail', { token: 'active-post-token', approvedHeadSha: HEAD_SHA });
     const { acquireAgentForTask: acquireSpy, continueSession: continueSpy } = stubManager({ releaseAgentForTask: false, acquireAgentForTask: true, continueSession: true });
 
@@ -1280,6 +1382,62 @@ describe('pr.updated handler', () => {
     expect(intervention!.data.phase).toBe('qa-recheck-failed-after-stop');
   });
 
+  it('push recheck hitting a recoverable handled hold → intervention carries the hold phase and the redispatch guidance', async () => {
+    await seedTask({ id: 'task-up-held', status: 'fixing', reviewRound: 1, prNumber: 63 });
+    const heldErr = new EnsureSessionError(
+      { createdSession: false, agentId: 'qa-1', handled: true },
+      'checkout preparation failed for task task-up-held: repl not ready (paneId=%0, runtime=codex) within timeout',
+    );
+    // handled 的语义：startSession 已把 hold 落库后才抛错，测试按同一时序落库
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      await agentStore.set({
+        id: 'qa-1', projectId: 'proj', taskId: 'task-up-held',
+        status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
+        awaitingReason: 'repl not ready', awaitingSince: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      throw heldErr;
+    });
+    const { releaseAgentForTask: releaseSpy } = stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-held', { prNumber: 63, kind: 'push' });
+
+    expect(releaseSpy).not.toHaveBeenCalled();
+    const intervention = findIntervention('task-up-held', 'qa-dispatch-held-awaiting-human');
+    expect(intervention).toBeTruthy();
+    expect(intervention!.data.qaAgentId).toBe('qa-1');
+    expect(intervention!.data.qaPhase).toBe('recheck');
+    expect(intervention!.data.awaitingPhase).toBe('checkout-preparation-failed');
+    expect(String(intervention!.data.note)).toContain('Resume the QA agent or POST /tasks/:id/review');
+    expect((await taskStore.get('task-up-held'))!.status).toBe('review');
+  });
+
+  it('push recheck hitting a non-recoverable handled hold (checkout-cleanup-failed) → intervention gives real guidance instead of the redispatch claim', async () => {
+    await seedTask({ id: 'task-up-held-cleanup', status: 'fixing', reviewRound: 1, prNumber: 64 });
+    const heldErr = new EnsureSessionError(
+      { createdSession: false, agentId: 'qa-1', handled: true },
+      'checkout cleanup failed for task task-up-held-cleanup: park failed',
+    );
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      await agentStore.set({
+        id: 'qa-1', projectId: 'proj', taskId: 'task-up-held-cleanup',
+        status: 'awaiting_human', awaitingPhase: 'checkout-cleanup-failed',
+        awaitingReason: 'Task checkout could not be parked safely', awaitingSince: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      throw heldErr;
+    });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-held-cleanup', { prNumber: 64, kind: 'push' });
+
+    const intervention = findIntervention('task-up-held-cleanup', 'qa-dispatch-held-awaiting-human');
+    expect(intervention).toBeTruthy();
+    expect(intervention!.data.awaitingPhase).toBe('checkout-cleanup-failed');
+    expect(String(intervention!.data.note)).toContain('not auto-redispatchable');
+    expect(String(intervention!.data.note)).not.toContain('Resume the QA agent or POST');
+  });
+
   it('push kind after QA approval transitions approved → review and starts QA recheck', async () => {
     await seedTask({ id: 'task-up-approved', status: 'approved', reviewRound: 1, prNumber: 73, qaAgentId: 'qa-1' });
     const { startSession: startSpy, releaseAgentForTask: releaseSpy, markAgentWaiting: markWaitSpy } = stubManager({ startSession: true, releaseAgentForTask: true, markAgentWaiting: true });
@@ -1345,7 +1503,7 @@ describe('pr.updated handler', () => {
     ['poller signal', 'task-up-post-approved', 75, 'post-token-75', {}],
     ['pane signal source', 'task-up-post-pane', 76, 'post-token-76', { source: 'pane-signal' }],
   ])('post-approve complete via %s → merge-ready awaiting human confirm (no auto-merge)', async (_label, id, prNumber, token, extra) => {
-    await seedTask({ id, status: 'approved', reviewRound: 1, prNumber, qaAgentId: 'qa-1' });
+    await seedTask({ id, status: 'approved', reviewRound: 1, prNumber, qaAgentId: 'qa-1', postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion(id, { token, approvedHeadSha: HEAD_SHA });
     const { markAgentWaiting: markWaitSpy, mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined });
 
@@ -1359,7 +1517,7 @@ describe('pr.updated handler', () => {
   });
 
   it('human confirm from merge-ready executes the merge (merge:auto moved to confirm)', async () => {
-    await seedTask({ id: 'task-up-post-merge-fail', status: 'approved', reviewRound: 1, prNumber: 80, qaAgentId: 'qa-1' });
+    await seedTask({ id: 'task-up-post-merge-fail', status: 'approved', reviewRound: 1, prNumber: 80, qaAgentId: 'qa-1', postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-post-merge-fail', { token: 'post-token-80', approvedHeadSha: HEAD_SHA });
     const { mergePr: mergeSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined });
 
@@ -1379,7 +1537,7 @@ describe('pr.updated handler', () => {
   it('manual-merge post-approve completion → merge-ready (completion cleared, later comment is a no-op)', async () => {
     CONFIG.project[0]!.merge = null;
     manager.replaceConfig(CONFIG);
-    await seedTask({ id: 'task-up-post-manual-complete', status: 'approved', reviewRound: 1, prNumber: 81, qaAgentId: 'qa-1' });
+    await seedTask({ id: 'task-up-post-manual-complete', status: 'approved', reviewRound: 1, prNumber: 81, qaAgentId: 'qa-1', postApproveHeadSha: HEAD_SHA });
     await manager.setPostApproveCompletion('task-up-post-manual-complete', { token: 'post-token-81', approvedHeadSha: HEAD_SHA });
     const { mergePr: mergeSpy, continueSession: continueSpy } = stubManager({ markAgentWaiting: true, mergePr: undefined, continueSession: true });
 
@@ -1466,6 +1624,143 @@ describe('pr.updated handler', () => {
 
     expect(mergeSpy).not.toHaveBeenCalled();
     const intervention = findIntervention('task-up-post-stale-before-merge');
+    expect(intervention).toBeTruthy();
+    expect(intervention!.data.phase).toBe('post-approve-merge-skipped-stale-task');
+  });
+
+  it('post-approve complete signal refuses to merge a completion from another approved episode', async () => {
+    await seedTask({ id: 'task-up-episode-merge', status: 'approved', reviewRound: 1, prNumber: 81 });
+    await manager.setPostApproveCompletion('task-up-episode-merge', { token: 'post-token-81', approvedHeadSha: HEAD_SHA });
+    await manager.updateTask('task-up-episode-merge', { postApproveHeadSha: NEXT_HEAD_SHA });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+
+    await emitPrUpdated('task-up-episode-merge', {
+      prNumber: 81,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'post-token-81',
+    });
+
+    expect(mergeSpy).not.toHaveBeenCalled();
+    const intervention = findIntervention('task-up-episode-merge');
+    expect(intervention).toBeTruthy();
+    expect(intervention!.data.phase).toBe('post-approve-merge-skipped-stale-task');
+  });
+
+  it('post-approve complete signal refuses to merge when the approved head was never persisted', async () => {
+    await seedTask({ id: 'task-up-headless-merge', status: 'approved', reviewRound: 1, prNumber: 83 });
+    await manager.setPostApproveCompletion('task-up-headless-merge', { token: 'headless-mr-tok', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+
+    await emitPrUpdated('task-up-headless-merge', {
+      prNumber: 83,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'headless-mr-tok',
+    });
+
+    expect(mergeSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-up-headless-merge'))?.status).toBe('approved');
+    expect(findIntervention('task-up-headless-merge', 'post-approve-merge-skipped-stale-task')).toBeTruthy();
+  });
+
+  it('a revoke landing between the entry check and the merge transition never reaches merge-ready', async () => {
+    await seedTask({ id: 'task-up-mr-revoke-race', status: 'approved', reviewRound: 1, prNumber: 84, postApproveHeadSha: HEAD_SHA });
+    await manager.setPostApproveCompletion('task-up-mr-revoke-race', { token: 'mr-race-tok', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+    const realRead = manager.getPostApproveCompletion.bind(manager);
+    let reads = 0;
+    vi.spyOn(manager, 'getPostApproveCompletion').mockImplementation(async (id) => {
+      reads += 1;
+      const value = await realRead(id);
+      // The entry re-validation saw a live pass; the revoke lands right after it.
+      if (reads === 2) {
+        await manager.revokePostApproveCompletion(id, 'request-changes');
+      }
+      return value;
+    });
+
+    await emitPrUpdated('task-up-mr-revoke-race', {
+      prNumber: 84,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'mr-race-tok',
+    });
+
+    expect(mergeSpy).not.toHaveBeenCalled();
+    const after = await taskStore.get('task-up-mr-revoke-race');
+    expect(after?.status).toBe('approved');
+    expect(after?.postApproveRevoked?.reason).toBe('request-changes');
+    expect(findIntervention('task-up-mr-revoke-race', 'post-approve-merge-skipped-stale-task')).toBeTruthy();
+  });
+
+  it('a feedback pending short-circuit re-reads the live completion instead of trusting the entry snapshot', async () => {
+    await seedTask({ id: 'task-up-pending-stale-entry', status: 'approved', reviewRound: 1, prNumber: 85, postApproveHeadSha: HEAD_SHA });
+    await seedDevAgent('task-up-pending-stale-entry', 'dev-1');
+    await manager.setPostApproveCompletion('task-up-pending-stale-entry', { token: 'live-unmarked-tok', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'getPostApproveCompletion')
+      .mockResolvedValueOnce({ token: 'stale-pending-tok', approvedHeadSha: HEAD_SHA, pendingRedispatch: true });
+    stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
+
+    await emitPrUpdated('task-up-pending-stale-entry', { prNumber: 85, kind: 'review-comment', reviewCommentReply: true });
+
+    const completion = await manager.getPostApproveCompletion('task-up-pending-stale-entry');
+    expect(completion?.token).toBe('live-unmarked-tok');
+    expect(completion?.pendingRedispatch).toBe(true);
+  });
+
+  it('feedback bound to a dead episode completion raises an intervention instead of redispatching', async () => {
+    await seedTask({ id: 'task-up-episode-feedback', status: 'approved', reviewRound: 1, prNumber: 86 });
+    await manager.setPostApproveCompletion('task-up-episode-feedback', { token: 'orphan-episode-tok', approvedHeadSha: HEAD_SHA });
+    const { continueSession: continueSpy } = stubManager({ releaseAgentForTask: true, acquireAgentForTask: true, continueSession: true });
+
+    await emitPrUpdated('task-up-episode-feedback', { prNumber: 86, kind: 'comment' });
+
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(findIntervention('task-up-episode-feedback', 'post-approve-completion-episode-mismatch')).toBeTruthy();
+    const completion = await manager.getPostApproveCompletion('task-up-episode-feedback');
+    expect(completion?.token).toBe('orphan-episode-tok');
+    expect(completion?.pendingRedispatch).toBeUndefined();
+  });
+
+  it('post-approve dispatch aborts when the task leaves approved before the head persist', async () => {
+    await seedTask({ id: 'task-up-head-cas', status: 'approved', reviewRound: 1, prNumber: 82, postApproveHeadSha: HEAD_SHA });
+    await manager.setPostApproveCompletion('task-up-head-cas', { token: 'old-head-cas', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async () => {
+      await manager.updateTaskStatus('task-up-head-cas', 'fixing');
+      return true;
+    });
+    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+
+    await emitPrUpdated('task-up-head-cas', { prNumber: 82, kind: 'comment', headSha: NEXT_HEAD_SHA });
+
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-up-head-cas'))?.postApproveHeadSha).toBe(HEAD_SHA);
+  });
+
+  it('post-approve complete signal refuses to merge once the completion was revoked', async () => {
+    await seedTask({ id: 'task-up-post-revoked', status: 'approved', reviewRound: 1, prNumber: 80 });
+    await manager.setPostApproveCompletion('task-up-post-revoked', { token: 'post-token-80', approvedHeadSha: HEAD_SHA });
+    await manager.updateTask('task-up-post-revoked', {
+      postApproveRevoked: { reason: 'request-changes', at: new Date().toISOString() },
+    });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    const mergeSpy = vi.spyOn(manager, 'mergePr').mockResolvedValue();
+
+    await emitPrUpdated('task-up-post-revoked', {
+      prNumber: 80,
+      kind: 'pr-merge-ready',
+      verdictAgentId: 'dev-1',
+      token: 'post-token-80',
+    });
+
+    expect(mergeSpy).not.toHaveBeenCalled();
+    const intervention = findIntervention('task-up-post-revoked');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('post-approve-merge-skipped-stale-task');
   });
@@ -2254,6 +2549,7 @@ describe('review.submitted APPROVE', () => {
     expect(intervention!.taskId).toBe('task-a3');
     expect(intervention!.data.devAgentId).toBe('dev-1');
     expect(continueSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-a3'))?.postApproveHeadSha).toBeUndefined();
   });
 
   it('post-approve dispatch fail + emit fail → handler swallows emit error (no rethrow)', async () => {
@@ -2725,6 +3021,58 @@ describe('review.submitted stale-verdict auto-redispatch (no active QA session)'
     expect(dispatchSpy).not.toHaveBeenCalled();
     expect(findInterventionByPhase('stale-verdict-superseded-pass')).toBeDefined();
   });
+
+  it('wrong-pass token while QA is bound but held on checkout-preparation-failed → redispatches (held QA is not an active session)', async () => {
+    await seedReviewPass('task-red-heldqa', { signalToken: 'current-token-22' });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-red-heldqa',
+      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
+      awaitingReason: 'runtime ack timeout (paneId=%1): pane already busy at baseline',
+      awaitingSince: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-heldqa', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).toHaveBeenCalledWith('task-red-heldqa', { fromStatus: ['review'], bumpRound: false, expectSignalToken: 'current-token-22' });
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeUndefined();
+  });
+
+  it('falls back to the wrong-pass intervention when the QA state read fails (no redispatch without evidence)', async () => {
+    await seedReviewPass('task-red-readfail', { signalToken: 'current-token-22' });
+    vi.spyOn(manager, 'getAgentState').mockRejectedValueOnce(new Error('agent store read failed'));
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-readfail', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeDefined();
+  });
+
+  it('wrong-pass token while QA is bound and held on dispatch-failed:ack_unknown → keeps intervention (prompt may still be running)', async () => {
+    await seedReviewPass('task-red-heldqa-ack', { signalToken: 'current-token-22' });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-red-heldqa-ack',
+      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      awaitingReason: 'ack unknown', awaitingSince: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await emitReview('task-red-heldqa-ack', {
+      action: 'APPROVE', prNumber: 214, headSha: HEAD_SHA, currentHeadSha: HEAD_SHA,
+      reviewPassToken: 'stale-token-11',
+    });
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(findInterventionByPhase('stale-verdict-wrong-pass')).toBeDefined();
+  });
 });
 
 describe('review.submitted REQUEST_CHANGES', () => {
@@ -3079,5 +3427,71 @@ describe('event-driven release does not interrupt agent mid-action', () => {
 
     const completionAfter = await manager.getPostApproveCompletion('task-postapprove-busy');
     expect(completionAfter).toBeNull();
+  });
+
+  it('REQUEST_CHANGES during post-approve fail-closes the episode even when the completion rotated mid-flight', async () => {
+    await seedTask({ id: 'task-postapprove-rotated', status: 'approved', reviewRound: 1, prNumber: 201, latestHeadSha: HEAD_SHA, qaAgentId: 'qa-1' });
+    await seedDevAgent('task-postapprove-rotated');
+    await lockManager.acquire('dev-1', 'task-postapprove-rotated');
+    await manager.setPostApproveCompletion('task-postapprove-rotated', { token: 'tok-live', approvedHeadSha: HEAD_SHA });
+    const realGetCompletion = manager.getPostApproveCompletion.bind(manager);
+    vi.spyOn(manager, 'getPostApproveCompletion')
+      .mockImplementation(realGetCompletion)
+      .mockImplementationOnce(realGetCompletion)
+      .mockResolvedValueOnce({ token: 'tok-stale', approvedHeadSha: HEAD_SHA });
+    stubManager({ acquireAgentForTask: true, continueSession: true, releaseAgentForTask: true });
+
+    await emitReview('task-postapprove-rotated', { action: 'REQUEST_CHANGES', prNumber: 201, headSha: HEAD_SHA });
+
+    const intervention = findInterventionByPhase('request-changes-during-post-approve');
+    expect(intervention).toBeTruthy();
+    expect(await manager.getPostApproveCompletion('task-postapprove-rotated')).toBeNull();
+    expect((await taskStore.get('task-postapprove-rotated'))?.postApproveRevoked?.reason).toBe('request-changes');
+  });
+
+  it('a stale REQUEST_CHANGES never revokes a successor approved episode', async () => {
+    const HEAD_B = 'b'.repeat(40);
+    await seedTask({
+      id: 'task-postapprove-episode', status: 'approved', reviewRound: 1, prNumber: 204,
+      latestHeadSha: HEAD_B, postApproveHeadSha: HEAD_B, qaAgentId: 'qa-1',
+    });
+    await seedDevAgent('task-postapprove-episode');
+    await lockManager.acquire('dev-1', 'task-postapprove-episode');
+    await manager.setPostApproveCompletion('task-postapprove-episode', { token: 'tok-B', approvedHeadSha: HEAD_B });
+    const realGetCompletion = manager.getPostApproveCompletion.bind(manager);
+    vi.spyOn(manager, 'getPostApproveCompletion')
+      .mockImplementation(realGetCompletion)
+      .mockImplementationOnce(realGetCompletion)
+      .mockResolvedValueOnce({ token: 'tok-A', approvedHeadSha: HEAD_SHA });
+    stubManager({ acquireAgentForTask: true, continueSession: true, releaseAgentForTask: true });
+
+    await emitReview('task-postapprove-episode', { action: 'REQUEST_CHANGES', prNumber: 204 });
+
+    const intervention = findInterventionByPhase('request-changes-during-post-approve');
+    expect(intervention).toBeTruthy();
+    expect((intervention!.data as { note?: string }).note).toMatch(/superseded/);
+    expect((await manager.getPostApproveCompletion('task-postapprove-episode'))?.token).toBe('tok-B');
+    expect((await taskStore.get('task-postapprove-episode'))?.postApproveRevoked).toBeUndefined();
+  });
+
+  it('a stalled approval flow cannot overwrite the head of a newer approved round', async () => {
+    await seedTask({ id: 'task-up-head-round', status: 'approved', reviewRound: 1, prNumber: 202, signalToken: 'round-old-tok', postApproveHeadSha: HEAD_SHA });
+    await manager.setPostApproveCompletion('task-up-head-round', { token: 'old-round-completion', approvedHeadSha: HEAD_SHA });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async () => {
+      await manager.updateTask('task-up-head-round', {
+        signalToken: 'round-new-tok',
+        reviewRound: 2,
+        postApproveHeadSha: NEXT_HEAD_SHA,
+      });
+      return true;
+    });
+    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+
+    await emitPrUpdated('task-up-head-round', { prNumber: 202, kind: 'comment', headSha: HEAD_SHA });
+
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-up-head-round'))?.postApproveHeadSha).toBe(NEXT_HEAD_SHA);
   });
 });

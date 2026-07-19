@@ -1,0 +1,8 @@
+{
+  "name": "github",
+  "version": "1.0.0",
+  "kind": "git-driver",
+  "tool": "gh",
+  "minToolVersion": "1.8.0",
+  "driverSchema": 1
+}

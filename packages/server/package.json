@@ -7,7 +7,7 @@
     "baxian": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc --build && rm -rf dist/agent/detect/manifests && cp -r src/agent/detect/manifests dist/agent/detect/manifests",
+    "build": "tsc --build && rm -rf dist/agent/detect/manifests dist/platform/plugins && cp -r src/agent/detect/manifests dist/agent/detect/manifests && cp -r src/platform/plugins dist/platform/plugins",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

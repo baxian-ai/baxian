@@ -8,6 +8,7 @@ const PLURAL_SINGULAR: Record<string, string> = {
 // normalizeKeys 靠 lowercase 实现大小写不敏感，camelCase 键需映射回规范形
 const CANONICAL_CASE: Record<string, string> = {
   specapproval: 'specApproval',
+  gitcli: 'gitCli',
 };
 
 export function normalizeConfig(raw: unknown): Record<string, unknown> {

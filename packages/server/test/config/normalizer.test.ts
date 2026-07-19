@@ -58,6 +58,15 @@ describe('normalizeConfig', () => {
         expect(proj).not.toHaveProperty('specapproval');
       },
     );
+
+    it('restores canonical camelCase for gitCli', () => {
+      const result = normalizeConfig({
+        project: [{ id: 'p', repo: 'x', gitCli: { tool: 'glab' } }],
+      });
+      const proj = (result.project as Record<string, unknown>[])[0];
+      expect(proj.gitCli).toEqual({ tool: 'glab' });
+      expect(proj).not.toHaveProperty('gitcli');
+    });
   });
 
   describe('passthrough', () => {

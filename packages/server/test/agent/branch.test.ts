@@ -9,7 +9,8 @@ import {
 } from '../../src/agent/branch.js';
 import { LocalRunner, shellQuote, type CommandRunner } from '../../src/agent/runner.js';
 import { ReplNotReadyError } from '../../src/agent/tmux.js';
-import { AgentManager } from '../../src/agent/manager.js';
+import { AgentManager, EnsureSessionError } from '../../src/agent/manager.js';
+import { ReviewStore } from '../../src/state/review-store.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -107,6 +108,95 @@ describe('BranchManager', () => {
       new BranchManager(local).switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true),
     ).rejects.toThrow(/already exists on origin/i);
     expect(await new BranchManager(local).currentRef(workdir)).toBe('refs/heads/main');
+  });
+
+  async function pushTaskCommitAndCleanLocalRef(manager: BranchManager): Promise<string> {
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await run(
+      `printf task > ${shellQuote(join(workdir, 'task.txt'))} && ` +
+      `git -C ${shellQuote(workdir)} add task.txt && ` +
+      `git -C ${shellQuote(workdir)} commit -q -m task && ` +
+      `git -C ${shellQuote(workdir)} push -q origin bx/task-1`,
+    );
+    const pushedTip = await run(`git -C ${shellQuote(workdir)} rev-parse HEAD`);
+    const cleanup = await manager.cleanupTaskBranch(workdir, {
+      taskId: 'task-1', taskBranch: 'bx/task-1', branchCreatedByBaxian: true,
+    }, async () => {});
+    expect(cleanup).toEqual({ status: 'deleted', remoteTipSha: pushedTip });
+    expect(await run(
+      `git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`,
+    )).toBe('1');
+    return pushedTip;
+  }
+
+  it('restores the task branch from the remote credential after cleanup removed the local ref', async () => {
+    const manager = new BranchManager(local);
+    const pushedTip = await pushTaskCommitAndCleanLocalRef(manager);
+
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true, {
+      restorableRemoteTip: pushedTip,
+    });
+
+    expect(await manager.currentRef(workdir)).toBe('refs/heads/bx/task-1');
+    expect(await run(`git -C ${shellQuote(workdir)} rev-parse HEAD`)).toBe(pushedTip);
+    expect(await run(`git -C ${shellQuote(workdir)} config --get branch.bx/task-1.baxian-task-id`)).toBe('task-1');
+    expect(await run(
+      `git -C ${shellQuote(workdir)} rev-parse --symbolic-full-name ${shellQuote('bx/task-1@{upstream}')}`,
+    )).toBe('refs/remotes/origin/bx/task-1');
+  });
+
+  it('refuses the restore when the remote branch no longer contains the cleaned tip', async () => {
+    const manager = new BranchManager(local);
+    const pushedTip = await pushTaskCommitAndCleanLocalRef(manager);
+    await run(`git -C ${shellQuote(seed)} push -q -f origin main:bx/task-1`);
+
+    await expect(
+      manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true, {
+        restorableRemoteTip: pushedTip,
+      }),
+    ).rejects.toThrow(/no longer contains/);
+    expect(await manager.currentRef(workdir)).toBeNull();
+  });
+
+  it('a missing local branch with a remote namesake still refuses without the credential', async () => {
+    const manager = new BranchManager(local);
+    await pushTaskCommitAndCleanLocalRef(manager);
+
+    await expect(
+      manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true),
+    ).rejects.toThrow(/already exists on origin/i);
+  });
+
+  it('a continuation with no local ref, no remote, and no credential refuses to recreate the branch', async () => {
+    const manager = new BranchManager(local);
+    await manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await run(
+      `git -C ${shellQuote(workdir)} switch -q --detach origin/HEAD && ` +
+      `git -C ${shellQuote(workdir)} branch -D bx/task-1`,
+    );
+
+    await expect(
+      manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true, { requireExistingWork: true }),
+    ).rejects.toThrow(/refusing to recreate it mid-task/);
+    expect(await run(
+      `git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`,
+    )).toBe('1');
+  });
+
+  it('refuses to recreate the branch from scratch when the credential exists but the remote vanished', async () => {
+    const manager = new BranchManager(local);
+    const pushedTip = await pushTaskCommitAndCleanLocalRef(manager);
+    await run(`git -C ${shellQuote(seed)} push -q origin :bx/task-1`);
+
+    await expect(
+      manager.switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true, {
+        restorableRemoteTip: pushedTip,
+      }),
+    ).rejects.toThrow(/vanished after its local ref was cleaned up/);
+    expect(await manager.currentRef(workdir)).toBeNull();
+    expect(await run(
+      `git -C ${shellQuote(workdir)} show-ref --verify --quiet refs/heads/bx/task-1; echo $?`,
+    )).toBe('1');
   });
 
   it('recovers an existing marked baxian branch without resetting it', async () => {
@@ -296,7 +386,7 @@ describe('BranchManager', () => {
       branchCreatedByBaxian: true,
     }, async () => undefined);
 
-    expect(result).toEqual({ status: 'deleted' });
+    expect(result).toEqual({ status: 'deleted', remoteTipSha: expect.stringMatching(/^[0-9a-f]{40,64}$/) });
     expect(await manager.currentRef(workdir)).toBeNull();
     expect(commands.some(command => command.includes('branch -d --'))).toBe(true);
     expect(commands.some(command => command.includes('branch -D'))).toBe(false);
@@ -481,7 +571,7 @@ describe('BranchManager', () => {
       branchCreatedByBaxian: true,
     }, async () => undefined);
 
-    expect(result).toEqual({ status: 'deleted' });
+    expect(result).toEqual({ status: 'deleted', remoteTipSha: expect.stringMatching(/^[0-9a-f]{40,64}$/) });
   });
 
   it('keeps cleanup pending when the post-delete exact-ref probe fails', async () => {
@@ -687,5 +777,91 @@ describe('BranchManager', () => {
 
     expect(refSpy).not.toHaveBeenCalled();
     expect(acquireSpy).not.toHaveBeenCalled();
+  });
+
+  it('a real dirty tree: rollback holds the dev, cleanup + Resume releases it, request-changes leaks nothing', async () => {
+    const now = new Date().toISOString();
+    const stateRoot = join(tempDir, 'handoff-manager-state');
+    for (const dir of ['agents', 'tasks', 'locks', 'reviews', 'events', 'skills']) {
+      await mkdir(join(stateRoot, dir), { recursive: true });
+    }
+    const agentStore = new AgentStore(join(stateRoot, 'agents'));
+    const taskStore = new TaskStore(join(stateRoot, 'tasks'));
+    const lockManager = new LockManager(join(stateRoot, 'locks'));
+    const reviewStore = new ReviewStore(join(stateRoot, 'reviews'));
+    const config: BaxianConfig = {
+      review: { rounds: 2 }, server: DEFAULT_SERVER_CONFIG,
+      project: [{
+        id: 'proj', repo: 'owner/repo', merge: null,
+        agent: [[
+          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
+          { id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: join(tempDir, 'research') },
+        ]],
+      }],
+    };
+    const maintenanceRunner: CommandRunner = {
+      exec: (command, options) => command.includes('tmux has-session')
+        ? Promise.resolve({ stdout: '', stderr: "can't find session", exitCode: 1 })
+        : local.exec(command, options),
+      writeFile: (path, content) => local.writeFile(path, content),
+      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
+    };
+    const watcherStub = { start: vi.fn(async () => true), stop: vi.fn(), has: vi.fn(() => false) };
+    const manager = new AgentManager({
+      config, agentStore, taskStore, lockManager, reviewStore,
+      eventBus: new EventBus(new EventLog(join(stateRoot, 'events'))),
+      skillRegistry: new SkillRegistry(join(stateRoot, 'skills')),
+      runnerFactory: () => maintenanceRunner,
+      phaseSignalWatcher: watcherStub as never,
+    });
+    await new BranchManager(local).switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
+    await run(`printf dirty > ${shellQuote(join(workdir, 'wip.txt'))}`);
+    await taskStore.set({
+      id: 'task-1', projectId: 'proj', title: 'spec', description: '',
+      preferredAgentId: 'research-1', agentId: '', devAgentId: 'dev-1',
+      researchAgentId: 'research-1', phase: 'spec', branch: 'bx/task-1',
+      branchCreatedByBaxian: true, reviewRound: 0, specReviewRound: 2,
+      status: 'max_rounds', createdAt: now, updatedAt: now,
+    });
+    await reviewStore.putRound('task-1', 'spec', {
+      round: 2, phase: 'spec', content: '# Spec v2',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
+      startedAt: now,
+    });
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
+    await agentStore.set({ id: 'research-1', projectId: 'proj', updatedAt: now });
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      await agentStore.update('dev-1', existing => ({
+        ...existing!,
+        status: 'awaiting_human',
+        awaitingPhase: 'dirty-workdir',
+        awaitingReason: `Workdir ${workdir} has staged, tracked, untracked, conflicted, or dirty submodule changes`,
+        awaitingSince: now,
+        updatedAt: now,
+      }));
+      throw new EnsureSessionError(
+        { createdSession: false, agentId: 'dev-1', handled: true },
+        'checkout preparation failed for task task-1: dirty workdir',
+      );
+    });
+
+    await expect(manager.submitSpecVerdict('task-1', 'approve')).rejects.toMatchObject({ status: 500 });
+    expect(await taskStore.get('task-1')).toMatchObject({ status: 'max_rounds', phase: 'spec', agentId: '' });
+    const heldDev = await agentStore.get('dev-1');
+    expect(heldDev?.taskId).toBe('task-1');
+    expect(heldDev?.awaitingPhase).toBe('branch-cleanup-pending');
+
+    await run(`rm ${shellQuote(join(workdir, 'wip.txt'))}`);
+    const resumeResult = await manager.resumeAgent('dev-1');
+    expect(resumeResult).toMatchObject({ resumed: true, releasedBinding: true });
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+
+    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    const rejected = await manager.submitSpecVerdict('task-1', 'request-changes', '再收敛一轮');
+    expect(rejected.status).toBe('fixing');
+    expect(rejected.agentId).toBe('research-1');
+    expect((await agentStore.get('research-1'))?.taskId).toBe('task-1');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 });

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { TaskState } from '../../src/shared/index.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { DispatchTerminalError } from '../../src/agent/manager.js';
 import { ApiError } from '../../src/errors.js';
 import {
   TASK_IMAGE_MAX_COUNT,
@@ -536,6 +537,116 @@ describe('POST /api/tasks/:id/spec', () => {
       .mockRejectedValue(new ApiError(409, 'Task task-001 is review; spec verdict requires spec-ready'));
     const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
     expect(response.statusCode).toBe(409);
+  });
+
+  it('202 request-changes on a spec-phase max_rounds task extends the cap and dispatches', async () => {
+    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 10, agentId: '' });
+    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
+      round: 10,
+      phase: 'spec',
+      content: '# Spec v10',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
+      startedAt: new Date().toISOString(),
+    });
+    const dispatchSpy = vi.spyOn(app.ctx.agentManager, 'dispatchServerFixToDev')
+      .mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '再收敛一轮' });
+
+    expect(response.statusCode).toBe(202);
+    expect(dispatchSpy).toHaveBeenCalledWith('task-001', expect.stringContaining('u-1'));
+    expect((await app.ctx.taskStore.get('task-001'))?.maxRoundsContinues).toBe(1);
+  });
+
+  it('409 with an actionable reason when the spec holder is gone from the config', async () => {
+    await seedTask({
+      status: 'max_rounds', phase: 'spec', specReviewRound: 10,
+      agentId: '', preferredAgentId: 'ghost', devAgentId: 'ghost',
+    });
+    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
+      round: 10,
+      phase: 'spec',
+      content: '# Spec v10',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
+      startedAt: new Date().toISOString(),
+    });
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '再收敛一轮' });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/not in the current config/);
+  });
+
+  it('an undelivered code prompt after approve answers 500 with Resume guidance, not a retry hint', async () => {
+    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 10, agentId: '' });
+    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
+      round: 10,
+      phase: 'spec',
+      content: '# Spec v10',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
+      startedAt: new Date().toISOString(),
+    });
+    vi.spyOn(app.ctx.agentManager, 'transitionToCodePhase').mockImplementation(async (taskId) => {
+      const t = (await app.ctx.taskStore.get(taskId))!;
+      t.status = 'in_progress';
+      t.phase = 'code';
+      t.agentId = t.devAgentId;
+      await app.ctx.taskStore.set(t);
+      return null;
+    });
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/Resume the dev agent/);
+  });
+
+  it('a terminal fix dispatch on request-changes answers 500 with failed-task Retry guidance', async () => {
+    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 10, agentId: '' });
+    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
+      round: 10,
+      phase: 'spec',
+      content: '# Spec v10',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
+      startedAt: new Date().toISOString(),
+    });
+    vi.spyOn(app.ctx.agentManager, 'continueSession').mockRejectedValue(
+      new DispatchTerminalError('prompt_too_large', 'prompt exceeds the runtime composer limit'),
+    );
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '再收敛一轮' });
+
+    expect(response.statusCode).toBe(500);
+    const body = JSON.parse(response.body);
+    expect(body.error).toContain('prompt_too_large');
+    expect(body.error).toContain('marked failed');
+    expect(body.error).toContain('Retry');
+    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('failed');
+    const round = await app.ctx.agentManager.getReviewStore()!.getRound('task-001', 'spec', 10);
+    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes' });
+  });
+
+  it('a terminal code-phase dispatch failure surfaces an actionable 500, not internal_error', async () => {
+    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 1, agentId: '' });
+    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
+      round: 1,
+      phase: 'spec',
+      content: '# Spec',
+      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
+      startedAt: new Date().toISOString(),
+    });
+    vi.spyOn(app.ctx.agentManager, 'continueSession').mockRejectedValue(
+      new DispatchTerminalError('prompt_too_large', 'prompt exceeds the runtime composer limit'),
+    );
+
+    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
+
+    expect(response.statusCode).toBe(500);
+    const body = JSON.parse(response.body);
+    expect(body.error).toContain('prompt_too_large');
+    expect(body.error).toContain('marked failed');
+    expect(body.error).toContain('Retry');
+    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('failed');
   });
 });
 

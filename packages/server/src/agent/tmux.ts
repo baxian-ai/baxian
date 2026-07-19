@@ -907,7 +907,7 @@ export class TmuxManager {
     paneId: string,
     prompt: string,
     agentId: string,
-  ): Promise<void> {
+  ): Promise<{ pasted: boolean }> {
     const bytes = Buffer.byteLength(prompt, 'utf8');
     if (bytes > MAX_PROMPT_BYTES) {
       throw new Error(
@@ -923,6 +923,75 @@ export class TmuxManager {
     const result = await run(this.runner, cmd);
     if (result.exitCode !== 0) {
       throw new Error(`tmux injectPrompt ${paneId} failed: ${result.stderr}`);
+    }
+    return { pasted: true };
+  }
+
+  // Staging split from pasting lets a caller fence the paste after every await the staging exec hides.
+  async stagePromptBuffer(paneId: string, prompt: string, agentId: string): Promise<{ buf: string }> {
+    const bytes = Buffer.byteLength(prompt, 'utf8');
+    if (bytes > MAX_PROMPT_BYTES) {
+      throw new Error(
+        `tmux stagePromptBuffer ${paneId} prompt too large: ${bytes} bytes > ${MAX_PROMPT_BYTES}`,
+      );
+    }
+    const promptB64 = Buffer.from(prompt, 'utf8').toString('base64');
+    const buf = `baxian-${agentId}-${randomUUID()}`;
+    let result: ExecResult;
+    let transportErr: unknown;
+    try {
+      result = await run(
+        this.runner,
+        `printf '%s' ${shellQuote(promptB64)} | openssl base64 -d -A | tmux load-buffer -b ${shellQuote(buf)} -`,
+      );
+    } catch (err) {
+      transportErr = err;
+      result = { stdout: '', stderr: '', exitCode: 255 };
+    }
+    if (transportErr !== undefined || result.exitCode !== 0) {
+      let retirementNote = '';
+      // Unknown outcome may have created the full-prompt buffer remotely; retire it by its unique name.
+      if (transportErr !== undefined || execOutcomeUnknown(result)) {
+        let cleanupFailure: string | undefined;
+        try {
+          const del = await run(this.runner, `tmux delete-buffer -b ${shellQuote(buf)}`);
+          const confirmedAbsent = !execOutcomeUnknown(del) && isUnknownTmuxBuffer(del.stderr);
+          if (del.exitCode !== 0 && !confirmedAbsent) {
+            cleanupFailure = `delete-buffer ${del.stderr.trim() || `exit ${del.exitCode}`} (exit ${del.exitCode})`;
+          }
+        } catch (probeErr) {
+          cleanupFailure = probeErr instanceof Error ? probeErr.message : String(probeErr);
+        }
+        if (cleanupFailure === undefined) {
+          console.info(`[TmuxManager] stagePromptBuffer ${paneId}: retired staged buffer ${buf} after an unconfirmed load`);
+        } else {
+          console.warn(
+            `[TmuxManager] stagePromptBuffer ${paneId}: reconciliation failed, buffer ${buf} may persist remotely: ${cleanupFailure}`,
+          );
+          retirementNote = `; staged buffer ${buf} may persist remotely (${cleanupFailure})`;
+        }
+      }
+      if (transportErr !== undefined) throw transportErr;
+      const unknownNote = execOutcomeUnknown(result) ? ' (outcome unknown)' : '';
+      throw new Error(`tmux stagePromptBuffer ${paneId} failed${unknownNote}: ${result.stderr}${retirementNote}`);
+    }
+    return { buf };
+  }
+
+  async pasteStagedBuffer(paneId: string, buf: string): Promise<void> {
+    const result = await run(
+      this.runner,
+      `tmux paste-buffer -b ${shellQuote(buf)} -t ${shellQuote(paneId)} -d -p -r`,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(`tmux pasteStagedBuffer ${paneId} failed: ${result.stderr}`);
+    }
+  }
+
+  async dropStagedBuffer(buf: string): Promise<void> {
+    const result = await run(this.runner, `tmux delete-buffer -b ${shellQuote(buf)}`);
+    if (result.exitCode !== 0) {
+      throw new Error(`tmux dropStagedBuffer ${buf} failed: ${result.stderr}`);
     }
   }
 
@@ -1133,7 +1202,7 @@ function isUnknownTmuxVariable(stderr: string): boolean {
 }
 
 function isUnknownTmuxBuffer(stderr: string): boolean {
-  return /unknown buffer/i.test(stderr);
+  return /unknown buffer|no buffer/i.test(stderr);
 }
 
 function isSessionAbsent(stderr: string): boolean {

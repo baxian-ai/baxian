@@ -13,11 +13,11 @@ export interface TaskFilter {
 
 const TASK_FIELDS = [
   'id', 'projectId', 'title', 'description', 'preferredAgentId',
-  'agentId', 'devAgentId', 'qaAgentId', 'researchAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'latestHeadSha', 'reviewHeadAnchorSha',
+  'agentId', 'devAgentId', 'qaAgentId', 'researchAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'branchLocalCleaned', 'latestHeadSha', 'reviewHeadAnchorSha',
   'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'specReviewRound', 'phase', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
   'reviewMode', 'batchIndex', 'batchTotal', 'reviewCheckoutMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
-  'verdictOverdue',
+  'postApproveRevoked', 'postApproveHeadSha', 'verdictOverdue',
 ] as const;
 
 const TASK_STATUSES = new Set<TaskStatus>([
@@ -80,6 +80,7 @@ function validateTask(raw: Record<string, unknown>): void {
   for (const field of [
     'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha', 'reviewDispatchedAt',
     'prFeedbackReceivedAt', 'fixDispatchedAt', 'signalToken', 'publishDispatchedAt',
+    'postApproveHeadSha',
   ]) optionalString(raw, field);
   if (!Number.isInteger(raw.reviewRound) || (raw.reviewRound as number) < 0) {
     throw taskSchemaError('reviewRound', 'an integer >= 0');
@@ -117,6 +118,23 @@ function validateTask(raw: Record<string, unknown>): void {
   }
   validateCleanupPending(raw, 'branchCleanupPending');
   validateCleanupPending(raw, 'branchCleanupSkipped');
+  if (raw.branchLocalCleaned !== undefined) {
+    const cleaned = raw.branchLocalCleaned;
+    if (!isRecord(cleaned)
+      || typeof cleaned.remoteTipSha !== 'string'
+      || !/^[0-9a-f]{40,64}$/i.test(cleaned.remoteTipSha)) {
+      throw taskSchemaError('branchLocalCleaned', 'a record with a commit-sha remoteTipSha when present');
+    }
+    requireString(cleaned, 'updatedAt');
+  }
+  if (raw.postApproveRevoked !== undefined) {
+    const revoked = raw.postApproveRevoked;
+    if (!isRecord(revoked)
+      || (revoked.reason !== 'request-changes' && revoked.reason !== 'redispatch-cap')) {
+      throw taskSchemaError('postApproveRevoked', 'a revocation record when present');
+    }
+    requireString(revoked, 'at');
+  }
   const participantIds = [raw.devAgentId, raw.qaAgentId, raw.researchAgentId]
     .filter((value): value is string => typeof value === 'string' && value !== '');
   if (new Set(participantIds).size !== participantIds.length) {

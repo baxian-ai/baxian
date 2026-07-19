@@ -318,6 +318,12 @@ export interface ContinueSessionOpts extends SessionDispatchOpts {
   postApproveRedispatchCount?: number;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   preserveDispatchOutputs?: boolean;
+  // In-flight replay: the dirty tree is the holder's own work, so only the branch pointer is asserted.
+  allowDirtyWorkdir?: boolean;
+  // Post-arm binding/lock rechecks don't re-verify task state; the replay fence extends to the pre-paste gates.
+  guardBeforeInject?: () => Promise<boolean>;
+  // Replay holds CAS on the entry hold generation so a successor hold is never overwritten.
+  expectedHold?: { phase?: string; since?: string; nonce?: string };
 }
 
 export interface DispatchArmContext {
@@ -355,6 +361,18 @@ export function canDispatchWithBinding(binding: AgentBindingFacts | null | undef
   return !binding?.taskId && !binding?.creationToken && binding?.status !== 'awaiting_human';
 }
 
+// 派发期 hold：prompt 从未注入、pane 无在途回合，重派安全；ack_unknown 一类不在此列
+export const RECOVERABLE_QA_DISPATCH_HOLD_PHASES = new Set<string>([
+  'checkout-preparation-failed',
+  'dirty-workdir',
+]);
+
+export function isRecoverableQaDispatchHold(binding: AgentBindingFacts | null | undefined): boolean {
+  return binding?.status === 'awaiting_human'
+    && binding.awaitingPhase != null
+    && RECOVERABLE_QA_DISPATCH_HOLD_PHASES.has(binding.awaitingPhase);
+}
+
 const TURN_COMPLETED_AWAITING_PHASES = new Set<string>();
 
 const CANCEL_CLEANUP_HOLD_PHASES = new Set<string>(['cancel-clearing', 'cancel-interrupt-failed']);
@@ -376,6 +394,12 @@ function cancelPhaseDowngrades(prev: string | undefined, next: string): boolean 
 
 const REGREET_REQUIRED_HOLD_PHASES = new Set<string>(['greeting_failed']);
 
+const CHECKOUT_HOLD_PHASES = new Set([
+  'dirty-workdir',
+  'checkout-preparation-failed',
+  'branch-cleanup-pending',
+]);
+
 function shouldReleaseHeldBinding(
   state: AgentBindingFacts,
   boundTask: TaskState | null | undefined,
@@ -383,7 +407,15 @@ function shouldReleaseHeldBinding(
   if (state.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(state.awaitingPhase)) return false;
   const taskIsTerminal = !!boundTask && TERMINAL_STATUSES.includes(boundTask.status);
   const turnCompleted = state.awaitingPhase != null && TURN_COMPLETED_AWAITING_PHASES.has(state.awaitingPhase);
-  return !boundTask || taskIsTerminal || turnCompleted;
+  // 任务已退回 verdict 门禁且当前持有者不是本 agent：这次绑定是转码失败的残留
+  // （fresh-acquire 释放被脏树挡下），Resume 时补完释放，否则 dev 被永久占住
+  const staleCodeHandoff =
+    state.awaitingPhase != null
+    && CHECKOUT_HOLD_PHASES.has(state.awaitingPhase)
+    && !!boundTask
+    && (boundTask.status === 'spec-ready' || boundTask.status === 'max_rounds')
+    && boundTask.agentId !== state.id;
+  return !boundTask || taskIsTerminal || turnCompleted || staleCodeHandoff;
 }
 
 export class AgentManager {
@@ -1954,7 +1986,14 @@ export class AgentManager {
     agentId: string,
     expectedTaskId: string,
     mode: 'waiting' | 'idle',
-    opts: { allowAwaitingHuman?: boolean; clearAwaitingHuman?: boolean; fromCancelCleanup?: boolean } = {},
+    opts: {
+      allowAwaitingHuman?: boolean;
+      clearAwaitingHuman?: boolean;
+      fromCancelCleanup?: boolean;
+      expectedTask?: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
+      expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
+      expectedLockToken?: string;
+    } = {},
   ): Promise<boolean> {
     return this.withTaskLock(async () => {
       const state = await this.agentStore.get(agentId);
@@ -1966,6 +2005,13 @@ export class AgentManager {
         );
         return false;
       }
+      if (opts.expectedLockToken !== undefined && state.lockToken !== opts.expectedLockToken) {
+        console.warn(
+          `[AgentManager] releaseAgentForTask: agent ${agentId} lock generation changed ` +
+          `(binding re-acquired by a successor); skipping release`,
+        );
+        return false;
+      }
       if (isCancelCleanupHold(state) && !opts.fromCancelCleanup) {
         console.warn(
           `[AgentManager] releaseAgentForTask: agent ${agentId} ${state.awaitingPhase} (cancel-cleanup hold); refusing auto-release`,
@@ -1973,6 +2019,20 @@ export class AgentManager {
         return false;
       }
       const boundTask = await this.taskStore.get(expectedTaskId);
+      if (
+        opts.expectedTask
+        && boundTask
+        && (
+          boundTask.status !== opts.expectedTask.status
+          || boundTask.phase !== opts.expectedTask.phase
+          || boundTask.signalToken !== opts.expectedTask.signalToken
+        )
+      ) {
+        console.warn(
+          `[AgentManager] releaseAgentForTask: task ${expectedTaskId} moved past the captured pass; skipping ${mode} transition`,
+        );
+        return false;
+      }
       if (state.status === 'awaiting_human' && !opts.allowAwaitingHuman) {
         if (!shouldReleaseHeldBinding(state, boundTask)) {
           console.warn(
@@ -1980,6 +2040,21 @@ export class AgentManager {
           );
           return false;
         }
+      }
+      // expectedHold 是 hold 世代快照的严格 CAS（全 undefined 表示“期望无 hold”）：
+      // hold 消失（被并发 Resume 清掉）或换代同样意味着接管，不得继续释放
+      const matchesExpectedHold = (binding: AgentBindingFacts): boolean => {
+        const held = binding.status === 'awaiting_human';
+        return (held ? binding.awaitingPhase : undefined) === opts.expectedHold!.phase
+          && (held ? binding.awaitingSince : undefined) === opts.expectedHold!.since
+          && (held ? binding.awaitingNonce : undefined) === opts.expectedHold!.nonce;
+      };
+      // 世代门前置：hold 换代时任何 pane/workdir 副作用都不得发生（末尾 CAS 只兜最后窗口）
+      if (opts.expectedHold && !matchesExpectedHold(state)) {
+        console.warn(
+          `[AgentManager] releaseAgentForTask: agent ${agentId} hold generation changed or cleared before release; refusing`,
+        );
+        return false;
       }
       if (mode === 'waiting' && (!boundTask || !ACTIVE_TASK_STATUSES.has(boundTask.status))) {
         console.warn(
@@ -2000,9 +2075,22 @@ export class AgentManager {
       const now = new Date().toISOString();
 
       if (mode === 'waiting') {
+        let preservedNewerHold = false;
         await this.agentStore.update(agentId, (latest) => {
           if (!latest) return AGENT_STORE_NOOP;
           if (opts.clearAwaitingHuman && latest.status === 'awaiting_human') {
+            // The hold-generation CAS lives inside the atomic update: a hold written after any pre-read survives.
+            if (
+              opts.expectedHold
+              && (
+                latest.awaitingPhase !== opts.expectedHold.phase
+                || latest.awaitingSince !== opts.expectedHold.since
+                || latest.awaitingNonce !== opts.expectedHold.nonce
+              )
+            ) {
+              preservedNewerHold = true;
+              return AGENT_STORE_NOOP;
+            }
             const cleared: AgentBindingFacts = {
               id: latest.id,
               projectId: latest.projectId,
@@ -2021,6 +2109,12 @@ export class AgentManager {
             updatedAt: now,
           };
         });
+        if (preservedNewerHold) {
+          console.warn(
+            `[AgentManager] releaseAgentForTask: agent ${agentId} holds a newer generation than the captured one; keeping the hold`,
+          );
+          return false;
+        }
         return true;
       }
 
@@ -2029,6 +2123,8 @@ export class AgentManager {
         const releaseWorkdir = state.workdir;
         const runner = this.createRunnerFor(cfg);
         const tmux = new TmuxManager(runner);
+        const holdMatchesExpected = (binding: AgentBindingFacts): boolean =>
+          !opts.expectedHold || matchesExpectedHold(binding);
         const hold = async (reason: string): Promise<boolean> => {
           const latest = await this.agentStore.get(agentId);
           if (
@@ -2039,18 +2135,28 @@ export class AgentManager {
           ) {
             return false;
           }
+          // 释放中被写入的新 hold（如 ack_unknown）比 cleanup 失败信息更关键，不得覆盖
+          if (!holdMatchesExpected(latest)) {
+            console.warn(
+              `[AgentManager] releaseAgentForTask: agent ${agentId} hold generation changed during release; not overwriting with branch-cleanup-pending`,
+            );
+            return false;
+          }
           const pendingAt = new Date().toISOString();
           if (boundTask && cfg.role === 'dev') {
             boundTask.branchCleanupPending = { agentId, reason, updatedAt: pendingAt };
             boundTask.updatedAt = pendingAt;
             await this.taskStore.set(boundTask);
           }
-          await this.agentStore.update(agentId, (latest) => {
-            if (!latest || latest.taskId !== expectedTaskId || latest.lockToken !== lockToken) {
+          let wrote = false;
+          await this.agentStore.update(agentId, (latest2) => {
+            if (!latest2 || latest2.taskId !== expectedTaskId || latest2.lockToken !== lockToken) {
               return AGENT_STORE_NOOP;
             }
+            if (!holdMatchesExpected(latest2)) return AGENT_STORE_NOOP;
+            wrote = true;
             return {
-              ...latest,
+              ...latest2,
               status: 'awaiting_human',
               awaitingPhase: 'branch-cleanup-pending',
               awaitingReason: reason,
@@ -2058,6 +2164,12 @@ export class AgentManager {
               updatedAt: pendingAt,
             };
           });
+          if (!wrote) {
+            console.warn(
+              `[AgentManager] releaseAgentForTask: agent ${agentId} branch-cleanup-pending hold not written (binding or hold changed)`,
+            );
+            return false;
+          }
           await this.emitIntervention(state.projectId, agentId, expectedTaskId, {
             phase: 'branch-cleanup-pending',
             reason,
@@ -2102,6 +2214,16 @@ export class AgentManager {
             sessionConfirmedAbsent = true;
           }
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
+          // 探测/等待期间 markAwaitingHuman 不受本锁串行；进入 checkout 变更前按当前盘面重验世代
+          if (opts.expectedHold) {
+            const beforeBranchOps = await this.agentStore.get(agentId);
+            if (!beforeBranchOps || !matchesExpectedHold(beforeBranchOps)) {
+              console.warn(
+                `[AgentManager] releaseAgentForTask: agent ${agentId} hold generation changed before checkout cleanup; aborting release`,
+              );
+              return false;
+            }
+          }
           if (cfg.role === 'dev' && boundTask) {
             const branches = new BranchManager(runner);
             const cleanup = await branches.cleanupTaskBranch(releaseWorkdir, {
@@ -2152,6 +2274,13 @@ export class AgentManager {
                 delete boundTask.branchCleanupSkipped;
                 cleanupStateChanged = true;
               }
+              if (cleanup.remoteTipSha) {
+                boundTask.branchLocalCleaned = {
+                  remoteTipSha: cleanup.remoteTipSha,
+                  updatedAt: new Date().toISOString(),
+                };
+                cleanupStateChanged = true;
+              }
             }
             if (cleanupStateChanged) {
               boundTask.updatedAt = new Date().toISOString();
@@ -2174,6 +2303,7 @@ export class AgentManager {
       } else {
         await this.assertTaskLockOwner(agentId, expectedTaskId, lockToken);
       }
+      let holdGenerationChanged = false;
       await this.agentStore.update(agentId, (existing) => {
         if (!existing) return AGENT_STORE_NOOP;
         if (
@@ -2181,6 +2311,11 @@ export class AgentManager {
           || existing.lockToken !== lockToken
           || (state.workdir !== undefined && existing.workdir !== state.workdir)
         ) {
+          return AGENT_STORE_NOOP;
+        }
+        // 世代 CAS 在原子写入内判定：预读后被重写或清除的 hold 都不得被这次释放清掉
+        if (opts.expectedHold && !matchesExpectedHold(existing)) {
+          holdGenerationChanged = true;
           return AGENT_STORE_NOOP;
         }
         return {
@@ -2192,14 +2327,35 @@ export class AgentManager {
           updatedAt: now,
         };
       });
+      if (holdGenerationChanged) {
+        console.warn(
+          `[AgentManager] releaseAgentForTask: agent ${agentId} hold generation changed during release; keeping the hold`,
+        );
+        return false;
+      }
       return this.lockManager.releaseIfOwner(agentId, expectedTaskId, lockToken);
+    });
+  }
+
+  private async clearBranchLocalCleaned(taskId: string): Promise<void> {
+    await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh?.branchLocalCleaned) return;
+      delete fresh.branchLocalCleaned;
+      fresh.updatedAt = new Date().toISOString();
+      await this.taskStore.set(fresh);
+    }).catch(err => {
+      console.warn(`[AgentManager] clearing branchLocalCleaned(${taskId}) failed:`, err);
     });
   }
 
   private async releaseAgentIfBound(
     agentId: string,
     expectedTaskId: string,
-    opts?: { allowAwaitingHuman?: boolean },
+    opts?: {
+      allowAwaitingHuman?: boolean;
+      expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
+    },
   ): Promise<boolean> {
     const state = await this.agentStore.get(agentId);
     if (state?.taskId !== expectedTaskId) return true;
@@ -2416,17 +2572,27 @@ export class AgentManager {
     await this.setAgentNeedInput(agentId, false);
   }
 
-  async clearAwaitingHuman(agentId: string): Promise<boolean> {
+  async clearAwaitingHuman(
+    agentId: string,
+    opts: { expectedHold?: { phase?: string; since?: string; nonce?: string } } = {},
+  ): Promise<boolean> {
     const now = new Date().toISOString();
     let cleared = false;
     await this.agentStore.update(agentId, (latest) => {
       if (!latest || latest.status !== 'awaiting_human') return AGENT_STORE_NOOP;
+      if (opts.expectedHold
+        && (latest.awaitingPhase !== opts.expectedHold.phase
+          || latest.awaitingSince !== opts.expectedHold.since
+          || latest.awaitingNonce !== opts.expectedHold.nonce)) {
+        return AGENT_STORE_NOOP;
+      }
       cleared = true;
       const {
         status: _status,
         awaitingPhase: _awaitingPhase,
         awaitingReason: _awaitingReason,
         awaitingSince: _awaitingSince,
+        awaitingNonce: _awaitingNonce,
         ...readyState
       } = latest;
       return {
@@ -2441,14 +2607,31 @@ export class AgentManager {
     agentId: string,
     phase: string,
     reason: string,
-    opts: { expectedCreationToken?: string | null; expectedTaskId?: string | null } = {},
-  ): Promise<void> {
+    opts: {
+      expectedCreationToken?: string | null;
+      expectedTaskId?: string | null;
+      expectedHold?: { phase?: string; since?: string; nonce?: string };
+      expectedLockToken?: string;
+    } = {},
+  ): Promise<boolean> {
     const now = new Date().toISOString();
     let projectId = '';
     let taskId: string | undefined;
     let wrote = false;
     await this.agentStore.update(agentId, (existing) => {
       if (!existing) return AGENT_STORE_NOOP;
+      if (opts.expectedHold) {
+        const heldPhase = existing.status === 'awaiting_human' ? existing.awaitingPhase : undefined;
+        const heldSince = existing.status === 'awaiting_human' ? existing.awaitingSince : undefined;
+        const heldNonce = existing.status === 'awaiting_human' ? existing.awaitingNonce : undefined;
+        if (
+          heldPhase !== opts.expectedHold.phase
+          || heldSince !== opts.expectedHold.since
+          || heldNonce !== opts.expectedHold.nonce
+        ) {
+          return AGENT_STORE_NOOP;
+        }
+      }
       if (opts.expectedCreationToken !== undefined) {
         const expected = opts.expectedCreationToken;
         const actual = existing.creationToken ?? null;
@@ -2458,6 +2641,10 @@ export class AgentManager {
         const expectedTask = opts.expectedTaskId;
         const actualTask = existing.taskId ?? null;
         if (actualTask !== expectedTask) return AGENT_STORE_NOOP;
+      }
+      // 锁代 CAS：绑定被 successor re-acquire 后不得把工作中的 agent 挂回旧 hold
+      if (opts.expectedLockToken !== undefined && existing.lockToken !== opts.expectedLockToken) {
+        return AGENT_STORE_NOOP;
       }
       if (isCancelCleanupHold(existing)) {
         if (!CANCEL_CLEANUP_HOLD_PHASES.has(phase)) return AGENT_STORE_NOOP;
@@ -2473,14 +2660,16 @@ export class AgentManager {
         awaitingPhase: phase,
         awaitingReason: reason,
         awaitingSince: now,
+        awaitingNonce: randomBytes(8).toString('hex'),
         updatedAt: now,
       };
     });
-    if (!wrote) return;
+    if (!wrote) return false;
     await this.emitIntervention(projectId, agentId, taskId, {
       phase,
       reason,
     });
+    return true;
   }
 
   private async markAwaitingIfAckUnknown(
@@ -2505,7 +2694,15 @@ export class AgentManager {
       resumed: boolean;
       releasedBinding: boolean;
       redispatchCodeTaskId?: string;
+      redispatchReviewTaskId?: string;
+      reviewPassToken?: string;
+      heldLockToken?: string;
       releaseTaskId?: string;
+      releaseHeldQa?: {
+        taskId: string;
+        expectedHold: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
+        expectedTask: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
+      };
       projectId?: string;
       previousPhase?: string;
       reason?: string;
@@ -2555,7 +2752,70 @@ export class AgentManager {
       if (
         (state.awaitingPhase === 'dirty-workdir' || state.awaitingPhase === 'checkout-preparation-failed')
         && boundTask && ACTIVE_TASK_STATUSES.has(boundTask.status)
+        // verdict 门禁状态没有在途派发：清掉 hold 后由 spec verdict 重新走完整转码，Resume 放行
+        && boundTask.status !== 'spec-ready' && boundTask.status !== 'max_rounds'
       ) {
+        if (state.taskId && boundTask.qaAgentId === agentId) {
+          // 停驻的 review pass 已死（任务离开 review）：重派会伪造新 pass，只清 hold 并释放绑定；
+          // 快照 hold/task 世代供释放路径 CAS，且不得借用 cancel-cleanup 的绕行凭据
+          if (boundTask.status !== 'review') {
+            return {
+              resumed: true,
+              releasedBinding: false,
+              releaseHeldQa: {
+                taskId: state.taskId,
+                expectedHold: {
+                  phase: state.awaitingPhase,
+                  since: state.awaitingSince,
+                  nonce: state.awaitingNonce,
+                },
+                expectedTask: {
+                  status: boundTask.status,
+                  phase: boundTask.phase,
+                  signalToken: boundTask.signalToken,
+                },
+              },
+              projectId: state.projectId,
+              previousPhase: state.awaitingPhase,
+            };
+          }
+          const nowQa = new Date().toISOString();
+          let clearedHold = false;
+          await this.agentStore.update(agentId, (existing) => {
+            if (!existing || existing.taskId !== state.taskId) return AGENT_STORE_NOOP;
+            if (
+              existing.awaitingPhase !== state.awaitingPhase
+              || existing.awaitingSince !== state.awaitingSince
+              || existing.awaitingNonce !== state.awaitingNonce
+            ) {
+              return AGENT_STORE_NOOP;
+            }
+            clearedHold = true;
+            return {
+              ...existing,
+              status: 'ok',
+              awaitingPhase: undefined,
+              awaitingReason: undefined,
+              awaitingSince: undefined,
+              awaitingNonce: undefined,
+              updatedAt: nowQa,
+            };
+          });
+          if (!clearedHold) {
+            const reason = `Agent ${agentId} hold changed while resuming; re-check the agent state and Resume again.`;
+            console.warn(`[AgentManager] resumeAgent: ${reason}`);
+            return { resumed: false, releasedBinding: false, reason };
+          }
+          return {
+            resumed: true,
+            releasedBinding: false,
+            redispatchReviewTaskId: state.taskId,
+            reviewPassToken: boundTask.signalToken,
+            heldLockToken: state.lockToken,
+            projectId: state.projectId,
+            previousPhase: state.awaitingPhase,
+          };
+        }
         const reason =
           `Task ${state.taskId} was not dispatched because its checkout could not be prepared. ` +
           'Fix the Workdir, then cancel and redispatch the task; Resume cannot reconstruct the original dispatch safely.';
@@ -2655,7 +2915,7 @@ export class AgentManager {
     if (result.redispatchCodeTaskId) {
       try {
         const task = await this.taskStore.get(result.redispatchCodeTaskId);
-        const round = task?.specReviewRound;
+        const round = task ? (task.specReviewRound ?? 1) : undefined;
         const stored = round === undefined
           ? null
           : await this.reviewStore?.getRound(result.redispatchCodeTaskId, 'spec', round);
@@ -2685,6 +2945,12 @@ export class AgentManager {
           ).catch(() => undefined);
           return { resumed: false, releasedBinding: false, reason };
         }
+        // 重派与首派同样不经 startSession 的 post-ack finalize：残留的 bootstrap 标记
+        // 会让下一次 recover 把已送达的 code prompt 再判成未送达
+        if (!this.isResearchHandoff(task, agentId)) {
+          const lockToken = (await this.agentStore.get(agentId))?.lockToken;
+          await this.finalizeReplayedBootstrap(agentId, result.redispatchCodeTaskId, 'code', lockToken);
+        }
       } catch (err) {
         console.error(`[AgentManager] resumeAgent code redispatch failed for ${agentId}:`, err);
         const reason = `Code-phase redispatch on Resume failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -2695,6 +2961,129 @@ export class AgentManager {
           { expectedTaskId: result.redispatchCodeTaskId },
         ).catch(() => undefined);
         return { resumed: false, releasedBinding: false, reason };
+      }
+    }
+    if (result.releaseHeldQa) {
+      const { taskId: heldTaskId, expectedHold, expectedTask } = result.releaseHeldQa;
+      const released = await this.releaseAgentForTask(agentId, heldTaskId, 'idle', {
+        allowAwaitingHuman: true,
+        expectedHold,
+        expectedTask,
+      });
+      if (!released) {
+        const refreshed = await this.agentStore.get(agentId).catch((readErr) => {
+          console.warn(`[AgentManager] resumeAgent post-release read failed for ${agentId}:`, readErr);
+          return null;
+        });
+        return {
+          resumed: false,
+          releasedBinding: false,
+          reason: refreshed?.awaitingReason
+            ?? `Agent ${agentId} could not safely release task ${heldTaskId}; its pass or hold moved on — re-check the agent state and Resume again.`,
+        };
+      }
+      await this.emitIntervention(result.projectId!, agentId, heldTaskId, {
+        phase: 'resumed',
+        previousPhase: result.previousPhase,
+        releasedBinding: true,
+      });
+      return { resumed: true, releasedBinding: true };
+    }
+    if (result.redispatchReviewTaskId) {
+      try {
+        await this.dispatchReviewToQa(result.redispatchReviewTaskId, {
+          bumpRound: false,
+          fromStatus: ['review'],
+          ...(result.reviewPassToken !== undefined ? { expectSignalToken: result.reviewPassToken } : {}),
+        });
+      } catch (err) {
+        console.error(`[AgentManager] resumeAgent review redispatch failed for ${agentId}:`, err);
+        const reason = `QA review redispatch on Resume failed: ${err instanceof Error ? err.message : String(err)}`;
+        const reviewTaskId = result.redispatchReviewTaskId;
+        // 锁代未变（未被 successor re-acquire）才允许补挂；markAwaitingHuman 内的 CAS 原子复核同一条件
+        const restoreHoldIfStillOurs = async (phase: string, holdReason: string): Promise<void> => {
+          const after = await this.agentStore.get(agentId);
+          if (
+            after?.taskId === reviewTaskId
+            && after.status !== 'awaiting_human'
+            && after.lockToken === result.heldLockToken
+          ) {
+            await this.markAwaitingHuman(agentId, phase, holdReason, {
+              expectedTaskId: reviewTaskId,
+              ...(result.heldLockToken !== undefined ? { expectedLockToken: result.heldLockToken } : {}),
+            });
+          }
+        };
+        // handled 只代表 startSession 已尝试落 hold；落库可能已失败，必须核实并按需补挂
+        if (err instanceof EnsureSessionError && err.partial.handled) {
+          try {
+            await restoreHoldIfStillOurs(result.previousPhase ?? 'checkout-preparation-failed', reason);
+            return { resumed: false, releasedBinding: false, reason };
+          } catch (holdErr) {
+            const holdMsg = holdErr instanceof Error ? holdErr.message : String(holdErr);
+            console.error(`[AgentManager] resumeAgent could not verify/restore the handled hold for ${agentId}:`, holdErr);
+            return {
+              resumed: false,
+              releasedBinding: false,
+              reason: `${reason}; verifying/restoring the hold also failed: ${holdMsg} — the agent may be missing its awaiting_human flag, inspect it manually`,
+            };
+          }
+        }
+        // ack_unknown：prompt 可能已在跑，必须恢复 ack hold 的可见性，而非按普通失败补挂 checkout hold
+        if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') {
+          try {
+            await restoreHoldIfStillOurs(
+              'dispatch-failed:ack_unknown',
+              `${err.message}. Prompt may still be running in the pane; verify before resuming.`,
+            );
+            return { resumed: false, releasedBinding: false, reason };
+          } catch (holdErr) {
+            const holdMsg = holdErr instanceof Error ? holdErr.message : String(holdErr);
+            console.error(`[AgentManager] resumeAgent could not restore the ack_unknown hold for ${agentId}:`, holdErr);
+            return {
+              resumed: false,
+              releasedBinding: false,
+              reason: `${reason}; restoring the dispatch-failed:ack_unknown hold also failed: ${holdMsg} — prompt state is unknown and the agent is NOT flagged awaiting_human, inspect it manually`,
+            };
+          }
+        }
+        // pass 被接管（token 轮换或任务离开 review）说明该 pass 已死，补挂会把新 pass 的 QA 打成 hold
+        let passSuperseded = false;
+        let recoveryReadFailed = false;
+        try {
+          const taskNow = await this.taskStore.get(reviewTaskId);
+          passSuperseded = taskNow?.status !== 'review'
+            || (result.reviewPassToken !== undefined && taskNow.signalToken !== result.reviewPassToken);
+        } catch (readErr) {
+          recoveryReadFailed = true;
+          console.error(`[AgentManager] resumeAgent recovery task read failed for ${agentId}:`, readErr);
+        }
+        if (passSuperseded) return { resumed: false, releasedBinding: false, reason };
+        try {
+          if (recoveryReadFailed) {
+            // 读失败时无法证明接管，优先恢复可见性：锁代/绑定 CAS 全部由 markAwaitingHuman 原子判定
+            await this.markAwaitingHuman(
+              agentId,
+              result.previousPhase ?? 'checkout-preparation-failed',
+              reason,
+              {
+                expectedTaskId: reviewTaskId,
+                ...(result.heldLockToken !== undefined ? { expectedLockToken: result.heldLockToken } : {}),
+              },
+            );
+          } else {
+            await restoreHoldIfStillOurs(result.previousPhase ?? 'checkout-preparation-failed', reason);
+          }
+          return { resumed: false, releasedBinding: false, reason };
+        } catch (holdErr) {
+          const holdMsg = holdErr instanceof Error ? holdErr.message : String(holdErr);
+          console.error(`[AgentManager] resumeAgent could not restore the QA hold for ${agentId}:`, holdErr);
+          return {
+            resumed: false,
+            releasedBinding: false,
+            reason: `${reason}; restoring the hold also failed: ${holdMsg} — the agent is NOT flagged awaiting_human, inspect it manually`,
+          };
+        }
       }
     }
     return {
@@ -3106,43 +3495,405 @@ export class AgentManager {
     });
   }
 
-  async redispatchResearchAfterReplRestart(agentId: string, taskId: string): Promise<boolean> {
+  // Holds only the pass captured in the task tuple: a successor pass (rotated token/phase/status) is never overwritten.
+  async holdReplayFailureIfCurrent(
+    agentId: string,
+    taskAtEntry: Pick<TaskState, 'id' | 'status' | 'phase' | 'signalToken'>,
+    holdPhase: string,
+    reason: string,
+    entryHold: { phase: string | undefined; since: string | undefined; nonce: string | undefined },
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskAtEntry.id);
+      if (
+        fresh?.agentId !== agentId
+        || fresh.status !== taskAtEntry.status
+        || fresh.phase !== taskAtEntry.phase
+        || fresh.signalToken !== taskAtEntry.signalToken
+      ) return false;
+      if (await this.markAwaitingHuman(agentId, holdPhase, reason, {
+        expectedTaskId: taskAtEntry.id,
+        expectedHold: entryHold,
+      })) return true;
+      // Entry hold gone (Resume raced): write over the empty generation, never over a foreign hold.
+      if (await this.markAwaitingHuman(agentId, holdPhase, reason, {
+        expectedTaskId: taskAtEntry.id,
+        expectedHold: { phase: undefined, since: undefined, nonce: undefined },
+      })) return true;
+      const now = await this.agentStore.get(agentId);
+      return now?.status === 'awaiting_human';
+    });
+  }
+
+  async redispatchTaskPromptAfterReplRestart(agentId: string, taskId: string): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     const task = await this.taskStore.get(taskId);
-    if (!agent || agent.role !== 'research' || !task) return false;
-    if (task.researchAgentId !== agentId || task.agentId !== agentId || !task.signalToken) return false;
+    if (!agent || !task || !TASK_OWNER_ROLES.has(agent.role)) return false;
+    if (task.agentId !== agentId) return false;
+    const participantId = agent.role === 'research' ? task.researchAgentId : task.devAgentId;
+    if (participantId !== agentId) return false;
 
-    let phase: 'research' | 'server-feedback';
-    let expectedKind: PhaseSignalKind;
-    let findings: string | undefined;
-    if (task.phase === 'research' && task.status === 'in_progress') {
-      phase = 'research';
-      expectedKind = 'spec-done';
-    } else if (task.phase === 'spec' && task.status === 'fixing') {
-      const round = task.specReviewRound ?? 1;
-      const stored = await this.reviewStore?.getRound(taskId, 'spec', round);
-      if (!stored?.findings) return false;
-      phase = 'server-feedback';
-      expectedKind = 'spec-fixed';
-      findings = JSON.stringify(stored.findings);
-    } else {
+    const bindingAtEntry = await this.agentStore.get(agentId);
+    const entryHold = {
+      phase: bindingAtEntry?.status === 'awaiting_human' ? bindingAtEntry.awaitingPhase : undefined,
+      since: bindingAtEntry?.status === 'awaiting_human' ? bindingAtEntry.awaitingSince : undefined,
+      nonce: bindingAtEntry?.status === 'awaiting_human' ? bindingAtEntry.awaitingNonce : undefined,
+    };
+    // Concurrent passes can advance the task mid-replay; every replay gate re-checks this snapshot.
+    const taskStillCurrent = async (): Promise<boolean> => {
+      const fresh = await this.taskStore.get(taskId);
+      return fresh?.agentId === agentId
+        && fresh.status === task.status
+        && fresh.phase === task.phase
+        && fresh.signalToken === task.signalToken;
+    };
+    // Hold ops share one task-mutation slot with a tuple re-check, and CAS on the entry hold generation.
+    const clearEntryHold = async (): Promise<boolean> => this.withTaskLock(async () => {
+      if (!(await taskStillCurrent())) return false;
+      if (entryHold.phase === undefined) {
+        const now = await this.agentStore.get(agentId);
+        return now?.status !== 'awaiting_human';
+      }
+      return this.clearAwaitingHuman(agentId, { expectedHold: entryHold });
+    });
+    const holdReplayFailure = (phase: string, reason: string): Promise<boolean> =>
+      this.holdReplayFailureIfCurrent(agentId, task, phase, reason, entryHold);
+    // skipSnapshot: stale scrollback literals belong to the aborted runtime; onlyReplaceOwnToken keeps a successor's watcher out of reach.
+    const fencedReplay = (
+      expectedKinds: readonly PhaseSignalKind[],
+      token: string,
+      stillCurrent: () => Promise<boolean>,
+    ): Pick<ContinueSessionOpts, 'armBeforeInject' | 'guardBeforeInject'> => {
+      const abortStaleReplay = async (): Promise<boolean> => {
+        if (await stillCurrent()) return true;
+        this.phaseSignalWatcher?.stopIfToken(taskId, token);
+        return false;
+      };
+      return {
+        armBeforeInject: async () => {
+          if (!(await stillCurrent())) return false;
+          const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, {
+            skipSnapshot: true,
+            onlyReplaceOwnToken: true,
+          });
+          if (!armed) {
+            if (!(await stillCurrent())) return false;
+            // Own-generation arm failure: throwing routes the caller into the resumable hold.
+            throw new Error(
+              `replay signal watcher failed to arm for task ${taskId}; Restart REPL again or cancel the task`,
+            );
+          }
+          return abortStaleReplay();
+        },
+        guardBeforeInject: abortStaleReplay,
+      };
+    };
+
+    try {
+      if (task.status === 'approved' && agent.role === 'dev') {
+        return await this.replayApprovedHolderAfterReplRestart(
+          agentId, task, taskStillCurrent, fencedReplay, { clearEntryHold, holdReplayFailure },
+        );
+      }
+
+      const mapped = this.mapTaskStateToExpectedWatcher(task);
+      if (!mapped || mapped.agentId !== agentId) return false;
+      if (!task.signalToken) {
+        return await holdReplayFailure(
+          'restart-redispatch-failed',
+          'REPL restarted mid-pass but the task has no signal token to replay the prompt with; cancel the task or re-dispatch it.',
+        );
+      }
+      const signalToken = task.signalToken;
+
+      const replayOpts: ContinueSessionOpts = {
+        signalToken,
+        preserveDispatchOutputs: true,
+        expectedHold: { phase: undefined, since: undefined, nonce: undefined },
+        ...fencedReplay(mapped.expectedKinds, signalToken, taskStillCurrent),
+      };
+      const replayInitialBootstrap = async (
+        phase: 'research' | 'develop',
+        opts: ContinueSessionOpts,
+      ): Promise<boolean> => {
+        // This hold means the prompt WAS delivered and only the marker clear failed; replaying would run it twice.
+        if (entryHold.phase === 'bootstrap-marker-clear-failed') {
+          return holdReplayFailure(
+            'restart-redispatch-failed',
+            'REPL restarted while the initial prompt was already delivered (its bootstrap marker clear had failed); replaying would dispatch the task twice. Resume and verify the Workdir, or cancel the task.',
+          );
+        }
+        const bindingBefore = await this.agentStore.get(agentId);
+        if (!(await clearEntryHold())) return false;
+        const resumed = await this.continueSession(taskId, agentId, phase, opts);
+        if (resumed && bindingBefore?.bootstrappingTaskId === taskId) {
+          await this.finalizeReplayedBootstrap(agentId, taskId, phase, bindingBefore.lockToken);
+        }
+        return resumed;
+      };
+
+      if (task.status === 'in_progress' && task.phase === 'research' && agent.role === 'research') {
+        return await replayInitialBootstrap('research', replayOpts);
+      }
+
+      if (task.status === 'in_progress' && task.phase === undefined && agent.role === 'dev') {
+        // An undelivered bootstrap never started work, so the fresh-dispatch clean gate still applies.
+        const delivered = (await this.agentStore.get(agentId))?.bootstrappingTaskId !== taskId;
+        return await replayInitialBootstrap('develop', {
+          ...replayOpts,
+          ...(delivered ? { allowDirtyWorkdir: true } : {}),
+        });
+      }
+
+      if (task.status === 'in_progress' && task.phase === 'code' && agent.role === 'dev') {
+        const state = await this.agentStore.get(agentId);
+        // A no-QA auto-approved spec never writes specReviewRound back; the code dispatch defaults to round 1.
+        const round = task.specReviewRound ?? 1;
+        const stored = await this.reviewStore?.getRound(taskId, 'spec', round);
+        if (state?.bootstrappingTaskId === taskId || !stored || stored.phase !== 'spec') {
+          return await holdReplayFailure(
+            'code-dispatch-failed',
+            'REPL restarted but the code-phase prompt cannot be resumed in place. Resume to replay the persisted Spec documents, or cancel the task.',
+          );
+        }
+        if (!(await clearEntryHold())) return false;
+        return await this.continueSession(taskId, agentId, 'code', {
+          ...replayOpts,
+          allowDirtyWorkdir: true,
+          specDocuments: stored.documents,
+          ...(task.specReviewRound !== undefined ? { currentSpecRound: task.specReviewRound } : {}),
+        });
+      }
+
+      if (task.status === 'fixing' && task.phase === 'spec') {
+        const round = task.specReviewRound ?? 1;
+        const stored = await this.reviewStore?.getRound(taskId, 'spec', round);
+        if (!stored?.findings) {
+          return await holdReplayFailure(
+            'restart-redispatch-failed',
+            `REPL restarted during the spec fixing round but round ${round} findings are not persisted; the feedback prompt cannot be replayed. Cancel the task or re-run the spec review.`,
+          );
+        }
+        if (!(await clearEntryHold())) return false;
+        return await this.continueSession(taskId, agentId, 'server-feedback', {
+          ...replayOpts,
+          ...(agent.role === 'dev' ? { allowDirtyWorkdir: true } : {}),
+          serverPriorFindings: JSON.stringify(stored.findings),
+          ...(task.specReviewRound !== undefined ? { currentSpecRound: task.specReviewRound } : {}),
+        });
+      }
+
+      // A direct (no-SDD) pass never persists a phase, so fixing + undefined is the plain code-feedback round.
+      if (
+        task.status === 'fixing'
+        && (task.phase === 'code' || task.phase === undefined)
+        && agent.role === 'dev'
+      ) {
+        if (task.reviewMode === 'server') {
+          const round = Math.max(task.reviewRound, 1);
+          const stored = await this.reviewStore?.getRound(taskId, 'code', round);
+          if (!stored?.findings) {
+            return await holdReplayFailure(
+              'restart-redispatch-failed',
+              `REPL restarted during the code fixing round but round ${round} findings are not persisted; the feedback prompt cannot be replayed. Cancel the task or re-run the code review.`,
+            );
+          }
+          if (!(await clearEntryHold())) return false;
+          return await this.continueSession(taskId, agentId, 'server-feedback', {
+            ...replayOpts,
+            allowDirtyWorkdir: true,
+            serverPriorFindings: JSON.stringify(stored.findings),
+          });
+        }
+        if (!(await clearEntryHold())) return false;
+        return await this.continueSession(taskId, agentId, 'fix', {
+          ...replayOpts,
+          allowDirtyWorkdir: true,
+        });
+      }
+
       return false;
+    } catch (err) {
+      // A post-entry throw may land after clearEntryHold; only a tuple-checked hold on the live generation is safe.
+      const message = err instanceof Error ? err.message : String(err);
+      if (await holdReplayFailure(
+        'restart-redispatch-failed',
+        `REPL restarted but replaying the task prompt failed: ${message}. Resume to retry, or cancel the task.`,
+      )) {
+        return true;
+      }
+      throw err;
+    }
+  }
+
+  // approved hosts two live holder passes — GitHub post-approve (PostApproveStore) and server after-done (task fields); a parked pre-publish holder stays on the waiting path.
+  private async replayApprovedHolderAfterReplRestart(
+    agentId: string,
+    task: TaskState,
+    taskStillCurrent: () => Promise<boolean>,
+    fencedReplay: (
+      expectedKinds: readonly PhaseSignalKind[],
+      token: string,
+      stillCurrent: () => Promise<boolean>,
+    ) => Pick<ContinueSessionOpts, 'armBeforeInject' | 'guardBeforeInject'>,
+    holdGen: {
+      clearEntryHold: () => Promise<boolean>;
+      holdReplayFailure: (phase: string, reason: string) => Promise<boolean>;
+    },
+  ): Promise<boolean> {
+    const taskId = task.id;
+    const { clearEntryHold, holdReplayFailure } = holdGen;
+    if (task.reviewMode === 'server') {
+      if (!task.publishDispatchedAt) return false;
+      if (!task.signalToken) {
+        return holdReplayFailure(
+          'restart-redispatch-failed',
+          'REPL restarted mid-publish but the rotated publish token is missing; the publish prompt cannot be replayed. Cancel the task or mark-complete to re-dispatch the publish.',
+        );
+      }
+      const token = task.signalToken;
+      const afterDone = this.resolveAfterDone(task);
+      if (!afterDone) {
+        return holdReplayFailure(
+          'restart-redispatch-failed',
+          'REPL restarted mid-publish but the after-done target cannot be resolved anymore. Resume then mark-complete to retry the publish, or cancel the task.',
+        );
+      }
+      let violation: Awaited<ReturnType<typeof this.findLineageViolation>>;
+      try {
+        violation = await this.findLineageViolation(taskId);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return holdReplayFailure(
+          'restart-redispatch-failed',
+          `REPL restarted mid-publish but the branch lineage re-check failed: ${message}. Resume then Restart REPL to retry, or cancel the task.`,
+        );
+      }
+      if (violation) {
+        return holdReplayFailure(
+          'restart-redispatch-failed',
+          `The task branch embeds another active task's commits (${violation.branch}); rebase onto origin/HEAD, then mark-complete to retry the publish.`,
+        );
+      }
+      if (!(await clearEntryHold())) return false;
+      return this.continueSession(taskId, agentId, 'server-after-done', {
+        signalToken: token,
+        preserveDispatchOutputs: true,
+        expectedHold: { phase: undefined, since: undefined, nonce: undefined },
+        allowDirtyWorkdir: true,
+        serverAfterDone: { kind: afterDone, branch: task.branch ?? BRANCH_PREFIX + taskId },
+        ...fencedReplay(['code-ready'], token, taskStillCurrent),
+      });
     }
 
-    await this.clearAwaitingHuman(agentId);
-    return this.continueSession(taskId, agentId, phase, {
-      bypassTaskStatusGate: true,
-      signalToken: task.signalToken,
-      preserveDispatchOutputs: true,
-      ...(findings ? { serverPriorFindings: findings } : {}),
-      ...(task.specReviewRound !== undefined ? { currentSpecRound: task.specReviewRound } : {}),
-      armBeforeInject: () => this.setupPhaseSignalWatcher(
-        taskId,
-        agentId,
-        expectedKind,
-        task.signalToken!,
-      ),
+    if (task.postApproveRevoked) {
+      return holdReplayFailure(
+        'restart-redispatch-failed',
+        `The post-approve completion was deliberately revoked (${task.postApproveRevoked.reason}); ` +
+        'the block stays effective, so the pass is not replayed. Re-request changes to restart the review round, or cancel the task.',
+      );
+    }
+    const stored = await this.getPostApproveCompletion(taskId);
+    let completion: { token: string; rebuilt: boolean } | 'held' | 'stale';
+    if (stored) {
+      if (!task.postApproveHeadSha) {
+        return holdReplayFailure(
+          'restart-redispatch-failed',
+          'REPL restarted during the post-approve pass but the stored completion cannot be tied to a persisted approved head; re-request the review verdict or cancel the task.',
+        );
+      }
+      if (stored.approvedHeadSha !== task.postApproveHeadSha) {
+        // Provably a dead episode's residue: retire it by token, then rebuild for the current head.
+        await this.clearPostApproveCompletionIfMatches(taskId, stored.token);
+        completion = await this.rebuildPostApproveCompletion(agentId, task, holdReplayFailure);
+      } else {
+        completion = { token: stored.token, rebuilt: false };
+      }
+    } else {
+      completion = await this.rebuildPostApproveCompletion(agentId, task, holdReplayFailure);
+    }
+    if (completion === 'held') return true;
+    if (completion === 'stale') return false;
+    const resolvedCompletion = completion;
+    const completionStillCurrent = async (): Promise<boolean> => {
+      const fresh = await this.taskStore.get(taskId);
+      return fresh?.agentId === agentId
+        && fresh.status === task.status
+        && fresh.phase === task.phase
+        && fresh.signalToken === task.signalToken
+        && fresh.postApproveRevoked === undefined
+        && fresh.postApproveHeadSha === task.postApproveHeadSha
+        && (await this.getPostApproveCompletion(taskId))?.token === resolvedCompletion.token;
+    };
+    if (!(await completionStillCurrent())) return false;
+    if (!(await clearEntryHold())) return false;
+    let resumed = false;
+    try {
+      resumed = await this.continueSession(taskId, agentId, 'post-approve', {
+        signalToken: completion.token,
+        preserveDispatchOutputs: true,
+        expectedHold: { phase: undefined, since: undefined, nonce: undefined },
+        allowDirtyWorkdir: true,
+        ...fencedReplay(['pr-merge-ready'], completion.token, completionStillCurrent),
+      });
+    } catch (err) {
+      if (completion.rebuilt) await this.clearPostApproveCompletionIfMatches(taskId, completion.token);
+      throw err;
+    }
+    if (!resumed && completion.rebuilt) {
+      await this.clearPostApproveCompletionIfMatches(taskId, completion.token);
+      const fresh = await this.taskStore.get(taskId);
+      const episodeIntact = fresh?.agentId === agentId
+        && fresh.status === task.status
+        && fresh.phase === task.phase
+        && fresh.signalToken === task.signalToken
+        && fresh.postApproveRevoked === undefined
+        && fresh.postApproveHeadSha === task.postApproveHeadSha;
+      if (!episodeIntact) return false;
+      return holdReplayFailure(
+        'restart-redispatch-failed',
+        'REPL restarted during the post-approve pass and the rebuilt prompt could not be delivered; Resume then Restart REPL to retry, or cancel the task.',
+      );
+    }
+    return resumed;
+  }
+
+  // A bare hold would loop (Resume clears it, the next restart misses the record again), so rebuild from the persisted approved head.
+  private async rebuildPostApproveCompletion(
+    agentId: string,
+    task: TaskState,
+    holdReplayFailure: (phase: string, reason: string) => Promise<boolean>,
+  ): Promise<{ token: string; rebuilt: true } | 'held' | 'stale'> {
+    // latestHeadSha drifts with pushes/mismatch probes; only the head persisted at dispatch is provably approved.
+    const approvedHeadSha = task.postApproveHeadSha;
+    if (!approvedHeadSha) {
+      const held = await holdReplayFailure(
+        'restart-redispatch-failed',
+        'REPL restarted during the post-approve pass but neither its completion context nor a provably approved head are persisted; cancel the task or re-request the review verdict.',
+      );
+      return held ? 'held' : 'stale';
+    }
+    const token = createSignalToken();
+    // Conditional create: the in-lock re-read rejects any revoke/dispatch landed since the snapshot.
+    const created = await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(task.id);
+      if (
+        !fresh
+        || fresh.agentId !== agentId
+        || fresh.status !== 'approved'
+        || fresh.phase !== task.phase
+        || fresh.signalToken !== task.signalToken
+        || fresh.postApproveRevoked !== undefined
+        || fresh.postApproveHeadSha !== approvedHeadSha
+      ) {
+        return false;
+      }
+      if (await this.postApproveStore.get(task.id)) return false;
+      await this.postApproveStore.set(task.id, { token, approvedHeadSha });
+      return true;
     });
+    if (!created) return 'stale';
+    return { token, rebuilt: true };
   }
 
   prepareRemoveTargets(agentId: string): { targets: string[] } {
@@ -3339,6 +4090,7 @@ export class AgentManager {
     return this.postApproveStore.get(taskId);
   }
 
+  // Install CASes on the current approved episode; only a fresh human verdict (clearRevocation) unlocks a standing marker.
   async setPostApproveCompletion(
     taskId: string,
     value: {
@@ -3347,12 +4099,22 @@ export class AgentManager {
       redispatchCount?: number;
       pendingRedispatch?: boolean;
     },
-  ): Promise<void> {
-    await this.withTaskLock(async () => {
-      await this.postApproveStore.set(taskId, value);
-      if (!this.phaseSignalWatcher) return;
+    opts: { clearRevocation?: boolean } = {},
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
-      if (!task) return;
+      if (task) {
+        if (task.status !== 'approved') return false;
+        if (task.postApproveRevoked && !opts.clearRevocation) return false;
+        if (task.postApproveHeadSha !== undefined && task.postApproveHeadSha !== value.approvedHeadSha) return false;
+      }
+      await this.postApproveStore.set(taskId, value);
+      if (!task) return true;
+      if (task.postApproveRevoked) {
+        const { postApproveRevoked: _revoked, ...rest } = task;
+        await this.taskStore.set({ ...rest, updatedAt: new Date().toISOString() });
+      }
+      if (!this.phaseSignalWatcher) return true;
       await this.startPhaseSignalWatch({
         taskId,
         projectId: task.projectId,
@@ -3360,6 +4122,7 @@ export class AgentManager {
         expectedKinds: 'pr-merge-ready',
         token: value.token,
       });
+      return true;
     });
   }
 
@@ -3367,6 +4130,53 @@ export class AgentManager {
     await this.withTaskLock(async () => {
       await this.postApproveStore.clear(taskId);
       this.phaseSignalWatcher?.stop(taskId);
+    });
+  }
+
+  // CAS for an existing pass: never creates a record nor touches the marker, so it cannot resurrect a revoked completion.
+  async updatePostApproveCompletionIfToken(
+    taskId: string,
+    expectedToken: string,
+    patch: { redispatchCount?: number; pendingRedispatch?: boolean },
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (task?.postApproveRevoked) return false;
+      const current = await this.postApproveStore.get(taskId);
+      if (!current || current.token !== expectedToken) return false;
+      await this.postApproveStore.set(taskId, { ...current, ...patch });
+      return true;
+    });
+  }
+
+  // Deliberate clear: the persisted marker keeps a restart replay from rebuilding the completion and bypassing the block.
+  async revokePostApproveCompletion(
+    taskId: string,
+    reason: 'request-changes' | 'redispatch-cap',
+    opts: { expectedToken?: string; expectedHeadSha?: string } = {},
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.status !== 'approved') return false;
+      // Head binds the revoke to one approved episode; an unpersisted head cannot disprove it, so blocking stays fail closed.
+      if (
+        opts.expectedHeadSha !== undefined
+        && task.postApproveHeadSha !== undefined
+        && task.postApproveHeadSha !== opts.expectedHeadSha
+      ) return false;
+      if (opts.expectedToken !== undefined) {
+        const current = await this.postApproveStore.get(taskId);
+        if (current?.token !== opts.expectedToken) return false;
+      }
+      // Marker lands first: a crash before the clear leaves marker+completion, which every consumer fences on.
+      await this.taskStore.set({
+        ...task,
+        postApproveRevoked: { reason, at: new Date().toISOString() },
+        updatedAt: new Date().toISOString(),
+      });
+      await this.postApproveStore.clear(taskId);
+      this.phaseSignalWatcher?.stop(taskId);
+      return true;
     });
   }
 
@@ -3378,12 +4188,78 @@ export class AgentManager {
     });
   }
 
+  // Marker/token/head/pending are re-checked inside the committing critical section, so a concurrent revoke never loses.
+  async completeApprovedPassToMergeReady(
+    taskId: string,
+    expectedToken: string,
+  ): Promise<{ task: TaskState } | { refused: 'stale' | 'pending' }> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.status !== 'approved' || task.postApproveRevoked) {
+        return { refused: 'stale' as const };
+      }
+      const completion = await this.postApproveStore.get(taskId);
+      if (
+        !completion
+        || completion.token !== expectedToken
+        || task.postApproveHeadSha === undefined
+        || completion.approvedHeadSha !== task.postApproveHeadSha
+      ) {
+        return { refused: 'stale' as const };
+      }
+      if (completion.pendingRedispatch) return { refused: 'pending' as const };
+      delete task.postApproveHeadSha;
+      Object.assign(task, {
+        status: 'merge-ready' as TaskStatus,
+        latestHeadSha: completion.approvedHeadSha,
+        updatedAt: new Date().toISOString(),
+      });
+      await this.taskStore.set(task);
+      await this.postApproveStore.clear(taskId);
+      this.phaseSignalWatcher?.stop(taskId);
+      return { task };
+    });
+  }
+
   async setupRecoveredPostApproveSignals(): Promise<void> {
-    if (!this.phaseSignalWatcher) return;
     const tasks = await this.taskStore.list({ status: 'approved' });
     for (const task of tasks) {
+      if (task.postApproveRevoked) {
+        // Finish an interrupted revoke: the marker is authoritative, the leftover record must not re-arm.
+        try {
+          await this.postApproveStore.clear(task.id);
+        } catch (err) {
+          console.warn(
+            `[AgentManager] setupRecoveredPostApproveSignals: revoked completion cleanup failed for task=${task.id}:`,
+            err,
+          );
+        }
+        continue;
+      }
       const completion = await this.postApproveStore.get(task.id);
       if (!completion) continue;
+      if (task.postApproveHeadSha === undefined) {
+        // A completion the task head cannot vouch for is another episode's residue until proven otherwise.
+        console.warn(
+          `[AgentManager] setupRecoveredPostApproveSignals: task=${task.id} has a stored completion but no persisted approved head; not re-arming`,
+        );
+        continue;
+      }
+      if (completion.approvedHeadSha !== task.postApproveHeadSha) {
+        try {
+          await this.postApproveStore.clear(task.id);
+          console.warn(
+            `[AgentManager] setupRecoveredPostApproveSignals: task=${task.id} retired a completion bound to head ${completion.approvedHeadSha} (persisted approved head ${task.postApproveHeadSha})`,
+          );
+        } catch (err) {
+          console.warn(
+            `[AgentManager] setupRecoveredPostApproveSignals: stale completion cleanup failed for task=${task.id}:`,
+            err,
+          );
+        }
+        continue;
+      }
+      if (!this.phaseSignalWatcher) continue;
       try {
         await this.startPhaseSignalWatch({
           taskId: task.id,
@@ -3593,6 +4469,23 @@ export class AgentManager {
     await this.taskStore.set(task);
   }
 
+  async updateTaskIfStatus(
+    taskId: string,
+    expectedStatus: TaskStatus,
+    updates: Partial<TaskState>,
+    alsoExpect: Partial<Pick<TaskState, 'signalToken' | 'reviewRound'>> = {},
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || task.status !== expectedStatus) return false;
+      if ('signalToken' in alsoExpect && task.signalToken !== alsoExpect.signalToken) return false;
+      if ('reviewRound' in alsoExpect && task.reviewRound !== alsoExpect.reviewRound) return false;
+      Object.assign(task, updates, { updatedAt: new Date().toISOString() });
+      await this.taskStore.set(task);
+      return true;
+    });
+  }
+
   async updateTask(taskId: string, updates: Partial<TaskState>): Promise<void> {
     await this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
@@ -3605,7 +4498,7 @@ export class AgentManager {
   async transitionTaskStatus(
     taskId: string,
     toStatus: TaskStatus,
-    guard: { fromStatus: TaskStatus[] },
+    guard: { fromStatus: TaskStatus[]; expectSignalToken?: string },
     patch?: Partial<Pick<
       TaskState,
       | 'reviewRound'
@@ -3623,6 +4516,7 @@ export class AgentManager {
       | 'batchIndex'
       | 'batchTotal'
       | 'branch'
+      | 'maxRoundsContinues'
     >>,
   ): Promise<TransitionResult | null> {
     return this.withTaskLock(async () => {
@@ -3631,9 +4525,15 @@ export class AgentManager {
       const previousStatus = task.status;
       if (TERMINAL_STATUSES.includes(previousStatus)) return null;
       if (!guard.fromStatus.includes(previousStatus)) return null;
+      if (guard.expectSignalToken !== undefined && task.signalToken !== guard.expectSignalToken) return null;
       if (patch?.branch && patch.branch !== task.branch) {
         const existing = await this.findTaskByBranch(patch.branch, task.projectId);
         if (existing && existing.id !== taskId) return null;
+      }
+      // The revocation marker and approved head scope to the approved episode they were created in.
+      if (previousStatus === 'approved' && toStatus !== 'approved') {
+        delete task.postApproveRevoked;
+        delete task.postApproveHeadSha;
       }
       Object.assign(task, patch ?? {}, {
         status: toStatus,
@@ -4582,7 +5482,11 @@ export class AgentManager {
           taskId,
           task.branch,
           task.branchCreatedByBaxian === true,
+          task.branchLocalCleaned
+            ? { restorableRemoteTip: task.branchLocalCleaned.remoteTipSha }
+            : {},
         );
+        if (task.branchLocalCleaned) await this.clearBranchLocalCleaned(taskId);
       }
       await assertOwner();
       if (!ensure.freshRuntime) {
@@ -4867,7 +5771,8 @@ export class AgentManager {
     prompt: string,
     agentId: string,
     runtime: AgentConfig['runtime'],
-  ): Promise<{ acked: boolean; composerDelivered: boolean }> {
+    guardBeforePaste?: () => Promise<boolean>,
+  ): Promise<{ acked: boolean; composerDelivered: boolean; aborted?: boolean }> {
     const before = await this.agentStore.get(agentId);
     const beforeLockToken = before?.taskId
       ? await this.resolveTaskLockToken(before, before.taskId)
@@ -4926,7 +5831,10 @@ export class AgentManager {
         }
         : undefined;
       await revalidate?.();
-      return await this.injectAndAwaitAckSteps(tmux, paneId, prompt, agentId, runtime, revalidate);
+      if (guardBeforePaste && !(await guardBeforePaste())) {
+        return { acked: false, composerDelivered: false, aborted: true };
+      }
+      return await this.injectAndAwaitAckSteps(tmux, paneId, prompt, agentId, runtime, revalidate, guardBeforePaste);
     } finally {
       this.compactInFlight.delete(agentId);
     }
@@ -4939,7 +5847,8 @@ export class AgentManager {
     agentId: string,
     runtime: AgentConfig['runtime'],
     revalidate?: () => Promise<void>,
-  ): Promise<{ acked: boolean; composerDelivered: boolean }> {
+    guardBeforePaste?: () => Promise<boolean>,
+  ): Promise<{ acked: boolean; composerDelivered: boolean; aborted?: boolean }> {
     // 静态忙信号（文本忙样式/working title）可能是残稿或 stale title 冒充，一律由帧活性仲裁；ready 视图覆盖 stale title。
     const preTitle = await tmux.readPaneTitle(paneId);
     const preFrame = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
@@ -4949,15 +5858,83 @@ export class AgentManager {
     if (staticBusy && await this.paneHasLiveTurn(tmux, paneId, runtime)) {
       throw new Error(`pre-inject busy check: pane ${paneId} is still running a turn; dispatch aborted`);
     }
-    await tmux.clearComposerDraft(paneId);
     await revalidate?.();
-    await tmux.injectPrompt(paneId, prompt, agentId);
+    if (guardBeforePaste) {
+      // A stale replay must not touch the pane at all: the guard runs before the first composer scrub.
+      if (!(await guardBeforePaste())) {
+        return { acked: false, composerDelivered: false, aborted: true };
+      }
+      const staged = await tmux.stagePromptBuffer(paneId, prompt, agentId);
+      // Fence + scrub + paste share one task-mutation-queue slot, so a rotation lands before or after, never between.
+      let pasted = false;
+      try {
+        pasted = await this.withTaskLock(async () => {
+          if (!(await guardBeforePaste())) return false;
+          await tmux.clearComposerDraft(paneId);
+          await tmux.pasteStagedBuffer(paneId, staged.buf);
+          return true;
+        });
+      } catch (pasteErr) {
+        // Buffer still present proves the paste never landed; missing/unprobeable fails closed to a composer scrub.
+        let bufferConsumed = true;
+        try {
+          await tmux.dropStagedBuffer(staged.buf);
+          bufferConsumed = false;
+        } catch (dropErr) {
+          console.warn(
+            `[AgentManager] staged buffer ${staged.buf} not confirmed dropped after failed paste (missing or unprobeable); failing closed to a composer scrub:`,
+            dropErr,
+          );
+        }
+        if (bufferConsumed) {
+          try {
+            await tmux.clearComposerDraft(paneId);
+          } catch (clearErr) {
+            console.warn(`[AgentManager] composer scrub after unknown paste outcome failed for pane ${paneId}:`, clearErr);
+          }
+        }
+        throw pasteErr;
+      }
+      if (!pasted) {
+        try {
+          await tmux.dropStagedBuffer(staged.buf);
+        } catch (err) {
+          console.warn(`[AgentManager] staged buffer ${staged.buf} cleanup failed:`, err);
+        }
+        return { acked: false, composerDelivered: false, aborted: true };
+      }
+    } else {
+      await tmux.clearComposerDraft(paneId);
+      await revalidate?.();
+      await tmux.injectPrompt(paneId, prompt, agentId);
+    }
     let baseline: string;
     let baselineTitle = '';
     try {
       baseline = await tmux.captureSettledSnapshot(paneId, { timeoutMs: this.dispatchSettleTimeoutMs });
       baselineTitle = await tmux.readPaneTitle(paneId);
-      await tmux.sendEnter(paneId);
+      if (guardBeforePaste) {
+        // The Enter is the actual submission; it takes the same fenced queue slot.
+        const submitted = await this.withTaskLock(async () => {
+          if (!(await guardBeforePaste())) return false;
+          await tmux.sendEnter(paneId);
+          return true;
+        });
+        if (!submitted) {
+          try {
+            await tmux.clearComposerDraft(paneId);
+          } catch (err) {
+            // Fail closed: a submit-ready stale prompt could not be confirmed gone.
+            const message = err instanceof Error ? err.message : String(err);
+            throw new Error(
+              `fence-rejected prompt could not be scrubbed from the composer of pane ${paneId}; verify the pane before reuse: ${message}`,
+            );
+          }
+          return { acked: false, composerDelivered: false, aborted: true };
+        }
+      } else {
+        await tmux.sendEnter(paneId);
+      }
     } catch (preAckErr) {
       if (await this.clearComposerForReuse(tmux, paneId, agentId)) throw preAckErr;
       const message = preAckErr instanceof Error ? preAckErr.message : String(preAckErr);
@@ -4966,11 +5943,22 @@ export class AgentManager {
         `pre-ack failure left an unconfirmed composer on live pane ${paneId}: ${message}`,
       );
     }
+    let staleDuringResend = false;
     try {
       await tmux.waitSubmitAck(paneId, baseline, runtime, {
         timeoutMs: this.dispatchAckTimeoutMs,
         baselineTitle,
-        resend: () => tmux.sendEnter(paneId),
+        resend: guardBeforePaste
+          ? async () => {
+            // A resend is a fresh submission of whatever sits in the composer; it takes the same fence.
+            const resent = await this.withTaskLock(async () => {
+              if (!(await guardBeforePaste())) return false;
+              await tmux.sendEnter(paneId);
+              return true;
+            });
+            if (!resent) staleDuringResend = true;
+          }
+          : () => tmux.sendEnter(paneId),
         resendIntervalMs: this.dispatchAckResendIntervalMs,
       });
       return { acked: true, composerDelivered: true };
@@ -4978,6 +5966,17 @@ export class AgentManager {
       const message = err instanceof Error ? err.message : String(err);
       if (!(err instanceof Error && /runtime ack timeout/.test(err.message))) {
         throw new DispatchTerminalError('ack_unknown', `ack_unknown for pane ${paneId}: ${message}`);
+      }
+      if (staleDuringResend) {
+        try {
+          await tmux.clearComposerDraft(paneId);
+        } catch (scrubErr) {
+          const scrubMessage = scrubErr instanceof Error ? scrubErr.message : String(scrubErr);
+          throw new Error(
+            `fence-rejected resend left an unverified composer on pane ${paneId}; verify the pane before reuse: ${scrubMessage}`,
+          );
+        }
+        return { acked: false, composerDelivered: false, aborted: true };
       }
       console.warn(
         `[AgentManager] dispatch ack timeout for pane ${paneId} agent ${agentId}: ${message}`,
@@ -5015,7 +6014,12 @@ export class AgentManager {
   async markAgentWaiting(
     agentId: string,
     expectedTaskId: string,
-    opts: { allowAwaitingHuman?: boolean; clearAwaitingHuman?: boolean } = {},
+    opts: {
+      allowAwaitingHuman?: boolean;
+      clearAwaitingHuman?: boolean;
+      expectedTask?: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
+      expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
+    } = {},
   ): Promise<boolean> {
     return this.releaseAgentForTask(agentId, expectedTaskId, 'waiting', opts);
   }
@@ -5117,7 +6121,7 @@ export class AgentManager {
         agentId,
         'workdir-changed-during-dispatch',
         `${reason}. The prompt was not delivered; verify the agent runtime and Workdir before resuming.`,
-        { expectedTaskId: taskId },
+        { expectedTaskId: taskId, ...(opts.expectedHold ? { expectedHold: opts.expectedHold } : {}) },
       );
       return false;
     }
@@ -5138,13 +6142,26 @@ export class AgentManager {
     }
     if (agent.role === 'dev' && task.branch) {
       const branches = new BranchManager(runner);
-      await branches.assertClean(verifiedWorkdir);
+      if (!opts.allowDirtyWorkdir) await branches.assertClean(verifiedWorkdir);
       const actualRef = await branches.currentRef(verifiedWorkdir);
       if (actualRef !== `refs/heads/${task.branch}`) {
-        throw new Error(
-          `Agent ${agentId} checkout mismatch for task ${taskId}: ` +
-          `expected refs/heads/${task.branch}, got ${actualRef ?? 'detached HEAD'}`,
+        // dev 可能已被释放过（如 spec max_rounds 停驻默认分支）；switchToTaskBranch 自带
+        // assertClean，脏树时抛 DirtyWorkdirError fail-closed，不会覆盖未提交的改动
+        await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
+        await branches.switchToTaskBranch(
+          verifiedWorkdir,
+          taskId,
+          task.branch,
+          task.branchCreatedByBaxian === true,
+          {
+            requireExistingWork: true,
+            ...(task.branchLocalCleaned
+              ? { restorableRemoteTip: task.branchLocalCleaned.remoteTipSha }
+              : {}),
+          },
         );
+        await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
+        if (task.branchLocalCleaned) await this.clearBranchLocalCleaned(taskId);
       }
     } else if (agent.role === 'research') {
       await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
@@ -5188,6 +6205,7 @@ export class AgentManager {
         agent,
         workdir: verifiedWorkdir,
         skillRegistry: this.skillRegistry,
+        hasQaPartner: task.qaAgentId !== undefined,
         ...(signalToken ? { signalToken } : {}),
         ...(useIncrementalNudge
           ? { postApproveRedispatchCount: opts.postApproveRedispatchCount }
@@ -5252,21 +6270,34 @@ export class AgentManager {
         agentId,
         'workdir-changed-during-dispatch',
         `${reason}. The prompt was not delivered; verify the agent runtime and Workdir before resuming.`,
-        { expectedTaskId: taskId },
+        { expectedTaskId: taskId, ...(opts.expectedHold ? { expectedHold: opts.expectedHold } : {}) },
       );
       return false;
     }
     await this.assertTaskLockOwner(agentId, taskId, lockToken);
 
-    if (phase === 'post-approve') {
-      const completionFresh = await this.getPostApproveCompletion(taskId);
-      if (!completionFresh || completionFresh.token !== signalToken) {
-        console.warn(
-          `[AgentManager] continueSession[post-approve]: token changed before paste for task ${taskId}; skipping`,
-        );
-        return false;
-      }
+    // A revoke marks before clearing and a push transitions before clearing; every half-window must abort the paste.
+    const postApprovePassStillLive = async (): Promise<boolean> => {
+      const [taskFresh, completionFresh] = await Promise.all([
+        this.taskStore.get(taskId),
+        this.getPostApproveCompletion(taskId),
+      ]);
+      return taskFresh?.agentId === agentId
+        && taskFresh.status === 'approved'
+        && taskFresh.postApproveRevoked === undefined
+        && taskFresh.postApproveHeadSha !== undefined
+        && completionFresh !== null
+        && completionFresh.token === signalToken
+        && completionFresh.approvedHeadSha === taskFresh.postApproveHeadSha;
+    };
+    if (phase === 'post-approve' && !(await postApprovePassStillLive())) {
+      console.warn(
+        `[AgentManager] continueSession[post-approve]: pass revoked or rotated before paste for task ${taskId}; skipping`,
+      );
+      return false;
     }
+    const guardBeforeInject =
+      opts.guardBeforeInject ?? (phase === 'post-approve' ? postApprovePassStillLive : undefined);
 
     if (opts.armBeforeInject && !(await opts.armBeforeInject({}))) {
       return false;
@@ -5306,13 +6337,27 @@ export class AgentManager {
         agentId,
         'workdir-changed-during-dispatch',
         `${reason}. The prompt was not delivered; verify the agent runtime and Workdir before resuming.`,
-        { expectedTaskId: taskId },
+        { expectedTaskId: taskId, ...(opts.expectedHold ? { expectedHold: opts.expectedHold } : {}) },
       );
       return false;
     }
     await this.assertTaskLockOwner(agentId, taskId, lockToken);
 
-    await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
+    if (guardBeforeInject && !(await guardBeforeInject())) {
+      console.warn(
+        `[AgentManager] continueSession[${phase}]: pre-inject guard rejected the paste for task ${taskId}; skipping`,
+      );
+      return false;
+    }
+    const delivery = await this.injectAndAwaitAck(
+      tmux, paneId, prompt, agentId, agent.runtime, guardBeforeInject,
+    );
+    if (delivery.aborted) {
+      console.warn(
+        `[AgentManager] continueSession[${phase}]: pre-paste guard rejected the inject for task ${taskId}; skipping`,
+      );
+      return false;
+    }
     return true;
   }
 
@@ -5419,6 +6464,59 @@ export class AgentManager {
       const { bootstrappingTaskId: _delivered, ...rest } = latest;
       return { ...rest, updatedAt: new Date().toISOString() };
     });
+  }
+
+  // continueSession never runs startSession's post-ack finalization; a surviving marker would make recover() roll the running task back to pending.
+  private async finalizeReplayedBootstrap(
+    agentId: string,
+    taskId: string,
+    phase: 'develop' | 'research' | 'code',
+    expectedLockToken: string | undefined,
+  ): Promise<void> {
+    let cleared = false;
+    let deliveredWorkdir: string | undefined;
+    try {
+      await this.agentStore.update(agentId, (latest) => {
+        if (
+          !latest
+          || latest.taskId !== taskId
+          || latest.bootstrappingTaskId !== taskId
+          || latest.lockToken !== expectedLockToken
+        ) {
+          return AGENT_STORE_NOOP;
+        }
+        cleared = true;
+        deliveredWorkdir = latest.workdir;
+        const { bootstrappingTaskId: _delivered, ...rest } = latest;
+        return { ...rest, updatedAt: new Date().toISOString() };
+      });
+    } catch (err) {
+      console.warn(`[AgentManager] replay: clearing bootstrap marker for task=${taskId} failed:`, err);
+      await this.markAwaitingHuman(
+        agentId,
+        'bootstrap-marker-clear-failed',
+        'Prompt was replayed but clearing the in-flight bootstrap marker failed; held so recovery does ' +
+          'not roll back an already-running task. Verify the agent via web terminal, then Resume.',
+        { expectedTaskId: taskId },
+      ).catch((holdErr) => {
+        console.warn(`[AgentManager] replay: hold after marker-clear failure for task=${taskId} failed:`, holdErr);
+      });
+      return;
+    }
+    if (!cleared) return;
+    try {
+      await this.eventBus.emit({
+        id: '',
+        type: 'session.started',
+        timestamp: new Date().toISOString(),
+        projectId: this.getAgentConfig(agentId)?.projectId ?? '',
+        agentId,
+        taskId,
+        data: { phase, ...(deliveredWorkdir !== undefined ? { workdir: deliveredWorkdir } : {}) },
+      });
+    } catch (err) {
+      console.warn(`[AgentManager] replay: session.started emit failed for task=${taskId}:`, err);
+    }
   }
 
   private async releaseOrphanedLocks(states: AgentBindingFacts[]): Promise<void> {
@@ -5999,14 +7097,49 @@ export class AgentManager {
           : 'recheck';
 
       const prevQa = await this.agentStore.get(qaId);
+      const resumingHeldDispatch = prevQa?.taskId === taskId && prevQa.status === 'awaiting_human';
       if (prevQa?.taskId === taskId) {
-        await this.releaseAgentForTask(qaId, taskId, 'idle');
+        if (prevQa.status === 'awaiting_human' && !isRecoverableQaDispatchHold(prevQa)) {
+          throw new ApiError(
+            409,
+            `QA agent ${qaId} is awaiting human (${prevQa.awaitingPhase ?? 'unknown phase'}); resolve that hold before redispatching review`,
+          );
+        }
+        const released = await this.releaseAgentIfBound(
+          qaId,
+          taskId,
+          prevQa.status === 'awaiting_human'
+            ? {
+                allowAwaitingHuman: true,
+                expectedHold: {
+                  phase: prevQa.awaitingPhase,
+                  since: prevQa.awaitingSince,
+                  nonce: prevQa.awaitingNonce,
+                },
+              }
+            : undefined,
+        );
+        if (!released) {
+          const after = await this.agentStore.get(qaId);
+          const holdNote = after?.status === 'awaiting_human'
+            ? ` (awaiting_human: ${after.awaitingPhase ?? 'unknown phase'})`
+            : '';
+          throw new ApiError(
+            409,
+            `QA agent ${qaId} could not be released from task ${taskId}${holdNote}; review dispatch aborted`,
+          );
+        }
       }
 
       const acquired = await this.acquireAgentForTask(qaId, taskId, qaPhase);
       if (!acquired) {
         throw new ApiError(409, `QA agent ${qaId} is busy or unavailable`);
       }
+      const acquiredClaim = await this.lockManager.claimOf(qaId);
+      const acquiredLockToken = acquiredClaim?.taskId === taskId ? acquiredClaim.token : undefined;
+      const releaseOwnAcquire = acquiredLockToken !== undefined
+        ? { expectedLockToken: acquiredLockToken }
+        : {};
 
       let devParked = false;
       if (!isTerminal && devAgentId) {
@@ -6018,7 +7151,7 @@ export class AgentManager {
               return false;
             });
           if (!devOk) {
-            await this.releaseAgentForTask(qaId, taskId, 'idle')
+            await this.releaseAgentForTask(qaId, taskId, 'idle', releaseOwnAcquire)
               .catch(() => undefined);
             throw new ApiError(
               500,
@@ -6038,7 +7171,8 @@ export class AgentManager {
       };
 
       const isTerminalAtClaim = TERMINAL_STATUSES.includes(taskStatusAtClaim);
-      const bumpRound = opts.bumpRound !== false;
+      // 仅当恢复的是任务当前 review pass 时沿用轮次；任务已离开 review 的手工调用是新 pass，保留加轮
+      const bumpRound = opts.bumpRound !== false && !(resumingHeldDispatch && taskStatusAtClaim === 'review');
       // 回滚在锁内判定 pass 是否已被并发接管并返回；仅未被接管时才释放本次 acquire 的 QA，
       // 否则会误清接管方 re-acquire 的同一 QA 绑定（同 task 同 agent，绕过 release 的 mismatch 保护）
       const abortDispatch = async (dispatchToken: string | undefined): Promise<void> => {
@@ -6055,7 +7189,11 @@ export class AgentManager {
         const preDispatched = await this.transitionTaskStatus(
           taskId,
           'review',
-          { fromStatus: [taskStatusAtClaim] },
+          {
+            fromStatus: [taskStatusAtClaim],
+            // 入口 claim 到此处之间 pass 可能被并发轮换；expect token 必须与写入同一原子段复核
+            ...(opts.expectSignalToken !== undefined ? { expectSignalToken: opts.expectSignalToken } : {}),
+          },
           {
             reviewHeadAnchorSha: reviewAnchor,
             reviewDispatchedAt: new Date().toISOString(),
@@ -6063,7 +7201,8 @@ export class AgentManager {
           },
         );
         if (!preDispatched) {
-          await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
+          // fence 拒绝可能源于 successor 已换代并 re-acquire 同一 QA；释放必须钉在本次 acquire 的锁代上
+          await this.releaseAgentForTask(qaId, taskId, 'idle', releaseOwnAcquire).catch(() => undefined);
           if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
           throw new ApiError(409, `Task ${taskId} status changed during dispatch; cannot enter review`);
         }
@@ -6120,9 +7259,19 @@ export class AgentManager {
           dialogFailFromStatuses: [isTerminalAtClaim ? taskStatusAtClaim : 'review'],
         });
       } catch (err) {
-        if (await this.markAwaitingIfAckUnknown(qaId, err, taskId)) {
-        } else if (err instanceof EnsureSessionError && err.partial.handled) {
-        } else {
+        if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') {
+          // prompt 可能已注入：不回滚 armed pass、不释放 QA；hold 持久化失败也不得吞掉 ack_unknown 分类
+          try {
+            await this.markAwaitingIfAckUnknown(qaId, err, taskId);
+          } catch (holdErr) {
+            console.error(
+              `[AgentManager] dispatchReviewToQa could not persist the ack_unknown hold for ${qaId}:`,
+              holdErr,
+            );
+          }
+          throw err;
+        }
+        if (!(err instanceof EnsureSessionError && err.partial.handled)) {
           await abortDispatch(armedToken);
         }
         throw err;
@@ -6472,7 +7621,9 @@ export class AgentManager {
   ): Promise<boolean> {
     const task = await this.taskStore.get(taskId);
     if (!task?.signalToken) return false;
-    return this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, task.signalToken, opts.skipSnapshot);
+    return this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, task.signalToken, {
+      skipSnapshot: opts.skipSnapshot ?? false,
+    });
   }
 
   private async emitManualReviewDevParkedQaFailedIntervention(
@@ -7056,8 +8207,11 @@ export class AgentManager {
     agentId: string,
     expectedKinds: PhaseSignalKind | readonly PhaseSignalKind[],
     token: string,
-    skipSnapshot = false,
-    onReadFile?: (req: ReadFileSignal) => void,
+    opts: {
+      skipSnapshot?: boolean;
+      onReadFile?: (req: ReadFileSignal) => void;
+      onlyReplaceOwnToken?: boolean;
+    } = {},
   ): Promise<boolean> {
     if (!this.phaseSignalWatcher) return true;
     const task = await this.taskStore.get(taskId);
@@ -7069,8 +8223,9 @@ export class AgentManager {
         agentId,
         expectedKinds,
         token,
-        skipSnapshot,
-        ...(onReadFile ? { onReadFile } : {}),
+        skipSnapshot: opts.skipSnapshot ?? false,
+        ...(opts.onlyReplaceOwnToken ? { onlyReplaceOwnToken: true } : {}),
+        ...(opts.onReadFile ? { onReadFile: opts.onReadFile } : {}),
       });
     } catch (err) {
       console.warn(
@@ -7089,7 +8244,10 @@ export class AgentManager {
     skipSnapshot = false,
     onReadFile?: (req: ReadFileSignal) => void,
   ): Promise<void> {
-    const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, skipSnapshot, onReadFile);
+    const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, {
+      skipSnapshot,
+      ...(onReadFile ? { onReadFile } : {}),
+    });
     if (!armed) await this.holdAgentForUnarmedSignal(taskId, agentId, expectedKinds);
   }
 
@@ -7203,8 +8361,12 @@ export class AgentManager {
     const task = await this.withTaskLock(async () => {
       const fresh = await this.taskStore.get(taskId);
       if (!fresh) throw new ApiError(404, `Task ${taskId} not found`);
-      if (fresh.status !== 'spec-ready') {
-        throw new ApiError(409, `Task ${taskId} is ${fresh.status}; spec verdict requires spec-ready`);
+      const specMaxRounds = fresh.status === 'max_rounds' && isSpecStagePhase(fresh.phase);
+      if (fresh.status !== 'spec-ready' && !specMaxRounds) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} is ${fresh.status}; spec verdict requires spec-ready or spec-phase max_rounds`,
+        );
       }
       if (verdict === 'archive' && !fresh.researchAgentId) {
         throw new ApiError(409, `Task ${taskId} is not a Research task; only Research specs can be archived`);
@@ -7246,7 +8408,7 @@ export class AgentManager {
       const transition = await this.transitionTaskStatus(
         taskId,
         'done',
-        { fromStatus: ['spec-ready'] },
+        { fromStatus: ['spec-ready', 'max_rounds'] },
       );
       if (!transition) throw new ApiError(409, `Task ${taskId} changed while archiving`);
       this.stopPhaseSignalWatcher(taskId);
@@ -7277,22 +8439,51 @@ export class AgentManager {
 
     if (verdict === 'approve') {
       await store.putRound(taskId, 'spec', { ...base, userDecision: { verdict, at } });
-      const result = await this.transitionToCodePhase(taskId);
+      let result: TaskState | null;
+      try {
+        result = await this.transitionToCodePhase(taskId);
+      } catch (err) {
+        if (err instanceof ApiError) throw err;
+        const message = err instanceof Error ? err.message : String(err);
+        const after = await this.taskStore.get(taskId);
+        if (after?.status === 'failed') {
+          const reason = err instanceof DispatchTerminalError ? ` (${err.reason})` : '';
+          throw new ApiError(
+            500,
+            `Code-phase dispatch failed terminally for task ${taskId}${reason}: ${message}. `
+            + 'The task has been marked failed; use Retry to run it as a fresh task.',
+          );
+        }
+        if (after?.phase === 'code' && after.status === 'in_progress') {
+          throw new ApiError(
+            500,
+            `Code-phase dispatch failed for task ${taskId}: ${message}. `
+            + 'The task already moved to the code phase and the dev is held; '
+            + 'Resume the dev agent to redeliver the prompt.',
+          );
+        }
+        throw new ApiError(
+          500,
+          `Code-phase dispatch failed for task ${taskId}: ${message}. `
+          + 'The task was rolled back to await the verdict; fix the dev Workdir '
+          + '(Resume the dev first if it is still held), then retry the verdict.',
+        );
+      }
       if (!result) {
+        const after = await this.taskStore.get(taskId);
+        if (after?.phase === 'code' && after.status === 'in_progress') {
+          throw new ApiError(
+            500,
+            `Code-phase prompt was not delivered for task ${taskId}; the task already moved to the `
+            + 'code phase and the dev is held. Resume the dev agent to redeliver the prompt '
+            + '(retrying the verdict will be rejected).',
+          );
+        }
         throw new ApiError(409, `Dev is unavailable for task ${taskId}; approval was recorded and can be retried`);
       }
       return result;
     }
 
-    // 打回消耗一轮修订；到达上限时拒绝而非派发注定进 max_rounds 的修订，让用户当场决策
-    const cap = this.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
-    if (round >= cap) {
-      throw new ApiError(
-        409,
-        `Task ${taskId} has reached the spec review round cap (${cap}); `
-        + 'approve the spec, or cancel the task and retry with a refined description',
-      );
-    }
     if (!trimmed) throw new ApiError(400, 'comments is required for request-changes');
     const priorFindings = base.findings?.findings ?? [];
     const nextUserId = `u-${priorFindings.filter(f => f.id.startsWith('u-')).length + 1}`;
@@ -7301,14 +8492,125 @@ export class AgentManager {
       verdict: 'request-changes',
       findings: [...priorFindings, { id: nextUserId, severity: 'major', message: trimmed }],
     };
-    await store.putRound(taskId, 'spec', {
+    const rejectedRound: ReviewRound = {
       ...base,
       findings: mergedFindings,
       userDecision: { verdict, comments: trimmed, at },
-    });
-    const dispatched = await this.dispatchServerFixToDev(taskId, JSON.stringify(mergedFindings));
+    };
+    // 到达上限后用户仍显式打回 = 对「再评一轮」的当场决策：扩 cap 而非拒绝。
+    // holder 恢复与扩 cap 正交：max_rounds 入态时 holder 已被释放清空，即便 cap
+    // 因配置热更新出现余量，打回前也必须先恢复 holder
+    const cap = this.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
+    const claim = task.status === 'max_rounds' || round >= cap
+      ? await this.claimSpecFixDispatch(taskId, { extendCapToFit: round >= cap ? round : null })
+      : null;
+    let dispatched: TaskState | null = null;
+    try {
+      await store.putRound(taskId, 'spec', rejectedRound);
+      dispatched = await this.dispatchServerFixToDev(taskId, JSON.stringify(mergedFindings));
+    } catch (err) {
+      if (err instanceof ApiError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      const after = await this.taskStore.get(taskId);
+      if (after?.status === 'failed') {
+        const reason = err instanceof DispatchTerminalError ? ` (${err.reason})` : '';
+        throw new ApiError(
+          500,
+          `Spec fix dispatch failed terminally for task ${taskId}${reason}: ${message}. `
+          + 'The task has been marked failed with the rejection kept on record; '
+          + 'use Retry to run it as a fresh task.',
+        );
+      }
+      if (after?.status === 'fixing') {
+        throw new ApiError(
+          500,
+          `Spec fix dispatch was interrupted for task ${taskId}: ${message}. `
+          + 'The task moved to fixing with the rejection recorded; resume the holder agent to redeliver it.',
+        );
+      }
+      throw new ApiError(
+        500,
+        `Spec fix dispatch failed for task ${taskId}: ${message}. `
+        + 'The rejection was rolled back; fix the agent runtime or configuration, then retry.',
+      );
+    } finally {
+      if (!dispatched) await this.recoverSpecRejectionState(taskId, claim, base);
+    }
     if (!dispatched) throw new ApiError(500, `Failed to dispatch spec fix for task ${taskId}`);
     return dispatched;
+  }
+
+  private async claimSpecFixDispatch(
+    taskId: string,
+    opts: { extendCapToFit: number | null },
+  ): Promise<{ originalAgentId: string; originalCounter: number; holderWritten: string; counterAfter: number }> {
+    return await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh) throw new ApiError(404, `Task ${taskId} not found`);
+      if (fresh.status !== 'spec-ready' && fresh.status !== 'max_rounds') {
+        throw new ApiError(409, `Task ${taskId} changed status during the spec verdict; aborted`);
+      }
+      const holder = fresh.agentId || fresh.researchAgentId || fresh.devAgentId;
+      if (!holder || !this.getAgentConfig(holder)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} spec holder agent ${holder || '(none)'} is not in the current config; `
+          + 'restore the agent config or cancel the task',
+        );
+      }
+      const originalAgentId = fresh.agentId;
+      const originalCounter = fresh.maxRoundsContinues ?? 0;
+      let counterAfter = originalCounter;
+      if (opts.extendCapToFit !== null) {
+        // cap 必须容下下一轮（round+1）；rounds 被调低时一次 +1 可能不够
+        counterAfter = Math.max(originalCounter + 1, opts.extendCapToFit + 1 - this.getConfig().review.rounds);
+        fresh.maxRoundsContinues = counterAfter;
+      }
+      fresh.agentId = holder;
+      fresh.updatedAt = new Date().toISOString();
+      await this.taskStore.set(fresh);
+      return { originalAgentId, originalCounter, holderWritten: holder, counterAfter };
+    });
+  }
+
+  // 补偿以 claim 时的 status+counter+holder 为代际证明：任务已被推进（fixing/cancelled/新扩轮）
+  // 就放弃恢复——尤其派发把任务带进 held fixing 时，打回 round 必须保留给后续 Resume 重派
+  private async recoverSpecRejectionState(
+    taskId: string,
+    claim: { originalAgentId: string; originalCounter: number; holderWritten: string; counterAfter: number } | null,
+    baseRound: ReviewRound,
+  ): Promise<void> {
+    const store = this.getReviewStore();
+    await this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh) return;
+      if (fresh.status !== 'spec-ready' && fresh.status !== 'max_rounds') {
+        console.warn(
+          `[AgentManager] spec rejection recovery(${taskId}) skipped: task moved to ${fresh.status}`,
+        );
+        return;
+      }
+      if (claim) {
+        if (
+          (fresh.maxRoundsContinues ?? 0) !== claim.counterAfter
+          || fresh.agentId !== claim.holderWritten
+        ) {
+          console.warn(
+            `[AgentManager] spec rejection recovery(${taskId}) skipped: `
+            + `continues=${fresh.maxRoundsContinues ?? 0} agentId=${fresh.agentId} `
+            + `(expected ${claim.counterAfter}/${claim.holderWritten})`,
+          );
+          return;
+        }
+        fresh.maxRoundsContinues = claim.originalCounter;
+        fresh.agentId = claim.originalAgentId;
+        fresh.updatedAt = new Date().toISOString();
+        await this.taskStore.set(fresh);
+      }
+      await store?.putRound(taskId, 'spec', baseRound);
+    }).catch(err => {
+      console.error(`[AgentManager] spec rejection recovery(${taskId}) failed:`, err);
+    });
   }
 
   async submitCodeVerdict(taskId: string, comments: string): Promise<TaskState> {
@@ -7493,6 +8795,7 @@ export class AgentManager {
       return null;
     }
 
+    const devBoundBefore = (await this.agentStore.get(devAgentId))?.taskId === taskId;
     const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'code');
     if (!acquired) {
       await this.emitIntervention(task.projectId, devAgentId, taskId, {
@@ -7501,13 +8804,15 @@ export class AgentManager {
       });
       return null;
     }
+    const acquiredLockToken = (await this.agentStore.get(devAgentId))?.lockToken;
 
     const newToken = createSignalToken();
+    // spec 阶段的扩轮决策不延续到 code 评审：cap 共享字段，进入编码时归零
     const transition = await this.transitionTaskStatus(
       taskId,
       'in_progress',
-      { fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready'] },
-      { agentId: devAgentId, phase: 'code', signalToken: newToken },
+      { fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready', 'max_rounds'] },
+      { agentId: devAgentId, phase: 'code', signalToken: newToken, maxRoundsContinues: 0 },
     );
     if (!transition) {
       await this.releaseAgentForTask(devAgentId, taskId, 'idle', { allowAwaitingHuman: true })
@@ -7526,6 +8831,40 @@ export class AgentManager {
     } catch (err) {
       if (err instanceof DispatchTerminalError) {
         await this.failTaskForDispatchError(taskId, 'code', devAgentId, err);
+      } else if (
+        err instanceof EnsureSessionError && err.partial.handled
+        && (task.status === 'spec-ready' || task.status === 'max_rounds')
+      ) {
+        // dev 已被 checkout/dialog hold 且 prompt 未送达；resumeAgent 不重派这些 hold，
+        // 任务停在 in_progress 会同时封死 Resume 与 verdict——退回 verdict 门禁状态
+        const rolledBack = await this.transitionTaskStatus(
+          taskId,
+          task.status,
+          { fromStatus: ['in_progress'] },
+          {
+            ...(task.phase !== undefined ? { phase: task.phase } : {}),
+            agentId: task.agentId,
+            ...(task.signalToken ? { signalToken: task.signalToken } : {}),
+            maxRoundsContinues: task.maxRoundsContinues ?? 0,
+          },
+        );
+        if (!rolledBack) {
+          console.warn(
+            `[AgentManager] transitionToCodePhase(${taskId}): handled dispatch failure but the task `
+            + 'moved on; leaving its status as-is',
+          );
+        } else if (!devBoundBefore) {
+          // 转码前 dev 未持有本任务（如 research handoff / max_rounds 重占用）：任务已退回
+          // verdict 门禁，释放本次新占用，否则 dev 会被回退后的任务永久占住
+          const released = await this.releaseAgentForTask(devAgentId, taskId, 'idle', { allowAwaitingHuman: true })
+            .catch(() => false);
+          if (!released) {
+            await this.emitIntervention(task.projectId, devAgentId, taskId, {
+              phase: 'code-rollback-dev-release-failed',
+              devAgentId,
+            });
+          }
+        }
       } else if (!(err instanceof EnsureSessionError && err.partial.handled)) {
         await this.markAwaitingHuman(
           devAgentId,
@@ -7552,6 +8891,11 @@ export class AgentManager {
         devAgentId,
       });
       return null;
+    }
+    // 重占用（released dev）的 acquire 会写 bootstrappingTaskId，而 continueSession 不做
+    // startSession 的 post-ack finalize；残留标记会让 recover 把已运行的任务按未送达回滚
+    if (!researchHandoff) {
+      await this.finalizeReplayedBootstrap(devAgentId, taskId, 'code', acquiredLockToken);
     }
     return await this.taskStore.get(taskId);
   }
@@ -7725,10 +9069,11 @@ export class AgentManager {
       armBeforeInject: (ctx: DispatchArmContext) => {
         dispatchedCheckoutMode = ctx.serverReviewCheckout;
         const allowReadFile = opts.phase === 'spec' || opts.continuation || ctx.serverReviewCheckout === 'base';
-        return this.setupPhaseSignalWatcher(
-          taskId, qaId, expectedKind, newToken, false,
-          allowReadFile ? (req) => { void this.handleReadFileRequest(taskId, qaId, req); } : undefined,
-        );
+        return this.setupPhaseSignalWatcher(taskId, qaId, expectedKind, newToken, {
+          ...(allowReadFile
+            ? { onReadFile: (req: ReadFileSignal) => { void this.handleReadFileRequest(taskId, qaId, req); } }
+            : {}),
+        });
       },
     };
     const rearmConsumedSignal = async () => {
@@ -7822,6 +9167,18 @@ export class AgentManager {
       await this.setupPhaseSignal(taskId, qaAgentId, reviewedKind, { skipSnapshot: true });
     };
 
+    const devBoundBefore = (await this.agentStore.get(devAgentId))?.taskId === taskId;
+    const releaseFreshAcquire = async (): Promise<void> => {
+      if (devBoundBefore) return;
+      const released = await this.releaseAgentForTask(devAgentId, taskId, 'idle')
+        .catch(() => false);
+      if (!released) {
+        console.error(
+          `[AgentManager] dispatchServerFixToDev: releasing freshly acquired dev ${devAgentId} for ${taskId} failed`,
+        );
+      }
+    };
+
     const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'server-feedback');
     if (!acquired) {
       await rearmReviewedSignal();
@@ -7833,6 +9190,7 @@ export class AgentManager {
       const released = await this.releaseAgentIfBound(qaAgentId, taskId)
         .catch(() => false);
       if (!released) {
+        await releaseFreshAcquire();
         await rearmReviewedSignal();
         await this.emitIntervention(projectId, qaAgentId, taskId, { phase: 'server-fix-qa-release-failed', qaAgentId });
         return null;
@@ -7846,6 +9204,7 @@ export class AgentManager {
       { signalToken: newToken, fixDispatchedAt: new Date().toISOString() },
     );
     if (!transition) {
+      await releaseFreshAcquire();
       await this.emitIntervention(projectId, devAgentId, taskId, { phase: 'server-fix-transition-failed', devAgentId });
       return null;
     }

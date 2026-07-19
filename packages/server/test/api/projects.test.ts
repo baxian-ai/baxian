@@ -1333,6 +1333,209 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     expect(state?.taskId).toBe('task-clear-held');
   });
 
+  it('restart-repl holds an unreplayable in-flight holder instead of downgrading it to waiting', async () => {
+    await seedTask('task-hold-ctx', 'proj', {
+      preferredAgentId: 'dev-1', status: 'fixing', branch: 'bx/task-hold-ctx',
+    });
+    await seedAgent('dev-1', 'proj', { taskId: 'task-hold-ctx', paneId: '%0' });
+    await app.ctx.lockManager.acquire('dev-1', 'task-hold-ctx');
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('restart-redispatch-failed');
+  });
+
+  it('restart-repl turns a redispatch failure into a resumable hold', async () => {
+    await seedTask('task-redis-throw', 'proj', {
+      preferredAgentId: 'dev-1', status: 'in_progress', branch: 'bx/task-redis-throw',
+      signalToken: 'tok-throw',
+    });
+    await seedAgent('dev-1', 'proj', { taskId: 'task-redis-throw', paneId: '%0' });
+    await app.ctx.lockManager.acquire('dev-1', 'task-redis-throw');
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+      .mockRejectedValue(new Error('replay signal watcher failed to arm'));
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('restart-redispatch-failed');
+  });
+
+  it('restart-repl waiting fallback preserves a hold that lands after every pre-read', async () => {
+    await seedTask('task-race-hold', 'proj', {
+      preferredAgentId: 'dev-1', status: 'in_progress', branch: 'bx/task-race-hold',
+      signalToken: 'tok-race',
+    });
+    await seedAgent('dev-1', 'proj', { taskId: 'task-race-hold', paneId: '%0' });
+    await app.ctx.lockManager.acquire('dev-1', 'task-race-hold');
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    let redispatched = false;
+    vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+      .mockImplementation(async () => {
+        redispatched = true;
+        return false;
+      });
+    const realUpdate = app.ctx.agentStore.update.bind(app.ctx.agentStore);
+    let injected = false;
+    vi.spyOn(app.ctx.agentStore, 'update').mockImplementation(async (id, updater) => {
+      // A recovery path writes an actionable hold between the fallback's reads and its atomic update.
+      if (redispatched && !injected && id === 'dev-1') {
+        injected = true;
+        const cur = await app.ctx.agentStore.get('dev-1');
+        await app.ctx.agentStore.set({
+          ...cur!,
+          status: 'awaiting_human',
+          awaitingPhase: 'successor-pass-hold',
+          awaitingReason: 'written after the fallback pre-reads',
+          awaitingSince: now(),
+          updatedAt: now(),
+        });
+      }
+      return realUpdate(id, updater);
+    });
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('successor-pass-hold');
+  });
+
+  it('restart-repl does not hold a successor pass that rotated during the failed replay', async () => {
+    await seedTask('task-redis-stale', 'proj', {
+      preferredAgentId: 'dev-1', status: 'in_progress', branch: 'bx/task-redis-stale',
+      signalToken: 'tok-entry',
+    });
+    await seedAgent('dev-1', 'proj', { taskId: 'task-redis-stale', paneId: '%0' });
+    await app.ctx.lockManager.acquire('dev-1', 'task-redis-stale');
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+      .mockImplementation(async () => {
+        const fresh = await app.ctx.taskStore.get('task-redis-stale');
+        await app.ctx.taskStore.set({ ...fresh!, signalToken: 'tok-successor' });
+        throw new Error('enter scrub failed mid-delivery');
+      });
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).not.toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBeUndefined();
+  });
+
+  it('restart-repl keeps a hold written by the failed replay delivery', async () => {
+    await seedTask('task-fresh-hold', 'proj', {
+      preferredAgentId: 'dev-1', status: 'in_progress', branch: 'bx/task-fresh-hold',
+      signalToken: 'tok-fresh-hold',
+    });
+    await seedAgent('dev-1', 'proj', { taskId: 'task-fresh-hold', paneId: '%0' });
+    await app.ctx.lockManager.acquire('dev-1', 'task-fresh-hold');
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+      .mockImplementation(async (agentId) => {
+        await app.ctx.agentManager.markAwaitingHuman(
+          agentId,
+          'workdir-changed-during-dispatch',
+          'workdir moved mid-replay',
+          { expectedTaskId: 'task-fresh-hold' },
+        );
+        return false;
+      });
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('workdir-changed-during-dispatch');
+  });
+
+  it('restart-repl keeps a replay hold rewritten with the same phase', async () => {
+    await seedTask('task-rehold', 'proj', {
+      preferredAgentId: 'dev-1', status: 'in_progress', branch: 'bx/task-rehold',
+      signalToken: 'tok-rehold',
+    });
+    await seedAgent('dev-1', 'proj', {
+      taskId: 'task-rehold', paneId: '%0',
+      status: 'awaiting_human',
+      awaitingPhase: 'workdir-changed-during-dispatch',
+      awaitingReason: 'moved before restart',
+      awaitingSince: '2026-07-01T00:00:00.000Z',
+    });
+    await app.ctx.lockManager.acquire('dev-1', 'task-rehold');
+    vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+    vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+      .mockImplementation(async (agentId) => {
+        await app.ctx.agentManager.clearAwaitingHuman(agentId);
+        await app.ctx.agentManager.markAwaitingHuman(
+          agentId,
+          'workdir-changed-during-dispatch',
+          'moved again mid-replay',
+          { expectedTaskId: 'task-rehold' },
+        );
+        return false;
+      });
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(200);
+    const state = await app.ctx.agentStore.get('dev-1');
+    expect(state?.status).toBe('awaiting_human');
+    expect(state?.awaitingPhase).toBe('workdir-changed-during-dispatch');
+    expect(state?.awaitingReason).toBe('moved again mid-replay');
+  });
+
+  it('restart-repl keeps a replay hold rewritten with the same phase in the same millisecond', async () => {
+    const frozen = '2026-07-01T00:00:00.000Z';
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date(frozen) });
+    try {
+      await seedTask('task-rehold-ms', 'proj', {
+        preferredAgentId: 'dev-1', status: 'in_progress', branch: 'bx/task-rehold-ms',
+        signalToken: 'tok-rehold-ms',
+      });
+      await seedAgent('dev-1', 'proj', {
+        taskId: 'task-rehold-ms', paneId: '%0',
+        status: 'awaiting_human',
+        awaitingPhase: 'workdir-changed-during-dispatch',
+        awaitingReason: 'moved before restart',
+        awaitingSince: frozen,
+      });
+      await app.ctx.lockManager.acquire('dev-1', 'task-rehold-ms');
+      vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+      vi.spyOn(app.ctx.agentManager, 'redispatchTaskPromptAfterReplRestart')
+        .mockImplementation(async (agentId) => {
+          await app.ctx.agentManager.clearAwaitingHuman(agentId);
+          await app.ctx.agentManager.markAwaitingHuman(
+            agentId,
+            'workdir-changed-during-dispatch',
+            'moved again mid-replay',
+            { expectedTaskId: 'task-rehold-ms' },
+          );
+          return false;
+        });
+
+      const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+      expect(response.statusCode).toBe(200);
+      const state = await app.ctx.agentStore.get('dev-1');
+      expect(state?.status).toBe('awaiting_human');
+      expect(state?.awaitingPhase).toBe('workdir-changed-during-dispatch');
+      expect(state?.awaitingReason).toBe('moved again mid-replay');
+      expect(state?.awaitingSince).toBe(frozen);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('restart-repl clears awaiting_human Held state when no task is bound', async () => {
     await seedAgent('dev-1', 'proj', {
       paneId: '%0',

@@ -22,23 +22,23 @@ interface FakeStreamer {
 }
 
 function createFakeStreamer(): FakeStreamer {
-  let live: SubscriberCallbacks['onLive'] | undefined;
-  let sessionGone: SubscriberCallbacks['onSessionGone'] | undefined;
+  // Per-subscription records: an old generation's unsubscribe must not silence a newer one.
+  const subs: Array<{ live?: SubscriberCallbacks['onLive']; sessionGone?: SubscriberCallbacks['onSessionGone'] }> = [];
   let snapshotData = '';
   const state: FakeStreamer = {
     unsubscribed: false,
-    triggerLive: (data: string) => live?.(data),
-    triggerSessionGone: () => sessionGone?.(),
+    triggerLive: (data: string) => { for (const sub of subs) sub.live?.(data); },
+    triggerSessionGone: () => { for (const sub of subs) sub.sessionGone?.(); },
     setSnapshot: (data: string) => { snapshotData = data; },
     subscribeAtomic: vi.fn(async (cbs: SubscriberCallbacks) => {
-      live = cbs.onLive;
-      sessionGone = cbs.onSessionGone;
+      const record: typeof subs[number] = { live: cbs.onLive, sessionGone: cbs.onSessionGone };
+      subs.push(record);
       return {
         snapshot: { data: snapshotData },
         unsubscribe: () => {
           state.unsubscribed = true;
-          live = undefined;
-          sessionGone = undefined;
+          record.live = undefined;
+          record.sessionGone = undefined;
         },
       };
     }),
@@ -259,6 +259,90 @@ describe('PhaseSignalWatcher', () => {
     watcher.stop('t1');
     streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
     expect(captured).toHaveLength(0);
+  });
+
+  it('stopIfToken removes the entry only when the token matches', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    const token = 'fencetok1234';
+    await startWatch(watcher, { expectedKinds: 'spec-done', token });
+
+    watcher.stopIfToken('t1', 'other-token1');
+    expect(watcher.has('t1')).toBe(true);
+
+    watcher.stopIfToken('t1', token);
+    expect(watcher.has('t1')).toBe(false);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
+    expect(captured).toHaveLength(0);
+  });
+
+  it('stopIfToken never kills a successor watch re-armed with a rotated token', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'staletok1234' });
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'freshtok1234' });
+
+    watcher.stopIfToken('t1', 'staletok1234');
+
+    expect(watcher.has('t1')).toBe(true);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'freshtok1234')}\n`);
+    expect(captured.length).toBeGreaterThan(0);
+    expect(captured[0].type).toBe('server.spec.ready');
+  });
+
+  it('a fenced arm never displaces a successor watch already re-armed with a rotated token', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token: 'freshtok9999' });
+
+    const staleArm = await startWatch(watcher, {
+      expectedKinds: 'spec-done', token: 'staletok1111', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+
+    expect(staleArm).toBe(false);
+    expect(watcher.has('t1')).toBe(true);
+    expect([...watcher.expectedKindsFor('t1')]).toEqual(['pr-merge-ready']);
+
+    watcher.stopIfToken('t1', 'staletok1111');
+    expect(watcher.has('t1')).toBe(true);
+    expect([...watcher.expectedKindsFor('t1')]).toEqual(['pr-merge-ready']);
+
+    streamer.triggerLive(`${buildPhaseSignal('pr-merge-ready', 'freshtok9999')}\n`);
+    expect(captured.length).toBeGreaterThan(0);
+    expect(captured[0].type).toBe('pr.updated');
+  });
+
+  it('a failed same-token re-arm keeps the previous watcher consuming', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token: 'sametok12345' });
+
+    streamer.subscribeAtomic.mockRejectedValueOnce(new Error('pane streamer hiccup'));
+    const rearm = await startWatch(watcher, {
+      expectedKinds: 'pr-merge-ready', token: 'sametok12345', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+
+    expect(rearm).toBe(false);
+    expect(watcher.has('t1')).toBe(true);
+    streamer.triggerLive(`${buildPhaseSignal('pr-merge-ready', 'sametok12345')}\n`);
+    expect(captured.some(e => e.type === 'pr.updated')).toBe(true);
+  });
+
+  it('a fenced arm aborts when a successor arms while its subscription is in flight', async () => {
+    const { watcher, streamer } = makeWatcher();
+    let releaseStale: (() => void) | undefined;
+    const original = streamer.subscribeAtomic.getMockImplementation()!;
+    streamer.subscribeAtomic.mockImplementationOnce(async (cbs: SubscriberCallbacks) => {
+      await new Promise<void>((resolve) => { releaseStale = resolve; });
+      return original(cbs);
+    });
+
+    const stalePromise = startWatch(watcher, {
+      expectedKinds: 'spec-done', token: 'staletok1111', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+    await flushMicrotasks();
+    await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token: 'freshtok9999' });
+    releaseStale!();
+
+    expect(await stalePromise).toBe(false);
+    expect(watcher.has('t1')).toBe(true);
+    expect([...watcher.expectedKindsFor('t1')]).toEqual(['pr-merge-ready']);
   });
 
   it('emits human.intervention when the underlying streamer reports session-gone before fire', async () => {

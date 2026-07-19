@@ -399,7 +399,7 @@ export const enUS = {
     codeMaxRoundsTitle: (round: number) => `Review round limit reached (round ${round})`,
     codeMaxRoundsBody: 'You can click "Mark complete" to merge what you have, or "Continue another round" to keep revising. For anything left over, consider opening a new task — more rounds make the agent more likely to drift off-topic.',
     specMaxRoundsTitle: (round: number) => `Spec review round limit reached (round ${round})`,
-    specMaxRoundsBody: 'No agreement was reached after multiple rounds; the task is paused. You can click "Retry" to start a new task from scratch, or "Cancel". We recommend reviewing the review history to find the disagreement and refining the description before retrying.',
+    specMaxRoundsBody: 'No agreement was reached after multiple rounds; the task is paused. You can approve the current Spec to start coding, reject it with comments to run one more round (cap +1), or Retry / Cancel. Reviewing the round history first helps locate the disagreement.',
     noDescription: '(No description)',
     noLinkedAgent: 'No linked agent',
     cancelling: 'Cancelling…',

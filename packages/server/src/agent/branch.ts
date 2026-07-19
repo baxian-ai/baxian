@@ -49,7 +49,7 @@ export interface ReviewCheckoutResult {
 }
 
 export type BranchCleanupResult =
-  | { status: 'deleted' }
+  | { status: 'deleted'; remoteTipSha?: string }
   | { status: 'skipped'; reason: string }
   | { status: 'pending'; reason: string };
 
@@ -72,6 +72,7 @@ export class BranchManager {
     taskId: string,
     branch: string,
     branchCreatedByBaxian: boolean,
+    opts: { restorableRemoteTip?: string; requireExistingWork?: boolean } = {},
   ): Promise<void> {
     if (!isValidBranchName(branch)) throw new Error(`Invalid task branch: ${branch}`);
     if (branchCreatedByBaxian && branch !== `${BRANCH_PREFIX}${taskId}`) {
@@ -88,21 +89,72 @@ export class BranchManager {
       await this.ensureTaskBranchUpstream(workdir, branch);
       await this.switch(workdir, `--no-guess ${shellQuote(branch)}`);
     } else if (local.exitCode === 1) {
-      await this.assertRemoteBranchAbsent(workdir, branch);
-      const baseSha = await this.resolveCommit(workdir, 'origin/HEAD');
-      await this.switch(
-        workdir,
-        `--no-track -c ${shellQuote(branch)} ${shellQuote(baseSha)}`,
-      );
-      await this.markTaskBranch(workdir, branch, taskId);
-      const head = await this.resolveCommit(workdir, 'HEAD');
-      if (head !== baseSha) {
-        throw new Error(`New branch ${branch} started at ${head}, expected base ${baseSha}`);
+      if (opts.restorableRemoteTip) {
+        // 凭据存在说明本地 ref 是 release 时主动清理的、工作在远端；远端也消失时绝不能
+        // 从 origin/HEAD 重建同名空分支顶替，否则已推送的上一轮成果被静默丢弃
+        if (!await this.remoteBranchExists(workdir, branch)) {
+          throw new Error(
+            `Remote ${branch} vanished after its local ref was cleaned up `
+            + `(expected tip ${opts.restorableRemoteTip}); refusing to recreate the task branch from scratch`,
+          );
+        }
+        await this.restoreTaskBranchFromRemote(workdir, taskId, branch, opts.restorableRemoteTip);
+      } else if (opts.requireExistingWork) {
+        // continuation 场景本地分支必须在（或持有清理凭据）：都没有说明上一轮工作已不可
+        // 证明，新建空分支会把丢失伪装成可继续
+        throw new Error(
+          `Local branch ${branch} is missing with no cleanup credential; refusing to recreate it mid-task`,
+        );
+      } else {
+        await this.assertRemoteBranchAbsent(workdir, branch);
+        const baseSha = await this.resolveCommit(workdir, 'origin/HEAD');
+        await this.switch(
+          workdir,
+          `--no-track -c ${shellQuote(branch)} ${shellQuote(baseSha)}`,
+        );
+        await this.markTaskBranch(workdir, branch, taskId);
+        const head = await this.resolveCommit(workdir, 'HEAD');
+        if (head !== baseSha) {
+          throw new Error(`New branch ${branch} started at ${head}, expected base ${baseSha}`);
+        }
       }
     } else {
       throw new Error(`Failed to probe local branch ${branch}: ${local.stderr.trim()}`);
     }
     await this.verifyRef(workdir, localRef);
+  }
+
+  // 只信删除时刻持久化的 remoteTipSha 凭据：远端 tip 必须仍包含它，防同名陌生分支或 force-push 重写被采纳
+  private async restoreTaskBranchFromRemote(
+    workdir: string,
+    taskId: string,
+    branch: string,
+    cleanedRemoteTipSha: string,
+  ): Promise<void> {
+    const remoteRef = `refs/remotes/origin/${branch}`;
+    const fetched = await execNetwork(
+      this.runner,
+      `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
+        `${shellQuote(`+refs/heads/${branch}:${remoteRef}`)}`,
+    );
+    if (fetched.exitCode !== 0) {
+      throw new Error(`Failed to fetch ${branch} for checkout restore: ${fetched.stderr.trim()}`);
+    }
+    const remoteTip = await this.resolveCommit(workdir, remoteRef);
+    const contained = await this.runner.exec(
+      `git -C ${shellQuote(workdir)} merge-base --is-ancestor ` +
+        `${shellQuote(cleanedRemoteTipSha)} ${shellQuote(remoteTip)}`,
+    );
+    if (contained.exitCode === 1) {
+      throw new Error(
+        `Remote ${branch} no longer contains the cleaned-up local tip ${cleanedRemoteTipSha}; refusing to restore`,
+      );
+    }
+    if (contained.exitCode !== 0) {
+      throw new Error(`Remote ancestry probe failed for ${branch}: ${contained.stderr.trim()}`);
+    }
+    await this.switch(workdir, `--no-guess -c ${shellQuote(branch)} --track ${shellQuote(remoteRef)}`);
+    await this.markTaskBranch(workdir, branch, taskId);
   }
 
   async switchToRemoteBranchDetached(
@@ -316,7 +368,7 @@ export class BranchManager {
     if (remaining.exitCode === 0) {
       return { status: 'pending', reason: 'local ref still exists after deletion' };
     }
-    if (remaining.exitCode === 1) return { status: 'deleted' };
+    if (remaining.exitCode === 1) return { status: 'deleted', remoteTipSha: remoteTip };
     return {
       status: 'pending',
       reason: `local ref deletion verification failed: ${remaining.stderr.trim()}`,

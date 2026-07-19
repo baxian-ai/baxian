@@ -928,21 +928,37 @@ async function pendingCleanupAfterReplReady(
   }
   if (takeover) {
     try {
-      if (await app.ctx.agentManager.redispatchResearchAfterReplRestart(agentId, taskId)) return;
+      if (await app.ctx.agentManager.redispatchTaskPromptAfterReplRestart(agentId, taskId)) return;
     } catch (err) {
-      app.log.error({ err, agentId, taskId }, 'restart/retry research redispatch failed');
-      await app.ctx.agentManager.markAwaitingHuman(
+      app.log.error({ err, agentId, taskId }, 'restart/retry task prompt redispatch failed');
+      // Bound to the pre-restart task tuple: a successor pass rotated mid-replay must not be held.
+      const held = await app.ctx.agentManager.holdReplayFailureIfCurrent(
         agentId,
+        task,
         'restart-redispatch-failed',
         `REPL restarted but the active task prompt could not be restored: ${err instanceof Error ? err.message : String(err)}`,
-        { expectedTaskId: taskId },
+        {
+          phase: state?.status === 'awaiting_human' ? state.awaitingPhase : undefined,
+          since: state?.status === 'awaiting_human' ? state.awaitingSince : undefined,
+          nonce: state?.status === 'awaiting_human' ? state.awaitingNonce : undefined,
+        },
       );
+      if (!held) {
+        app.log.warn({ agentId, taskId }, 'restart/retry failure hold skipped: the pass moved past the pre-restart generation');
+      }
       return;
     }
   }
+  // Both fences ride inside the release itself: a hold or pass rotation landing after any pre-read survives.
   await app.ctx.agentManager.markAgentWaiting(agentId, taskId, {
     allowAwaitingHuman: true,
     clearAwaitingHuman: true,
+    expectedTask: task,
+    expectedHold: {
+      phase: state?.status === 'awaiting_human' ? state.awaitingPhase : undefined,
+      since: state?.status === 'awaiting_human' ? state.awaitingSince : undefined,
+      nonce: state?.status === 'awaiting_human' ? state.awaitingNonce : undefined,
+    },
   });
 }
 

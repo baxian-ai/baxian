@@ -3,7 +3,7 @@ export type AgentRole = 'dev' | 'qa' | 'research';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
-export type ReviewMode = 'github' | 'server';
+export type ReviewMode = 'github' | 'server' | 'git';
 export type AfterDone = 'pr' | 'branch' | null;
 type SupportedLanguage = 'zh-CN' | 'en-US';
 
@@ -34,11 +34,18 @@ export interface ProjectConfig {
   merge: MergeStrategy;
   specApproval?: SpecApprovalStrategy;
   review?: ProjectReviewConfig;
+  gitCli?: GitCliConfig;
   agent: AgentConfig[][];
 }
 
 interface ProjectReviewConfig {
   mode?: ReviewMode;
+}
+
+export interface GitCliConfig {
+  tool: string;
+  binary?: string;
+  notes?: string;
 }
 
 interface ReviewConfig {
@@ -126,6 +133,8 @@ export interface AgentBindingFacts {
   awaitingPhase?: string;
   awaitingReason?: string;
   awaitingSince?: string;
+  // Random per-write hold generation: (phase, since) alone can ABA within one millisecond.
+  awaitingNonce?: string;
   // Display-only: agent asked its human partner and is waiting ([bx:need-input]).
   // Never consulted by scheduling — that is what status/awaiting* are for.
   needInputAt?: string;
@@ -188,6 +197,11 @@ export interface TaskState {
     reason: string;
     updatedAt: string;
   };
+  // 释放时本地任务分支被清理（远端保留）的凭据；检出恢复只信这枚删除时刻的远端 tip
+  branchLocalCleaned?: {
+    remoteTipSha: string;
+    updatedAt: string;
+  };
   latestHeadSha?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
@@ -207,6 +221,10 @@ export interface TaskState {
   maxRoundsContinues?: number;
   afterDone?: AfterDone;
   publishDispatchedAt?: string;
+  // Deliberately cleared post-approve completion; a restart replay must not rebuild it while this stands.
+  postApproveRevoked?: { reason: 'request-changes' | 'redispatch-cap'; at: string };
+  // Approved head persisted at post-approve dispatch; the only SHA a completion rebuild may trust.
+  postApproveHeadSha?: string;
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;

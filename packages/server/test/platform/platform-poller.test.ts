@@ -1,0 +1,917 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  PlatformPoller, type PlatformDriver, type PlatformTaskView,
+} from '../../src/platform/platform-poller.js';
+import { platformPollerStatePath, CommentCursorStore } from '../../src/platform/comment-cursor.js';
+import { DriverOpError, type OpVars } from '../../src/platform/git-driver.js';
+import type { CommentSourceOp } from '../../src/platform/types.js';
+import type { NormalizedRow } from '../../src/platform/row-schema.js';
+import type { MappedEvent } from '../../src/github/mapper.js';
+import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
+import { bodyDigest } from '../../src/platform/body-digest.js';
+
+const REPO = 'https://github.com/owner/repo';
+const SHA1 = '1'.repeat(40);
+const SHA2 = '2'.repeat(40);
+const ANCHOR = SHA1;
+const PASS = 'aaaaaaaaaaaa';
+const FAIL = 'bbbbbbbbbbbb';
+const T0 = Date.parse('2026-07-17T12:00:00Z');
+const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+const OLD_TS = iso(T0 - 120_000);
+
+const SOURCES: CommentSourceOp[] = [
+  { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u' } },
+  { key: 'inline-comments', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u', discussionId: { sources: ['r'], optional: true } } },
+  { key: 'reviews', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u', reviewState: { sources: ['s'], optional: true } } },
+];
+
+const prRow = (over: Partial<Record<string, unknown>> = {}): NormalizedRow => ({
+  prNumber: 42, prUrl: 'https://github.com/owner/repo/pull/42', branch: 'bx/task-1',
+  headSha: SHA1, state: 'open', draft: false, mergedAt: null, updatedAt: OLD_TS,
+  sourceProjectId: '7', targetProjectId: '7', targetBranch: 'main', ...over,
+});
+
+const comment = (id: string, body: string, ts: string = OLD_TS, extra: Record<string, unknown> = {}): NormalizedRow =>
+  ({ id, body, createdAt: ts, updatedAt: ts, ...extra });
+
+class FakeDriver implements PlatformDriver {
+  visibilityLagMs = 5000;
+  commentSources = SOURCES;
+  defaultBranch: string | (() => string) = 'main';
+  projectViewError?: Error;
+  listPrsRows: NormalizedRow[] = [];
+  listPrsPages?: NormalizedRow[][];
+  pagesFetched = 0;
+  listPrsError?: Error;
+  prViews = new Map<number, NormalizedRow | Error>();
+  prViewSeq = new Map<number, NormalizedRow[]>();
+  comments: Record<string, NormalizedRow[] | Error> = {};
+  calls: string[] = [];
+
+  async runOp(opName: string, vars: OpVars = {}): Promise<NormalizedRow[]> {
+    this.calls.push(opName);
+    if (opName === 'projectView') {
+      if (this.projectViewError) throw this.projectViewError;
+      const value = typeof this.defaultBranch === 'function' ? this.defaultBranch() : this.defaultBranch;
+      return [{ defaultBranch: value }];
+    }
+    if (opName === 'prView') {
+      const seq = this.prViewSeq.get(vars.prNumber!);
+      if (seq !== undefined && seq.length > 0) return [seq.shift()!];
+      const row = this.prViews.get(vars.prNumber!);
+      if (row === undefined) throw new Error(`no prView fixture for #${vars.prNumber}`);
+      if (row instanceof Error) throw row;
+      return [row];
+    }
+    throw new Error(`unexpected op ${opName}`);
+  }
+
+  async runListPrs(
+    _vars: OpVars,
+    shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean,
+  ): Promise<NormalizedRow[]> {
+    this.calls.push('listPrs');
+    if (this.listPrsError) throw this.listPrsError;
+    if (this.listPrsPages !== undefined) {
+      const all: NormalizedRow[] = [];
+      this.pagesFetched = 0;
+      for (let page = 1; page <= this.listPrsPages.length; page++) {
+        const rows = this.listPrsPages[page - 1];
+        if (rows.length === 0) return all;
+        this.pagesFetched = page;
+        all.push(...rows);
+        if (shouldStop?.(rows, page) === true) return all;
+      }
+      return all;
+    }
+    return this.listPrsRows;
+  }
+
+  async runCommentSource(source: CommentSourceOp): Promise<NormalizedRow[]> {
+    this.calls.push(`listComments:${source.key}`);
+    const rows = this.comments[source.key] ?? [];
+    if (rows instanceof Error) throw rows;
+    return rows;
+  }
+}
+
+let dir = '';
+let driver: FakeDriver;
+let tasks: PlatformTaskView[];
+let events: MappedEvent[];
+let failEventMatch: ((e: MappedEvent) => boolean) | undefined;
+let clockNow = T0;
+
+function makePoller() {
+  const poller = new PlatformPoller({
+    onEvent: (_projectId, event) => {
+      if (failEventMatch?.(event)) throw new Error('delivery rejected');
+      events.push(event);
+    },
+    tasks: async () => tasks,
+    now: () => clockNow,
+  });
+  poller.add({ projectId: 'p1', repoUrl: REPO, driver, statePath: platformPollerStatePath(dir, REPO) });
+  return poller;
+}
+
+const ofType = (type: string) => events.filter(e => e.type === type);
+
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), 'bx-poller-'));
+  driver = new FakeDriver();
+  tasks = [];
+  events = [];
+  failEventMatch = undefined;
+  clockNow = T0;
+});
+
+afterEach(async () => {
+  await rm(dir, { recursive: true, force: true });
+});
+
+describe('PlatformPoller: adoption predicate', () => {
+  it('adopts an open non-draft same-repo bx branch onto the matching base and rejects the rest', async () => {
+    tasks = [
+      { taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' },
+      { taskId: 'task-2', terminal: false, branch: 'bx/task-2', expectedBase: 'main' },
+      { taskId: 'task-3', terminal: false, branch: 'bx/task-3', expectedBase: 'main' },
+      { taskId: 'task-4', terminal: false, branch: 'bx/task-4', expectedBase: 'main' },
+      { taskId: 'task-5', terminal: false, branch: 'bx/task-5', expectedBase: 'release' },
+    ];
+    driver.listPrsRows = [
+      prRow(),
+      prRow({ prNumber: 43, branch: 'bx/task-2', draft: true }),
+      prRow({ prNumber: 44, branch: 'bx/task-3', sourceProjectId: null }),
+      prRow({ prNumber: 45, branch: 'bx/task-4', sourceProjectId: '8' }),
+      prRow({ prNumber: 46, branch: 'bx/task-5', targetBranch: 'main' }),
+    ];
+    await makePoller().poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect(ofType('pr.created')[0]!.data).toMatchObject({
+      prNumber: 42, branch: 'bx/task-1', headSha: SHA1, targetBranch: 'main',
+    });
+  });
+
+  it('without a base snapshot compares against the cycle default branch and escalates mismatches', async () => {
+    tasks = [
+      { taskId: 'task-1', terminal: false, branch: 'bx/task-1' },
+      { taskId: 'task-2', terminal: false, branch: 'bx/task-2' },
+    ];
+    driver.defaultBranch = 'develop';
+    driver.listPrsRows = [
+      prRow({ targetBranch: 'develop' }),
+      prRow({ prNumber: 43, branch: 'bx/task-2', targetBranch: 'main' }),
+    ];
+    await makePoller().poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+    const intervention = ofType('human.intervention');
+    expect(intervention).toHaveLength(1);
+    expect(intervention[0]!.data).toMatchObject({
+      reason: 'base-mismatch', prNumber: 43, targetBranch: 'main', expectedBase: 'develop', taskId: 'task-2',
+    });
+  });
+
+  it('delivers a base-mismatch escalation once per condition, retries failed deliveries, and re-alerts on change', async () => {
+    tasks = [{ taskId: 'task-2', terminal: false, branch: 'bx/task-2' }];
+    driver.listPrsRows = [prRow({ prNumber: 43, branch: 'bx/task-2', targetBranch: 'release' })];
+    failEventMatch = e => e.type === 'human.intervention';
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('human.intervention')).toHaveLength(0);
+
+    failEventMatch = undefined;
+    await poller.poll();
+    await poller.poll();
+    expect(ofType('human.intervention')).toHaveLength(1);
+
+    driver.listPrsRows = [prRow({ prNumber: 43, branch: 'bx/task-2', targetBranch: 'hotfix' })];
+    await poller.poll();
+    expect(ofType('human.intervention')).toHaveLength(2);
+    expect(ofType('human.intervention')[1]!.data).toMatchObject({ targetBranch: 'hotfix' });
+  });
+
+  it('defers no-snapshot adoption when projectView fails but still adopts snapshot-carrying tasks', async () => {
+    tasks = [
+      { taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' },
+      { taskId: 'task-2', terminal: false, branch: 'bx/task-2' },
+    ];
+    driver.projectViewError = new Error('projectView down');
+    driver.listPrsRows = [prRow(), prRow({ prNumber: 43, branch: 'bx/task-2' })];
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect(ofType('human.intervention')).toHaveLength(0);
+    expect(poller.snapshots()[0]!.consecutiveFailures).toBe(1);
+  });
+
+  it('never adopts for terminal, already-bound, branch-mismatched, or branch-missing tasks', async () => {
+    tasks = [
+      { taskId: 'task-1', terminal: true, branch: 'bx/task-1', expectedBase: 'main' },
+      { taskId: 'task-2', terminal: false, branch: 'custom/branch', expectedBase: 'main' },
+      { taskId: 'task-3', terminal: false, branch: 'bx/task-3', prNumber: 99, expectedBase: 'main' },
+      { taskId: 'task-6', terminal: false, expectedBase: 'main' },
+    ];
+    driver.listPrsRows = [
+      prRow({ branch: 'bx/task-1' }),
+      prRow({ prNumber: 43, branch: 'bx/task-2' }),
+      prRow({ prNumber: 44, branch: 'bx/task-3' }),
+      prRow({ prNumber: 46, branch: 'bx/task-6' }),
+    ];
+    driver.prViews.set(99, prRow({ prNumber: 99, branch: 'bx/task-3' }));
+    await makePoller().poll();
+    expect(ofType('pr.created')).toHaveLength(0);
+  });
+});
+
+describe('PlatformPoller: reopen and generations', () => {
+  it('synthesizes a reopened update for an anchored task when its PR shows open again', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, closedUnmergedAnchor: true }];
+    driver.listPrsRows = [prRow()];
+    driver.prViews.set(42, prRow());
+    await makePoller().poll();
+    expect(ofType('pr.updated').filter(e => e.data.kind === 'reopened')).toHaveLength(1);
+  });
+
+  it('halts the entire sub-poll while the closed-unmerged anchor is set, until the durable state clears it', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, closedUnmergedAnchor: true, latestHeadSha: SHA1 }];
+    driver.listPrsError = new Error('listing offline');
+    driver.prViews.set(42, prRow());
+    driver.comments['issue-comments'] = [comment('c1', 'new blocker')];
+    const poller = makePoller();
+    await poller.poll();
+    expect(driver.calls).not.toContain('prView');
+    expect(driver.calls.filter(c => c.startsWith('listComments'))).toHaveLength(0);
+    expect(events).toHaveLength(0);
+
+    driver.listPrsError = undefined;
+    driver.listPrsRows = [];
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+    await poller.poll();
+    expect(ofType('pr.updated').filter(e => e.data.kind === 'comment')).toHaveLength(1);
+  });
+
+  it('drops cursor generations for terminal or vanished tasks', async () => {
+    const statePath = platformPollerStatePath(dir, REPO);
+    const seed = new CommentCursorStore(statePath, REPO);
+    await seed.load();
+    await seed.commitSource('task-gone', 42, 'issue-comments', [comment('1', 'x')], T0);
+    await seed.commitSource('task-done', 42, 'issue-comments', [comment('1', 'x')], T0);
+    const seeded = new CommentCursorStore(statePath, REPO);
+    await seeded.load();
+    expect(seeded.generations().sort()).toEqual(['task-done', 'task-gone']);
+
+    tasks = [{ taskId: 'task-done', terminal: true }];
+    await makePoller().poll();
+    const check = new CommentCursorStore(statePath, REPO);
+    await check.load();
+    expect(check.generations()).toEqual([]);
+  });
+});
+
+describe('PlatformPoller: pr lifecycle sub-poll', () => {
+  beforeEach(() => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+  });
+
+  it('emits push once per observed head change', async () => {
+    driver.prViews.set(42, prRow({ headSha: SHA2 }));
+    const poller = makePoller();
+    await poller.poll();
+    await poller.poll();
+    const pushes = ofType('pr.updated').filter(e => e.data.kind === 'push');
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.data).toMatchObject({ headSha: SHA2, prNumber: 42 });
+  });
+
+  it('emits pr.merged for a merged close and closed-unmerged otherwise, skipping comment scans', async () => {
+    driver.prViews.set(42, prRow({ state: 'closed', mergedAt: OLD_TS }));
+    driver.comments['issue-comments'] = [comment('1', 'should not be scanned')];
+    await makePoller().poll();
+    expect(ofType('pr.merged')).toHaveLength(1);
+    expect(ofType('pr.updated')).toHaveLength(0);
+
+    events = [];
+    driver.prViews.set(42, prRow({ state: 'closed', mergedAt: null }));
+    const poller = makePoller();
+    await poller.poll();
+    await poller.poll();
+    const closed = ofType('pr.updated').filter(e => e.data.kind === 'closed-unmerged');
+    expect(closed).toHaveLength(1);
+    expect(events.some(e => e.data.kind === 'comment')).toBe(false);
+  });
+});
+
+describe('PlatformPoller: comment flow', () => {
+  beforeEach(() => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
+      replyActorId: '77', replyActorStatus: 'verified',
+    }];
+    driver.prViews.set(42, prRow());
+  });
+
+  it('emits feedback events with revision keys and thread flags', async () => {
+    driver.comments['issue-comments'] = [comment('100', 'top level feedback')];
+    driver.comments['inline-comments'] = [comment('200', 'thread reply', OLD_TS, { discussionId: '150' })];
+    await makePoller().poll();
+    const feedback = ofType('pr.updated');
+    expect(feedback).toHaveLength(2);
+    expect(feedback[0]!.data).toMatchObject({
+      kind: 'comment', commentId: '100',
+      revision: { sourceKey: 'issue-comments', id: '100', bodyDigest: bodyDigest('top level feedback') },
+    });
+    expect(feedback[1]!.data).toMatchObject({ kind: 'review-comment', reviewCommentReply: true });
+  });
+
+  it('retries only the failed delivery thanks to the ledger, then goes quiet', async () => {
+    driver.comments['issue-comments'] = [comment('a1', 'first'), comment('b1', 'second')];
+    failEventMatch = e => e.data.commentId === 'b1';
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(1);
+
+    failEventMatch = undefined;
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['b1']);
+
+    events = [];
+    await poller.poll();
+    expect(events).toHaveLength(0);
+  });
+
+  it('filters verdict-token rows and valid ack replies, but treats forged acks as human comments', async () => {
+    const ack = buildAckMarker({ sourceKey: 'issue-comments', commentId: '100', bodyDigest: bodyDigest('x') });
+    driver.comments['issue-comments'] = [
+      comment('1', `findings\n${buildReviewTokenLine({ kind: 'fail', anchorSha: ANCHOR, token: FAIL })}`),
+      comment('2', `done\n${ack}`, OLD_TS, { authorId: '77' }),
+      comment('3', `forged\n${ack}`, OLD_TS, { authorId: '999' }),
+      comment('4', '', OLD_TS),
+    ];
+    await makePoller().poll();
+    const feedback = ofType('pr.updated');
+    expect(feedback.map(e => e.data.commentId)).toEqual(['3']);
+  });
+
+  it('skips undated pending rows and re-emits edited revisions', async () => {
+    driver.comments['reviews'] = [{ id: 'r1', body: 'pending review' }];
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(0);
+
+    driver.comments['issue-comments'] = [comment('9', 'v1')];
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(1);
+
+    driver.comments['issue-comments'] = [comment('9', 'v2 edited')];
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.updated')[0]!.data.revision).toMatchObject({ bodyDigest: bodyDigest('v2 edited') });
+  });
+
+  it('keeps healthy sources flowing while a failed source holds its watermark', async () => {
+    driver.comments['issue-comments'] = [comment('1', 'ok source')];
+    driver.comments['inline-comments'] = new Error('boom') as unknown as NormalizedRow[];
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(1);
+    expect(poller.snapshots()[0]!.consecutiveFailures).toBe(1);
+
+    driver.comments['inline-comments'] = [comment('5', 'late but preserved', OLD_TS, { discussionId: null })];
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['5']);
+    expect(poller.snapshots()[0]!.consecutiveFailures).toBe(0);
+  });
+
+  it('honors cross-source acks: an acked revision never re-emits even from a zero watermark', async () => {
+    const blocker = comment('55', 'inline blocker', OLD_TS, { discussionId: null, authorId: '99' });
+    driver.comments['inline-comments'] = [blocker];
+    driver.comments['issue-comments'] = [
+      comment('700', `handled\n${buildAckMarker({ sourceKey: 'inline-comments', commentId: '55', bodyDigest: bodyDigest('inline blocker') })}`, OLD_TS, { authorId: '77' }),
+      comment('701', 'unrelated feedback', OLD_TS, { authorId: '99' }),
+    ];
+    await makePoller().poll();
+    expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['701']);
+  });
+
+  it('drops system rows from every channel', async () => {
+    driver.comments['issue-comments'] = [
+      comment('s1', 'added 3 commits', OLD_TS, { system: true }),
+      comment('h1', 'human words', OLD_TS, { system: false }),
+    ];
+    await makePoller().poll();
+    expect(ofType('pr.updated').map(e => e.data.commentId)).toEqual(['h1']);
+  });
+
+  it('logs undated rows once per generation and re-logs for a new owner task', async () => {
+    const warns: string[] = [];
+    const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      warns.push(args.map(String).join(' '));
+    });
+    try {
+      driver.comments['reviews'] = [{ id: 'r1', body: 'pending review' }];
+      const poller = makePoller();
+      await poller.poll();
+      await poller.poll();
+      const undatedWarns = () => warns.filter(w => w.includes('without timestamps'));
+      expect(undatedWarns()).toHaveLength(1);
+
+      tasks = [{ taskId: 'task-1', terminal: true }];
+      await poller.poll();
+
+      tasks = [{
+        taskId: 'task-2', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
+        replyActorId: '77', replyActorStatus: 'verified',
+      }];
+      await poller.poll();
+      expect(undatedWarns()).toHaveLength(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('PlatformPoller: verdict integration', () => {
+  beforeEach(() => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
+      anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig-token-123',
+    }];
+    driver.prViews.set(42, prRow());
+  });
+
+  it('emits REQUEST_CHANGES immediately on a fail token and dedupes the same decision', async () => {
+    driver.comments['reviews'] = [comment('r1', `findings\n${buildReviewTokenLine({ kind: 'fail', anchorSha: ANCHOR, token: FAIL })}`)];
+    const poller = makePoller();
+    await poller.poll();
+    await poller.poll();
+    const verdicts = ofType('review.submitted');
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0]!.data).toMatchObject({
+      action: 'REQUEST_CHANGES', prNumber: 42, headSha: ANCHOR, currentHeadSha: SHA1,
+      reviewPassToken: 'sig-token-123', submittedAt: OLD_TS,
+    });
+  });
+
+  it('holds a pass for the confirmation cycle and approves on the next poll', async () => {
+    driver.comments['reviews'] = [comment('r1', `LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`)];
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(1);
+    expect(ofType('review.submitted')[0]!.data).toMatchObject({ action: 'APPROVE' });
+  });
+
+  it('produces no verdict while any comment source fails', async () => {
+    driver.comments['reviews'] = [comment('r1', `LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`)];
+    driver.comments['issue-comments'] = new Error('offline') as unknown as NormalizedRow[];
+    const poller = makePoller();
+    await poller.poll();
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+  });
+});
+
+describe('PlatformPoller: health accounting', () => {
+  it('does not count rate-limited cycles as consecutive failures but surfaces the class', async () => {
+    tasks = [];
+    driver.listPrsError = new DriverOpError('op listPrs failed (exit 1, class RATE_LIMIT): HTTP 429', {
+      opName: 'listPrs', errorClass: 'RATE_LIMIT', exitCode: 1,
+    });
+    const poller = makePoller();
+    await poller.poll();
+    const snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(0);
+    expect(snap.lastErrorClass).toBe('RATE_LIMIT');
+    expect(snap.health).toBe('healthy');
+  });
+
+  it('counts and classifies non-rate-limit driver failures', async () => {
+    tasks = [];
+    driver.listPrsError = new DriverOpError('op listPrs failed (exit 1, class ACCESS_DENIED): HTTP 403', {
+      opName: 'listPrs', errorClass: 'ACCESS_DENIED', exitCode: 1,
+    });
+    const poller = makePoller();
+    await poller.poll();
+    const snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorClass).toBe('ACCESS_DENIED');
+    expect(snap.health).toBe('degraded');
+  });
+});
+
+describe('PlatformPoller: durability and retention', () => {
+  it('confines a cursor persist failure to the cycle error budget and keeps scanning other tasks', async () => {
+    tasks = [
+      { taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 },
+      { taskId: 'task-2', terminal: false, branch: 'bx/task-2', prNumber: 43, latestHeadSha: SHA1 },
+    ];
+    driver.prViews.set(42, prRow());
+    driver.prViews.set(43, prRow({ prNumber: 43, branch: 'bx/task-2' }));
+    driver.comments['issue-comments'] = [comment('1', 'first round feedback')];
+    const poller = makePoller();
+    await poller.poll();
+
+    await rm(join(dir, 'state'), { recursive: true, force: true });
+    await writeFile(join(dir, 'state'), 'not a directory');
+    driver.comments['issue-comments'] = [comment('1', 'first round feedback'), comment('2', 'second round feedback')];
+    events = [];
+    await poller.poll();
+    const perTask = ofType('pr.updated').filter(e => e.data.kind === 'comment');
+    expect(perTask.map(e => e.data.commentId)).toEqual(['2', '2']);
+    expect(poller.snapshots()[0]!.consecutiveFailures).toBe(1);
+    expect(poller.snapshots()[0]!.lastErrorMessage).toBeTruthy();
+  });
+
+  it('retries a failed pass delivery on the very next cycle', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
+      anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig',
+    }];
+    driver.prViews.set(42, prRow());
+    driver.comments['reviews'] = [comment('r1', `LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`)];
+    const poller = makePoller();
+    await poller.poll();
+    failEventMatch = e => e.type === 'review.submitted';
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+
+    failEventMatch = undefined;
+    clockNow = T0 + 60_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(1);
+  });
+
+  it('prunes per-pr observation caches when the owning task reaches a terminal state', async () => {
+    tasks = [{ taskId: 'task-a', terminal: false, branch: 'bx/task-a', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow({ branch: 'bx/task-a', state: 'closed', mergedAt: OLD_TS }));
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.merged')).toHaveLength(1);
+
+    tasks = [{ taskId: 'task-a', terminal: true, prNumber: 42 }];
+    await poller.poll();
+
+    tasks = [{ taskId: 'task-b', terminal: false, branch: 'bx/task-a', prNumber: 42, latestHeadSha: SHA1 }];
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.merged')).toHaveLength(1);
+  });
+
+  it('re-observes lifecycle events for a new owner task handed the same pr with no idle cycle in between', async () => {
+    tasks = [{ taskId: 'task-a', terminal: false, branch: 'bx/task-a', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow({ branch: 'bx/task-a', state: 'closed', mergedAt: OLD_TS }));
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.merged')).toHaveLength(1);
+
+    tasks = [
+      { taskId: 'task-a', terminal: true, prNumber: 42 },
+      { taskId: 'task-b', terminal: false, branch: 'bx/task-a', prNumber: 42, latestHeadSha: SHA1 },
+    ];
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.merged')).toHaveLength(1);
+  });
+});
+
+describe('PlatformPoller: listPrs cursor integrity', () => {
+  it('keeps paging through a fully-known watermark page until a strictly older row appears', async () => {
+    tasks = [{ taskId: 'task-x', terminal: false, branch: 'bx/task-x', expectedBase: 'main' }];
+    driver.listPrsRows = [prRow({ prNumber: 42, branch: 'other/seed' })];
+    const poller = makePoller();
+    await poller.poll();
+
+    const atWatermark = (n: number, branch: string) => prRow({ prNumber: n, branch, updatedAt: OLD_TS });
+    driver.listPrsPages = [
+      Array.from({ length: 10 }, (_, i) => atWatermark(42 + i, i === 0 ? 'other/seed' : `other/k${i}`)),
+      [atWatermark(60, 'bx/task-x'), prRow({ prNumber: 2, branch: 'other/ancient', updatedAt: iso(T0 - 600_000) })],
+    ];
+    await poller.poll();
+    expect(driver.pagesFetched).toBe(2);
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect(ofType('pr.created')[0]!.data.prNumber).toBe(60);
+  });
+
+  it('freezes the listPrs watermark while a no-snapshot adoption is deferred', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1' }];
+    driver.projectViewError = new Error('projectView down');
+    driver.listPrsRows = [prRow()];
+    const poller = makePoller();
+    await poller.poll();
+    const frozen = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await frozen.load();
+    expect(frozen.listPrsCursor().watermarkTime).toBe(null);
+    expect(ofType('pr.created')).toHaveLength(0);
+
+    driver.projectViewError = undefined;
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+    const advanced = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await advanced.load();
+    expect(advanced.listPrsCursor().watermarkTime).not.toBe(null);
+  });
+});
+
+describe('PlatformPoller: source key lifecycle', () => {
+  it('drops removed source cursors so a re-added key rescans from zero', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow());
+    const extra: CommentSourceOp = { key: 'extra', argv: ['{binary}'], map: { id: 'id', body: 'body', createdAt: 'c', updatedAt: 'u' } };
+    driver.commentSources = [...SOURCES, extra];
+    driver.comments['extra'] = [comment('9', 'seen once')];
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.updated').filter(e => e.data.kind === 'comment')).toHaveLength(1);
+
+    driver.commentSources = SOURCES;
+    await poller.poll();
+
+    driver.commentSources = [...SOURCES, extra];
+    events = [];
+    await poller.poll();
+    expect(ofType('pr.updated').filter(e => e.data.kind === 'comment')).toHaveLength(1);
+  });
+});
+
+describe('PlatformPoller: sub-poll binding predicate', () => {
+  beforeEach(() => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1,
+      expectedBase: 'main', anchorSha: ANCHOR, passToken: PASS, failToken: FAIL, signalToken: 'sig',
+    }];
+    driver.comments['reviews'] = [comment('r1', `LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`)];
+  });
+
+  it('suppresses verdicts on a retargeted PR and escalates the mismatch once', async () => {
+    driver.prViews.set(42, prRow({ targetBranch: 'release' }));
+    const poller = makePoller();
+    await poller.poll();
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+    const escalations = ofType('human.intervention');
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]!.data).toMatchObject({ reason: 'binding-mismatch', mismatch: 'target', prNumber: 42 });
+  });
+
+  it('suppresses pr.merged while the binding is broken', async () => {
+    driver.prViews.set(42, prRow({ state: 'closed', mergedAt: OLD_TS, targetBranch: 'release' }));
+    await makePoller().poll();
+    expect(ofType('pr.merged')).toHaveLength(0);
+    expect(ofType('human.intervention')).toHaveLength(1);
+  });
+
+  it('gates branch hijack and fork drift', async () => {
+    driver.prViews.set(42, prRow({ branch: 'hijack/x' }));
+    await makePoller().poll();
+    expect(ofType('human.intervention')[0]!.data).toMatchObject({ mismatch: 'branch' });
+
+    events = [];
+    driver.prViews.set(42, prRow({ sourceProjectId: null }));
+    await makePoller().poll();
+    expect(ofType('human.intervention')[0]!.data).toMatchObject({ mismatch: 'fork' });
+  });
+
+  it('resumes the verdict flow once the binding is restored', async () => {
+    driver.prViews.set(42, prRow({ targetBranch: 'release' }));
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('human.intervention')).toHaveLength(1);
+
+    driver.prViews.set(42, prRow());
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    clockNow = T0 + 60_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(1);
+    expect(ofType('review.submitted')[0]!.data).toMatchObject({ action: 'APPROVE' });
+
+    events = [];
+    driver.prViews.set(42, prRow({ targetBranch: 'release' }));
+    clockNow = T0 + 90_000;
+    await poller.poll();
+    expect(ofType('human.intervention')).toHaveLength(1);
+  });
+
+  it('invalidates an established pass candidate across a retarget instead of confirming on recovery', async () => {
+    const poller = makePoller();
+    driver.prViews.set(42, prRow());
+    await poller.poll();
+
+    driver.prViews.set(42, prRow({ targetBranch: 'release' }));
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+
+    driver.prViews.set(42, prRow());
+    clockNow = T0 + 60_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+    clockNow = T0 + 90_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(1);
+  });
+
+  it('invalidates an established pass candidate across a draft flip', async () => {
+    const poller = makePoller();
+    driver.prViews.set(42, prRow());
+    await poller.poll();
+
+    driver.prViews.set(42, prRow({ draft: true }));
+    clockNow = T0 + 30_000;
+    await poller.poll();
+
+    driver.prViews.set(42, prRow());
+    clockNow = T0 + 60_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+    clockNow = T0 + 90_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(1);
+  });
+
+  it('never lets tokens anchored to an old head approve a moved head', async () => {
+    tasks[0] = { ...tasks[0]!, latestHeadSha: SHA1 };
+    driver.prViews.set(42, prRow({ headSha: SHA2 }));
+    const poller = makePoller();
+    await poller.poll();
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+    expect(ofType('pr.updated').filter(e => e.data.kind === 'push')).toHaveLength(1);
+  });
+
+  it('re-checks the authoritative view after evaluation and withholds the verdict when the head moved mid-scan', async () => {
+    const poller = makePoller();
+    driver.prViews.set(42, prRow());
+    await poller.poll();
+
+    clockNow = T0 + 30_000;
+    driver.prViewSeq.set(42, [prRow(), prRow({ headSha: SHA2 })]);
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(0);
+
+    clockNow = T0 + 60_000;
+    await poller.poll();
+    clockNow = T0 + 90_000;
+    await poller.poll();
+    expect(ofType('review.submitted')).toHaveLength(1);
+  });
+
+  it('requires a non-blank task signal token before emitting any verdict', async () => {
+    driver.prViews.set(42, prRow());
+    for (const signalToken of [undefined, '', '   ']) {
+      events = [];
+      tasks[0] = { ...tasks[0]!, signalToken };
+      const poller = makePoller();
+      await poller.poll();
+      clockNow += 30_000;
+      await poller.poll();
+      expect(ofType('review.submitted')).toHaveLength(0);
+      clockNow += 30_000;
+    }
+  });
+
+  it('escalates once and stays silent when the task view carries no branch binding', async () => {
+    tasks[0] = { taskId: 'task-1', terminal: false, prNumber: 42, latestHeadSha: SHA1, expectedBase: 'main' };
+    driver.prViews.set(42, prRow({ state: 'closed', mergedAt: OLD_TS }));
+    const poller = makePoller();
+    await poller.poll();
+    await poller.poll();
+    expect(ofType('pr.merged')).toHaveLength(0);
+    const escalations = ofType('human.intervention');
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]!.data).toMatchObject({ mismatch: 'branch' });
+  });
+});
+
+describe('PlatformPoller: default-branch expectations for the binding guard', () => {
+  beforeEach(() => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow());
+  });
+
+  it('stops the sub-poll entirely while the base expectation is unverifiable, then recovers', async () => {
+    driver.projectViewError = new Error('projectView down');
+    driver.comments['issue-comments'] = [comment('c1', 'blocker')];
+    const poller = makePoller();
+    await poller.poll();
+    expect(driver.calls.filter(c => c.startsWith('listComments'))).toHaveLength(0);
+    expect(ofType('pr.updated')).toHaveLength(0);
+
+    driver.projectViewError = undefined;
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(1);
+  });
+
+  it('bridges up to two failed projectView cycles with the cached default branch, then fails closed', async () => {
+    driver.comments['issue-comments'] = [comment('c1', 'first')];
+    const poller = makePoller();
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(1);
+
+    driver.projectViewError = new Error('projectView down');
+    driver.comments['issue-comments'] = [comment('c1', 'first'), comment('c2', 'second')];
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(2);
+
+    driver.comments['issue-comments'] = [comment('c1', 'first'), comment('c2', 'second'), comment('c3', 'third')];
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(3);
+
+    driver.comments['issue-comments'] = [comment('c1', 'first'), comment('c2', 'second'), comment('c3', 'third'), comment('c4', 'fourth')];
+    await poller.poll();
+    expect(ofType('pr.updated')).toHaveLength(3);
+  });
+});
+
+describe('PlatformPoller: rate limit backoff', () => {
+  const rateLimited = (op: string) => new DriverOpError(`op ${op} failed (exit 1, class RATE_LIMIT): HTTP 429`, {
+    opName: op, errorClass: 'RATE_LIMIT', exitCode: 1,
+  });
+
+  it('short-circuits the entry, skips until the backoff expires, and grows the window exponentially', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow());
+    driver.projectViewError = rateLimited('projectView');
+    const poller = makePoller();
+    await poller.poll();
+    expect(driver.calls).toEqual(['projectView']);
+    let snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(0);
+    expect(snap.lastErrorClass).toBe('RATE_LIMIT');
+    expect(snap.rateLimitedUntil).toBe(new Date(T0 + 60_000).toISOString());
+
+    driver.calls = [];
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(driver.calls).toEqual([]);
+
+    clockNow = T0 + 61_000;
+    await poller.poll();
+    expect(driver.calls).toEqual(['projectView']);
+    snap = poller.snapshots()[0]!;
+    expect(snap.rateLimitedUntil).toBe(new Date(T0 + 61_000 + 120_000).toISOString());
+
+    driver.projectViewError = undefined;
+    driver.calls = [];
+    clockNow = T0 + 300_000;
+    await poller.poll();
+    expect(driver.calls.length).toBeGreaterThan(1);
+    expect(poller.snapshots()[0]!.rateLimitedUntil).toBe(undefined);
+
+    driver.projectViewError = rateLimited('projectView');
+    clockNow = T0 + 400_000;
+    await poller.poll();
+    expect(poller.snapshots()[0]!.rateLimitedUntil).toBe(new Date(T0 + 400_000 + 60_000).toISOString());
+  });
+
+  it('stops scanning remaining comment sources after a mid-cycle rate limit', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow());
+    driver.comments['issue-comments'] = rateLimited('listComments') as unknown as NormalizedRow[];
+    driver.comments['inline-comments'] = [comment('5', 'never scanned', OLD_TS, { discussionId: null })];
+    const poller = makePoller();
+    await poller.poll();
+    expect(driver.calls.filter(c => c.startsWith('listComments'))).toEqual(['listComments:issue-comments']);
+    expect(ofType('pr.updated')).toHaveLength(0);
+  });
+
+  it('keeps earlier real failures in the health accounting when a later call rate-limits', async () => {
+    tasks = [];
+    driver.projectViewError = new DriverOpError('op projectView failed (exit 1, class ACCESS_DENIED): HTTP 403', {
+      opName: 'projectView', errorClass: 'ACCESS_DENIED', exitCode: 1,
+    });
+    driver.listPrsError = rateLimited('listPrs');
+    const poller = makePoller();
+    await poller.poll();
+    const snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorClass).toBe('ACCESS_DENIED');
+    expect(snap.lastErrorMessage).toContain('projectView');
+    expect(snap.rateLimitedUntil).toBe(new Date(T0 + 60_000).toISOString());
+  });
+});
+
+describe('PlatformPoller: reentrancy', () => {
+  it('lets only one cycle run at a time across direct poll calls', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
+    driver.prViews.set(42, prRow());
+    driver.comments['issue-comments'] = [comment('c1', 'fresh feedback')];
+    const poller = makePoller();
+    await Promise.all([poller.poll(), poller.poll()]);
+    expect(ofType('pr.updated')).toHaveLength(1);
+  });
+});

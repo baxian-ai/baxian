@@ -590,6 +590,48 @@ describe('TaskDetail page — actions & states', () => {
       expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(true);
       expect(screen.getByText(/Spec review round limit reached \(round 0\)/)).toBeTruthy();
     });
+
+    it('spec-phase renders the verdict controls: approve starts coding', async () => {
+      tasksSpecMock.mockResolvedValue(makeTask({ status: 'in_progress', phase: 'code' }));
+      openMaxRounds({ phase: 'spec', specReviewRound: 10 });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Approve Spec and start coding' }));
+      await settleConfirmDialog('Approve Spec');
+      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'approve' });
+    });
+
+    it('spec-phase reject submits request-changes for one more round', async () => {
+      tasksSpecMock.mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
+      openMaxRounds({ phase: 'spec', specReviewRound: 10 });
+
+      const reject = screen.getByRole('button', { name: 'Reject Spec' }) as HTMLButtonElement;
+      expect(reject.disabled).toBe(true);
+      fireEvent.change(screen.getByPlaceholderText(/[Rr]ejection comments/), { target: { value: '按分歧点再收敛一轮' } });
+      await act(async () => {
+        fireEvent.click(screen.getByRole('button', { name: 'Reject Spec' }));
+      });
+
+      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '按分歧点再收敛一轮' });
+    });
+
+    it('spec-phase research task can be archived from max_rounds', async () => {
+      tasksSpecMock.mockResolvedValue(makeTask({ status: 'done', phase: 'spec' }));
+      openMaxRounds({
+        phase: 'spec',
+        specReviewRound: 10,
+        preferredAgentId: 'bx-research',
+        agentId: '',
+        researchAgentId: 'bx-research',
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Archive research' }));
+      const dialog = await findConfirmDialog();
+      await act(async () => {
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Archive research' }));
+      });
+
+      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'archive' });
+    });
   });
 
   describe('spec-ready actions', () => {

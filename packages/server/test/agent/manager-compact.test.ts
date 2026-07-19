@@ -425,6 +425,46 @@ describe('compactAgent', () => {
     );
   });
 
+  it('a guarded dispatch that goes stale after entry never touches the composer', async () => {
+    await seedAgent();
+    setPollMs(1);
+    const fakeTmux = fakeDispatchTmux();
+    fakeTmux.stagePromptBuffer = vi.fn().mockResolvedValue({ buf: 'baxian-dev-1-x' });
+    fakeTmux.pasteStagedBuffer = mockFn();
+    fakeTmux.dropStagedBuffer = mockFn();
+    let calls = 0;
+    const guard = vi.fn(async () => {
+      calls += 1;
+      // The entry guard passes; the pre-scrub guard sees the takeover.
+      return calls === 1;
+    });
+
+    const result = await injectAndAwaitAck(fakeTmux, '%7', 'stale prompt', 'dev-1', 'claude-code', guard);
+
+    expect(result).toMatchObject({ aborted: true });
+    expect(fakeTmux.clearComposerDraft).not.toHaveBeenCalled();
+    expect(fakeTmux.stagePromptBuffer).not.toHaveBeenCalled();
+    expect(fakeTmux.pasteStagedBuffer).not.toHaveBeenCalled();
+  });
+
+  it('a guarded dispatch scrubs the composer inside the paste fence, after staging', async () => {
+    await seedAgent();
+    setPollMs(1);
+    const fakeTmux = fakeDispatchTmux();
+    fakeTmux.stagePromptBuffer = vi.fn().mockResolvedValue({ buf: 'baxian-dev-1-y' });
+    fakeTmux.pasteStagedBuffer = mockFn();
+    fakeTmux.dropStagedBuffer = mockFn();
+    const guard = vi.fn(async () => true);
+
+    const result = await injectAndAwaitAck(fakeTmux, '%7', 'live prompt', 'dev-1', 'claude-code', guard);
+
+    expect(result).toMatchObject({ acked: true });
+    expect(fakeTmux.clearComposerDraft.mock.invocationCallOrder[0])
+      .toBeGreaterThan(fakeTmux.stagePromptBuffer.mock.invocationCallOrder[0]!);
+    expect(fakeTmux.clearComposerDraft.mock.invocationCallOrder[0])
+      .toBeLessThan(fakeTmux.pasteStagedBuffer.mock.invocationCallOrder[0]!);
+  });
+
   it('aborts a guarded dispatch when the binding is released while waiting (task cancelled)', async () => {
     await seedAgent({ taskId: 't1' });
     const lockToken = await lockManager.acquire('dev-1', 't1');

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeRepoUrl, repoSlug, parseGitRemote, isGitHubRepo, isSafeGitHost, redactGitCredentials, hasEmbeddedCredentials } from '../../src/shared/index.js';
+import { normalizeRepoUrl, repoSlug, parseGitRemote, isGitHubRepo, isSafeGitHost, redactGitCredentials, hasEmbeddedCredentials, repoIdentityKey } from '../../src/shared/index.js';
 
 describe('normalizeRepoUrl', () => {
   it('extracts owner/repo from every supported GitHub URL form', () => {
@@ -153,5 +153,27 @@ describe('hasEmbeddedCredentials', () => {
       'https://gitlab.example.com/g/p.git',
       'owner/repo',
     ]) expect.soft(hasEmbeddedCredentials(r), r).toBe(false);
+  });
+});
+
+describe('repoIdentityKey', () => {
+  it('folds all github forms, path case, and .git case variants into github.com/<slug>', () => {
+    for (const repo of [
+      'Owner/Repo',
+      'https://github.com/owner/repo.git',
+      'ssh://git@github.com/OWNER/REPO',
+      'git@github.com:Owner/repo.git',
+      'https://github.com/Owner/Repo.GIT',
+      'owner/repo.Git',
+    ]) {
+      expect(repoIdentityKey(repo), repo).toBe('github.com/owner/repo');
+    }
+  });
+
+  it('preserves non-github path case; strips default port, trailing slash, exact-case .git', () => {
+    expect(repoIdentityKey('https://gl.example.com:443/Team/App.git/')).toBe('gl.example.com/Team/App');
+    expect(repoIdentityKey('https://gl.example.com:8443/Team/App')).toBe('gl.example.com:8443/Team/App');
+    expect(repoIdentityKey('https://gl.example.com/g/p.GIT')).toBe('gl.example.com/g/p.GIT');
+    expect(repoIdentityKey('https://GL.example.com/g/p')).toBe('gl.example.com/g/p');
   });
 });

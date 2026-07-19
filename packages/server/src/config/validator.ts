@@ -1,8 +1,11 @@
 import { isAbsolute, normalize } from 'node:path';
 import {
-  hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoSlug,
+  CONTROL_CHAR_RE, TOOL_PATTERN,
+  hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
   type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
 } from '../shared/index.js';
+
+const VALID_REVIEW_MODES: ReadonlySet<string> = new Set(['github', 'server', 'git']);
 
 export interface ValidationError {
   path: string;
@@ -37,6 +40,7 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateHosts(config, errors);
   validateProjectFields(config, errors);
   validateProjectReviewModes(config, errors);
+  validateGitMode(config, errors);
   validateProjectIds(config, errors);
   validateAgentFields(config, errors);
   validateAgentIds(config, errors);
@@ -52,9 +56,16 @@ function nonEmptyString(v: unknown): boolean {
 }
 
 
-function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
+export function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
   const review = (project as { review?: unknown }).review;
   return (isRecord(review) && review.mode !== undefined ? review.mode : (config.review.mode ?? 'github')) as ReviewMode;
+}
+
+// tool 解析的唯一定义（spec v2 §4）：显式 gitCli.tool 优先；github 仓库零配置自动 'gh'（内置插件）；
+// 非 github 且未声明 → undefined（validator 已报配置错误，消费端跳过）。
+export function resolveProjectTool(project: ProjectConfig): string | undefined {
+  if (isRecord(project.gitCli) && typeof project.gitCli.tool === 'string') return project.gitCli.tool;
+  return nonEmptyString(project.repo) && isGitHubRepo(project.repo) ? 'gh' : undefined;
 }
 
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {
@@ -99,8 +110,8 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
   if (!Number.isInteger(config.review.rounds) || config.review.rounds <= 0) {
     errors.push({ path: 'review.rounds', message: 'review.rounds must be a positive integer' });
   }
-  if (config.review.mode !== undefined && config.review.mode !== 'github' && config.review.mode !== 'server') {
-    errors.push({ path: 'review.mode', message: "review.mode must be 'github' or 'server'" });
+  if (config.review.mode !== undefined && !VALID_REVIEW_MODES.has(config.review.mode)) {
+    errors.push({ path: 'review.mode', message: "review.mode must be 'github', 'server', or 'git'" });
   }
   const afterDone = config.review.afterDone;
   if (afterDone !== undefined && afterDone !== null && afterDone !== 'pr' && afterDone !== 'branch') {
@@ -157,23 +168,84 @@ function validateProjectReviewModes(config: BaxianConfig, errors: ValidationErro
         errors.push({ path: `${path}.review`, message: 'project.review must be an object' });
         return;
       }
-      if (review.mode !== undefined && review.mode !== 'github' && review.mode !== 'server') {
-        errors.push({ path: `${path}.review.mode`, message: "project.review.mode must be 'github' or 'server'" });
+      if (review.mode !== undefined && !(typeof review.mode === 'string' && VALID_REVIEW_MODES.has(review.mode))) {
+        errors.push({ path: `${path}.review.mode`, message: "project.review.mode must be 'github', 'server', or 'git'" });
       }
     }
 
+    const mode = projectReviewMode(config, project);
     if (
       nonEmptyString(project.repo)
       && !hasEmbeddedCredentials(project.repo)
       && isValidRepo(project.repo)
       && !isGitHubRepo(project.repo)
-      && projectReviewMode(config, project) !== 'server'
+      && mode !== 'server'
+      && mode !== 'git'
     ) {
       errors.push({
         path: `${path}.review.mode`,
         message: "non-GitHub projects require effective review.mode 'server'",
       });
     }
+  });
+}
+
+function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void {
+  const seenGitRepos = new Map<string, string>();
+
+  config.project.forEach((project, i) => {
+    const path = `project[${i}]`;
+    const gitCli = project.gitCli;
+
+    // project.repo 的存在性/类型错误已由 validateProjectFields 报告；此处短路，避免对畸形 repo 重复报告或在 isGitHubRepo/dedupe 上崩溃
+    if (!nonEmptyString(project.repo)) return;
+
+    if (projectReviewMode(config, project) !== 'git') return;
+
+    // github 仓库豁免 http(s) 形态与 gitCli 声明：内置 gh 驱动只用 {hostname}/{repoPath} 占位符
+    // 且 tool 自动解析为 'gh'（spec v2 §4），SSH/scp/裸 slug 形态照常合法。
+    if (!isGitHubRepo(project.repo)) {
+      // scheme 大小写不敏感（WHATWG）：大写 HTTPS:// 由 isValidRepo 统一拒，此处小写敏感会对它误报「ssh/scp 打到 SSH 端口」。
+      if (!/^https?:\/\//i.test(project.repo)) {
+        errors.push({
+          path: `${path}.repo`,
+          message: "mode 'git' requires an http(s):// repo URL (the git-driver CLI derives its API endpoint from it; ssh/scp forms would target the SSH port instead)",
+        });
+      } else {
+        // 补 isValidRepo 段模式不查的 URL 结构错误（如非数字端口）；退化路径形态
+        // （纯 host/query/fragment）由 validateProjectFields 的 isValidRepo 单点把守。
+        try {
+          new URL(project.repo);
+        } catch {
+          errors.push({ path: `${path}.repo`, message: 'repo is not a parseable URL' });
+        }
+      }
+
+      if (gitCli === undefined) {
+        errors.push({
+          path: `${path}.gitCli`,
+          message: "non-GitHub repos in review.mode 'git' require gitCli.tool — declare it and install the matching git-driver plugin under ~/.baxian/plugins/, or use review.mode 'server'",
+        });
+      }
+    }
+
+    const norm = repoIdentityKey(project.repo);
+    const prev = seenGitRepos.get(norm);
+    if (prev !== undefined) {
+      errors.push({
+        path: `${path}.repo`,
+        message: `normalized repo URL must be unique across git-mode projects (already used by project '${prev}')`,
+      });
+    } else {
+      seenGitRepos.set(norm, project.id);
+    }
+
+    // Temporary gate — the git-driver only exists on paper until M2/M3 wire up gitCli
+    // execution; remove this push once that lands, leaving the checks above intact.
+    errors.push({
+      path: `${path}.review.mode`,
+      message: "review.mode 'git' is not yet operational (git-driver M2/M3 pending); keep 'github' or 'server' until then",
+    });
   });
 }
 
@@ -212,6 +284,9 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
     }
     if (!nonEmptyString(project.repo)) {
       errors.push({ path: `${path}.repo`, message: 'project.repo must be a non-empty string' });
+    } else if (CONTROL_CHAR_RE.test(project.repo)) {
+      // repo 会进入 descriptor 行协议与 argv 渲染；段模式对 Cc 的拒绝是巧合而非声明，这里钉死不变量（spec §4）。
+      errors.push({ path: `${path}.repo`, message: 'project.repo must not contain control characters' });
     } else if (hasEmbeddedCredentials(project.repo)) {
       errors.push({
         path: `${path}.repo`,
@@ -238,6 +313,32 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
     if (!Array.isArray(project.agent)) {
       errors.push({ path: `${path}.agent`, message: 'project.agent must be an array of agent groups' });
     }
+    validateGitCliShape(project, path, errors);
+  }
+}
+
+// gitCli 形状与 review mode 无关（对任意项目合法，spec v2 §4），归字段形状层——
+// 放 validateGitMode 会被其 repo 短路压掉，repo 与 gitCli 同坏时用户要修两轮才见全错。
+function validateGitCliShape(project: ProjectConfig, path: string, errors: ValidationError[]): void {
+  const gitCli = project.gitCli;
+  if (gitCli === undefined) return;
+  if (!isRecord(gitCli)) {
+    errors.push({ path: `${path}.gitCli`, message: 'gitCli must be an object' });
+    return;
+  }
+  if (typeof gitCli.tool !== 'string' || !TOOL_PATTERN.test(gitCli.tool)) {
+    errors.push({ path: `${path}.gitCli.tool`, message: `gitCli.tool must match ${TOOL_PATTERN}` });
+  }
+  // isAbsolute 单独挡不住换行伪造（isAbsolute('/x\nbase: forged') 为真），行协议值一律拒 Cc（spec §4）。
+  if (gitCli.binary !== undefined
+    && (typeof gitCli.binary !== 'string' || !isAbsolute(gitCli.binary) || CONTROL_CHAR_RE.test(gitCli.binary))) {
+    errors.push({ path: `${path}.gitCli.binary`, message: 'gitCli.binary must be an absolute path without control characters' });
+  }
+  // 长度约束按 spec §8 属 cli-notes 渲染层的截断语义（512B + 警告）；控制字符在此拒——
+  // cli-notes 是行式派发描述符，\n 可伪造额外 cli-*: 行，截断不移除换行。
+  if (gitCli.notes !== undefined
+    && (typeof gitCli.notes !== 'string' || CONTROL_CHAR_RE.test(gitCli.notes))) {
+    errors.push({ path: `${path}.gitCli.notes`, message: 'gitCli.notes must be a string without control characters' });
   }
 }
 
