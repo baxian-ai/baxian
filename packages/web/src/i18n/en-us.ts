@@ -199,6 +199,11 @@ export const enUS = {
     specApprovalAutoLabel: 'Auto-start coding after QA approval',
     reviewModeLabel: 'Review mode',
     reviewModeFollowGlobalLabel: 'Follow global setting',
+    reviewModeGitLabel: 'Git (PR/MR)',
+    reviewModeServerLabel: 'Server',
+    gitCliToolLabel: 'Git CLI tool',
+    gitCliToolPlaceholder: 'e.g. forge',
+    gitCliNotesLabel: 'CLI instance notes (optional)',
     createdToastTitle: (projectId: string) => `Project ${projectId} created`,
   },
   createAgent: {
@@ -476,11 +481,12 @@ export const enUS = {
     interdiffUnavailableReleased: 'Dev is no longer bound to this task; incremental view unavailable',
     interdiffUnavailableGeneric: 'Incremental view unavailable',
   },
-  githubReview: {
+  prReview: {
     reasonServerMode: 'This task uses server review mode; code review records are under "Review records" on the task detail page.',
     reasonServerModeEntry: 'This task uses server review mode; code review records are in the server review rounds.',
     reasonNoPr: 'This task has no PR yet; there are no code review records.',
     reasonNotGithub: "This task's repository is not a GitHub repository; PR review records cannot be fetched.",
+    reasonDriverUnavailable: 'No git driver is resolvable for this project; PR review records cannot be fetched.',
     codeReviewHeading: 'Code review',
     fetchFailed: (detail: string) => `Failed to fetch review records: ${detail}`,
     partialFetchFailed: (detail: string) => `Some review records failed to fetch: ${detail} (showing only what was retrieved).`,
@@ -492,6 +498,8 @@ export const enUS = {
     bodyTruncated: 'Content is large; truncated.',
     truncatedSuffix: '(truncated)',
     noReviewBodyFallback: 'No review body',
+    ghostAuthor: 'ghost (deleted account)',
+    listTruncated: 'This PR has too many comments; only the earliest part is shown.',
     commitFallback: 'commit',
   },
   toast: {

@@ -1,13 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import type { GithubReviewItem } from '../../src/shared/index.js';
+import type { PrReviewItem } from '../../src/shared/index.js';
 import {
   PrConversationCache,
-  githubReviewRevision,
+  prReviewCacheRevision,
   type PrConversationPayload,
 } from '../../src/github/pr-conversation-cache.js';
 
 function convo(label: string, error?: string): PrConversationPayload {
-  const items: GithubReviewItem[] = [{ kind: 'issue-comment', id: label, body: label }];
+  const items: PrReviewItem[] = [{ kind: 'issue-comment', id: label, body: label }];
   return { items, ...(error ? { error } : {}) };
 }
 
@@ -32,9 +32,9 @@ function counting(payload: PrConversationPayload) {
   };
 }
 
-describe('githubReviewRevision (server)', () => {
+describe('prReviewCacheRevision (server)', () => {
   it('joins the web fields plus prNumber and repoSlug', () => {
-    const rev = githubReviewRevision(
+    const rev = prReviewCacheRevision(
       {
         reviewRound: 3,
         latestHeadSha: 'abc123',
@@ -45,24 +45,24 @@ describe('githubReviewRevision (server)', () => {
       },
       'owner/repo',
     );
-    expect(rev).toBe('3:abc123:review:2026-07-01T10:00:00Z:2026-07-02T11:00:00Z:7:owner/repo');
+    expect(rev).toBe('3:abc123:review:2026-07-01T10:00:00Z:2026-07-02T11:00:00Z:7::owner/repo');
   });
 
   it('renders absent optional fields as empty slots', () => {
-    const rev = githubReviewRevision({ reviewRound: 0, status: 'pending' }, 'o/r');
-    expect(rev).toBe('0::pending::::o/r');
+    const rev = prReviewCacheRevision({ reviewRound: 0, status: 'pending' }, 'o/r');
+    expect(rev).toBe('0::pending:::::o/r');
   });
 
   it('changes when only prNumber changes', () => {
     const base = { reviewRound: 1, status: 'review' as const };
-    expect(githubReviewRevision({ ...base, prNumber: 7 }, 'o/r'))
-      .not.toBe(githubReviewRevision({ ...base, prNumber: 9 }, 'o/r'));
+    expect(prReviewCacheRevision({ ...base, prNumber: 7 }, 'o/r'))
+      .not.toBe(prReviewCacheRevision({ ...base, prNumber: 9 }, 'o/r'));
   });
 
   it('changes when only repoSlug changes', () => {
     const base = { reviewRound: 1, status: 'review' as const, prNumber: 7 };
-    expect(githubReviewRevision(base, 'o/r'))
-      .not.toBe(githubReviewRevision(base, 'o/moved'));
+    expect(prReviewCacheRevision(base, 'o/r'))
+      .not.toBe(prReviewCacheRevision(base, 'o/moved'));
   });
 });
 
@@ -225,5 +225,101 @@ describe('PrConversationCache', () => {
     expect(cache.stats().totalBytes).toBe(
       Buffer.byteLength(JSON.stringify(convo('hot')), 'utf8'),
     );
+  });
+});
+
+describe('PrConversationCache rate-limit backoff', () => {
+  it('serves a rate-limited payload from the backoff window instead of rebuilding', async () => {
+    let now = 1_000;
+    const cache = new PrConversationCache({ now: () => now });
+    let builds = 0;
+    const build = async () => {
+      builds += 1;
+      return { items: [], error: 'issue-comments: rate limited', rateLimited: true };
+    };
+    await cache.get('task-1', 'rev-1', build);
+    await cache.get('task-1', 'rev-1', build);
+    await cache.get('task-1', 'rev-2', build);
+    expect(builds).toBe(1);
+
+    now += 61_000;
+    await cache.get('task-1', 'rev-1', build);
+    expect(builds).toBe(2);
+  });
+
+  it('never serves another revision the throttled payload of the previous PR', async () => {
+    const now = 1_000;
+    const cache = new PrConversationCache({ now: () => now });
+    let builds = 0;
+    const build = async () => {
+      builds += 1;
+      return { items: [{ kind: 'issue-comment' as const, id: 'from-pr-a' }], error: 'rate limited', rateLimited: true };
+    };
+    await cache.get('task-1', 'revision-pr-a', build);
+    const other = await cache.get('task-1', 'revision-pr-b', build);
+    expect(builds).toBe(1);
+    expect(other.rateLimited).toBe(true);
+    expect(other.items).toEqual([]);
+  });
+
+  it('grows the shared backoff exponentially while the platform keeps throttling', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now });
+    let builds = 0;
+    const build = async () => {
+      builds += 1;
+      return { items: [], error: 'rate limited', rateLimited: true };
+    };
+    await cache.get('t', 'r', build);
+    now = 61_000;
+    await cache.get('t', 'r', build);
+    now = 122_000;
+    await cache.get('t', 'r', build);
+    expect(builds).toBe(2);
+    now = 182_000;
+    await cache.get('t', 'r', build);
+    expect(builds).toBe(3);
+  });
+
+  it('caps the shared backoff so a long throttle cannot lock the endpoint for hours', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now });
+    let builds = 0;
+    const build = async () => {
+      builds += 1;
+      return { items: [], error: 'rate limited', rateLimited: true };
+    };
+    for (let i = 0; i < 8; i++) {
+      await cache.get('t', 'r', build);
+      now += 16 * 60_000;
+    }
+    const before = builds;
+    now += 15 * 60_000 + 1_000;
+    await cache.get('t', 'r', build);
+    expect(builds).toBe(before + 1);
+  });
+
+  it('counts throttled payloads against the shared byte budget', async () => {
+    const big = 'b'.repeat(400 * 1024);
+    const cache = new PrConversationCache({ maxPayloadBytes: 64 * 1024, maxTotalBytes: 256 * 1024 });
+    for (const id of ['t1', 't2', 't3']) {
+      await cache.get(id, 'r', async () => ({
+        items: [{ kind: 'issue-comment' as const, id, body: big }],
+        error: 'rate limited',
+        rateLimited: true,
+      }));
+    }
+    expect(cache.stats().totalBytes).toBeLessThanOrEqual(256 * 1024);
+  });
+
+  it('sweeps expired backoff entries instead of holding their payloads forever', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now, maxEntries: 2 });
+    const throttle = async () => ({ items: [], error: 'rate limited', rateLimited: true });
+    for (const id of ['t1', 't2', 't3', 't4']) await cache.get(id, 'r', throttle);
+    now = 10 * 60_000;
+    await cache.get('t5', 'r', async () => ({ items: [] }));
+    const internals = cache as unknown as { rateLimited: Map<string, unknown> };
+    expect(internals.rateLimited.size).toBeLessThanOrEqual(2);
   });
 });

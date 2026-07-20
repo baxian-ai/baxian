@@ -10,7 +10,7 @@ All platform commands follow three iron rules. ① Prefix EVERY gh command with 
 
 1. Commit, then push first: `git push origin "HEAD:<branch>"` (the remote branch must exist before create).
 2. Strip any Draft prefix (`Draft:`, `[Draft]`, `(Draft)`, `WIP:`) from the task title.
-3. Write the title to `/tmp/bx-title-<task>.txt` and the description (body plus managed marker) to `/tmp/bx-body-<task>.md` with your file tool. The description file ends with:
+3. Write the title and the description (body plus managed marker) to files with your file tool. Put every temp file this skill needs under `<workdir>/.baxian/tmp/` and give each a random suffix you generate (e.g. `.baxian/tmp/pr-title-8f3a1c.txt`): the dispatch descriptor carries no task id, and fixed `/tmp/bx-*` names collide between concurrent agents and baxian instances — a collision can publish one task's text to another repo. Paths below are written as `<title-file>` / `<body-file>`; substitute your own. The description file ends with:
 
 ```
 <!-- baxian:managed -->
@@ -20,7 +20,7 @@ All platform commands follow three iron rules. ① Prefix EVERY gh command with 
 
 ```bash
 GH_HOST=<cli-host> gh pr create -R <cli-repo> --head "<branch>" --base "<base>" \
-  --title "$(cat /tmp/bx-title-<task>.txt)" --body-file /tmp/bx-body-<task>.md
+  --title "$(cat <title-file>)" --body-file <body-file>
 ```
 
 5. Draft recovery BEFORE signalling: query `GH_HOST=<cli-host> gh pr view <pr> -R <cli-repo> --json isDraft --jq .isDraft`; if `true` (repo policy or a `Draft:`/`fixup!` subject can re-draft it), run `GH_HOST=<cli-host> gh pr ready <pr> -R <cli-repo>` and re-check. A draft PR is never adopted by the server — signalling without this step strands the task.
@@ -45,10 +45,10 @@ Source keys for ack lines: `reviews`, `inline-comments` (pulls comments), `issue
 Reply in the channel the feedback lives in. Inline review comments: reply inside the thread via the top-level comment id — for a reply row use its `in_reply_to_id`, for a thread root use its own `id`; calling the endpoint with a reply's id is rejected:
 
 ```bash
-GH_HOST=<cli-host> gh api -X POST repos/<cli-repo>/pulls/<pr>/comments/<top_level_id>/replies -F body=@/tmp/bx-reply-<id>.md
+GH_HOST=<cli-host> gh api -X POST repos/<cli-repo>/pulls/<pr>/comments/<top_level_id>/replies -F body=@<reply-file>
 ```
 
-Issue comments and fail-verdict findings: answer with a top-level issue comment (`GH_HOST=<cli-host> gh api -X POST repos/<cli-repo>/issues/<pr>/comments -F body=@<file>`).
+Issue comments, fail-verdict findings, **and every other `reviews`-source row** (a plain COMMENTED / CHANGES_REQUESTED review body a human submitted, with or without a verdict token): answer with a top-level issue comment (`GH_HOST=<cli-host> gh api -X POST repos/<cli-repo>/issues/<pr>/comments -F body=@<file>`). A review row can never be acked by another review — the server rejects `reviews`-source rows as ack carriers — so a top-level issue comment carrying `<!-- baxian:reply:ack:reviews:<reviewId>:<bodyDigest> -->` is the ONLY way to close one; replying with a new review leaves it pending forever and the task never reaches merge-ready.
 
 Every reply body ends with one ack line PER feedback revision you are addressing (a single reply may carry several):
 
@@ -74,7 +74,7 @@ Recheck first re-reads ALL three sources in full and checks every prior finding 
 Publish exactly ONE verdict comment carrying all findings. Write the body to a temp file (rule ③), ending with the verdict marker line that carries the anchor sha (`anchor-sha:` from your descriptor) and the matching token (`pass-token:` on pass, `fail-token:` on fail):
 
 ```
-/tmp/bx-verdict-<pr>.md:
+<verdict-file>:
 <conclusion and findings>
 
 <!-- baxian:review:pass:<anchor-sha>:<pass-token> -->
@@ -83,16 +83,25 @@ Publish exactly ONE verdict comment carrying all findings. Write the body to a t
 Deliver it as a native review first (green check / red cross evidence on the PR page):
 
 ```bash
-GH_HOST=<cli-host> gh pr review <pr> -R <cli-repo> --approve --body-file /tmp/bx-verdict-<pr>.md
+GH_HOST=<cli-host> gh pr review <pr> -R <cli-repo> --approve --body-file <verdict-file>
 ```
 
 (fail form: `--request-changes` with the `fail` marker.) If the platform rejects it with a 422 (dev and QA share one account — GitHub forbids self-approval), degrade to a COMMENTED review with the SAME body file:
 
 ```bash
-GH_HOST=<cli-host> gh pr review <pr> -R <cli-repo> --comment --body-file /tmp/bx-verdict-<pr>.md
+GH_HOST=<cli-host> gh pr review <pr> -R <cli-repo> --comment --body-file <verdict-file>
 ```
 
 The token comment is the complete verdict either way — native state is corroborating display only. If posting keeps failing, report the error via your pane. There is no pane-signal fallback for verdicts in git mode.
+
+## Create an issue (out-of-scope work)
+
+Write BOTH the title and the body to temp files with your file tool (rule ③ — quoted untrusted text goes in the body file, with its HTML comment lines stripped). Your own summary line goes to a file too: even self-written titles routinely contain `$VAR`, backticks or quotes when they name code identifiers, and pasting them into the command would let the shell expand or execute them:
+
+```bash
+GH_HOST=<cli-host> gh issue create -R <cli-repo> \
+  --title "$(cat <issue-title-file>)" --body-file <issue-body-file>
+```
 
 ## Instance notes
 

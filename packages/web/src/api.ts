@@ -7,11 +7,12 @@ import type {
   BaxianConfig,
   AgentMode,
   HostConfig,
+  GitCliConfig,
   MergeStrategy,
   SpecApprovalStrategy,
   ProjectReviewConfig,
   ReviewRound,
-  GithubReviewConversation,
+  PrReviewConversation,
   PetMeta,
 } from './shared/index.js';
 
@@ -282,15 +283,15 @@ export const api = {
     reviews: (id: string) => get<ReviewRound[]>(`/tasks/${enc(id)}/reviews`),
     interdiff: (id: string, round: number) =>
       get<{ diff: string }>(`/tasks/${enc(id)}/reviews/code/${round}/interdiff`),
-    githubReview: (id: string) =>
-      get<GithubReviewConversation>(`/tasks/${enc(id)}/github-review`),
+    prReview: (id: string) =>
+      get<PrReviewConversation>(`/tasks/${enc(id)}/pr-review`),
     dispatch: (id: string, body: { agentId: string }) =>
       post<TaskState>(`/tasks/${enc(id)}/dispatch`, body),
   },
   projects: {
     list: () => get<ProjectConfig[]>('/projects'),
     get: (id: string) => get<ProjectConfig>(`/projects/${enc(id)}`),
-    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectReviewConfig }) =>
+    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectReviewConfig; gitCli?: GitCliConfig }) =>
       post<{ project: ProjectConfig; restartRequired: boolean }>('/projects', body),
     delete: (id: string) =>
       del<{ removed: string; restartRequired: boolean }>(`/projects/${enc(id)}`),

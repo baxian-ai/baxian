@@ -215,6 +215,19 @@ describe('POST /api/projects', () => {
     }
   });
 
+  it('persists a submitted gitCli declaration onto the created project', async () => {
+    const response = await post('/api/projects', {
+      id: 'withcli',
+      repo: 'https://github.com/example-owner/example-repo.git',
+      merge: null,
+      gitCli: { tool: 'gh', notes: 'runs behind :8443' },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(response.body).project.gitCli).toEqual({ tool: 'gh', notes: 'runs behind :8443' });
+    const written = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
+    expect(written.project.find(p => p.id === 'withcli')?.gitCli).toEqual({ tool: 'gh', notes: 'runs behind :8443' });
+  });
+
   it('creates a project from a non-github git URL (stored verbatim, incl. subgroup paths)', async () => {
     for (const [id, repo] of [
       ['glproj', 'https://gitlab.example.com/group/proj.git'],
@@ -350,6 +363,29 @@ describe('POST /api/projects/:id/checks', () => {
     const body = JSON.parse(response.body);
     expect(body.fixes).toEqual([]);
     expect(installSpy).not.toHaveBeenCalled();
+  });
+
+  it('adds a server-host check group for effective git projects even with zero agents', async () => {
+    await createProject('proj-a');
+    const gitPlatform = {
+      tool: 'gh', minToolVersion: '1.8.0', steps: [],
+      renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'user/repo', binary: 'gh' },
+      driverFor: () => ({ runOp: async () => [{}] }),
+    };
+    const ctxSpy = vi.spyOn(app.ctx.agentManager, 'agentGitPreflightContext')
+      .mockReturnValue(gitPlatform as never);
+    const driverSpy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
+      runPreflightSteps: async () => [{ step: 'driver-preflight-1', ok: true, message: 'gh OK' }],
+      runOp: async () => [{ defaultBranch: 'main', pushPermitted: false }],
+    } as never);
+    const response = await post('/api/projects/proj-a/checks', {});
+    expect(response.statusCode).toBe(201);
+    const body = JSON.parse(response.body) as { agents: unknown[]; server?: { results: Array<{ step: string; ok: boolean }> } };
+    expect(body.server).toBeDefined();
+    const push = body.server!.results.find(r => r.step === 'platform-push');
+    expect(push?.ok).toBe(false);
+    ctxSpy.mockRestore();
+    driverSpy.mockRestore();
   });
 });
 

@@ -158,7 +158,7 @@ describe('request contract per endpoint', () => {
       body: { verdict: 'request-changes', comments: '打回' },
     },
     { name: 'tasks.reviews', run: () => api.tasks.reviews('t-1'), url: '/api/tasks/t-1/reviews' },
-    { name: 'tasks.githubReview', run: () => api.tasks.githubReview('t-1'), url: '/api/tasks/t-1/github-review' },
+    { name: 'tasks.prReview', run: () => api.tasks.prReview('t-1'), url: '/api/tasks/t-1/pr-review' },
     {
       name: 'tasks.dispatch',
       run: () => api.tasks.dispatch('t-1', { agentId: 'dev-2' }),

@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
+import {
+  PhaseSignalWatcher,
+  type NeedInputCommitIntent,
+  type NeedInputCommitResult,
+} from '../../src/agent/phase-signal-watcher.js';
 import { buildPhaseSignal, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
 import type { AgentConfig, BaxianEvent, EventType } from '../../src/shared/index.js';
 import type { EventBus } from '../../src/event/bus.js';
@@ -18,6 +22,8 @@ interface FakeStreamer {
   triggerLive: (data: string) => void;
   triggerSessionGone: () => void;
   setSnapshot: (data: string) => void;
+  failNextSubscribe: () => void;
+  holdNextSubscribe: () => { release: () => void };
   unsubscribed: boolean;
 }
 
@@ -25,12 +31,29 @@ function createFakeStreamer(): FakeStreamer {
   // Per-subscription records: an old generation's unsubscribe must not silence a newer one.
   const subs: Array<{ live?: SubscriberCallbacks['onLive']; sessionGone?: SubscriberCallbacks['onSessionGone'] }> = [];
   let snapshotData = '';
+  let failNext = false;
+  let holdNext: Promise<void> | null = null;
   const state: FakeStreamer = {
     unsubscribed: false,
     triggerLive: (data: string) => { for (const sub of subs) sub.live?.(data); },
     triggerSessionGone: () => { for (const sub of subs) sub.sessionGone?.(); },
     setSnapshot: (data: string) => { snapshotData = data; },
+    failNextSubscribe: () => { failNext = true; },
+    holdNextSubscribe: () => {
+      let release!: () => void;
+      holdNext = new Promise<void>(resolve => { release = resolve; });
+      return { release };
+    },
     subscribeAtomic: vi.fn(async (cbs: SubscriberCallbacks) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error('subscribe transport down');
+      }
+      if (holdNext) {
+        const gate = holdNext;
+        holdNext = null;
+        await gate;
+      }
       const record: typeof subs[number] = { live: cbs.onLive, sessionGone: cbs.onSessionGone };
       subs.push(record);
       return {
@@ -66,16 +89,26 @@ function makeWatcher() {
   const paneStreamerManager = { ensure: vi.fn(() => streamer) } as unknown as PaneStreamerManager;
   const emit = vi.fn(async () => undefined);
   const eventBus = { emit } as unknown as EventBus;
+  const commits: NeedInputCommitIntent[] = [];
+  let commitResult: NeedInputCommitResult | Error = 'ok';
   const watcher = new PhaseSignalWatcher({
     paneStreamerManager,
     eventBus,
     resolveAgent: (id) => (id === DEV_AGENT.id ? DEV_AGENT : undefined),
+    commitNeedInputWatermark: async (intent) => {
+      commits.push(intent);
+      if (commitResult instanceof Error) throw commitResult;
+      return commitResult;
+    },
   });
   const captured: BaxianEvent[] = [];
   emit.mockImplementation(async (event: BaxianEvent) => {
     captured.push(event);
   });
-  return { watcher, streamer, emit, captured };
+  return {
+    watcher, streamer, emit, captured, commits,
+    setCommitResult: (r: NeedInputCommitResult | Error) => { commitResult = r; },
+  };
 }
 
 const QA_AGENT: AgentConfig = {
@@ -597,110 +630,538 @@ describe('snapshot read-file suppression', () => {
   });
 });
 
-describe('need-input side-channel', () => {
+describe('need-input ask/answer watermark', () => {
   const token = 'needtok12345';
-
-  it('fires onNeedInput(true) once per ask, not on tail rescans', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
-    streamer.triggerLive(`question?\n[bx:need-input:${token}]\n`);
-    streamer.triggerLive('more output keeps the literal in the tail buffer');
-    expect(calls).toEqual([true]);
+  const wm = (epoch: number, askSeq: number, answeredSeq: number) => ({ epoch, askSeq, answeredSeq });
+  const intent = (epoch: number, askSeq: number, answeredSeq: number) => ({
+    agentId: DEV_AGENT.id, taskId: 't1', epoch, askSeq, answeredSeq,
   });
 
-  it('ignores a need-input literal with a foreign token', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
-    streamer.triggerLive('[bx:need-input:othertok9999]\n');
-    expect(calls).toEqual([]);
+  it('lights once per seq ask and swallows replays (redraw immunity)', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(5, 0, 0) });
+    streamer.triggerLive(`question?\n[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(5, 1, 0)]);
+    streamer.triggerLive(`redraw replay [bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(5, 1, 0)]);
   });
 
-  it('ignores snapshot content: a pre-restart leftover neither fires nor swallows the next live ask', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
-    streamer.setSnapshot(`[bx:need-input:${token}]`);
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
-    expect(calls).toEqual([]);
-    streamer.triggerLive('agent resumes with plain output\n');
-    expect(calls).toEqual([]);
-    streamer.triggerLive(`follow-up question\n[bx:need-input:${token}]\n`);
-    expect(calls).toEqual([true]);
-  });
-
-  it('re-arms immediately: a prompt follow-up ask fires while the old literal is still in the tail window', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
+  it('bare ask lights when idle and is swallowed while lit', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(3, 0, 0) });
     streamer.triggerLive(`[bx:need-input:${token}]\n`);
-    expect(calls).toEqual([true]);
-    watcher.rearmNeedInput(DEV_AGENT.id);
-    streamer.triggerLive('user answer echo\n');
-    expect(calls).toEqual([true]);
-    streamer.triggerLive(`follow-up question\n[bx:need-input:${token}]\n`);
-    expect(calls).toEqual([true, true]);
+    expect(commits).toEqual([intent(3, 1, 0)]);
+    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+    expect(commits).toEqual([intent(3, 1, 0)]);
   });
 
-  it('matches a need-input literal torn across chunks', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
+  it('answer clears the open question; a stale answer for an older ask is swallowed', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:2]\n`);
+    expect(commits).toEqual([intent(1, 2, 0)]);
+    streamer.triggerLive(`[bx:input-received:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 2, 0)]);
+    streamer.triggerLive(`[bx:input-received:${token}:2]\n`);
+    expect(commits).toEqual([intent(1, 2, 0), intent(1, 2, 2)]);
+  });
+
+  it('bare answer clears while lit and is swallowed when idle', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:input-received:${token}]\n`);
+    expect(commits).toEqual([]);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    streamer.triggerLive(`[bx:input-received:${token}]\n`);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
+  });
+
+  it('an answered edge drops the tail window so a windowed bare ask cannot re-fire', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}]`);
+    streamer.triggerLive(`[bx:input-received:${token}]\n`);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
+    streamer.triggerLive('filler that would rescan a surviving tail window\n');
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
+    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1), intent(1, 2, 1)]);
+  });
+
+  it('gap-A round trips: ask/answer pairs with interleaved replays never corrupt the watermark', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    streamer.triggerLive(`[bx:input-received:${token}:1]\n`);
+    streamer.triggerLive(`[bx:need-input:${token}:1] replayed by a redraw\n`);
+    streamer.triggerLive(`[bx:need-input:${token}:2]\n`);
+    streamer.triggerLive(`[bx:input-received:${token}:1] stale replay\n`);
+    streamer.triggerLive(`[bx:input-received:${token}:2]\n`);
+    expect(commits).toEqual([
+      intent(2, 1, 0), intent(2, 1, 1), intent(2, 2, 1), intent(2, 2, 2),
+    ]);
+  });
+
+  it('ignores snapshot content for both ask and answer literals', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(`[bx:need-input:${token}:1] [bx:input-received:${token}:1]`);
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(4, 2, 1) });
+    expect(commits).toEqual([]);
+    streamer.triggerLive(`[bx:input-received:${token}:2]\n`);
+    expect(commits).toEqual([intent(4, 2, 2)]);
+  });
+
+  it('rearm ignores a leftover entry of another task so the store fallback still runs', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
     await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
+      taskId: 'old-task', expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0),
     });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toHaveLength(1);
+    // Reported under its own task, so the manager can tell it is not the current one.
+    expect(await watcher.rearmNeedInput(DEV_AGENT.id)).toEqual(new Set(['old-task']));
+  });
+
+  it('a same-token replay makes this token\'s pane unattributable, so it is not read', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    // Two generations of the same ordinals are on screen and a framebuffer carries no
+    // time order, so neither the old answer nor the current ask can be attributed.
+    streamer.setSnapshot(
+      `old [bx:need-input:${token}:1] old [bx:input-received:${token}:1] `
+      + `current [bx:need-input:${token}:1]`,
+    );
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(3, 1, 0),
+      needInputInherit: true, needInputSnapshotBlind: true,
+    });
+    expect(commits).toEqual([]);
+  });
+
+  it('without a replay the snapshot ordinals are this generation\'s own record', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(`[bx:need-input:${token}:1] asked while nothing watched`);
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), needInputInherit: true,
+    });
+    expect(commits).toEqual([intent(2, 1, 0)]);
+  });
+
+  it('an unanswered question stays open however the redraw arranged the rows', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    // A redraw put the older ask BELOW the newer one; only ordinals matter.
+    streamer.setSnapshot(
+      `[bx:need-input:${token}:2] and above it on screen [bx:need-input:${token}:1]`,
+    );
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 2, 1), needInputInherit: true,
+    });
+    expect(commits).toEqual([]);
+  });
+
+  it('reconciles asked-and-answered ordinals regardless of their screen order', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    // The answer to Q2 was redrawn ABOVE the follow-up ask that came after it.
+    streamer.setSnapshot(
+      `[bx:input-received:${token}:2] then higher up [bx:need-input:${token}:3]`,
+    );
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 2, 1), needInputInherit: true,
+    });
+    expect(commits).toEqual([intent(2, 3, 2)]);
+  });
+
+  it('a literal torn across the snapshot/live boundary still matches', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(`question 1 open [bx:need-input:${token}:1] then [bx:input-`);
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 1, 0), needInputInherit: true,
+    });
+    expect(commits).toEqual([]);
+    streamer.triggerLive(`received:${token}:1]\n`);
+    expect(commits).toEqual([intent(2, 1, 1)]);
+  });
+
+  it('a seq-matched snapshot answer clears a persisted lit watermark (offline reply recovery)', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(`agent replied while the server was down [bx:input-received:${token}:1]`);
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 1, 0), needInputInherit: true,
+    });
+    expect(commits).toEqual([intent(2, 1, 1)]);
+  });
+
+  it('reconciles an offline answer followed by a new question in the same snapshot', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(
+      `[bx:input-received:${token}:1] follow-up question [bx:need-input:${token}:2]`,
+    );
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 1, 0), needInputInherit: true,
+    });
+    expect(commits).toEqual([intent(2, 2, 1)]);
+  });
+
+  it('an answer redrawn above its own question still clears the badge', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    // Exactly the xterm redraw shape: the later answer serializes on an earlier row.
+    streamer.setSnapshot(
+      `[bx:input-received:${token}:1] ...rows below... [bx:need-input:${token}:1]`,
+    );
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 1, 0), needInputInherit: true,
+    });
+    expect(commits).toEqual([intent(2, 1, 1)]);
+  });
+
+  it('a fresh arm stays blind to snapshot history (its prompt supersedes it)', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(`[bx:need-input:${token}:3] from the aborted runtime`);
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0) });
+    expect(commits).toEqual([]);
+  });
+
+  it('a failed fresh arm rescues the predecessor without re-committing its stale question', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:3]\n`);
+    expect(commits).toEqual([intent(1, 3, 0)]);
+    streamer.failNextSubscribe();
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), skipSnapshot: true,
+    })).toBe(false);
+    // Rescued onto the fresh generation with its stripped ordinals: no stale re-commit,
+    // and the new prompt's first question still lights the badge.
+    expect(commits).toEqual([intent(1, 3, 0)]);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 3, 0), intent(2, 1, 0)]);
+  });
+
+  it('bare and stale-seq snapshot answers stay blind', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    streamer.setSnapshot(`[bx:input-received:${token}] [bx:input-received:${token}:1]`);
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 2, 1), needInputInherit: true,
+    });
+    expect(commits).toEqual([]);
+  });
+
+  it('ignores literals with a foreign token', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive('[bx:need-input:othertok9999:1]\n[bx:input-received:othertok9999:1]\n');
+    expect(commits).toEqual([]);
+  });
+
+  it('matches literals torn across chunks', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
     streamer.triggerLive('[bx:need-');
-    streamer.triggerLive(`input:${token}]\n`);
-    expect(calls).toEqual([true]);
+    streamer.triggerLive(`input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
   });
 
-  it('clears the badge when the phase signal fires', async () => {
-    const { watcher, streamer, captured } = makeWatcher();
-    const calls: boolean[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
-    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+  it('restore state swallows pre-restart replays and accepts the live answer', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(7, 2, 1) });
+    streamer.triggerLive(`[bx:need-input:${token}:1] redraw of the answered ask\n`);
+    streamer.triggerLive(`[bx:input-received:${token}:1] redraw of the old answer\n`);
+    expect(commits).toEqual([]);
+    streamer.triggerLive(`[bx:input-received:${token}:2]\n`);
+    expect(commits).toEqual([intent(7, 2, 2)]);
+  });
+
+  it('an answer swallowed while idle cannot replay against a later ask (split chunks)', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:input-received:${token}:1]\n`);
+    expect(commits).toEqual([]);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
+    streamer.triggerLive('more output rescans the tail window\n');
+    expect(commits).toEqual([intent(1, 1, 0)]);
+  });
+
+  it('document order rules one chunk: an answer BEFORE an ask does not clear it', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:input-received:${token}:1] then [bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
+  });
+
+  it('a consumed answer keeps a torn next-ask prefix alive across chunks', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 1, 0) });
+    streamer.triggerLive(`[bx:input-received:${token}:1]\n[bx:need-`);
+    expect(commits).toEqual([intent(1, 1, 1)]);
+    streamer.triggerLive(`input:${token}:2]\n`);
+    expect(commits).toEqual([intent(1, 1, 1), intent(1, 2, 1)]);
+  });
+
+  it('the phase signal closes the open question', async () => {
+    const { watcher, streamer, captured, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     streamer.triggerLive('y'.repeat(2000));
     streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
     expect(captured).toHaveLength(1);
-    expect(calls).toEqual([true, false]);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
   });
 
-  it('clears unconditionally on phase signal: a recovered watch may hold the badge without fired state', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
+  it('a phase signal with nothing open commits no clear', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
     streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
-    expect(calls).toEqual([false]);
+    expect(commits).toEqual([]);
   });
 
-  it('clears the badge on session-gone', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const calls: boolean[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'pr-created', token,
-      onNeedInput: pending => calls.push(pending),
-    });
-    streamer.triggerLive(`[bx:need-input:${token}]\n`);
+  it('session-gone closes the open question', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     streamer.triggerSessionGone();
-    expect(calls).toEqual([true, false]);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
+  });
+
+  it('rearmNeedInput answers the open question and settles its commit', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    await watcher.rearmNeedInput(DEV_AGENT.id);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
+    await watcher.rearmNeedInput(DEV_AGENT.id);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
+  });
+
+  it('a restore replacement merges the evicted entry watermark and persists any lead at once', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:3]\n`);
+    expect(commits).toEqual([intent(1, 3, 0)]);
+    // The bump write knows {epoch 2, ask 3} but the entry's in-memory lead (answered 3,
+    // e.g. an error'd commit whose retry the arm just cleared) must be re-persisted.
+    streamer.triggerLive(`[bx:input-received:${token}:3]\n`);
+    expect(commits).toEqual([intent(1, 3, 0), intent(1, 3, 3)]);
+    await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 3, 0), needInputInherit: true,
+    });
+    // The predecessor is migrated synchronously (before subscribe) and re-persists its
+    // lead there; the installed replacement inherits the same watermark, so its own
+    // post-install lead commit repeats it.
+    expect(commits).toEqual([
+      intent(1, 3, 0), intent(1, 3, 3), intent(2, 3, 3), intent(2, 3, 3),
+    ]);
+    streamer.triggerLive(`[bx:need-input:${token}:3] replay must stay swallowed\n`);
+    expect(commits).toEqual([
+      intent(1, 3, 0), intent(1, 3, 3), intent(2, 3, 3), intent(2, 3, 3),
+    ]);
+  });
+
+  it('a fresh replacement does not inherit ordinals: the replayed prompt lights from 1 again', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:3]\n`);
+    expect(commits).toEqual([intent(1, 3, 0)]);
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 3, 0), intent(2, 1, 0)]);
+  });
+
+  it('a failed arm hands its generation to the entry it started against (and persists its lead)', async () => {
+    const { watcher, streamer, commits, setCommitResult } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    setCommitResult('error');
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
+    setCommitResult('ok');
+    streamer.failNextSubscribe();
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0),
+      needInputInherit: true, skipSnapshot: true,
+    })).toBe(false);
+    expect(commits).toEqual([intent(1, 1, 0), intent(2, 1, 0)]);
+    streamer.triggerLive(`[bx:input-received:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0), intent(2, 1, 0), intent(2, 1, 1)]);
+  });
+
+  it('a successor that bumped but failed to subscribe still fences the late older arm', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    const gate = streamer.holdNextSubscribe();
+    const lateP = startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.failNextSubscribe();
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), skipSnapshot: true,
+    })).toBe(false);
+    gate.release();
+    expect(await lateP).toBe(false);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([]);
+  });
+
+  it('a degraded successor install fences the late older arm by arrival order', async () => {
+    const { watcher, streamer } = makeWatcher();
+    const gate = streamer.holdNextSubscribe();
+    const lateP = startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token: 'tokDEGRADED12', skipSnapshot: true,
+    })).toBe(true);
+    gate.release();
+    expect(await lateP).toBe(false);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('a doomed stale arm is rejected before it can tear down a live sibling watcher', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await watcher.start({
+      taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id,
+      expectedKinds: 'pr-created', token: 'tokDEV1234567',
+      needInput: { epoch: 3, askSeq: 0, answeredSeq: 0 },
+    });
+    streamers[DEV_AGENT.id].triggerLive('[bx:pr-created:7:tokDEV1234567]\n');
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
+    await watcher.start({
+      taskId: 't1', projectId: 'p1', agentId: QA_AGENT.id,
+      expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'tokQA12345678',
+      needInput: { epoch: 1, askSeq: 0, answeredSeq: 0 },
+    });
+    expect(await watcher.start({
+      taskId: 't1', projectId: 'p1', agentId: DEV_AGENT.id,
+      expectedKinds: 'pr-created', token: 'tokSTALE12345', skipSnapshot: true,
+      needInput: { epoch: 2, askSeq: 0, answeredSeq: 0 },
+    })).toBe(false);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+    streamers[QA_AGENT.id].triggerLive('[bx:pr-approved:tokQA12345678]\n');
+    expect(captured.some(e => e.type === 'review.submitted')).toBe(true);
+  });
+
+  it('a degraded fresh arm restarts ordinals so the new prompt cannot be swallowed', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:3]\n`);
+    expect(commits).toEqual([intent(1, 3, 0)]);
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, skipSnapshot: true,
+    })).toBe(true);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 3, 0)]);
+    // The restore successor inherits the degraded entry's memory: its immediate lead
+    // commit proves ask 1 was tracked, not swallowed.
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), needInputInherit: true, skipSnapshot: true,
+    })).toBe(true);
+    // Pre-subscribe migration lifts the degraded entry (ask 1 tracked, never swallowed),
+    // then the replacement inherits and re-persists the same watermark.
+    expect(commits).toEqual([intent(1, 3, 0), intent(2, 1, 0), intent(2, 1, 0)]);
+  });
+
+  it('a torn OSC across chunks does not shift new literals into the old region', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`\x1b]0;${'x'.repeat(80)}`);
+    streamer.triggerLive(`\x07[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
+  });
+
+  it('a failed older arm never demotes the generation of the entry it rescues', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(3, 0, 0) });
+    streamer.failNextSubscribe();
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), skipSnapshot: true,
+    })).toBe(false);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(3, 1, 0)]);
+  });
+
+  it('a late same-token start with an older generation is rejected, keeping the successor', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(3, 0, 0) });
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), skipSnapshot: true,
+    })).toBe(false);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(3, 1, 0)]);
+  });
+
+  it('a late arm does not re-enable a degraded successor that replaced its predecessor', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 3, 2) });
+    const gate = streamer.holdNextSubscribe();
+    const lateP = startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(2, 3, 2), needInputInherit: true, skipSnapshot: true,
+    });
+    // A newer same-token replay whose bump failed installs a degraded successor.
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, skipSnapshot: true,
+    })).toBe(true);
+    gate.release();
+    expect(await lateP).toBe(false);
+    // The rescue is bound to the predecessor the late arm started against, which the
+    // degraded successor already replaced — it must stay commit-disabled.
+    commits.length = 0;
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([]);
+  });
+
+  it('a claimed but not yet installed foreign token already owns the fence', async () => {
+    const { watcher } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    const claim = watcher.claimArm({ taskId: 't1', agentId: DEV_AGENT.id, token: 'tokNEW1234567' });
+    expect(claim).not.toBeNull();
+    // The stale same-token replay loses to the pending new-token owner...
+    expect(watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
+    })).toBeNull();
+    expect(watcher.wouldRejectOwnTokenArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
+    })).toBe(true);
+    // ...and regains its chance once that arm settles.
+    watcher.releaseArm(claim);
+    expect(watcher.wouldRejectOwnTokenArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
+    })).toBe(false);
+  });
+
+  it('an arm never fences itself out on its own claim', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    const claim = watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
+    });
+    expect(claim).not.toBeNull();
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0),
+      onlyReplaceOwnToken: true, armClaimId: claim ?? undefined,
+    })).toBe(true);
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
+  });
+
+  it('wouldRejectOwnTokenArm mirrors the own-token fence without touching entries', async () => {
+    const { watcher } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    expect(watcher.wouldRejectOwnTokenArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: 'othertok9999', onlyReplaceOwnToken: true,
+    })).toBe(true);
+    expect(watcher.wouldRejectOwnTokenArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
+    })).toBe(false);
+    expect(watcher.wouldRejectOwnTokenArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: 'othertok9999',
+    })).toBe(false);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('a failed commit does not roll back memory seqs', async () => {
+    const { watcher, streamer, commits, setCommitResult } = makeWatcher();
+    setCommitResult(new Error('store down'));
+    await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
+    await flushMicrotasks();
+    setCommitResult('ok');
+    streamer.triggerLive(`[bx:need-input:${token}:1] replay still swallowed\n`);
+    expect(commits).toEqual([intent(1, 1, 0)]);
+    streamer.triggerLive(`[bx:input-received:${token}:1]\n`);
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
   });
 });
 

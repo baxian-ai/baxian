@@ -401,6 +401,24 @@ describe('RepoStore per-agent Workdir', () => {
     expect(clone).toContain("gh repo clone 'owner/repo'");
     expect(clone).not.toContain('--bare');
   });
+
+  it('clones a github repo with plain git when the resolved tool is not gh', async () => {
+    const origin = join(tempDir, 'origin.git');
+    await run(`git init --bare ${shellQuote(origin)}`);
+    const home = join(tempDir, 'home');
+    await run(`mkdir -p ${shellQuote(home)}`);
+    const runner = new TestRunner(home, origin, 'https://github.com/owner/repo.git');
+    const store = new RepoStore(
+      runner, 'https://github.com/owner/repo.git', 'remote', { hostname: 'box-a' },
+      createRepoStoreCache(), 'dev-1', undefined, false,
+    );
+
+    await store.ensure();
+
+    expect(runner.commands.some(command => command.includes('gh repo clone'))).toBe(false);
+    const clone = runner.commands.find(command => command.includes('git clone'));
+    expect(clone).toContain("git clone 'https://github.com/owner/repo.git'");
+  });
 });
 
 describe('accessMethodDiffers', () => {

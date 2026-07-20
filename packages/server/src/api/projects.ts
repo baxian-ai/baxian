@@ -26,6 +26,7 @@ import { redactProjects } from './config.js';
 import { CleanupFailedError } from '../agent/manager.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
 import { applyConfigHotReload } from '../config/hot-reload.js';
+import { safeDriverErrorText } from '../platform/git-driver.js';
 
 interface CheckRun {
   agentId: string;
@@ -81,6 +82,42 @@ async function fixMissingTmux(
     }
   }
   return fixes;
+}
+
+async function runServerHostChecks(
+  agentManager: import('../agent/manager.js').AgentManager,
+  projectId: string,
+): Promise<PreflightResult[]> {
+  const driver = agentManager.platformDriverFor(projectId);
+  if (!driver) {
+    return [{ step: 'driver', ok: false, message: 'no git driver resolvable for this project on the server host' }];
+  }
+  let results: PreflightResult[];
+  try {
+    results = await driver.runPreflightSteps();
+  } catch (err) {
+    console.warn('[checks] server-host driver preflight failed:', safeDriverErrorText(err));
+    return [{ step: 'driver-preflight', ok: false, message: safeDriverErrorText(err) }];
+  }
+  if (results.some(r => !r.ok)) return results;
+  try {
+    const [row] = await driver.runOp('projectView');
+    results.push({ step: 'platform-repo', ok: true, message: 'driver projectView OK on the server host' });
+    const push = row?.pushPermitted;
+    results.push(push === true
+      ? { step: 'platform-push', ok: true, message: 'push permission confirmed (server merge/close channel)' }
+      : push === false
+        ? { step: 'platform-push', ok: false, message: 'push permission missing — server merge/close requires write access' }
+        : { step: 'platform-push', ok: true, message: 'plugin did not report pushPermitted — write access cannot be asserted statically' });
+  } catch (err) {
+    console.warn('[checks] server-host projectView failed:', safeDriverErrorText(err));
+    results.push({
+      step: 'platform-repo',
+      ok: false,
+      message: `driver projectView failed on the server host — ${safeDriverErrorText(err)}`,
+    });
+  }
+  return results;
 }
 
 function configHash(config: BaxianConfig): string {
@@ -142,13 +179,14 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
 
       const entries: CheckEntry[] = [];
       const checks: Promise<CheckRun>[] = [];
+      const gitPlatform = app.ctx.agentManager.agentGitPreflightContext(project.id);
       for (const pair of project.agent) {
         for (const agent of pair) {
           const host = resolveAgentHost(app.ctx.config.host, agent.host);
           const runner = createRunner(agent.mode, host);
           entries.push({ agent, hostGroup: hostGroupKey(agent.mode, host), runner });
           checks.push(
-            runPreflight(runner, agent, project.repo, host, project.id).then(results => ({
+            runPreflight(runner, agent, project.repo, host, project.id, gitPlatform).then(results => ({
               agentId: agent.id,
               mode: agent.mode,
               results,
@@ -157,11 +195,16 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
       }
       const agents = await Promise.all(checks);
+      // server 执行面手动诊断组：poller 未装配/零 agent 的部署也要能自证 merge/close 通道。
+      let server: { results: PreflightResult[] } | undefined;
+      if (gitPlatform !== undefined) {
+        server = { results: await runServerHostChecks(app.ctx.agentManager, project.id) };
+      }
       if (request.body?.fix !== true) {
-        return reply.status(201).send({ projectId: project.id, agents });
+        return reply.status(201).send({ projectId: project.id, agents, ...(server ? { server } : {}) });
       }
       const fixes = await fixMissingTmux(project.id, entries, agents);
-      return reply.status(201).send({ projectId: project.id, agents, fixes });
+      return reply.status(201).send({ projectId: project.id, agents, ...(server ? { server } : {}), fixes });
     },
   );
 
@@ -225,7 +268,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectConfig['review'] } }>(
+  app.post<{ Body: { id?: string; repo?: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectConfig['review']; gitCli?: ProjectConfig['gitCli'] } }>(
     '/projects',
     async (request, reply) => {
       if (!app.ctx.configPath) {
@@ -233,7 +276,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       return withConfigLock(async () => {
-        const { id, repo, merge, specApproval, review } = request.body ?? {};
+        const { id, repo, merge, specApproval, review, gitCli } = request.body ?? {};
         if (!id || typeof id !== 'string') {
           return reply.status(400).send({ error: 'id must be a non-empty string' });
         }
@@ -250,6 +293,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           merge: merge ?? null,
           ...(specApproval !== undefined ? { specApproval } : {}),
           ...(review !== undefined ? { review } : {}),
+          ...(gitCli !== undefined ? { gitCli } : {}),
           agent: [],
         };
 
@@ -266,6 +310,14 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
             return reply.status(400).send({ error: 'Invalid config', details: err.errors });
           }
           throw err;
+        }
+
+        try {
+          await app.ctx.agentManager.ensurePluginSkillPools(validated);
+        } catch (err) {
+          return reply.status(400).send({
+            error: `git-driver plugin skill pool is unusable for this config: ${err instanceof Error ? err.message : String(err)}`,
+          });
         }
 
         await saveConfig(app.ctx.configPath!, validated);

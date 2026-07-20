@@ -60,6 +60,18 @@ describe('PluginRegistry', () => {
     if (roots?.base) await rm(roots.base, { recursive: true, force: true });
   });
 
+  it('rejects a symlinked SKILL.md at load time instead of leaving a never-materialized skill', async () => {
+    const pluginPath = await writePlugin(roots.builtin, 'forge', 'forge', { skill: false });
+    const real = join(roots.base, 'real-skill.md');
+    await writeFile(real, '---\nname: baxian-cli-forge\ndescription: linked\n---\nbody');
+    const skillDir = join(pluginPath, 'skills', 'baxian-cli-forge');
+    await mkdir(skillDir, { recursive: true });
+    await symlink(real, join(skillDir, 'SKILL.md'));
+    const res = await PluginRegistry.load(roots);
+    expect(res.registry.resolveTool('forge')).toBeUndefined();
+    expect(res.diagnostics.some(d => d.messages.some(m => m.includes('must be a regular file')))).toBe(true);
+  });
+
   it('loads a valid plugin and resolves by tool, with no diagnostics', async () => {
     await writePlugin(roots.builtin, 'glab', 'glab');
     const res = await PluginRegistry.load(roots);

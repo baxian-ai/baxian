@@ -45,7 +45,7 @@ export const DRIVER = JSON.stringify({
       treatAsSuccess: ['REF_NOT_FOUND'],
     },
   },
-  preflight: [{ argv: ['{binary}', '--version'], fixMessage: 'install it' }],
+  preflight: [{ argv: ['{binary}', '--version'], fixMessage: 'install it', versionCheck: true }],
   errorClasses: [
     { class: 'RATE_LIMIT', regex: ['429'] },
     { class: 'ACCESS_DENIED', regex: ['401', '403'] },

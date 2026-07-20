@@ -474,6 +474,138 @@ describe('buildPromptInline', () => {
     ]);
   });
 
+  describe('git review mode descriptor', () => {
+    const CLI = { tool: 'gh', host: 'github.com', repo: 'user/repo', repoEncoded: 'user%2Frepo' };
+    const GIT_TASK: TaskState = {
+      ...TASK,
+      reviewMode: 'git',
+      branch: 'bx/task-001',
+      baseBranch: 'main',
+    };
+
+    it('develop carries the cli family, branch/base snapshot and the git-pr exchange', async () => {
+      await seedAndScan();
+      const prompt = build({
+        task: GIT_TASK,
+        signalToken: 'dev-token-1',
+        platformCli: { ...CLI, notes: 'instance runs behind :8443' },
+      });
+      expect(prompt).toContain('exchange: git-pr');
+      expect(prompt).toContain('cli: gh');
+      expect(prompt).toContain('cli-host: github.com');
+      expect(prompt).toContain('cli-repo: user/repo');
+      expect(prompt).toContain('cli-repo-encoded: user%2Frepo');
+      expect(prompt).toContain('cli-notes: instance runs behind :8443');
+      expect(prompt).toContain('branch: bx/task-001');
+      expect(prompt).toContain('base: main');
+      expect(prompt).toContain('signal: pr-created');
+      expect(prompt).not.toContain('cli-binary');
+      expect(prompt).not.toContain('cli-env');
+    });
+
+    it('code renders the same platform family as develop', async () => {
+      await seedAndScan();
+      const prompt = build({
+        task: { ...GIT_TASK, status: 'in_progress', phase: 'code' },
+        phase: 'code',
+        signalToken: 'code-token-1',
+        platformCli: CLI,
+      });
+      expect(prompt).toContain('exchange: git-pr');
+      expect(prompt).toContain('cli: gh');
+      expect(prompt).toContain('branch: bx/task-001');
+      expect(prompt).toContain('base: main');
+      expect(prompt).not.toContain('cli-notes:');
+    });
+
+    it('omits base: when the task carries no snapshot', async () => {
+      await seedAndScan();
+      const { baseBranch: _unused, ...noBase } = GIT_TASK;
+      const prompt = build({ task: noBase, signalToken: 'dev-token-2', platformCli: CLI });
+      expect(prompt).toContain('branch: bx/task-001');
+      expect(prompt).not.toMatch(/^base: /m);
+    });
+
+    it('review and recheck carry the minted token pair alongside the signal token', async () => {
+      await seedAndScan();
+      for (const phase of ['review', 'recheck'] as const) {
+        const prompt = build({
+          task: {
+            ...GIT_TASK,
+            status: 'review',
+            prNumber: 42,
+            reviewHeadAnchorSha: 'sha-review-1',
+            passToken: 'a1b2c3d4e5f6',
+            failToken: 'f6e5d4c3b2a1',
+          },
+          phase,
+          agent: QA_AGENT,
+          signalToken: 'qa-token-1',
+          platformCli: CLI,
+        });
+        expect(prompt).toContain('cli: gh');
+        expect(prompt).toContain('pass-token: a1b2c3d4e5f6');
+        expect(prompt).toContain('fail-token: f6e5d4c3b2a1');
+        expect(prompt).toContain('pr: 42');
+        expect(prompt).toContain('token: qa-token-1');
+        expect(prompt).not.toMatch(/^branch: /m);
+      }
+    });
+
+    it('review for a git task without a minted pair fails loud', async () => {
+      await seedAndScan();
+      expect(() => build({
+        task: { ...GIT_TASK, status: 'review', prNumber: 42, reviewHeadAnchorSha: 'sha-review-2' },
+        phase: 'review',
+        agent: QA_AGENT,
+        signalToken: 'qa-token-2',
+        platformCli: CLI,
+      })).toThrow(/pass\/fail token pair/);
+    });
+
+    it('fix and post-approve carry the cli family without duplicating identity fields', async () => {
+      await seedAndScan();
+      const fixPrompt = build({
+        task: { ...GIT_TASK, status: 'fixing', prNumber: 42, reviewRound: 1 },
+        phase: 'fix',
+        signalToken: 'fix-token-1',
+        platformCli: CLI,
+      });
+      expect(fixPrompt).toContain('cli: gh');
+      expect(fixPrompt.match(/^branch: /gm)).toHaveLength(1);
+      const paPrompt = build({
+        task: { ...GIT_TASK, status: 'approved', prNumber: 42 },
+        phase: 'post-approve',
+        signalToken: 'pa-token-1',
+        platformCli: CLI,
+      });
+      expect(paPrompt).toContain('cli: gh');
+      expect(paPrompt).toContain('signal: pr-merge-ready');
+      expect(paPrompt).not.toMatch(/^branch: /m);
+    });
+
+    it('truncates cli-notes at 512 bytes on a code-point boundary', async () => {
+      await seedAndScan();
+      const prompt = build({
+        task: GIT_TASK,
+        signalToken: 'dev-token-3',
+        platformCli: { ...CLI, notes: '汉'.repeat(200) },
+      });
+      const rendered = prompt.match(/^cli-notes: (.*)$/m)?.[1];
+      expect(rendered).toBe('汉'.repeat(170));
+      expect(Buffer.byteLength(rendered ?? '', 'utf8')).toBeLessThanOrEqual(512);
+    });
+
+    it('legacy tasks render no cli family even when platformCli is passed', async () => {
+      await seedAndScan();
+      const prompt = build({ task: TASK, signalToken: 'dev-token-4', platformCli: CLI });
+      expect(prompt).toContain('exchange: github-pr');
+      expect(prompt).not.toContain('cli: gh');
+      expect(prompt).not.toContain('cli-host:');
+      expect(prompt).not.toMatch(/^base: /m);
+    });
+  });
+
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
   });

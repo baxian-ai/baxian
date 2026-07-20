@@ -45,7 +45,7 @@ const MINIMAL = {
       treatAsSuccess: ['REF_NOT_FOUND'],
     },
   },
-  preflight: [{ argv: ['{binary}', '--version'], fixMessage: '安装 ≥ {minToolVersion}' }],
+  preflight: [{ argv: ['{binary}', '--version'], fixMessage: '安装 ≥ {minToolVersion}', versionCheck: true }],
   errorClasses: [
     { class: 'RATE_LIMIT', regex: ['429 Too Many Requests'] },
     { class: 'ACCESS_DENIED', regex: ['401 Unauthorized'] },
@@ -126,6 +126,41 @@ describe('parseDriverSpec', () => {
     bad.ops = [] as unknown as Record<string, Record<string, unknown>>;
     const result = parseDriverSpec(j(bad), '/p/glab');
     expect('errors' in result).toBe(true);
+  });
+
+  it('preflight without exactly one versionCheck step is a load error', () => {
+    const zero = clone(MINIMAL);
+    zero.preflight = [{ argv: ['{binary}', '--version'], fixMessage: 'install ≥ {minToolVersion}' }];
+    expect(errMsgs(zero).some(e => e.includes('exactly one versionCheck'))).toBe(true);
+
+    const two = clone(MINIMAL);
+    two.preflight = [
+      { argv: ['{binary}', '--version'], versionCheck: true, fixMessage: 'install ≥ {minToolVersion}' },
+      { argv: ['{binary}', 'api', 'user'], versionCheck: true, fixMessage: 'login' },
+    ];
+    expect(errMsgs(two).some(e => e.includes('exactly one versionCheck'))).toBe(true);
+
+    const nonBool = clone(MINIMAL);
+    nonBool.preflight = [{ argv: ['{binary}', '--version'], versionCheck: 'yes', fixMessage: 'install ≥ {minToolVersion}' }];
+    expect(errMsgs(nonBool).some(e => e.includes('versionCheck must be a boolean'))).toBe(true);
+  });
+
+  it('agentCommands must be well-formed command-alternative groups', () => {
+    const good = clone(MINIMAL) as Record<string, unknown>;
+    good.agentCommands = [['openssl'], ['shasum', 'sha256sum']];
+    expect(errMsgs(good)).toEqual([]);
+
+    const emptyGroup = clone(MINIMAL) as Record<string, unknown>;
+    emptyGroup.agentCommands = [[]];
+    expect(errMsgs(emptyGroup).some(e => e.includes('non-empty array'))).toBe(true);
+
+    const badName = clone(MINIMAL) as Record<string, unknown>;
+    badName.agentCommands = [['rm -rf /']];
+    expect(errMsgs(badName).some(e => e.includes('plain command names'))).toBe(true);
+
+    const nonArray = clone(MINIMAL) as Record<string, unknown>;
+    nonArray.agentCommands = 'openssl';
+    expect(errMsgs(nonArray).some(e => e.includes('command-alternative groups'))).toBe(true);
   });
 
   it('preflight array with null element does not throw', () => {

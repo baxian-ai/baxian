@@ -61,12 +61,12 @@ function baseBadge(agent: AgentSnapshot, t: Messages['agents']): Omit<AgentBadge
       title: agent.binding.awaitingReason ?? t.heldDefaultReason,
     };
   }
-  if (agent.binding?.needInputAt) {
+  if (agent.binding?.needInput?.at) {
     return {
       kind: 'alert',
       label: t.needInputBadge,
       cls: 'pill pill-warn',
-      title: t.needInputTitle(new Date(agent.binding.needInputAt).toLocaleString()),
+      title: t.needInputTitle(new Date(agent.binding.needInput.at).toLocaleString()),
     };
   }
   if (agent.runtimeStatus === 'pending') {
@@ -136,7 +136,7 @@ export function AgentCard({
 
   const taskId = agent.binding?.taskId;
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
-  const needInputAt = agent.binding?.needInputAt;
+  const needInputAt = agent.binding?.needInput?.at;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
   const isBootstrapping = isAgentBootstrapping(agent);
   const bootstrapBlocksTerminal = isBootstrapping && agent.tmuxSessionStatus !== 'present';

@@ -4,6 +4,7 @@ import {
   createSignalToken,
   decodeSignalActorId,
   PHASE_SIGNAL_KINDS,
+  scanInputReceivedSignals,
   scanNeedInputSignals,
   scanPhaseSignals,
   scanReadFileSignals,
@@ -212,13 +213,13 @@ describe('phase signal protocol', () => {
 describe('need-input signal', () => {
   it('scans need-input with token', () => {
     expect(scanNeedInputSignals('question?\n[bx:need-input:abcdef123456]\n')).toEqual([
-      { token: 'abcdef123456', raw: '[bx:need-input:abcdef123456]' },
+      { token: 'abcdef123456', raw: '[bx:need-input:abcdef123456]', index: 9 },
     ]);
   });
 
   it('survives ANSI noise and TUI soft-wrap whitespace', () => {
     expect(scanNeedInputSignals('\x1b[31m[bx:need-\ninput:abcdef123456]\x1b[0m')).toEqual([
-      { token: 'abcdef123456', raw: '[bx:need-input:abcdef123456]' },
+      { token: 'abcdef123456', raw: '[bx:need-input:abcdef123456]', index: 0 },
     ]);
   });
 
@@ -231,6 +232,33 @@ describe('need-input signal', () => {
   it('scans multiple occurrences', () => {
     const text = '[bx:need-input:abcdef123456] later [bx:need-input:abcdef123456]';
     expect(scanNeedInputSignals(text)).toHaveLength(2);
+  });
+
+  it('scans the ordinal form and keeps the bare form seq-less', () => {
+    expect(scanNeedInputSignals('[bx:need-input:abcdef123456:3]')).toEqual([
+      { token: 'abcdef123456', seq: 3, raw: '[bx:need-input:abcdef123456:3]', index: 0 },
+    ]);
+    expect(scanNeedInputSignals('[bx:need-input:abcdef123456]')[0]?.seq).toBeUndefined();
+  });
+
+  it('rejects malformed ordinals outright instead of degrading to bare', () => {
+    expect(scanNeedInputSignals('[bx:need-input:abcdef123456:abc]')).toEqual([]);
+    expect(scanNeedInputSignals('[bx:need-input:abcdef123456:12345]')).toEqual([]);
+    expect(scanNeedInputSignals('[bx:need-input:abcdef123456:0]')).toEqual([]);
+    expect(scanNeedInputSignals('[bx:need-input:abcdef123456:1:2]')).toEqual([]);
+  });
+
+  it('scans input-received with the same grammar', () => {
+    expect(scanInputReceivedSignals('done\n[bx:input-received:abcdef123456:2]\n')).toEqual([
+      { token: 'abcdef123456', seq: 2, raw: '[bx:input-received:abcdef123456:2]', index: 4 },
+    ]);
+    expect(scanInputReceivedSignals('[bx:input-received:abcdef123456]')).toEqual([
+      { token: 'abcdef123456', raw: '[bx:input-received:abcdef123456]', index: 0 },
+    ]);
+    expect(scanInputReceivedSignals('\x1b[2m[bx:input-\nreceived:abcdef123456:7]\x1b[0m')).toEqual([
+      { token: 'abcdef123456', seq: 7, raw: '[bx:input-received:abcdef123456:7]', index: 0 },
+    ]);
+    expect(scanInputReceivedSignals('[bx:input-received:abcdef123456:00a]')).toEqual([]);
   });
 });
 

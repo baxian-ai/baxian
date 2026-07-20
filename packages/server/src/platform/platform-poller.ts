@@ -10,7 +10,8 @@ import type { NormalizedRow } from './row-schema.js';
 import { versionTimeOf } from './row-schema.js';
 import { CommentCursorStore } from './comment-cursor.js';
 import { VerdictEngine, type VerdictSourceScan } from './verdict-engine.js';
-import { collectValidAcks } from './markers.js';
+import { collectValidAcks, rowBodyDigest } from './markers.js';
+import { createHash } from 'node:crypto';
 import { buildAckCarrierRows, feedbackEventTarget, scanCommentSourcesOnce } from './feedback.js';
 import { checkPrBinding, type BindingCheck } from './pr-binding.js';
 
@@ -39,6 +40,7 @@ export type PlatformTasksProvider = (projectId: string) => Promise<PlatformTaskV
 export interface PlatformDriver {
   readonly visibilityLagMs: number;
   readonly commentSources: CommentSourceOp[];
+  runPreflightSteps?(): Promise<Array<{ step: string; ok: boolean; message: string }>>;
   runOp(opName: string, vars?: OpVars): Promise<NormalizedRow[]>;
   runListPrs(vars: OpVars, shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean): Promise<NormalizedRow[]>;
   runCommentSource(
@@ -63,6 +65,8 @@ export interface PlatformPollerOptions {
   onCursorCommitted?: (
     taskId: string, prNumber: number, sourceKey: string, watermarkTime: number,
   ) => void | Promise<void>;
+  // 纯展示通知，不参与裁决与反馈事件流
+  onConversationRevision?: (taskId: string) => void | Promise<void>;
 }
 
 interface EntryStatus {
@@ -92,6 +96,8 @@ interface InternalEntry extends PlatformPollerEntryInit {
   // 观察缓存按 (taskId, prNumber) 隔离：同一 PR 号可被先后不同任务收编（自定义分支复用/reopen），
   // 只按 PR 号会让新任务继承旧任务的 merged/push 观察、事件被永久抑制（与 cursor 代际同理）。
   observedPr: Map<string, ObservedPr>;
+  conversationDigest: Map<string, string>;
+  preflightPassed?: boolean;
   deliveredVerdicts: Map<string, string>;
   loggedUndated: Set<string>;
   baseMismatch: Map<number, string>;
@@ -147,6 +153,7 @@ export class PlatformPoller {
       status: { isPolling: false, consecutiveFailures: 0 },
       defaultBranchStale: 0,
       observedPr: new Map(),
+      conversationDigest: new Map(),
       deliveredVerdicts: new Map(),
       loggedUndated: new Set(),
       baseMismatch: new Map(),
@@ -158,6 +165,13 @@ export class PlatformPoller {
     if (i === -1) return false;
     this.entries.splice(i, 1);
     return true;
+  }
+
+  // 超龄即视为缺失；纯缓存读，派发路径零网络调用。
+  defaultBranchSnapshot(repoKey: string): string | undefined {
+    const entry = this.entries.find(e => e.repoKey === repoKey);
+    if (entry?.defaultBranch === undefined) return undefined;
+    return entry.defaultBranchStale < DEFAULT_BRANCH_STALE_CYCLES ? entry.defaultBranch : undefined;
   }
 
   snapshots(): Array<PollerSnapshot & { lastErrorClass?: string; rateLimitedUntil?: string }> {
@@ -335,8 +349,29 @@ export class PlatformPoller {
     for (const key of entry.deliveredVerdicts.keys()) {
       if (!activeKeys.has(key)) entry.deliveredVerdicts.delete(key);
     }
+    for (const key of entry.conversationDigest.keys()) {
+      if (!activeKeys.has(key)) entry.conversationDigest.delete(key);
+    }
     for (const key of entry.loggedUndated) {
       if (!activePrs.has(Number(key.split(':')[0]))) entry.loggedUndated.delete(key);
+    }
+
+    // 首周期自证，失败进健康度周期重试；早退周期未刷新 projectView，须同步老化缓存。
+    if (entry.preflightPassed !== true && entry.driver.runPreflightSteps !== undefined) {
+      let steps: Array<{ step: string; ok: boolean; message: string }>;
+      try {
+        steps = await entry.driver.runPreflightSteps();
+      } catch (e) {
+        entry.defaultBranchStale += 1;
+        fail('driver-preflight', e);
+        return failures;
+      }
+      const bad = steps.find(s => !s.ok);
+      if (bad !== undefined) {
+        entry.defaultBranchStale += 1;
+        fail(bad.step, new Error(bad.message));
+        return failures;
+      }
     }
 
     let defaultBranch: string | undefined;
@@ -346,6 +381,18 @@ export class PlatformPoller {
         entry.defaultBranch = row.defaultBranch;
         entry.defaultBranchStale = 0;
         defaultBranch = row.defaultBranch;
+      }
+      if (row !== undefined && entry.preflightPassed !== true && entry.driver.runPreflightSteps !== undefined) {
+        if (row.pushPermitted === false) {
+          fail('preflight-push', new Error(
+            `push permission missing for ${entry.repoUrl} — server merge/close requires write access`,
+          ));
+        } else {
+          if (row.pushPermitted === undefined) {
+            console.warn(`[PlatformPoller] ${entry.repoKey}: plugin did not report pushPermitted — write access cannot be asserted`);
+          }
+          entry.preflightPassed = true;
+        }
       }
     } catch (e) {
       entry.defaultBranchStale += 1;
@@ -573,6 +620,7 @@ export class PlatformPoller {
     }
 
     const scans = await this.scanCommentSources(entry, task, base, fail);
+    await this.noteConversationProjection(entry, task.taskId, obsKey, scans);
 
     const anchorSha = task.anchorSha?.toLowerCase();
     // 裁决资格门：head 偏离锚点只能走 push/recheck，旧锚令牌不得批准新 head；signalToken
@@ -627,6 +675,43 @@ export class PlatformPoller {
       entry.deliveredVerdicts.set(obsKey, fp);
     } catch (e) {
       fail(`verdict pr#${prNumber}`, e);
+    }
+  }
+
+  // 全源成功才比对（失败源缺行会伪刷新两次）；回调失败不推进基线，下轮重试。
+  private async noteConversationProjection(
+    entry: InternalEntry,
+    taskId: string,
+    obsKey: string,
+    scans: VerdictSourceScan[],
+  ): Promise<void> {
+    const notify = this.opts.onConversationRevision;
+    if (notify === undefined) return;
+    if (scans.length === 0 || scans.some(s => !s.ok)) return;
+    const h = createHash('sha256');
+    for (const scan of [...scans].sort((a, b) => a.key.localeCompare(b.key))) {
+      // 源未承诺稳定行序：按行身份规范化后再散列，重排不产生伪 revision。
+      const rows = [...scan.rows].sort((a, b) => {
+        const ai = String(a.id);
+        const bi = String(b.id);
+        if (ai !== bi) return ai < bi ? -1 : 1;
+        const ad = rowBodyDigest(a);
+        const bd = rowBodyDigest(b);
+        return ad < bd ? -1 : ad > bd ? 1 : 0;
+      });
+      for (const row of rows) {
+        // versionTime 入摘要：正文相同但 updatedAt 变化会改变时间线排序（进而改变分轮），
+        // 不计入就永远不推进展示 revision。
+        h.update(`${scan.key}:${String(row.id)}:${rowBodyDigest(row)}:${String(row.reviewState ?? '')}:${String(versionTimeOf(row) ?? '')}\n`);
+      }
+    }
+    const digest = h.digest('hex');
+    if (entry.conversationDigest.get(obsKey) === digest) return;
+    try {
+      await notify(taskId);
+      entry.conversationDigest.set(obsKey, digest);
+    } catch (e) {
+      console.warn('[PlatformPoller] onConversationRevision failed:', e instanceof Error ? e.message : e);
     }
   }
 

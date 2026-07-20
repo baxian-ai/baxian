@@ -199,9 +199,9 @@ export class DispatchReconciler {
       }
       // 一条规则：pending 每周期要么被消费，要么计入等待预算——任何不可消费的原因
       // （不可注入/探测失败/正等人回答/观测未更新）都不得让 dispatchBusyWaitBudgetMs 失去消费点。
-      // needInputAt 在场说明该回合正等人回答（不落 awaiting_human 且静止后探测可注入），
+      // needInput.at 在场说明该回合正等人回答（不落 awaiting_human 且静止后探测可注入），
       // 重投 review prompt 会覆盖问题——与无登记兜底同一门禁
-      const awaitingAnswer = qaState.needInputAt !== undefined;
+      const awaitingAnswer = qaState.needInput?.at !== undefined;
       if (awaitingAnswer || !canInjectObservation(observation) || !this.observationDrivesRetry(task, observation, entry.since)) {
         await this.alertIfBudgetExhausted(task, entry, observation, qaId, awaitingAnswer);
         return;
@@ -221,7 +221,7 @@ export class DispatchReconciler {
       && observation.reason === 'PENDING_IDLE'
       && canInjectObservation(observation)
       && observedAfter(observation, task.reviewDispatchedAt)
-      && !qaState.needInputAt
+      && qaState.needInput?.at === undefined
     ) {
       if (anchorMissing && !gitMode && !(await this.refreshMissingHead(task, qaId))) return;
       await this.redispatchReview(task, qaId, 'stalled-idle');
@@ -253,7 +253,7 @@ export class DispatchReconciler {
       // hold 本身在 UI 可见，无需再升级
       if (devState.status === 'awaiting_human') return;
       // 与 review 侧同一条规则：不可消费即计入预算（不注入但有界升级）
-      const awaitingAnswer = devState.needInputAt !== undefined;
+      const awaitingAnswer = devState.needInput?.at !== undefined;
       if (awaitingAnswer || !canInjectObservation(observation) || !this.observationDrivesRetry(task, observation, entry.since)) {
         await this.alertIfBudgetExhausted(task, entry, observation, devId, awaitingAnswer);
         return;
@@ -263,12 +263,12 @@ export class DispatchReconciler {
     }
 
     // 'waiting' 是派生视图态不落盘；兜底以「绑定 + 非 hold + 未在等用户输入 + 观察到持续静止」判定，
-    // needInputAt 在场说明 dev 正等人回答，重投 fix prompt 会覆盖问题
+    // needInput.at 在场说明 dev 正等人回答，重投 fix prompt 会覆盖问题
     const devState = await this.opts.agentStore.get(devId);
     if (
       devState?.taskId === task.id
       && devState.status !== 'awaiting_human'
-      && !devState.needInputAt
+      && devState.needInput?.at === undefined
       && observation.tmuxSessionStatus === 'present'
       && observation.reason === 'PENDING_IDLE'
       && canInjectObservation(observation)

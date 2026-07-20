@@ -1,4 +1,5 @@
-import { PluginRegistry, type PluginDiagnostic } from './plugin-registry.js';
+import { join } from 'node:path';
+import { PluginRegistry, type PluginDiagnostic, type LoadedPlugin } from './plugin-registry.js';
 import { builtinPluginRoot, userPluginRoot } from './plugin-roots.js';
 import type { BaxianConfig } from '../shared/index.js';
 import { projectReviewMode, resolveProjectTool } from '../config/validator.js';
@@ -51,6 +52,34 @@ export async function loadPluginsOrExplainWithRoots(
   // 未被任何项目引用的用户插件坏损：警告 + 跳过，不得清空有效集合（§5.4）。
   for (const d of diagnostics) console.warn(`[PluginRegistry] skipped ${describe(d)}`);
   return { registry };
+}
+
+export function referencedGitTools(config: BaxianConfig): Set<string> {
+  const tools = new Set<string>();
+  for (const project of config.project) {
+    if (projectReviewMode(config, project) !== 'git') continue;
+    const tool = resolveProjectTool(project);
+    if (tool !== undefined) tools.add(tool);
+  }
+  return tools;
+}
+
+// skill 池扫描沿加载期同一部分成功模型：未引用用户插件坏损警告跳过，内置或被引用插件坏损才拖垮启动。
+export async function scanPluginSkillPools(
+  skillRegistry: { scanPluginSkills(tool: string, skillsRoot: string): Promise<void> },
+  plugins: LoadedPlugin[],
+  referencedTools: ReadonlySet<string>,
+): Promise<void> {
+  for (const plugin of plugins) {
+    try {
+      await skillRegistry.scanPluginSkills(plugin.manifest.tool, join(plugin.pluginPath, 'skills'));
+    } catch (err) {
+      if (plugin.source === 'builtin' || referencedTools.has(plugin.manifest.tool)) throw err;
+      console.warn(
+        `[startup] plugin '${plugin.manifest.name}' skill pool skipped (not referenced by any project): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 }
 
 export function loadPluginsOrExplain(

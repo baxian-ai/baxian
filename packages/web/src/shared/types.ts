@@ -3,7 +3,7 @@ export type AgentRole = 'dev' | 'qa' | 'research';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
-export type ReviewMode = 'github' | 'server';
+export type ReviewMode = 'github' | 'server' | 'git';
 type AfterDone = 'pr' | 'branch' | null;
 export type SupportedLanguage = 'zh-CN' | 'en-US';
 
@@ -34,7 +34,14 @@ export interface ProjectConfig {
   merge: MergeStrategy;
   specApproval?: SpecApprovalStrategy;
   review?: ProjectReviewConfig;
+  gitCli?: GitCliConfig;
   agent: AgentConfig[][];
+}
+
+export interface GitCliConfig {
+  tool: string;
+  binary?: string;
+  notes?: string;
 }
 
 export interface ProjectReviewConfig {
@@ -125,7 +132,12 @@ export interface AgentBindingFacts {
   awaitingPhase?: string;
   awaitingReason?: string;
   awaitingSince?: string;
-  needInputAt?: string;
+  needInput?: {
+    epoch: number;
+    askSeq?: number;
+    answeredSeq?: number;
+    at?: string;
+  };
 }
 
 interface AgentErrorSummary {
@@ -189,6 +201,7 @@ export interface TaskState {
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
   prFeedbackReceivedAt?: string;
+  reviewConversationUpdatedAt?: string;
   reviewRound: number;
   specReviewRound?: number;
   phase?: TaskPhase;
@@ -277,31 +290,40 @@ export interface CodeReviewRound extends ReviewRoundBase {
 
 export type ReviewRound = SpecReviewRound | CodeReviewRound;
 
-type GithubReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
+type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
 
-export type GithubReviewVerdict = 'approve' | 'request-changes' | 'comment';
+export type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
 
-export interface GithubReviewItem {
-  kind: GithubReviewItemKind;
+export interface PrReviewItem {
+  kind: PrReviewItemKind;
   id: string;
   author?: string;
   body?: string;
   bodyTruncated?: boolean;
   createdAt?: string;
-  verdict?: GithubReviewVerdict;
+  verdict?: PrReviewVerdict;
   path?: string;
   line?: number;
   commitSha?: string;
   inReplyTo?: boolean;
+  sourceKey?: string;
+  threadKey?: string;
+  reviewState?: string;
+  roundToken?: string;
+  anchorSha?: string;
 }
 
-export interface GithubReviewConversation {
+export interface PrReviewConversation {
   available: boolean;
-  reason?: 'server-mode' | 'no-pr' | 'not-github';
+  reason?: 'server-mode' | 'no-pr' | 'not-github' | 'driver-unavailable';
   prNumber?: number;
   prUrl?: string;
-  items: GithubReviewItem[];
+  items: PrReviewItem[];
   error?: string;
+  // 平台限流：展示端必须遵循平台退避，不得按秒级重试
+  rateLimited?: boolean;
+  // 聚合超出预算，时间线只含前若干条
+  truncated?: boolean;
 }
 
 export type StreamSubMode = 'preview' | 'full';

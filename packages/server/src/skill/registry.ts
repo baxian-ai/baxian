@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstat, readdir, readFile } from 'node:fs/promises';
+import { lstat, readdir, readFile, stat } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { AGENT_PHASES } from '../shared/index.js';
@@ -82,21 +82,23 @@ function firstParagraph(text: string): string {
   return para.replace(/\s+/g, ' ').slice(0, 200);
 }
 
+// 仅顶层 skill 目录跟随 symlink；内部一律 lstat——后代链接可越界或成环，跟随会把外部内容物化进 Workdir。
 async function walk(dir: string, base: string = dir): Promise<SkillFile[]> {
   const out: SkillFile[] = [];
   let entries: string[];
   try {
     entries = await readdir(dir);
-  } catch {
-    return out;
+  } catch (err) {
+    // 静默跳过会把残缺 skill 标成功——不可遍历即整插件拒绝（usage-aware 层兜未引用插件）。
+    throw new SkillScanError(`${dir}: unreadable skill directory (${err instanceof Error ? err.message : String(err)})`);
   }
   for (const entry of entries) {
     const entryPath = join(dir, entry);
     let s;
     try {
       s = await lstat(entryPath);
-    } catch {
-      continue;
+    } catch (err) {
+      throw new SkillScanError(`${entryPath}: unreadable entry (${err instanceof Error ? err.message : String(err)})`);
     }
     if (s.isDirectory()) {
       out.push(...(await walk(entryPath, base)));
@@ -113,53 +115,46 @@ async function walk(dir: string, base: string = dir): Promise<SkillFile[]> {
   return out;
 }
 
+export interface SkillScope {
+  pluginTools: string[];
+}
+
 export class SkillRegistry {
   private skills = new Map<string, SkillDef>();
+  private pluginSkills = new Map<string, SkillDef[]>();
   constructor(private skillsDir?: string) {}
 
   async scan(): Promise<void> {
     this.skills.clear();
     if (!this.skillsDir) return;
-    let entries: string[];
-    try {
-      entries = await readdir(this.skillsDir);
-    } catch {
-      return;
+    for (const def of await scanSkillRoot(this.skillsDir)) {
+      this.skills.set(def.name, def);
     }
-    for (const entry of entries) {
-      const entryPath = join(this.skillsDir, entry);
-      let s;
-      try {
-        s = await lstat(entryPath);
-      } catch {
-        continue;
+  }
+
+  // 与核心同名即整插件抛错（原子淘汰，池不留半截）——只删单个 skill 会留下引用它的残缺插件。
+  async scanPluginSkills(tool: string, skillsRoot: string): Promise<void> {
+    const defs = await scanSkillRoot(skillsRoot);
+    for (const def of defs) {
+      if (this.skills.has(def.name)) {
+        throw new SkillScanError(`plugin '${tool}' skill '${def.name}' collides with a core skill`);
       }
-      if (!s.isDirectory()) continue;
-      const skillFile = join(entryPath, 'SKILL.md');
-      let skillStat;
-      try {
-        skillStat = await lstat(skillFile);
-      } catch {
-        continue;
-      }
-      if (!skillStat.isFile()) continue;
-      let skillBuf: Buffer;
-      try {
-        skillBuf = await readFile(skillFile);
-      } catch {
-        continue;
-      }
-      const skillMd = decodeStrictUtf8(skillFile, skillBuf);
-      const files = await walk(entryPath);
-      this.skills.set(entry, {
-        name: entry,
-        dir: entryPath,
-        path: skillFile,
-        content: skillMd,
-        description: parseSkillDescription(skillMd),
-        files,
-      });
     }
+    this.pluginSkills.set(tool, defs);
+  }
+
+  private scopedDefs(scope?: SkillScope): SkillDef[] {
+    const defs = [...this.skills.values()];
+    for (const tool of scope?.pluginTools ?? []) {
+      defs.push(...(this.pluginSkills.get(tool) ?? []));
+    }
+    return defs;
+  }
+
+  pluginSkillNames(scope?: SkillScope): string[] {
+    return (scope?.pluginTools ?? []).flatMap(
+      (tool) => (this.pluginSkills.get(tool) ?? []).map((d) => d.name),
+    );
   }
 
   has(name: string): boolean {
@@ -182,9 +177,9 @@ export class SkillRegistry {
     return phaseConfig.skills.filter((name) => this.skills.has(name));
   }
 
-  async materialize(write: SkillFileWriter, destRoot: string): Promise<string[]> {
+  async materialize(write: SkillFileWriter, destRoot: string, scope?: SkillScope): Promise<string[]> {
     const written: string[] = [];
-    for (const def of this.skills.values()) {
+    for (const def of this.scopedDefs(scope)) {
       for (const file of def.files) {
         const path = join(destRoot, def.name, file.relPath);
         await write(path, file.content);
@@ -194,17 +189,65 @@ export class SkillRegistry {
     return written;
   }
 
-  contentHash(): string {
+  contentHash(scope?: SkillScope): string {
     const h = createHash('sha256');
-    for (const name of [...this.skills.keys()].sort()) {
-      const def = this.skills.get(name)!;
-      h.update(name).update('\0');
+    const defs = [...this.scopedDefs(scope)].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const def of defs) {
+      h.update(def.name).update('\0');
       for (const file of [...def.files].sort((a, b) => a.relPath.localeCompare(b.relPath))) {
         h.update(file.relPath).update('\0').update(file.content).update('\0');
       }
     }
     return h.digest('hex').slice(0, 16);
   }
+}
+
+async function scanSkillRoot(root: string): Promise<SkillDef[]> {
+  const defs: SkillDef[] = [];
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return defs;
+  }
+  for (const entry of entries) {
+    // 与插件加载器同候选集：隐藏目录与非 baxian- 前缀不入池——物化清理只回收 baxian-*，
+    // 越集注入的目录无法清理。
+    if (entry.startsWith('.') || !entry.startsWith('baxian-')) continue;
+    const entryPath = join(root, entry);
+    let s;
+    try {
+      s = await stat(entryPath);
+    } catch {
+      continue;
+    }
+    if (!s.isDirectory()) continue;
+    const skillFile = join(entryPath, 'SKILL.md');
+    let skillStat;
+    try {
+      skillStat = await lstat(skillFile);
+    } catch {
+      continue;
+    }
+    if (!skillStat.isFile()) continue;
+    let skillBuf: Buffer;
+    try {
+      skillBuf = await readFile(skillFile);
+    } catch {
+      continue;
+    }
+    const skillMd = decodeStrictUtf8(skillFile, skillBuf);
+    const files = await walk(entryPath);
+    defs.push({
+      name: entry,
+      dir: entryPath,
+      path: skillFile,
+      content: skillMd,
+      description: parseSkillDescription(skillMd),
+      files,
+    });
+  }
+  return defs;
 }
 
 export type SkillFileWriter = (path: string, content: Buffer) => Promise<void>;

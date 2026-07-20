@@ -95,3 +95,21 @@ describe('makeDriverExec', () => {
     expect(seen).toEqual({ timeout: 1234, maxBuffer: 4096 });
   });
 });
+
+describe('GitDriver.runPreflightSteps', () => {
+  function driverWith(result: ExecResult) {
+    return buildProjectDriver(project(), registry, async () => result)!;
+  }
+
+  it('classifies a rate-limited step from raw output and never returns it', async () => {
+    const driver = driverWith({ stdout: 'secret-diagnostic', stderr: 'HTTP 429 rate limit exceeded', exitCode: 1 });
+    await expect(driver.runPreflightSteps()).rejects.toMatchObject({ info: { errorClass: 'RATE_LIMIT' } });
+  });
+
+  it('returns plain results for a non-rate-limit failure', async () => {
+    const driver = driverWith({ stdout: 'secret-diagnostic', stderr: 'command not found', exitCode: 127 });
+    const results = await driver.runPreflightSteps();
+    expect(results.some(r => !r.ok)).toBe(true);
+    expect(JSON.stringify(results)).not.toContain('secret-diagnostic');
+  });
+});

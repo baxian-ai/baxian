@@ -1,14 +1,28 @@
 import type { CommandRunner, RemoteShellMode } from './runner.js';
 import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshEnv } from './runner.js';
 import { ancestorSymlinkGuard } from './repo-store.js';
-import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
+import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
 import { isGitHubRepo, redactGitCredentials, repoSlug } from '../shared/index.js';
+import { runDriverPreflightSteps, type DriverPreflightStep } from '../platform/preflight-exec.js';
+import type { RenderContext } from '../platform/command-renderer.js';
+import { safeDriverErrorText } from '../platform/git-driver.js';
 
 export interface PreflightResult {
   step: string;
   ok: boolean;
   message: string;
+}
+
+export interface AgentGitPreflight {
+  tool: string;
+  minToolVersion: string;
+  steps: readonly DriverPreflightStep[];
+  agentCommands: readonly string[][];
+  renderCtx: RenderContext;
+  driverFor: (
+    exec: (cmd: string, opts: { timeout: number; maxBuffer: number }) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
+  ) => { runOp(opName: string): Promise<Array<Record<string, unknown>>> };
 }
 
 const CLI_BINARY: Record<AgentRuntime, string> = {
@@ -96,6 +110,7 @@ export async function runPreflight(
   repo: string,
   host?: HostConfig,
   projectId?: string,
+  gitPlatform?: AgentGitPreflight,
 ): Promise<PreflightResult[]> {
   repo = repo.trim();
   const results: PreflightResult[] = [];
@@ -135,13 +150,27 @@ export async function runPreflight(
   results.push(await probeTmux(runner, projectId));
 
   const isAuto = !agent.workdir;
+  const probe = gitPlatform === undefined
+    ? { urls: undefined }
+    : await gitLsRemoteProbeUrl(runner, repo, agent, gitPlatform);
+  if ('error' in probe) {
+    // 执行状态不明时不猜协议：探测失败即该检查项失败，ls-remote 跳过（猜错方向的提示更有害）。
+    results.push({
+      step: 'git',
+      ok: false,
+      message: `cannot determine the push/clone channel on this host: ${probe.error}`,
+    });
+  }
+  const lsRemote = 'error' in probe ? { skip: true as const } : { urls: probe.urls };
   if (isAuto) {
-    await runAutoModePreflight(runner, agent.id, repo, results);
+    await runAutoModePreflight(runner, agent.id, repo, results, lsRemote);
   } else {
-    await runManualModePreflight(runner, agent.workdir!, repo, results);
+    await runManualModePreflight(runner, agent.workdir!, repo, results, lsRemote);
   }
 
-  if (isGitHubRepo(repo)) {
+  if (gitPlatform !== undefined) {
+    await runGitPlatformChecks(runner, agent, gitPlatform, results);
+  } else if (isGitHubRepo(repo)) {
     const slug = repoSlug(repo);
     const ghCheck = await runner.exec('gh auth status');
     results.push({
@@ -163,11 +192,178 @@ export async function runPreflight(
   return results;
 }
 
+// 探测通道必须等于运行期真正使用的通道，否则绿灯毫无诊断意义：
+//   manual Workdir —— origin 不被改写，publish 走 `git push origin` ⇒ 探测该 origin 的 push URL
+//   auto + gh      —— clone 是 `gh repo clone <slug>`，显式 URL 被丢弃 ⇒ 探测 gh 的 git_protocol 通道
+//   auto + 其它 tool —— 朴素 `git clone <repo>` ⇒ 探测 repo 原文
+async function gitLsRemoteProbeUrl(
+  runner: CommandRunner,
+  repo: string,
+  agent: AgentConfig,
+  git: AgentGitPreflight,
+): Promise<{ urls: string[] } | { error: string }> {
+  const read = async (cmd: string): Promise<{ value: string; lines: string[] } | { error: string }> => {
+    try {
+      const res = await runner.exec(cmd, { timeout: PREFLIGHT_PROBE_TIMEOUT_MS });
+      // 探测失败三态（AGENTS.md）：exit 255 / 瞬态网络特征是「结果未知」，落进「未配置 → 默认
+      // https」会让 checks 按错误协议放行，而运行期 clone 仍按真实 SSH 配置执行。
+      if (execOutcomeUnknown(res)) {
+        return { error: `${cmd} exited ${res.exitCode}: ${lastNonEmptyLine(res.stderr) || 'transport failure'}` };
+      }
+      const lines = res.exitCode === 0
+        ? res.stdout.split(/\r?\n/).map(l => l.trim()).filter(l => l !== '')
+        : [];
+      return { value: lines.length > 0 ? lines[lines.length - 1] : '', lines };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  };
+  if (agent.workdir !== undefined) {
+    // --all：配置了多个 remote.origin.pushurl 时 `git push origin` 会推向全部，只探第一个
+    // 会在「首个可达、后续失效」时误报绿灯。
+    const origin = await read(
+      `cd ${shellQuote(agent.workdir)} && git remote get-url --push --all origin`,
+    );
+    if ('error' in origin) return origin;
+    const urls = origin.value === '' ? [] : origin.lines;
+    if (urls.length === 0) {
+      return { error: `no push origin configured in ${agent.workdir} — publish would fail` };
+    }
+    return { urls };
+  }
+  if (git.tool !== 'gh' || !isGitHubRepo(repo)) return { urls: [repo] };
+  const slug = repoSlug(repo);
+  const hostname = git.renderCtx.hostname;
+  const hostScoped = await read(`gh config get -h ${shellQuote(hostname)} git_protocol`);
+  if ('error' in hostScoped) return hostScoped;
+  let protocol = hostScoped.value;
+  if (protocol === '') {
+    const globalCfg = await read('gh config get git_protocol');
+    if ('error' in globalCfg) return globalCfg;
+    protocol = globalCfg.value;
+  }
+  if (protocol === '') protocol = 'https';
+  return {
+    urls: [protocol === 'ssh' ? `git@${hostname}:${slug}.git` : `https://${hostname}/${slug}.git`],
+  };
+}
+
+async function runGitPlatformChecks(
+  runner: CommandRunner,
+  agent: AgentConfig,
+  git: AgentGitPreflight,
+  results: PreflightResult[],
+): Promise<void> {
+  const ctx = { ...git.renderCtx, binary: git.tool, minToolVersion: git.minToolVersion };
+  const stepResults = await runDriverPreflightSteps((cmd) => probeNetwork(runner, cmd), git.steps, ctx);
+  results.push(...stepResults);
+  if (stepResults.some((s) => !s.ok)) return;
+
+  // 插件自声明的 agent 面运行期命令按**该角色实际会执行的路径**检查：内置 gh skill 只在
+  // §Create/§Reply 用到 openssl 与摘要工具，QA 的 review/recheck 只走 §Inspect/§Verdict，
+  // research 更不接收 cli: 描述符——对它们探测只会制造假红。
+  const runsPlatformWrites = agent.role === 'dev';
+  if (runsPlatformWrites && git.agentCommands.length > 0) {
+    const missing: string[] = [];
+    const probeErrors: string[] = [];
+    for (const group of git.agentCommands) {
+      let satisfied = false;
+      const groupErrors: string[] = [];
+      for (const cmd of group) {
+        try {
+          const probe = await runner.exec(`command -v ${cmd}`, { timeout: PREFLIGHT_PROBE_TIMEOUT_MS });
+          if (probe.exitCode === 0 && lastNonEmptyLine(probe.stdout) !== '') {
+            satisfied = true;
+            break;
+          }
+        } catch (err) {
+          // 探测本身失败（超时/spawn）不得 reject 整个 preflight：/checks 的 Promise.all 会
+          // 让其余 agent 与 server 的结果一并丢失（500）。组内后项满足即契约已足，前项的
+          // 瞬态异常不算数。
+          groupErrors.push(`${cmd}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (!satisfied) {
+        missing.push(group.join(' or '));
+        probeErrors.push(...groupErrors);
+      }
+    }
+    const detail = probeErrors.length > 0 ? ` (probe failures: ${probeErrors.join('; ')})` : '';
+    results.push(missing.length === 0 && probeErrors.length === 0
+      ? { step: 'platform-skill-deps', ok: true, message: 'all commands declared by the platform skill are available' }
+      : {
+        step: 'platform-skill-deps',
+        ok: false,
+        message: missing.length === 0
+          ? `could not verify the commands required by the platform skill${detail}`
+          : `missing command(s) required by the platform skill: ${missing.join(', ')} — install them on this host${detail}`,
+      });
+  }
+
+  const driver = git.driverFor(async (cmd, opts) => {
+    try {
+      return await execNetwork(runner, cmd, { timeout: opts.timeout, retries: 0 });
+    } catch (err) {
+      return { stdout: '', stderr: err instanceof Error ? err.message : String(err), exitCode: 124 };
+    }
+  });
+  let row: Record<string, unknown> | undefined;
+  try {
+    [row] = await driver.runOp('projectView');
+  } catch (err) {
+    console.warn('[preflight] projectView failed:', safeDriverErrorText(err));
+    results.push({
+      step: 'platform-repo',
+      ok: false,
+      message: `driver projectView on ${git.renderCtx.repoPath} failed — check the ${git.tool} credentials and repo authorization on this host (${safeDriverErrorText(err)})`,
+    });
+    return;
+  }
+  results.push({
+    step: 'platform-repo',
+    ok: true,
+    message: `driver projectView on ${git.renderCtx.repoPath} OK`,
+  });
+
+  const push = row?.pushPermitted;
+  if (push === true) {
+    results.push({ step: 'platform-push', ok: true, message: 'push permission confirmed' });
+  } else if (push === false) {
+    // 可读不证可写：push 只是 dev 的发布前置；QA 的 PR write 无法静态自省，research 不发布。
+    results.push(agent.role === 'dev'
+      ? {
+        step: 'platform-push',
+        ok: false,
+        message: 'repo is readable but push is not permitted — dev publish requires push access',
+      }
+      : agent.role === 'qa'
+        ? {
+          step: 'platform-push',
+          ok: true,
+          message: 'read access OK; push is not required for QA (PR write scope cannot be probed statically — deploy credentials must include it)',
+        }
+        : {
+          step: 'platform-push',
+          ok: true,
+          message: 'read access OK; push is not required for research',
+        });
+  } else {
+    results.push({
+      step: 'platform-push',
+      ok: true,
+      message: 'plugin did not report pushPermitted — write access cannot be asserted statically',
+    });
+  }
+}
+
+type LsRemoteTarget = { urls?: string[] } | { skip: true };
+
 async function runManualModePreflight(
   runner: CommandRunner,
   workdir: string,
   repo: string,
   results: PreflightResult[],
+  lsRemote: LsRemoteTarget = {},
 ): Promise<void> {
   const workdirCheck = await runner.exec(
     `cd ${shellQuote(workdir)} && ` +
@@ -184,14 +380,20 @@ async function runManualModePreflight(
       : `${workdir} is not accessible or is not an independent ordinary Git clone root`,
   });
 
-  const lsRemoteUrl = isGitHubRepo(repo) ? `https://github.com/${repoSlug(repo)}.git` : repo;
-  const gitCheck = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
+  if ('skip' in lsRemote) return;
+  const targets = lsRemote.urls
+    ?? [isGitHubRepo(repo) ? `https://github.com/${repoSlug(repo)}.git` : repo];
+  const failed: string[] = [];
+  for (const url of targets) {
+    const check = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(url)} HEAD`);
+    if (check.exitCode !== 0) failed.push(redactGitCredentials(url));
+  }
   results.push({
     step: 'git',
-    ok: gitCheck.exitCode === 0,
-    message: gitCheck.exitCode === 0
+    ok: failed.length === 0,
+    message: failed.length === 0
       ? 'Git repository accessible'
-      : 'Cannot access repository — check SSH key or HTTPS credentials',
+      : `Cannot access ${failed.join(', ')} — check SSH key or HTTPS credentials`,
   });
 }
 
@@ -200,6 +402,7 @@ async function runAutoModePreflight(
   agentId: string,
   repo: string,
   results: PreflightResult[],
+  lsRemote: LsRemoteTarget = {},
 ): Promise<void> {
   const gh = isGitHubRepo(repo);
   // ~ is expanded by the remote shell to $HOME; physicalize it first so the agent dir is created
@@ -256,24 +459,36 @@ async function runAutoModePreflight(
     });
   }
 
+  if ('skip' in lsRemote) return;
+  const lsRemoteOverride = lsRemote.urls?.[0];
   if (!gh) {
-    const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(repo)} HEAD`);
+    const url = lsRemoteOverride ?? repo;
+    const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(url)} HEAD`);
     results.push({
       step: 'git',
       ok: ls.exitCode === 0,
       message: ls.exitCode === 0
         ? 'git ls-remote OK'
-        : `git ls-remote ${redactGitCredentials(repo)} failed — check the git credentials (HTTPS credential helper or SSH key) for this host`,
+        : `git ls-remote ${redactGitCredentials(url)} failed — check the git credentials (HTTPS credential helper or SSH key) for this host`,
     });
     return;
   }
 
   const slug = repoSlug(repo);
-  const proto = await runner.exec('gh config get git_protocol');
-  const protocol = proto.stdout.trim() || 'https';
-  const lsRemoteUrl = protocol === 'ssh'
-    ? `git@github.com:${slug}.git`
-    : `https://github.com/${slug}.git`;
+  let lsRemoteUrl: string;
+  let protocol: string;
+  if (lsRemoteOverride !== undefined) {
+    lsRemoteUrl = lsRemoteOverride;
+    protocol = lsRemoteOverride.startsWith('git@') || lsRemoteOverride.startsWith('ssh://')
+      ? 'ssh'
+      : 'https';
+  } else {
+    const proto = await runner.exec('gh config get git_protocol');
+    protocol = proto.stdout.trim() || 'https';
+    lsRemoteUrl = protocol === 'ssh'
+      ? `git@github.com:${slug}.git`
+      : `https://github.com/${slug}.git`;
+  }
   const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
   results.push({
     step: 'git',

@@ -32,6 +32,61 @@ const SKILL_INVOKE_SIGIL: Record<AgentRuntime, string> = {
   qodercli: '/',
 };
 
+export interface PlatformCliDescriptor {
+  tool: string;
+  host: string;
+  repo: string;
+  repoEncoded: string;
+  notes?: string;
+}
+
+const CLI_NOTES_MAX_BYTES = 512;
+const GIT_PLATFORM_PHASES = new Set(['develop', 'code', 'review', 'recheck', 'fix', 'post-approve']);
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  let bytes = 0;
+  let out = '';
+  for (const ch of value) {
+    const b = Buffer.byteLength(ch, 'utf8');
+    if (bytes + b > maxBytes) break;
+    out += ch;
+    bytes += b;
+  }
+  return out;
+}
+
+function gitDescriptorFields(
+  task: TaskState,
+  phase: string,
+  platformCli?: PlatformCliDescriptor,
+): string[] {
+  if (task.reviewMode !== 'git' || !GIT_PLATFORM_PHASES.has(phase)) return [];
+  const lines: string[] = [];
+  if (platformCli) {
+    lines.push(
+      `cli: ${platformCli.tool}`,
+      `cli-host: ${platformCli.host}`,
+      `cli-repo: ${platformCli.repo}`,
+      `cli-repo-encoded: ${platformCli.repoEncoded}`,
+    );
+    if (platformCli.notes !== undefined) {
+      lines.push(`cli-notes: ${truncateUtf8(platformCli.notes, CLI_NOTES_MAX_BYTES)}`);
+    }
+  }
+  if (phase === 'develop' || phase === 'code') {
+    lines.push(`branch: ${task.branch ?? '<branch>'}`);
+    if (task.baseBranch) lines.push(`base: ${task.baseBranch}`);
+  }
+  if (phase === 'review' || phase === 'recheck') {
+    if (!task.passToken || !task.failToken) {
+      throw new Error(`${phase} prompt for git task ${task.id} requires a minted pass/fail token pair`);
+    }
+    lines.push(`pass-token: ${task.passToken}`, `fail-token: ${task.failToken}`);
+  }
+  return lines;
+}
+
 function phasePrimarySkill(role: AgentRole, phase: string): string | undefined {
   const skills = AGENT_PHASES[role]?.[phase as keyof (typeof AGENT_PHASES)[AgentRole]]?.skills ?? [];
   return skills[0];
@@ -65,6 +120,7 @@ export interface BuildPromptOpts {
   serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   hasQaPartner?: boolean;
+  platformCli?: PlatformCliDescriptor;
 }
 
 export function buildPromptInline(opts: BuildPromptOpts): string {
@@ -100,6 +156,7 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     serverPriorResponseFile: opts.serverPriorResponseFile,
     serverAfterDone: opts.serverAfterDone,
     hasQaPartner: opts.hasQaPartner,
+    platformCli: opts.platformCli,
   });
   const primary = phasePrimarySkill(opts.agent.role, opts.phase);
   const slotSkill = primary ?? (opts.signalToken ? 'baxian-signals' : undefined);
@@ -142,6 +199,7 @@ interface TaskBodyArgs {
   serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   hasQaPartner?: boolean;
+  platformCli?: PlatformCliDescriptor;
 }
 
 interface PhasePromptCtx {
@@ -317,7 +375,7 @@ function buildTaskBody(args: TaskBodyArgs): string {
     serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
     serverReviewCheckout, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
     serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
-    serverAfterDone, hasQaPartner,
+    serverAfterDone, hasQaPartner, platformCli,
   } = args;
   if (phase === 'post-approve' && !signalToken) {
     throw new Error('post-approve prompt requires signalToken');
@@ -350,11 +408,14 @@ function buildTaskBody(args: TaskBodyArgs): string {
 
   // exchange 只有 baxian-task-check（develop/code）消费，其余 phase 不输出
   const carriesExchange = phase === 'develop' || phase === 'code';
-  const exchange = task.reviewMode === 'server' ? 'server-files' : 'github-pr';
+  const exchange = task.reviewMode === 'server'
+    ? 'server-files'
+    : task.reviewMode === 'git' ? 'git-pr' : 'github-pr';
   const descriptor = [
     `phase: ${phase}`,
     `workdir: ${workdir}`,
     ...(carriesExchange ? [`exchange: ${exchange}`] : []),
+    ...gitDescriptorFields(task, phase, platformCli),
     ...fields,
     ...(signalToken ? [`token: ${signalToken}`] : []),
   ].join('\n');

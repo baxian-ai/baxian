@@ -379,6 +379,7 @@ export function buildCli(): Command {
           mode: string;
           results: Array<{ ok: boolean; step: string; message: string }>;
         }>;
+        server?: { results: Array<{ ok: boolean; step: string; message: string }> };
         fixes?: Array<{ hostGroup: string; ok: boolean; message: string }>;
       };
       const result = await apiPost<CheckResult>(
@@ -393,6 +394,13 @@ export function buildCli(): Command {
       for (const agentResult of result.agents ?? []) {
         console.log(`\n[${agentResult.agentId}] (${agentResult.mode})`);
         for (const r of agentResult.results) {
+          const mark = r.ok ? 'PASS' : 'FAIL';
+          console.log(`  ${mark}  ${r.step}: ${r.message}`);
+        }
+      }
+      if (result.server) {
+        console.log('\n[server host]');
+        for (const r of result.server.results) {
           const mark = r.ok ? 'PASS' : 'FAIL';
           console.log(`  ${mark}  ${r.step}: ${r.message}`);
         }

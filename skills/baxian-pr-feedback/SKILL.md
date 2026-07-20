@@ -6,6 +6,8 @@ disable-model-invocation: true
 
 baxian dispatches you with a block of `key: value` dispatch fields. `workdir:` is your fixed current directory with the task branch already checked out; do not change directories or branches. The PR is in `pr:`. Communicate via the GitHub PR; stay in scope (out-of-scope work goes to a new Issue). Route on `phase:`: follow §Fix for `fix`, §Post-Approve for `post-approve`.
 
+When the descriptor carries `cli:` (git-pr flow): load the `baxian-cli-<tool>` skill it names and take every platform command from it — its §Inspect replaces the §Fetch Feedback commands, its §Reply carries the reply mechanics. In that flow every platform noun in this file reads platform-neutral: you communicate via the platform PR (not necessarily GitHub), and out-of-scope work — including §Decide and Act's issue step — goes to a new issue created through that platform skill. Feedback that arrives as a review body (not an inline thread) is answered with a top-level comment carrying that review's ack line — a review can never ack another review, so replying in kind leaves it pending and blocks merge-ready. Progress is tracked by per-revision ack marker lines (one per feedback revision you addressed, digest-bound so an edited comment becomes pending again), never by reply timestamps: the `T_self` idempotency procedure in §Post-Approve applies only to descriptors without `cli:`. §Decide and Act, the push rules, and the merge-ready discipline below apply to both flows.
+
 ## Fetch Feedback
 
 Substitute `N` with your `pr:` field:

@@ -1,5 +1,6 @@
 import { SINGLE_RESOURCE_OPS, type CommentSourceOp, type DriverOp, type DriverSpec } from './types.js';
 import { renderCommand, type RenderContext } from './command-renderer.js';
+import { runDriverPreflightSteps, type DriverPreflightStepResult } from './preflight-exec.js';
 import { parseJsonResponse, parseJsonPagedPage } from './response-parser.js';
 import { mapResponse } from './field-mapper.js';
 import { validateRows, type NormalizedRow } from './row-schema.js';
@@ -29,6 +30,24 @@ export class DriverOpError extends Error {
     super(message);
     this.name = 'DriverOpError';
   }
+}
+
+// 跨 HTTP/日志边界的错误一律有界投影：DriverOpError 的 message 携 stderr 尾部，
+// RowSchemaError 等会把非法值整个 JSON.stringify 进 message（实测可达数 MiB）——
+// 未知错误只保留类名与截断后的短摘要，原文不出边界。
+const SAFE_ERROR_SUMMARY_CHARS = 200;
+
+export function safeDriverErrorText(err: unknown): string {
+  if (err instanceof DriverOpError) {
+    const cls = err.info.errorClass ? `, class ${err.info.errorClass}` : '';
+    return `op ${err.info.opName} failed (exit ${err.info.exitCode ?? 'n/a'}${cls})`;
+  }
+  if (err instanceof Error) {
+    const head = err.message.slice(0, SAFE_ERROR_SUMMARY_CHARS);
+    const clipped = err.message.length > SAFE_ERROR_SUMMARY_CHARS ? '…' : '';
+    return `${err.name}: ${head}${clipped}`;
+  }
+  return String(err).slice(0, SAFE_ERROR_SUMMARY_CHARS);
 }
 
 export interface OpVars {
@@ -72,7 +91,7 @@ export class GitDriver {
   private readonly errorMatchers: Array<{ class: string; regexes: RegExp[] }>;
 
   constructor(
-    private readonly plugin: { spec: DriverSpec },
+    private readonly plugin: { spec: DriverSpec; manifest?: { minToolVersion: string } },
     private readonly ctx: RenderContext,
     private readonly exec: DriverExec,
   ) {
@@ -89,6 +108,25 @@ export class GitDriver {
 
   get commentSources(): CommentSourceOp[] {
     return this.plugin.spec.commentSources;
+  }
+
+  async runPreflightSteps(): Promise<DriverPreflightStepResult[]> {
+    // 限流失败折叠成普通结果会绕过 poller 的 RateLimitAbort 退避，持续加重 secondary limit。
+    let rateLimited: string | undefined;
+    const results = await runDriverPreflightSteps(
+      (cmd) => this.exec(cmd, { timeout: DRIVER_EXEC_TIMEOUT_MS, maxBuffer: DRIVER_MAX_BUFFER }),
+      this.plugin.spec.preflight,
+      { ...this.ctx, minToolVersion: this.plugin.manifest?.minToolVersion ?? '' },
+      (step, rawOutput) => {
+        if (this.classify(rawOutput) === 'RATE_LIMIT') rateLimited = step;
+      },
+    );
+    if (rateLimited !== undefined) {
+      throw new DriverOpError(`preflight ${rateLimited} failed (class RATE_LIMIT)`, {
+        opName: rateLimited, errorClass: 'RATE_LIMIT',
+      });
+    }
+    return results;
   }
 
   classify(text: string): string | undefined {
@@ -141,9 +179,10 @@ export class GitDriver {
     source: CommentSourceOp,
     vars: OpVars,
     projectPage?: (pageRows: NormalizedRow[]) => NormalizedRow[],
+    shouldStop?: (pageRows: NormalizedRow[], page: number) => boolean,
   ): Promise<NormalizedRow[]> {
     return this.runPaged('listComments', source, vars, {
-      pageCap: COMMENT_SOURCE_PAGE_CAP, capBehavior: 'fail', idField: 'id', sourceKey: source.key, projectPage,
+      pageCap: COMMENT_SOURCE_PAGE_CAP, capBehavior: 'fail', idField: 'id', sourceKey: source.key, projectPage, shouldStop,
     });
   }
 

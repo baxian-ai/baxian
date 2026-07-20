@@ -3077,7 +3077,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect(researchOpts.allowDirtyWorkdir).toBeUndefined();
     expect(researchOpts.bypassTaskStatusGate).toBeUndefined();
     expect(await armedWith()).toEqual([
-      ['task-research-restart', 'research-1', ['spec-done'], 'research-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-research-restart', 'research-1', ['spec-done'], 'research-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3164,7 +3164,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect((continueSpy.mock.calls[0]![3] as { bypassTaskStatusGate?: boolean }).bypassTaskStatusGate)
       .toBeUndefined();
     expect(await armedWith()).toEqual([
-      ['task-dev-restart', 'dev-1', ['spec-done', 'pr-created'], 'dev-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-dev-restart', 'dev-1', ['spec-done', 'pr-created'], 'dev-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3180,7 +3180,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-server-restart')).toBe(true);
     expect(await armedWith()).toEqual([
-      ['task-dev-server-restart', 'dev-1', ['spec-done', 'code-done'], 'dev-token-2', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-dev-server-restart', 'dev-1', ['spec-done', 'code-done'], 'dev-token-2', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3220,7 +3220,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       }),
     );
     expect(await armedWith()).toEqual([
-      ['task-code-restart', 'dev-1', ['pr-created'], 'code-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-code-restart', 'dev-1', ['pr-created'], 'code-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3317,7 +3317,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       }),
     );
     expect(await armedWith()).toEqual([
-      ['task-dev-spec-fix-restart', 'dev-1', ['spec-fixed'], 'dev-spec-token', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-dev-spec-fix-restart', 'dev-1', ['spec-fixed'], 'dev-spec-token', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3346,7 +3346,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect((continueSpy.mock.calls[0]![3] as { serverPriorFindings?: string }).serverPriorFindings)
       .toBeUndefined();
     expect(await armedWith()).toEqual([
-      ['task-dev-fix-restart', 'dev-1', ['pr-fixed'], 'dev-fix-token', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-dev-fix-restart', 'dev-1', ['pr-fixed'], 'dev-fix-token', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3372,7 +3372,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       }),
     );
     expect(await armedWith()).toEqual([
-      ['task-dev-fix-nophase-restart', 'dev-1', ['pr-fixed'], 'dev-fix-nophase-token', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-dev-fix-nophase-restart', 'dev-1', ['pr-fixed'], 'dev-fix-nophase-token', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3422,7 +3422,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       }),
     );
     expect(await armedWith()).toEqual([
-      ['task-dev-server-fix-restart', 'dev-1', ['code-fixed'], 'dev-server-fix-token', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-dev-server-fix-restart', 'dev-1', ['code-fixed'], 'dev-server-fix-token', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3437,7 +3437,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
 
     expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-snap-restart')).toBe(true);
     expect(await armedWith()).toEqual([
-      ['task-snap-restart', 'dev-1', ['spec-done', 'pr-created'], 'snap-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-snap-restart', 'dev-1', ['spec-done', 'pr-created'], 'snap-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3702,7 +3702,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     const opts = continueSpy.mock.calls[0]![3] as { postApproveRedispatchCount?: number };
     expect(opts.postApproveRedispatchCount).toBeUndefined();
     expect(await armedWith()).toEqual([
-      ['task-postapprove-restart', 'dev-1', ['pr-merge-ready'], 'pa-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-postapprove-restart', 'dev-1', ['pr-merge-ready'], 'pa-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -3733,7 +3733,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       }),
     );
     expect(await armedWith()).toEqual([
-      ['task-postapprove-rebuild', 'dev-1', ['pr-merge-ready'], rebuilt!.token, { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-postapprove-rebuild', 'dev-1', ['pr-merge-ready'], rebuilt!.token, { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -4680,7 +4680,7 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       }),
     );
     expect(await armedWith()).toEqual([
-      ['task-afterdone-restart', 'dev-1', ['code-ready'], 'publish-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true }],
+      ['task-afterdone-restart', 'dev-1', ['code-ready'], 'publish-token-1', { skipSnapshot: true, onlyReplaceOwnToken: true, needInputMode: 'fresh', needInputPaneCutover: true }],
     ]);
   });
 
@@ -11296,36 +11296,991 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
   });
 });
 
-describe('AgentManager need-input badge lifecycle', () => {
-  it('a continuation dispatch clears the stale need-input badge', async () => {
-    const t = await seedTask({ status: 'fixing', signalToken: 'tok123456789' });
-    await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      workdir: '/tmp/repo/.baxian-worktrees/wt',
-      needInputAt: '2026-07-06T10:00:00.000Z',
+describe('AgentManager need-input watermark persistence', () => {
+  const commit = (over: Partial<{ agentId: string; taskId: string; epoch: number; askSeq: number; answeredSeq: number }> = {}) =>
+    manager.commitNeedInputWatermark({
+      agentId: 'dev-1', taskId: 't-wm', epoch: 1, askSeq: 1, answeredSeq: 0, ...over,
     });
-    stubEnsureSession(manager);
-    stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
 
-    await expect(manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
-    const binding = await agentStore.get('dev-1');
-    expect(binding?.needInputAt).toBeUndefined();
+  async function seedWatermarkAgent(needInput?: { epoch: number; askSeq?: number; answeredSeq?: number; at?: string }): Promise<void> {
+    await seedAgent({ id: 'dev-1', taskId: 't-wm', ...(needInput ? { needInput } : {}) });
+  }
+
+  it('fences on taskId and on a stale epoch, in both directions', async () => {
+    await seedWatermarkAgent({ epoch: 2 });
+    expect(await commit({ taskId: 'other-task' })).toBe('fenced');
+    expect(await commit({ epoch: 1, askSeq: 1, answeredSeq: 0 })).toBe('fenced');
+    expect(await commit({ epoch: 1, askSeq: 1, answeredSeq: 1 })).toBe('fenced');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 2 });
   });
 
-  it('a stale watcher callback does not stamp a rebound agent', async () => {
-    await seedAgent({ id: 'dev-1', taskId: 'new-task' });
+  it('merges monotonically within the epoch and derives the badge projection', async () => {
+    await seedWatermarkAgent({ epoch: 1 });
+    expect(await commit({ askSeq: 1, answeredSeq: 0 })).toBe('ok');
+    const lit = (await agentStore.get('dev-1'))?.needInput;
+    expect(lit).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+    expect(lit?.at).toBeDefined();
 
-    await manager['setAgentNeedInput']('dev-1', true, { taskId: 'old-task' });
-    expect((await agentStore.get('dev-1'))?.needInputAt).toBeUndefined();
+    expect(await commit({ askSeq: 1, answeredSeq: 1 })).toBe('ok');
+    const cleared = (await agentStore.get('dev-1'))?.needInput;
+    expect(cleared).toEqual({ epoch: 1, askSeq: 1, answeredSeq: 1 });
 
-    await manager['setAgentNeedInput']('dev-1', true, { taskId: 'new-task' });
-    expect((await agentStore.get('dev-1'))?.needInputAt).toBeDefined();
+    expect(await commit({ askSeq: 1, answeredSeq: 0 })).toBe('ok');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+  });
 
-    await manager['setAgentNeedInput']('dev-1', false, { taskId: 'old-task' });
-    expect((await agentStore.get('dev-1'))?.needInputAt).toBeDefined();
+  it('writes a tombstone onto an empty same-epoch watermark (first-write-error recovery path)', async () => {
+    await seedWatermarkAgent({ epoch: 3 });
+    expect(await commit({ epoch: 3, askSeq: 1, answeredSeq: 1 })).toBe('ok');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 3, askSeq: 1, answeredSeq: 1 });
+  });
 
+  it('treats legacy flat needInputAt as an epoch-0 lit watermark via parse migration', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 't-wm' });
+    const raw = { id: 'dev-1', projectId: 'proj', taskId: 't-wm', updatedAt: NOW, needInputAt: '2026-07-06T10:00:00.000Z' };
+    await agentStore.update('dev-1', () => raw as never);
+    const migrated = await agentStore.get('dev-1');
+    expect(migrated?.needInput).toEqual({
+      epoch: 0, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00.000Z',
+    });
+    expect(await commit({ epoch: 0, askSeq: 1, answeredSeq: 1 })).toBe('ok');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 0, askSeq: 1, answeredSeq: 1 });
+  });
+
+  it('bump(fresh) strips seqs, bump(restore) carries them; both advance the epoch', async () => {
+    await seedWatermarkAgent({ epoch: 4, askSeq: 2, answeredSeq: 1, at: NOW });
+    const restored = await manager['bumpNeedInputEpochForArm']('dev-1', 't-wm', 'restore');
+    expect(restored).toEqual({ wm: { epoch: 5, askSeq: 2, answeredSeq: 1 }, bumped: true, snapshotBlind: false });
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 5, askSeq: 2, answeredSeq: 1 });
+    expect((await agentStore.get('dev-1'))?.needInput?.at).toBeDefined();
+
+    const fresh = await manager['bumpNeedInputEpochForArm']('dev-1', 't-wm', 'fresh');
+    expect(fresh).toEqual({ wm: { epoch: 6, askSeq: 0, answeredSeq: 0 }, bumped: true, snapshotBlind: false });
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 6, askSeq: 0, answeredSeq: 0 });
+  });
+
+  it('bump refuses to touch a foreign-task binding and reports no generation', async () => {
+    await seedAgent({ id: 'dev-1', taskId: 'other-task', needInput: { epoch: 9 } });
+    const wm = await manager['bumpNeedInputEpochForArm']('dev-1', 't-wm', 'fresh');
+    expect(wm).toEqual({ wm: null, bumped: false, snapshotBlind: true });
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 9 });
+  });
+
+  it('queues a failed commit and converges it on the retry pass', async () => {
+    await seedWatermarkAgent({ epoch: 1 });
+    const real = agentStore.update.bind(agentStore);
+    const failing = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await commit({ askSeq: 1, answeredSeq: 0 })).toBe('error');
+    failing.mockImplementation(real as never);
+    await manager['needInputRetryPass']();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+    expect(manager['needInputRetry'].size).toBe(0);
+  });
+
+  it('keeps a queued item that was raised mid-retry (snapshot-conditional dequeue)', async () => {
+    await seedWatermarkAgent({ epoch: 1 });
+    vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('down'));
+    expect(await commit({ askSeq: 1, answeredSeq: 1 })).toBe('error');
+    const key = manager['needInputRetryKey']('dev-1', 't-wm', 1);
+    expect(manager['needInputRetry'].get(key)).toEqual({ askSeq: 1, answeredSeq: 1 });
+    // A newer edge raises the queued intent after the write we are settling.
+    manager['enqueueNeedInputRetry'](key, 2, 1);
+    manager['settleNeedInputRetry'](key, 1, 1, 'ok');
+    expect(manager['needInputRetry'].get(key)).toEqual({ askSeq: 2, answeredSeq: 1 });
+    manager['settleNeedInputRetry'](key, 2, 1, 'ok');
+    expect(manager['needInputRetry'].has(key)).toBe(false);
+  });
+
+  it('drops stale-generation queue items as fenced on retry', async () => {
+    await seedWatermarkAgent({ epoch: 2 });
+    manager['enqueueNeedInputRetry'](manager['needInputRetryKey']('dev-1', 't-wm', 1), 1, 0);
+    await manager['needInputRetryPass']();
+    expect(manager['needInputRetry'].size).toBe(0);
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 2 });
+  });
+
+  it('confirmNeedInputAnswered settles the open question from the store', async () => {
+    await seedWatermarkAgent({ epoch: 1, askSeq: 2, answeredSeq: 1, at: NOW });
     await manager.notifyHumanTerminalInput('dev-1');
-    expect((await agentStore.get('dev-1'))?.needInputAt).toBeUndefined();
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 1, askSeq: 2, answeredSeq: 2 });
+  });
+
+  it('confirmNeedInputAnswered sees a queue-only pending ask and tombstones it (r7-f8 chain)', async () => {
+    await seedWatermarkAgent({ epoch: 1 });
+    vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('down'));
+    expect(await commit({ askSeq: 1, answeredSeq: 0 })).toBe('error');
+    await manager.notifyHumanTerminalInput('dev-1');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+    await manager['needInputRetryPass']();
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+  });
+
+  it('release(waiting) strips the watermark and bumps the epoch on both success branches', async () => {
+    const t = await seedTask({ id: 't-wm', status: 'review', signalToken: 'tokRel1234567' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      needInput: { epoch: 3, askSeq: 1, answeredSeq: 0, at: NOW },
+    });
+    await acquireBoundLock('dev-1');
+    await manager.releaseAgentForTask('dev-1', t.id, 'waiting');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 4 });
+  });
+
+  it('release(waiting, clearAwaitingHuman) whitelist branch also bumps (restart-repl path)', async () => {
+    const t = await seedTask({ id: 't-wm', status: 'review', signalToken: 'tokRel1234567' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      status: 'awaiting_human', awaitingPhase: 'agent_dialog_pending', awaitingSince: NOW, awaitingNonce: 'n1',
+      needInput: { epoch: 7, askSeq: 2, answeredSeq: 1, at: NOW },
+    });
+    await acquireBoundLock('dev-1');
+    await manager.releaseAgentForTask('dev-1', t.id, 'waiting', {
+      allowAwaitingHuman: true,
+      clearAwaitingHuman: true,
+      expectedHold: { phase: 'agent_dialog_pending', since: NOW, nonce: 'n1' },
+    });
+    const binding = await agentStore.get('dev-1');
+    expect(binding?.status).toBeUndefined();
+    expect(binding?.needInput).toEqual({ epoch: 8 });
+  });
+
+  it('a stale-generation write after the release gate fences instead of relighting', async () => {
+    const t = await seedTask({ id: 't-wm', status: 'review', signalToken: 'tokRel1234567' });
+    await seedAgent({
+      id: 'dev-1', taskId: t.id, paneId: '%0',
+      needInput: { epoch: 3, askSeq: 1, answeredSeq: 0, at: NOW },
+    });
+    await acquireBoundLock('dev-1');
+    await manager.releaseAgentForTask('dev-1', t.id, 'waiting');
+    expect(await commit({ epoch: 3, askSeq: 1, answeredSeq: 0 })).toBe('fenced');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 4 });
+  });
+});
+
+describe('AgentManager need-input cross-layer (real watcher)', () => {
+  interface CrossStreamer {
+    subscribeAtomic: (cbs: { onLive: (data: string) => void; onSessionGone: () => void }) => Promise<{
+      snapshot: { data: string };
+      unsubscribe: () => void;
+    }>;
+    triggerLive: (data: string) => void;
+    triggerSessionGone: () => void;
+    failNextSubscribe: () => void;
+    holdNextSubscribe: () => { release: () => void };
+    setSnapshotData: (data: string) => void;
+  }
+
+  function makeCrossLayer(): { m: AgentManager; streamer: CrossStreamer; captured: BaxianEvent[] } {
+    const lives: Array<(data: string) => void> = [];
+    const gones: Array<() => void> = [];
+    let failNext = false;
+    const holdQueue: Promise<void>[] = [];
+    let snapshotData = '';
+    const streamer: CrossStreamer = {
+      subscribeAtomic: async (cbs) => {
+        if (failNext) {
+          failNext = false;
+          throw new Error('subscribe transport down');
+        }
+        const gate = holdQueue.shift();
+        if (gate) await gate;
+        lives.push(cbs.onLive);
+        gones.push(cbs.onSessionGone);
+        return { snapshot: { data: snapshotData }, unsubscribe: () => undefined };
+      },
+      triggerLive: (data) => { for (const fn of [...lives]) fn(data); },
+      triggerSessionGone: () => { for (const fn of [...gones]) fn(); },
+      failNextSubscribe: () => { failNext = true; },
+      holdNextSubscribe: () => {
+        let release!: () => void;
+        holdQueue.push(new Promise<void>(resolve => { release = resolve; }));
+        return { release };
+      },
+      setSnapshotData: (data) => { snapshotData = data; },
+    };
+    const captured: BaxianEvent[] = [];
+    const m = makeManager({
+      paneStreamerManager: { ensure: () => streamer } as never,
+      eventBus: {
+        emit: async (event: BaxianEvent) => { captured.push(event); },
+        subscribe: () => () => undefined,
+      } as never,
+    });
+    return { m, streamer, captured };
+  }
+
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 4; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
+    }
+  };
+
+  const armVia = (
+    m: AgentManager,
+    token: string,
+    opts: Record<string, unknown> = {},
+  ): Promise<boolean> =>
+    (m as never as {
+      setupPhaseSignalWatcher: (
+        taskId: string, agentId: string, kinds: readonly string[], token: string, opts: Record<string, unknown>,
+      ) => Promise<boolean>;
+    }).setupPhaseSignalWatcher('t-xl', 'dev-1', ['pr-created'], token, opts);
+
+  async function seedCross(needInput?: AgentBindingFacts['needInput']): Promise<void> {
+    await seedTask({ id: 't-xl', status: 'in_progress', signalToken: 'tokXL12345678' });
+    await seedAgent({ id: 'dev-1', taskId: 't-xl', paneId: '%0', ...(needInput ? { needInput } : {}) });
+  }
+
+  it('restore re-arm persists the merged watermark so an error-queued answer cannot re-stick the badge', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await flush();
+    spy.mockImplementation(real as never);
+    expect((await agentStore.get('dev-1'))?.needInput?.at).toBeDefined();
+
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', onlyReplaceOwnToken: true })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a fresh same-token replay does not inherit old ordinals, so the new prompt lights from 1', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:3]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 3 });
+
+    expect(await armVia(m, 'tokXL12345678', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+    })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 0 });
+    expect(wm?.at).toBeDefined();
+  });
+
+  it('an own-token-fenced arm neither bumps the epoch nor fences the surviving watcher', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    const epochBefore = (await agentStore.get('dev-1'))?.needInput?.epoch;
+
+    expect(await armVia(m, 'tokOTHER123456', {
+      needInputMode: 'fresh', onlyReplaceOwnToken: true,
+    })).toBe(false);
+    expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(epochBefore);
+
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+  });
+
+  it('a failed re-subscribe migrates the surviving entry onto the bumped generation', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+
+    streamer.failNextSubscribe();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', onlyReplaceOwnToken: true })).toBe(false);
+    expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 0 });
+  });
+
+  it('a failed epoch bump arms with the badge disabled instead of ghost-fencing (watch survives)', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 5 });
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    spy.mockImplementation(real as never);
+
+    // Signal watching works; badge commits are disabled for this degraded generation.
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 5 });
+
+    // The next successful arm re-establishes the generation and the badge lights again.
+    expect(await armVia(m, 'tokXL12345678', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+    })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 6, askSeq: 1, answeredSeq: 0 });
+  });
+
+  it('restore migrates an answer whose write is still in flight when the entry already exited', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+
+    // The answer's store write hangs in the chain; the session dies while it is in flight.
+    const real = agentStore.update.bind(agentStore);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(agentStore, 'update').mockImplementationOnce(
+      (async (_id: string, _updater: never) => {
+        await gate;
+        throw new Error('store down');
+      }) as never,
+    );
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    streamer.triggerSessionGone();
+    spy.mockImplementation(real as never);
+
+    // Restore re-arm starts while the answer write is still unsettled: the in-flight
+    // ledger must carry {1,1} into the bump snapshot.
+    const armP = armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true });
+    release();
+    expect(await armP).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+    await m['needInputRetryPass']();
+    expect(m['needInputRetry'].size).toBe(0);
+  });
+
+  it('an answer arriving after the bump updater ran but before its write settled is lifted to the new epoch', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+
+    // Bump write fully lands but its promise is held back from the caller; the old
+    // watcher (still on the old generation, migration pending) consumes the answer,
+    // whose own write fails into the retry queue; the session then dies.
+    const real = agentStore.update.bind(agentStore);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(agentStore, 'update')
+      .mockImplementationOnce((async (id: string, updater: never) => {
+        const result = await real(id, updater as never);
+        await gate;
+        return result;
+      }) as never)
+      .mockImplementationOnce((async () => {
+        throw new Error('store down');
+      }) as never);
+    const armP = armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    streamer.triggerSessionGone();
+    release();
+    expect(await armP).toBe(true);
+    spy.mockRestore();
+    await flush();
+    await m['needInputRetryPass']();
+
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+    expect(m['needInputRetry'].size).toBe(0);
+  });
+
+  it('an answer consumed between the restore bump and the replacement subscribe still clears the badge', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+
+    // The replacement's subscribe hangs; the bump has already advanced the store. The
+    // old entry (migrated onto the new generation) consumes the answer, then dies.
+    const gate = streamer.holdNextSubscribe();
+    const armP = armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true });
+    await vi.waitFor(async () => {
+      expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    });
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await flush();
+    streamer.triggerSessionGone();
+    gate.release();
+    expect(await armP).toBe(true);
+    await flush();
+
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('restore migrates an answer that starts while the bump is queued in the store chain', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+
+    // Every store write waits on one gate: the restore bump is issued FIRST, then the
+    // answer commit starts (ledger-registered) while the bump is still queued, then the
+    // session dies. On release the bump updater must still see the in-flight answer.
+    const real = agentStore.update.bind(agentStore);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(agentStore, 'update').mockImplementation(
+      (async (id: string, updater: never) => {
+        await gate;
+        return real(id, updater as never);
+      }) as never,
+    );
+    const armP = armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    streamer.triggerSessionGone();
+    release();
+    expect(await armP).toBe(true);
+    spy.mockRestore();
+    await flush();
+
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('the ledger holds the intent until an error is queued, so a racing restore never misses it', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+
+    // The answer write settles as an error; a restore snapshot taken in ANY later
+    // promise job must see the intent in the ledger or in the retry queue.
+    const real = agentStore.update.bind(agentStore);
+    const failing = Promise.reject(new Error('store down'));
+    failing.catch(() => undefined);
+    const spy = vi.spyOn(agentStore, 'update').mockImplementationOnce((() => failing) as never);
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    streamer.triggerSessionGone();
+    spy.mockImplementation(real as never);
+    // Schedule the restore reaction directly behind the write settle, racing the
+    // commit continuation that moves the intent from the ledger to the queue.
+    const armP = failing.catch(() => undefined).then(() =>
+      armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true }));
+    expect(await armP).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('web input does not confirm an ask that lands while the clear write is still in flight', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+
+    // Hold the rearm's clear write in the store chain; question 2 arrives meanwhile.
+    const real = agentStore.update.bind(agentStore);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(agentStore, 'update').mockImplementationOnce(
+      (async (id: string, updater: never) => {
+        await gate;
+        return real(id, updater);
+      }) as never,
+    );
+    const notifyP = m.notifyHumanTerminalInput('dev-1');
+    streamer.triggerLive('[bx:need-input:tokXL12345678:2]\n');
+    release();
+    await notifyP;
+    spy.mockRestore();
+    await flush();
+
+    const wmAfter = (await agentStore.get('dev-1'))?.needInput;
+    expect(wmAfter).toMatchObject({ epoch: 1, askSeq: 2, answeredSeq: 1 });
+    expect(wmAfter?.at).toBeDefined();
+  });
+
+  it('after a same-token replay this token\'s snapshot is never used to clear or relight', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    streamer.triggerLive('[bx:need-input:tokXL12345678:2]\n');
+    await flush();
+
+    // REPL-restart replay: same token, ordinals restart at 1 for the new prompt.
+    expect(await armVia(m, 'tokXL12345678', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+      needInputPaneCutover: true,
+    })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ askSeq: 1, answeredSeq: 0 });
+
+    // Recovery sees BOTH generations of this token's ordinals. Asks are ambiguous (the
+    // superseded generation used 1 and 2), so they change nothing…
+    streamer.setSnapshotData(
+      'old [bx:need-input:tokXL12345678:1] old [bx:need-input:tokXL12345678:2] '
+      + 'current [bx:need-input:tokXL12345678:1]',
+    );
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore' })).toBe(true);
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ askSeq: 1, answeredSeq: 0 });
+
+    // An answer literal is equally unattributable (the superseded generation may have
+    // printed it while nothing was watching), so the snapshot never clears the badge…
+    streamer.setSnapshotData(
+      'old [bx:need-input:tokXL12345678:1] old [bx:input-received:tokXL12345678:1] '
+      + 'current [bx:need-input:tokXL12345678:1]',
+    );
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore' })).toBe(true);
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ askSeq: 1, answeredSeq: 0 });
+
+    // …the live answer of the current generation does.
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a rotated token is unaffected by an earlier token\'s replay history', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokOLD1234567', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokOLD1234567:1]\n');
+    await flush();
+    expect(await armVia(m, 'tokOLD1234567', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+    })).toBe(true);
+
+    // New pass, new token: its own question and its offline answer recover normally.
+    expect(await armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokNEW1234567:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput?.at).toBeDefined();
+
+    // The new token never had a replay, and the redraw put its answer above its ask.
+    streamer.setSnapshotData(
+      'answered [bx:input-received:tokNEW1234567:1] old token noise '
+      + '[bx:need-input:tokOLD1234567:1] current [bx:need-input:tokNEW1234567:1]',
+    );
+    expect(await armVia(m, 'tokNEW1234567', { needInputMode: 'restore' })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a same-token fresh replay is not relit by pre-replay asks left in a later snapshot', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput?.at).toBeDefined();
+
+    // REPL restart replay: same token, fresh mode, snapshot skipped — the question is
+    // superseded and the watermark is stripped.
+    expect(await armVia(m, 'tokXL12345678', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+      needInputPaneCutover: true,
+    })).toBe(true);
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ askSeq: 0, answeredSeq: 0 });
+
+    // A later recovery arm DOES read the snapshot, which still holds the pre-replay ask.
+    streamer.setSnapshotData('stale scrollback [bx:need-input:tokXL12345678:1]');
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore' })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ askSeq: 0, answeredSeq: 0 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('web input falls back to the store when only another task has a live watcher', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW });
+    // A leftover watcher of a previous task on the same agent.
+    await m['phaseSignalWatcher']!.start({
+      taskId: 'old-task', projectId: 'proj', agentId: 'dev-1',
+      expectedKinds: 'pr-created', token: 'tokOLD1234567',
+      needInput: { epoch: 1, askSeq: 0, answeredSeq: 0 },
+    });
+    streamer.triggerLive('');
+
+    await m.notifyHumanTerminalInput('dev-1');
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('recovers an offline reply AND the follow-up question the agent asked next', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW });
+    streamer.setSnapshotData(
+      'replied during downtime [bx:input-received:tokXL12345678:1] '
+      + 'then asked again [bx:need-input:tokXL12345678:2]',
+    );
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore' })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 2, answeredSeq: 1 });
+    expect(wm?.at).toBeDefined();
+  });
+
+  it('read-back after a failed bump also picks up questions owed by the retry queue', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+    // A later question whose write failed lives only in the queue.
+    m['enqueueNeedInputRetry'](m['needInputRetryKey']('dev-1', 't-xl', 1), 2, 1);
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true })).toBe(true);
+    spy.mockImplementation(real as never);
+
+    // The entry knows question 2 is open, so its answer is not swallowed.
+    streamer.triggerLive('[bx:input-received:tokXL12345678:2]\n');
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 1, askSeq: 2, answeredSeq: 2 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('recovers an offline reply: restore arm consumes the seq-matched answer from the snapshot', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW });
+    streamer.setSnapshotData(`replied during downtime [bx:input-received:tokXL12345678:1]`);
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore' })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('restore re-arm after session-gone merges the queued answer watermark before clearing the queue', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 0 });
+
+    // The answer's persistence fails and lands in the retry queue; the session then dies,
+    // deleting the entry — the queue holds the only proof the user answered.
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await flush();
+    spy.mockImplementation(real as never);
+    streamer.triggerSessionGone();
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput?.at).toBeDefined();
+
+    expect(await armVia(m, 'tokXL12345678', {
+      needInputMode: 'restore', skipSnapshot: true,
+    })).toBe(true);
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a superseded older-generation intent is not transplanted onto the restore watermark', async () => {
+    const { m } = makeCrossLayer();
+    // Store already moved past the old question (a fresh redispatch stripped it).
+    await seedCross({ epoch: 5, askSeq: 0, answeredSeq: 0 });
+    // A leftover intent from a generation the fresh prompt superseded.
+    m['enqueueNeedInputRetry'](m['needInputRetryKey']('dev-1', 't-xl', 3), 2, 0);
+
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 6, askSeq: 0, answeredSeq: 0 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a fully degraded restore keeps the pending question in memory until a later arm persists it', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput?.at).toBeDefined();
+
+    // Both the bump write and the watermark read-back fail: the arm degrades entirely.
+    const realUpdate = agentStore.update.bind(agentStore);
+    const realGet = agentStore.get.bind(agentStore);
+    const updateSpy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    const getSpy = vi.spyOn(agentStore, 'get').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true })).toBe(true);
+    updateSpy.mockImplementation(realUpdate as never);
+    getSpy.mockImplementation(realGet as never);
+
+    // The answer lands while commits are disabled — memory must still record it.
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await flush();
+    // The next healthy restore inherits that memory and persists the clear.
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true })).toBe(true);
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('an external terminal reply still clears the badge when the restore bump failed', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW });
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true })).toBe(true);
+    spy.mockImplementation(real as never);
+
+    // No web fallback here: the answer arrives purely as a pane signal.
+    streamer.triggerLive('[bx:input-received:tokXL12345678:1]\n');
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a failed restore bump keeps owed retry intents instead of dropping them', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW });
+    m['enqueueNeedInputRetry'](m['needInputRetryKey']('dev-1', 't-xl', 1), 1, 1);
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore', skipSnapshot: true })).toBe(true);
+    spy.mockImplementation(real as never);
+    expect(m['needInputRetry'].size).toBe(1);
+
+    await m['needInputRetryPass']();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+    expect(m['needInputRetry'].size).toBe(0);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:2]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 2, answeredSeq: 1 });
+  });
+
+  it('web input clears a lit store even when the arm degraded on a bump error', async () => {
+    const { m } = makeCrossLayer();
+    await seedCross({ epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW });
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'restore' })).toBe(true);
+    spy.mockImplementation(real as never);
+
+    await m.notifyHumanTerminalInput('dev-1');
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 1, askSeq: 1, answeredSeq: 1 });
+    expect(wm?.at).toBeUndefined();
+  });
+
+  it('a late-settling foreign-token arm cannot demote the successor generation', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokOLD1234567', { needInputMode: 'fresh' })).toBe(true);
+
+    const gate = streamer.holdNextSubscribe();
+    const lateP = armVia(m, 'tokOLD1234567', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+    await vi.waitFor(async () => {
+      expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    });
+    expect(await armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
+    expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(3);
+
+    gate.release();
+    expect(await lateP).toBe(false);
+
+    streamer.triggerLive('[bx:need-input:tokNEW1234567:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 3, askSeq: 1, answeredSeq: 0 });
+  });
+
+  it('a stale replay cannot evict a current-token pass whose subscribe is still pending', async () => {
+    const { m, streamer, captured } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokOLD1234567', { needInputMode: 'fresh' })).toBe(true);
+
+    // Reverse arrival order: the current pass claims and bumps, then hangs on subscribe;
+    // the stale replay (past its upper guard) arrives while nothing new is installed yet.
+    const successorGate = streamer.holdNextSubscribe();
+    const successorP = armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true });
+    await vi.waitFor(async () => {
+      expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    });
+    const staleP = armVia(m, 'tokOLD1234567', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+    expect(await staleP).toBe(false);
+    // The rejected replay must not have bumped either.
+    expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    successorGate.release();
+    expect(await successorP).toBe(true);
+    await flush();
+
+    // The current token owns the watch: its question lights the badge and its phase
+    // signal is consumed.
+    streamer.triggerLive('[bx:need-input:tokNEW1234567:1]\n');
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 0 });
+    expect(wm?.at).toBeDefined();
+    streamer.triggerLive('[bx:pr-created:7:tokNEW1234567]\n');
+    await flush();
+    expect(captured.some(e => e.type === 'pr.created')).toBe(true);
+  });
+
+  it('a late restore does not re-enable a degraded fresh successor onto its stale watermark', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    streamer.triggerLive('[bx:need-input:tokXL12345678:2]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 1, askSeq: 2, answeredSeq: 0 });
+
+    // Restore arm bumps (carrying the lit watermark) but hangs on subscribe; a same-token
+    // fresh replay whose bump fails then installs a degraded successor.
+    const gate = streamer.holdNextSubscribe();
+    const restoreP = armVia(m, 'tokXL12345678', {
+      needInputMode: 'restore', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+    await vi.waitFor(async () => {
+      expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    });
+    const real = agentStore.update.bind(agentStore);
+    const spy = vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
+    spy.mockImplementation(real as never);
+    gate.release();
+    expect(await restoreP).toBe(false);
+    await flush();
+
+    // The degraded successor must NOT be re-enabled onto the restore's stale watermark:
+    // its fresh ask:1 would be swallowed by the max merge and keep the badge lit.
+    const before = (await agentStore.get('dev-1'))?.needInput;
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual(before);
+  });
+
+  it('a stale replay whose bump lags a new-token arm cannot ghost-fence the successor', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokOLD1234567', { needInputMode: 'fresh' })).toBe(true);
+
+    // The stale replay passes its probe, then its bump write hangs in the store; a
+    // new-token pass arms concurrently. The arm lock must serialize them so the store
+    // and the surviving watcher land on the SAME generation.
+    const real = agentStore.update.bind(agentStore);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const spy = vi.spyOn(agentStore, 'update').mockImplementationOnce(
+      (async (id: string, updater: never) => {
+        await gate;
+        return real(id, updater as never);
+      }) as never,
+    );
+    const staleP = armVia(m, 'tokOLD1234567', {
+      needInputMode: 'fresh', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+    const successorP = armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true });
+    release();
+    // The stale arm may briefly install before the successor replaces it — a legal
+    // handover. The invariant is that store and surviving watcher land on ONE
+    // generation and the new prompt's ask reaches the badge.
+    await staleP;
+    expect(await successorP).toBe(true);
+    spy.mockRestore();
+    await flush();
+
+    streamer.triggerLive('[bx:need-input:tokNEW1234567:1]\n');
+    await flush();
+    const wm = (await agentStore.get('dev-1'))?.needInput;
+    expect(wm).toMatchObject({ askSeq: 1, answeredSeq: 0 });
+    expect(wm?.at).toBeDefined();
+  });
+
+  it('a late arm cannot resurrect on a dead generation after the successor fired and exited', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+
+    const gate = streamer.holdNextSubscribe();
+    const lateP = armVia(m, 'tokOLD1234567', { needInputMode: 'fresh', skipSnapshot: true });
+    await vi.waitFor(async () => {
+      expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(1);
+    });
+
+    expect(await armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
+    expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    // The successor consumes its phase signal and exits the watcher map entirely.
+    streamer.triggerLive('[bx:pr-created:7:tokNEW1234567]\n');
+    await flush();
+    expect(m['phaseSignalWatcher']!.has('t-xl', 'dev-1')).toBe(false);
+
+    gate.release();
+    expect(await lateP).toBe(false);
+    expect(m['phaseSignalWatcher']!.has('t-xl', 'dev-1')).toBe(false);
+
+    streamer.triggerLive('[bx:need-input:tokOLD1234567:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 2, askSeq: 0, answeredSeq: 0 });
+  });
+
+  it('a late-settling same-token arm cannot replace the successor entry', async () => {
+    const { m, streamer } = makeCrossLayer();
+    await seedCross();
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh' })).toBe(true);
+
+    const gate = streamer.holdNextSubscribe();
+    const lateP = armVia(m, 'tokXL12345678', {
+      needInputMode: 'restore', skipSnapshot: true, onlyReplaceOwnToken: true,
+    });
+    await vi.waitFor(async () => {
+      expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
+    });
+    expect(await armVia(m, 'tokXL12345678', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
+    expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(3);
+
+    gate.release();
+    expect(await lateP).toBe(false);
+
+    streamer.triggerLive('[bx:need-input:tokXL12345678:1]\n');
+    await flush();
+    expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 3, askSeq: 1, answeredSeq: 0 });
+  });
+
+  it('armPostDispatchSignalOrHold strips a superseded watermark (server fix/publish continuations)', async () => {
+    const { m } = makeCrossLayer();
+    await seedCross({ epoch: 2, askSeq: 1, answeredSeq: 0, at: NOW });
+    await (m as never as {
+      armPostDispatchSignalOrHold: (
+        taskId: string, agentId: string, kinds: readonly string[], token: string,
+      ) => Promise<void>;
+    }).armPostDispatchSignalOrHold('t-xl', 'dev-1', ['code-fixed'], 'tokXL12345678');
+    expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 3, askSeq: 0, answeredSeq: 0 });
   });
 });
 

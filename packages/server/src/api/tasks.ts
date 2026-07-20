@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import type { TaskState, TaskStatus, GithubReviewItem } from '../shared/index.js';
+import type { TaskState, TaskStatus, PrReviewItem } from '../shared/index.js';
 import {
   TASK_IMAGE_MAX_COUNT,
   TASK_CREATE_ROUTE_BODY_LIMIT,
@@ -13,7 +13,8 @@ import {
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
 import { createRunner } from '../agent/runner.js';
 import { buildGithubReviewConversation } from '../github/pr-conversation.js';
-import { PrConversationCache, githubReviewRevision } from '../github/pr-conversation-cache.js';
+import { buildDriverReviewTimeline } from '../platform/review-timeline.js';
+import { PrConversationCache, prReviewCacheRevision } from '../github/pr-conversation-cache.js';
 import { enrichTaskSnapshot } from '../state/snapshot.js';
 
 const TITLE_MAX_LEN = 200;
@@ -281,15 +282,41 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  app.get<{ Params: { id: string } }>('/tasks/:id/github-review', async (request, reply) => {
+  app.get<{ Params: { id: string } }>('/tasks/:id/pr-review', async (request, reply) => {
     const task = await app.ctx.taskStore.get(request.params.id);
     if (!task) return reply.status(404).send({ error: 'task not found' });
-    const empty: GithubReviewItem[] = [];
+    const empty: PrReviewItem[] = [];
     if (task.reviewMode === 'server') {
       return reply.send({ available: false, reason: 'server-mode', items: empty });
     }
     if (task.prNumber === undefined) {
       return reply.send({ available: false, reason: 'no-pr', items: empty });
+    }
+    if (task.reviewMode === 'git') {
+      // 终态任务不受配置锁保护：身份快照失配即按不可用兜底，不拿旧 PR 号查新仓库。
+      const binding = task.platformBinding;
+      const live = app.ctx.agentManager.platformBindingFields(task.projectId).platformBinding;
+      const bindingIntact = binding !== undefined && live !== undefined
+        && binding.mode === live.mode && binding.repoKey === live.repoKey && binding.tool === live.tool;
+      const driver = bindingIntact ? app.ctx.agentManager.platformDriverFor(task.projectId) : undefined;
+      if (!driver || binding === undefined) {
+        return reply.send({ available: false, reason: 'driver-unavailable', items: empty });
+      }
+      const prNumber = task.prNumber;
+      const timeline = await prConversationCache.get(
+        task.id,
+        prReviewCacheRevision(task, binding.repoKey),
+        () => buildDriverReviewTimeline(driver, prNumber),
+      );
+      return reply.send({
+        available: true,
+        prNumber: task.prNumber,
+        ...(task.prUrl ? { prUrl: task.prUrl } : {}),
+        items: timeline.items,
+        ...(timeline.error ? { error: timeline.error } : {}),
+        ...(timeline.rateLimited ? { rateLimited: true } : {}),
+        ...(timeline.truncated ? { truncated: true } : {}),
+      });
     }
     const repo = app.ctx.agentManager.getProjectConfig(task.projectId)?.repo;
     if (!repo || !isGitHubRepo(repo)) {
@@ -300,7 +327,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     const prNumber = task.prNumber;
     const convo = await prConversationCache.get(
       task.id,
-      githubReviewRevision(task, slug),
+      prReviewCacheRevision(task, slug),
       () => buildGithubReviewConversation(runner, slug, prNumber),
     );
     return reply.send({

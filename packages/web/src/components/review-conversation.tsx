@@ -8,7 +8,7 @@ import type {
   TaskState,
 } from '../shared/index.js';
 import { useReviewRounds, reviewRevision } from '../hooks/use-review-rounds.ts';
-import { GithubReviewEntry } from './github-review-entry.tsx';
+import { PrReviewEntry } from './pr-review-entry.tsx';
 import { TurnRow } from './review-turn-row.tsx';
 import { useT, type Messages } from '../i18n/index.tsx';
 
@@ -68,8 +68,8 @@ function responseSummary(t: Messages, response: ReviewResponse): string {
 export function ReviewConversation({ task }: Props) {
   const t = useT();
   const hasRoundRecords = task.reviewMode === 'server' || (task.specReviewRound ?? 0) > 0;
-  const hasGithubReview = task.reviewMode !== 'server' && task.prNumber !== undefined;
-  if (!hasRoundRecords && !hasGithubReview) return null;
+  const hasPrReview = task.reviewMode !== 'server' && task.prNumber !== undefined;
+  if (!hasRoundRecords && !hasPrReview) return null;
   return (
     <section className="mt-4" aria-label={t.review.sectionTitle}>
       <div className="mb-2 text-sm text-og-700">
@@ -77,7 +77,7 @@ export function ReviewConversation({ task }: Props) {
       </div>
       <div className="space-y-4">
         {hasRoundRecords && <ReviewRounds task={task} />}
-        {hasGithubReview && <GithubReviewEntry task={task} />}
+        {hasPrReview && <PrReviewEntry task={task} />}
       </div>
     </section>
   );

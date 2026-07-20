@@ -395,7 +395,7 @@ export class PaneStreamer {
     if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
     await this.alignSpawnBaseline(flagged);
     if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
-    // The attach command re-proves the pinned expectedRef (generation+claim) before exec, so a same-name successor is never attached.
+    // The attach command re-proves and attaches the pinned expectedRef before PTY streaming.
     const expected = this.expectedRef
       ? {
           serverPid: this.expectedRef.serverPid,

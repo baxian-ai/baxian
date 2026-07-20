@@ -1,5 +1,5 @@
 import { isAbsolute, normalize } from 'node:path';
-import {
+import { isBareRepoSlug,
   CONTROL_CHAR_RE, TOOL_PATTERN,
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
   type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
@@ -244,6 +244,12 @@ function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void 
           message: "non-GitHub repos in review.mode 'git' require gitCli.tool — declare it and install the matching git-driver plugin under ~/.baxian/plugins/, or use review.mode 'server'",
         });
       }
+    } else if (isBareRepoSlug(project.repo) && resolveProjectTool(project) !== 'gh') {
+      // 裸 slug 只有 gh 能 clone；不代用户合成 URL——https 与 ssh 的凭据通道不同（spec §4）。
+      errors.push({
+        path: `${path}.repo`,
+        message: "a bare owner/repo slug requires the resolved tool 'gh' (plain git cannot clone a bare slug) — declare the full https:// or ssh URL, or drop gitCli.tool",
+      });
     }
 
     const norm = repoIdentityKey(project.repo);

@@ -2,7 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { loadPluginsOrExplainWithRoots } from '../../src/platform/startup.js';
+import { loadPluginsOrExplainWithRoots, referencedGitTools, scanPluginSkillPools } from '../../src/platform/startup.js';
+import { SkillRegistry } from '../../src/skill/registry.js';
 import { MANIFEST, DRIVER } from './plugin-fixtures.js';
 
 const cfgWith = (projects: unknown[]) => ({
@@ -211,5 +212,47 @@ describe('loadPluginsOrExplainWithRoots', () => {
     expect(joined).toMatch(/forge/);
     expect(joined).toMatch(/bad2/);
     expect(joined).toMatch(/hub/);
+  });
+});
+
+
+describe('scanPluginSkillPools', () => {
+  async function loadedPlugins(roots: { builtin: string; user: string }) {
+    const r = await loadPluginsOrExplainWithRoots(cfgWith([]), roots);
+    if ('fatal' in r) throw new Error(r.fatal.join('\n'));
+    return r.registry.all();
+  }
+
+  it('skips an unreferenced user plugin whose auxiliary file is broken instead of killing startup', async () => {
+    const roots = await createRoots();
+    const pluginPath = await writeValidPlugin(roots.user, 'forge');
+    await writeFile(join(pluginPath, 'skills', 'baxian-cli-forge', 'bad.bin'), Buffer.from([0xff]));
+    const healthy = await writeValidPlugin(roots.user, 'glab');
+    void healthy;
+    const registry = new SkillRegistry();
+    await registry.scan();
+    const plugins = await loadedPlugins(roots);
+    await scanPluginSkillPools(registry, plugins, new Set());
+    expect(registry.pluginSkillNames({ pluginTools: ['forge'] })).toEqual([]);
+    expect(registry.pluginSkillNames({ pluginTools: ['glab'] })).toEqual(['baxian-cli-glab']);
+  });
+
+  it('fails startup when the broken plugin is referenced by a project', async () => {
+    const roots = await createRoots();
+    const pluginPath = await writeValidPlugin(roots.user, 'forge');
+    await writeFile(join(pluginPath, 'skills', 'baxian-cli-forge', 'bad.bin'), Buffer.from([0xff]));
+    const registry = new SkillRegistry();
+    await registry.scan();
+    const plugins = await loadedPlugins(roots);
+    await expect(scanPluginSkillPools(registry, plugins, new Set(['forge']))).rejects.toThrow(/invalid UTF-8/);
+  });
+
+  it('resolves referenced tools from effective git projects only', () => {
+    const cfg = cfgWith([
+      { id: 'a', repo: 'https://gl.example.com/g/a.git', merge: null, review: { mode: 'git' }, gitCli: { tool: 'glab' }, agent: [] },
+      { id: 'b', repo: 'https://github.com/o/r.git', merge: null, review: { mode: 'git' }, agent: [] },
+      { id: 'c', repo: 'https://gl.example.com/g/c.git', merge: null, review: { mode: 'server' }, gitCli: { tool: 'forge' }, agent: [] },
+    ]);
+    expect([...referencedGitTools(cfg)].sort()).toEqual(['gh', 'glab']);
   });
 });

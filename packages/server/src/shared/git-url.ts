@@ -44,6 +44,10 @@ export function isSafeGitHost(host: string): boolean {
   return host.split(/[.:]/).every(label => HOST_LABEL_RE.test(label));
 }
 
+export function isBareRepoSlug(repo: string): boolean {
+  return BARE_SLUG_RE.test(repo.trim());
+}
+
 export function isGitHubRepo(repo: string): boolean {
   const parsed = parseGitRemote(repo);
   if (parsed) return parsed.host.split(':')[0] === 'github.com';

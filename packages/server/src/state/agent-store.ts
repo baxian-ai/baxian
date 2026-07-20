@@ -1,6 +1,6 @@
 import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { AgentBindingFacts } from '../shared/index.js';
+import type { AgentBindingFacts, NeedInputWatermark } from '../shared/index.js';
 
 export type AgentStoreChangeKind = 'set' | 'delete';
 export type AgentStoreListener = (kind: AgentStoreChangeKind, agentId: string) => void;
@@ -150,6 +150,29 @@ function normalizeBinding(raw: Record<string, unknown>, fallbackId: string): Age
   if (typeof raw.awaitingReason === 'string') binding.awaitingReason = raw.awaitingReason;
   if (typeof raw.awaitingSince === 'string') binding.awaitingSince = raw.awaitingSince;
   if (typeof raw.awaitingNonce === 'string') binding.awaitingNonce = raw.awaitingNonce;
-  if (typeof raw.needInputAt === 'string') binding.needInputAt = raw.needInputAt;
+  const needInput = normalizeNeedInput(raw);
+  if (needInput) binding.needInput = needInput;
   return binding;
+}
+
+function normalizeNeedInput(raw: Record<string, unknown>): NeedInputWatermark | undefined {
+  const nested = raw.needInput;
+  if (nested && typeof nested === 'object') {
+    const o = nested as Record<string, unknown>;
+    if (typeof o.epoch === 'number' && Number.isInteger(o.epoch) && o.epoch >= 0) {
+      const w: NeedInputWatermark = { epoch: o.epoch };
+      if (typeof o.askSeq === 'number' && Number.isInteger(o.askSeq) && o.askSeq >= 0) w.askSeq = o.askSeq;
+      if (typeof o.answeredSeq === 'number' && Number.isInteger(o.answeredSeq) && o.answeredSeq >= 0) {
+        w.answeredSeq = o.answeredSeq;
+      }
+      if (typeof o.at === 'string') w.at = o.at;
+      if (typeof o.cutoverToken === 'string') w.cutoverToken = o.cutoverToken;
+      return w;
+    }
+  }
+  // Pre-watermark data: a lit flat needInputAt maps to "epoch 0, question #1 open".
+  if (typeof raw.needInputAt === 'string') {
+    return { epoch: 0, askSeq: 1, answeredSeq: 0, at: raw.needInputAt };
+  }
+  return undefined;
 }

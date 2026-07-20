@@ -842,9 +842,9 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
     }));
   });
 
-  it('dev 正在等用户输入（needInputAt）→ 兜底不得覆盖问题，不 re-continue', async () => {
+  it('dev 正在等用户输入（needInput.at）→ 兜底不得覆盖问题，不 re-continue', async () => {
     await seedTask({ status: 'fixing' });
-    await seedDev({ needInputAt: NOW });
+    await seedDev({ needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: NOW } });
     devObs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
     const continueSpy = vi.spyOn(manager, 'continueSession');
 
@@ -1197,9 +1197,9 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('R32：pending 补派前复核 needInputAt——QA 正等人回答时不得覆盖问题（与兜底同门禁）', async () => {
+  it('R32：pending 补派前复核 needInput.at——QA 正等人回答时不得覆盖问题（与兜底同门禁）', async () => {
     const t = await seedTask();
-    await seedQa({ needInputAt: new Date().toISOString() });
+    await seedQa({ needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: new Date().toISOString() } });
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
@@ -1212,7 +1212,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
 
   it('R32：等人回答的阻塞同样有界升级（超预算一次性告警，标注 blockedBy）', async () => {
     const t = await seedTask();
-    await seedQa({ needInputAt: new Date().toISOString() });
+    await seedQa({ needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: new Date().toISOString() } });
     manager.registerPendingDispatchRetry(
       t.id,
       { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! },
@@ -1229,11 +1229,11 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(alerts[0].data).toMatchObject({ blockedBy: 'need-input' });
   });
 
-  it('R32：dev-fix pending 补派前同样复核 needInputAt', async () => {
+  it('R32：dev-fix pending 补派前同样复核 needInput.at', async () => {
     const t = await seedTask({ status: 'fixing' });
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, workdir: '/tmp/repo', paneId: '%1',
-      needInputAt: new Date().toISOString(), startedAt: NOW, updatedAt: NOW,
+      needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: new Date().toISOString() }, startedAt: NOW, updatedAt: NOW,
     } as AgentBindingFacts);
     manager.registerPendingDispatchRetry(t.id, { kind: 'dev-fix', agentId: 'dev-1', signalToken: t.signalToken! });
     statusStore.set('dev-1', {

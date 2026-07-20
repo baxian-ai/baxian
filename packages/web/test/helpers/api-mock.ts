@@ -54,7 +54,7 @@ export function createApiMock(): ApiModule {
         code: vi.fn(),
         reviews: vi.fn(),
         interdiff: vi.fn(),
-        githubReview: vi.fn(),
+        prReview: vi.fn(),
         dispatch: vi.fn(),
       },
       projects: {

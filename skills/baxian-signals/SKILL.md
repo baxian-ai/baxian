@@ -15,6 +15,7 @@ baxian scans the pane fuzzily (strips ANSI escapes and whitespace), so a TUI sof
 
 - Two-segment: `[bx:KIND:TOKEN]` — for kinds with no payload.
 - Three-segment: `[bx:pr-created:<pr_number>:TOKEN]` — `pr-created` always carries the PR number; `code-ready` may carry it (publish-as-PR).
+- Actor form: `[bx:pr-created:<pr_number>:<base64url-actor-id>:TOKEN]` — the git-pr flow (descriptor carries `cli:`) inserts your base64url-encoded platform account id between the PR number and the token; your `baxian-cli-<tool>` skill §Create tells you how to compute it. Use the plain three-segment form only when no `cli:` field is present.
 
 If your runtime's TUI renders assistant markdown and would turn a bare `[bx:...]` into a link — dropping the square brackets from what baxian captures — wrap the signal in inline-code backticks so the brackets survive to the pane: `` `[bx:KIND:TOKEN]` ``. Backticks are always safe to add, so when in doubt wrap every signal.
 
@@ -27,7 +28,7 @@ signal: pr-fixed
 token: a1b2c3d4e5f6
 ```
 
-1. Build the wire form `[bx:KIND:TOKEN]` — KIND = the selected field's value, TOKEN = the `token:` value. A kind that carries a PR number (see Format) takes the number of the PR you just created with `gh pr create`; the descriptor has no PR-number field.
+1. Build the wire form `[bx:KIND:TOKEN]` — KIND = the selected field's value, TOKEN = the `token:` value. A kind that carries a PR number (see Format) takes the number of the PR you just created (with `gh pr create`, or with your `baxian-cli-<tool>` skill's create command in the git-pr flow); the descriptor has no PR-number field.
 2. Emit the filled signal **alone on its own line**.
 3. **Never emit an angle-bracket placeholder** like `[bx:pr-fixed:<token>]` verbatim — the scanner's strict regex cannot match placeholders, so it fires nothing and the task hangs forever waiting on a signal.
 4. Emit **exactly once**, only when the route's precondition holds. The token rotates every dispatch, so a stale or guessed token never fires.
@@ -51,6 +52,8 @@ GitHub PR flow:
 | `pr-changes-requested` | QA requests changes — 422 fallback only |
 | `pr-fixed` | dev addressed all review feedback |
 | `pr-merge-ready` | post-approve feedback handled clean; safe to merge |
+
+In the git-pr flow (descriptor carries `cli:`) verdicts travel only as platform review comments carrying the paired verdict tokens — the `pr-approved` / `pr-changes-requested` pane signals belong to the legacy github-pr flow and are never emitted there.
 
 SDD spec flow:
 
@@ -81,10 +84,22 @@ Own line, repo-relative path, ≤200 lines, then wait — baxian injects the con
 
 ## Need-input side-channel
 
-When you ask your human partner a question and pause for their answer (see the baxian-task-check skill), also emit, on its own line, with the current `token:` value:
+A paired ask/answer protocol. Neither signal consumes the phase-signal watch or advances the task.
+
+**Ask** — when you ask your human partner a question and pause for their answer, also emit, on its own line:
 
 ```
-[bx:need-input:<token>]
+[bx:need-input:<token>:<n>]
 ```
 
-baxian shows a waiting badge in its UI so the user knows to open your terminal. This does NOT consume the phase-signal watch and does not advance the task — emit it each time you ask. The badge clears when the user types into your terminal or when your next phase signal fires.
+`<token>` is the current dispatch's `token:` value; `<n>` is the question's ordinal within this dispatch — 1 for your first question, incremented by 1 for every later one (also when re-asking the same question). baxian shows a waiting badge in its UI so the user knows to open your terminal.
+
+**Answer received** — when the answer arrives (typed reply, or an AskUserQuestion tool result), emit at the earliest point of your next output, on its own line, with the SAME `<n>` as the question it answers:
+
+```
+[bx:input-received:<token>:<n>]
+```
+
+This clears the waiting badge for every reply path (web terminal, external `tmux attach`, single-key picker choices alike). The badge also clears when the user submits input through baxian's web terminal, and at the latest when your next phase signal fires — but the paired confirm is what keeps it accurate, so emit it every time.
+
+Keep the ordinals honest and monotonic: baxian ignores replayed or out-of-order ordinals, so a wrong `<n>` can only delay the badge, never corrupt it.

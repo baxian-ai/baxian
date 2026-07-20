@@ -199,6 +199,11 @@ export const zhCN: Messages = {
     specApprovalAutoLabel: 'QA Approve 后自动开始编码',
     reviewModeLabel: 'Review 模式',
     reviewModeFollowGlobalLabel: '跟随全局',
+    reviewModeGitLabel: 'Git (PR/MR)',
+    reviewModeServerLabel: 'Server',
+    gitCliToolLabel: 'Git CLI 工具',
+    gitCliToolPlaceholder: '如 forge',
+    gitCliNotesLabel: 'CLI 实例说明（可选）',
     createdToastTitle: (projectId) => `项目 ${projectId} 已创建`,
   },
   createAgent: {
@@ -476,11 +481,12 @@ export const zhCN: Messages = {
     interdiffUnavailableReleased: 'Dev 已不再绑定该任务，增量不可用',
     interdiffUnavailableGeneric: '增量视图暂不可用',
   },
-  githubReview: {
+  prReview: {
     reasonServerMode: '该 task 为 server 评审模式，代码评审记录见任务详情的「评审记录」。',
     reasonServerModeEntry: '该 task 为 server 评审模式，代码评审记录见 server 评审轮次。',
     reasonNoPr: '该 task 还没有 PR，暂无代码评审记录。',
     reasonNotGithub: '该 task 的仓库不是 GitHub 仓库，无法拉取 PR 评审记录。',
+    reasonDriverUnavailable: '该项目当前无法解析 git 驱动，无法拉取 PR 评审记录。',
     codeReviewHeading: '代码评审',
     fetchFailed: (detail) => `评审记录拉取失败：${detail}`,
     partialFetchFailed: (detail) => `部分评审记录拉取失败：${detail}（仅展示已获取的部分）`,
@@ -492,6 +498,8 @@ export const zhCN: Messages = {
     bodyTruncated: '内容较大，已截断。',
     truncatedSuffix: '（已截断）',
     noReviewBodyFallback: '无评审正文',
+    ghostAuthor: 'ghost（账号已注销）',
+    listTruncated: '该 PR 评论过多，仅展示靠前的一部分。',
     commitFallback: 'commit',
   },
   toast: {

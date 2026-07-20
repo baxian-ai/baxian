@@ -201,6 +201,14 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
+      try {
+        await app.ctx.agentManager.ensurePluginSkillPools(validated);
+      } catch (err) {
+        return reply.status(400).send({
+          error: `git-driver plugin skill pool is unusable for this config: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+
       const mustRestart = requiresRestart(current.server, validated.server);
       // 扫描与提交经 manager 任务锁成栅栏：与 createTask 的「读配置快照+落任务」串行，
       // 关闭「扫描时无任务 → 并发建任务 → 提交换身份」的 TOCTOU（spec §4 活动任务锁）

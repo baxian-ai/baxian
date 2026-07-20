@@ -1,35 +1,38 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import type { GithubReviewItem, GithubReviewVerdict } from '../shared/index.js';
+import type { PrReviewItem, PrReviewVerdict } from '../shared/index.js';
 import {
-  GITHUB_REVIEW_VERDICT_CLASS,
-  groupGithubReviewRounds,
-  githubReviewItemAnchor,
-  githubReviewItemKey,
-  githubReviewRevision,
-  githubReviewRoundKey,
-  type GithubReviewRound,
-} from '../shared/github-review.js';
+  PR_REVIEW_VERDICT_CLASS,
+  groupPrReviewRounds,
+  prReviewItemAnchor,
+  prReviewItemKey,
+  prReviewRevision,
+  prReviewRoundKey,
+  type PrReviewRound,
+} from '../shared/pr-review.js';
 import { useTask } from '../hooks/use-events.ts';
-import { useGithubReview } from '../hooks/use-github-review.ts';
+import { usePrReview } from '../hooks/use-pr-review.ts';
 import { MarkdownLite } from '../components/markdown-lite.tsx';
 import { useT, type Messages } from '../i18n/index.tsx';
 
-const VERDICT_LABEL: Record<GithubReviewVerdict, string> = {
+const VERDICT_LABEL: Record<PrReviewVerdict, string> = {
   approve: 'approve',
   'request-changes': 'request-changes',
   comment: 'comment',
 };
 
-function reasonOf(reason?: string): 'server-mode' | 'no-pr' | 'not-github' | undefined {
-  return reason === 'server-mode' || reason === 'no-pr' || reason === 'not-github' ? reason : undefined;
+function reasonOf(reason?: string): 'server-mode' | 'no-pr' | 'not-github' | 'driver-unavailable' | undefined {
+  return reason === 'server-mode' || reason === 'no-pr' || reason === 'not-github' || reason === 'driver-unavailable'
+    ? reason
+    : undefined;
 }
 
 function reasonText(t: Messages): Record<NonNullable<ReturnType<typeof reasonOf>>, string> {
   return {
-    'server-mode': t.githubReview.reasonServerMode,
-    'no-pr': t.githubReview.reasonNoPr,
-    'not-github': t.githubReview.reasonNotGithub,
+    'server-mode': t.prReview.reasonServerMode,
+    'no-pr': t.prReview.reasonNoPr,
+    'not-github': t.prReview.reasonNotGithub,
+    'driver-unavailable': t.prReview.reasonDriverUnavailable,
   };
 }
 
@@ -39,19 +42,19 @@ function fmt(ts?: string): string {
   return m ? `${m[1]} ${m[2]}` : ts;
 }
 
-export function GithubReviewPage() {
+export function PrReviewPage() {
   const t = useT();
   const { taskId = '' } = useParams();
   const navigate = useNavigate();
   const { hash } = useLocation();
   const { data: task } = useTask(taskId);
-  const revision = task ? githubReviewRevision(task) : undefined;
-  const { data, loaded, error } = useGithubReview(taskId, revision);
+  const revision = task ? prReviewRevision(task) : undefined;
+  const { data, loaded, error } = usePrReview(taskId, revision);
   const [flashId, setFlashId] = useState<string | null>(null);
 
   const prNumber = data?.prNumber ?? task?.prNumber;
   const prUrl = data?.prUrl ?? task?.prUrl;
-  const rounds = data ? groupGithubReviewRounds(data.items) : [];
+  const rounds = data ? groupPrReviewRounds(data.items) : [];
   const itemsReady = loaded && !error && data?.available === true && data.items.length > 0;
 
   const landedRef = useRef<string | null>(null);
@@ -96,7 +99,7 @@ export function GithubReviewPage() {
         <span className="text-sm font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
-        <span className="pill">{t.githubReview.codeReviewHeading}</span>
+        <span className="pill">{t.prReview.codeReviewHeading}</span>
         {prUrl && prNumber !== undefined && (
           <a href={prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
             {t.taskDetail.viewPr(prNumber)}
@@ -111,19 +114,22 @@ export function GithubReviewPage() {
       )}
       {loaded && !error && data?.available &&
         (data.items.length === 0 ? (
-          data.error ? (
-            <div className="text-sm text-accent">{t.githubReview.fetchFailed(data.error)}</div>
+          data.truncated ? (
+            <div className="text-sm text-accent">{t.prReview.listTruncated}</div>
+          ) : data.error ? (
+            <div className="text-sm text-accent">{t.prReview.fetchFailed(data.error)}</div>
           ) : (
             <div className="text-sm text-og-400">{t.review.notStarted}</div>
           )
         ) : (
           <>
             {data.error && (
-              <div className="mb-3 text-xs text-accent">{t.githubReview.partialFetchFailed(data.error)}</div>
+              <div className="mb-3 text-xs text-accent">{t.prReview.partialFetchFailed(data.error)}</div>
             )}
+            {data.truncated && <div className="mb-3 text-xs text-accent">{t.prReview.listTruncated}</div>}
             <div className="space-y-5">
               {rounds.map((round, i) => (
-                <RoundBlock key={githubReviewRoundKey(round, String(i))} round={round} index={i} flashId={flashId} />
+                <RoundBlock key={prReviewRoundKey(round, String(i))} round={round} index={i} flashId={flashId} />
               ))}
             </div>
           </>
@@ -132,7 +138,7 @@ export function GithubReviewPage() {
   );
 }
 
-function RoundBlock({ round, index, flashId }: { round: GithubReviewRound; index: number; flashId: string | null }) {
+function RoundBlock({ round, index, flashId }: { round: PrReviewRound; index: number; flashId: string | null }) {
   const t = useT();
   const label = round.review ? t.agents.round(index + 1) : t.status.in_progress;
   return (
@@ -140,7 +146,9 @@ function RoundBlock({ round, index, flashId }: { round: GithubReviewRound; index
       <div className="mb-1.5 text-xs font-medium text-og-700">{label}</div>
       <div className="space-y-2">
         {round.items.map((it, itemIndex) => (
-          <ItemRow key={githubReviewItemKey(it, `${index}-${itemIndex}`)} item={it} flashId={flashId} />
+          it.kind === 'review'
+            ? <ReviewBlock key={prReviewItemKey(it, `${index}-${itemIndex}`)} item={it} flashId={flashId} />
+            : <ItemRow key={prReviewItemKey(it, `${index}-${itemIndex}`)} item={it} flashId={flashId} />
         ))}
         {round.review && <ReviewBlock item={round.review} flashId={flashId} />}
       </div>
@@ -148,18 +156,18 @@ function RoundBlock({ round, index, flashId }: { round: GithubReviewRound; index
   );
 }
 
-function itemCardClass(item: GithubReviewItem, flashId: string | null): string {
-  const anchor = githubReviewItemAnchor(item);
+function itemCardClass(item: PrReviewItem, flashId: string | null): string {
+  const anchor = prReviewItemAnchor(item);
   return `card p-3 text-sm${anchor && anchor === flashId ? ' ring-2 ring-accent' : ''}`;
 }
 
-function ItemRow({ item, flashId }: { item: GithubReviewItem; flashId: string | null }) {
+function ItemRow({ item, flashId }: { item: PrReviewItem; flashId: string | null }) {
   const t = useT();
   if (item.kind === 'commit') {
     return (
-      <div id={githubReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
+      <div id={prReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
         <div className="mb-1 flex flex-wrap items-center gap-2">
-          <span className="pill shrink-0">{t.githubReview.commitPill}</span>
+          <span className="pill shrink-0">{t.prReview.commitPill}</span>
           {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
           {item.author && <span className="text-xs text-og-400">{item.author}</span>}
           {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
@@ -170,16 +178,18 @@ function ItemRow({ item, flashId }: { item: GithubReviewItem; flashId: string | 
   }
   const isInline = item.kind === 'review-comment';
   return (
-    <div id={githubReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
+    <div id={prReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className="pill shrink-0">{isInline ? t.githubReview.inlineComment : t.githubReview.comment}</span>
-        {item.author && <span className="font-medium text-og-700">{item.author}</span>}
+        <span className="pill shrink-0">{isInline ? t.prReview.inlineComment : t.prReview.comment}</span>
+        {item.author
+          ? <span className="font-medium text-og-700">{item.author}</span>
+          : <span className="text-xs italic text-og-400">{t.prReview.ghostAuthor}</span>}
         {isInline && item.path && (
           <span className="min-w-0 break-all font-mono text-xs text-og-500">
             {item.line !== undefined ? `${item.path}:${item.line}` : item.path}
           </span>
         )}
-        {item.inReplyTo && <span className="text-xs text-og-400">{t.githubReview.replyIndicator}</span>}
+        {item.inReplyTo && <span className="text-xs text-og-400">{t.prReview.replyIndicator}</span>}
         {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
       </div>
       <Body item={item} />
@@ -187,26 +197,32 @@ function ItemRow({ item, flashId }: { item: GithubReviewItem; flashId: string | 
   );
 }
 
-function ReviewBlock({ item, flashId }: { item: GithubReviewItem; flashId: string | null }) {
+function ReviewBlock({ item, flashId }: { item: PrReviewItem; flashId: string | null }) {
   const t = useT();
   const verdict = item.verdict ?? 'comment';
   return (
-    <div id={githubReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
+    <div id={prReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
       <div className="mb-1 flex flex-wrap items-center gap-2">
         <span className="shrink-0 min-w-[1.75rem] text-xs font-semibold tracking-wide text-og-600">
           {t.review.roleQa}
         </span>
-        <span className={GITHUB_REVIEW_VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
-        {item.author && <span className="text-xs text-og-400">{item.author}</span>}
+        <span className={PR_REVIEW_VERDICT_CLASS[verdict]}>{VERDICT_LABEL[verdict]}</span>
+        {item.reviewState && <span className="pill shrink-0">{item.reviewState}</span>}
+        {item.author
+          ? <span className="text-xs text-og-400">{item.author}</span>
+          : <span className="text-xs italic text-og-400">{t.prReview.ghostAuthor}</span>}
         {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
+        {!item.commitSha && item.anchorSha && (
+          <span className="font-mono text-xs text-og-500">{item.anchorSha.slice(0, 9)}</span>
+        )}
         {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
       </div>
-      <Body item={item} placeholder={t.githubReview.noReviewBody} />
+      <Body item={item} placeholder={t.prReview.noReviewBody} />
     </div>
   );
 }
 
-function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: string }) {
+function Body({ item, placeholder }: { item: PrReviewItem; placeholder?: string }) {
   const t = useT();
   return (
     <>
@@ -217,7 +233,7 @@ function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: str
       ) : placeholder ? (
         <div className="text-og-400">{placeholder}</div>
       ) : null}
-      {item.bodyTruncated && <div className="mt-1 text-xs text-accent">{t.githubReview.bodyTruncated}</div>}
+      {item.bodyTruncated && <div className="mt-1 text-xs text-accent">{t.prReview.bodyTruncated}</div>}
     </>
   );
 }

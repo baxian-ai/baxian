@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import type { GithubReviewConversation, TaskState } from '../../src/shared/index.js';
+import type { PrReviewConversation, TaskState } from '../../src/shared/index.js';
 
 const navigateMock = vi.fn();
 vi.mock('../../src/api.ts', async () => (await import('../helpers/api-mock.ts')).createApiMock());
@@ -11,10 +11,10 @@ vi.mock('react-router-dom', async (orig) => ({
 }));
 
 import { api } from '../../src/api.ts';
-import { GithubReviewEntry } from '../../src/components/github-review-entry.tsx';
+import { PrReviewEntry } from '../../src/components/pr-review-entry.tsx';
 import { makeTask } from '../helpers/fixtures.ts';
 
-const ghMock = vi.mocked(api.tasks.githubReview);
+const ghMock = vi.mocked(api.tasks.prReview);
 
 function task(overrides: Partial<TaskState> = {}): TaskState {
   return makeTask({ id: 'task-9', reviewRound: 0, status: 'review', prNumber: 7, ...overrides });
@@ -23,7 +23,7 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
 function renderEntry(t: TaskState) {
   render(
     <MemoryRouter>
-      <GithubReviewEntry task={t} />
+      <PrReviewEntry task={t} />
     </MemoryRouter>,
   );
 }
@@ -34,7 +34,7 @@ beforeEach(() => {
 });
 afterEach(() => cleanup());
 
-describe('GithubReviewEntry', () => {
+describe('PrReviewEntry', () => {
   it('renders the Code review process split into rounds and turns', async () => {
     ghMock.mockResolvedValue({
       available: true,
@@ -45,7 +45,7 @@ describe('GithubReviewEntry', () => {
         { kind: 'review', id: '11', author: 'qa', body: 'please fix', verdict: 'request-changes' },
         { kind: 'review', id: '12', author: 'qa', body: 'lgtm', verdict: 'approve' },
       ],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(screen.getByText('Code review')).toBeTruthy();
     expect(await screen.findByText('Round 1')).toBeTruthy();
@@ -66,7 +66,7 @@ describe('GithubReviewEntry', () => {
         { kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1' },
         { kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' },
       ],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     const qa = await screen.findByText('QA');
     expect(qa.className).toContain('text-og-600');
@@ -80,7 +80,7 @@ describe('GithubReviewEntry', () => {
     ghMock.mockResolvedValue({
       available: true,
       items: [{ kind: 'issue-comment', id: 'i1', author: 'human-reviewer', body: 'please recheck' }],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText('In progress')).toBeTruthy();
     expect(screen.getByText('Comment')).toBeTruthy();
@@ -103,7 +103,7 @@ describe('GithubReviewEntry', () => {
           inReplyTo: true,
         },
       ],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText('Response')).toBeTruthy();
     expect(screen.getByText(/human-reviewer · src\/a\.ts:42 · please recheck this line/)).toBeTruthy();
@@ -114,7 +114,7 @@ describe('GithubReviewEntry', () => {
     ghMock.mockResolvedValue({
       available: true,
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     const title = screen.getByText('Code review');
     expect(title.className).toContain('text-xs');
@@ -126,6 +126,42 @@ describe('GithubReviewEntry', () => {
     expect(qa.className).not.toContain('font-medium');
   });
 
+  it('badges a token verdict carried by a non-review comment as the QA round verdict', async () => {
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [
+        { kind: 'issue-comment', id: 'c1', author: 'dev', body: 'progress note', createdAt: '2026-06-01T10:00:00Z' },
+        {
+          kind: 'issue-comment', id: 'c9', author: 'qa', body: 'needs work', createdAt: '2026-06-01T10:05:00Z',
+          verdict: 'request-changes', roundToken: '123456abcdef',
+        },
+      ],
+    } as PrReviewConversation);
+    renderEntry(task());
+    expect(await screen.findByText('request-changes')).toBeTruthy();
+    const row = screen.getByText('request-changes').closest('button, [role], div');
+    expect(row).toBeTruthy();
+  });
+
+  it('says the history was truncated rather than "not started" for an empty truncated result', async () => {
+    ghMock.mockResolvedValue({ available: true, prNumber: 7, truncated: true, items: [] } as PrReviewConversation);
+    renderEntry(task());
+    expect(await screen.findByText(/too many comments/)).toBeTruthy();
+    expect(screen.queryByText('Review has not started')).toBeNull();
+  });
+
+  it('surfaces the server-side truncation notice in the compact entry', async () => {
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      truncated: true,
+      items: [{ kind: 'issue-comment', id: 'c1', author: 'dev', body: 'note' }],
+    } as PrReviewConversation);
+    renderEntry(task());
+    expect(await screen.findByText(/too many comments/)).toBeTruthy();
+  });
+
   it('navigates to the review page anchored at the clicked record', async () => {
     ghMock.mockResolvedValue({
       available: true,
@@ -134,21 +170,21 @@ describe('GithubReviewEntry', () => {
         { kind: 'review-comment', id: '21', body: 'nit', path: 'a.ts', line: 12, createdAt: '2026-06-01T10:05:00Z' },
         { kind: 'review', id: 'r1', body: 'ok', verdict: 'approve', createdAt: '2026-06-01T10:10:00Z' },
       ],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ id: 'task-42', reviewMode: 'github' }));
 
     fireEvent.click((await screen.findByText('Submit code changes')).closest('button')!);
-    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/github-review#gh-commit-c1');
+    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/pr-review#pr-commit-c1');
 
     fireEvent.click(screen.getByText('Inline comment').closest('button')!);
-    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/github-review#gh-review-comment-21');
+    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/pr-review#pr-review-comment-21');
 
     fireEvent.click(screen.getByText('Review').closest('button')!);
-    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/github-review#gh-review-r1');
+    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/pr-review#pr-review-r1');
   });
 
   it('shows an empty hint when the PR has no review items', async () => {
-    ghMock.mockResolvedValue({ available: true, items: [] } as GithubReviewConversation);
+    ghMock.mockResolvedValue({ available: true, items: [] } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText('Review has not started')).toBeTruthy();
   });
@@ -160,7 +196,7 @@ describe('GithubReviewEntry', () => {
         { kind: 'review', id: 'r1', body: 'needs work', verdict: 'request-changes' },
         { kind: 'commit', id: 'c2', body: 'fix: follow-up', commitSha: 'c2' },
       ],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText('Round 1')).toBeTruthy();
     expect(screen.getByText('In progress')).toBeTruthy();
@@ -172,7 +208,7 @@ describe('GithubReviewEntry', () => {
       available: true,
       error: 'reviews: rate limited',
       items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
-    } as GithubReviewConversation);
+    } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText(/Some review records failed to fetch: reviews: rate limited/)).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
@@ -183,15 +219,15 @@ describe('GithubReviewEntry', () => {
       .mockResolvedValueOnce({
         available: true,
         items: [{ kind: 'review', id: 'r1', body: 'old review', verdict: 'comment' }],
-      } as GithubReviewConversation)
+      } as PrReviewConversation)
       .mockResolvedValueOnce({
         available: true,
         items: [{ kind: 'review-comment', id: 'c2', body: 'new comment', path: 'a.ts', line: 7 }],
-      } as GithubReviewConversation);
+      } as PrReviewConversation);
 
     const { rerender } = render(
       <MemoryRouter>
-        <GithubReviewEntry task={task({ reviewMode: 'github', reviewDispatchedAt: '2026-07-02T09:00:00Z' })} />
+        <PrReviewEntry task={task({ reviewMode: 'github', reviewDispatchedAt: '2026-07-02T09:00:00Z' })} />
       </MemoryRouter>,
     );
     expect(await screen.findByText('old review')).toBeTruthy();
@@ -199,7 +235,7 @@ describe('GithubReviewEntry', () => {
 
     rerender(
       <MemoryRouter>
-        <GithubReviewEntry task={task({ reviewMode: 'github', reviewDispatchedAt: '2026-07-02T09:10:00Z' })} />
+        <PrReviewEntry task={task({ reviewMode: 'github', reviewDispatchedAt: '2026-07-02T09:10:00Z' })} />
       </MemoryRouter>,
     );
 
@@ -212,15 +248,15 @@ describe('GithubReviewEntry', () => {
       .mockResolvedValueOnce({
         available: true,
         items: [{ kind: 'review', id: 'r1', body: 'old review', verdict: 'comment' }],
-      } as GithubReviewConversation)
+      } as PrReviewConversation)
       .mockResolvedValueOnce({
         available: true,
         items: [{ kind: 'review-comment', id: 'c2', body: 'new inline reply', author: 'human', path: 'a.ts', line: 7, inReplyTo: true }],
-      } as GithubReviewConversation);
+      } as PrReviewConversation);
 
     const { rerender } = render(
       <MemoryRouter>
-        <GithubReviewEntry task={task({ reviewMode: 'github', prFeedbackReceivedAt: '2026-07-02T09:00:00Z' })} />
+        <PrReviewEntry task={task({ reviewMode: 'github', prFeedbackReceivedAt: '2026-07-02T09:00:00Z' })} />
       </MemoryRouter>,
     );
     expect(await screen.findByText('old review')).toBeTruthy();
@@ -228,7 +264,7 @@ describe('GithubReviewEntry', () => {
 
     rerender(
       <MemoryRouter>
-        <GithubReviewEntry task={task({ reviewMode: 'github', prFeedbackReceivedAt: '2026-07-02T09:10:00Z' })} />
+        <PrReviewEntry task={task({ reviewMode: 'github', prFeedbackReceivedAt: '2026-07-02T09:10:00Z' })} />
       </MemoryRouter>,
     );
 
@@ -242,16 +278,16 @@ describe('GithubReviewEntry', () => {
         available: true,
         prNumber: 7,
         items: [{ kind: 'review', id: 'r1', body: 'old pr review', verdict: 'comment' }],
-      } as GithubReviewConversation)
+      } as PrReviewConversation)
       .mockResolvedValueOnce({
         available: true,
         prNumber: 9,
         items: [{ kind: 'review', id: 'r2', body: 'rebound pr review', verdict: 'comment' }],
-      } as GithubReviewConversation);
+      } as PrReviewConversation);
 
     const { rerender } = render(
       <MemoryRouter>
-        <GithubReviewEntry task={task({ reviewMode: 'github', prNumber: 7 })} />
+        <PrReviewEntry task={task({ reviewMode: 'github', prNumber: 7 })} />
       </MemoryRouter>,
     );
     expect(await screen.findByText('old pr review')).toBeTruthy();
@@ -259,7 +295,7 @@ describe('GithubReviewEntry', () => {
 
     rerender(
       <MemoryRouter>
-        <GithubReviewEntry task={task({ reviewMode: 'github', prNumber: 9 })} />
+        <PrReviewEntry task={task({ reviewMode: 'github', prNumber: 9 })} />
       </MemoryRouter>,
     );
 
@@ -268,12 +304,12 @@ describe('GithubReviewEntry', () => {
   });
 
   it('shows unavailable reasons and falls back unknown reasons to no-pr', async () => {
-    ghMock.mockResolvedValueOnce({ available: false, reason: 'not-github', items: [] } as GithubReviewConversation);
+    ghMock.mockResolvedValueOnce({ available: false, reason: 'not-github', items: [] } as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText(/not a GitHub repository/)).toBeTruthy();
 
     cleanup();
-    ghMock.mockResolvedValueOnce({ available: false, reason: 'unexpected', items: [] } as unknown as GithubReviewConversation);
+    ghMock.mockResolvedValueOnce({ available: false, reason: 'unexpected', items: [] } as unknown as PrReviewConversation);
     renderEntry(task({ reviewMode: 'github' }));
     expect(await screen.findByText(/has no PR yet/)).toBeTruthy();
   });

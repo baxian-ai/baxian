@@ -1,6 +1,6 @@
 import type { CommandRunner } from '../agent/runner.js';
 import { shellQuote } from '../agent/runner.js';
-import type { GithubReviewItem, GithubReviewItemKind, GithubReviewVerdict } from '../shared/index.js';
+import type { PrReviewItem, PrReviewItemKind, PrReviewVerdict } from '../shared/index.js';
 import { MAX_INLINE_CONTENT_BYTES } from '../shared/index.js';
 
 const GH_TIMEOUT_MS = 20_000;
@@ -72,7 +72,7 @@ function truncateUtf8(text: string, maxBytes: number): { text: string; truncated
   return { text: buf.subarray(0, cut).toString('utf8'), truncated: true };
 }
 
-function verdictFromState(state: string): GithubReviewVerdict | undefined {
+function verdictFromState(state: string): PrReviewVerdict | undefined {
   switch (state.toUpperCase()) {
     case 'APPROVED':
       return 'approve';
@@ -105,8 +105,8 @@ async function ghJson(runner: CommandRunner, apiPath: string, jq: string): Promi
   return result.stdout;
 }
 
-function mapReviews(rows: RawReview[]): GithubReviewItem[] {
-  const out: GithubReviewItem[] = [];
+function mapReviews(rows: RawReview[]): PrReviewItem[] {
+  const out: PrReviewItem[] = [];
   for (const r of rows) {
     const verdict = verdictFromState(r.state ?? '');
     if (!verdict) continue;
@@ -124,7 +124,7 @@ function mapReviews(rows: RawReview[]): GithubReviewItem[] {
   return out;
 }
 
-function mapReviewComments(rows: RawReviewComment[]): GithubReviewItem[] {
+function mapReviewComments(rows: RawReviewComment[]): PrReviewItem[] {
   return rows.map((c) => {
     const line = c.line ?? c.original_line ?? undefined;
     return {
@@ -140,7 +140,7 @@ function mapReviewComments(rows: RawReviewComment[]): GithubReviewItem[] {
   });
 }
 
-function mapIssueComments(rows: RawIssueComment[]): GithubReviewItem[] {
+function mapIssueComments(rows: RawIssueComment[]): PrReviewItem[] {
   return rows.map((c) => ({
     kind: 'issue-comment' as const,
     id: String(c.id),
@@ -150,7 +150,7 @@ function mapIssueComments(rows: RawIssueComment[]): GithubReviewItem[] {
   }));
 }
 
-function mapCommits(rows: RawCommit[]): GithubReviewItem[] {
+function mapCommits(rows: RawCommit[]): PrReviewItem[] {
   return rows.map((c) => {
     const message = firstLine(c.message ?? '');
     return {
@@ -169,8 +169,8 @@ async function fetchSource<T>(
   label: string,
   apiPath: string,
   jq: string,
-  map: (rows: T[]) => GithubReviewItem[],
-): Promise<{ items: GithubReviewItem[]; error?: string }> {
+  map: (rows: T[]) => PrReviewItem[],
+): Promise<{ items: PrReviewItem[]; error?: string }> {
   try {
     const rows = parseJsonl<T>(await ghJson(runner, apiPath, jq));
     if (!rows) return { items: [], error: `${label}: failed to parse response` };
@@ -181,7 +181,7 @@ async function fetchSource<T>(
 }
 
 // Same createdAt → comments/commits sort before a review (rank 0 < 1).
-const KIND_ORDER: Record<GithubReviewItemKind, number> = {
+const KIND_ORDER: Record<PrReviewItemKind, number> = {
   'review-comment': 0,
   'issue-comment': 0,
   commit: 0,
@@ -192,7 +192,7 @@ export async function buildGithubReviewConversation(
   runner: CommandRunner,
   repo: string,
   prNumber: number,
-): Promise<{ items: GithubReviewItem[]; error?: string }> {
+): Promise<{ items: PrReviewItem[]; error?: string }> {
   // The four GitHub queries are independent; run them concurrently so the
   // endpoint's latency is the slowest single call, not their sum.
   const sources = await Promise.all([

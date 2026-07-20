@@ -434,6 +434,7 @@ export function parseDriverSpec(
   if (!Array.isArray(spec.preflight)) {
     err('preflight must be an array');
   } else {
+    let versionSteps = 0;
     spec.preflight.forEach((step, i) => {
       const ctx = `preflight[${i}]`;
       if (!isRecord(step)) {
@@ -444,7 +445,36 @@ export function parseDriverSpec(
       checkEnv(step.env, ctx, PREFLIGHT_PLACEHOLDERS);
       if (typeof step.fixMessage !== 'string' || step.fixMessage === '') err(`${ctx}.fixMessage must be a non-empty string`);
       else checkPlaceholders(step.fixMessage, `${ctx}.fixMessage`, PREFLIGHT_FIXMESSAGE_PLACEHOLDERS);
+      if (step.versionCheck !== undefined && typeof step.versionCheck !== 'boolean') {
+        err(`${ctx}.versionCheck must be a boolean when present`);
+      }
+      if (step.versionCheck === true) versionSteps += 1;
     });
+    // manifest 的 minToolVersion 必填：没有恰好一个版本步骤，它就是装机即死的字段。
+    if (versionSteps !== 1) {
+      err(`preflight must declare exactly one versionCheck step (got ${versionSteps})`);
+    }
+  }
+
+  const COMMAND_NAME_RE = /^[a-z0-9_.-]+$/i;
+  let agentCommands: string[][] = [];
+  if (spec.agentCommands !== undefined) {
+    if (!Array.isArray(spec.agentCommands)) {
+      err('agentCommands must be an array of command-alternative groups');
+    } else {
+      spec.agentCommands.forEach((group, i) => {
+        if (!Array.isArray(group) || group.length === 0) {
+          err(`agentCommands[${i}] must be a non-empty array of command names`);
+          return;
+        }
+        for (const cmd of group) {
+          if (typeof cmd !== 'string' || !COMMAND_NAME_RE.test(cmd)) {
+            err(`agentCommands[${i}] entries must be plain command names (got ${JSON.stringify(cmd)})`);
+          }
+        }
+      });
+      if (errors.length === 0) agentCommands = spec.agentCommands as string[][];
+    }
   }
 
   if (errors.length > 0) return { errors };
@@ -458,6 +488,7 @@ export function parseDriverSpec(
       commentSources,
       visibilityLagSeconds,
       preflight: spec.preflight,
+      agentCommands,
       errorClasses: spec.errorClasses,
     },
   };

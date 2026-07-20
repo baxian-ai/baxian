@@ -130,7 +130,7 @@ describe('resolveAgentBadge', () => {
       binding: makeBinding('dev-1', {
         status: 'awaiting_human',
         awaitingReason: 'stuck',
-        needInputAt: '2026-07-06T10:00:00Z',
+        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
       }),
     });
     expect(badge.label).toBe('Host unreachable');
@@ -172,7 +172,7 @@ describe('resolveAgentBadge', () => {
       binding: makeBinding('dev-1', {
         status: 'awaiting_human',
         awaitingReason: 'recheck dispatch failed',
-        needInputAt: '2026-07-06T10:00:00Z',
+        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
       }),
     });
     expect(badge.label).toBe('Held');
@@ -189,7 +189,7 @@ describe('resolveAgentBadge', () => {
   it('ranks an unanswered question above the pending runtime status', () => {
     const badge = badgeFor({
       runtimeStatus: 'pending',
-      binding: makeBinding('dev-1', { needInputAt: '2026-07-06T10:00:00Z' }),
+      binding: makeBinding('dev-1', { needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' } }),
     });
     expect(badge.label).toBe('Awaiting reply');
     expect(badge.kind).toBe('alert');
@@ -458,13 +458,13 @@ describe('AgentCard', () => {
     expect(screen.queryByText(/Agent is starting/)).toBeNull();
   });
 
-  it('shows the need-input badge and hint when binding.needInputAt is set', () => {
+  it('shows the need-input badge and hint when the needInput watermark is lit', () => {
     renderCard(makeSnapshot({
       id: 'dev-asking',
       runtimeStatus: 'working',
       binding: makeBinding('dev-asking', {
         taskId: 'task-9',
-        needInputAt: '2026-07-06T10:00:00Z',
+        needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
       }),
     }));
 
@@ -473,7 +473,7 @@ describe('AgentCard', () => {
     expect(terminalHrefs()).toContain('/terminal/dev-asking');
   });
 
-  it('renders no need-input badge without binding.needInputAt', () => {
+  it('renders no need-input badge without a lit needInput watermark', () => {
     renderCard(makeSnapshot({
       id: 'dev-quiet',
       runtimeStatus: 'working',
@@ -633,7 +633,7 @@ describe('AgentCard', () => {
         stale: true,
         binding: makeBinding('dev-multi', {
           status: 'awaiting_human',
-          needInputAt: '2026-07-06T10:00:00Z',
+          needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: '2026-07-06T10:00:00Z' },
         }),
       }));
 

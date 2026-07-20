@@ -16,7 +16,9 @@ export class EventLog {
     const file = join(this.dir, `${date}.jsonl`);
     try {
       const content = await readFile(file, 'utf-8');
-      return content.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as BaxianEvent);
+      return dedupeById(
+        content.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as BaxianEvent),
+      );
     } catch {
       return [];
     }
@@ -35,6 +37,21 @@ export class EventLog {
       .filter(date => date >= from && date <= to)
       .sort();
     const perDate = await mapWithConcurrency(matching, FS_READ_CONCURRENCY, date => this.readDate(date));
-    return perDate.flat();
+    return dedupeById(perDate.flat());
   }
+}
+
+// 只收敛 outbox 的确定性重投 id：常规事件 id 是「毫秒 + 4 位随机」，同毫秒碰撞虽罕见但
+// 会让通用去重静默吞掉一条不同事件。
+function dedupeById(events: BaxianEvent[]): BaxianEvent[] {
+  const seen = new Set<string>();
+  const out: BaxianEvent[] = [];
+  for (const event of events) {
+    if (typeof event.id === 'string' && event.id.startsWith('outbox:')) {
+      if (seen.has(event.id)) continue;
+      seen.add(event.id);
+    }
+    out.push(event);
+  }
+  return out;
 }

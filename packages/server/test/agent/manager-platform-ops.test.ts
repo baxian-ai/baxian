@@ -542,3 +542,152 @@ describe('third review round: merge gate integrity', () => {
     expect(emitted[0]?.id).toBe('outbox:task-1:42:mr-closed-unmerged:1');
   });
 });
+
+describe('platform dispatch descriptor context', () => {
+  it('derives the live cli descriptor for a git task', () => {
+    expect(manager.platformCliContextOf(gitTask())).toEqual({
+      tool: 'gh', host: 'github.com', repo: 'owner/repo', repoEncoded: 'owner%2Frepo',
+    });
+  });
+
+  it('carries operator notes and follows config changes live', () => {
+    manager.replaceConfig({
+      ...CONFIG,
+      project: [{ ...CONFIG.project[0], gitCli: { tool: 'gh', notes: 'runs behind :8443' } }],
+    });
+    expect(manager.platformCliContextOf(gitTask())?.notes).toBe('runs behind :8443');
+  });
+
+  it('returns undefined for legacy tasks and fails loud when the identity drifted away', () => {
+    expect(manager.platformCliContextOf(gitTask({ reviewMode: undefined }))).toBeUndefined();
+    manager.replaceConfig({
+      ...CONFIG,
+      project: [{
+        ...CONFIG.project[0],
+        repo: 'https://git.corp.example.com/g/p.git',
+        review: { mode: 'server' },
+      }],
+    });
+    expect(() => manager.platformCliContextOf(gitTask())).toThrow(/platform binding mismatch/);
+  });
+});
+
+describe('ensureGitBaseSnapshot', () => {
+  function managerWithBaseSource(source?: (projectId: string) => string | undefined): AgentManager {
+    const m = new AgentManager({
+      config: CONFIG,
+      agentStore: new AgentStore(`${tempDir}/state/agents`),
+      taskStore,
+      lockManager: new LockManager(`${tempDir}/state`),
+      eventBus: new EventBus(new EventLog(`${tempDir}/events`)),
+      ...(source ? { platformDefaultBranchOf: source } : {}),
+    });
+    vi.spyOn(m, 'effectiveReviewMode').mockReturnValue('git');
+    return m;
+  }
+
+  it('persists the injected default branch once for develop and code dispatch', async () => {
+    const m = managerWithBaseSource(() => 'main');
+    const task = await seed({ baseBranch: undefined, status: 'in_progress' });
+    const out = await m.ensureGitBaseSnapshot(task, 'develop');
+    expect(out.baseBranch).toBe('main');
+    expect((await taskStore.get('task-1'))?.baseBranch).toBe('main');
+  });
+
+  it('never overwrites an existing snapshot even when the live default moved', async () => {
+    const m = managerWithBaseSource(() => 'develop');
+    const task = await seed();
+    const out = await m.ensureGitBaseSnapshot(task, 'code');
+    expect(out.baseBranch).toBe('main');
+    expect((await taskStore.get('task-1'))?.baseBranch).toBe('main');
+  });
+
+  it('stays inert without a source, outside develop/code, and for legacy tasks', async () => {
+    const task = await seed({ baseBranch: undefined });
+    expect((await manager.ensureGitBaseSnapshot(task, 'develop')).baseBranch).toBeUndefined();
+    const m = managerWithBaseSource(() => 'main');
+    expect((await m.ensureGitBaseSnapshot(task, 'review')).baseBranch).toBeUndefined();
+    expect((await m.ensureGitBaseSnapshot({ ...task, reviewMode: undefined }, 'develop')).baseBranch)
+      .toBeUndefined();
+    expect((await taskStore.get('task-1'))?.baseBranch).toBeUndefined();
+  });
+});
+
+describe('ensureGitBaseSnapshot binding guard', () => {
+  it('refuses to persist a base from a drifted project and leaves the task untouched', async () => {
+    const m = new AgentManager({
+      config: CONFIG,
+      agentStore: new AgentStore(`${tempDir}/state/agents`),
+      taskStore,
+      lockManager: new LockManager(`${tempDir}/state`),
+      eventBus: new EventBus(new EventLog(`${tempDir}/events`)),
+      platformDefaultBranchOf: () => 'main',
+    });
+    const task = await seed({
+      baseBranch: undefined,
+      status: 'in_progress',
+      platformBinding: { mode: 'git', repoKey: 'github.com/owner/other-repo', tool: 'gh' },
+    });
+    await expect(m.ensureGitBaseSnapshot(task, 'develop')).rejects.toThrow(/platform binding mismatch/);
+    expect((await taskStore.get('task-1'))?.baseBranch).toBeUndefined();
+  });
+});
+
+describe('noteReviewConversationRevision', () => {
+  it('stamps the display revision on a live task', async () => {
+    await seed({ status: 'review' });
+    await manager.noteReviewConversationRevision('task-1');
+    expect((await taskStore.get('task-1'))?.reviewConversationUpdatedAt).toMatch(/^\d{4}-/);
+  });
+
+  it('skips terminal and missing tasks', async () => {
+    await seed({ status: 'merged' });
+    await manager.noteReviewConversationRevision('task-1');
+    expect((await taskStore.get('task-1'))?.reviewConversationUpdatedAt).toBeUndefined();
+    await expect(manager.noteReviewConversationRevision('task-404')).resolves.toBeUndefined();
+  });
+});
+
+describe('agentGitPreflightContext', () => {
+  it('builds the agent-track context with the tool name as binary and live steps', () => {
+    const plugin = {
+      manifest: { tool: 'gh', minToolVersion: '2.40.0' },
+      spec: {
+        preflight: [{ argv: ['{binary}', '--version'], versionCheck: true, fixMessage: 'need {minToolVersion}' }],
+        errorClasses: [],
+      },
+    };
+    (manager as unknown as { pluginRegistry: unknown }).pluginRegistry = {
+      resolveTool: (tool: string) => (tool === 'gh' ? plugin : undefined),
+    };
+    const ctx = manager.agentGitPreflightContext('proj');
+    expect(ctx?.tool).toBe('gh');
+    expect(ctx?.minToolVersion).toBe('2.40.0');
+    expect(ctx?.renderCtx.binary).toBe('gh');
+    expect(ctx?.renderCtx.repoPath).toBe('owner/repo');
+    expect(ctx?.steps).toHaveLength(1);
+    expect(typeof ctx?.driverFor).toBe('function');
+  });
+
+  it('returns undefined without a plugin registry or outside git mode', () => {
+    expect(manager.agentGitPreflightContext('proj')).toBeUndefined();
+    (manager as unknown as { pluginRegistry: unknown }).pluginRegistry = { resolveTool: () => undefined };
+    expect(manager.agentGitPreflightContext('proj')).toBeUndefined();
+    vi.mocked(manager.effectiveReviewMode).mockReturnValue('github');
+    expect(manager.agentGitPreflightContext('proj')).toBeUndefined();
+  });
+});
+
+describe('platformCliContextOf binding guard', () => {
+  it('refuses to render the cli descriptor when the live identity drifted from the binding', () => {
+    const drifted = gitTask({
+      platformBinding: { mode: 'git', repoKey: 'github.com/owner/other-repo', tool: 'gh' },
+    });
+    expect(() => manager.platformCliContextOf(drifted)).toThrow(/platform binding mismatch/);
+  });
+
+  it('refuses a git task without a binding snapshot', () => {
+    const bare = gitTask({ platformBinding: undefined });
+    expect(() => manager.platformCliContextOf(bare)).toThrow(/binding missing/);
+  });
+});

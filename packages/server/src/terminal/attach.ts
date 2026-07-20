@@ -14,9 +14,10 @@ export interface AttachExpectedRef {
   claim: string;
 }
 
-// Re-prove identity in the same shell right before exec so a server-restart same-name successor is never attached.
-function attachGenerationGuard(target: string, expected: AttachExpectedRef): string {
+// Re-prove the pinned session immediately before attaching it so stale generation references fail closed.
+function attachGenerationGuard(expected: AttachExpectedRef): string {
   const identity = `${expected.serverPid}|${expected.serverStart}|${expected.sessionId}|${expected.claim}`;
+  const target = shellQuote(`${expected.sessionId}:`);
   // display-message takes the format as its message argument (-p to print); it has no -F flag.
   const probe = `tmux display-message -p -t ${target} '#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}' 2>/dev/null`;
   return `[ "$(${probe})" = ${shellQuote(identity)} ] || { echo BX_ATTACH_GENERATION_MISMATCH >&2; exit 47; }`;
@@ -45,8 +46,8 @@ export function buildAttachInteractiveCommand(
   expected?: AttachExpectedRef,
   opts: { ignoreSize?: boolean } = {},
 ): AttachCommand {
-  const target = shellQuote(`=${agent.id}`);
-  const guard = expected ? `${attachGenerationGuard(target, expected)}; ` : '';
+  const attachTarget = shellQuote(expected?.sessionId ?? `=${agent.id}`);
+  const guard = expected ? `${attachGenerationGuard(expected)}; ` : '';
   const flag = opts.ignoreSize ? '-f ignore-size ' : '';
   if (agent.mode === 'remote') {
     return remoteCommand(
@@ -54,7 +55,7 @@ export function buildAttachInteractiveCommand(
       host,
       `tmux set-option -g focus-events on 2>/dev/null || true; ` +
         `tmux set-option -g set-clipboard external 2>/dev/null || true; ` +
-        `${guard}tmux -u attach-session ${flag}-t ${target}`,
+        `${guard}tmux -u attach-session ${flag}-t ${attachTarget}`,
     );
   }
   return {
@@ -63,7 +64,7 @@ export function buildAttachInteractiveCommand(
       '-c',
       `tmux set-option -gq focus-events on 2>/dev/null || true; ` +
         `tmux set-option -g set-clipboard external 2>/dev/null || true; ` +
-        `${guard}exec tmux -u attach-session ${flag}-t ${target}`,
+        `${guard}exec tmux -u attach-session ${flag}-t ${attachTarget}`,
     ],
   };
 }

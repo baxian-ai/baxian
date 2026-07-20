@@ -9,7 +9,7 @@ import {
   userConfigPath,
   createDefaultConfig,
 } from './config/loader.js';
-import { loadPluginsOrExplain } from './platform/startup.js';
+import { loadPluginsOrExplain, referencedGitTools, scanPluginSkillPools } from './platform/startup.js';
 import { initStateDir } from './state/init.js';
 import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
@@ -175,6 +175,7 @@ export async function startServer(configPath?: string): Promise<void> {
     const registry = new SkillRegistry(skillsDir);
     await registry.scan();
     assertCoreSkillsPresent(registry, skillsDir);
+    await scanPluginSkillPools(registry, pluginRegistry.all(), referencedGitTools(config));
 
     let resolveHostRef: (agent: AgentConfig) => HostConfig | undefined = (agent) =>
       (typeof agent.host === 'object' ? agent.host : undefined);

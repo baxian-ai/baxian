@@ -54,6 +54,8 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
     const exec: DriverExec = async (cmd) => {
       const page = Number(/[?&]page=(\d+)/.exec(cmd)?.[1] ?? '1');
       const body = (rows: unknown[]) => ({ stdout: JSON.stringify(page === 1 ? rows : []), stderr: '', exitCode: 0 });
+      if (cmd.includes("'--version'")) return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
+      if (cmd.endsWith("'api' 'user'")) return { stdout: JSON.stringify({ id: 77, login: 'devbot' }), stderr: '', exitCode: 0 };
       if (cmd.includes('pulls?state=all')) return body(world.pulls);
       if (cmd.includes('/pulls/42/reviews')) return body(world.reviews);
       if (cmd.includes('/pulls/42/comments')) return body(world.inlineComments);

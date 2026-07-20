@@ -477,7 +477,7 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
       id: 'dev-1',
       projectId: 'proj-a',
       taskId: 'task-1',
-      needInputAt: new Date().toISOString(),
+      needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: new Date().toISOString() },
       updatedAt: new Date().toISOString(),
     });
     const ws = openWs(p);
@@ -491,29 +491,29 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
     const started = Date.now();
     while (Date.now() - started < 1000) {
       const binding = await ctx.agentStore.get('dev-1');
-      if (binding && binding.needInputAt === undefined) break;
+      if (binding && binding.needInput?.at === undefined) break;
       await flushAsyncWork();
     }
     const binding = await ctx.agentStore.get('dev-1');
-    expect(binding?.needInputAt).toBeUndefined();
+    expect(binding?.needInput).toEqual({ epoch: 1, askSeq: 1, answeredSeq: 1 });
     expect(binding?.taskId).toBe('task-1');
 
     send(ws, { op: 'input', subscriberId: 'sub-1', data: 'plain keys no enter' });
     await flushAsyncWork();
     const after = await ctx.agentStore.get('dev-1');
-    expect(after?.needInputAt).toBeUndefined();
+    expect(after?.needInput?.at).toBeUndefined();
     ws.close();
   });
 
   it('keeps the need-input badge when the pane write fails', async () => {
     const { app, port: p, ctx } = await startApp({ withPaneStreamerManager: true });
     runningApp = app;
-    const needInputAt = new Date().toISOString();
+    const at = new Date().toISOString();
     await ctx.agentStore.set({
       id: 'dev-1',
       projectId: 'proj-a',
       taskId: 'task-1',
-      needInputAt,
+      needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at },
       updatedAt: new Date().toISOString(),
     });
     vi.spyOn(ctx.paneStreamerManager!, 'enqueueInput').mockRejectedValue(new Error('pane gone'));
@@ -532,7 +532,7 @@ describe('streamWsPlugin /api/stream — subscribe state machine', () => {
     }
     expect(sawInputFailed).toBe(true);
     const binding = await ctx.agentStore.get('dev-1');
-    expect(binding?.needInputAt).toBe(needInputAt);
+    expect(binding?.needInput).toEqual({ epoch: 1, askSeq: 1, answeredSeq: 0, at });
     ws.close();
   });
 });

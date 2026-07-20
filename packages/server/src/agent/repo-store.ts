@@ -211,6 +211,7 @@ export async function moveFileIntoPlace(
 
 export class RepoStore {
   private readonly isGitHub: boolean;
+  private readonly cloneWithGh: boolean;
   private readonly repo: string;
 
   constructor(
@@ -221,9 +222,13 @@ export class RepoStore {
     private cache: RepoStoreCache,
     private agentId: string,
     private configuredWorkdir?: string,
+    cloneViaGh?: boolean,
   ) {
     this.repo = repo.trim();
     this.isGitHub = isGitHubRepo(this.repo);
+    // clone 是 agent 执行面：github 仓库仅 resolved tool 为 gh 时走 gh repo clone，
+    // 自定义 tool 走朴素 git（repo clone 是 gh 专属子命令）。
+    this.cloneWithGh = cloneViaGh ?? this.isGitHub;
   }
 
   async ensure(): Promise<string> {
@@ -331,7 +336,7 @@ export class RepoStore {
       const stagingGuard = ancestorSymlinkGuard(guardRoot, staging);
       const mk = await this.runner.exec(`${stagingGuard} && mkdir -p ${shellQuote(parent)}`);
       if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent} (symlink-safe): ${mk.stderr}`);
-      const cloneCmd = this.isGitHub
+      const cloneCmd = this.cloneWithGh
         ? `${stagingGuard} && ${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(staging)} --no-upstream`
         : `${stagingGuard} && ${GIT_NET_ENV} git clone ${shellQuote(this.repo)} ${shellQuote(staging)}`;
       let clone: ExecResult;
@@ -346,7 +351,7 @@ export class RepoStore {
       }
       if (clone.exitCode !== 0) {
         await this.discardStaging(staging, `clone exit ${clone.exitCode}`, ancestorSymlinkGuard(guardRoot, staging));
-        const cmd = this.isGitHub ? 'gh repo clone' : 'git clone';
+        const cmd = this.cloneWithGh ? 'gh repo clone' : 'git clone';
         throw new Error(redactGitCredentials(`${cmd} ${this.repo} failed: ${clone.stderr || clone.stdout}`));
       }
       await this.promoteStaging(staging, absRepoPath, guardRoot);

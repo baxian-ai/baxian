@@ -12,6 +12,7 @@ import type { NormalizedRow } from '../../src/platform/row-schema.js';
 import type { MappedEvent } from '../../src/github/mapper.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
+import { repoIdentityKey } from '../../src/shared/git-url.js';
 
 const REPO = 'https://github.com/owner/repo';
 const SHA1 = '1'.repeat(40);
@@ -42,6 +43,8 @@ class FakeDriver implements PlatformDriver {
   visibilityLagMs = 5000;
   commentSources = SOURCES;
   defaultBranch: string | (() => string) = 'main';
+  projectViewExtra: Record<string, unknown> = {};
+  runPreflightSteps?: () => Promise<Array<{ step: string; ok: boolean; message: string }>>;
   projectViewError?: Error;
   listPrsRows: NormalizedRow[] = [];
   listPrsPages?: NormalizedRow[][];
@@ -57,7 +60,7 @@ class FakeDriver implements PlatformDriver {
     if (opName === 'projectView') {
       if (this.projectViewError) throw this.projectViewError;
       const value = typeof this.defaultBranch === 'function' ? this.defaultBranch() : this.defaultBranch;
-      return [{ defaultBranch: value }];
+      return [{ defaultBranch: value, ...this.projectViewExtra }];
     }
     if (opName === 'prView') {
       const seq = this.prViewSeq.get(vars.prNumber!);
@@ -922,6 +925,212 @@ describe('PlatformPoller: reentrancy', () => {
     const poller = makePoller();
     await Promise.all([poller.poll(), poller.poll()]);
     expect(ofType('pr.updated')).toHaveLength(1);
+  });
+});
+
+describe('PlatformPoller: server-track preflight gate', () => {
+  it('fails the cycle into health with the fixMessage until steps pass, then never reruns', async () => {
+    let calls = 0;
+    let stepOk = false;
+    driver.runPreflightSteps = async () => {
+      calls += 1;
+      return stepOk
+        ? [{ step: 'driver-preflight-1', ok: true, message: 'gh --version OK' }]
+        : [{ step: 'driver-preflight-1', ok: false, message: 'gh 需 ≥ 2.40.0，安装见 https://cli.github.com' }];
+    };
+    driver.projectViewExtra = { pushPermitted: true };
+    const poller = makePoller();
+
+    await poller.poll();
+    expect(driver.calls).toEqual([]);
+    let snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toContain('cli.github.com');
+
+    stepOk = true;
+    await poller.poll();
+    snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(0);
+    expect(driver.calls).toContain('projectView');
+
+    await poller.poll();
+    expect(calls).toBe(2);
+  });
+
+  it('backs off when the preflight itself is rate limited instead of hammering every cycle', async () => {
+    driver.runPreflightSteps = async () => {
+      throw new DriverOpError('preflight driver-preflight-2 failed (class RATE_LIMIT): HTTP 429', {
+        opName: 'driver-preflight-2', errorClass: 'RATE_LIMIT',
+      });
+    };
+    const poller = makePoller();
+    await poller.poll();
+    const snap = poller.snapshots()[0]!;
+    expect(snap.rateLimitedUntil).toBe(new Date(T0 + 60_000).toISOString());
+    expect(driver.calls).toEqual([]);
+
+    driver.calls = [];
+    clockNow = T0 + 30_000;
+    await poller.poll();
+    expect(driver.calls).toEqual([]);
+  });
+
+  it('ages the default-branch cache on step-failing cycles so the snapshot expires', async () => {
+    const repoKey = repoIdentityKey(REPO);
+    let stepOk = true;
+    driver.runPreflightSteps = async () => (stepOk
+      ? []
+      : [{ step: 'driver-preflight-1', ok: false, message: 'auth broken' }]);
+    driver.projectViewExtra = { pushPermitted: false };
+    const poller = makePoller();
+
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+
+    stepOk = false;
+    await poller.poll();
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBeUndefined();
+  });
+
+  it('holds the gate open while push permission is missing and closes it when granted', async () => {
+    let calls = 0;
+    driver.runPreflightSteps = async () => {
+      calls += 1;
+      return [];
+    };
+    driver.projectViewExtra = { pushPermitted: false };
+    const poller = makePoller();
+
+    await poller.poll();
+    let snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(1);
+    expect(snap.lastErrorMessage).toContain('push permission missing');
+
+    driver.projectViewExtra = { pushPermitted: true };
+    await poller.poll();
+    snap = poller.snapshots()[0]!;
+    expect(snap.consecutiveFailures).toBe(0);
+
+    await poller.poll();
+    expect(calls).toBe(2);
+  });
+});
+
+describe('PlatformPoller: default-branch snapshot accessor', () => {
+  it('serves the cached branch while fresh and reports missing after three failed cycles', async () => {
+    const repoKey = repoIdentityKey(REPO);
+    const poller = makePoller();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBeUndefined();
+
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+
+    driver.projectViewError = new Error('projectView down');
+    await poller.poll();
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBeUndefined();
+
+    driver.projectViewError = undefined;
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+    expect(poller.defaultBranchSnapshot('github.com/other/repo')).toBeUndefined();
+  });
+});
+
+describe('PlatformPoller: conversation projection revision', () => {
+  let revisions: string[];
+
+  beforeEach(() => {
+    revisions = [];
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, expectedBase: 'main' }];
+    driver.prViews.set(42, prRow());
+    driver.comments['inline-comments'] = [];
+    driver.comments['reviews'] = [];
+  });
+
+  const pollerWithRevisions = () => makePoller({
+    onConversationRevision: (taskId) => { revisions.push(taskId); },
+  });
+
+  it('fires once per projection change and stays quiet on identical rescans', async () => {
+    driver.comments['issue-comments'] = [comment('c1', 'feedback')];
+    const poller = pollerWithRevisions();
+    await poller.poll();
+    expect(revisions).toEqual(['task-1']);
+
+    await poller.poll();
+    expect(revisions).toEqual(['task-1']);
+
+    driver.comments['issue-comments'] = [comment('c1', 'feedback edited')];
+    await poller.poll();
+    expect(revisions).toEqual(['task-1', 'task-1']);
+  });
+
+  it('ignores pure row reordering across rescans', async () => {
+    const a = comment('a1', 'first');
+    const b = comment('b2', 'second');
+    driver.comments['issue-comments'] = [a, b];
+    const poller = pollerWithRevisions();
+    await poller.poll();
+    expect(revisions).toHaveLength(1);
+
+    driver.comments['issue-comments'] = [b, a];
+    await poller.poll();
+    expect(revisions).toHaveLength(1);
+  });
+
+  it('bumps on a state-only change of an existing row', async () => {
+    driver.comments['reviews'] = [comment('r1', 'looks good', OLD_TS, { reviewState: 'COMMENTED' })];
+    const poller = pollerWithRevisions();
+    await poller.poll();
+    expect(revisions).toHaveLength(1);
+
+    driver.comments['reviews'] = [comment('r1', 'looks good', OLD_TS, { reviewState: 'DISMISSED' })];
+    await poller.poll();
+    expect(revisions).toHaveLength(2);
+  });
+
+  it('bumps when only the revision time moves (same body re-submitted)', async () => {
+    driver.comments['issue-comments'] = [comment('c1', 'same body', OLD_TS)];
+    const poller = pollerWithRevisions();
+    await poller.poll();
+    expect(revisions).toHaveLength(1);
+
+    driver.comments['issue-comments'] = [comment('c1', 'same body', iso(T0 - 60_000))];
+    await poller.poll();
+    expect(revisions).toHaveLength(2);
+  });
+
+  it('stays silent while any source fails and fires once on recovery', async () => {
+    driver.comments['issue-comments'] = [comment('c1', 'feedback')];
+    driver.comments['reviews'] = new Error('HTTP 500') as unknown as NormalizedRow[];
+    const poller = pollerWithRevisions();
+    await poller.poll();
+    expect(revisions).toEqual([]);
+
+    driver.comments['reviews'] = [];
+    await poller.poll();
+    expect(revisions).toEqual(['task-1']);
+  });
+
+  it('drops the projection baseline with the task generation so a re-adopting task starts fresh', async () => {
+    driver.comments['issue-comments'] = [comment('c1', 'feedback')];
+    const poller = pollerWithRevisions();
+    await poller.poll();
+    expect(revisions).toEqual(['task-1']);
+
+    tasks = [{ taskId: 'task-1', terminal: true }];
+    await poller.poll();
+
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, expectedBase: 'main' }];
+    await poller.poll();
+    expect(revisions).toEqual(['task-1', 'task-1']);
   });
 });
 

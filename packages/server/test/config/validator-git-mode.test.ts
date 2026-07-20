@@ -50,6 +50,20 @@ describe("validateConfig: review.mode 'git'", () => {
     }
   });
 
+  it("rejects a bare slug when the resolved tool is not 'gh' (plain git cannot clone it)", () => {
+    const bad = messages(baseConfig({ repo: 'owner/repo', gitCli: { tool: 'forge' } }));
+    expect(bad).toMatch(/bare owner\/repo slug requires the resolved tool 'gh'/);
+
+    const bareDefault = messages(baseConfig({ repo: 'owner/repo', gitCli: undefined }));
+    expect(bareDefault).not.toMatch(/bare owner\/repo slug/);
+
+    const explicitGh = messages(baseConfig({ repo: 'owner/repo', gitCli: { tool: 'gh' } }));
+    expect(explicitGh).not.toMatch(/bare owner\/repo slug/);
+
+    const fullUrl = messages(baseConfig({ repo: 'https://github.com/owner/repo.git', gitCli: { tool: 'forge' } }));
+    expect(fullUrl).not.toMatch(/bare owner\/repo slug/);
+  });
+
   it('non-github repos in git mode require gitCli, with the install-or-server hint', () => {
     const msgs = messages(baseConfig({ gitCli: undefined }));
     expect(msgs).toMatch(/gitCli\.tool/);

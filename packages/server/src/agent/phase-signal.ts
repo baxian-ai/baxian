@@ -156,18 +156,90 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
 
 export interface NeedInputSignal {
   token: string;
+  // Absent on the bare legacy form; malformed ordinals reject the whole literal instead.
+  seq?: number;
   raw: string;
+  // Position in the compact scan text — orders ask/answer literals of ONE scan pass.
+  index: number;
 }
 
-const NEED_INPUT_RE = new RegExp(`\\[bx:need-input:(${TOKEN_RANGE})\\]`, 'g');
+export interface AskAnswerSignal extends NeedInputSignal {
+  kind: 'ask' | 'answer';
+}
 
-export function scanNeedInputSignals(text: string): NeedInputSignal[] {
-  const compact = stripSignalAnsi(text).replace(/\s+/g, '');
+const NEED_INPUT_RE = new RegExp(`\\[bx:need-input:(${TOKEN_RANGE})(?::(\\d{1,4}))?\\]`, 'g');
+const INPUT_RECEIVED_RE = new RegExp(`\\[bx:input-received:(${TOKEN_RANGE})(?::(\\d{1,4}))?\\]`, 'g');
+
+// The exact transform scans run on — exported so callers can convert raw-buffer
+// boundaries into scan-text coordinates (old/new-region split in the watcher).
+export function compactSignalText(text: string): string {
+  return stripSignalAnsi(text).replace(/\s+/g, '');
+}
+
+function trackBoundaryThroughStrip(
+  text: string,
+  boundary: number,
+  pattern: RegExp,
+): { text: string; boundary: number } {
+  let out = '';
+  let mapped = boundary;
+  let last = 0;
+  for (const m of text.matchAll(pattern)) {
+    const start = m.index ?? 0;
+    const end = start + m[0].length;
+    out += text.slice(last, start);
+    if (boundary >= end) mapped -= m[0].length;
+    else if (boundary > start) mapped -= boundary - start;
+    last = end;
+  }
+  out += text.slice(last);
+  return { text: out, boundary: mapped };
+}
+
+// Maps a raw offset of `text` into compactSignalText(text) coordinates by tracking
+// every stripped span. Compacting the prefix on its own would misplace the boundary
+// whenever an ANSI/OSC escape or whitespace run straddles it (the joined text strips
+// what the prefix alone cannot), and a shifted boundary misclassifies brand-new
+// literals as already-scanned tail.
+export function compactBoundaryIndex(text: string, rawBoundary: number): number {
+  let state = { text, boundary: Math.max(0, Math.min(rawBoundary, text.length)) };
+  state = trackBoundaryThroughStrip(state.text, state.boundary, OSC_PATTERN);
+  state = trackBoundaryThroughStrip(state.text, state.boundary, ANSI_PATTERN);
+  state = trackBoundaryThroughStrip(state.text, state.boundary, /\s+/g);
+  return state.boundary;
+}
+
+function scanAskAnswer(text: string, re: RegExp): NeedInputSignal[] {
+  const compact = compactSignalText(text);
   const out: NeedInputSignal[] = [];
-  for (const m of compact.matchAll(NEED_INPUT_RE)) {
-    out.push({ token: m[1], raw: m[0] });
+  for (const m of compact.matchAll(re)) {
+    if (m[2] !== undefined) {
+      const seq = Number.parseInt(m[2], 10);
+      if (!Number.isFinite(seq) || seq < 1) continue;
+      out.push({ token: m[1], seq, raw: m[0], index: m.index ?? 0 });
+    } else {
+      out.push({ token: m[1], raw: m[0], index: m.index ?? 0 });
+    }
   }
   return out;
+}
+
+export function scanNeedInputSignals(text: string): NeedInputSignal[] {
+  return scanAskAnswer(text, NEED_INPUT_RE);
+}
+
+export function scanInputReceivedSignals(text: string): NeedInputSignal[] {
+  return scanAskAnswer(text, INPUT_RECEIVED_RE);
+}
+
+// Document order matters across the two families: an answer swallowed while idle must
+// not out-of-order clear an ask that appears after it in the same window.
+export function scanAskAnswerSignals(text: string): AskAnswerSignal[] {
+  const merged: AskAnswerSignal[] = [
+    ...scanNeedInputSignals(text).map(s => ({ ...s, kind: 'ask' as const })),
+    ...scanInputReceivedSignals(text).map(s => ({ ...s, kind: 'answer' as const })),
+  ];
+  return merged.sort((a, b) => a.index - b.index);
 }
 
 export interface ReadFileSignal {

@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { probeTmux, runPreflight } from '../../src/agent/preflight.js';
+import { probeTmux, runPreflight, type AgentGitPreflight } from '../../src/agent/preflight.js';
 import { LocalRunner } from '../../src/agent/runner.js';
 import * as runnerModule from '../../src/agent/runner.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import { DriverOpError } from '../../src/platform/git-driver.js';
 import type { AgentConfig } from '../../src/shared/index.js';
 
 const OK_PATH: ExecResult = { stdout: '/usr/local/bin/x', stderr: '', exitCode: 0 };
@@ -19,6 +20,7 @@ function mockRunner(responses: Record<string, ExecResult>): CommandRunner {
       if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
       if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
       if (cmd.startsWith('command -v')) return OK_PATH;
+      if (cmd.includes("'--version'")) return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
       return OK_EMPTY;
     }),
   };
@@ -416,5 +418,295 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
     expect(results.find(r => r.step === 'gh')).toBeDefined();
     expect(results.find(r => r.step === 'gh-repo')).toBeDefined();
+  });
+});
+
+describe('runPreflight — git platform track', () => {
+  function gitPlatform(over: Partial<AgentGitPreflight> = {}, projectViewRow: Record<string, unknown> | Error = { defaultBranch: 'main', pushPermitted: true }): AgentGitPreflight {
+    return {
+      tool: 'gh',
+      minToolVersion: '2.40.0',
+      agentCommands: [['openssl'], ['shasum', 'sha256sum']],
+      steps: [
+        { argv: ['{binary}', '--version'], versionCheck: true, fixMessage: '{binary} 需 ≥ {minToolVersion}' },
+        { argv: ['{binary}', 'api', 'user'], env: { GH_HOST: '{host}' }, fixMessage: 'run {binary} auth login --hostname {hostname}' },
+      ],
+      renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'user/repo', binary: 'gh' },
+      driverFor: () => ({
+        runOp: async () => {
+          if (projectViewRow instanceof Error) throw projectViewRow;
+          return [projectViewRow];
+        },
+      }),
+      ...over,
+    };
+  }
+
+  it('runs driver steps with the tool name as {binary} and asserts push for a dev host', async () => {
+    const runner = mockRunner({});
+    const results = await runPreflight(runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform());
+    const steps = results.map(r => r.step);
+    expect(steps).toContain('driver-preflight-1');
+    expect(steps).toContain('platform-repo');
+    expect(steps).toContain('platform-push');
+    expect(results.find(r => r.step === 'platform-push')?.ok).toBe(true);
+    expect(steps).not.toContain('gh');
+    expect(steps).not.toContain('gh-repo');
+    expect(execCmds(runner).some(c => c.includes("'gh' '--version'"))).toBe(true);
+    expect(execCmds(runner).every(c => !c.includes('/opt/'))).toBe(true);
+  });
+
+  it('flags a dev host red when the repo is readable but push is not permitted', async () => {
+    const runner = mockRunner({});
+    const results = await runPreflight(
+      runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({}, { defaultBranch: 'main', pushPermitted: false }),
+    );
+    const push = results.find(r => r.step === 'platform-push');
+    expect(push?.ok).toBe(false);
+    expect(push?.message).toContain('push');
+  });
+
+  it('keeps a QA host green on missing push permission but red when the repo is unreadable', async () => {
+    const runner = mockRunner({});
+    const okResults = await runPreflight(
+      runner, makeAgent({ role: 'qa' }), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({}, { defaultBranch: 'main', pushPermitted: false }),
+    );
+    const push = okResults.find(r => r.step === 'platform-push');
+    expect(push?.ok).toBe(true);
+    expect(push?.message).toMatch(/QA/);
+
+    const badResults = await runPreflight(
+      runner, makeAgent({ role: 'qa' }), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({}, new Error('HTTP 404')),
+    );
+    const repoStep = badResults.find(r => r.step === 'platform-repo');
+    expect(repoStep?.ok).toBe(false);
+  });
+
+  it('keeps a research host green on missing push permission (non-publishing role)', async () => {
+    const runner = mockRunner({});
+    const results = await runPreflight(
+      runner, makeAgent({ role: 'research' }), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({}, { defaultBranch: 'main', pushPermitted: false }),
+    );
+    const push = results.find(r => r.step === 'platform-push');
+    expect(push?.ok).toBe(true);
+    expect(push?.message).toContain('research');
+  });
+
+  it('warns without failing when the plugin does not map pushPermitted', async () => {
+    const runner = mockRunner({});
+    const results = await runPreflight(
+      runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({}, { defaultBranch: 'main' }),
+    );
+    const push = results.find(r => r.step === 'platform-push');
+    expect(push?.ok).toBe(true);
+    expect(push?.message).toContain('pushPermitted');
+  });
+
+  it('skips the repo read when a driver step fails and never runs the legacy gh block', async () => {
+    const runner = mockRunner({ "'--version'": FAIL });
+    const results = await runPreflight(runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform());
+    expect(results.find(r => r.step === 'driver-preflight-1')?.ok).toBe(false);
+    expect(results.some(r => r.step === 'platform-repo')).toBe(false);
+    expect(execCmds(runner).every(c => !c.includes('gh auth status'))).toBe(true);
+  });
+
+  it('synthesizes the bare-slug probe URL from the host-scoped git_protocol', async () => {
+    const sshRunner = mockRunner({ "config get -h 'github.com' git_protocol": { stdout: 'ssh\n', stderr: '', exitCode: 0 } });
+    await runPreflight(sshRunner, makeAgent({ workdir: undefined }), 'user/repo', undefined, 'p1', gitPlatform());
+    expect(execCmds(sshRunner).some(c => c.includes("git ls-remote 'git@github.com:user/repo.git'"))).toBe(true);
+
+    const httpsRunner = mockRunner({ "config get -h 'github.com' git_protocol": { stdout: 'https\n', stderr: '', exitCode: 0 } });
+    await runPreflight(httpsRunner, makeAgent({ workdir: undefined }), 'user/repo', undefined, 'p1', gitPlatform());
+    expect(execCmds(httpsRunner).some(c => c.includes("git ls-remote 'https://github.com/user/repo.git'"))).toBe(true);
+  });
+
+  it('flags missing plugin-skill runtime deps (openssl / sha256 checksum) on the agent host', async () => {
+    const runner = mockRunner({
+      'command -v openssl': FAIL,
+      'command -v shasum': FAIL,
+      'command -v sha256sum': FAIL,
+    });
+    const results = await runPreflight(runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform());
+    const deps = results.find(r => r.step === 'platform-skill-deps');
+    expect(deps?.ok).toBe(false);
+    expect(deps?.message).toContain('openssl');
+    expect(deps?.message).toContain('sha256sum');
+  });
+
+  it('passes the skill-deps probe when openssl and a checksum variant are present', async () => {
+    const runner = mockRunner({ 'command -v shasum': FAIL });
+    const results = await runPreflight(runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform());
+    expect(results.find(r => r.step === 'platform-skill-deps')?.ok).toBe(true);
+  });
+
+  it('folds a rejecting skill-deps probe into a failed check instead of rejecting the whole preflight', async () => {
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('command -v openssl')) throw new Error('Command timed out after 5000ms');
+        if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
+        if (cmd.startsWith('command -v')) return OK_PATH;
+        if (cmd.includes("'--version'")) return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
+        return OK_EMPTY;
+      }),
+    };
+    const results = await runPreflight(runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform());
+    const deps = results.find(r => r.step === 'platform-skill-deps');
+    expect(deps?.ok).toBe(false);
+    expect(deps?.message).toContain('timed out');
+    expect(results.find(r => r.step === 'platform-repo')).toBeDefined();
+  });
+
+  it('probes the configured Workdir origin, not gh git_protocol (publish pushes to that origin)', async () => {
+    const runner = mockRunner({
+      'git remote get-url --push': { stdout: 'git@github.com:user/repo.git\n', stderr: '', exitCode: 0 },
+      "config get -h 'github.com' git_protocol": { stdout: 'https\n', stderr: '', exitCode: 0 },
+    });
+    await runPreflight(runner, makeAgent({ workdir: '/tmp/code' }), 'https://github.com/user/repo.git', undefined, 'p1', gitPlatform());
+    expect(execCmds(runner).some(c => c.includes("git ls-remote 'git@github.com:user/repo.git'"))).toBe(true);
+    expect(execCmds(runner).every(c => !c.includes('config get'))).toBe(true);
+  });
+
+  it('probes the gh git_protocol channel for auto workdirs even when the repo is an explicit URL', async () => {
+    const runner = mockRunner({ "config get -h 'github.com' git_protocol": { stdout: 'ssh\n', stderr: '', exitCode: 0 } });
+    await runPreflight(runner, makeAgent({ workdir: undefined }), 'https://github.com/user/repo.git', undefined, 'p1', gitPlatform());
+    expect(execCmds(runner).some(c => c.includes("git ls-remote 'git@github.com:user/repo.git'"))).toBe(true);
+  });
+
+  it('fails the git check when the configured Workdir has no push origin', async () => {
+    const runner = mockRunner({ 'git remote get-url --push': { stdout: '', stderr: '', exitCode: 1 } });
+    const results = await runPreflight(runner, makeAgent({ workdir: '/tmp/code' }), 'user/repo', undefined, 'p1', gitPlatform());
+    const git = results.find(r => r.step === 'git');
+    expect(git?.ok).toBe(false);
+    expect(git?.message).toContain('no push origin');
+  });
+
+  it('keeps driver stderr tails out of the checks response', async () => {
+    const runner = mockRunner({});
+    const results = await runPreflight(
+      runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({
+        driverFor: () => ({
+          runOp: async () => {
+            throw new DriverOpError('op projectView failed (exit 1, class ACCESS_DENIED): token-like-diagnostic=SECRET123', {
+              opName: 'projectView', errorClass: 'ACCESS_DENIED', exitCode: 1,
+            });
+          },
+        }),
+      }),
+    );
+    const repoStep = results.find(r => r.step === 'platform-repo');
+    expect(repoStep?.ok).toBe(false);
+    expect(JSON.stringify(results)).not.toContain('SECRET123');
+    expect(repoStep?.message).toContain('ACCESS_DENIED');
+  });
+
+  it('treats a resolved exit 255 on the protocol probe as inconclusive, not as an unset config', async () => {
+    const runner = mockRunner({
+      "config get -h 'github.com' git_protocol": { stdout: '', stderr: 'kex_exchange_identification: read: Connection reset', exitCode: 255 },
+    });
+    const results = await runPreflight(runner, makeAgent({ workdir: undefined }), 'user/repo', undefined, 'p1', gitPlatform());
+    const git = results.find(r => r.step === 'git');
+    expect(git?.ok).toBe(false);
+    expect(execCmds(runner).every(c => !c.includes('git ls-remote'))).toBe(true);
+  });
+
+  it('ignores a probe error in a group that a later alternative satisfies', async () => {
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('command -v shasum')) throw new Error('Command timed out after 5000ms');
+        if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
+        if (cmd.startsWith('command -v')) return OK_PATH;
+        if (cmd.includes("'--version'")) return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
+        return OK_EMPTY;
+      }),
+    };
+    const results = await runPreflight(runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform());
+    expect(results.find(r => r.step === 'platform-skill-deps')?.ok).toBe(true);
+  });
+
+  it('folds a rejecting git_protocol probe into a failed git check without guessing a protocol', async () => {
+    const runner: CommandRunner = {
+      exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('config get')) throw new Error('transport down');
+        if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
+        if (cmd.startsWith('command -v')) return OK_PATH;
+        if (cmd.includes("'--version'")) return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
+        return OK_EMPTY;
+      }),
+    };
+    const results = await runPreflight(runner, makeAgent({ workdir: undefined }), 'user/repo', undefined, 'p1', gitPlatform());
+    const git = results.find(r => r.step === 'git');
+    expect(git?.ok).toBe(false);
+    expect(git?.message).toContain('transport down');
+    expect(execCmds(runner).every(c => !c.includes('git ls-remote'))).toBe(true);
+    expect(results.find(r => r.step === 'platform-repo')).toBeDefined();
+  });
+
+  it('skips the platform-skill dependency probe for roles that never run those commands', async () => {
+    for (const role of ['qa', 'research'] as const) {
+      const runner = mockRunner({ 'command -v openssl': FAIL, 'command -v shasum': FAIL, 'command -v sha256sum': FAIL });
+      const results = await runPreflight(
+        runner, makeAgent({ role }), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform(),
+      );
+      expect(results.some(r => r.step === 'platform-skill-deps'), role).toBe(false);
+      expect(execCmds(runner).every(c => !c.includes('command -v openssl')), role).toBe(true);
+    }
+  });
+
+  it('probes nothing for a plugin that declares no agent-side commands', async () => {
+    const runner = mockRunner({ 'command -v openssl': FAIL });
+    const results = await runPreflight(
+      runner, makeAgent(), 'git@github.com:user/repo.git', undefined, 'p1',
+      gitPlatform({ agentCommands: [] }),
+    );
+    expect(results.some(r => r.step === 'platform-skill-deps')).toBe(false);
+    expect(execCmds(runner).every(c => !c.includes('command -v openssl'))).toBe(true);
+  });
+
+  it('diagnoses an ssh:// origin failure toward SSH, not gh credential setup', async () => {
+    const runner = mockRunner({
+      'git remote get-url --push': { stdout: 'ssh://git@github.com/user/repo.git\n', stderr: '', exitCode: 0 },
+      'git ls-remote': FAIL,
+    });
+    const results = await runPreflight(
+      runner, makeAgent({ workdir: '/tmp/code' }), 'ssh://git@github.com/user/repo.git', undefined, 'p1', gitPlatform(),
+    );
+    const git = results.find(r => r.step === 'git');
+    expect(git?.ok).toBe(false);
+    expect(git?.message).toContain('SSH key');
+  });
+
+  it('probes a non-gh tool auto workdir with the repo URL verbatim (plain git clone face)', async () => {
+    const runner = mockRunner({ "config get -h 'github.com' git_protocol": { stdout: 'ssh\n', stderr: '', exitCode: 0 } });
+    await runPreflight(
+      runner, makeAgent({ workdir: undefined }), 'https://github.com/user/repo.git', undefined, 'p1',
+      gitPlatform({ tool: 'forge' }),
+    );
+    expect(execCmds(runner).some(c => c.includes("git ls-remote 'https://github.com/user/repo.git'"))).toBe(true);
+    expect(execCmds(runner).every(c => !c.includes('config get'))).toBe(true);
+  });
+
+  it('falls back to the global git_protocol when the host scope is unset', async () => {
+    const runner = mockRunner({
+      "config get -h 'github.com' git_protocol": OK_EMPTY,
+      'config get git_protocol': { stdout: 'ssh\n', stderr: '', exitCode: 0 },
+    });
+    await runPreflight(runner, makeAgent({ workdir: undefined }), 'user/repo', undefined, 'p1', gitPlatform());
+    expect(execCmds(runner).some(c => c.includes("git ls-remote 'git@github.com:user/repo.git'"))).toBe(true);
+  });
+
+  it('probes a non-gh github repo with the repo URL verbatim (plain git clone face)', async () => {
+    const runner = mockRunner({});
+    await runPreflight(
+      runner, makeAgent({ workdir: undefined }), 'https://github.com/user/repo.git', undefined, 'p1',
+      gitPlatform({ tool: 'forge' }),
+    );
+    expect(execCmds(runner).some(c => c.includes("git ls-remote 'https://github.com/user/repo.git'"))).toBe(true);
+    expect(execCmds(runner).every(c => !c.includes('config get'))).toBe(true);
   });
 });

@@ -1040,7 +1040,7 @@ describe('server review mode API', () => {
   });
 });
 
-describe('GET /api/tasks/:id/github-review', () => {
+describe('GET /api/tasks/:id/pr-review', () => {
   function fakeRunner(byPath: Record<string, string>): CommandRunner {
     return {
       exec: async (cmd: string): Promise<ExecResult> => {
@@ -1055,26 +1055,26 @@ describe('GET /api/tasks/:id/github-review', () => {
   }
 
   it('404 when the task does not exist', async () => {
-    const res = await get('/api/tasks/missing/github-review');
+    const res = await get('/api/tasks/missing/pr-review');
     expect(res.statusCode).toBe(404);
   });
 
   it('available:false (server-mode) for server-mode tasks', async () => {
     await seedTask({ id: 'gh-srv', reviewMode: 'server', prNumber: 9 });
-    const res = await get('/api/tasks/gh-srv/github-review');
+    const res = await get('/api/tasks/gh-srv/pr-review');
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'server-mode', items: [] });
   });
 
   it('available:false (no-pr) when the task has no PR', async () => {
     await seedTask({ id: 'gh-nopr' });
-    const res = await get('/api/tasks/gh-nopr/github-review');
+    const res = await get('/api/tasks/gh-nopr/pr-review');
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'no-pr' });
   });
 
   it('available:false (not-github) when the project repo is unresolvable', async () => {
     await seedTask({ id: 'gh-other', projectId: 'ghost', prNumber: 3 });
-    const res = await get('/api/tasks/gh-other/github-review');
+    const res = await get('/api/tasks/gh-other/pr-review');
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'not-github' });
   });
 
@@ -1083,13 +1083,67 @@ describe('GET /api/tasks/:id/github-review', () => {
       'pulls/7/reviews': JSON.stringify({ id: 1, state: 'APPROVED', body: 'lgtm', submitted_at: '2026-06-01T10:00:00Z' }),
     });
     await seedTask({ id: 'gh-ok', prNumber: 7, prUrl: 'https://github.com/user/repo/pull/7' });
-    const res = await get('/api/tasks/gh-ok/github-review');
+    const res = await get('/api/tasks/gh-ok/pr-review');
     const body = JSON.parse(res.body);
     expect(body.available).toBe(true);
     expect(body.prNumber).toBe(7);
     expect(body.prUrl).toBe('https://github.com/user/repo/pull/7');
     expect(body.items).toHaveLength(1);
     expect(body.items[0]).toMatchObject({ kind: 'review', verdict: 'approve' });
+  });
+
+  it('the retired github-review path is gone (no alias route)', async () => {
+    await seedTask({ id: 'gh-old', prNumber: 7 });
+    const res = await get('/api/tasks/gh-old/github-review');
+    expect(res.statusCode).toBe(404);
+  });
+
+  const GIT_BINDING = { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' };
+
+  function spyLiveBinding(binding = GIT_BINDING) {
+    return vi.spyOn(app.ctx.agentManager, 'platformBindingFields')
+      .mockReturnValue({ platformBinding: binding });
+  }
+
+  it('git tasks render the driver timeline instead of the gh hardcoded path', async () => {
+    await seedTask({ id: 'git-ok', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    const fakeDriver = {
+      commentSources: [
+        { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
+      ],
+      runCommentSource: async () => [{ id: 'c1', body: 'from driver', createdAt: '2026-07-19T01:00:00Z' }],
+    };
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor')
+      .mockReturnValue(fakeDriver as never);
+    const res = await get('/api/tasks/git-ok/pr-review');
+    const body = JSON.parse(res.body);
+    expect(body.available).toBe(true);
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]).toMatchObject({ kind: 'issue-comment', body: 'from driver', sourceKey: 'issue-comments' });
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('git tasks without a resolvable driver report driver-unavailable', async () => {
+    await seedTask({ id: 'git-nodrv', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(undefined);
+    const res = await get('/api/tasks/git-nodrv/pr-review');
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'driver-unavailable' });
+    spy.mockRestore();
+    bindingSpy.mockRestore();
+  });
+
+  it('a drifted platform binding never queries the live repo for a historical task', async () => {
+    await seedTask({ id: 'git-drift', reviewMode: 'git', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
+    const bindingSpy = spyLiveBinding({ mode: 'git', repoKey: 'github.com/user/other-repo', tool: 'gh' });
+    const driverSpy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor');
+    const res = await get('/api/tasks/git-drift/pr-review');
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'driver-unavailable' });
+    expect(driverSpy).not.toHaveBeenCalled();
+    driverSpy.mockRestore();
+    bindingSpy.mockRestore();
   });
 
   function countingRunner(): { runner: CommandRunner; commands: string[] } {
@@ -1109,9 +1163,9 @@ describe('GET /api/tasks/:id/github-review', () => {
     const { runner, commands } = countingRunner();
     app.ctx.githubRunner = runner;
     await seedTask({ id: 'gh-cache', prNumber: 7 });
-    await get('/api/tasks/gh-cache/github-review');
+    await get('/api/tasks/gh-cache/pr-review');
     const afterFirst = commands.length;
-    const res = await get('/api/tasks/gh-cache/github-review');
+    const res = await get('/api/tasks/gh-cache/pr-review');
     expect(afterFirst).toBe(4);
     expect(commands.length).toBe(4);
     expect(JSON.parse(res.body).available).toBe(true);
@@ -1121,9 +1175,9 @@ describe('GET /api/tasks/:id/github-review', () => {
     const { runner, commands } = countingRunner();
     app.ctx.githubRunner = runner;
     await seedTask({ id: 'gh-rev', prNumber: 7 });
-    await get('/api/tasks/gh-rev/github-review');
+    await get('/api/tasks/gh-rev/pr-review');
     await seedTask({ id: 'gh-rev', prNumber: 7, reviewDispatchedAt: '2026-07-01T00:00:00Z' });
-    await get('/api/tasks/gh-rev/github-review');
+    await get('/api/tasks/gh-rev/pr-review');
     expect(commands.length).toBe(8);
   });
 
@@ -1131,9 +1185,9 @@ describe('GET /api/tasks/:id/github-review', () => {
     const { runner, commands } = countingRunner();
     app.ctx.githubRunner = runner;
     await seedTask({ id: 'gh-rebind', prNumber: 7 });
-    await get('/api/tasks/gh-rebind/github-review');
+    await get('/api/tasks/gh-rebind/pr-review');
     await seedTask({ id: 'gh-rebind', prNumber: 9 });
-    const res = await get('/api/tasks/gh-rebind/github-review');
+    const res = await get('/api/tasks/gh-rebind/pr-review');
     expect(commands.length).toBe(8);
     expect(commands.slice(4).every((c) => c.includes('/9'))).toBe(true);
     expect(JSON.parse(res.body).prNumber).toBe(9);
@@ -1143,11 +1197,11 @@ describe('GET /api/tasks/:id/github-review', () => {
     const { runner, commands } = countingRunner();
     app.ctx.githubRunner = runner;
     await seedTask({ id: 'gh-slug', prNumber: 7 });
-    await get('/api/tasks/gh-slug/github-review');
+    await get('/api/tasks/gh-slug/pr-review');
     const project = app.ctx.agentManager.getProjectConfig('proj');
     if (!project) throw new Error('test project missing');
     project.repo = 'user/moved';
-    await get('/api/tasks/gh-slug/github-review');
+    await get('/api/tasks/gh-slug/pr-review');
     expect(commands.length).toBe(8);
     expect(commands.slice(4).every((c) => c.includes('repos/user/moved/'))).toBe(true);
   });

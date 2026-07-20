@@ -47,7 +47,9 @@ export interface DriverSpec {
   // 独立持久化，key 是跨插件升级稳定的 cursor 身份（spec §5.3 增量①）。
   commentSources: CommentSourceOp[];
   visibilityLagSeconds: number;
-  preflight: Array<{ argv: string[]; env?: Record<string, string>; fixMessage: string }>;
+  preflight: Array<{ argv: string[]; env?: Record<string, string>; fixMessage: string; versionCheck?: boolean }>;
+  // agent 面 skill 的运行期命令依赖：每组任一命令在 PATH 即满足（如 [["openssl"],["shasum","sha256sum"]]）
+  agentCommands: string[][];
   errorClasses: Array<{ class: string; regex: string[] }>;
 }
 
@@ -75,7 +77,7 @@ export const MAP_FIELD_KINDS: Readonly<Record<string, MapFieldKind>> = {
   defaultBranch: 'string', username: 'string', path: 'string', state: 'state',
   headSha: 'sha', commitSha: 'sha',
   mergedAt: 'timestamp', updatedAt: 'timestamp', createdAt: 'timestamp', approvedAt: 'timestamp',
-  sourceProjectId: 'id', targetProjectId: 'id', id: 'id', discussionId: 'id',
+  sourceProjectId: 'id', targetProjectId: 'id', id: 'id', discussionId: 'id', parentId: 'id',
   authorId: 'id', prAuthorId: 'id',
   draft: 'boolean', system: 'boolean', resolvable: 'boolean', resolved: 'boolean', pushPermitted: 'boolean',
   line: 'integer', originalLine: 'integer',

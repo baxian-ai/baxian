@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { lstat, readdir, readFile, stat } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { join } from 'node:path';
 import { parseManifest, type ManifestIdentity } from './manifest.js';
@@ -117,7 +117,18 @@ async function loadOne(
       errors.push({ pluginPath, message: `skill dir 'skills/${name}' must be prefixed 'baxian-'` });
       continue;
     }
-    const skillR = await readPluginFile(join(skillsRoot, name, 'SKILL.md'), pluginPath, `skills/${name}/SKILL.md`);
+    // 物化扫描（skill/registry）对 skill 内部一律 lstat 不跟随；加载期接受 symlink SKILL.md
+    // 会造出「插件有效但必需 skill 永不物化」的静默空洞，在此拒绝。
+    const skillMdPath = join(skillsRoot, name, 'SKILL.md');
+    try {
+      if ((await lstat(skillMdPath)).isSymbolicLink()) {
+        errors.push({ pluginPath, message: `skills/${name}/SKILL.md must be a regular file (a symlink is never materialized)` });
+        continue;
+      }
+    } catch {
+      // 缺失走下方统一的 not found 诊断
+    }
+    const skillR = await readPluginFile(skillMdPath, pluginPath, `skills/${name}/SKILL.md`);
     if ('errors' in skillR) {
       errors.push(...skillR.errors);
       continue;

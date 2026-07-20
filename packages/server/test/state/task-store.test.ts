@@ -474,6 +474,7 @@ describe('TaskStore git review fields', () => {
     outbox: [{ key: 't1:42:mr-closed-unmerged:1', type: 'human.intervention', data: { phase: 'mr-closed-unmerged' } }],
     pendingRedispatch: true,
     redispatchCount: 2,
+    reviewConversationUpdatedAt: '2026-07-19T08:00:00Z',
   };
 
   it('round-trips the git field family through set and get', async () => {
@@ -490,6 +491,8 @@ describe('TaskStore git review fields', () => {
 
   it('rejects malformed git field shapes on load', async () => {
     const bad: Array<[string, Record<string, unknown>]> = [
+      ['reviewConversationUpdatedAt', { reviewConversationUpdatedAt: 123 }],
+      ['reviewConversationUpdatedAt', { reviewConversationUpdatedAt: '' }],
       ['replyActorStatus', { replyActorStatus: 'trusted' }],
       ['passToken', { passToken: 'short' }],
       ['failToken', { failToken: 42 }],

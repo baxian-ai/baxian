@@ -21,6 +21,12 @@ const REPO_URL_PATTERNS = [
   /^[^/\s:@]+\/[^/\s]+$/,
 ];
 
+// 裸 owner/repo slug 的 resolved tool 必须是 gh（validator 拒绝其它组合），此时不展示
+// tool 输入；完整 URL（含 GitHub）允许显式覆盖 driver，UI 必须能表达。
+function isBareSlug(repo: string): boolean {
+  return /^[^/\s:@]+\/[^/\s]+$/.test(repo.trim());
+}
+
 
 export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const t = useT();
@@ -29,6 +35,9 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [merge, setMerge] = useState<MergeStrategy>(null);
   const [specApproval, setSpecApproval] = useState<SpecApprovalStrategy>('human');
   const [reviewMode, setReviewMode] = useState<ReviewMode | ''>('');
+  const [globalMode, setGlobalMode] = useState<ReviewMode>('github');
+  const [gitCliTool, setGitCliTool] = useState('');
+  const [gitCliNotes, setGitCliNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{ id?: string; repo?: string }>({});
@@ -46,6 +55,9 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setMerge(null);
     setSpecApproval('human');
     setReviewMode('');
+    setGlobalMode('github');
+    setGitCliTool('');
+    setGitCliNotes('');
     setError(null);
     setFieldErrors({});
     setExistingIds(new Set());
@@ -54,14 +66,22 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
       .then(cfg => {
         if (session !== sessionRef.current) return;
         setExistingIds(new Set(cfg.project.map(p => p.id)));
+        setGlobalMode(cfg.review?.mode ?? 'github');
       })
-      .catch(() => {});
+      .catch(err => {
+        if (session !== sessionRef.current) return;
+        setError(t.common.loadFailed(err instanceof Error ? err.message : String(err)));
+      });
   }, [open]);
 
   const handleDismiss = () => {
     if (submitting) return;
     onClose();
   };
+
+  // 按解析后的 effective mode 展示：跟随全局下的自建仓库也要有 tool 入口。
+  const effectiveMode: ReviewMode = reviewMode === '' ? globalMode : reviewMode;
+  const showGitCli = effectiveMode === 'git' && repo.trim() !== '' && !isBareSlug(repo);
 
   const validate = (): boolean => {
     const errs: { id?: string; repo?: string } = {};
@@ -91,6 +111,9 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
         merge,
         ...(specApproval ? { specApproval } : {}),
         ...(reviewMode ? { review: { mode: reviewMode } } : {}),
+        ...(showGitCli && gitCliTool.trim()
+          ? { gitCli: { tool: gitCliTool.trim(), ...(gitCliNotes.trim() ? { notes: gitCliNotes.trim() } : {}) } }
+          : {}),
       });
       if (result.restartRequired) flagDirty();
       show({
@@ -231,7 +254,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">GitHub PR</span>
+            <span className="text-sm text-og-800">{t.createProject.reviewModeGitLabel}</span>
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -242,9 +265,33 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />
-            <span className="text-sm text-og-800">Server</span>
+            <span className="text-sm text-og-800">{t.createProject.reviewModeServerLabel}</span>
           </label>
         </div>
+
+        {showGitCli && (
+          <div>
+            <label className="mb-1 block">
+              <span className={labelCls}>{t.createProject.gitCliToolLabel}</span>
+              <input
+                value={gitCliTool}
+                onChange={e => setGitCliTool(e.target.value)}
+                placeholder={t.createProject.gitCliToolPlaceholder}
+                disabled={submitting}
+                className={inputCls}
+              />
+            </label>
+            <label className="block">
+              <span className={labelCls}>{t.createProject.gitCliNotesLabel}</span>
+              <input
+                value={gitCliNotes}
+                onChange={e => setGitCliNotes(e.target.value)}
+                disabled={submitting}
+                className={inputCls}
+              />
+            </label>
+          </div>
+        )}
       </form>
     </Modal>
   );

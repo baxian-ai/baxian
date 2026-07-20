@@ -10,7 +10,7 @@ import { ReviewConversation } from '../../src/components/review-conversation.tsx
 import { makeTask as makeTaskFixture } from '../helpers/fixtures.ts';
 
 const reviewsMock = vi.mocked(api.tasks.reviews);
-const githubReviewMock = vi.mocked(api.tasks.githubReview);
+const prReviewMock = vi.mocked(api.tasks.prReview);
 
 function LocationProbe() {
   const loc = useLocation();
@@ -56,7 +56,7 @@ function renderConv(task: TaskState) {
 
 beforeEach(() => {
   reviewsMock.mockReset();
-  githubReviewMock.mockReset();
+  prReviewMock.mockReset();
 });
 afterEach(() => cleanup());
 
@@ -95,7 +95,7 @@ describe('ReviewConversation gating', () => {
 
 describe('ReviewConversation github code-review group', () => {
   it('renders the Code review process under Review records without fetching server rounds', async () => {
-    githubReviewMock.mockResolvedValue({
+    prReviewMock.mockResolvedValue({
       available: true,
       prNumber: 7,
       items: [
@@ -112,14 +112,14 @@ describe('ReviewConversation github code-review group', () => {
     expect(screen.getByText('Submit code changes')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(reviewsMock).not.toHaveBeenCalled();
-    expect(githubReviewMock).toHaveBeenCalledWith('task-1');
+    expect(prReviewMock).toHaveBeenCalledWith('task-1');
   });
 
   it('shows Spec review and Code review together for a github SDD task with spec rounds + PR', async () => {
     reviewsMock.mockResolvedValue([
       specRound(1, 'spec', { findings: { round: 1, verdict: 'approve', findings: [] } }),
     ]);
-    githubReviewMock.mockResolvedValue({
+    prReviewMock.mockResolvedValue({
       available: true,
       prNumber: 7,
       items: [{ kind: 'review', id: '11', body: 'lgtm', verdict: 'approve' }],

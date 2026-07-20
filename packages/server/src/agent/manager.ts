@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { join, normalize } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createSignalToken, type ReadFileSignal } from './phase-signal.js';
-import { tmuxInstallHint } from './preflight.js';
+import { tmuxInstallHint, type AgentGitPreflight } from './preflight.js';
 import type {
   AfterDone,
   BaxianConfig,
@@ -20,6 +20,7 @@ import type {
   TaskPhase,
   TaskState,
   TaskStatus,
+  NeedInputWatermark,
 } from '../shared/index.js';
 import {
   BRANCH_PREFIX,
@@ -36,8 +37,8 @@ import {
   repoSlug,
 } from '../shared/index.js';
 import { buildProjectDriver, makeDriverExec } from '../platform/driver-host.js';
-import { DriverOpError } from '../platform/git-driver.js';
-import type { GitDriver, DriverExec } from '../platform/git-driver.js';
+import { DriverOpError, buildDriverRunContext, GitDriver } from '../platform/git-driver.js';
+import type { DriverExec } from '../platform/git-driver.js';
 import type { PluginRegistry } from '../platform/plugin-registry.js';
 import type { NormalizedRow } from '../platform/row-schema.js';
 import { checkOpenPrBinding, type PrRejection } from '../platform/pr-binding.js';
@@ -50,7 +51,7 @@ import { PostApproveStore, type PostApproveCompletion } from '../state/post-appr
 import type { LockManager } from '../state/lock.js';
 import type { EventBus } from '../event/bus.js';
 import type { ErrorRecordStore, ErrorRecordInput } from '../state/error-record-store.js';
-import { SkillRegistry } from '../skill/registry.js';
+import { SkillRegistry, type SkillScope } from '../skill/registry.js';
 import type { CommandRunner } from './runner.js';
 import {
   createRunner,
@@ -83,7 +84,12 @@ import {
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError, isAutoDeletableTaskBranch } from './branch.js';
 import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFileGuarded, canonicalSelfGuard, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
-import { PhaseSignalWatcher, type PhaseSignalWatcherStartArgs } from './phase-signal-watcher.js';
+import {
+  PhaseSignalWatcher,
+  type NeedInputCommitIntent,
+  type NeedInputCommitResult,
+  type PhaseSignalWatcherStartArgs,
+} from './phase-signal-watcher.js';
 import type { PhaseSignalKind } from './phase-signal.js';
 import { ReviewTransport, resolveServerPayloads, type ServerPayloadPromptOpts } from './review-transport.js';
 import type { ReviewStore } from '../state/review-store.js';
@@ -94,10 +100,11 @@ import {
   RequiredSkillsMissingError,
   MAX_PROMPT_BYTES_ROUTE_LIMIT,
   type PostMergeCleanupContext,
+  type PlatformCliDescriptor,
 } from './prompt.js';
 import { ApiError } from '../errors.js';
 import { prepareConfig } from '../config/loader.js';
-import { resolveProjectTool } from '../config/validator.js';
+import { projectReviewMode, resolveProjectTool } from '../config/validator.js';
 import { SHA_HEX_SOURCE } from '../platform/types.js';
 
 export interface EnsureSessionResult {
@@ -294,6 +301,7 @@ export interface AgentManagerDeps {
   paneStreamerManager?: PaneStreamerManager;
   postApproveStore?: PostApproveStore;
   pluginRegistry?: PluginRegistry;
+  platformDefaultBranchOf?: (projectId: string) => string | undefined;
   phaseSignalWatcher?: PhaseSignalWatcher;
   errorRecordStore?: ErrorRecordStore;
   reviewStore?: ReviewStore;
@@ -303,10 +311,12 @@ export interface AgentManagerDeps {
     greeting?: number;
   };
   dispatchAckTimeoutMs?: number;
+  needInputRetryIntervalMs?: number;
   dispatchSettleTimeoutMs?: number;
 }
 
 const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30_000;
+const DEFAULT_NEED_INPUT_RETRY_INTERVAL_MS = 5_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
 // DELETE runtime cleanup runs while holding the deletion tombstone + rotated lock; an unbounded remote
 // probe/kill would block rollback/finally forever, so every tmux round-trip in it carries this deadline.
@@ -490,6 +500,7 @@ export class AgentManager {
   protected paneStreamerManager?: PaneStreamerManager;
   protected postApproveStore: PostApproveStore;
   protected pluginRegistry?: PluginRegistry;
+  private platformDefaultBranchOf?: (projectId: string) => string | undefined;
   private readonly platformDriverExec: DriverExec;
   protected phaseSignalWatcher?: PhaseSignalWatcher;
   protected errorRecordStore?: ErrorRecordStore;
@@ -497,6 +508,7 @@ export class AgentManager {
   private reviewTransportInstance?: ReviewTransport;
   private serverReviewDriver?: ServerReviewDriver;
   protected dispatchAckTimeoutMs: number;
+  private readonly needInputRetryIntervalMs: number;
   protected dispatchSettleTimeoutMs: number;
   protected dispatchAckResendIntervalMs = 3_000;
 
@@ -542,6 +554,7 @@ export class AgentManager {
     this.paneStreamerManager = deps.paneStreamerManager;
     this.postApproveStore = deps.postApproveStore ?? new PostApproveStore();
     this.pluginRegistry = deps.pluginRegistry;
+    this.platformDefaultBranchOf = deps.platformDefaultBranchOf;
     this.errorRecordStore = deps.errorRecordStore;
     this.phaseSignalWatcher = deps.phaseSignalWatcher
       ?? (deps.paneStreamerManager
@@ -549,8 +562,10 @@ export class AgentManager {
             paneStreamerManager: deps.paneStreamerManager,
             eventBus: deps.eventBus,
             resolveAgent: (id) => this.getAgentConfig(id),
+            commitNeedInputWatermark: (intent) => this.commitNeedInputWatermark(intent),
           })
         : undefined);
+    this.needInputRetryIntervalMs = deps.needInputRetryIntervalMs ?? DEFAULT_NEED_INPUT_RETRY_INTERVAL_MS;
     this.reviewStore = deps.reviewStore;
     this.dispatchAckTimeoutMs = deps.dispatchAckTimeoutMs ?? DEFAULT_DISPATCH_ACK_TIMEOUT_MS;
     this.dispatchSettleTimeoutMs = deps.dispatchSettleTimeoutMs ?? DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS;
@@ -930,12 +945,23 @@ export class AgentManager {
     return this.adoptOrRestartSessionLocked(tmux, runner, agent, agentId, workdir, workdir, snapshot);
   }
 
+  private agentSkillScope(agentId: string): SkillScope {
+    const projectId = this.getAgentConfig(agentId)?.projectId;
+    if (projectId === undefined || this.effectiveReviewMode(projectId) !== 'git') {
+      return { pluginTools: [] };
+    }
+    const project = this.getProjectConfig(projectId);
+    const tool = project === undefined ? undefined : resolveProjectTool(project);
+    return { pluginTools: tool === undefined ? [] : [tool] };
+  }
+
   private async provisionRepoSkills(
     runner: CommandRunner,
     agent: AgentConfig,
     workdir: string,
   ): Promise<void> {
     if (this.skillRegistry.names().length === 0) return;
+    const scope = this.agentSkillScope(agent.id);
     const subdir = skillSubdirFor(agent.runtime);
     const destRoot = `${workdir}/${subdir}`;
     await this.excludeInjectedSkills(runner, workdir, subdir);
@@ -945,10 +971,14 @@ export class AgentManager {
     // would execute a `!`cmd`` / inline a @path embedded in an untrusted task title/description
     // before the skill runs. Message-body payloads are not expanded, so this path is injection-safe.
     await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
-      await this.ensureSkillDirSafe(runner, workdir, subdir);
+      await this.ensureSkillDirSafe(runner, workdir, subdir, [
+        ...this.skillRegistry.names(),
+        ...this.skillRegistry.pluginSkillNames(scope),
+      ]);
       await this.skillRegistry.materialize(
         (path, content) => this.atomicWriteFile(runner, workdir, path, content),
         destRoot,
+        scope,
       );
     });
   }
@@ -1076,9 +1106,10 @@ export class AgentManager {
     runner: CommandRunner,
     workdir: string,
     subdir: string,
+    keepNames: string[],
   ): Promise<void> {
     const top = subdir.split('/')[0];
-    const keep = this.skillRegistry.names().map((n) => `! -name ${shellQuote(n)}`).join(' ');
+    const keep = keepNames.map((n) => `! -name ${shellQuote(n)}`).join(' ');
     const inner =
       // canonicalSelfGuard (cd+pwd -P) rejects a rebound MIDDLE ancestor, not just a symlinked leaf, so the find/rm can't escape.
       `${canonicalSelfGuard(workdir)} && ` +
@@ -1105,14 +1136,14 @@ export class AgentManager {
   ): Promise<void> {
     if (this.skillRegistry.names().length === 0) return;
     await this.setSessionOptions(tmux, agentId, ref, [
-      ['@baxian-skills-version', this.skillRegistry.contentHash()],
+      ['@baxian-skills-version', this.skillRegistry.contentHash(this.agentSkillScope(agentId))],
     ]);
   }
 
   private async replSkillsStale(tmux: TmuxManager, agentId: string, ref: TmuxSessionRef): Promise<boolean> {
     if (this.skillRegistry.names().length === 0) return false;
     const tagged = await tmux.getSessionOptionByRef(ref, agentId, '@baxian-skills-version');
-    return tagged !== this.skillRegistry.contentHash();
+    return tagged !== this.skillRegistry.contentHash(this.agentSkillScope(agentId));
   }
 
   private async excludeInjectedSkills(
@@ -2297,11 +2328,15 @@ export class AgentManager {
               ...(latest.workdir !== undefined ? { workdir: latest.workdir } : {}),
               ...(latest.startedAt !== undefined ? { startedAt: latest.startedAt } : {}),
               ...(latest.creationToken !== undefined ? { creationToken: latest.creationToken } : {}),
+              // Release voids the open question: strip the watermark, bump the epoch so
+              // any in-flight/queued commit of the old generation fences server-side.
+              needInput: { epoch: (latest.needInput?.epoch ?? 0) + 1 },
             };
             return cleared;
           }
           return {
             ...latest,
+            needInput: { epoch: (latest.needInput?.epoch ?? 0) + 1 },
             updatedAt: now,
           };
         });
@@ -2311,6 +2346,7 @@ export class AgentManager {
           );
           return false;
         }
+        this.clearNeedInputRetryFor(agentId, expectedTaskId);
         return true;
       }
 
@@ -2530,6 +2566,7 @@ export class AgentManager {
           ...(existing.workdir !== undefined ? { workdir: existing.workdir } : {}),
           ...(!sessionConfirmedAbsent && existing.paneId !== undefined ? { paneId: existing.paneId } : {}),
           ...(existing.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
+          needInput: { epoch: (existing.needInput?.epoch ?? 0) + 1 },
           updatedAt: now,
         };
       });
@@ -2539,6 +2576,7 @@ export class AgentManager {
         );
         return false;
       }
+      this.clearNeedInputRetryFor(agentId, expectedTaskId);
       return this.lockManager.releaseIfOwner(agentId, expectedTaskId, lockToken);
     });
   }
@@ -2736,46 +2774,483 @@ export class AgentManager {
     }
   }
 
-  private async setAgentNeedInput(agentId: string, pending: boolean, opts: { taskId?: string } = {}): Promise<void> {
-    const now = new Date().toISOString();
+  // ---- need-input watermark: epoch-fenced monotonic persistence + retry convergence ----
+
+  private readonly needInputRetry = new Map<string, { askSeq: number; answeredSeq: number }>();
+  private readonly needInputRetryInFlight = new Set<string>();
+  // Watermark writes currently in the store chain. A restore bump snapshots these along
+  // with the queue: an answer whose write has not settled yet would otherwise be invisible
+  // to the migration and its error-enqueue would land after the arm already cleared the
+  // queue — deleting the only proof the user answered.
+  private readonly needInputWritesInFlight = new Map<number, NeedInputCommitIntent>();
+  private needInputWriteSeq = 0;
+  // Serializes the probe→bump→queue-clear section of concurrent arms for one
+  // (agentId, taskId): without it a stale replay probed before a successor's bump can
+  // itself bump afterwards, ghost-fencing the installed successor. All locked steps are
+  // bounded (memory probe + one store update); subscribe stays outside the lock.
+  private readonly needInputArmLocks = new Map<string, Promise<void>>();
+  private needInputRetryTimer: ReturnType<typeof setInterval> | null = null;
+
+  private needInputRetryKey(agentId: string, taskId: string, epoch: number): string {
+    return `${agentId} ${taskId} ${epoch}`;
+  }
+
+  private parseNeedInputRetryKey(key: string): { agentId: string; taskId: string; epoch: number } | null {
+    const [agentId, taskId, epochRaw] = key.split(' ');
+    if (!agentId || !taskId || epochRaw === undefined) return null;
+    const epoch = Number.parseInt(epochRaw, 10);
+    if (!Number.isFinite(epoch)) return null;
+    return { agentId, taskId, epoch };
+  }
+
+  // Standard commit entry: one agentStore.update, NEVER called from inside another
+  // updater (the store's per-id chain is non-reentrant).
+  // The ledger entry lives until the result is fully handed over — an error is IN the
+  // retry queue before deregistration, in the same synchronous continuation. Splitting
+  // those two across promise jobs would open a window where neither the ledger nor the
+  // queue holds the intent and a concurrent restore snapshot loses the answer.
+  async commitNeedInputWatermark(intent: NeedInputCommitIntent): Promise<NeedInputCommitResult> {
+    const writeId = ++this.needInputWriteSeq;
+    this.needInputWritesInFlight.set(writeId, intent);
+    const key = this.needInputRetryKey(intent.agentId, intent.taskId, intent.epoch);
     try {
-      await this.agentStore.update(agentId, (existing) => {
-        if (!existing) return AGENT_STORE_NOOP;
-        // A stale watcher callback must not stamp a rebound agent: the badge belongs
-        // to the watch's task, so a taskId mismatch means the binding moved on.
-        if (opts.taskId !== undefined && existing.taskId !== opts.taskId) return AGENT_STORE_NOOP;
-        if (pending) {
-          if (existing.needInputAt !== undefined) return AGENT_STORE_NOOP;
-          return { ...existing, needInputAt: now, updatedAt: now };
-        }
-        if (existing.needInputAt === undefined) return AGENT_STORE_NOOP;
-        const { needInputAt: _needInputAt, ...rest } = existing;
-        return { ...rest, updatedAt: now };
-      });
+      const result = await this.writeNeedInputWatermark(intent);
+      if (result === 'error') {
+        this.enqueueNeedInputRetry(key, intent.askSeq, intent.answeredSeq);
+      } else {
+        this.settleNeedInputRetry(key, intent.askSeq, intent.answeredSeq, result);
+      }
+      return result;
     } catch (err) {
-      console.warn(`[AgentManager] setAgentNeedInput(${agentId}, ${pending}) failed:`, err);
+      this.enqueueNeedInputRetry(key, intent.askSeq, intent.answeredSeq);
+      throw err;
+    } finally {
+      this.needInputWritesInFlight.delete(writeId);
     }
   }
 
-  // Single entry for arming phase-signal watches: every path (dispatch, post-approve,
-  // recover, rollback) must carry the need-input callback, or that watch silently
-  // drops the side-channel and the badge never lights for its phase.
-  private startPhaseSignalWatch(
-    args: Omit<PhaseSignalWatcherStartArgs, 'onNeedInput'>,
-  ): Promise<boolean> {
-    if (!this.phaseSignalWatcher) return Promise.resolve(true);
-    return this.phaseSignalWatcher.start({
-      ...args,
-      onNeedInput: (pending) => {
-        void this.setAgentNeedInput(args.agentId, pending, { taskId: args.taskId });
-      },
-    });
+  private async writeNeedInputWatermark(intent: NeedInputCommitIntent): Promise<NeedInputCommitResult> {
+    let outcome: NeedInputCommitResult = 'fenced';
+    try {
+      await this.agentStore.update(intent.agentId, (existing) => {
+        if (!existing || existing.taskId !== intent.taskId) {
+          outcome = 'fenced';
+          return AGENT_STORE_NOOP;
+        }
+        const cur = existing.needInput;
+        if ((cur?.epoch ?? 0) !== intent.epoch) {
+          outcome = 'fenced';
+          return AGENT_STORE_NOOP;
+        }
+        const askSeq = Math.max(cur?.askSeq ?? 0, intent.askSeq);
+        const answeredSeq = Math.max(cur?.answeredSeq ?? 0, intent.answeredSeq);
+        outcome = 'ok';
+        if (cur && (cur.askSeq ?? 0) === askSeq && (cur.answeredSeq ?? 0) === answeredSeq) {
+          return AGENT_STORE_NOOP;
+        }
+        const now = new Date().toISOString();
+        const at = askSeq > answeredSeq ? (cur?.at ?? now) : undefined;
+        return {
+          ...existing,
+          needInput: {
+            epoch: intent.epoch, askSeq, answeredSeq,
+            ...(at !== undefined ? { at } : {}),
+            ...(cur?.cutoverToken !== undefined ? { cutoverToken: cur.cutoverToken } : {}),
+          },
+          updatedAt: now,
+        };
+      });
+    } catch (err) {
+      console.warn(
+        `[AgentManager] needInput watermark write failed (agent=${intent.agentId} epoch=${intent.epoch}):`,
+        err,
+      );
+      return 'error';
+    }
+    return outcome;
   }
 
-  // The user typed into the agent's terminal — its pending question is being answered.
+  private enqueueNeedInputRetry(key: string, askSeq: number, answeredSeq: number): void {
+    const cur = this.needInputRetry.get(key);
+    this.needInputRetry.set(key, {
+      askSeq: Math.max(cur?.askSeq ?? 0, askSeq),
+      answeredSeq: Math.max(cur?.answeredSeq ?? 0, answeredSeq),
+    });
+    this.ensureNeedInputRetryTimer();
+  }
+
+  // ok deletes only when the queued item is still covered by what was written
+  // (a concurrent edge may have raised it mid-flight); fenced is terminal either way.
+  private settleNeedInputRetry(
+    key: string,
+    wroteAskSeq: number,
+    wroteAnsweredSeq: number,
+    result: 'ok' | 'fenced',
+  ): void {
+    const cur = this.needInputRetry.get(key);
+    if (!cur) return;
+    if (result === 'fenced' || (cur.askSeq <= wroteAskSeq && cur.answeredSeq <= wroteAnsweredSeq)) {
+      this.needInputRetry.delete(key);
+      this.ensureNeedInputRetryTimer();
+    }
+  }
+
+  private clearNeedInputRetryFor(agentId: string, taskId: string): void {
+    for (const key of [...this.needInputRetry.keys()]) {
+      const parsed = this.parseNeedInputRetryKey(key);
+      if (parsed && parsed.agentId === agentId && parsed.taskId === taskId) {
+        this.needInputRetry.delete(key);
+      }
+    }
+    this.ensureNeedInputRetryTimer();
+  }
+
+  private ensureNeedInputRetryTimer(): void {
+    if (this.needInputRetry.size === 0) {
+      if (this.needInputRetryTimer) {
+        clearInterval(this.needInputRetryTimer);
+        this.needInputRetryTimer = null;
+      }
+      return;
+    }
+    if (this.needInputRetryTimer) return;
+    this.needInputRetryTimer = setInterval(() => {
+      void this.needInputRetryPass();
+    }, this.needInputRetryIntervalMs);
+    this.needInputRetryTimer.unref?.();
+  }
+
+  private async needInputRetryPass(): Promise<void> {
+    for (const [key, snapshot] of [...this.needInputRetry.entries()]) {
+      if (this.needInputRetryInFlight.has(key)) continue;
+      const parsed = this.parseNeedInputRetryKey(key);
+      if (!parsed) {
+        this.needInputRetry.delete(key);
+        continue;
+      }
+      this.needInputRetryInFlight.add(key);
+      try {
+        const result = await this.writeNeedInputWatermark({
+          agentId: parsed.agentId,
+          taskId: parsed.taskId,
+          epoch: parsed.epoch,
+          askSeq: snapshot.askSeq,
+          answeredSeq: snapshot.answeredSeq,
+        });
+        if (result !== 'error') {
+          this.settleNeedInputRetry(key, snapshot.askSeq, snapshot.answeredSeq, result);
+        }
+      } finally {
+        this.needInputRetryInFlight.delete(key);
+      }
+    }
+    this.ensureNeedInputRetryTimer();
+  }
+
+  private collectSameEpochNeedInput(
+    agentId: string,
+    taskId: string,
+    epoch: number,
+  ): { askSeq: number; answeredSeq: number } | null {
+    let owed: { askSeq: number; answeredSeq: number } | null = null;
+    const merge = (wm: { askSeq: number; answeredSeq: number }): void => {
+      owed = {
+        askSeq: Math.max(owed?.askSeq ?? 0, wm.askSeq),
+        answeredSeq: Math.max(owed?.answeredSeq ?? 0, wm.answeredSeq),
+      };
+    };
+    for (const [key, wm] of this.needInputRetry) {
+      const parsed = this.parseNeedInputRetryKey(key);
+      if (!parsed || parsed.agentId !== agentId || parsed.taskId !== taskId) continue;
+      if (parsed.epoch === epoch) merge(wm);
+    }
+    for (const intent of this.needInputWritesInFlight.values()) {
+      if (intent.agentId !== agentId || intent.taskId !== taskId) continue;
+      if (intent.epoch === epoch) merge(intent);
+    }
+    return owed;
+  }
+
+  // Only the generation this arm directly succeeds (bumps are +1 and serialized per key).
+  // Anything older was already superseded — a fresh arm in between stripped its question
+  // on purpose, and transplanting it would relight a prompt nobody asked.
+  private collectPredecessorNeedInputDelta(
+    agentId: string,
+    taskId: string,
+    epoch: number,
+  ): { askSeq: number; answeredSeq: number } | null {
+    let delta: { askSeq: number; answeredSeq: number } | null = null;
+    const merge = (wm: { askSeq: number; answeredSeq: number }): void => {
+      delta = {
+        askSeq: Math.max(delta?.askSeq ?? 0, wm.askSeq),
+        answeredSeq: Math.max(delta?.answeredSeq ?? 0, wm.answeredSeq),
+      };
+    };
+    for (const [key, wm] of this.needInputRetry) {
+      const parsed = this.parseNeedInputRetryKey(key);
+      if (!parsed || parsed.agentId !== agentId || parsed.taskId !== taskId) continue;
+      if (parsed.epoch === epoch - 1) merge(wm);
+    }
+    for (const intent of this.needInputWritesInFlight.values()) {
+      if (intent.agentId !== agentId || intent.taskId !== taskId) continue;
+      if (intent.epoch === epoch - 1) merge(intent);
+    }
+    return delta;
+  }
+
+  private async withNeedInputArmLock<T>(
+    agentId: string,
+    taskId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const key = `${agentId} ${taskId}`;
+    const prev = this.needInputArmLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn);
+    const settled = run.then(() => undefined, () => undefined);
+    this.needInputArmLocks.set(key, settled);
+    void settled.finally(() => {
+      if (this.needInputArmLocks.get(key) === settled) this.needInputArmLocks.delete(key);
+    });
+    return run;
+  }
+
+  // 'restore' must also merge queued retry seqs of the CURRENT persisted epoch: after
+  // session-gone the queue can hold the only proof an answer happened (the entry is
+  // gone, so needInputInherit has nothing to merge), and the arm clears the queue.
+  private async bumpNeedInputEpochForArm(
+    agentId: string,
+    taskId: string,
+    mode: 'fresh' | 'restore',
+    opts: { armToken?: string; paneCutover?: boolean } = {},
+  ): Promise<{
+    wm: { epoch: number; askSeq: number; answeredSeq: number } | null;
+    bumped: boolean;
+    snapshotBlind: boolean;
+  }> {
+    // Contributions are collected INSIDE the updater: it runs when the store chain
+    // reaches this bump, so an answer whose commit started while the bump was queued
+    // (registered in the ledger, or already error-queued) is still visible. A snapshot
+    // taken at call time would miss exactly that window.
+    const collectContributions = (): Map<number, { askSeq: number; answeredSeq: number }> => {
+      const queued = new Map<number, { askSeq: number; answeredSeq: number }>();
+      if (mode !== 'restore') return queued;
+      const mergeContribution = (epoch: number, wm: { askSeq: number; answeredSeq: number }): void => {
+        const cur = queued.get(epoch);
+        queued.set(epoch, {
+          askSeq: Math.max(cur?.askSeq ?? 0, wm.askSeq),
+          answeredSeq: Math.max(cur?.answeredSeq ?? 0, wm.answeredSeq),
+        });
+      };
+      for (const [key, qwm] of this.needInputRetry) {
+        const parsed = this.parseNeedInputRetryKey(key);
+        if (!parsed || parsed.agentId !== agentId || parsed.taskId !== taskId) continue;
+        mergeContribution(parsed.epoch, qwm);
+      }
+      for (const intent of this.needInputWritesInFlight.values()) {
+        if (intent.agentId !== agentId || intent.taskId !== taskId) continue;
+        mergeContribution(intent.epoch, intent);
+      }
+      return queued;
+    };
+    let wm: { epoch: number; askSeq: number; answeredSeq: number } | null = null;
+    let snapshotBlind = false;
+    // Scoped to THIS arm's token: a marker left by another token's replay says nothing
+    // about the pane's ambiguity for us, so it is neither honoured nor carried forward.
+    const keepCutover = (cur: NeedInputWatermark | undefined): string | undefined =>
+      (opts.paneCutover
+        ? opts.armToken
+        : cur !== undefined && cur.cutoverToken === opts.armToken ? cur.cutoverToken : undefined);
+    try {
+      await this.agentStore.update(agentId, (existing) => {
+        if (!existing || existing.taskId !== taskId) return AGENT_STORE_NOOP;
+        const cur = existing.needInput;
+        const contrib = collectContributions().get(cur?.epoch ?? 0);
+        const epoch = (cur?.epoch ?? 0) + 1;
+        const askSeq = mode === 'restore' ? Math.max(cur?.askSeq ?? 0, contrib?.askSeq ?? 0) : 0;
+        const answeredSeq = mode === 'restore'
+          ? Math.max(cur?.answeredSeq ?? 0, contrib?.answeredSeq ?? 0)
+          : 0;
+        wm = { epoch, askSeq, answeredSeq };
+        const cutoverToken = keepCutover(cur);
+        snapshotBlind = cutoverToken !== undefined;
+        const at = askSeq > answeredSeq ? (cur?.at ?? new Date().toISOString()) : undefined;
+        return {
+          ...existing,
+          needInput: {
+            epoch, askSeq, answeredSeq,
+            ...(at !== undefined ? { at } : {}),
+            ...(cutoverToken !== undefined ? { cutoverToken } : {}),
+          },
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    } catch (err) {
+      console.warn(`[AgentManager] needInput epoch bump failed (agent=${agentId} task=${taskId}):`, err);
+      // Fall back to the persisted watermark for a restore: without it the entry would
+      // start at 0/0 and swallow the answer to a question that is still open in the
+      // store, leaving the badge lit forever. No bump means no generation advance —
+      // the caller must not treat this as a fresh generation.
+      if (mode === 'restore') {
+        try {
+          const cur = await this.agentStore.get(agentId);
+          if (cur?.taskId === taskId && cur.needInput) {
+            // Same-generation intents still owed to the store hold questions the
+            // persisted watermark has not caught up with; merge them in.
+            const owed = this.collectSameEpochNeedInput(agentId, taskId, cur.needInput.epoch);
+
+            return {
+              wm: {
+                epoch: cur.needInput.epoch,
+                askSeq: Math.max(cur.needInput.askSeq ?? 0, owed?.askSeq ?? 0),
+                answeredSeq: Math.max(cur.needInput.answeredSeq ?? 0, owed?.answeredSeq ?? 0),
+              },
+              bumped: false,
+              snapshotBlind: cur.needInput.cutoverToken === opts.armToken,
+            };
+          }
+        } catch (readErr) {
+          console.warn(`[AgentManager] needInput watermark read-back failed (agent=${agentId}):`, readErr);
+        }
+      }
+      return { wm: null, bumped: false, snapshotBlind: true };
+    }
+    return { wm, bumped: wm !== null, snapshotBlind: wm === null ? true : snapshotBlind };
+  }
+
+  // Single entry for arming phase-signal watches — every path must flow through the
+  // epoch bump, or stale-generation commits could survive the re-arm.
+  private async startPhaseSignalWatch(
+    args: Omit<PhaseSignalWatcherStartArgs, 'needInput' | 'needInputInherit' | 'needInputSnapshotBlind'>
+      & { needInputMode?: 'fresh' | 'restore'; needInputPaneCutover?: boolean },
+  ): Promise<boolean> {
+    if (!this.phaseSignalWatcher) return true;
+    const { needInputMode, needInputPaneCutover: _paneCutover, ...rest } = args;
+    const mode = needInputMode ?? 'restore';
+    const watcher = this.phaseSignalWatcher;
+    // Claim ownership before bumping: a rejected arm must not bump (it would fence the
+    // owner), and the claim keeps this arm visible to later probes while it subscribes.
+    const gateResult = await this.withNeedInputArmLock(args.agentId, args.taskId, async () => {
+      const claim = watcher.claimArm?.({
+        taskId: args.taskId,
+        agentId: args.agentId,
+        token: args.token,
+        ...(args.onlyReplaceOwnToken !== undefined ? { onlyReplaceOwnToken: args.onlyReplaceOwnToken } : {}),
+        ...(args.replaceScope !== undefined ? { replaceScope: args.replaceScope } : {}),
+      });
+      if (claim === null) return 'rejected' as const;
+      const bump = await this.bumpNeedInputEpochForArm(args.agentId, args.taskId, mode, {
+        armToken: args.token,
+        ...(args.needInputPaneCutover ? { paneCutover: true } : {}),
+      });
+      // Only a real generation advance may drop the queue: same-generation intents
+      // (bump failed, watermark read back) are still owed to the store.
+      if (bump.bumped) this.clearNeedInputRetryFor(args.agentId, args.taskId);
+      return { ...bump, claim };
+    });
+    if (gateResult === 'rejected') return false;
+    const { wm, bumped, snapshotBlind, claim } = gateResult;
+    // Same synchronous section as the bump result: old-generation answers must not slip
+    // between the bump and the handoff (start() migrates the predecessor synchronously).
+    if (wm !== null && bumped && mode === 'restore') {
+      const delta = this.collectPredecessorNeedInputDelta(args.agentId, args.taskId, wm.epoch);
+      if (delta) {
+        void this.commitNeedInputWatermark({
+          agentId: args.agentId,
+          taskId: args.taskId,
+          epoch: wm.epoch,
+          askSeq: Math.max(delta.askSeq, wm.askSeq),
+          answeredSeq: Math.max(delta.answeredSeq, wm.answeredSeq),
+        });
+      }
+    }
+    // wm === null (no binding / store error): arm anyway with badge commits disabled —
+    // the badge is display-only, the signal watch drives task progress.
+    try {
+      return await watcher.start({
+        ...rest,
+        ...(claim != null ? { armClaimId: claim } : {}),
+        // Inherit is about restore semantics, not about having a generation: a degraded
+        // restore still has to keep the predecessor's pending question in memory.
+        needInputInherit: mode === 'restore',
+        ...(snapshotBlind ? { needInputSnapshotBlind: true } : {}),
+        ...(wm !== null ? { needInput: wm } : {}),
+      });
+    } finally {
+      watcher.releaseArm?.(claim);
+    }
+  }
+
+  // Web-fallback confirm: settles the newest known question (store ∪ retry queue) as
+  // answered in ONE store update — usable when no watch entry exists (pre-recovery,
+  // arm failure, post-stop). Queue contributions are snapshotted synchronously; the
+  // updater derives everything else from `existing`, so no nested store calls.
+  private async confirmNeedInputAnswered(agentId: string): Promise<void> {
+    const queueAsk = new Map<string, number>();
+    for (const [key, wm] of this.needInputRetry) {
+      const parsed = this.parseNeedInputRetryKey(key);
+      if (!parsed || parsed.agentId !== agentId) continue;
+      const mapKey = `${parsed.taskId} ${parsed.epoch}`;
+      queueAsk.set(mapKey, Math.max(queueAsk.get(mapKey) ?? 0, wm.askSeq));
+    }
+    for (const intent of this.needInputWritesInFlight.values()) {
+      if (intent.agentId !== agentId) continue;
+      const mapKey = `${intent.taskId} ${intent.epoch}`;
+      queueAsk.set(mapKey, Math.max(queueAsk.get(mapKey) ?? 0, intent.askSeq));
+    }
+    let settled: { taskId: string; epoch: number; askSeq: number } | null = null;
+    try {
+      await this.agentStore.update(agentId, (existing) => {
+        if (!existing?.taskId) return AGENT_STORE_NOOP;
+        const cur = existing.needInput;
+        const epoch = cur?.epoch ?? 0;
+        const qAsk = queueAsk.get(`${existing.taskId} ${epoch}`) ?? 0;
+        const askSeq = Math.max(cur?.askSeq ?? 0, qAsk);
+        const answeredSeq = Math.max(cur?.answeredSeq ?? 0, askSeq);
+        settled = { taskId: existing.taskId, epoch, askSeq };
+        if (cur && (cur.askSeq ?? 0) === askSeq && (cur.answeredSeq ?? 0) === answeredSeq && cur.at === undefined) {
+          return AGENT_STORE_NOOP;
+        }
+        if (!cur && askSeq === 0) return AGENT_STORE_NOOP;
+        return {
+          ...existing,
+          needInput: {
+            epoch, askSeq, answeredSeq,
+            ...(cur?.cutoverToken !== undefined ? { cutoverToken: cur.cutoverToken } : {}),
+          },
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    } catch (err) {
+      console.warn(`[AgentManager] confirmNeedInputAnswered(${agentId}) failed:`, err);
+      if (settled !== null) {
+        const s: { taskId: string; epoch: number; askSeq: number } = settled;
+        this.enqueueNeedInputRetry(this.needInputRetryKey(agentId, s.taskId, s.epoch), s.askSeq, s.askSeq);
+      }
+      return;
+    }
+    if (settled !== null) {
+      const s: { taskId: string; epoch: number; askSeq: number } = settled;
+      this.settleNeedInputRetry(this.needInputRetryKey(agentId, s.taskId, s.epoch), s.askSeq, s.askSeq, 'ok');
+    }
+  }
+
+  // The user typed into the agent's terminal — its open question counts as answered.
+  // The store fallback runs only when no watch entry exists (pre-recovery, arm failure,
+  // post-stop): with a live entry it would race the entry's in-flight writes and could
+  // confirm an ask that arrived after this input.
   async notifyHumanTerminalInput(agentId: string): Promise<void> {
-    this.phaseSignalWatcher?.rearmNeedInput(agentId);
-    await this.setAgentNeedInput(agentId, false);
+    // Rearm first: it settles entry state synchronously, so a question printed during
+    // this call cannot be confirmed by mistake. The binding read only decides whether a
+    // watcher of the CURRENT task took the input — a leftover entry of a finished task
+    // must not suppress the store fallback.
+    const handled = await this.phaseSignalWatcher?.rearmNeedInput(agentId);
+    let taskId: string | undefined;
+    try {
+      taskId = (await this.agentStore.get(agentId))?.taskId;
+    } catch (err) {
+      console.warn(`[AgentManager] notifyHumanTerminalInput(${agentId}) binding read failed:`, err);
+    }
+    if (taskId === undefined || !handled?.has(taskId)) await this.confirmNeedInputAnswered(agentId);
   }
 
   async clearAwaitingHuman(
@@ -3087,6 +3562,7 @@ export class AgentManager {
           if (existing.taskId !== undefined) next.taskId = existing.taskId;
           if (existing.lockToken !== undefined) next.lockToken = existing.lockToken;
           if (existing.startedAt !== undefined) next.startedAt = existing.startedAt;
+          if (existing.needInput !== undefined) next.needInput = existing.needInput;
         }
         return next;
       });
@@ -3800,6 +4276,8 @@ export class AgentManager {
           const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, {
             skipSnapshot: true,
             onlyReplaceOwnToken: true,
+            needInputMode: 'fresh',
+            needInputPaneCutover: true,
             // git 双 watcher 下 fence 只应比较自己的 (taskId, agentId) 条目：task 域会拿
             // sibling（reconciliation）的不同 token 否决本应合法的重布防
             ...(task.reviewMode === 'git' ? { replaceScope: 'agent' as const } : {}),
@@ -4426,6 +4904,7 @@ export class AgentManager {
         agentId: task.agentId,
         expectedKinds: 'pr-merge-ready',
         token: value.token,
+        needInputMode: 'fresh',
       });
       if (!armed) {
         // completion 没有 consumer 就不算安装成功：撤销本次写，durable pending（若有）随原状保留
@@ -4728,6 +5207,29 @@ export class AgentManager {
 
   // 配置身份切换与任务创建共栅栏（TOCTOU）：blocker 扫描与提交在 withTaskLock 内执行，
   // createTask 的「读配置快照+落任务」同经该锁，扫描时不可见的并发新任务不存在。
+  // 启动期按「未引用」跳过 skill 池的插件，被热配置首次引用时同步重扫；仍不可物化即拒绝提交——
+  // 可解析但物化为空的 tool 会让派发要求加载一个不存在的 skill。
+  async ensurePluginSkillPools(next: BaxianConfig): Promise<void> {
+    if (!this.pluginRegistry) return;
+    for (const project of next.project) {
+      if (projectReviewMode(next, project) !== 'git') continue;
+      const tool = resolveProjectTool(project);
+      if (tool === undefined) continue;
+      const plugin = this.pluginRegistry.resolveTool(tool);
+      // 静默放行会存下一个「无 driver、无平台 skill、重启即 fatal」的配置（启动期同判据）
+      if (plugin === undefined) {
+        throw new Error(
+          `project '${project.id}': no git-driver plugin provides tool '${tool}' — install it under ~/.baxian/plugins/ first`,
+        );
+      }
+      if (this.skillRegistry.pluginSkillNames({ pluginTools: [tool] }).length > 0) continue;
+      await this.skillRegistry.scanPluginSkills(tool, join(plugin.pluginPath, 'skills'));
+      if (this.skillRegistry.pluginSkillNames({ pluginTools: [tool] }).length === 0) {
+        throw new Error(`plugin '${plugin.manifest.name}' provides no materializable skills for tool '${tool}'`);
+      }
+    }
+  }
+
   async guardGitConfigCommit(
     current: BaxianConfig,
     next: BaxianConfig,
@@ -5187,6 +5689,73 @@ export class AgentManager {
     return { platformBinding: { mode: 'git', repoKey: repoIdentityKey(project.repo), tool } };
   }
 
+  // agent 面一律 PATH 解析 tool；server 面 binary/env 不进入该轨。
+  agentGitPreflightContext(projectId: string): AgentGitPreflight | undefined {
+    if (this.effectiveReviewMode(projectId) !== 'git') return undefined;
+    const project = this.getProjectConfig(projectId);
+    if (!project || !this.pluginRegistry) return undefined;
+    const tool = resolveProjectTool(project);
+    if (tool === undefined) return undefined;
+    const plugin = this.pluginRegistry.resolveTool(tool);
+    if (plugin === undefined) return undefined;
+    const renderCtx = buildDriverRunContext(project.repo, tool);
+    return {
+      tool,
+      minToolVersion: plugin.manifest.minToolVersion,
+      steps: plugin.spec.preflight,
+      agentCommands: plugin.spec.agentCommands,
+      renderCtx,
+      driverFor: (exec) => new GitDriver(plugin, renderCtx, exec),
+    };
+  }
+
+  // cli 字段族每次派发实时渲染，不做创建时快照。渲染前按持久化 binding 校验身份——
+  // 离线漂移的配置会把旧任务的 PR 号/分支/令牌带到新仓库，与平台操作同一守卫。
+  platformCliContextOf(task: TaskState): PlatformCliDescriptor | undefined {
+    if (task.reviewMode !== 'git') return undefined;
+    this.assertPlatformBinding(task);
+    const project = this.getProjectConfig(task.projectId);
+    if (!project) return undefined;
+    const tool = resolveProjectTool(project);
+    if (tool === undefined) return undefined;
+    const ctx = buildDriverRunContext(project.repo, tool);
+    return {
+      tool,
+      host: ctx.host,
+      repo: ctx.repoPath,
+      repoEncoded: encodeURIComponent(ctx.repoPath),
+      ...(project.gitCli?.notes !== undefined ? { notes: project.gitCli.notes } : {}),
+    };
+  }
+
+  // base 快照一经持久化不可变；无快照保持缺省，由 agent 现场显式查询。
+  async ensureGitBaseSnapshot(task: TaskState, phase: string): Promise<TaskState> {
+    if (task.reviewMode !== 'git' || (phase !== 'develop' && phase !== 'code')) return task;
+    if (task.baseBranch !== undefined) return task;
+    // 读默认分支与落快照都以 binding 为前提：失配任务先写入新仓库的 base 会永久污染不可变快照
+    this.assertPlatformBinding(task);
+    const base = this.platformDefaultBranchOf?.(task.projectId);
+    if (base === undefined) return task;
+    return this.withTaskLock(async () => {
+      const fresh = await this.taskStore.get(task.id);
+      if (!fresh) return task;
+      if (fresh.baseBranch !== undefined) return fresh;
+      this.assertPlatformBinding(fresh);
+      const next = { ...fresh, baseBranch: base, updatedAt: new Date().toISOString() };
+      await this.taskStore.set(next);
+      return next;
+    });
+  }
+
+  async noteReviewConversationRevision(taskId: string): Promise<void> {
+    await this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || TERMINAL_STATUSES.includes(task.status)) return;
+      const now = new Date().toISOString();
+      await this.taskStore.set({ ...task, reviewConversationUpdatedAt: now, updatedAt: now });
+    });
+  }
+
   // 指纹为纯身份三元组（spec §4）：binary/env/skill 文本 live 解析可演进，身份失配即拒绝
   private assertPlatformBinding(task: TaskState): void {
     const binding = task.platformBinding;
@@ -5562,8 +6131,11 @@ export class AgentManager {
         runner, project.repo, agent.mode, host, this.repoCache, agent.id, agent.workdir,
       );
     }
+    const cloneViaGh = this.effectiveReviewMode(project.id) === 'git'
+      ? resolveProjectTool(project) === 'gh'
+      : undefined;
     return new RepoStore(
-      runner, project.repo, agent.mode, host, this.repoCache, agent.id, agent.workdir,
+      runner, project.repo, agent.mode, host, this.repoCache, agent.id, agent.workdir, cloneViaGh,
     );
   }
 
@@ -5848,6 +6420,8 @@ export class AgentManager {
             ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
             ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
             ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
+            // A new task never inherits the previous one's question: void the watermark.
+            needInput: { epoch: (existing?.needInput?.epoch ?? 0) + 1 },
           };
         });
       } catch (err) {
@@ -6446,6 +7020,8 @@ export class AgentManager {
             ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
             ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
             ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
+            // A new task never inherits the previous one's question: void the watermark.
+            needInput: { epoch: (existing?.needInput?.epoch ?? 0) + 1 },
           };
         });
       } catch (err) {
@@ -6815,12 +7391,9 @@ export class AgentManager {
 
     await this.agentStore.update(agentId, (stateNow) => {
       if (!stateNow || stateNow.taskId !== taskId) return AGENT_STORE_NOOP;
-      const {
-        needInputAt: _needInputAt,
-        ...rest
-      } = stateNow;
+      // Watermark stays: the arm-time epoch bump owns superseding the old question.
       return {
-        ...rest,
+        ...stateNow,
         paneId,
         workdir,
         updatedAt: new Date().toISOString(),
@@ -6854,13 +7427,16 @@ export class AgentManager {
           ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
         });
       }
+      const taskForPrompt = await this.ensureGitBaseSnapshot(task, phase);
+      const platformCli = this.platformCliContextOf(taskForPrompt);
       prompt = buildPromptInline({
-        task,
+        task: taskForPrompt,
         phase,
         agent,
         workdir: dispatchWorkdir,
         skillRegistry: this.skillRegistry,
         hasQaPartner,
+        ...(platformCli ? { platformCli } : {}),
         ...(promptSignalToken ? { signalToken: promptSignalToken } : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
@@ -7527,13 +8103,16 @@ export class AgentManager {
           ...(opts.serverPriorResponse ? { serverPriorResponse: opts.serverPriorResponse } : {}),
         });
       }
+      const taskForPrompt = await this.ensureGitBaseSnapshot(task, phase);
+      const platformCli = this.platformCliContextOf(taskForPrompt);
       prompt = buildPromptInline({
-        task,
+        task: taskForPrompt,
         phase,
         agent,
         workdir: verifiedWorkdir,
         skillRegistry: this.skillRegistry,
         hasQaPartner: task.qaAgentId !== undefined,
+        ...(platformCli ? { platformCli } : {}),
         ...(signalToken ? { signalToken } : {}),
         ...(useIncrementalNudge
           ? { postApproveRedispatchCount: opts.postApproveRedispatchCount }
@@ -7641,10 +8220,11 @@ export class AgentManager {
       ) {
         return AGENT_STORE_NOOP;
       }
-      // The continuation prompt supersedes any question asked under the previous one.
-      const { needInputAt: _needInputAt, ...rest } = latest;
+      // The continuation prompt supersedes the previous question, but the arm-time
+      // epoch bump owns that transition — stripping here would race an arm that
+      // already re-established the watermark (post-approve arms before injecting).
       return {
-        ...rest,
+        ...latest,
         paneId,
         workdir: verifiedWorkdir,
         lockToken,
@@ -8007,6 +8587,7 @@ export class AgentManager {
             ...(latest.taskId !== undefined ? { taskId: latest.taskId } : {}),
             ...(latest.lockToken !== undefined ? { lockToken: latest.lockToken } : {}),
             ...(latest.startedAt !== undefined ? { startedAt: latest.startedAt } : {}),
+            ...(latest.needInput !== undefined ? { needInput: latest.needInput } : {}),
           };
           if (!preserveHeld) return withBinding;
           return {
@@ -8681,7 +9262,10 @@ export class AgentManager {
       const dispatchTaskAfterClaim = await this.taskStore.get(taskId);
       const armed = await this.setupPhaseSignalWatcher(
         taskId, qaId, ['pr-approved', 'pr-changes-requested'] as const, armedToken,
-        dispatchTaskAfterClaim?.reviewMode === 'git' ? { replaceScope: 'agent' } : {},
+        {
+          needInputMode: 'fresh',
+          ...(dispatchTaskAfterClaim?.reviewMode === 'git' ? { replaceScope: 'agent' as const } : {}),
+        },
       );
       if (armed && dispatchTaskAfterClaim?.reviewMode === 'git') {
         await this.rearmGitReconciliationWatcher(taskId);
@@ -9786,6 +10370,8 @@ export class AgentManager {
       onReadFile?: (req: ReadFileSignal) => void;
       onlyReplaceOwnToken?: boolean;
       replaceScope?: 'task' | 'agent';
+      needInputMode?: 'fresh' | 'restore';
+      needInputPaneCutover?: boolean;
     } = {},
   ): Promise<boolean> {
     if (!this.phaseSignalWatcher) return true;
@@ -9802,6 +10388,8 @@ export class AgentManager {
         ...(opts.onlyReplaceOwnToken ? { onlyReplaceOwnToken: true } : {}),
         ...(opts.replaceScope ? { replaceScope: opts.replaceScope } : {}),
         ...(opts.onReadFile ? { onReadFile: opts.onReadFile } : {}),
+        ...(opts.needInputMode ? { needInputMode: opts.needInputMode } : {}),
+        ...(opts.needInputPaneCutover ? { needInputPaneCutover: true } : {}),
       });
     } catch (err) {
       console.warn(
@@ -9822,6 +10410,10 @@ export class AgentManager {
   ): Promise<void> {
     const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, {
       skipSnapshot,
+      // Every post-dispatch arm follows a freshly injected prompt: the previous
+      // question is superseded, its watermark must not carry over (fix/publish
+      // continuations included).
+      needInputMode: 'fresh',
       ...(onReadFile ? { onReadFile } : {}),
     });
     if (!armed) await this.holdAgentForUnarmedSignal(taskId, agentId, expectedKinds);
@@ -9875,8 +10467,10 @@ export class AgentManager {
     // pair 的重铸已随「进入 review 的 transition」单写落盘（spec §7 与新轮可见性原子）；
     // 这里只轮换 signal token 并布防
     await this.updateTask(taskId, { signalToken: newToken });
-    const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, newToken,
-      isGit ? { replaceScope: 'agent' } : {});
+    const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, newToken, {
+      needInputMode: 'fresh',
+      ...(isGit ? { replaceScope: 'agent' as const } : {}),
+    });
     if (armed && isGit && kinds.includes('pr-approved')) await this.rearmGitReconciliationWatcher(taskId);
     return { token: newToken, armed };
   }
@@ -10359,6 +10953,7 @@ export class AgentManager {
         devAgentId,
         expectedKind,
         signalToken,
+        { needInputMode: 'fresh' },
       ),
     };
     return this.isResearchHandoff(task, devAgentId)
@@ -10684,6 +11279,7 @@ export class AgentManager {
         dispatchedCheckoutMode = ctx.serverReviewCheckout;
         const allowReadFile = opts.phase === 'spec' || opts.continuation || ctx.serverReviewCheckout === 'base';
         return this.setupPhaseSignalWatcher(taskId, qaId, expectedKind, newToken, {
+          needInputMode: 'fresh',
           ...(allowReadFile
             ? { onReadFile: (req: ReadFileSignal) => { void this.handleReadFileRequest(taskId, qaId, req); } }
             : {}),

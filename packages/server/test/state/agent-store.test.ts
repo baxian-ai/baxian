@@ -51,11 +51,21 @@ describe('AgentStore', () => {
     expect(loaded).toEqual(state);
   });
 
-  it('round-trips needInputAt through the normalize whitelist', async () => {
-    const state = makeState('dev-1', { taskId: 'task-001', needInputAt: NOW });
+  it('round-trips the needInput watermark through the normalize whitelist', async () => {
+    const state = makeState('dev-1', {
+      taskId: 'task-001',
+      needInput: { epoch: 2, askSeq: 3, answeredSeq: 2, at: NOW },
+    });
     await store.set(state);
     const loaded = await store.get('dev-1');
-    expect(loaded?.needInputAt).toBe(NOW);
+    expect(loaded?.needInput).toEqual({ epoch: 2, askSeq: 3, answeredSeq: 2, at: NOW });
+  });
+
+  it('migrates legacy flat needInputAt into an epoch-0 lit watermark', async () => {
+    const state = makeState('dev-1', { taskId: 'task-001' });
+    await store.set({ ...state, needInputAt: NOW } as never);
+    const loaded = await store.get('dev-1');
+    expect(loaded?.needInput).toEqual({ epoch: 0, askSeq: 1, answeredSeq: 0, at: NOW });
   });
 
   it('overwrites existing binding facts', async () => {

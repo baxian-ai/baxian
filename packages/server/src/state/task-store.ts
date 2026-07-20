@@ -14,7 +14,7 @@ export interface TaskFilter {
 const TASK_FIELDS = [
   'id', 'projectId', 'title', 'description', 'preferredAgentId',
   'agentId', 'devAgentId', 'qaAgentId', 'researchAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'branchLocalCleaned', 'latestHeadSha', 'reviewHeadAnchorSha',
-  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'signalToken',
+  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
   'reviewMode', 'batchIndex', 'batchTotal', 'reviewCheckoutMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
   'postApproveRevoked', 'postApproveHeadSha', 'verdictOverdue',
@@ -83,8 +83,8 @@ function validateTask(raw: Record<string, unknown>): void {
   optionalString(raw, 'researchAgentId');
   for (const field of [
     'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha', 'reviewDispatchedAt',
-    'prFeedbackReceivedAt', 'fixDispatchedAt', 'signalToken', 'publishDispatchedAt',
-    'postApproveHeadSha',
+    'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'signalToken',
+    'publishDispatchedAt', 'postApproveHeadSha',
   ]) optionalString(raw, field);
   if (!Number.isInteger(raw.reviewRound) || (raw.reviewRound as number) < 0) {
     throw taskSchemaError('reviewRound', 'an integer >= 0');

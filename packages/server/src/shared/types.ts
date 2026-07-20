@@ -138,9 +138,22 @@ export interface AgentBindingFacts {
   awaitingSince?: string;
   // Random per-write hold generation: (phase, since) alone can ABA within one millisecond.
   awaitingNonce?: string;
-  // Display-only: agent asked its human partner and is waiting ([bx:need-input]).
+  // Display-only ask/answer watermark ([bx:need-input]/[bx:input-received]).
   // Never consulted by scheduling — that is what status/awaiting* are for.
-  needInputAt?: string;
+  needInput?: NeedInputWatermark;
+}
+
+// Invariants: epoch and per-epoch seqs only grow; `at` exists iff askSeq > answeredSeq.
+// Every whole-binding rebuild write must carry the object through (or bump epoch to void it).
+export interface NeedInputWatermark {
+  epoch: number;
+  askSeq?: number;
+  answeredSeq?: number;
+  at?: string;
+  // A same-token replay split this token's pane history into two generations that reuse
+  // the same ordinals: a framebuffer snapshot cannot attribute a literal to either, so
+  // this token's arms stop reading it. Dropped as soon as another token takes over.
+  cutoverToken?: string;
 }
 
 export interface AgentErrorSummary {
@@ -209,6 +222,7 @@ export interface TaskState {
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
   prFeedbackReceivedAt?: string;
+  reviewConversationUpdatedAt?: string;
   fixDispatchedAt?: string;
   reviewRound: number;
   // 本 pass 的轮次尚未计入（直派路径在 startSession 成功后才 bump）；补派/重启重放据此恰好补计一次
@@ -345,22 +359,28 @@ export interface CodeReviewRound extends ReviewRoundBase {
 
 export type ReviewRound = SpecReviewRound | CodeReviewRound;
 
-export type GithubReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
+export type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
 
-export type GithubReviewVerdict = 'approve' | 'request-changes' | 'comment';
+export type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
 
-export interface GithubReviewItem {
-  kind: GithubReviewItemKind;
+export interface PrReviewItem {
+  kind: PrReviewItemKind;
   id: string;
   author?: string;
   body?: string;
   bodyTruncated?: boolean;
   createdAt?: string;
-  verdict?: GithubReviewVerdict;
+  verdict?: PrReviewVerdict;
   path?: string;
   line?: number;
   commitSha?: string;
   inReplyTo?: boolean;
+  // 三源 id 无跨表唯一性：线程键 = (sourceKey, discussionId ?? id)
+  sourceKey?: string;
+  threadKey?: string;
+  reviewState?: string;
+  roundToken?: string;
+  anchorSha?: string;
 }
 
 export type EventType =
