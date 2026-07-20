@@ -14,7 +14,7 @@ export interface TaskFilter {
 const TASK_FIELDS = [
   'id', 'projectId', 'title', 'description', 'preferredAgentId',
   'agentId', 'devAgentId', 'qaAgentId', 'researchAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'branchLocalCleaned', 'latestHeadSha', 'reviewHeadAnchorSha',
-  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'specReviewRound', 'phase', 'signalToken',
+  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
   'reviewMode', 'batchIndex', 'batchTotal', 'reviewCheckoutMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
   'postApproveRevoked', 'postApproveHeadSha', 'verdictOverdue',
@@ -102,7 +102,7 @@ function validateTask(raw: Record<string, unknown>): void {
   optionalInteger(raw, 'batchIndex', 0);
   optionalInteger(raw, 'batchTotal', 1);
   optionalInteger(raw, 'maxRoundsContinues', 0);
-  for (const field of ['branchCreatedByBaxian', 'verdictOverdue']) optionalBoolean(raw, field);
+  for (const field of ['branchCreatedByBaxian', 'verdictOverdue', 'reviewRoundPending']) optionalBoolean(raw, field);
   if (raw.images !== undefined && (
     !Array.isArray(raw.images)
     || raw.images.some(image => typeof image !== 'string' || image.trim() === '')

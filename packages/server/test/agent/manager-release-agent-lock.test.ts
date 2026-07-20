@@ -56,13 +56,13 @@ function releaseProbeRunner(opts: {
           ? { stdout: '', stderr: '', exitCode: 0 }
           : { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
       }
-      if (cmd.includes('tmux show-option')) {
+      if (cmd.includes('tmux list-sessions')) {
         if (opts.fail === 'claim') {
           return { stdout: '', stderr: 'tmux probe failed', exitCode: 2 };
         }
         return claim === null
-          ? { stdout: '', stderr: 'option not set', exitCode: 1 }
-          : { stdout: `${claim}\n`, stderr: '', exitCode: 0 };
+          ? { stdout: '4242|1700000000|$1|\n', stderr: '', exitCode: 0 }
+          : { stdout: `4242|1700000000|$1|${claim}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('tmux list-panes')) {
         if (opts.fail === 'panes') {
@@ -71,10 +71,10 @@ function releaseProbeRunner(opts: {
         return { stdout: panes, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK\n⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
@@ -350,8 +350,8 @@ describe('releaseAgentForTask does not interrupt the REPL', () => {
         if (cmd.includes('tmux has-session')) {
           return { stdout: '', stderr: '', exitCode: 0 };
         }
-        if (cmd.includes('tmux show-option')) {
-          return { stdout: 'dev-1\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('tmux list-sessions')) {
+          return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('tmux list-panes')) {
           return { stdout: '%0 claude\n', stderr: '', exitCode: 0 };
@@ -361,10 +361,10 @@ describe('releaseAgentForTask does not interrupt the REPL', () => {
           return { stdout: '', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          return { stdout: 'Tool use: Bash\nRunning gh pr comment...\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK\nTool use: Bash\nRunning gh pr comment...\n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),

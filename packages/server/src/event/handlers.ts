@@ -12,6 +12,8 @@ import {
 } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import { type AgentManager, DispatchTerminalError, EnsureSessionError, isRecoverableQaDispatchHold } from '../agent/manager.js';
+import { ReplNotReadyError } from '../agent/tmux.js';
+import { DirtyWorkdirError } from '../agent/branch.js';
 
 type InterventionData = Record<string, unknown> & { phase: string };
 // 平台 SHA 文法单点（spec §5.3：7-64 位 hex）；legacy github 值恒 40 位，放宽为 additive
@@ -612,6 +614,7 @@ async function releaseQaAfterSkippedRollback(
   taskId: string,
   qaId: string,
   logPrefix: string,
+  ownAcquire: { expectedLockToken?: string } = {},
 ): Promise<void> {
   const now = await manager.getTask(taskId);
   if (now && !TASK_TERMINAL_STATUS_SET.has(now.status)) {
@@ -621,8 +624,9 @@ async function releaseQaAfterSkippedRollback(
     await manager.rearmPhaseSignalForCurrentPass(taskId);
     return;
   }
-  // 终态/已删：没有接管方持有这只 QA，而 cancel 清理可能没见到刚写入的 qaAgentId
-  await manager.releaseAgentForTask(qaId, taskId, 'idle').catch(err => {
+  // 终态/已删：没有接管方持有这只 QA，而 cancel 清理可能没见到刚写入的 qaAgentId。
+  // 仍钉住本次 acquire 世代——本 handler 的每一条失败释放都只清自己那一代
+  await manager.releaseAgentForTask(qaId, taskId, 'idle', ownAcquire).catch(err => {
     console.error(`${logPrefix} releaseAgentForTask(QA=${qaId}) after terminal-skip rollback failed:`, err);
     return false;
   });
@@ -679,6 +683,12 @@ async function handlePrCodePush(
       ...(anchorAtDispatch ? { reviewHeadAnchorSha: anchorAtDispatch } : {}),
       reviewDispatchedAt: new Date().toISOString(),
       signalToken: createSignalToken(),
+      // 这些起点的轮次在 prompt 确认送达后才计（consumeReviewRoundIntent）；持久化「未计」意图，
+      // 供 busy pending/可恢复 hold/进程重启后的任何补派方恰好补计一次
+      reviewRoundPending: (taskBeforeTransition.status === 'in_progress'
+        || taskBeforeTransition.status === 'approved'
+        || taskBeforeTransition.status === 'merge-ready') ? true
+        : (taskBeforeTransition.status === 'review' ? taskBeforeTransition.reviewRoundPending : undefined),
       // pair 与新轮可见性原子（spec §7）：transition 后到 rotate 的窗口内旧 pair 不得授权本轮
       ...(taskBeforeTransition.reviewMode === 'git'
         ? { ...manager.mintReviewTokenPair(), reviewDispatchPending: true }
@@ -687,7 +697,6 @@ async function handlePrCodePush(
   );
   if (!result) return;
   const { task: transitioned, previousStatus } = result;
-  const expectedRound = transitioned.reviewRound;
   await manager.clearPostApproveCompletion(transitioned.id);
 
   let devAlreadyWaiting = false;
@@ -710,9 +719,16 @@ async function handlePrCodePush(
     }
   }
 
+  // review 起点且首评从未送达（round=0 + 未计轮 intent 在场）仍是首评：不得换成 recheck prompt/skill
+  const deferredFirstReview = previousStatus === 'review'
+    && taskBeforeTransition.reviewRound === 0
+    && taskBeforeTransition.reviewRoundPending === true;
+  const qaPhase: 'review' | 'recheck' =
+    previousStatus === 'in_progress' || deferredFirstReview ? 'review' : 'recheck';
+
   if (previousStatus === 'review' && transitioned.qaAgentId) {
     const released = await manager
-      .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle')
+      .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { deferWhenBusy: true })
       .catch(err => {
         console.error(
           `[EventHandler] pr.updated releaseAgentForTask(QA=${transitioned.qaAgentId}) for review→review push failed:`,
@@ -721,6 +737,23 @@ async function handlePrCodePush(
         return false;
       });
     if (!released) {
+      // 忙碌拒绝的形状：QA 仍绑定本任务且未落 hold（release 对 REPL 忙碌不再写 hold）。
+      // 这是「欠一次投递」而非故障：登记 pending，由对账在 pane 空闲后按标准入口补派
+      const qaAfter = await manager.getAgentState(transitioned.qaAgentId).catch(() => null);
+      const deferrable = qaAfter?.taskId === transitioned.id && qaAfter.status !== 'awaiting_human';
+      if (deferrable && transitioned.signalToken !== undefined) {
+        manager.registerPendingDispatchRetry(transitioned.id, {
+          kind: 'qa-recheck',
+          agentId: transitioned.qaAgentId,
+          signalToken: transitioned.signalToken,
+          qaPhase,
+        });
+        console.warn(
+          `[EventHandler] pr.updated QA ${qaPhase} deferred for task=${transitioned.id}: QA still busy on the ` +
+          `previous turn; reconciler will redispatch when idle`,
+        );
+        return;
+      }
       await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
         phase: 'qa-release-failed-cannot-recheck',
         qaAgentId: transitioned.qaAgentId,
@@ -728,12 +761,6 @@ async function handlePrCodePush(
       return;
     }
   }
-
-  const qaPhase: 'review' | 'recheck' =
-    previousStatus === 'fixing' || previousStatus === 'review'
-    || previousStatus === 'approved' || previousStatus === 'merge-ready'
-      ? 'recheck'
-      : 'review';
 
   const qaId = transitioned.qaAgentId;
   if (!qaId) {
@@ -754,7 +781,12 @@ async function handlePrCodePush(
     return;
   }
 
-  const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, qaPhase);
+  // 锁代由 acquire 原子交出（事后重读只会读到 successor 的代）：派发放弃时只释放自己这一代，
+  // successor 若已重新 acquire 同一 QA（同 task 同 agent，绕过 release 的 taskId 校验）不得被误清
+  let ownLockToken: string | undefined;
+  const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, qaPhase, {
+    onAcquired: (lockToken) => { ownLockToken = lockToken; },
+  });
   if (!acquired) {
     await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
       phase: 'qa-acquire-failed',
@@ -763,6 +795,7 @@ async function handlePrCodePush(
     });
     return;
   }
+  const ownAcquire = ownLockToken !== undefined ? { expectedLockToken: ownLockToken } : {};
 
   const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
     transitioned.id,
@@ -780,16 +813,21 @@ async function handlePrCodePush(
         signalToken: taskBeforeTransition.signalToken,
         reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
         reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
+        // git 回滚保留 durable pending 供 sweep 重试：计轮 intent 必须同持（transition 写入值），
+        // 否则最终送达的首评按 stale intent 少计一轮
+        reviewRoundPending: taskBeforeTransition.reviewMode === 'git'
+          ? transitioned.reviewRoundPending
+          : taskBeforeTransition.reviewRoundPending,
         ...(taskBeforeTransition.reviewMode === 'git'
           ? { restorePair: true, passToken: taskBeforeTransition.passToken, failToken: taskBeforeTransition.failToken }
           : {}),
       }, { expect: { status: 'review', signalToken: dispatchToken }, rearmSkipSnapshot });
       if (!rolledBack) {
-        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated arm-failure');
+        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated arm-failure', ownAcquire);
         return;
       }
     }
-    await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
+    await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire).catch(err => {
       console.error(`[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
       return false;
     });
@@ -803,7 +841,9 @@ async function handlePrCodePush(
   let started = false;
   let dispatchErr: unknown = null;
   try {
-    started = await manager.startSession(transitioned.id, qa.id, qaPhase);
+    started = await manager.startSession(transitioned.id, qa.id, qaPhase, {
+      dispatchPassToken: dispatchToken,
+    });
   } catch (err) {
     dispatchErr = err;
     console.error(
@@ -817,6 +857,12 @@ async function handlePrCodePush(
     );
     if (dispatchErr instanceof DispatchTerminalError) {
       await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
+    } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.busyPending) {
+      // 遇忙不是故障：pass 保持 armed、QA 保持绑定，pending 登记已在 startSession 内完成，交对账补派
+      console.warn(
+        `[EventHandler] pr.updated QA ${qaPhase} deferred for task=${transitioned.id}: QA pane busy; ` +
+        `reconciler will redispatch when idle`,
+      );
     } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
       // handled 不止代表可恢复派发 hold（checkout-cleanup-failed / dialog 等也走这里），指引须按实际相位分流
       const qaState = await manager.getAgentState(qa.id).catch((stateErr: unknown) => {
@@ -843,12 +889,16 @@ async function handlePrCodePush(
         signalToken: taskBeforeTransition.signalToken,
         reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
         reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
+        // git 保留 durable pending 即保留计轮 intent（同 arm-failure 站点）
+        reviewRoundPending: taskBeforeTransition.reviewMode === 'git'
+          ? transitioned.reviewRoundPending
+          : taskBeforeTransition.reviewRoundPending,
         ...(taskBeforeTransition.reviewMode === 'git'
           ? { restorePair: true, passToken: taskBeforeTransition.passToken, failToken: taskBeforeTransition.failToken }
           : {}),
       }, { expect: { status: 'review', signalToken: dispatchToken }, rearmSkipSnapshot });
       if (rolledBack) {
-        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire)
           .catch(err => {
             console.error(
               `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
@@ -857,10 +907,10 @@ async function handlePrCodePush(
             return false;
           });
       } else {
-        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated recheck');
+        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated recheck', ownAcquire);
       }
     } else {
-      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire)
         .catch(err => {
           console.error(
             `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
@@ -886,9 +936,9 @@ async function handlePrCodePush(
   if (taskBeforeTransition.reviewMode === 'git') {
     await manager.clearReviewDispatchPending(transitioned.id, dispatchToken);
   }
-  if (previousStatus === 'in_progress' || previousStatus === 'approved' || previousStatus === 'merge-ready') {
-    await manager.bumpReviewRoundIfStillAt(transitioned.id, expectedRound);
-  }
+  // 送达确认后按本次 pass CAS 消费未计轮 intent：flag 本身已编码「哪些起点开新轮」
+  // （review→review 的既计轮 recheck 无 flag 即天然 no-op），successor 换代则留给它自己消费
+  await manager.consumeReviewRoundIntent(transitioned.id, dispatchToken);
 
   const ok = devAlreadyWaiting || (await manager.markAgentWaiting(agentId, transitioned.id));
   if (!ok) {
@@ -930,10 +980,15 @@ async function redispatchReviewForStaleVerdict(
   try {
     // fromStatus/expectSignalToken 在 dispatch 锁内复核：本地快照到这里的窗口里任务可能已离开 review
     // 或被并发 dispatcher 换代 pass，不能靠上面的预检
+    const entry = manager.getPendingDispatchRetry(task.id);
+    const qaPhase = entry?.kind === 'qa-recheck' && entry.signalToken === task.signalToken && entry.qaPhase !== undefined
+      ? entry.qaPhase
+      : (task.reviewRound === 0 ? 'review' as const : undefined);
     await manager.dispatchReviewToQa(task.id, {
       fromStatus: ['review'],
-      bumpRound: false,
+      bumpRound: task.reviewRoundPending === true,
       expectSignalToken: task.signalToken,
+      ...(qaPhase !== undefined ? { qaPhase } : {}),
     });
   } catch (err) {
     console.error(
@@ -1006,9 +1061,17 @@ async function handleReviewApproval(
       // 校验后提交前的并发换代（push/重派轮换 token+pair）使旧 APPROVE 失效（spec §7）
       ...(task.reviewMode === 'git' ? { expectSignalToken: task.signalToken } : {}),
     },
-    task.reviewRound === 0
-      ? { ...prPatch, ...provenanceFields, ...gitHeadPatch(task, anchor.headSha), reviewRound: 1 }
-      : { ...prPatch, ...provenanceFields, ...gitHeadPatch(task, anchor.headSha) },
+    {
+      ...prPatch,
+      ...provenanceFields,
+      ...gitHeadPatch(task, anchor.headSha),
+      // 崩溃在「prompt 已送达、bump 未落盘」窗口时 pending 轮次由 verdict 消费补计
+      reviewRound: Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0)),
+      reviewRoundPending: undefined,
+      // verdict 即送达证据：durable pending 随 transition 原子消费，封死「送达后 verdict 抢先、
+      // startSession 的 clear 因 status/token 已变而拒绝」留下 stale 凭据的竞态
+      reviewDispatchPending: undefined,
+    },
   );
   if (!result) return;
   const { task: transitioned } = result;
@@ -1065,7 +1128,7 @@ async function handleReviewRequestChanges(
     return;
   }
 
-  const reviewedRound = task.reviewRound === 0 ? 1 : task.reviewRound;
+  const reviewedRound = Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0));
   const nextRound = reviewedRound + 1;
   if (task.status === 'approved' && nextRound <= manager.getConfig().review.rounds) {
     const devState = await manager.getAgentState(task.agentId);
@@ -1119,7 +1182,15 @@ async function handleReviewRequestChanges(
       // fail 方向同样按入口代际 CAS（spec §7）：await 窗口内 push/重派换代后旧 RC 不得推进新轮
       ...(task.reviewMode === 'git' ? { expectSignalToken: task.signalToken } : {}),
     },
-    { ...prPatch, ...gitHeadPatch(task, anchor.headSha), reviewRound: nextRound, fixDispatchedAt: new Date().toISOString() },
+    {
+      ...prPatch,
+      ...gitHeadPatch(task, anchor.headSha),
+      reviewRound: nextRound,
+      reviewRoundPending: undefined,
+      // verdict 即送达证据（同 APPROVE）：不消费会让 sweep 在 fixing 态按 stale pending 把任务拽回 review
+      reviewDispatchPending: undefined,
+      fixDispatchedAt: new Date().toISOString(),
+    },
   );
   if (!result) return;
   const { task: transitioned, previousStatus } = result;
@@ -1153,7 +1224,7 @@ async function handleReviewRequestChanges(
     return;
   }
 
-  const { armed } = await manager.rotateAndSetupPhaseSignal(transitioned.id, transitioned.agentId, 'pr-fixed');
+  const { token: fixToken, armed } = await manager.rotateAndSetupPhaseSignal(transitioned.id, transitioned.agentId, 'pr-fixed');
 
   if (!armed) {
     console.warn(
@@ -1171,7 +1242,13 @@ async function handleReviewRequestChanges(
   let resumed = false;
   let dispatchErr: unknown = null;
   try {
-    resumed = await manager.continueSession(transitioned.id, transitioned.agentId, 'fix');
+    resumed = await manager.continueSession(transitioned.id, transitioned.agentId, 'fix', {
+      signalToken: fixToken,
+      guardBeforeInject: async () => {
+        const freshTask = await manager.getTask(transitioned.id);
+        return freshTask?.status === 'fixing' && freshTask.signalToken === fixToken;
+      },
+    });
   } catch (err) {
     dispatchErr = err;
     console.error(
@@ -1189,7 +1266,7 @@ async function handleReviewRequestChanges(
         transitioned.id, 'fix', transitioned.agentId, dispatchErr,
       );
     } else {
-      await manager.markAgentWaiting(transitioned.agentId, transitioned.id)
+      const parked = await manager.markAgentWaiting(transitioned.agentId, transitioned.id)
         .catch(err => {
           console.error(
             `[EventHandler] REQUEST_CHANGES markAgentWaiting(dev=${transitioned.agentId}) rollback failed:`,
@@ -1197,10 +1274,24 @@ async function handleReviewRequestChanges(
           );
           return false;
         });
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'fix-resume-failed',
-        reviewRound: transitioned.reviewRound,
-      });
+      if (parked && (dispatchErr instanceof ReplNotReadyError || dispatchErr instanceof DirtyWorkdirError)) {
+        // dev 回合在途（忙碌/未提交改动）是常态而非故障：登记待补派，回合结束后由对账 re-continue。
+        // 停驻失败说明绑定/锁已不受控，pending 无法证明还有可承接的 session，必须走人工告警
+        manager.registerPendingDispatchRetry(transitioned.id, {
+          kind: 'dev-fix',
+          agentId: transitioned.agentId,
+          signalToken: fixToken,
+        });
+        console.warn(
+          `[EventHandler] REQUEST_CHANGES fix deferred for task=${transitioned.id}: dev pane busy or workdir dirty ` +
+          `(${dispatchErr.name}); reconciler will re-continue when idle`,
+        );
+      } else {
+        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+          phase: 'fix-resume-failed',
+          reviewRound: transitioned.reviewRound,
+        });
+      }
     }
   }
 }
@@ -1219,7 +1310,7 @@ async function handleMaxRounds(
       fromStatus: ['review', 'approved', 'merge-ready'],
       ...(task.reviewMode === 'git' ? { expectSignalToken: task.signalToken } : {}),
     },
-    { ...prPatch, reviewRound: reviewedRound },
+    { ...prPatch, reviewRound: reviewedRound, reviewRoundPending: undefined, reviewDispatchPending: undefined },
   );
   if (!result) return;
   const { task: transitioned } = result;
@@ -1488,6 +1579,7 @@ export function registerEventHandlers(
         ...(reconciledBranch ? { branch: reconciledBranch } : {}),
         ...gitAdoptionFields,
         reviewDispatchedAt: new Date().toISOString(),
+        reviewRoundPending: taskBeforeTransition?.status === 'in_progress' ? true : undefined,
         signalToken: createSignalToken(),
         ...(isGit ? { ...manager.mintReviewTokenPair(), reviewDispatchPending: true } : {}),
       },
@@ -1516,8 +1608,6 @@ export function registerEventHandlers(
         `${taskBeforeTransition?.branch} → ${reconciledBranch}`,
       );
     }
-    const expectedRound = transitioned.reviewRound;
-
     const qaId = transitioned.qaAgentId;
     if (!qaId) {
       const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
@@ -1538,7 +1628,10 @@ export function registerEventHandlers(
       return;
     }
 
-    const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, 'review');
+    let ownLockToken: string | undefined;
+    const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, 'review', {
+      onAcquired: (lockToken) => { ownLockToken = lockToken; },
+    });
     if (!acquired) {
       await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
         phase: 'qa-acquire-failed',
@@ -1546,6 +1639,7 @@ export function registerEventHandlers(
       });
       return;
     }
+    const ownAcquire = ownLockToken !== undefined ? { expectedLockToken: ownLockToken } : {};
 
     const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
       transitioned.id,
@@ -1561,15 +1655,19 @@ export function registerEventHandlers(
         signalToken: taskBeforeTransition?.signalToken,
         reviewHeadAnchorSha: taskBeforeTransition?.reviewHeadAnchorSha,
         reviewDispatchedAt: taskBeforeTransition?.reviewDispatchedAt,
+        // git 保留 durable pending 即保留计轮 intent（同 pr.updated 回滚站点）
+        reviewRoundPending: taskBeforeTransition?.reviewMode === 'git'
+          ? transitioned.reviewRoundPending
+          : taskBeforeTransition?.reviewRoundPending,
         ...(taskBeforeTransition?.reviewMode === 'git'
           ? { restorePair: true, passToken: taskBeforeTransition.passToken, failToken: taskBeforeTransition.failToken }
           : {}),
       }, { expect: { status: 'review', signalToken: dispatchToken } });
       if (!rolledBack) {
-        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.created arm-failure');
+        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.created arm-failure', ownAcquire);
         return;
       }
-      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle').catch(err => {
+      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire).catch(err => {
         console.error(`[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
         return false;
       });
@@ -1582,7 +1680,9 @@ export function registerEventHandlers(
     let started = false;
     let dispatchErr: unknown = null;
     try {
-      started = await manager.startSession(transitioned.id, qa.id, 'review');
+      started = await manager.startSession(transitioned.id, qa.id, 'review', {
+        dispatchPassToken: dispatchToken,
+      });
     } catch (err) {
       dispatchErr = err;
       console.error(`[EventHandler] pr.created startSession(QA=${qa.id}) hard error:`, err);
@@ -1596,7 +1696,7 @@ export function registerEventHandlers(
         await manager.failTaskForDispatchError(transitioned.id, 'review', qa.id, dispatchErr);
       } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
       } else {
-        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle')
+        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire)
           .catch(err => {
             console.error(
               `[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
@@ -1612,9 +1712,10 @@ export function registerEventHandlers(
       return;
     }
 
-    if (previousStatus === 'in_progress') {
-      await manager.bumpReviewRoundIfStillAt(transitioned.id, expectedRound);
+    if (taskBeforeTransition?.reviewMode === 'git') {
+      await manager.clearReviewDispatchPending(transitioned.id, dispatchToken);
     }
+    await manager.consumeReviewRoundIntent(transitioned.id, dispatchToken);
 
     const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
     if (!ok) {

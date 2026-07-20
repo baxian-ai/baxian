@@ -47,22 +47,25 @@ let eventBus: EventBus;
 let manager: AgentManager;
 const events: BaxianEvent[] = [];
 
+const REF = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+
 function noopRunner(): CommandRunner {
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      const agentId = cmd.match(/=([^':\s]+)/)?.[1];
-      if (agentId && cmd.includes('tmux show-option') && cmd.includes('@baxian-agent-id')) {
-        return { stdout: `${agentId}\n`, stderr: '', exitCode: 0 };
+      const sessionName = cmd.match(/session_name},([^}]+)}/)?.[1];
+      if (sessionName && cmd.includes('tmux list-sessions')) {
+        return { stdout: `4242|1700000000|$1|${sessionName}\n`, stderr: '', exitCode: 0 };
       }
-      if (agentId && cmd.includes('tmux list-panes')) {
-        const runtime = agentId === 'qa-1' ? 'codex' : 'claude';
+      const claim = cmd.match(/@baxian-agent-id},([^}]+)}/)?.[1];
+      if (claim && cmd.includes('tmux list-panes')) {
+        const runtime = claim === 'qa-1' ? 'codex' : 'claude';
         return { stdout: `%1 ${runtime}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK\n⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
@@ -98,8 +101,10 @@ function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void>
 }
 
 function mockEnsureSessionOk(overrides: Record<string, unknown> = {}): void {
+  const paneId = (overrides.paneId as string | undefined) ?? '%1';
   vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-    ok: true, createdSession: false, freshRuntime: false, paneId: '%1', workdir: '/tmp/repo',
+    ok: true, createdSession: false, freshRuntime: false, paneId,
+    pane: { session: REF, paneId, claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
     ...overrides,
   } as never);
 }
@@ -235,7 +240,8 @@ describe('recover()', () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
     await seedTask({ id: 'task-merged', prNumber: 42, reviewRound: 1, status: 'merged' });
     vi.spyOn(manager, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: false, paneId: '%1', workdir: '/tmp/repo',
+      ok: true, createdSession: false, freshRuntime: false, paneId: '%1',
+      pane: { session: REF, paneId: '%1', claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
     });
     let paneIdSeenByCleanup: string | undefined;
     const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockImplementation(async (agentId, ctx) => {
@@ -263,7 +269,7 @@ describe('recover()', () => {
     const compactSpy = vi.spyOn(
       manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
       'runPostMergeCompaction',
-    ).mockImplementation(async (_tmux, _paneId, agentId, taskId) => {
+    ).mockImplementation(async (_tmux, _pane, agentId, taskId) => {
       paneIdSeenByCompaction = (await agentStore.get(agentId as string))?.paneId;
       await manager.releaseAgentForTask(agentId as string, taskId as string, 'idle');
     });
@@ -290,7 +296,7 @@ describe('recover()', () => {
     const compactSpy = vi.spyOn(
       manager as never as { runPostMergeCompaction: (...a: unknown[]) => Promise<void> },
       'runPostMergeCompaction',
-    ).mockImplementation(async (_tmux, _paneId, agentId, taskId) => {
+    ).mockImplementation(async (_tmux, _pane, agentId, taskId) => {
       await manager.releaseAgentForTask(agentId as string, taskId as string, 'idle');
     });
 
@@ -1238,7 +1244,10 @@ describe('recover() deferred branches', () => {
       },
     });
 
-    expect(killSpy).toHaveBeenCalledWith({ sessionId: '$7', serverPid: '4242', serverStart: '1700000000' });
+    expect(killSpy).toHaveBeenCalledWith(
+      { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' },
+      { kind: 'emptyOr', claim: 'dev-1' },
+    );
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes('created-session rollback') && String(c[0]).includes('failed'))).toBe(true);
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBeUndefined();

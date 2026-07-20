@@ -4,6 +4,7 @@ import type { Finding, FindingResponse, FindingSeverity, ReviewRound } from '../
 import { useTask } from '../hooks/use-events.ts';
 import { useReviewRounds, reviewRevision } from '../hooks/use-review-rounds.ts';
 import { DiffView, parseDiffFiles, type DiffExpandRequest } from '../components/diff-view.tsx';
+import { MarkdownLite } from '../components/markdown-lite.tsx';
 import { useInterdiff, type InterdiffUnavailableReason } from '../hooks/use-interdiff.ts';
 import { useT } from '../i18n/index.tsx';
 
@@ -17,6 +18,12 @@ const ACTION_CLASS: Record<FindingResponse['action'], string> = {
   fix: 'pill pill-live',
   reject: 'pill pill-warn',
   'out-of-scope': 'pill',
+};
+
+const DECISION_CLASS: Record<'approve' | 'request-changes' | 'archive', string> = {
+  approve: 'pill pill-live',
+  'request-changes': 'pill pill-warn',
+  archive: 'pill',
 };
 
 function fmt(ts?: string): string {
@@ -175,7 +182,9 @@ function RoundDetail({ round, taskId }: { round: ReviewRound; taskId: string }) 
           {f.id.startsWith('u-') && <span className="pill pill-warn">{t.review.roleUser}</span>}
           {locationEl(f)}
         </div>
-        <div className="whitespace-pre-wrap break-words text-og-800">{f.message}</div>
+        <div className="text-og-800">
+          <MarkdownLite text={f.message} />
+        </div>
       </div>
     );
   }
@@ -213,7 +222,9 @@ function RoundDetail({ round, taskId }: { round: ReviewRound; taskId: string }) 
         )}
         {round.phase === 'spec' ? (
           round.content ? (
-            <pre className="card whitespace-pre-wrap break-words p-4 text-sm text-og-800">{round.content}</pre>
+            <div className="card p-4 text-sm text-og-800">
+              <MarkdownLite text={round.content} />
+            </div>
           ) : (
             <div className="text-sm text-og-400">{t.review.noContent}</div>
           )
@@ -240,7 +251,7 @@ function RoundDetail({ round, taskId }: { round: ReviewRound; taskId: string }) 
           batchFindings.length > 0 ? (
             <div className="space-y-3">
               {batchFindings.map((batch, i) => (
-                <div key={i} className="space-y-2">
+                <div key={i} id={`batch-${i}`} className="space-y-2">
                   <div className="text-xs text-og-500">{t.review.batchPartialHeading(i + 1)}</div>
                   {batch.length === 0
                     ? <div className="text-sm text-og-400">{t.review.noFindingsThisRound}</div>
@@ -258,26 +269,49 @@ function RoundDetail({ round, taskId }: { round: ReviewRound; taskId: string }) 
         )}
       </section>
 
-      {responses.length > 0 && (
+      {round.response && (
         <section id="response">
           <h2 className="mb-2 text-sm font-semibold text-og-800">{t.review.devResponsesHeading}</h2>
-          <div className="space-y-2">
-            {responses.map((r) => {
-              const f = findingById.get(r.findingId);
-              return (
-                <div key={r.findingId} className="card p-3 text-sm">
-                  <div className="mb-1 flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-og-400">{r.findingId}</span>
-                    <span className={ACTION_CLASS[r.action]}>{r.action}</span>
-                    {r.commitSha && (
-                      <span className="font-mono text-xs text-og-500">{r.commitSha.slice(0, 9)}</span>
-                    )}
+          {responses.length === 0 ? (
+            <div className="text-sm text-og-400">{t.review.noContent}</div>
+          ) : (
+            <div className="space-y-2">
+              {responses.map((r) => {
+                const f = findingById.get(r.findingId);
+                return (
+                  <div key={r.findingId} className="card p-3 text-sm">
+                    <div className="mb-1 flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-og-400">{r.findingId}</span>
+                      <span className={ACTION_CLASS[r.action]}>{r.action}</span>
+                      {r.commitSha && (
+                        <span className="font-mono text-xs text-og-500">{r.commitSha.slice(0, 9)}</span>
+                      )}
+                    </div>
+                    {f && <div className="mb-1 break-words text-xs text-og-500">↳ {f.message}</div>}
+                    <div className="text-og-800">
+                      <MarkdownLite text={r.rationale} />
+                    </div>
                   </div>
-                  {f && <div className="mb-1 break-words text-xs text-og-500">↳ {f.message}</div>}
-                  <div className="whitespace-pre-wrap break-words text-og-800">{r.rationale}</div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
+      {round.userDecision && (
+        <section id="user-decision">
+          <h2 className="mb-2 text-sm font-semibold text-og-800">{t.review.userDecisionHeading}</h2>
+          <div className="card p-3 text-sm">
+            <div className="mb-1 flex flex-wrap items-center gap-2">
+              <span className={DECISION_CLASS[round.userDecision.verdict]}>{round.userDecision.verdict}</span>
+              <span className="text-xs text-og-400">{fmt(round.userDecision.at)}</span>
+            </div>
+            {round.userDecision.comments && (
+              <div className="text-og-800">
+                <MarkdownLite text={round.userDecision.comments} />
+              </div>
+            )}
           </div>
         </section>
       )}

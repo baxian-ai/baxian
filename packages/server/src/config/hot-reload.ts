@@ -6,6 +6,7 @@ export function applyConfigHotReload(ctx: AppContext, validated: BaxianConfig): 
   ctx.agentManager.replaceConfig(validated);
   ctx.tmuxProbePoller?.replaceConfig(validated);
   ctx.bootstrapPoller?.replaceConfig(validated);
+  ctx.dispatchReconciler?.replaceConfig(validated);
   const stateDir = ctx.stateDir;
   ctx.poller?.replaceConfig(validated, {
     statePathFor: stateDir

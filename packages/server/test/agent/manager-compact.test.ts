@@ -3,7 +3,7 @@ import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentManager } from '../../src/agent/manager.js';
-import { TmuxManager } from '../../src/agent/tmux.js';
+import { TmuxManager, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -28,6 +28,11 @@ const CONFIG: BaxianConfig = {
     ]],
   }],
 };
+
+const REF: TmuxSessionRef = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+const paneRef = (agentId: string, paneId: string): PaneRef => ({ session: REF, paneId, claim: agentId });
+// shellQuote(`send-keys -l -t %N ' '`) 中空格字面量的转义形态，用于在 exec 命令流里辨认"空格弄脏 composer"那一次写入
+const SPACE_LITERAL = "'\\'' '\\''";
 
 let tempDir: string;
 let agentStore: AgentStore;
@@ -202,6 +207,7 @@ beforeEach(async () => {
   mockRunner = {
     exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
     writeFile: vi.fn<(p: string, c: Buffer | string) => Promise<void>>().mockResolvedValue(undefined),
+    execWithStdin: vi.fn<(cmd: string, stdin: Buffer) => Promise<ExecResult>>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
   };
 
   const config: BaxianConfig = {
@@ -226,6 +232,15 @@ beforeEach(async () => {
     manager as never as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
     'waitForReplPromptReady',
   );
+
+  vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
+    .mockImplementation(async name => ({ ref: REF, claim: name }));
+  vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef')
+    .mockImplementation(async (_ref, claim) => {
+      const paneId = (await agentStore.get(claim))?.paneId;
+      if (!paneId) throw new Error(`tmux session ${claim} is gone (no panes match)`);
+      return { session: REF, paneId, claim };
+    });
 });
 
 afterEach(async () => {
@@ -242,13 +257,13 @@ describe('compactAgent', () => {
 
     await vi.waitFor(() => expect(waitReadySpy).toHaveBeenCalledTimes(3));
     await expectGuardReleased('dev-1');
-    const [, paneId, runtime, timeoutMs] = waitReadySpy.mock.calls[0];
-    expect(paneId).toBe('%7');
+    const [, pane, runtime, timeoutMs] = waitReadySpy.mock.calls[0];
+    expect(pane).toMatchObject({ paneId: '%7' });
     expect(runtime).toBe('claude-code');
     expect(timeoutMs).toBe(5_000);
 
     const calls = execCalls();
-    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.endsWith("' '"));
+    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes(SPACE_LITERAL));
     const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/compact'));
     expect(spaceIdx).toBeGreaterThanOrEqual(0);
@@ -341,7 +356,7 @@ describe('compactAgent', () => {
     const manual = manager.compactAgent('dev-1');
     await waitGates(gates, 1);
 
-    const postMerge = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
+    const postMerge = runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'claude-code');
     await new Promise(r => setTimeout(r, 20));
     expect(gates.length).toBe(1);
 
@@ -349,7 +364,7 @@ describe('compactAgent', () => {
     await manual;
 
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
-    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith('%7', '/clear');
+    expect(fakeTmux.sendKeysLiteral).toHaveBeenCalledWith(expect.objectContaining({ paneId: '%7' }), '/clear');
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
@@ -394,14 +409,14 @@ describe('compactAgent', () => {
     const fakeTmux = fakeDispatchTmux();
     const { gates, holder: manual } = await startGuarded();
 
-    const dispatch = injectAndAwaitAck(fakeTmux, '%7', 'next prompt', 'dev-1', 'claude-code');
+    const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'next prompt', 'dev-1', 'claude-code');
     await new Promise(r => setTimeout(r, 20));
     expect(fakeTmux.injectPrompt).not.toHaveBeenCalled();
 
     await drainHolderGates(gates, manual);
 
     await expect(dispatch).resolves.toMatchObject({ acked: true });
-    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith('%7', 'next prompt', 'dev-1');
+    expect(fakeTmux.injectPrompt).toHaveBeenCalledWith(expect.objectContaining({ paneId: '%7' }), 'next prompt', 'dev-1');
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
@@ -412,7 +427,7 @@ describe('compactAgent', () => {
     fakeTmux.readPaneTitle.mockResolvedValue('~/repo'); // pre-Enter idle title
     const { gates, holder: manual } = await startGuarded();
 
-    const dispatch = injectAndAwaitAck(fakeTmux, '%7', 'p', 'dev-1', 'claude-code');
+    const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'p', 'dev-1', 'claude-code');
     await drainHolderGates(gates, manual);
     await expect(dispatch).resolves.toMatchObject({ acked: true });
 
@@ -421,7 +436,8 @@ describe('compactAgent', () => {
       .toBeLessThan(fakeTmux.sendEnter.mock.invocationCallOrder[0]);
     // …and is threaded to waitSubmitAck as the busy-baseline anchor
     expect(fakeTmux.waitSubmitAck).toHaveBeenCalledWith(
-      '%7', 'snapshot', 'claude-code', expect.objectContaining({ baselineTitle: '~/repo' }),
+      expect.objectContaining({ paneId: '%7' }),
+      'snapshot', 'claude-code', expect.objectContaining({ baselineTitle: '~/repo' }),
     );
   });
 
@@ -474,7 +490,7 @@ describe('compactAgent', () => {
     const fakeTmux = fakeDispatchTmux();
     const { gates, holder: manual } = await startGuarded();
 
-    const dispatch = injectAndAwaitAck(fakeTmux, '%7', 'stale prompt', 'dev-1', 'claude-code');
+    const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'stale prompt', 'dev-1', 'claude-code');
     await seedAgent();
 
     gates[0]();
@@ -500,7 +516,7 @@ describe('compactAgent', () => {
     await drainHolderGates(gates, manual);
 
     await inject;
-    expect(injectSpy).toHaveBeenCalledWith('%3', 'file body', 'qa-1');
+    expect(injectSpy).toHaveBeenCalledWith(expect.objectContaining({ paneId: '%3' }), 'file body', 'qa-1');
     expect(enterSpy).toHaveBeenCalled();
     expect(guardSet().has('qa-1')).toBe(false);
   });
@@ -519,7 +535,7 @@ describe('compactAgent', () => {
     await expect(manual).rejects.toMatchObject({ status: 409 });
 
     await expect(inject).rejects.toThrow('no longer bound');
-    expect(injectSpy).not.toHaveBeenCalledWith('%3', 'file body', 'qa-1');
+    expect(injectSpy).not.toHaveBeenCalledWith(expect.objectContaining({ paneId: '%3' }), 'file body', 'qa-1');
     expect(guardSet().has('qa-1')).toBe(false);
   });
 
@@ -583,7 +599,7 @@ describe('compactAgent', () => {
     const gates = installGates();
     const fakeTmux = fakeCompactionTmux();
 
-    const run = runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
+    const run = runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'claude-code');
     await waitGates(gates, 1);
 
     await expect(manager.compactAgent('dev-1')).rejects.toMatchObject({
@@ -606,7 +622,7 @@ describe('compactAgent', () => {
     let clearSubmits = 0;
     const fakeTmux = {
       ...fakeCompactionTmux(),
-      sendKeysLiteral: vi.fn(async (_paneId: string, text: string) => { lastLiteral = text; }),
+      sendKeysLiteral: vi.fn(async (_pane: PaneRef, text: string) => { lastLiteral = text; }),
       sendEnter: vi.fn(async () => {
         if (lastLiteral === '/clear') clearSubmits++;
       }),
@@ -617,7 +633,7 @@ describe('compactAgent', () => {
       )),
     };
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
+    await runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'codex');
 
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
     expect(slashCalls).toHaveLength(2);
@@ -633,13 +649,13 @@ describe('compactAgent', () => {
 
     const fakeTmux = fakeCompactionTmux();
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex', 'cleanup prompt', true);
+    await runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'codex');
 
-    const draftIdx = fakeTmux.clearComposerDraft.mock.calls.findIndex(([paneId]) => paneId === '%7');
+    const draftIdx = fakeTmux.clearComposerDraft.mock.calls.findIndex(([pane]) => (pane as PaneRef).paneId === '%7');
     const clearIdx = fakeTmux.sendKeysLiteral.mock.calls.findIndex(([, text]) => text === '/clear');
     expect(draftIdx).toBeGreaterThanOrEqual(0);
     expect(clearIdx).toBeGreaterThanOrEqual(0);
-    expect(fakeTmux.sendKeysToPane).not.toHaveBeenCalledWith('%7', 'Escape');
+    expect(fakeTmux.sendKeysToPane).not.toHaveBeenCalledWith(expect.objectContaining({ paneId: '%7' }), 'Escape');
     expect(fakeTmux.clearComposerDraft.mock.invocationCallOrder[draftIdx])
       .toBeLessThan(fakeTmux.sendKeysLiteral.mock.invocationCallOrder[clearIdx]);
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
@@ -656,7 +672,7 @@ describe('compactAgent', () => {
     let clearSubmits = 0;
     const fakeTmux = {
       ...fakeCompactionTmux(),
-      sendKeysLiteral: vi.fn(async (_paneId: string, text: string) => { lastLiteral = text; }),
+      sendKeysLiteral: vi.fn(async (_pane: PaneRef, text: string) => { lastLiteral = text; }),
       sendEnter: vi.fn(async () => {
         if (lastLiteral === '/clear') clearSubmits++;
       }),
@@ -672,9 +688,9 @@ describe('compactAgent', () => {
       }),
     };
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
+    await runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'codex');
 
-    expect(fakeTmux.clearComposerDraft.mock.calls.filter(([paneId]) => paneId === '%7')).toHaveLength(1);
+    expect(fakeTmux.clearComposerDraft.mock.calls.filter(([pane]) => (pane as PaneRef).paneId === '%7')).toHaveLength(1);
     expect(releaseSpy).not.toHaveBeenCalled();
     expect(guardSet().has('dev-1')).toBe(false);
   });
@@ -689,7 +705,7 @@ describe('compactAgent', () => {
     let clearSubmits = 0;
     const fakeTmux = {
       ...fakeCompactionTmux(),
-      sendKeysLiteral: vi.fn(async (_paneId: string, text: string) => { lastLiteral = text; }),
+      sendKeysLiteral: vi.fn(async (_pane: PaneRef, text: string) => { lastLiteral = text; }),
       sendEnter: vi.fn(async () => {
         if (lastLiteral === '/clear') clearSubmits++;
       }),
@@ -700,11 +716,11 @@ describe('compactAgent', () => {
       )),
     };
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
+    await runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'codex');
 
     const slashCalls = fakeTmux.sendKeysLiteral.mock.calls.filter(([, text]) => text === '/clear');
     expect(slashCalls).toHaveLength(2);
-    const draftCalls = fakeTmux.clearComposerDraft.mock.calls.filter(([paneId]) => paneId === '%7');
+    const draftCalls = fakeTmux.clearComposerDraft.mock.calls.filter(([pane]) => (pane as PaneRef).paneId === '%7');
     expect(draftCalls).toHaveLength(2);
     const draftOrders = fakeTmux.clearComposerDraft.mock.invocationCallOrder;
     const slashOrders = fakeTmux.sendKeysLiteral.mock.calls
@@ -725,6 +741,8 @@ describe('compactAgent', () => {
       createdSession: false,
       freshRuntime: true,
       paneId: '%9',
+      pane: paneRef('dev-1', '%9'),
+      sessionRef: REF,
       workdir: tempDir,
     });
     waitReadySpy
@@ -736,10 +754,10 @@ describe('compactAgent', () => {
       displayMessage: vi.fn().mockResolvedValue('zsh'),
     };
 
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'codex');
+    await runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'codex');
 
     expect(ensureSpy).toHaveBeenCalledWith('dev-1', 'runtime');
-    expect(fakeTmux.sendKeysLiteral).not.toHaveBeenCalledWith('%7', '/clear');
+    expect(fakeTmux.sendKeysLiteral).not.toHaveBeenCalledWith(expect.objectContaining({ paneId: '%7' }), '/clear');
     const state = await agentStore.get('dev-1');
     expect(state?.paneId).toBe('%9');
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 't1');
@@ -754,6 +772,8 @@ describe('compactAgent', () => {
       createdSession: false,
       freshRuntime: true,
       paneId: '%9',
+      pane: paneRef('dev-1', '%9'),
+      sessionRef: REF,
       workdir: tempDir,
     });
     const fakeTmux = {
@@ -763,7 +783,7 @@ describe('compactAgent', () => {
     const recovered = await callPrivate<Promise<boolean>>(
       'recoverPostMergeExitedRuntime',
       fakeTmux,
-      '%7',
+      paneRef('dev-1', '%7'),
       'dev-1',
       't1',
       lockToken,
@@ -784,6 +804,8 @@ describe('compactAgent', () => {
       createdSession: false,
       freshRuntime: true,
       paneId: '%7',
+      pane: paneRef('dev-1', '%7'),
+      sessionRef: REF,
       workdir: tempDir,
     });
     const fakeTmux = {
@@ -794,7 +816,7 @@ describe('compactAgent', () => {
     const recovered = await callPrivate<Promise<boolean>>(
       'recoverPostMergeExitedRuntime',
       fakeTmux,
-      '%7',
+      paneRef('dev-1', '%7'),
       'dev-1',
       't1',
       lockToken,
@@ -816,7 +838,7 @@ describe('compactAgent', () => {
       clearComposerDraft: vi.fn().mockRejectedValue(new Error('keystroke failed')),
       hasSession: vi.fn().mockResolvedValue(true),
     };
-    await runPostMergeCompaction(fakeTmux, '%7', 'dev-1', 't1', 'claude-code');
+    await runPostMergeCompaction(fakeTmux, paneRef('dev-1', '%7'), 'dev-1', 't1', 'claude-code');
 
     expect(releaseSpy).not.toHaveBeenCalled();
     expect(guardSet().has('dev-1')).toBe(false);
@@ -851,7 +873,7 @@ describe('clearAgent', () => {
     expect(waitReadySpy.mock.calls[0][2]).toBe('codex');
     const calls = execCalls();
     expect(calls.some(c => c.includes('send-keys') && c.includes('Escape'))).toBe(false);
-    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.endsWith("' '"));
+    const spaceIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes(SPACE_LITERAL));
     const ccIdx = calls.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const literalIdx = calls.findIndex(c => c.includes('send-keys -l') && c.includes('/clear'));
     expect(spaceIdx).toBeGreaterThanOrEqual(0);
@@ -888,11 +910,12 @@ describe('waitForReplPromptReady (narrow-pane width-independent idle detection)'
     '\n' +
     '✻ Churned for 56s\n';
 
+  // 走真实 guardedPaneRead：首行 marker 判定 ok/gone，故 mock 输出必须以 BX_PANE_OK 开头
   function mockPaneState(procTitle: string, screen: string, title: string): void {
     (mockRunner.exec as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
-      if (cmd.includes('pane_current_command')) return { stdout: `${procTitle}\n`, stderr: '', exitCode: 0 };
-      if (cmd.includes('pane_title')) return { stdout: `${title}\n`, stderr: '', exitCode: 0 };
-      return { stdout: screen, stderr: '', exitCode: 0 };
+      if (cmd.includes('pane_current_command')) return { stdout: `BX_PANE_OK${procTitle}\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('pane_title')) return { stdout: `BX_PANE_OK${title}\n`, stderr: '', exitCode: 0 };
+      return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
     });
   }
 
@@ -901,7 +924,7 @@ describe('waitForReplPromptReady (narrow-pane width-independent idle detection)'
     mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
     const tmux = new TmuxManager(mockRunner);
     await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, '%6', 'claude-code', 1000),
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 1000),
     ).resolves.toBeUndefined();
   });
 
@@ -910,7 +933,7 @@ describe('waitForReplPromptReady (narrow-pane width-independent idle detection)'
     mockPaneState('2.1.199', NARROW_IDLE_SCREEN, 'baxian');
     const tmux = new TmuxManager(mockRunner);
     await expect(
-      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, '%6', 'claude-code', 200),
+      callPrivate<Promise<void>>('waitForReplPromptReady', tmux, paneRef('dev-1', '%6'), 'claude-code', 200),
     ).rejects.toThrow(/repl not ready/);
   });
 });

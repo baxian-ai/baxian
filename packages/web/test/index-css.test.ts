@@ -28,12 +28,17 @@ describe('index.css base typography', () => {
 
   it('limits app font-size utilities to xs and sm', () => {
     const allowed = new Set(['text-xs', 'text-sm']);
+    // Markdown 标题按需求必须比 14px 正文稍大且分级；豁免仅限该文件的四个刻度。
+    const fileExceptions: Record<string, Set<string>> = {
+      'components/markdown-lite.tsx': new Set(['text-[18px]', 'text-[17px]', 'text-[16px]', 'text-[15px]']),
+    };
     const disallowed = sourceFiles(srcDir).flatMap((file) => {
+      const rel = relative(srcDir, file).replace(/\\/g, '/');
       const source = readFileSync(file, 'utf8');
       return Array.from(source.matchAll(/!?text-(?:xs|sm|base|lg|xl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|9xl|\[(?!#)[^\]]+\])/g))
         .map((match) => match[0])
-        .filter((token) => !allowed.has(token))
-        .map((token) => `${relative(srcDir, file)}:${token}`);
+        .filter((token) => !allowed.has(token) && !fileExceptions[rel]?.has(token))
+        .map((token) => `${rel}:${token}`);
     });
 
     expect(disallowed).toEqual([]);

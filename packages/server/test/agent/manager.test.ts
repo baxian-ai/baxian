@@ -10,7 +10,8 @@ import { prepareConfig } from '../../src/config/loader.js';
 import { ApiError } from '../../src/errors.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { PromptSizeError, RequiredSkillsMissingError } from '../../src/agent/prompt.js';
-import { TmuxManager } from '../../src/agent/tmux.js';
+import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
+import type { PaneRef, TmuxSessionRef } from '../../src/agent/tmux.js';
 import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError } from '../../src/agent/branch.js';
 import { AgentStore } from '../../src/state/agent-store.js';
@@ -60,18 +61,18 @@ const events: BaxianEvent[] = [];
 function readyRunner(): CommandRunner {
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('tmux has-session') || cmd.includes('tmux list-panes')) {
+      if (cmd.includes('tmux has-session') || cmd.includes('tmux list-sessions') || cmd.includes('tmux list-panes')) {
         return { stdout: '', stderr: 'session not found', exitCode: 1 };
       }
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: cmd.includes('%1') ? 'codex\n' : 'claude\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command') && !cmd.includes('capture-pane')) {
+        return { stdout: cmd.includes('%1') ? 'BX_PANE_OKcodex\n' : 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
         const frame = cmd.includes('%1')
           ? 'permissions: YOLO mode\n\n>'
           : '⏵⏵ bypass permissions on /tmp/repo\n\n>';
         return {
-          stdout: cmd.includes('history_size') ? `${frame}\n___bx-snap-sep___\n0\n` : frame,
+          stdout: cmd.includes('history_size') ? `BX_PANE_OK|0\n${frame}` : `BX_PANE_OK\n${frame}`,
           stderr: '',
           exitCode: 0,
         };
@@ -79,6 +80,7 @@ function readyRunner(): CommandRunner {
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
   };
 }
 
@@ -110,21 +112,22 @@ function clearAwareRunner(
       }
       const pane = paneOf(cmd);
       const info = paneInfo(pane);
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: `${info.proc}\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command') && !cmd.includes('capture-pane')) {
+        return { stdout: `BX_PANE_OK${info.proc}\n`, stderr: '', exitCode: 0 };
       }
       const frame = rejected.has(pane)
         ? `■ '/clear' is disabled while a task is in progress.\n${info.idle}`
         : clearTyped.has(pane) ? `${info.idle} /clear` : info.idle;
       if (cmd.includes('capture-pane') && cmd.includes('history_size')) {
-        return { stdout: `${frame}\n___bx-snap-sep___\n0\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK|0\n${frame}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        return { stdout: frame, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n${frame}`, stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
   } as unknown as CommandRunner;
 }
 
@@ -146,18 +149,19 @@ function compactRunner(
       const runtimeFact = claimedRuntimeFact(cmd, () => '%5');
       if (runtimeFact) return runtimeFact;
       if (cmd.includes('send-keys') && cmd.includes("'Enter'")) busyLeft = busyCaptures;
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command') && !cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
         let frame = IDLE;
         if (busyLeft > 0) { busyLeft--; frame = BUSY; }
-        if (cmd.includes('history_size')) return { stdout: `${frame}\n___bx-snap-sep___\n0`, stderr: '', exitCode: 0 };
-        return { stdout: frame, stderr: '', exitCode: 0 };
+        if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${frame}`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n${frame}`, stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
   } as unknown as CommandRunner;
 }
 
@@ -171,18 +175,19 @@ function smallPaneClaudeCompactRunner(execs: string[]): CommandRunner {
       const runtimeFact = claimedRuntimeFact(cmd, () => '%5');
       if (runtimeFact) return runtimeFact;
       if (cmd.includes('send-keys') && cmd.includes("'Enter'")) busyLeft = 2;
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command') && !cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
         let frame = IDLE;
         if (busyLeft > 0) { busyLeft--; frame = BUSY; }
-        if (cmd.includes('history_size')) return { stdout: `${frame}\n___bx-snap-sep___\n0`, stderr: '', exitCode: 0 };
-        return { stdout: frame, stderr: '', exitCode: 0 };
+        if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${frame}`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n${frame}`, stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
   } as unknown as CommandRunner;
 }
 
@@ -219,21 +224,39 @@ function makeManager(overrides: Partial<AgentManagerDeps> = {}): AgentManager {
   });
 }
 
+const SESSION_REF: TmuxSessionRef = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+
+function paneRefOf(paneId: string, claim: string): PaneRef {
+  return { session: SESSION_REF, paneId, claim };
+}
+
+function stubClaimedPaneResolution(paneForAgent: (agentId: string) => string): void {
+  vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
+    .mockImplementation(async (name) => ({ ref: SESSION_REF, claim: name }));
+  vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef')
+    .mockImplementation(async (ref, claim) => ({ session: ref, paneId: paneForAgent(claim), claim }));
+}
+
 function claimedRuntimeFact(
   cmd: string,
   paneForAgent: (agentId: string) => string,
 ): ExecResult | null {
-  const agentId = cmd.match(/=([^':\s]+)/)?.[1];
-  if (!agentId) return null;
-  if (cmd.includes('tmux has-session')) {
+  const hasSessionAgent = cmd.match(/=([^':\s]+)/)?.[1];
+  if (hasSessionAgent && cmd.includes('tmux has-session')) {
     return { stdout: '', stderr: '', exitCode: 0 };
   }
-  if (cmd.includes('tmux show-option') && cmd.includes('@baxian-agent-id')) {
-    return { stdout: `${agentId}\n`, stderr: '', exitCode: 0 };
+  const sessionName = cmd.match(/session_name},([^}]+)}/)?.[1];
+  if (sessionName && cmd.includes('tmux list-sessions')) {
+    return {
+      stdout: `${SESSION_REF.serverPid}|${SESSION_REF.serverStart}|${SESSION_REF.sessionId}|${sessionName}\n`,
+      stderr: '',
+      exitCode: 0,
+    };
   }
-  if (cmd.includes('tmux list-panes')) {
-    const runtime = agentId === 'qa-1' ? 'codex' : 'claude';
-    return { stdout: `${paneForAgent(agentId)} ${runtime}\n`, stderr: '', exitCode: 0 };
+  const claim = cmd.match(/@baxian-agent-id},([^}]+)}/)?.[1];
+  if (claim && cmd.includes('tmux list-panes')) {
+    const runtime = claim === 'qa-1' ? 'codex' : 'claude';
+    return { stdout: `${paneForAgent(claim)} ${runtime}\n`, stderr: '', exitCode: 0 };
   }
   return null;
 }
@@ -249,6 +272,7 @@ function recordingRunner(
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
   } as unknown as CommandRunner;
 }
 
@@ -289,10 +313,10 @@ function callInjectAndAwaitAck(
 ): Promise<AckResult> {
   return (mgr as unknown as {
     injectAndAwaitAck: (
-      tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex',
+      tmux: TmuxManager, pane: PaneRef, prompt: string, agentId: string, runtime: 'claude-code' | 'codex',
       guardBeforePaste?: () => Promise<boolean>,
     ) => Promise<AckResult>;
-  }).injectAndAwaitAck(tmux, paneId, prompt, agentId, runtime, guardBeforePaste);
+  }).injectAndAwaitAck(tmux, paneRefOf(paneId, agentId), prompt, agentId, runtime, guardBeforePaste);
 }
 
 function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
@@ -320,15 +344,19 @@ function capturePaneRunner(
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
       execs.push(cmd);
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+      const runtimeFact = claimedRuntimeFact(cmd, () => '%5');
+      if (runtimeFact) return runtimeFact;
+      if (cmd.includes('display-message') && cmd.includes('pane_current_command') && !cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        return { stdout: await capture(), stderr: '', exitCode: 0 };
+        const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
+        return { stdout: `${header}\n${await capture()}`, stderr: '', exitCode: 0 };
       }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
   } as unknown as CommandRunner;
 }
 
@@ -392,8 +420,9 @@ beforeEach(async () => {
     await mirrorExactLock(state.id);
   });
   vi.spyOn(agentStore, 'update').mockImplementation(async (id, update) => {
-    await updateAgent(id, update);
+    const commit = await updateAgent(id, update);
     await mirrorExactLock(id);
+    return commit;
   });
   eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   events.length = 0;
@@ -441,6 +470,169 @@ describe('AgentManager task binding flow', () => {
     expect((await agentStore.get('dev-1'))?.taskId).toBe(created.id);
     expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(events.some(e => e.type === 'task.assigned' && e.agentId === 'dev-1')).toBe(true);
+  });
+
+  it('createTask rejects the binding when a DELETE→recreate bumps the generation during config reads', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // Simulate a concurrent DELETE→same-id recreate landing in the window between the entry
+    // generation capture and the commit: bump the generation while the agent config is read.
+    // The capture must precede pickAgent/config reads so this change closes the gate.
+    const realPick = manager.pickAgent.bind(manager);
+    vi.spyOn(manager, 'pickAgent').mockImplementation(async (projectId, agentId) => {
+      const picked = await realPick(projectId, agentId);
+      manager.bumpDeletionGeneration(agentId);
+      return picked;
+    });
+
+    const result = await manager.createTask('proj', {
+      title: 'racy', description: 'd', preferredAgentId: 'dev-1',
+    });
+
+    expect(result.status).toBe('pending');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('createTask rejects the queued early-return when a DELETE→recreate bumps the generation (no stale participants persisted)', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // Agent appears busy (pickAgent → null), but the group snapshot is already stale because a
+    // DELETE→same-id recreate bumped the generation; the queued early-return must reject, not persist
+    // a pending task carrying the old incarnation's devAgentId/qaAgentId.
+    vi.spyOn(manager, 'pickAgent').mockImplementation(async (_projectId, agentId) => {
+      manager.bumpDeletionGeneration(agentId);
+      return null;
+    });
+
+    await expect(manager.createTask('proj', {
+      title: 'racy queued', description: 'd', preferredAgentId: 'dev-1',
+    })).rejects.toThrow(/deleted or recreated/);
+  });
+
+  it('createTask queued early-return rejects when a group member (QA) is being deleted, even with the dev generation unchanged', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // Standalone QA delete: dev's generation is unchanged, but the QA participant is tombstoned.
+    manager.tryClaimDeletion(['qa-1']);
+    vi.spyOn(manager, 'pickAgent').mockResolvedValue(null); // agent appears busy → preferred_agent_busy branch
+
+    await expect(manager.createTask('proj', {
+      title: 'qa-deleting', description: 'd', preferredAgentId: 'dev-1',
+    })).rejects.toThrow(/being deleted or recreated/);
+  });
+
+  it('createTask does not create an active task when the lock is rotated away after the binding commit (binding-before-active)', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // Simulate a DELETE rotating the lock in the window between the binding commit and the in_progress write.
+    vi.spyOn(lockManager, 'isOwner').mockResolvedValue(false);
+
+    const result = await manager.createTask('proj', { title: 't', description: 'd', preferredAgentId: 'dev-1' });
+
+    expect(result.status).toBe('pending'); // NOT in_progress → no orphan active task
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined(); // binding rolled back
+    expect(await lockManager.isLocked('dev-1')).toBe(false); // lock released
+  });
+
+  it('createTask does not create an active task when a group participant (QA) is deleted+recreated after the snapshot', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // dev's generation is unchanged and no tombstone remains, but a QA member was reintroduced after the
+    // group snapshot — its captured generation no longer matches, so the active task must not bake it in.
+    const realAcquire = lockManager.acquire.bind(lockManager);
+    vi.spyOn(lockManager, 'acquire').mockImplementation(async (id: string, taskId: string) => {
+      const token = await realAcquire(id, taskId);
+      manager.bumpDeletionGeneration('qa-1');
+      return token;
+    });
+
+    const result = await manager.createTask('proj', { title: 't', description: 'd', preferredAgentId: 'dev-1' });
+
+    expect(result.status).toBe('pending');
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('scanActiveThenClaimDeletion serializes with createTask: a racing delete-claim cannot orphan the in_progress write', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // createTask is invoked first so it wins the task lock; the delete-claim queues behind it and its active
+    // scan runs only AFTER the in_progress commit — the owner-check→commit window is never interleaved.
+    const create = manager.createTask('proj', { title: 't', description: 'd', preferredAgentId: 'dev-1' });
+    const claim = manager.scanActiveThenClaimDeletion(['dev-1']);
+    const [created, claimResult] = await Promise.all([create, claim]);
+
+    expect(created.status).toBe('in_progress');
+    expect(claimResult).toEqual({ ok: false, code: 'active', agentId: 'dev-1', taskId: created.id });
+    expect(manager.isDeletionInFlight('dev-1')).toBe(false); // claim refused before tryClaimDeletion → no tombstone
+  });
+
+  it('a delete-claim that wins the task lock forces a racing createTask to reject (no active task on a claimed agent)', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // Reverse order: the delete-claim wins the lock and tombstones dev-1; createTask (queued behind it) then
+    // sees the tombstone at its gate/participant check and rejects instead of committing an active task.
+    const claim = manager.scanActiveThenClaimDeletion(['dev-1']);
+    const create = manager.createTask('proj', { title: 't', description: 'd', preferredAgentId: 'dev-1' });
+
+    await expect(create).rejects.toThrow(/being deleted or recreated/);
+    expect(await claim).toEqual({ ok: true });
+    expect(manager.isDeletionInFlight('dev-1')).toBe(true);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+  });
+
+  it('ensureSession refuses and skips the Workdir state-write when a DELETE→recreate bumps the generation mid-flight', async () => {
+    await seedAgent({ id: 'dev-1' });
+    // ensureWorkdir resolves, but a concurrent DELETE→same-id recreate bumps the generation during it.
+    // The gate re-check under the lifecycle lock must throw BEFORE the stale Workdir is persisted.
+    vi.spyOn(manager as unknown as { ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }> }, 'ensureWorkdir')
+      .mockImplementation(async () => {
+        manager.bumpDeletionGeneration('dev-1');
+        return { workdir: '/tmp/stale-workdir' };
+      });
+
+    await expect(manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/being deleted|recreated/);
+    expect((await agentStore.get('dev-1'))?.workdir).not.toBe('/tmp/stale-workdir');
+  });
+
+  it('ensureSession re-gates after the tmux probe: a DELETE tombstone during getSessionSnapshot blocks build/adopt', async () => {
+    await seedAgent({ id: 'dev-1', workdir: '/repo/wt' });
+    vi.spyOn(manager as unknown as { ensureWorkdir: (...a: unknown[]) => Promise<{ workdir: string }> }, 'ensureWorkdir')
+      .mockResolvedValue({ workdir: '/repo/wt' });
+    vi.spyOn(manager as unknown as { provisionRepoSkills: (...a: unknown[]) => Promise<void> }, 'provisionRepoSkills')
+      .mockResolvedValue(undefined);
+    const buildSpy = vi.spyOn(
+      manager as unknown as { buildFreshSession: (...a: unknown[]) => Promise<unknown> }, 'buildFreshSession',
+    ).mockResolvedValue({ createdSession: true, agentId: 'dev-1' });
+    // Gate is open at entry; a DELETE claims the tombstone while the snapshot probe is in flight. The post-probe
+    // re-gate must throw before buildFreshSession (or adopt) creates a session for the agent being deleted.
+    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockImplementation(async () => {
+      manager.tryClaimDeletion(['dev-1']);
+      return null;
+    });
+
+    await expect(manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/being deleted|recreated/);
+    expect(buildSpy).not.toHaveBeenCalled();
+  });
+
+  it('reconcileTaskBranches skips branch cleanup when a DELETE→recreate bumps the generation during the ref scan', async () => {
+    await seedTask({ id: 'rtb-1', status: 'merged', branch: 'bx/rtb-1', branchCreatedByBaxian: true, agentId: 'dev-1' });
+    await seedAgent({ id: 'dev-1', workdir: '/repo/wt' });
+
+    const cmds: string[] = [];
+    vi.spyOn(manager as unknown as { createRunnerFor: (a: unknown) => CommandRunner }, 'createRunnerFor')
+      .mockReturnValue({
+        exec: vi.fn(async (cmd: string) => {
+          cmds.push(cmd);
+          if (cmd.includes('for-each-ref')) {
+            // A DELETE→same-id recreate lands mid-scan; the gate captured before this read must close.
+            manager.bumpDeletionGeneration('dev-1');
+            return { stdout: 'refs/heads/bx/rtb-1\n', stderr: '', exitCode: 0 };
+          }
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }),
+        writeFile: vi.fn(async () => {}),
+      } as unknown as CommandRunner);
+
+    await manager.reconcileTaskBranches();
+
+    // Gate closed after the bump → the old runner/workdir is never used to delete a branch.
+    expect(cmds.some(c => c.includes('show-ref --verify'))).toBe(false);
+    expect(cmds.some(c => /branch\s+-[dD]\b/.test(c))).toBe(false);
   });
 
   it('createTask records the QA partner before any review dispatch', async () => {
@@ -772,6 +964,24 @@ describe('AgentManager task binding flow', () => {
     expect((await taskStore.get(t.id))?.status).toBe('pending');
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
     expect(await lockManager.isLocked('dev-1')).toBe(false);
+  });
+
+  it('rollbackFailedDispatch does not resurrect state deleted by a DELETE→recreate during the rollback', async () => {
+    const t = await seedTask({ id: 'task-rb-revive', status: 'in_progress' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const token = (await agentStore.get('dev-1'))!.lockToken!;
+    // A DELETE completes during the task-rollback await: generation bumps and the state file is removed.
+    const realSet = taskStore.set.bind(taskStore);
+    vi.spyOn(taskStore, 'set').mockImplementation(async (task) => {
+      await realSet(task);
+      manager.bumpDeletionGeneration('dev-1');
+      await agentStore.delete('dev-1');
+    });
+
+    await manager['rollbackFailedDispatch'](t.id, 'dev-1', undefined, token);
+
+    // The final write-back must NOT rebuild the deleted incarnation from the stale entry snapshot.
+    expect(await agentStore.get('dev-1')).toBeNull();
   });
 
   it('rollbackFailedDispatch with a reason emits a human.intervention naming the failure', async () => {
@@ -1207,6 +1417,7 @@ describe('AgentManager task binding flow', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
 
@@ -1238,6 +1449,7 @@ describe('AgentManager task binding flow', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
 
@@ -1264,6 +1476,7 @@ describe('AgentManager task binding flow', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => minimalRunner;
 
@@ -1485,7 +1698,7 @@ describe('AgentManager dispatchReviewToQa', () => {
       message: expect.stringContaining('arm review verdict watcher'),
     });
     expect(startSpy).not.toHaveBeenCalled();
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle', expect.any(Object));
     expect((await taskStore.get('task-review'))?.reviewRound).toBe(1);
   });
 
@@ -1497,7 +1710,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
     await manager.dispatchReviewToQa('task-review');
 
-    expect(acquireSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'review');
+    expect(acquireSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'review', expect.any(Object));
     expect(startSpy).toHaveBeenCalledWith('task-review', 'qa-1', 'review', expect.objectContaining({ bypassTaskStatusGate: true }));
   });
 
@@ -1555,6 +1768,209 @@ describe('AgentManager dispatchReviewToQa', () => {
     expect(qa?.status).toBeUndefined();
     expect(qa?.awaitingPhase).toBeUndefined();
   }, 10_000);
+
+  it('busyPending 时回补 claim 段已计的轮次与 intent：送达前不消费（#563 CX-4.1）', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a', reviewRound: 1, reviewRoundPending: true });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'startSession').mockImplementation(async (taskId) => {
+      const armed = (await taskStore.get(taskId as string))!.signalToken!;
+      manager.registerPendingDispatchRetry(taskId as string, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: armed, qaPhase: 'review' });
+      throw new EnsureSessionError(
+        { createdSession: false, agentId: 'qa-1', handled: true, busyPending: true },
+        'QA REPL busy; review dispatch queued for redispatch when idle',
+      );
+    });
+
+    const result = await manager.dispatchReviewToQa('task-review', {
+      fromStatus: ['review'], bumpRound: true, expectSignalToken: 'pass-a',
+    });
+
+    expect(result.reviewRound).toBe(1);
+    expect(result.reviewRoundPending).toBe(true);
+    const persisted = (await taskStore.get('task-review'))!;
+    expect(persisted.reviewRound).toBe(1);
+    expect(persisted.reviewRoundPending).toBe(true);
+  });
+
+  it('未计轮 intent 与进入 review 的 transition 原子落库（arm 前崩溃仍可恢复计轮，#563 R41）', async () => {
+    await seedReviewable({ status: 'in_progress', reviewRound: 2, signalToken: 'pass-pre1' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    // 观测点正对崩溃窗口：进入 review 的 transition 刚落库、claim2 尚未写入之时
+    let afterTransition: TaskState | null = null;
+    const realTransition = manager.transitionTaskStatus.bind(manager);
+    vi.spyOn(manager, 'transitionTaskStatus').mockImplementation(async (...args: Parameters<typeof realTransition>) => {
+      const result = await realTransition(...args);
+      if (args[1] === 'review' && afterTransition === null) {
+        afterTransition = await taskStore.get('task-review');
+      }
+      return result;
+    });
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchReviewToQa('task-review');
+
+    expect(afterTransition).not.toBeNull();
+    expect(afterTransition!.status).toBe('review');
+    expect(afterTransition!.reviewRoundPending).toBe(true);
+    expect(afterTransition!.reviewRound).toBe(2);
+  });
+
+  it('标准入口的失败清理只释放本次 acquire 的锁代：窗口内 successor 重绑同一 QA 不被误清（#563 R43）', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-x1' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    const realAcquire = manager.acquireAgentForTask.bind(manager);
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(
+      async (...args: Parameters<typeof realAcquire>) => {
+        const ok = await realAcquire(...args);
+        // 并发 pr.updated（不受 manualReviewInFlight 约束）在 acquire 返回后 release+re-acquire 同一 QA/同一 task
+        const claim = await lockManager.claimOf('qa-1');
+        if (claim) await lockManager.releaseIfOwner('qa-1', 'task-review', claim.token);
+        const successorToken = await lockManager.acquire('qa-1', 'task-review');
+        const binding = await agentStore.get('qa-1');
+        if (binding && successorToken) {
+          await agentStore.set({ ...binding, lockToken: successorToken, updatedAt: new Date().toISOString() });
+        }
+        return ok;
+      },
+    );
+    // arm 失败 → abortDispatch 里的清理释放
+    vi.spyOn(
+      manager as unknown as { setupPhaseSignalWatcher: (...args: unknown[]) => Promise<boolean> },
+      'setupPhaseSignalWatcher',
+    ).mockResolvedValue(false);
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'] })).rejects.toBeTruthy();
+
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe('task-review');
+  });
+
+  it('git 锚点预检失败的释放同样钉住本次 acquire 世代（#563 R43）', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-x2', reviewMode: 'git' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    let acquiredToken: string | undefined;
+    const realAcquire = manager.acquireAgentForTask.bind(manager);
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(
+      async (...args: Parameters<typeof realAcquire>) => {
+        const ok = await realAcquire(...args);
+        acquiredToken = (await agentStore.get('qa-1'))?.lockToken;
+        return ok;
+      },
+    );
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
+
+    await expect(manager.dispatchReviewToQa('task-review', { fromStatus: ['review'] })).rejects.toBeTruthy();
+
+    expect(acquiredToken).toBeTruthy();
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-review', 'idle', expect.objectContaining({ expectedLockToken: acquiredToken }),
+    );
+  });
+
+  it('手工重派保留未送达首评的相位：同代 pending 登记的 qaPhase 优先（#563 R35）', async () => {
+    await seedReviewable({
+      status: 'review', reviewRound: 0, reviewRoundPending: true, signalToken: 'pass-first1',
+    });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    manager.registerPendingDispatchRetry('task-review', {
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'pass-first1', qaPhase: 'review',
+    });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchReviewToQa('task-review');
+
+    expect(startSpy).toHaveBeenCalledWith('task-review', 'qa-1', 'review', expect.anything());
+  });
+
+  it('手工重派：进程重启丢登记后仍按持久化 round=0 兜底为首评（#563 R35）', async () => {
+    await seedReviewable({
+      status: 'review', reviewRound: 0, reviewRoundPending: true, signalToken: 'pass-first2',
+    });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchReviewToQa('task-review');
+
+    expect(startSpy).toHaveBeenCalledWith('task-review', 'qa-1', 'review', expect.anything());
+  });
+
+  it('手工重派：已计过轮的 review 任务仍是 recheck（#563 R35 边界）', async () => {
+    await seedReviewable({ status: 'review', reviewRound: 1, signalToken: 'pass-r1' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await manager.dispatchReviewToQa('task-review');
+
+    expect(startSpy).toHaveBeenCalledWith('task-review', 'qa-1', 'recheck', expect.anything());
+  });
+
+  it('handled hold（未送达）不消费计轮 intent：round 不变、flag 保留、pass 保持 armed（#563 CX-4.2）', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a', reviewRound: 1, reviewRoundPending: true });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'startSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'qa-1', handled: true },
+      'checkout-preparation-failed: repl not ready',
+    ));
+
+    await expect(manager.dispatchReviewToQa('task-review', {
+      fromStatus: ['review'], bumpRound: true, expectSignalToken: 'pass-a',
+    })).rejects.toThrow(/repl not ready/);
+
+    const persisted = (await taskStore.get('task-review'))!;
+    expect(persisted.reviewRound).toBe(1);
+    expect(persisted.reviewRoundPending).toBe(true);
+    expect(persisted.signalToken).not.toBe('pass-a');
+  });
+
+  it('计轮在确认送达时落账：startSession 成功后 round+1 且 intent 清除（#563 CX-4.2）', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a', reviewRound: 1, reviewRoundPending: true });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    let roundAtStart: number | undefined;
+    let flagAtStart: boolean | undefined;
+    vi.spyOn(manager, 'startSession').mockImplementation(async (taskId) => {
+      const t = (await taskStore.get(taskId as string))!;
+      roundAtStart = t.reviewRound;
+      flagAtStart = t.reviewRoundPending;
+      return true;
+    });
+
+    const result = await manager.dispatchReviewToQa('task-review', {
+      fromStatus: ['review'], bumpRound: true, expectSignalToken: 'pass-a',
+    });
+
+    expect(roundAtStart).toBe(1);
+    expect(flagAtStart).toBe(true);
+    expect(result.reviewRound).toBe(2);
+    expect(result.reviewRoundPending).toBeUndefined();
+  });
+
+  it('busyPending 派发不算失败：返回带新 pass 的 task，QA 保持绑定（#558 M2 B1）', async () => {
+    await seedReviewable({ status: 'review', signalToken: 'pass-a' });
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue('a'.repeat(40));
+    vi.spyOn(manager, 'startSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'qa-1', handled: true, busyPending: true },
+      'QA REPL busy; recheck dispatch queued for redispatch when idle',
+    ));
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask');
+
+    const result = await manager.dispatchReviewToQa('task-review', { fromStatus: ['review'], bumpRound: false });
+
+    expect(result.status).toBe('review');
+    expect(result.signalToken).not.toBe('pass-a');
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe('task-review');
+    expect(qa?.status).toBeUndefined();
+    expect(releaseSpy).not.toHaveBeenCalled();
+  });
 
   it('rethrows the original ack_unknown and keeps the armed pass when persisting the ack hold fails', async () => {
     await seedReviewable({ status: 'review', signalToken: 'pass-a' });
@@ -1823,7 +2239,7 @@ describe('AgentManager dispatchReviewToQa', () => {
       reviewDispatchedAt: '2026-07-04T07:00:00.000Z',
       reviewHeadAnchorSha: 'c'.repeat(40),
     });
-    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-review', 'idle', expect.any(Object));
   });
 
   it('drift-aware rollback keeps the signal fields rotated by a concurrent transition', async () => {
@@ -1878,8 +2294,9 @@ describe('AgentManager dispatchReviewToQa', () => {
 
     await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
 
-    // status drifted to approved during our dispatch: round now belongs to the concurrent owner, rollback must not decrement it
-    expect(await taskStore.get('task-review')).toMatchObject({ status: 'approved', reviewRound: 2 });
+    // status drifted to approved during our dispatch: rollback must not clobber it; the undelivered
+    // round was never pre-counted (delivery-time accounting), so reviewRound stays put
+    expect(await taskStore.get('task-review')).toMatchObject({ status: 'approved', reviewRound: 1 });
   });
 
   it('claim2-failure rollback does not decrement a reviewRound this dispatch never bumped', async () => {
@@ -1932,7 +2349,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
     expect((await taskStore.get('task-review'))?.reviewRound).toBe(1);
     // 无并发接管的普通失败回滚：QA 必须释放，不能被 takeover 守卫误判泄漏
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle', expect.any(Object));
   });
 
   it('merge-lock re-check aborts without overwriting a concurrently rotated pass, and releases the orphan QA', async () => {
@@ -1957,7 +2374,7 @@ describe('AgentManager dispatchReviewToQa', () => {
       signalToken: 'fix-tok',
       fixDispatchedAt: '2026-07-04T08:00:00.000Z',
     });
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle', expect.any(Object));
   });
 
   it('merge-lock re-check treats an in-review token rotation as takeover: keeps the new pass, spares the re-acquired QA', async () => {
@@ -1977,7 +2394,7 @@ describe('AgentManager dispatchReviewToQa', () => {
 
     expect(startSpy).not.toHaveBeenCalled();
     expect(await taskStore.get('task-review')).toMatchObject({ status: 'review', signalToken: 'takeover-tok' });
-    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+    expect(releaseSpy).not.toHaveBeenCalledWith('qa-1', 'task-review', 'idle', expect.any(Object));
   });
 
   it('rollbackVerdictArmFailure does not revive a task cancelled mid-dispatch', async () => {
@@ -2013,10 +2430,11 @@ describe('AgentManager dispatchReviewToQa', () => {
 
     await expect(manager.dispatchReviewToQa('task-review')).rejects.toMatchObject({ status: 500 });
 
-    // terminal task must be left fully alone: neither status revived nor reviewRound/fields written back
+    // terminal task must be left fully alone: neither status revived nor fields written back;
+    // the round was never pre-counted at claim, so it stays at the seeded value
     const after = await taskStore.get('task-review');
     expect(after?.status).toBe('cancelled');
-    expect(after?.reviewRound).toBe(2);
+    expect(after?.reviewRound).toBe(1);
   });
 
   it('terminal-at-claim recheck failure restores snapshot fields (status stays terminal)', async () => {
@@ -2305,7 +2723,7 @@ describe('AgentManager dispatchReviewToQa', () => {
       status: 500,
       message: expect.stringContaining('Failed to start'),
     });
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-review', 'idle', expect.any(Object));
     expect(await taskStore.get('task-review')).toMatchObject({
       status: 'fixing',
       reviewRound: 1,
@@ -5547,6 +5965,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
   }
 
@@ -5610,6 +6029,23 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(ok).toBe(true);
     expect(prompts[0]).toContain('signal: pr-created');
     expect(prompts[0]).not.toContain('spec-signal:');
+  });
+
+  it('startSession assertOwner gates on generation: a DELETE→recreate during ensureSession aborts before checkout', async () => {
+    const t = await seedTask({ id: 'task-ss-aba', branch: 'bx/task-ss-aba', signalToken: 'ssaba1234ab' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    await acquireBoundLock('dev-1');
+    // ensureSession succeeds, but a DELETE→same-id recreate bumps the generation during it; the next
+    // assertOwner (before waitForReplPromptReady / branch checkout) must fail closed on the stale generation.
+    vi.spyOn(manager, 'ensureSession').mockImplementation(async (agentId) => {
+      manager.bumpDeletionGeneration(agentId);
+      return { ok: true, createdSession: false, freshRuntime: false, paneId: '%0', workdir: '/tmp/repo' };
+    });
+    const switchSpy = vi.spyOn(BranchManager.prototype, 'switchToTaskBranch');
+    useWorkdirRunner();
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow(/being deleted or was recreated/);
+    expect(switchSpy).not.toHaveBeenCalled();
   });
 
   it('startSession develop prompt keeps the Dev-SDD spec route when the task snapshot has QA', async () => {
@@ -5821,7 +6257,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(devStaged.every(p => /\.baxian-tmp-[0-9a-f]{12}$/.test(p))).toBe(true);
     expect(devStaged.every(p => !p.includes('/.agents/skills/'))).toBe(true);
     const devStageCmds = devRunner.execWithStdin.mock.calls.map(c => c[0] as string).filter(c => c.includes('cat > '));
-    expect(devStageCmds.every(c => c.includes("[ ! -L '/tmp/repo' ]"))).toBe(true);
+    expect(devStageCmds.every(c => c.includes(`[ "$(cd -- '/tmp/repo' 2>/dev/null && pwd -P)" = '/tmp/repo' ]`))).toBe(true);
     const devMv = devRunner.exec.mock.calls.map(c => c[0] as string).filter(c => c.includes('mv -f'));
     expect(devMv.some(c => /\.claude\/skills\/baxian-task-check\/SKILL\.md\.baxian-tmp-[0-9a-f]{12}/.test(c))).toBe(true);
     expect(devMv.length).toBe(devStaged.length);
@@ -5857,6 +6293,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
           ? { stdout: '', stderr: 'fatal: not a git repository', exitCode: 1 }
           : { stdout: '', stderr: '', exitCode: 0 }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const agent = agentConfig({ id: 'dev-1' });
     await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo'))
@@ -5920,6 +6357,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
           ? { stdout: '', stderr: 'baxian: .claude/skills is a symlink -> /shared/skills; replace it with a real directory', exitCode: 3 }
           : { stdout: '', stderr: '', exitCode: 0 }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const agent = agentConfig({ id: 'dev-sym' });
     await expect(provision(manager)(runner as unknown as CommandRunner, agent, '/tmp/repo')).rejects.toThrow(/symlink-safe/);
@@ -6026,6 +6464,361 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
+  it('startSession recheck 遇忙不落 hold：登记 qa-recheck pending 并抛 busyPending（#558 M2 B1）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-busyq', branch: 'bx/task-busyq', status: 'review',
+      reviewMode: 'github', prNumber: 7, qaAgentId: 'qa-1', signalToken: 'tokA12345678',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', '', 'stable idle not confirmed within 5000ms'));
+
+    await expect(manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'tokA12345678',
+    })).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true, busyPending: true }),
+    });
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.status).toBeUndefined();
+    expect(qa?.awaitingPhase).toBeUndefined();
+    expect(qa?.taskId).toBe(t.id);
+    expect(await lockManager.isLocked('qa-1')).toBe(true);
+    expect(manager.getPendingDispatchRetry(t.id)).toMatchObject({
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'tokA12345678',
+      qaPhase: 'recheck',
+    });
+  });
+
+  it('startSession 遇忙但 pass 已被接管（fence 令牌漂移）→ 不登记 pending，走原始失败路径', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-busysup', branch: 'bx/task-busysup', status: 'review',
+      reviewMode: 'github', prNumber: 9, qaAgentId: 'qa-1', signalToken: 'successor-tk',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', '', 'stable idle not confirmed within 5000ms'));
+
+    await expect(manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'old-pass-tok1',
+    })).rejects.toBeInstanceOf(ReplNotReadyError);
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+  });
+
+  it('startSession 遇忙且无 fence 令牌（或令牌核验读失败）→ fail closed 不登记', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-busynof', branch: 'bx/task-busynof', status: 'review',
+      reviewMode: 'github', prNumber: 10, qaAgentId: 'qa-1', signalToken: 'tokNF1234567',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', '', 'stable idle not confirmed within 5000ms'));
+
+    await expect(manager.startSession(t.id, 'qa-1', 'recheck')).rejects.toBeInstanceOf(ReplNotReadyError);
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+
+    const queue = (manager as unknown as {
+      queueQaBusyPendingRetry(
+        taskId: string, agentId: string, phase: string, createdSession: boolean,
+        err: unknown, dispatch: { passToken?: string; roundCounted?: boolean },
+      ): Promise<unknown>;
+    }).queueQaBusyPendingRetry.bind(manager);
+    vi.spyOn(taskStore, 'get').mockRejectedValueOnce(new Error('store read failed'));
+    await expect(queue(
+      t.id, 'qa-1', 'recheck', false,
+      new ReplNotReadyError('%0', 'codex', '', 'busy'),
+      { passToken: 'tokNF1234567' },
+    )).resolves.toBeNull();
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+  });
+
+  it('startSession recheck 边界段遇忙同样登记 pending 而非 hold', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-busyb', branch: 'bx/task-busyb', status: 'review',
+      reviewMode: 'github', prNumber: 8, qaAgentId: 'qa-1', signalToken: 'tokB12345678',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForTaskBoundary',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', '', 'stable idle not confirmed within 5000ms'));
+
+    await expect(manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'tokB12345678',
+    })).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true, busyPending: true }),
+    });
+    expect((await agentStore.get('qa-1'))?.status).toBeUndefined();
+    expect(manager.getPendingDispatchRetry(t.id)).toMatchObject({ kind: 'qa-recheck', agentId: 'qa-1' });
+  });
+
+  it('startSession develop 边界段遇忙保持既有 hold 语义（非 QA 相位不登记 pending）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({ id: 'task-busyd', branch: 'bx/task-busyd' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
+    await acquireBoundLock('dev-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue();
+    vi.spyOn(
+      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForTaskBoundary',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'claude-code', '', 'stable idle not confirmed within 5000ms'));
+
+    await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true }),
+    });
+    expect(await agentStore.get('dev-1')).toMatchObject({
+      status: 'awaiting_human',
+      awaitingPhase: 'checkout-preparation-failed',
+    });
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+  });
+
+  it('注入阶段预注入忙碌检查命中：同样登记 pending 而非 cleanup/release（C3）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-busyinj', branch: 'bx/task-busyinj', status: 'review',
+      reviewMode: 'github', prNumber: 12, qaAgentId: 'qa-1', signalToken: 'tokINJ123456',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+    spyInject(manager, async () => {
+      throw new ReplNotReadyError('%0', 'codex', '', 'pre-inject busy check: pane %0 is still running a turn; dispatch aborted');
+    });
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue();
+
+    await expect(manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'tokINJ123456',
+    })).rejects.toMatchObject({
+      partial: expect.objectContaining({ handled: true, busyPending: true }),
+    });
+    expect(parkSpy).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+    expect(manager.getPendingDispatchRetry(t.id)).toMatchObject({
+      kind: 'qa-recheck', signalToken: 'tokINJ123456',
+    });
+  });
+
+  it('pending 登记按代保留预算：同代刷新沿用 since/alerted，pass 换代即重置（R12）', async () => {
+    manager = await makeManagedCloneManager();
+    manager.registerPendingDispatchRetry('task-gen', { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'gen-a' });
+    const first = manager.getPendingDispatchRetry('task-gen')!;
+    manager.markPendingDispatchRetryBudgetAlerted('task-gen', { agentId: 'qa-1', signalToken: 'gen-a' });
+    manager.markPendingDispatchRetryBudgetAlerted('task-gen', { agentId: 'qa-1', signalToken: 'gen-stale' });
+
+    manager.registerPendingDispatchRetry('task-gen', { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'gen-a' });
+    const sameGen = manager.getPendingDispatchRetry('task-gen')!;
+    expect(sameGen.since).toBe(first.since);
+    expect(sameGen.budgetAlerted).toBe(true);
+
+    await new Promise(r => setTimeout(r, 2));
+    manager.registerPendingDispatchRetry('task-gen', { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'gen-b' });
+    const nextGen = manager.getPendingDispatchRetry('task-gen')!;
+    expect(nextGen.since).toBeGreaterThan(first.since);
+    expect(nextGen.budgetAlerted).toBeUndefined();
+  });
+
+  it('startSession 注入前 pass 已被接管（token 轮换、锁未换）→ 放弃 paste 返回 false（#563 R25）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-fence', branch: 'bx/task-fence', status: 'review',
+      reviewMode: 'github', prNumber: 13, qaAgentId: 'qa-1', signalToken: 'old-pass-tok9',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+    // 在 artifacts 制备窗口里 push 轮换了 token（不动锁）——旧派发不得把旧 prompt 注入 successor pass
+    vi.spyOn(
+      manager as unknown as { prepareDispatchArtifacts: (...args: unknown[]) => Promise<void> },
+      'prepareDispatchArtifacts',
+    ).mockImplementation(async () => {
+      const fresh = (await taskStore.get(t.id))!;
+      await taskStore.set({ ...fresh, signalToken: 'successor-tok9', updatedAt: new Date().toISOString() });
+    });
+    const injectSpy = vi.spyOn(
+      manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
+      'injectAndAwaitAck',
+    );
+
+    const started = await manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'old-pass-tok9',
+    });
+
+    expect(started).toBe(false);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('startSession 携带 pass guard 到 injectAndAwaitAck 的 paste fence（#563 R25）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-fence2', branch: 'bx/task-fence2', status: 'review',
+      reviewMode: 'github', prNumber: 14, qaAgentId: 'qa-1', signalToken: 'tokF212345678'.slice(0, 12),
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+    let guardArg: unknown;
+    vi.spyOn(
+      manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
+      'injectAndAwaitAck',
+    ).mockImplementation(async (...args: unknown[]) => {
+      guardArg = args[5];
+      return { acked: true, composerDelivered: true };
+    });
+
+    const started = await manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: (await taskStore.get(t.id))!.signalToken,
+    });
+
+    expect(started).toBe(true);
+    expect(typeof guardArg).toBe('function');
+    await expect((guardArg as () => Promise<boolean>)()).resolves.toBe(true);
+    const fresh = (await taskStore.get(t.id))!;
+    await taskStore.set({ ...fresh, signalToken: 'rotated-mid99', updatedAt: new Date().toISOString() });
+    await expect((guardArg as () => Promise<boolean>)()).resolves.toBe(false);
+  });
+
+  it('cancel 不轮换 token：注入前 fence 复核可投递状态，cancelled 任务放弃 paste（#563 R31）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-fence3', branch: 'bx/task-fence3', status: 'review',
+      reviewMode: 'github', prNumber: 15, qaAgentId: 'qa-1', signalToken: 'cancel-tok99',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+    vi.spyOn(
+      manager as unknown as { prepareDispatchArtifacts: (...args: unknown[]) => Promise<void> },
+      'prepareDispatchArtifacts',
+    ).mockImplementation(async () => {
+      const fresh = (await taskStore.get(t.id))!;
+      await taskStore.set({ ...fresh, status: 'cancelled', updatedAt: new Date().toISOString() });
+    });
+    const injectSpy = vi.spyOn(
+      manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
+      'injectAndAwaitAck',
+    );
+
+    const started = await manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'cancel-tok99',
+    });
+
+    expect(started).toBe(false);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('paste fence 的 guard 同时复核任务状态：cancelled（token 未变）判 false（#563 R31）', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-fence4', branch: 'bx/task-fence4', status: 'review',
+      reviewMode: 'github', prNumber: 16, qaAgentId: 'qa-1', signalToken: 'cancel-tok88',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+
+    mockEnsureSession();
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+    let guardArg: unknown;
+    vi.spyOn(
+      manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
+      'injectAndAwaitAck',
+    ).mockImplementation(async (...args: unknown[]) => {
+      guardArg = args[5];
+      return { acked: true, composerDelivered: true };
+    });
+
+    const started = await manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'cancel-tok88',
+    });
+
+    expect(started).toBe(true);
+    await expect((guardArg as () => Promise<boolean>)()).resolves.toBe(true);
+    const fresh = (await taskStore.get(t.id))!;
+    await taskStore.set({ ...fresh, status: 'cancelled', updatedAt: new Date().toISOString() });
+    await expect((guardArg as () => Promise<boolean>)()).resolves.toBe(false);
+  });
+
+  it('startSession 成功只按代清除本次派发的 pending：successor 登记不受影响', async () => {
+    manager = await makeManagedCloneManager();
+    const t = await seedTask({
+      id: 'task-clearp', branch: 'bx/task-clearp', status: 'review',
+      reviewMode: 'github', prNumber: 11, qaAgentId: 'qa-1', signalToken: 'tokCL1234567',
+    });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
+    await acquireBoundLock('qa-1', t.id);
+    manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'tokCL1234567' });
+
+    mockEnsureSession();
+    capturePrompts(manager);
+    vi.spyOn(
+      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
+      'switchToVerifiedReviewHead',
+    ).mockResolvedValue(undefined);
+
+    expect(await manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'tokCL1234567',
+    })).toBe(true);
+    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
+
+    manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'succ-tok1234' });
+    expect(await manager.startSession(t.id, 'qa-1', 'recheck', {
+      dispatchPassToken: 'tokCL1234567',
+    })).toBe(true);
+    expect(manager.getPendingDispatchRetry(t.id)).toMatchObject({ signalToken: 'succ-tok1234' });
+  });
+
   it('startSession develop switches the fixed Workdir to the exact baxian task branch', async () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({ id: 'task-headok', branch: 'bx/task-headok' });
@@ -6066,19 +6859,19 @@ describe('AgentManager runtime menu marker', () => {
     let captures = 0;
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        const runtimeFact = claimedRuntimeFact(cmd, () => '%0');
+        if (runtimeFact) return runtimeFact;
         if (cmd.includes('capture-pane')) {
           captures += 1;
-          return {
-            stdout: captures <= 2
-              ? 'Enter to confirm · Esc to cancel'
-              : '⏵⏵ bypass permissions on /tmp/repo\n\n>',
-            stderr: '',
-            exitCode: 0,
-          };
+          const frame = captures <= 2
+            ? 'Enter to confirm · Esc to cancel'
+            : '⏵⏵ bypass permissions on /tmp/repo\n\n>';
+          return { stdout: `BX_PANE_OK\n${frame}`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     manager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
     manager['runtimeMenuPollIntervalMs'] = 5;
@@ -6153,6 +6946,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
 
@@ -6168,9 +6962,11 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
     await acquireBoundLock('dev-1');
 
     const realAgentGet = agentStore.get.bind(agentStore);
+    let devGets = 0;
     let switched = false;
+    // 首次 get 落在 markPaneCancelClearing 的 update 临界区内，在那里写 store 会卡死 per-id 互斥
     vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
-      if (id === 'dev-1' && !switched) {
+      if (id === 'dev-1' && !switched && ++devGets >= 2) {
         switched = true;
         const cur = await realAgentGet(id);
         if (cur) {
@@ -6203,6 +6999,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => runner });
 
@@ -6240,6 +7037,7 @@ describe('cancelTask interrupts (ESC) then releases dev and qa panes without cle
   it('keeps the mutex-busy hold reason and emits a single intervention when the pane mutex stays busy', async () => {
     const localManager = makeManager({ skillRegistry: freshRegistry(), runnerFactory: () => readyRunner() });
     Object.assign(localManager, { cancelInterruptGuardWaitMs: 30, compactIdlePollMs: 5 });
+    stubClaimedPaneResolution(() => '%0');
     (localManager as unknown as { compactInFlight: Set<string> }).compactInFlight.add('dev-1');
 
     const t = await seedTask();
@@ -6542,13 +7340,19 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
       getAgentConfig: (id: string) => AgentConfig & { projectId: string };
     }).getAgentConfig(id);
   }
+  const INTERRUPT_PANES: Record<string, string> = { 'qa-1': '%7', 'dev-1': '%3' };
+  function stubInterruptPanes(): void {
+    stubClaimedPaneResolution(id => INTERRUPT_PANES[id] ?? '%0');
+  }
   function spyKeys(proc = 'node'): string[] {
+    stubInterruptPanes();
     const keys: string[] = [];
     vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
     vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue(proc);
     return keys;
   }
   function spyClearFlow(dirty: string, afterCtrlC: string, opts: { proc?: string; cleanAfterCtrlC?: boolean } = {}): string[] {
+    stubInterruptPanes();
     const proc = opts.proc ?? 'node';
     const cleanAfterCtrlC = opts.cleanAfterCtrlC ?? true;
     const keys: string[] = [];
@@ -6674,6 +7478,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
 
   it('re-checks proc title right before C-c: holds (no C-c) if the runtime crashed to a shell during the liveness window', async () => {
     Object.assign(manager, { runtimeLivenessProbeMs: 1, cleanComposerWaitMs: 20 });
+    stubInterruptPanes();
     const keys: string[] = [];
     vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
     vi.spyOn(TmuxManager.prototype, 'displayMessage')
@@ -6693,6 +7498,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
 
   it('holds (no C-c) when the screen is static but the OSC braille title ADVANCES across samples (live turn)', async () => {
     Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    stubInterruptPanes();
     const keys: string[] = [];
     vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
     vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
@@ -6723,6 +7529,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
 
   it('an ADVANCING OSC title is live even when the screen momentarily shows a ready-looking prompt', async () => {
     Object.assign(manager, { runtimeLivenessProbeMs: 1 });
+    stubInterruptPanes();
     const keys: string[] = [];
     vi.spyOn(TmuxManager.prototype, 'sendKeysToPane').mockImplementation(async (_p, k) => { keys.push(k); });
     vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
@@ -6879,6 +7686,42 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     expect(injectSpy).not.toHaveBeenCalled();
   });
 
+  it('injectTextToAgent aborts before paste when a DELETE→recreate bumps the generation during pane resolution', async () => {
+    const t = await seedTask({ id: 'task-rf-aba', status: 'in_progress' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0' });
+    await acquireBoundLock('qa-1', t.id);
+    const injectSpy = vi.spyOn(TmuxManager.prototype, 'injectPrompt').mockResolvedValue(undefined as unknown as void);
+    vi.spyOn(manager as unknown as { resolveClaimedPane: (...a: unknown[]) => Promise<unknown> }, 'resolveClaimedPane')
+      .mockImplementation(async () => {
+        manager.bumpDeletionGeneration('qa-1'); // DELETE→same-id recreate lands during the resolve await
+        return { session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' }, paneId: '%0', claim: 'qa-1' };
+      });
+    await expect(
+      manager.injectTextToAgent('qa-1', 'file body', { expectedTaskId: t.id }),
+    ).rejects.toThrow(/deleted or recreated before paste/);
+    expect(injectSpy).not.toHaveBeenCalled();
+  });
+
+  it('cleanupRemovedAgentRuntime bounds every tmux probe/kill with a deadline (no unbounded hang holding the tombstone)', async () => {
+    await seedAgent({ id: 'dev-1', paneId: '%5' });
+    const timeouts: Array<number | undefined> = [];
+    vi.spyOn(manager as unknown as { createRunnerFor: (a: unknown) => CommandRunner }, 'createRunnerFor')
+      .mockReturnValue({
+        exec: vi.fn(async (cmd: string, o?: { timeout?: number }) => {
+          timeouts.push(o?.timeout);
+          if (cmd.includes('list-sessions')) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+          return { stdout: '', stderr: '', exitCode: 0 }; // kill if-shell → killed
+        }),
+        writeFile: vi.fn(async () => {}),
+      } as unknown as CommandRunner);
+
+    await manager.cleanupRemovedAgentRuntime(['dev-1']);
+
+    // The snapshot probe and the kill both carry the bounded deadline.
+    expect(timeouts.filter(t => t !== undefined).length).toBeGreaterThanOrEqual(2);
+    expect(timeouts.filter(t => t !== undefined).every(t => t === 15_000)).toBe(true);
+  });
+
   it('injectTextToAgent (read-file responder) refuses to inject into a pane held by cancel cleanup', async () => {
     await seedTask({ id: 'task-rf-hold', status: 'in_progress' });
     await seedAgent({ id: 'qa-1', taskId: 'task-rf-hold', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
@@ -6968,6 +7811,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
       runnerFactory: () => ({
         exec: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
         writeFile: vi.fn(async () => undefined),
+        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
       } as unknown as CommandRunner),
     });
     await expect(
@@ -7019,6 +7863,7 @@ describe('AgentManager.prHasDevReplySince', () => {
       platformRunner: {
         exec: vi.fn(async (cmd: string) => execImpl(cmd)),
         writeFile: vi.fn(async () => undefined),
+        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
       } as unknown as CommandRunner,
     });
   }
@@ -7097,9 +7942,76 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     const joined = execs.join('\n');
     expect(promptInjections).toEqual([]);
     expect(joined).not.toMatch(/tmux (load|paste)-buffer/);
-    expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect(joined).not.toMatch(/\/compact/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+  });
+
+  it('skips the pane /clear when a DELETE→recreate bumps the generation mid-flight (ABA: reused pane id)', async () => {
+    const execs: string[] = [];
+    manager = makeManager({ runnerFactory: () => compactRunner(execs) });
+    setCompactTiming(manager);
+    await seedAgent({ id: 'dev-1', paneId: '%5', taskId: 'merged-task', workdir: '/repo/main' });
+
+    // Bump the generation on the first state read (after the entry capture) → the pane side-effect gate closes.
+    let bumped = false;
+    const realGet = agentStore.get.bind(agentStore);
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+      const s = await realGet(id);
+      if (id === 'dev-1' && !bumped) { bumped = true; manager.bumpDeletionGeneration('dev-1'); }
+      return s;
+    });
+
+    await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(execs.join('\n')).not.toMatch(/send-keys.*\/clear/);
+  });
+
+  it('regreetHeldAgent aborts without injecting when a DELETE→recreate bumps the generation', async () => {
+    const execs: string[] = [];
+    manager = makeManager({ runnerFactory: () => recordingRunner(execs) });
+    await seedAgent({ id: 'dev-1', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW });
+
+    let bumped = false;
+    const realGet = agentStore.get.bind(agentStore);
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+      const s = await realGet(id);
+      if (id === 'dev-1' && !bumped) { bumped = true; manager.bumpDeletionGeneration('dev-1'); }
+      return s;
+    });
+
+    expect(await manager.regreetHeldAgent('dev-1')).toBe(false);
+    expect(execs.join('\n')).not.toMatch(/paste-buffer|send-keys/);
+  });
+
+  it('attachImageToRunningAgent aborts when a DELETE→recreate bumps the generation mid-upload', async () => {
+    const execs: string[] = [];
+    manager = makeManager({ runnerFactory: () => recordingRunner(execs) });
+    await seedAgent({ id: 'dev-1', paneId: '%0' });
+
+    let bumped = false;
+    const realGet = agentStore.get.bind(agentStore);
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+      const s = await realGet(id);
+      if (id === 'dev-1' && !bumped) { bumped = true; manager.bumpDeletionGeneration('dev-1'); }
+      return s;
+    });
+
+    await expect(manager.attachImageToRunningAgent('dev-1', Buffer.from('x'), 'png'))
+      .rejects.toThrow(/deleted or recreated/);
+  });
+
+  it('handleDialogPendingFromRuntime refuses when the caller generation no longer matches (DELETE→recreate)', async () => {
+    await seedAgent({ id: 'dev-1', paneId: '%0', taskId: 'task-x' });
+    const gen = manager.deletionGenerationOf('dev-1');
+    manager.bumpDeletionGeneration('dev-1'); // incarnation replaced since the caller captured gen
+    const err = new EnsureSessionError({ createdSession: false, agentId: 'dev-1', dialogPending: true }, 'dialog');
+
+    const handled = await manager.handleDialogPendingFromRuntime('dev-1', err, { expectedGeneration: gen });
+
+    expect(handled).toBe(false);
+    expect((await agentStore.get('dev-1'))?.awaitingPhase).toBeUndefined();
   });
 
   it('temporarily claims an exact lock before cleaning an unbound idle agent', async () => {
@@ -7113,7 +8025,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
       !(await agentStore.get('dev-1'))?.taskId && !(await lockManager.isLocked('dev-1')),
     );
 
-    expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
@@ -7126,7 +8038,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     await manager.dispatchPostMergeCleanup('dev-1', { taskId: 'merged-task', branch: 'bx/merged-task' });
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
-    expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
@@ -7140,7 +8052,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     expect(execs.join('\n')).not.toContain('git branch -D');
-    expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
   });
 
   it('holds taskId on the binding during local branch cleanup and releases after', async () => {
@@ -7159,7 +8071,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     expect(taskIdDuringCheckoutCleanup).toBe('merged-task');
-    expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
@@ -7175,18 +8087,19 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
           const runtimeFact = claimedRuntimeFact(cmd, () => '%5');
           if (runtimeFact) return runtimeFact;
           if (cmd.includes('send-keys') && cmd.includes("'Enter'")) busyLeft = 3;
-          if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-            return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+          if (cmd.includes('display-message') && cmd.includes('pane_current_command') && !cmd.includes('capture-pane')) {
+            return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
           }
           if (cmd.includes('capture-pane')) {
             let frame = IDLE;
             if (busyLeft > 0) { busyLeft--; frame = BUSY; }
-            if (cmd.includes('history_size')) return { stdout: `${frame}\n___bx-snap-sep___\n0`, stderr: '', exitCode: 0 };
-            return { stdout: frame, stderr: '', exitCode: 0 };
+            if (cmd.includes('history_size')) return { stdout: `BX_PANE_OK|0\n${frame}`, stderr: '', exitCode: 0 };
+            return { stdout: `BX_PANE_OK\n${frame}`, stderr: '', exitCode: 0 };
           }
           return { stdout: '', stderr: '', exitCode: 0 };
         }),
         writeFile: vi.fn(async (): Promise<void> => undefined),
+        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
       }) as unknown as CommandRunner,
     });
     setCompactTiming(manager);
@@ -7197,7 +8110,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
     const joined = execs.join('\n');
     expect(joined).not.toContain('git branch -D');
-    expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect(joined).not.toMatch(/\/compact/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
@@ -7213,7 +8126,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
     const joined = execs.join('\n');
     expect(joined).not.toContain('git branch -D');
-    expect(joined).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(joined).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
@@ -7227,7 +8140,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     await waitUntilAsync(async () => !(await agentStore.get('dev-1'))?.taskId);
 
     const binding = await agentStore.get('dev-1');
-    expect(execs.join('\n')).toMatch(/tmux send-keys -l -t '%5' '\/clear'/);
+    expect(execs.join('\n')).toMatch(/send-keys -l -t %5 '\\''\/clear'\\''/);
     expect(binding?.taskId).toBeUndefined();
     expect(binding?.status).not.toBe('awaiting_human');
   });
@@ -7243,7 +8156,7 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
     const joined = execs.join('\n');
     expect(joined).not.toContain('git fetch --prune origin');
-    expect(joined).not.toContain("send-keys -l -t '%5' '/clear'");
+    expect(joined).not.toContain("send-keys -l -t %5 '\\''/clear'\\''");
     const binding = await agentStore.get('dev-1');
     expect(binding?.taskId).toBe('next-task');
   });
@@ -7256,6 +8169,65 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
 
     expect(result.errorCode).toBe(409);
     expect((await taskStore.get('next-task'))?.status).toBe('pending');
+  });
+
+  it('dispatchPendingTask rejects the binding when a DELETE→recreate bumps the generation after entry', async () => {
+    await seedAgent({ id: 'dev-1' });
+    await seedTask({ id: 'pend-task', status: 'pending', agentId: 'dev-1', preferredAgentId: 'dev-1' });
+    // The generation capture must precede the agent config/state reads: bump it on the first
+    // post-capture state read so a DELETE→same-id recreate in that window closes the gate.
+    let bumped = false;
+    const realGet = agentStore.get.bind(agentStore);
+    vi.spyOn(agentStore, 'get').mockImplementation(async (id: string) => {
+      const state = await realGet(id);
+      if (id === 'dev-1' && !bumped) {
+        bumped = true;
+        manager.bumpDeletionGeneration('dev-1');
+      }
+      return state;
+    });
+
+    const result = await manager.dispatchPendingTask('pend-task', 'dev-1');
+
+    expect(result.errorCode).toBe(409);
+    expect((await realGet('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect((await taskStore.get('pend-task'))?.status).toBe('pending');
+  });
+
+  it('a delete-claim that wins the task lock forces a racing dispatchPendingTask to refuse (task stays pending)', async () => {
+    await seedAgent({ id: 'dev-1' });
+    await seedTask({ id: 'pend-ser', status: 'pending', agentId: 'dev-1', preferredAgentId: 'dev-1' });
+    // The claim is invoked first, tombstones dev-1 under the task lock; the dispatch queued behind it sees the
+    // tombstone and refuses — the claim and the dispatch's active commit share one critical section.
+    const claim = manager.scanActiveThenClaimDeletion(['dev-1']);
+    const dispatched = await manager.dispatchPendingTask('pend-ser', 'dev-1');
+
+    expect(await claim).toEqual({ ok: true });
+    expect(dispatched.errorCode).toBe(409);
+    expect((await taskStore.get('pend-ser'))?.status).toBe('pending');
+    expect(manager.isDeletionInFlight('dev-1')).toBe(true);
+  });
+
+  it('dispatchPendingTask rejects when a non-dispatched participant (QA) is deleted+recreated before the active write', async () => {
+    await seedAgent({ id: 'dev-1' });
+    await seedTask({ id: 'pend-qa', status: 'pending', preferredAgentId: '', agentId: '' });
+    // Unassigned task dispatched to dev-1 snapshots qa-1 from its group; bump qa-1's generation right after the
+    // binding commit (between the participant snapshot and the active write) so the re-check rejects the stale qa.
+    const realUpdate = agentStore.update.bind(agentStore);
+    let bumped = false;
+    vi.spyOn(agentStore, 'update').mockImplementation(async (id: string, cb) => {
+      const result = await realUpdate(id, cb);
+      if (id === 'dev-1' && !bumped) { bumped = true; manager.bumpDeletionGeneration('qa-1'); }
+      return result;
+    });
+
+    const result = await manager.dispatchPendingTask('pend-qa', 'dev-1');
+
+    expect(result.errorCode).toBe(409);
+    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect((await taskStore.get('pend-qa'))?.status).toBe('pending');
   });
 
   it('keeps the binding and exact lock when runtime idleness cannot be proven', async () => {
@@ -7616,7 +8588,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
     expect(caught).toBeInstanceOf(DispatchTerminalError);
     const updated = await taskStore.get(t.id);
     expect(updated?.status).toBe('review');
-    expect(updated?.reviewRound).toBe(2);
+    // prompt 送达与否未知：round 不预计，intent 保留——若 verdict 到来由消费公式补计恰好一次
+    expect(updated?.reviewRound).toBe(1);
+    expect(updated?.reviewRoundPending).toBe(true);
     expect(updated?.qaAgentId).toBe('qa-1');
     expect((await agentStore.get('qa-1'))?.status).toBe('awaiting_human');
   });
@@ -7653,7 +8627,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
     });
     await acquireBoundLock('dev-1');
     await acquireBoundLock('qa-1');
-    vi.spyOn(TmuxManager.prototype, 'getSinglePaneId').mockResolvedValue('%1');
+    stubClaimedPaneResolution(() => '%1');
     vi.spyOn(manager, 'startSession').mockImplementation(async (_taskId, agentId, _phase, opts) => {
       const err = new EnsureSessionError(
         { createdSession: true, agentId, dialogPending: true },
@@ -7688,10 +8662,10 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     const updated = await taskStore.get(t.id);
     expect(updated?.status).toBe('fixing');
-    expect(updated?.reviewRound).toBe(2);
+    expect(updated?.reviewRound).toBe(1);
   });
 
-  it('dispatchReviewToQa: PHASE 1 persists status="review" + reviewHeadAnchorSha + reviewRound bump BEFORE startSession sees the task', async () => {
+  it('dispatchReviewToQa: PHASE 1 persists status="review" + reviewHeadAnchorSha + 未计轮 intent BEFORE startSession sees the task', async () => {
     const t = await seedTask({ id: 'task-phase-order', status: 'in_progress', prNumber: 42, branch: 'bx/x', qaAgentId: 'qa-1', reviewRound: 0 });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1' });
@@ -7708,7 +8682,9 @@ describe('AgentManager awaiting_human lifecycle', () => {
 
     expect(snapshotInsideStartSession).toBeDefined();
     expect(snapshotInsideStartSession?.status).toBe('review');
-    expect(snapshotInsideStartSession?.reviewRound).toBe(1);
+    // 送达时计轮：startSession 看到的是「未计轮」intent，round 在送达确认后 +1
+    expect(snapshotInsideStartSession?.reviewRound).toBe(0);
+    expect(snapshotInsideStartSession?.reviewRoundPending).toBe(true);
     expect(snapshotInsideStartSession?.reviewHeadAnchorSha).toBe('a'.repeat(40));
     expect(snapshotInsideStartSession?.qaAgentId).toBe('qa-1');
   });
@@ -7921,12 +8897,16 @@ describe('AgentManager awaiting_human lifecycle', () => {
     await seedAgent({ id: 'dev-1' });
     const probingRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
+        if (cmd.includes('list-sessions')) {
+          return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+        }
         if (cmd.includes('list-panes')) {
           return { stdout: '%99 claude\n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => probingRunner;
 
@@ -7953,6 +8933,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => failingProbeRunner;
 
@@ -7978,6 +8959,7 @@ describe('AgentManager awaiting_human lifecycle', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     (manager as unknown as { runnerFactory: () => CommandRunner }).runnerFactory = () => probingRunner;
 
@@ -8091,8 +9073,6 @@ describe('AgentManager awaiting_human lifecycle', () => {
   });
 });
 
-const ACK_SEP = '___bx-snap-sep___';
-
 function ackInterventions(): BaxianEvent[] {
   return events.filter(
     e => e.type === 'human.intervention' && (e.data as { phase?: string }).phase === 'dispatch-ack-timeout',
@@ -8107,16 +9087,20 @@ function snapRunner(
   let enterSent = false;
   return {
     exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('display-message')) {
-        return { stdout: `${frame(enterSent)}${ACK_SEP}\n${scrollback(enterSent)}\n`, stderr: '', exitCode: 0 };
-      }
       if (cmd.includes('send-keys') && cmd.includes('Enter')) {
         enterSent = true;
         return { stdout: '', stderr: '', exitCode: 0 };
       }
+      if (cmd.includes('history_size')) {
+        return { stdout: `BX_PANE_OK|${scrollback(enterSent)}\n${frame(enterSent)}`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
+      }
       return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn(async (): Promise<void> => undefined),
+    execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     sawEnter: () => enterSent,
   } as unknown as SnapRunner;
 }
@@ -8186,12 +9170,12 @@ describe('injectAndAwaitAck pre-paste generation guard', () => {
     const base = readyRunner();
     const runner = {
       ...base,
-      exec: vi.fn(async (cmd: string) => {
+      execWithStdin: vi.fn(async (cmd: string, stdin: Buffer) => {
         if (cmd.includes('load-buffer')) {
           const fresh = await taskStore.get(t.id);
           await taskStore.set({ ...fresh!, signalToken: 'stage-T2' });
         }
-        return (base.exec as (cmd: string) => Promise<ExecResult>)(cmd);
+        return (base.execWithStdin as (cmd: string, stdin: Buffer) => Promise<ExecResult>)(cmd, stdin);
       }),
     } as unknown as CommandRunner;
     const localManager = makeInjectManager(runner, 150, 150);
@@ -8432,11 +9416,13 @@ describe('injectAndAwaitAck ack timeout', () => {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         sentCommands.push(cmd);
         if (cmd.includes('capture-pane')) {
-          return { stdout: `stuck-screen\n${ACK_SEP}\n42\n`, stderr: '', exitCode: 0 };
+          const header = cmd.includes('history_size') ? 'BX_PANE_OK|42' : 'BX_PANE_OK';
+          return { stdout: `${header}\nstuck-screen\n`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const localManager = makeManager({
       skillRegistry: freshRegistry(),
@@ -8487,11 +9473,13 @@ describe('injectAndAwaitAck ack timeout', () => {
         }
         if (cmd.includes('capture-pane')) {
           const visible = enterCount >= 2 ? 'working\n  esc to interrupt\n' : 'idle composer\n';
-          return { stdout: `${visible}${ACK_SEP}\n0\n`, stderr: '', exitCode: 0 };
+          const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
+          return { stdout: `${header}\n${visible}`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const localManager = makeInjectManager(flakyRunner, 3000, 10);
     (localManager as unknown as { dispatchAckResendIntervalMs: number }).dispatchAckResendIntervalMs = 50;
@@ -8505,7 +9493,6 @@ describe('injectAndAwaitAck ack timeout', () => {
 
   it('infrastructure failure during the post-Enter ack wait throws DispatchTerminalError, not human.intervention', async () => {
     let enterSent = false;
-    const SETTLED = `idle\n${ACK_SEP}\n10\n`;
     const failingRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
@@ -8513,12 +9500,16 @@ describe('injectAndAwaitAck ack timeout', () => {
           return { stdout: '', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          if (!enterSent) return { stdout: SETTLED, stderr: '', exitCode: 0 };
+          if (!enterSent) {
+            const header = cmd.includes('history_size') ? 'BX_PANE_OK|10' : 'BX_PANE_OK';
+            return { stdout: `${header}\nidle\n`, stderr: '', exitCode: 0 };
+          }
           return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { caught } = await runAck(failingRunner, { ackMs: 50, settleMs: 200, lock: false });
     expect(caught).toBeInstanceOf(DispatchTerminalError);
@@ -8538,21 +9529,25 @@ describe('injectAndAwaitAck settles the pane before Enter', () => {
     let snap = 0;
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message')) {
-          order.push(enterSent ? 'snap-post' : 'snap-pre');
-          const visible = enterSent
-            ? 'box: [Image #1]\nThinking\n  esc to interrupt\n'
-            : preEnter[Math.min(snap++, preEnter.length - 1)];
-          return { stdout: `${visible}${ACK_SEP}\n0\n`, stderr: '', exitCode: 0 };
-        }
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
           enterSent = true;
           order.push('enter');
           return { stdout: '', stderr: '', exitCode: 0 };
         }
+        if (cmd.includes('history_size')) {
+          order.push(enterSent ? 'snap-post' : 'snap-pre');
+          const visible = enterSent
+            ? 'box: [Image #1]\nThinking\n  esc to interrupt\n'
+            : preEnter[Math.min(snap++, preEnter.length - 1)];
+          return { stdout: `BX_PANE_OK|0\n${visible}`, stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: 'BX_PANE_OK\n', stderr: '', exitCode: 0 };
+        }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { result } = await runAck(runner, { ackMs: 2000, settleMs: 2000 });
 
@@ -8571,19 +9566,20 @@ describe('injectAndAwaitAck never-settle + swallowed Enter is non-ackable', () =
     let enterSent = false;
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message')) {
-          return { stdout: `frame ${n++}\n${ACK_SEP}\n0\n`, stderr: '', exitCode: 0 };
-        }
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
           enterSent = true;
           return { stdout: '', stderr: '', exitCode: 0 };
         }
+        if (cmd.includes('history_size')) {
+          return { stdout: `BX_PANE_OK|0\nframe ${n++}\n`, stderr: '', exitCode: 0 };
+        }
         if (cmd.includes('capture-pane')) {
-          return { stdout: `composer still open ${n++}\n[Image #1] attaching\n`, stderr: '', exitCode: 0 };
+          return { stdout: `BX_PANE_OK\ncomposer still open ${n++}\n[Image #1] attaching\n`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { result, taskId } = await runAck(runner, { ackMs: 60, settleMs: 60 });
 
@@ -8615,15 +9611,19 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
   it('a failed sendEnter is raw cleanup, not ack_unknown', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message')) {
-          return { stdout: `idle\n${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
-        }
         if (cmd.includes('send-keys') && cmd.includes('Enter')) {
           return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+        }
+        if (cmd.includes('history_size')) {
+          return { stdout: 'BX_PANE_OK|5\nidle\n', stderr: '', exitCode: 0 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: 'BX_PANE_OK\nidle\n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { caught } = await runAck(runner, { ackMs: 100, settleMs: 100 });
     expect(caught).toBeInstanceOf(Error);
@@ -8639,15 +9639,16 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
           pasted = true;
           return { stdout: '', stderr: '', exitCode: 0 };
         }
-        if (cmd.includes('display-message')) {
-          return { stdout: `${pasted ? screen : '❯ \n'}${ACK_SEP}\n3\n`, stderr: '', exitCode: 0 };
+        if (cmd.includes('history_size')) {
+          return { stdout: `BX_PANE_OK|3\n${pasted ? screen : '❯ \n'}`, stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          return { stdout: pasted ? screen : '❯ \n', stderr: '', exitCode: 0 };
+          return { stdout: `BX_PANE_OK\n${pasted ? screen : '❯ \n'}`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { result } = await runAck(runner, { ackMs: 150, settleMs: 150, prompt: 'do X\n  esc to interrupt' });
     expect(result).toEqual({ acked: false, composerDelivered: false });
@@ -8660,14 +9661,18 @@ describe('injectAndAwaitAck post-approve edge cases', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
         sent.push(cmd);
-        if (cmd.includes('display-message')) {
+        if (cmd.includes('history_size')) {
           snaps++;
-          if (snaps === 1) return { stdout: `composer\n${ACK_SEP}\n1\n`, stderr: '', exitCode: 0 };
+          if (snaps === 1) return { stdout: 'BX_PANE_OK|1\ncomposer\n', stderr: '', exitCode: 0 };
           return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+        }
+        if (cmd.includes('capture-pane')) {
+          return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     };
     const { caught } = await runAck(runner, { ackMs: 150, settleMs: 150 });
     expect(caught).toBeInstanceOf(Error);
@@ -8690,6 +9695,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return respond(cmd) ?? { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     } as unknown as CommandRunner;
   }
 
@@ -8697,10 +9703,13 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const sent: string[] = [];
     let snaps = 0;
     const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('display-message')) {
+      if (cmd.includes('history_size')) {
         snaps++;
-        if (snaps === 1) return { stdout: `composer\n${ACK_SEP}\n1\n`, stderr: '', exitCode: 0 };
+        if (snaps === 1) return { stdout: 'BX_PANE_OK|1\ncomposer\n', stderr: '', exitCode: 0 };
         return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
       }
       return undefined;
     });
@@ -8759,7 +9768,8 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         const preClearDone = sendKeysSeen > 2;
         if (failKeys === 'after-preclear' ? preClearDone : cmd.includes('Enter')) return sendKeys;
       }
-      if (cmd.includes('display-message')) return { stdout: `idle\n${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+      if (cmd.includes('history_size')) return { stdout: 'BX_PANE_OK|5\nidle\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: 'BX_PANE_OK\nidle\n', stderr: '', exitCode: 0 };
       return undefined;
     });
     const { caught } = await runAck(runner);
@@ -8785,7 +9795,10 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         return { stdout: '', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') || cmd.includes('display-message')) {
-        if (!enterSent) return { stdout: `idle\n${ACK_SEP}\n10\n`, stderr: '', exitCode: 0 };
+        if (!enterSent) {
+          const header = cmd.includes('history_size') ? 'BX_PANE_OK|10' : 'BX_PANE_OK';
+          return { stdout: `${header}\nidle\n`, stderr: '', exitCode: 0 };
+        }
         return { stdout: '', stderr: 'no such pane: %0', exitCode: 1 };
       }
       return undefined;
@@ -8803,14 +9816,17 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     let enterSent = false;
     let enterIdx = -1;
     const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('display-message')) {
-        const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
-        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
-      }
       if (cmd.includes('send-keys') && cmd.includes('Enter')) {
         enterSent = true;
         enterIdx = sent.length - 1;
         return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('history_size')) {
+        const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
+        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
       }
       return undefined;
     });
@@ -8829,15 +9845,18 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
         enterSent = true;
         return { stdout: '', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('display-message')) {
+      if (cmd.includes('history_size')) {
         const visible = enterSent ? 'working\n  esc to interrupt\n' : 'composer\n';
-        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
       }
       return undefined;
     });
     const { result } = await runAck(runner);
     expect(result).toEqual({ acked: true, composerDelivered: true });
-    const spaceIdx = sent.findIndex(c => c.includes('send-keys -l') && c.endsWith("' '"));
+    const spaceIdx = sent.findIndex(c => c.includes('send-keys -l'));
     const ccIdx = sent.findIndex(c => c.includes('send-keys') && c.includes('C-c'));
     const pasteIdx = sent.findIndex(c => c.includes('paste-buffer'));
     expect(spaceIdx).toBeGreaterThanOrEqual(0);
@@ -8849,18 +9868,21 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const sent: string[] = [];
     let pasted = false;
     const runner = recordRunner(sent, cmd => {
-      if (cmd.includes('send-keys -l') && cmd.endsWith("' '")) {
+      if (cmd.includes('send-keys -l')) {
         return { stdout: '', stderr: 'ssh: connect: connection timed out', exitCode: 1 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
         return undefined;
       }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OK\ncomposer\n', stderr: '', exitCode: 0 };
+      }
       return undefined;
     });
     const { caught } = await runAck(runner);
     expect(caught).toBeInstanceOf(Error);
-    expect(String((caught as Error).message)).toMatch(/sendKeysLiteral/);
+    expect(String((caught as Error).message)).toMatch(/guarded write/);
     expect(pasted).toBe(false);
     expect(sent.filter(c => c.includes('send-keys') && c.includes('Enter'))).toHaveLength(0);
   });
@@ -8871,14 +9893,14 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     let enterSent = false;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('pane_title')) {
-        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
-        return { stdout: '❯ \n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK\n❯ \n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
         const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
-        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -8892,7 +9914,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     });
     await runAck(runner);
     expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(1);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(1);
     expect(ccCmds(sent)).toHaveLength(1);
   });
 
@@ -8902,11 +9924,11 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     let captures = 0;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('pane_title')) {
-        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
         captures++;
-        return { stdout: `soft-wrapped output without any anchor line ${captures}\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\nsoft-wrapped output without any anchor line ${captures}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -8928,14 +9950,14 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const DRAFT = '› 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('pane_title')) {
-        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
-        return { stdout: DRAFT, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n${DRAFT}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
         const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
-        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -8949,7 +9971,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     });
     await runAck(runner);
     expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(1);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(1);
     expect(ccCmds(sent)).toHaveLength(1);
   });
 
@@ -8959,11 +9981,11 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     let captures = 0;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('pane_title')) {
-        return { stdout: '⠹ Grooving…\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK⠹ Grooving…\n', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('capture-pane') && !cmd.includes('display-message')) {
+      if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
         captures++;
-        return { stdout: `✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -8975,7 +9997,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     expect(caught).toBeInstanceOf(Error);
     expect(String((caught as Error).message)).toMatch(/pre-inject busy check/);
     expect(pasted).toBe(false);
-    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(0);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(0);
     expect(ccCmds(sent)).toHaveLength(0);
   });
 
@@ -8986,14 +10008,14 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     const DRAFT = '❯ 排查 codex 卡死，日志：\n  • Working (12s)\n  esc to interrupt\n';
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('pane_title')) {
-        return { stdout: 'dev-1\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OKdev-1\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
-        return { stdout: DRAFT, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n${DRAFT}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('history_size')) {
         const visible = enterSent ? 'working\n  esc to interrupt\n' : '❯ \n';
-        return { stdout: `${visible}${ACK_SEP}\n5\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK|5\n${visible}`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -9007,7 +10029,7 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     });
     await runAck(runner);
     expect(pasted).toBe(true);
-    expect(sent.filter(c => c.includes('send-keys -l') && c.endsWith("' '"))).toHaveLength(1);
+    expect(sent.filter(c => c.includes('send-keys -l'))).toHaveLength(1);
     expect(ccCmds(sent)).toHaveLength(1);
   });
 
@@ -9017,11 +10039,11 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
     let captures = 0;
     const runner = recordRunner(sent, cmd => {
       if (cmd.includes('pane_title')) {
-        return { stdout: 'dev-1\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OKdev-1\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane') && !cmd.includes('history_size')) {
         captures++;
-        return { stdout: `✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
+        return { stdout: `BX_PANE_OK\n✶ Grooving… (${12 + captures}s)\n  esc to interrupt\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('paste-buffer')) {
         pasted = true;
@@ -9043,6 +10065,9 @@ describe('injectAndAwaitAck makes the pane reuse-safe on pre-Enter failure', () 
       if (cmd.includes('paste-buffer')) {
         pasted = true;
         return undefined;
+      }
+      if (cmd.includes('capture-pane')) {
+        return { stdout: 'BX_PANE_OK\n❯ \n', stderr: '', exitCode: 0 };
       }
       return undefined;
     });
@@ -9622,7 +10647,10 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     const killSpy = vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed');
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toThrow('session boot boom');
-    expect(killSpy).toHaveBeenCalledWith({ sessionId: '$7', serverPid: '4242', serverStart: '1700000000' });
+    expect(killSpy).toHaveBeenCalledWith(
+      { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' },
+      { kind: 'emptyOr', claim: 'dev-1' },
+    );
   });
 
   it('still rethrows the ensureSession error when the rollback killSession also fails', async () => {
@@ -10171,7 +11199,10 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     await expect(manager.continueSession(t.id, 'dev-1', 'fix')).rejects.toThrow('session boot boom');
-    expect(killSpy).toHaveBeenCalledWith({ sessionId: '$7', serverPid: '4242', serverStart: '1700000000' });
+    expect(killSpy).toHaveBeenCalledWith(
+      { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' },
+      { kind: 'emptyOr', claim: 'dev-1' },
+    );
     expect(warnSpy.mock.calls.some(c => String(c[0]).includes('created-session rollback') && String(c[0]).includes('failed'))).toBe(true);
     warnSpy.mockRestore();
   });
@@ -10406,6 +11437,7 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
         bumpRound: false,
         fromStatus: ['review'],
         expectSignalToken: 'pass-t1',
+        qaPhase: 'review',
       });
       const qa = await agentStore.get('qa-1');
       expect(qa?.taskId).toBe(t.id);
@@ -10413,6 +11445,28 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       expect(qa?.awaitingPhase).toBeUndefined();
     },
   );
+
+  it('Resume 首评 hold 携带持久化未计轮 intent：bumpRound=true + qaPhase=review（#563 R23）', async () => {
+    const t = await seedTask({
+      status: 'review', qaAgentId: 'qa-1', prNumber: 12,
+      signalToken: 'pass-t2', reviewRound: 0, reviewRoundPending: true,
+    });
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1',
+      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
+      awaitingReason: 'repl not ready', awaitingSince: NOW,
+    });
+    await acquireBoundLock('qa-1', t.id);
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await manager.resumeAgent('qa-1');
+
+    expect(dispatchSpy).toHaveBeenCalledWith(t.id, expect.objectContaining({
+      bumpRound: true,
+      qaPhase: 'review',
+      expectSignalToken: 'pass-t2',
+    }));
+  });
 
   it('releases the held QA binding instead of redispatching when the task has left review', async () => {
     const t = await seedTask({ status: 'fixing', qaAgentId: 'qa-1', prNumber: 12, signalToken: 'pass-t1' });
@@ -10906,6 +11960,7 @@ describe('AgentManager.verifyPaneSignalPrNumber', () => {
       platformRunner: {
         exec: vi.fn(async (): Promise<ExecResult> => ({ stdout, stderr: '', exitCode })),
         writeFile: vi.fn(async () => undefined),
+        execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
       },
     });
   }
@@ -11565,6 +12620,99 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     expect(await lockManager.isLocked('qa-1')).toBe(true);
   });
 
+  it('QA REPL 仍忙 → 拒绝释放但不落 hold（忙碌不是清理失败，可再排队）（#563 R38）', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireBoundLock('qa-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true });
+
+    expect(released).toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+    expect(qa?.awaitingPhase).toBeUndefined();
+  });
+
+  it('release 的忙碌等待走真实实现：持续忙碌时 deferWhenBusy 生效、不落 hold（#563 R45）', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireBoundLock('qa-1', t.id);
+    Object.assign(manager, { compactIdlePollMs: 1, cleanComposerWaitMs: 5 });
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    // 真实 waitForReplPromptReady：waitReplReady 通过后仍持续忙碌 → 走「stayed busy past」超时分支
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined as never);
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue(
+      '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n',
+    );
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true });
+
+    expect(released).toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+  });
+
+  it('未声明 deferWhenBusy 的普通释放（终态/清理路径）遇忙仍落 hold 并告警（#563 R39）', async () => {
+    const t = await seedTask({ status: 'merged', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireBoundLock('qa-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle');
+
+    expect(released).toBe(false);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.status).toBe('awaiting_human');
+    expect(qa?.awaitingPhase).toBe('branch-cleanup-pending');
+  });
+
+  it('dev REPL 忙仍按 branch-cleanup-pending 落 hold（分支清理凭据不可丢）（#563 R38 边界）', async () => {
+    const t = await seedTask({ status: 'review', agentId: 'dev-1', branch: 'bx/task-review' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/dev-repo' });
+    await acquireBoundLock('dev-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%0', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'claude-code', ''));
+
+    const released = await manager.releaseAgentForTask('dev-1', t.id, 'idle');
+
+    expect(released).toBe(false);
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.status).toBe('awaiting_human');
+    expect(dev?.awaitingPhase).toBe('branch-cleanup-pending');
+  });
+
   it('refuses an expectedHold release when the hold was already cleared', async () => {
     const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
     await seedAgent({ id: 'qa-1', taskId: t.id });
@@ -11659,6 +12807,7 @@ describe('AgentManager.computeCodeInterdiff', () => {
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
       writeFile: vi.fn(async (): Promise<void> => undefined),
+      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
     } as unknown as CommandRunner;
   }
 

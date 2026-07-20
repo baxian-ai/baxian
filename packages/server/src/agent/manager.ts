@@ -74,12 +74,14 @@ import {
   hasOscTitleWorking,
   hasOscTitleIdle,
   screenAllowsTitleIdle,
+  PaneGoneError,
   type AdoptPaneState,
   type AgentRuntimeKind,
   type TmuxSessionRef,
+  type PaneRef,
 } from './tmux.js';
 import { BranchManager, DirtyWorkdirError, ReviewHeadMismatchError, isAutoDeletableTaskBranch } from './branch.js';
-import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFileGuarded, type RepoStoreCache } from './repo-store.js';
+import { RepoStore, createRepoStoreCache, moveFileIntoPlace, stageFileGuarded, canonicalSelfGuard, type RepoStoreCache } from './repo-store.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import { PhaseSignalWatcher, type PhaseSignalWatcherStartArgs } from './phase-signal-watcher.js';
 import type { PhaseSignalKind } from './phase-signal.js';
@@ -104,6 +106,7 @@ export interface EnsureSessionResult {
   freshRuntime: boolean;
   skillsStale?: true;
   paneId: string;
+  pane: PaneRef;
   workdir: string;
   sessionRef: TmuxSessionRef;
 }
@@ -117,6 +120,7 @@ export class EnsureSessionError extends Error {
       genAtCreate?: number;
       dialogPending?: boolean;
       handled?: boolean;
+      busyPending?: boolean;
       lastScreen?: string;
     },
     message: string,
@@ -156,6 +160,13 @@ export class DispatchTerminalError extends Error {
 }
 
 export type EnsureSessionMode = 'create' | 'runtime' | 'recover';
+
+export type DeletionClaimOutcome =
+  | { ok: true }
+  | { ok: false; code: 'active'; agentId: string; taskId: string }
+  | { ok: false; code: 'bootstrapping'; agentId: string }
+  | { ok: false; code: 'referencing'; taskId: string }
+  | { ok: false; code: 'already-deleting'; agentId: string };
 
 export function buildLaunchCommand(agent: AgentConfig): string {
   const yolo = agent.yolo !== false;
@@ -216,7 +227,7 @@ const WORKDIR_SESSION_OPTION = '@baxian-workdir';
 
 type ReleaseRuntime =
   | { kind: 'absent' }
-  | { kind: 'pane'; paneId: string }
+  | { kind: 'pane'; pane: PaneRef }
   | { kind: 'hold'; reason: string };
 
 function normalizedDir(left: string | null | undefined): string | null {
@@ -297,6 +308,9 @@ export interface AgentManagerDeps {
 
 const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
+// DELETE runtime cleanup runs while holding the deletion tombstone + rotated lock; an unbounded remote
+// probe/kill would block rollback/finally forever, so every tmux round-trip in it carries this deadline.
+const DELETE_CLEANUP_TIMEOUT_MS = 15_000;
 const GH_NET = { timeout: GH_EXEC_TIMEOUT_MS, retries: 1 } as const;
 const PLATFORM_HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 
@@ -340,6 +354,8 @@ interface SessionDispatchOpts {
 
 interface StartSessionOpts extends SessionDispatchOpts {
   preserveBindingOnFailure?: boolean;
+  dispatchPassToken?: string;
+  dispatchPendingBudget?: { since: number; budgetAlerted?: boolean };
 }
 
 export interface ContinueSessionOpts extends SessionDispatchOpts {
@@ -373,6 +389,7 @@ interface DispatchReviewSnapshot {
   signalToken?: string;
   reviewHeadAnchorSha?: string;
   reviewDispatchedAt?: string;
+  reviewRoundPending?: boolean;
   passToken?: string;
   failToken?: string;
 }
@@ -402,6 +419,17 @@ export function isRecoverableQaDispatchHold(binding: AgentBindingFacts | null | 
   return binding?.status === 'awaiting_human'
     && binding.awaitingPhase != null
     && RECOVERABLE_QA_DISPATCH_HOLD_PHASES.has(binding.awaitingPhase);
+}
+
+// REPL 忙碌是常态（QA 回合分钟级、dev 修完即推），遇忙派发不落 hold 而登记待补派；
+// 内存态即可：进程重启丢失后由对账兜底路径按 PENDING_IDLE 观察恢复。
+export interface PendingDispatchRetry {
+  kind: 'qa-recheck' | 'dev-fix';
+  agentId: string;
+  signalToken: string;
+  qaPhase?: 'review' | 'recheck';
+  since: number;
+  budgetAlerted?: boolean;
 }
 
 const TURN_COMPLETED_AWAITING_PHASES = new Set<string>();
@@ -485,6 +513,9 @@ export class AgentManager {
   protected manualCompactWaitMs = 5_000;
   protected runtimeLivenessProbeMs = 700;
   protected cleanComposerWaitMs = 5_000;
+  protected readyStableSamples = 3;
+  protected readyStableSpacingMs = 1_000;
+  private pendingDispatchRetryByTask = new Map<string, PendingDispatchRetry>();
   protected cancelInterruptGuardWaitMs = DEFAULT_DISPATCH_ACK_TIMEOUT_MS + 5_000;
   private manualReviewInFlight = new Set<string>();
   private markCompleteInFlight = new Set<string>();
@@ -493,6 +524,9 @@ export class AgentManager {
   // 引用计数：cancelTask 与 startCreatedTaskSession 的清理段可合法并存（启动期 Stop），先完成者不得清掉后者的 guard。
   private cancelCleanupInFlight = new Map<string, number>();
   private deletionInFlight = new Set<string>();
+  // Diverged ids live in a separate set the DELETE finally never clears: a post-commit replaceConfig throw must fail-stop for the whole process.
+  private divergedAgents = new Set<string>();
+  private deletionGeneration = new Map<string, number>();
   private compactInFlight = new Set<string>();
 
   constructor(deps: AgentManagerDeps) {
@@ -726,15 +760,72 @@ export class AgentManager {
     return null;
   }
 
+  // Scan + claim share createTask/dispatchPendingTask's withTaskLock, so a delete can't pass an active-scan that a concurrent in_progress commit then orphans.
+  async scanActiveThenClaimDeletion(targets: readonly string[]): Promise<DeletionClaimOutcome> {
+    return this.withTaskLock(async () => {
+      for (const id of targets) {
+        const state = await this.agentStore.get(id);
+        const task = state?.taskId ? await this.taskStore.get(state.taskId) : null;
+        if (task && ACTIVE_TASK_STATUSES.has(task.status)) {
+          return { ok: false, code: 'active', agentId: id, taskId: task.id };
+        }
+        if (state?.status === 'awaiting_human') continue;
+        if (state?.creationToken) return { ok: false, code: 'bootstrapping', agentId: id };
+      }
+      const targetSet = new Set(targets);
+      const referencing = (await this.taskStore.list({})).find(t =>
+        ACTIVE_TASK_STATUSES.has(t.status)
+        && ((t.preferredAgentId !== '' && targetSet.has(t.preferredAgentId))
+          || (!!t.agentId && targetSet.has(t.agentId))
+          || (!!t.devAgentId && targetSet.has(t.devAgentId))
+          || (!!t.qaAgentId && targetSet.has(t.qaAgentId))
+          || (!!t.researchAgentId && targetSet.has(t.researchAgentId))));
+      if (referencing) return { ok: false, code: 'referencing', taskId: referencing.id };
+      const conflict = this.tryClaimDeletion(targets);
+      if (conflict) return { ok: false, code: 'already-deleting', agentId: conflict };
+      return { ok: true };
+    });
+  }
+
   releaseDeletionClaim(agentIds: readonly string[]): void {
     for (const id of agentIds) this.deletionInFlight.delete(id);
   }
 
-  isDeletionInFlight(agentId: string): boolean {
-    return this.deletionInFlight.has(agentId);
+  // A completed DELETE keeps blocking this id past tombstone release; the process dies with any suspended flow, so no persistence is needed.
+  bumpDeletionGeneration(agentId: string): void {
+    this.deletionGeneration.set(agentId, this.deletionGenerationOf(agentId) + 1);
   }
 
-  async ensureSession(agentId: string, mode: EnsureSessionMode): Promise<EnsureSessionResult> {
+  deletionGenerationOf(agentId: string): number {
+    return this.deletionGeneration.get(agentId) ?? 0;
+  }
+
+  // Boolean tombstone alone is ABA-prone (delete→recreate same id); commits must hold both the tombstone-clear and an unchanged generation from entry.
+  private deletionGateOpen(agentId: string, genAtEntry: number): boolean {
+    return !this.isDeletionInFlight(agentId) && this.deletionGenerationOf(agentId) === genAtEntry;
+  }
+
+  isDeletionInFlight(agentId: string): boolean {
+    return this.deletionInFlight.has(agentId) || this.divergedAgents.has(agentId);
+  }
+
+  // replaceConfig 抛错后的 fail-stop：进入 divergedAgents（不随 DELETE finally 释放），重建/分配持续被拒直到重启。
+  retainTombstoneForDivergence(agentId: string): void {
+    this.divergedAgents.add(agentId);
+  }
+
+  async ensureSession(
+    agentId: string,
+    mode: EnsureSessionMode,
+    opts: { expectedGeneration?: number } = {},
+  ): Promise<EnsureSessionResult> {
+    const genAtEntry = opts.expectedGeneration ?? this.deletionGenerationOf(agentId);
+    if (!this.deletionGateOpen(agentId, genAtEntry)) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `agent ${agentId} is being deleted (or was deleted and recreated); refusing session work`,
+      );
+    }
     const agent = this.getAgentConfig(agentId);
     if (!agent) {
       throw new EnsureSessionError({ createdSession: false, agentId }, `Unknown agent: ${agentId}`);
@@ -749,24 +840,48 @@ export class AgentManager {
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
 
+    // Side-effects run inside the lifecycle section (serialized with DELETE cleanup) behind a re-checked generation gate; the entry gate is only a fast-fail.
+    return this.runUnderSessionLifecycle(agentId, () =>
+      this.ensureSessionLocked(tmux, runner, agent, project, agentId, mode, genAtEntry),
+    );
+  }
+
+  private async ensureSessionLocked(
+    tmux: TmuxManager,
+    runner: CommandRunner,
+    agent: AgentConfig & { projectId: string },
+    project: ProjectConfig,
+    agentId: string,
+    mode: EnsureSessionMode,
+    genAtEntry: number,
+  ): Promise<EnsureSessionResult> {
+    const assertGenerationOpen = (): void => {
+      if (!this.deletionGateOpen(agentId, genAtEntry)) {
+        throw new EnsureSessionError(
+          { createdSession: false, agentId },
+          `agent ${agentId} is being deleted (or was deleted and recreated); refusing session work`,
+        );
+      }
+    };
+    assertGenerationOpen();
+
     let workdir: string;
     try {
       const resolved = await this.ensureWorkdir(agent, project, runner);
       workdir = resolved.workdir;
-      await this.agentStore.update(agentId, (existing) => {
-        if (!existing) return AGENT_STORE_NOOP;
-        return {
-          ...existing,
-          workdir,
-          updatedAt: new Date().toISOString(),
-        };
-      });
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
         `ensureWorkdir failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    // Gate the Workdir write too: a DELETE→recreate during the slow ensureWorkdir must not persist a stale Workdir onto the new incarnation.
+    assertGenerationOpen();
+    await this.agentStore.update(agentId, (existing) => {
+      if (!existing || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
+      return { ...existing, workdir, updatedAt: new Date().toISOString() };
+    });
+    assertGenerationOpen();
 
     try {
       await this.provisionRepoSkills(runner, agent, workdir);
@@ -776,10 +891,10 @@ export class AgentManager {
         `skill provisioning failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-
-    let alive: boolean;
+    assertGenerationOpen();
+    let snapshot: Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>;
     try {
-      alive = await tmux.hasSession(agentId);
+      snapshot = await tmux.getSessionSnapshot(agentId);
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
@@ -787,25 +902,32 @@ export class AgentManager {
           `if tmux is missing, ${tmuxInstallHint(agent.projectId)}`,
       );
     }
-
-    if (mode === 'create' && alive) {
-      const reclaimed = await this.runUnderSessionLifecycle(agentId, () =>
-        this.reclaimHalfCreatedSession(tmux, agentId),
-      );
-      if (!reclaimed) {
-        throw new EnsureSessionError(
-          { createdSession: false, agentId },
-          `tmux session "${agentId}" already exists on host; baxian only manages sessions ` +
-            `it creates itself — kill it manually or pick a different agent id`,
-        );
+    // Re-gate after the probe await: a DELETE may have tombstoned mid-probe, and build/adopt would else create a session cleanup can only reap later.
+    assertGenerationOpen();
+    if (!snapshot) {
+      return this.buildFreshSession(tmux, agent, agentId, workdir, workdir);
+    }
+    if (snapshot.claim === null) {
+      if (await this.reclaimHalfCreatedSession(tmux, agentId, snapshot)) {
+        return this.buildFreshSession(tmux, agent, agentId, workdir, workdir);
       }
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        `tmux session "${agentId}" already exists on host; baxian only manages sessions ` +
+          `it creates itself — kill it manually or pick a different agent id`,
+      );
     }
-
-    if (alive && (mode === 'runtime' || mode === 'recover')) {
-      return this.adoptOrRestartSession(tmux, runner, agent, agentId, workdir, workdir);
+    if (mode === 'create' || snapshot.claim !== agentId) {
+      throw new EnsureSessionError(
+        { createdSession: false, agentId },
+        mode === 'create'
+          ? `tmux session "${agentId}" already exists on host; baxian only manages sessions ` +
+            `it creates itself — kill it manually or pick a different agent id`
+          : `tmux session "${agentId}" exists but @baxian-agent-id session claim mismatch ` +
+            `(got "${snapshot.claim}"); baxian will not adopt foreign session — operator must intervene`,
+      );
     }
-
-    return this.buildFreshSession(tmux, agent, agentId, workdir, workdir);
+    return this.adoptOrRestartSessionLocked(tmux, runner, agent, agentId, workdir, workdir, snapshot);
   }
 
   private async provisionRepoSkills(
@@ -894,10 +1016,11 @@ export class AgentManager {
           return;
         }
         const runner = this.createRunnerFor(cfg);
-        const outcome = await new TmuxManager(runner).killSessionRef(ref);
-        if (outcome === 'stale-server') {
+        // Rollback may run before or after the claim write, so accept empty-or-ours.
+        const outcome = await new TmuxManager(runner).killSessionRef(ref, { kind: 'emptyOr', claim: agentId });
+        if (outcome === 'refused') {
           console.warn(
-            `[AgentManager] ${agentId} rollback (${reason}): tmux server generation changed — leaving session ${ref.sessionId} untouched`,
+            `[AgentManager] ${agentId} rollback (${reason}): tmux generation/claim changed — leaving session ${ref.sessionId} untouched`,
           );
         } else if (outcome === 'killed') {
           console.warn(`[AgentManager] ${agentId} rollback (${reason}): killed created session ${ref.sessionId}`);
@@ -957,7 +1080,8 @@ export class AgentManager {
     const top = subdir.split('/')[0];
     const keep = this.skillRegistry.names().map((n) => `! -name ${shellQuote(n)}`).join(' ');
     const inner =
-      `[ ! -L ${shellQuote(workdir)} ] && [ -d ${shellQuote(workdir)} ] && ` +
+      // canonicalSelfGuard (cd+pwd -P) rejects a rebound MIDDLE ancestor, not just a symlinked leaf, so the find/rm can't escape.
+      `${canonicalSelfGuard(workdir)} && ` +
       `cd ${shellQuote(workdir)} && ` +
       `for d in ${top} ${subdir}; do if [ -L "$d" ]; then ` +
       `printf 'baxian: %s is a symlink -> %s; replace it with a real directory\\n' "$d" "$(readlink "$d")" >&2; ` +
@@ -985,9 +1109,9 @@ export class AgentManager {
     ]);
   }
 
-  private async replSkillsStale(tmux: TmuxManager, agentId: string): Promise<boolean> {
+  private async replSkillsStale(tmux: TmuxManager, agentId: string, ref: TmuxSessionRef): Promise<boolean> {
     if (this.skillRegistry.names().length === 0) return false;
-    const tagged = await tmux.getOption(agentId, '@baxian-skills-version');
+    const tagged = await tmux.getSessionOptionByRef(ref, agentId, '@baxian-skills-version');
     return tagged !== this.skillRegistry.contentHash();
   }
 
@@ -997,7 +1121,8 @@ export class AgentManager {
     subdir: string,
   ): Promise<void> {
     const inner =
-      `[ ! -L ${shellQuote(workdir)} ] && [ -d ${shellQuote(workdir)} ] && ` +
+      // canonicalSelfGuard (cd+pwd -P) rejects a rebound MIDDLE ancestor too, so the info/exclude write can't escape.
+      `${canonicalSelfGuard(workdir)} && ` +
       `cd ${shellQuote(workdir)} && ` +
       `if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo BX_SKILLS_NON_GIT; exit 0; fi; ` +
       `tracked="$(git ls-files -- ${shellQuote(`${subdir}/baxian-*`)} 2>/dev/null | head -5)"; ` +
@@ -1042,13 +1167,32 @@ export class AgentManager {
     agentId: string,
     ref: TmuxSessionRef,
     entries: Array<[string, string]>,
+    expectedClaim: string = agentId,
   ): Promise<void> {
-    const outcome = await tmux.setSessionOptionsIfAlive(ref, entries);
+    const outcome = await tmux.setSessionOptionsIfAlive(ref, entries, { expectedClaim });
     if (outcome === 'gone') {
       throw new Error(
         `tmux session ${ref.sessionId} (${agentId}) vanished before its options could be applied`,
       );
     }
+  }
+
+  // Snapshot's claim check is a filter; the returned PaneRef re-proves generation+claim on every op.
+  private async resolveClaimedPane(
+    tmux: TmuxManager,
+    agentId: string,
+    expectedPaneId?: string,
+  ): Promise<PaneRef> {
+    const snapshot = await tmux.getSessionSnapshot(agentId);
+    if (!snapshot) throw new PaneGoneError(agentId, 'no tmux session');
+    if (snapshot.claim !== agentId) {
+      throw new PaneGoneError(agentId, `session claim mismatch (got "${snapshot.claim ?? 'null'}")`);
+    }
+    const pane = await tmux.getSinglePaneByRef(snapshot.ref, agentId);
+    if (expectedPaneId !== undefined && pane.paneId !== expectedPaneId) {
+      throw new PaneGoneError(agentId, `pane id changed (state ${expectedPaneId} != live ${pane.paneId})`);
+    }
+    return pane;
   }
 
   private async buildFreshSession(
@@ -1078,6 +1222,7 @@ export class AgentManager {
     try {
       createdRef = await tmux.createSession(agentId, sessionDir);
       createdSession = true;
+      // First batch writes the claim itself, so it must prove the session is still unclaimed.
       await this.setSessionOptions(tmux, agentId, createdRef, [
         ['@baxian-agent-id', agentId],
         ['@baxian-runtime', agent.runtime],
@@ -1087,20 +1232,21 @@ export class AgentManager {
         ['window-size', 'latest'],
         ...this.runtimePinEntries(),
         ['status-right', ''],
-      ]);
+      ], '');
       await tmux.setServerOption('extended-keys', 'on');
       await tmux.appendServerOptionIfMissing('terminal-features', 'xterm*:extkeys');
-      const paneId = await tmux.getSinglePaneIdByRef(createdRef);
-      await tmux.sendKeysToPane(paneId, `${launchCommandIn(sessionDir, agent)}\n`);
-      await tmux.handleTrustDialog(paneId, runtime, {
+      const pane = await tmux.getSinglePaneByRef(createdRef, agentId);
+      await tmux.sendKeysLiteral(pane, launchCommandIn(sessionDir, agent));
+      await tmux.sendEnter(pane);
+      await tmux.handleTrustDialog(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
       });
-      await tmux.waitReplReady(paneId, runtime, {
+      await tmux.waitReplReady(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
       await this.tagSessionSkillsVersion(tmux, agentId, createdRef);
-      return { ok: true, createdSession: true, freshRuntime: true, paneId, workdir, sessionRef: createdRef };
+      return { ok: true, createdSession: true, freshRuntime: true, paneId: pane.paneId, pane, workdir, sessionRef: createdRef };
     } catch (err) {
       const partial: {
         createdSession: boolean;
@@ -1134,7 +1280,7 @@ export class AgentManager {
     }
     try {
       const result = await this.ensureSession(agentId, 'create');
-      if (!(await this.runGreetingHandshake(agentId, cfgAtStart, result.paneId))) {
+      if (!(await this.runGreetingHandshake(agentId, cfgAtStart, result.pane))) {
         const current = await this.agentStore.get(agentId);
         if (current && current.creationToken !== creationToken) {
           console.warn(
@@ -1209,7 +1355,7 @@ export class AgentManager {
   private async runGreetingHandshake(
     agentId: string,
     agent: AgentConfig & { projectId: string },
-    paneId: string,
+    pane: PaneRef,
   ): Promise<boolean> {
     const watcher = this.phaseSignalWatcher;
     if (!watcher) return true;
@@ -1218,7 +1364,7 @@ export class AgentManager {
       const token = createSignalToken();
       try {
         await this.injectAndAwaitAckSteps(
-          tmux, paneId, buildGreetingPrompt(token, agent.runtime), agentId, agent.runtime,
+          tmux, pane, buildGreetingPrompt(token, agent.runtime), agentId, agent.runtime,
         );
       } catch (err) {
         console.warn(`[bootstrap] greeting inject failed for ${agentId} (attempt ${attempt}):`, err);
@@ -1236,7 +1382,7 @@ export class AgentManager {
         `[bootstrap] greeting attempt ${attempt}/${this.greetingMaxAttempts} for ${agentId}: ${outcome}`,
       );
       if (outcome === 'no-agent') break;
-      if (attempt < this.greetingMaxAttempts && !(await this.clearComposerForReuse(tmux, paneId, agentId))) {
+      if (attempt < this.greetingMaxAttempts && !(await this.clearComposerForReuse(tmux, pane, agentId))) {
         break;
       }
     }
@@ -1278,19 +1424,21 @@ export class AgentManager {
   async regreetHeldAgent(agentId: string): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) return false;
+    // Pin the incarnation before reading state so a DELETE→recreate reusing %0 can't route the greeting handshake to the new session.
+    const genAtEntry = this.deletionGenerationOf(agentId);
     const state = await this.agentStore.get(agentId);
     if (state?.awaitingPhase !== 'greeting_failed') return false;
     const guardSince = state.awaitingSince;
-    let paneId = state.paneId;
-    if (!paneId) {
-      try {
-        paneId = await new TmuxManager(this.createRunnerFor(agent)).getSinglePaneId(agentId);
-      } catch (err) {
-        console.warn(`[regreet] cannot resolve pane for ${agentId}:`, err);
-        return true;
-      }
+    if (!this.deletionGateOpen(agentId, genAtEntry)) return false;
+    let pane: PaneRef;
+    try {
+      pane = await this.resolveClaimedPane(new TmuxManager(this.createRunnerFor(agent)), agentId, state.paneId);
+    } catch (err) {
+      console.warn(`[regreet] cannot resolve pane for ${agentId}:`, err);
+      return true;
     }
-    if (!(await this.runGreetingHandshake(agentId, agent, paneId))) {
+    if (!this.deletionGateOpen(agentId, genAtEntry)) return false;
+    if (!(await this.runGreetingHandshake(agentId, agent, pane))) {
       return true;
     }
     await this.agentStore.update(agentId, (fresh) => {
@@ -1334,8 +1482,7 @@ export class AgentManager {
     let paneId: string | undefined = existing.paneId;
     if (cfg && !paneId) {
       try {
-        const runner = this.createRunnerFor(cfg);
-        paneId = await new TmuxManager(runner).getSinglePaneId(agentId);
+        paneId = (await this.resolveClaimedPane(new TmuxManager(this.createRunnerFor(cfg)), agentId)).paneId;
       } catch {
       }
     }
@@ -1405,20 +1552,22 @@ export class AgentManager {
   async handleDialogPendingFromRuntime(
     agentId: string,
     err: unknown,
-    opts: { expectedFromStatuses?: TaskStatus[] } = {},
+    opts: { expectedFromStatuses?: TaskStatus[]; expectedGeneration?: number } = {},
   ): Promise<boolean> {
     if (!(err instanceof EnsureSessionError) || !err.partial.dialogPending) {
       return false;
     }
+    // The error belongs to the caller's incarnation; gate every side-effect so a DELETE→recreate reusing %0 can't write the stale dialog/fail onto the new agent.
+    const gateOpen = (): boolean =>
+      opts.expectedGeneration === undefined || this.deletionGateOpen(agentId, opts.expectedGeneration);
     let state = await this.agentStore.get(agentId);
-    if (!state) return false;
+    if (!state || !gateOpen()) return false;
     if (state.paneId === undefined && err.partial.createdSession) {
       const cfg = this.getAgentConfig(agentId);
       if (!cfg) return false;
       let discoveredPaneId: string | undefined;
       try {
-        const runner = this.createRunnerFor(cfg);
-        discoveredPaneId = await new TmuxManager(runner).getSinglePaneId(agentId);
+        discoveredPaneId = (await this.resolveClaimedPane(new TmuxManager(this.createRunnerFor(cfg)), agentId)).paneId;
       } catch (probeErr) {
         console.warn(
           `[AgentManager] handleDialogPendingFromRuntime: tmux probe paneId failed for ${agentId}:`,
@@ -1429,7 +1578,7 @@ export class AgentManager {
       if (!discoveredPaneId) return false;
       const probeNow = new Date().toISOString();
       await this.agentStore.update(agentId, (fresh) => {
-        if (!fresh) return AGENT_STORE_NOOP;
+        if (!fresh || !gateOpen()) return AGENT_STORE_NOOP;
         if (fresh.paneId !== undefined) return AGENT_STORE_NOOP;
         return { ...fresh, paneId: discoveredPaneId, updatedAt: probeNow };
       });
@@ -1442,6 +1591,7 @@ export class AgentManager {
       );
       return false;
     }
+    if (!gateOpen()) return false;
     await this.markDialogPending(agentId, undefined, {
       runtimePath: true,
       ...(state.paneId !== undefined ? { expectedPaneId: state.paneId } : {}),
@@ -1516,15 +1666,16 @@ export class AgentManager {
       const state = await this.agentStore.get(agentId);
       if (!state) return;
       if (generationMismatch(state)) return;
-      let paneId: string;
+      let pane: PaneRef;
       try {
-        paneId = await tmux.getSinglePaneId(agentId);
+        pane = await this.resolveClaimedPane(tmux, agentId);
       } catch {
         continue;
       }
+      const paneId = pane.paneId;
 
       try {
-        await tmux.waitReplReady(paneId, runtime, {
+        await tmux.waitReplReady(pane, runtime, {
           timeoutMs: 1_000,
           intervalMs: 200,
           scrollback: 0,
@@ -1540,7 +1691,7 @@ export class AgentManager {
       let projectIdForEmit = '';
       let wrote = false;
       const isBootstrapPath = creationToken !== undefined;
-      if (isBootstrapPath && !(await this.runGreetingHandshake(agentId, cfg, paneId))) {
+      if (isBootstrapPath && !(await this.runGreetingHandshake(agentId, cfg, pane))) {
         await this.markGreetingFailed(agentId, creationToken);
         return;
       }
@@ -1630,7 +1781,8 @@ export class AgentManager {
 
       let stripped: string;
       try {
-        stripped = await tmux.capturePaneById(state.paneId, { ansi: false, scrollback: 0 });
+        const pane = await this.resolveClaimedPane(tmux, agentId, state.paneId);
+        stripped = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
       } catch {
         continue;
       }
@@ -1674,20 +1826,7 @@ export class AgentManager {
     });
   }
 
-  // Claim snapshot and adoption declaration share one critical section with rollbacks.
-  private async adoptOrRestartSession(
-    tmux: TmuxManager,
-    runner: CommandRunner,
-    agent: AgentConfig & { projectId: string },
-    agentId: string,
-    workdir: string,
-    sessionDir: string,
-  ): Promise<EnsureSessionResult> {
-    return this.runUnderSessionLifecycle(agentId, () =>
-      this.adoptOrRestartSessionLocked(tmux, runner, agent, agentId, workdir, sessionDir),
-    );
-  }
-
+  // Runs inside the caller's lifecycle section (ensureSessionLocked routed the snapshot here).
   private async adoptOrRestartSessionLocked(
     tmux: TmuxManager,
     runner: CommandRunner,
@@ -1695,30 +1834,9 @@ export class AgentManager {
     agentId: string,
     workdir: string,
     sessionDir: string,
+    snapshot: NonNullable<Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>>,
   ): Promise<EnsureSessionResult> {
-    let snapshot: Awaited<ReturnType<TmuxManager['getSessionSnapshot']>>;
-    try {
-      snapshot = await tmux.getSessionSnapshot(agentId);
-    } catch (err) {
-      throw new EnsureSessionError(
-        { createdSession: false, agentId },
-        `session snapshot failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    if (!snapshot) {
-      return this.buildFreshSession(tmux, agent, agentId, workdir, sessionDir);
-    }
     const sessionRef = snapshot.ref;
-    if (snapshot.claim !== agentId) {
-      if (snapshot.claim === null && await this.reclaimHalfCreatedSession(tmux, agentId, snapshot)) {
-        return this.buildFreshSession(tmux, agent, agentId, workdir, sessionDir);
-      }
-      throw new EnsureSessionError(
-        { createdSession: false, agentId },
-        `tmux session "${agentId}" exists but @baxian-agent-id session claim mismatch ` +
-          `(got "${snapshot.claim ?? 'null'}"); baxian will not adopt foreign session — operator must intervene`,
-      );
-    }
     this.adoptGeneration.set(agentId, (this.adoptGeneration.get(agentId) ?? 0) + 1);
     try {
       await this.setSessionOptions(tmux, agentId, sessionRef, this.runtimePinEntries());
@@ -1728,19 +1846,20 @@ export class AgentManager {
         `pinning runtime session options failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    let paneId: string;
+    let pane: PaneRef;
     try {
-      paneId = await tmux.getSinglePaneIdByRef(sessionRef);
+      pane = await tmux.getSinglePaneByRef(sessionRef, agentId);
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
         `getSinglePaneId failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    const paneId = pane.paneId;
     const runtime = agentRuntimeKindFor(agent);
     let state: AdoptPaneState;
     try {
-      state = await tmux.classifyPaneForAdopt(paneId, runtime);
+      state = await tmux.classifyPaneForAdopt(pane, runtime);
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
@@ -1749,7 +1868,7 @@ export class AgentManager {
     }
     let currentPath: string;
     try {
-      currentPath = await tmux.getPaneCurrentPath(paneId);
+      currentPath = await tmux.getPaneCurrentPath(pane);
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
@@ -1770,7 +1889,7 @@ export class AgentManager {
         try {
           await this.waitForReplPromptReady(
             tmux,
-            paneId,
+            pane,
             agent.runtime,
             this.cleanComposerWaitMs,
           );
@@ -1794,7 +1913,7 @@ export class AgentManager {
       case 'live-runtime': {
         let stale: boolean;
         try {
-          stale = await this.replSkillsStale(tmux, agentId);
+          stale = await this.replSkillsStale(tmux, agentId, sessionRef);
         } catch (err) {
           throw new EnsureSessionError(
             { createdSession: false, agentId },
@@ -1808,11 +1927,12 @@ export class AgentManager {
             freshRuntime: false,
             skillsStale: true,
             paneId,
+            pane,
             workdir,
             sessionRef,
           };
         }
-        return { ok: true, createdSession: false, freshRuntime: false, paneId, workdir, sessionRef };
+        return { ok: true, createdSession: false, freshRuntime: false, paneId, pane, workdir, sessionRef };
       }
       case 'startup-dialog':
         throw new EnsureSessionError(
@@ -1833,15 +1953,15 @@ export class AgentManager {
         );
       case 'trust-dialog':
         try {
-          await tmux.handleTrustDialog(paneId, runtime, {
+          await tmux.handleTrustDialog(pane, runtime, {
             timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
           });
-          await tmux.waitReplReady(paneId, runtime, {
+          await tmux.waitReplReady(pane, runtime, {
             timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
             scrollback: 0,
           });
           await this.tagSessionSkillsVersion(tmux, agentId, sessionRef);
-          return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir, sessionRef };
+          return { ok: true, createdSession: false, freshRuntime: true, paneId, pane, workdir, sessionRef };
         } catch (trustErr) {
           if (trustErr instanceof ReplNotReadyError && detectStartupDialog(trustErr.lastScreen, runtime)) {
             throw new EnsureSessionError(
@@ -1864,16 +1984,17 @@ export class AgentManager {
         break;
     }
     try {
-      await tmux.sendKeysToPane(paneId, `${launchCommandIn(sessionDir, agent)}\n`);
-      await tmux.handleTrustDialog(paneId, runtime, {
+      await tmux.sendKeysLiteral(pane, launchCommandIn(sessionDir, agent));
+      await tmux.sendEnter(pane);
+      await tmux.handleTrustDialog(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
       });
-      await tmux.waitReplReady(paneId, runtime, {
+      await tmux.waitReplReady(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
       await this.tagSessionSkillsVersion(tmux, agentId, sessionRef);
-      return { ok: true, createdSession: false, freshRuntime: true, paneId, workdir, sessionRef };
+      return { ok: true, createdSession: false, freshRuntime: true, paneId, pane, workdir, sessionRef };
     } catch (relErr) {
       if (relErr instanceof ReplNotReadyError && detectStartupDialog(relErr.lastScreen, runtime)) {
         throw new EnsureSessionError(
@@ -1924,14 +2045,14 @@ export class AgentManager {
     let outcome: Awaited<ReturnType<TmuxManager['killSessionRef']>>;
     try {
       // claim-still-empty rides the kill itself — a claim racing the probes makes the server refuse.
-      outcome = await tmux.killSessionRef(snapshot.ref, { onlyIfUnclaimed: true });
+      outcome = await tmux.killSessionRef(snapshot.ref, { kind: 'unclaimed' });
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
         `killSessionRef (half-created leftover) failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    if (outcome === 'refused' || outcome === 'stale-server') {
+    if (outcome === 'refused') {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
         `session ${snapshot.ref.sessionId} was claimed (or its server changed) while reclaiming the half-created leftover — retry to observe the new state`,
@@ -1957,17 +2078,17 @@ export class AgentManager {
   ): Promise<void> {
     let outcome: Awaited<ReturnType<TmuxManager['killSessionRef']>>;
     try {
-      outcome = await tmux.killSessionRef(sessionRef);
+      outcome = await tmux.killSessionRef(sessionRef, { kind: 'equals', claim: agentId });
     } catch (err) {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
         `killSessionRef (${reason}) failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    if (outcome === 'stale-server') {
+    if (outcome === 'refused') {
       throw new EnsureSessionError(
         { createdSession: false, agentId },
-        `tmux server generation changed while replacing session (${reason}); retry to observe the new state`,
+        `tmux generation/claim changed while replacing session (${reason}); retry to observe the new state`,
       );
     }
     if (outcome === 'killed') {
@@ -1977,11 +2098,21 @@ export class AgentManager {
     }
   }
 
+  // Create-on-null only under this predicate (evaluated inside the store's serialized commit): closes the delete→recreate ABA yet keeps lazy first-allocation for config-only agents.
+  private bindingInitPredicate(agentId: string, genAtEntry: number): boolean {
+    return this.deletionGateOpen(agentId, genAtEntry) && this.getAgentConfig(agentId) !== undefined;
+  }
+
   async acquireAgentForTask(
     agentId: string,
     taskId: string,
     phase: string,
+    // 锁代必须由 acquire 原子交出：事后重读 claim/binding 的窗口里并发派发方可以
+    // release + re-acquire 同一 agent/同一 task，读到的会是 successor 的代
+    opts: { onAcquired?: (lockToken: string) => void } = {},
   ): Promise<boolean> {
+    const genAtEntry = this.deletionGenerationOf(agentId);
+    if (this.isDeletionInFlight(agentId)) return false;
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new Error(`Unknown agent: ${agentId}`);
     const state = await this.agentStore.get(agentId);
@@ -2004,16 +2135,43 @@ export class AgentManager {
     }
     const token = reuseLock ? existingToken : await this.lockManager.acquire(agentId, taskId);
     if (!token) return false;
+    const releaseAcquired = async (originalErr?: unknown): Promise<void> => {
+      if (reuseLock) return;
+      try {
+        await this.lockManager.releaseIfOwner(agentId, taskId, token);
+      } catch (releaseErr) {
+        console.warn(
+          `[AgentManager] acquireAgentForTask(${agentId}, ${taskId}): lock release after ` +
+          `${originalErr === undefined ? 'refused commit' : 'commit failure'} itself failed:`,
+          releaseErr,
+        );
+      }
+    };
     const now = new Date().toISOString();
-    await this.agentStore.update(agentId, (existing) => ({
-      ...(existing ?? { id: agentId, projectId: cfg.projectId, updatedAt: now }),
-      id: agentId,
-      projectId: cfg.projectId,
-      taskId,
-      lockToken: token,
-      ...(phase === 'code' && !sameTaskReentry ? { bootstrappingTaskId: taskId } : {}),
-      updatedAt: now,
-    }));
+    let commit: Awaited<ReturnType<AgentStore['update']>>;
+    try {
+      commit = await this.agentStore.update(agentId, (existing) => {
+        if (existing === null && !this.bindingInitPredicate(agentId, genAtEntry)) return AGENT_STORE_NOOP;
+        if (!this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
+        return {
+          ...(existing ?? { id: agentId, projectId: cfg.projectId, updatedAt: now }),
+          id: agentId,
+          projectId: cfg.projectId,
+          taskId,
+          lockToken: token,
+          ...(phase === 'code' && !sameTaskReentry ? { bootstrappingTaskId: taskId } : {}),
+          updatedAt: now,
+        };
+      });
+    } catch (err) {
+      await releaseAcquired(err);
+      throw err;
+    }
+    if (commit !== 'committed') {
+      await releaseAcquired();
+      return false;
+    }
+    opts.onAcquired?.(token);
     return true;
   }
 
@@ -2028,6 +2186,9 @@ export class AgentManager {
       expectedTask?: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
       expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
       expectedLockToken?: string;
+      // 调用方承诺把「忙碌拒绝」转成待补派登记时才置位；否则遇忙仍按原样落 hold 告警，
+      // 免得终态/清理路径静默留下绑定
+      deferWhenBusy?: boolean;
     } = {},
   ): Promise<boolean> {
     return this.withTaskLock(async () => {
@@ -2217,7 +2378,7 @@ export class AgentManager {
           if (runtime.kind === 'hold') return hold(runtime.reason);
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
           if (runtime.kind === 'pane') {
-            if (state.paneId !== runtime.paneId) {
+            if (state.paneId !== runtime.pane.paneId) {
               await this.agentStore.update(agentId, (latest) => {
                 if (
                   !latest
@@ -2227,7 +2388,7 @@ export class AgentManager {
                 ) {
                   return AGENT_STORE_NOOP;
                 }
-                return { ...latest, paneId: runtime.paneId, updatedAt: new Date().toISOString() };
+                return { ...latest, paneId: runtime.pane.paneId, updatedAt: new Date().toISOString() };
               });
               const refreshed = await this.assertTaskGeneration(
                 agentId,
@@ -2235,13 +2396,13 @@ export class AgentManager {
                 lockToken,
                 releaseWorkdir,
               );
-              if (refreshed.paneId !== runtime.paneId) {
+              if (refreshed.paneId !== runtime.pane.paneId) {
                 throw new Error(`Agent ${agentId} runtime pane changed during release; operation aborted`);
               }
             }
             await this.waitForReplPromptReady(
               tmux,
-              runtime.paneId,
+              runtime.pane,
               agentRuntimeKindFor(cfg),
               this.cleanComposerWaitMs,
             );
@@ -2327,6 +2488,16 @@ export class AgentManager {
           }
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
         } catch (err) {
+          // REPL 忙碌不是清理失败：pane 完好、绑定未动、非 dev 无分支凭据可留。落
+          // branch-cleanup-pending（不在可恢复白名单）会把常态忙碌变成永久 hold（#558 验收 1），
+          // 故拒绝释放而不落 hold，由调用方按「仍绑定且未 hold」判定重新排队本 pass
+          if (opts.deferWhenBusy && err instanceof ReplNotReadyError && cfg.role !== 'dev') {
+            console.warn(
+              `[AgentManager] releaseAgentForTask: agent ${agentId} REPL is busy; refusing release without a hold ` +
+              `(the pass can be re-queued): ${err.message}`,
+            );
+            return false;
+          }
           const reason = err instanceof DirtyWorkdirError
             ? err.message
             : `checkout cleanup failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -2472,6 +2643,8 @@ export class AgentManager {
       );
       if (candidateTasks.length === 0) continue;
       const candidateByBranch = new Map(candidateTasks.map(task => [task.branch!, task]));
+      // Pin the incarnation before the first state/workdir/refs snapshot so a DELETE→same-id recreate (possibly a different workdir) in the read→gate window is rejected.
+      const genAtEntry = this.deletionGenerationOf(cfg.id);
       const state = await this.agentStore.get(cfg.id);
       if (!state || !canDispatchWithBinding(state)) continue;
       const workdir = state.workdir ?? cfg.workdir;
@@ -2489,6 +2662,7 @@ export class AgentManager {
         continue;
       }
       if (!refs.some(ref => candidateByBranch.has(ref.slice('refs/heads/'.length)))) continue;
+      if (this.isDeletionInFlight(cfg.id)) continue;
       const token = await this.lockManager.acquire(cfg.id, owner);
       if (!token) continue;
       const cleanupResults: Array<{
@@ -2496,6 +2670,7 @@ export class AgentManager {
         cleanup: Awaited<ReturnType<BranchManager['cleanupTaskBranch']>>;
       }> = [];
       try {
+        if (!this.deletionGateOpen(cfg.id, genAtEntry)) continue;
         const lockedState = await this.agentStore.get(cfg.id);
         if (!lockedState || !canDispatchWithBinding(lockedState)) continue;
         if (!(await this.lockManager.isOwner(cfg.id, owner, token))) continue;
@@ -2504,14 +2679,10 @@ export class AgentManager {
         if (refs.length === 0) continue;
         const tmux = new TmuxManager(runner);
         if (await tmux.hasSession(cfg.id)) {
-          const claim = await tmux.getOption(cfg.id, '@baxian-agent-id');
-          if (claim !== cfg.id) {
-            throw new Error(`tmux session claim mismatch for ${cfg.id}: ${claim ?? '<missing>'}`);
-          }
-          const paneId = lockedState.paneId ?? await tmux.getSinglePaneId(cfg.id);
+          const pane = await this.resolveClaimedPane(tmux, cfg.id, lockedState.paneId ?? undefined);
           await this.waitForReplPromptReady(
             tmux,
-            paneId,
+            pane,
             agentRuntimeKindFor(cfg),
             this.cleanComposerWaitMs,
           );
@@ -3026,10 +3197,18 @@ export class AgentManager {
     }
     if (result.redispatchReviewTaskId) {
       try {
+        const reviewTask = await this.taskStore.get(result.redispatchReviewTaskId);
+        const resumeEntry = this.getPendingDispatchRetry(result.redispatchReviewTaskId);
+        const resumeQaPhase = resumeEntry?.kind === 'qa-recheck'
+          && resumeEntry.signalToken === reviewTask?.signalToken
+          && resumeEntry.qaPhase !== undefined
+          ? resumeEntry.qaPhase
+          : (reviewTask?.reviewRound === 0 ? 'review' as const : undefined);
         await this.dispatchReviewToQa(result.redispatchReviewTaskId, {
-          bumpRound: false,
+          bumpRound: reviewTask?.reviewRoundPending === true,
           fromStatus: ['review'],
           ...(result.reviewPassToken !== undefined ? { expectSignalToken: result.reviewPassToken } : {}),
+          ...(resumeQaPhase !== undefined ? { qaPhase: resumeQaPhase } : {}),
         });
       } catch (err) {
         console.error(`[AgentManager] resumeAgent review redispatch failed for ${agentId}:`, err);
@@ -3128,15 +3307,18 @@ export class AgentManager {
     };
   }
 
-  private async resolvePaneId(
+  private async resolveClaimedPaneOrNull(
     state: AgentBindingFacts,
     cfg: AgentConfig & { projectId: string },
-  ): Promise<string | null> {
-    if (state.paneId) return state.paneId;
+  ): Promise<PaneRef | null> {
     try {
-      return await new TmuxManager(this.createRunnerFor(cfg)).getSinglePaneId(cfg.id);
+      return await this.resolveClaimedPane(
+        new TmuxManager(this.createRunnerFor(cfg)),
+        cfg.id,
+        state.paneId,
+      );
     } catch (err) {
-      console.warn(`[AgentManager] resolvePaneId: getSinglePaneId failed for ${cfg.id}:`, err);
+      console.warn(`[AgentManager] resolveClaimedPane failed for ${cfg.id}:`, err);
       return null;
     }
   }
@@ -3158,28 +3340,15 @@ export class AgentManager {
     }
     if (!sessionAlive) return { kind: 'absent' };
 
-    let claim: string | null;
     try {
-      claim = await tmux.getOption(agentId, '@baxian-agent-id');
+      return { kind: 'pane', pane: await this.resolveClaimedPane(tmux, agentId) };
     } catch (err) {
-      return {
-        kind: 'hold',
-        reason:
-          `Runtime session claim probe failed; refusing checkout cleanup: ` +
-          `${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-    if (claim !== agentId) {
-      return {
-        kind: 'hold',
-        reason:
-          `Runtime session claim mismatch (got "${claim ?? 'null'}"); refusing checkout cleanup`,
-      };
-    }
-
-    try {
-      return { kind: 'pane', paneId: await tmux.getSinglePaneId(agentId) };
-    } catch (err) {
+      if (err instanceof PaneGoneError) {
+        return {
+          kind: 'hold',
+          reason: `Runtime session claim probe/mismatch; refusing checkout cleanup: ${err.message}`,
+        };
+      }
       return {
         kind: 'hold',
         reason:
@@ -3193,8 +3362,9 @@ export class AgentManager {
     state: AgentBindingFacts,
     cfg: AgentConfig & { projectId: string },
   ): Promise<boolean> {
-    const paneId = await this.resolvePaneId(state, cfg);
-    if (!paneId) return false;
+    const pane = await this.resolveClaimedPaneOrNull(state, cfg);
+    if (!pane) return false;
+    const paneId = pane.paneId;
     const tmux = new TmuxManager(this.createRunnerFor(cfg));
     const runtime = agentRuntimeKindFor(cfg);
     if (!(await this.acquireCompactGuardWithin(cfg.id, this.cancelInterruptGuardWaitMs))) {
@@ -3210,38 +3380,39 @@ export class AgentManager {
     }
     try {
       try {
-        await tmux.sendKeysToPane(paneId, 'Escape');
+        await tmux.sendKeysToPane(pane, 'Escape');
         await new Promise(r => setTimeout(r, 200));
       } catch (err) {
         console.warn(`[AgentManager] interruptPaneAndWaitReady: send Escape failed for pane ${paneId}:`, err);
         return false;
       }
-      if (await this.paneReachedReplReady(tmux, paneId, runtime, 10_000)) return true;
-      if (!(await this.paneRunsRuntime(tmux, paneId, runtime))) return false;
-      if (await this.paneHasLiveTurn(tmux, paneId, runtime)) {
+      if (await this.paneReachedReplReady(tmux, pane, runtime, 10_000)) return true;
+      if (!(await this.paneRunsRuntime(tmux, pane, runtime))) return false;
+      if (await this.paneHasLiveTurn(tmux, pane, runtime)) {
         console.warn(`[AgentManager] interruptPaneAndWaitReady: pane ${paneId} still running a turn after ESC; holding`);
         return false;
       }
-      if (!(await this.paneRunsRuntime(tmux, paneId, runtime))) return false;
+      if (!(await this.paneRunsRuntime(tmux, pane, runtime))) return false;
       try {
-        await tmux.sendKeysToPane(paneId, 'C-c');
+        await tmux.sendKeysToPane(pane, 'C-c');
         await new Promise(r => setTimeout(r, 200));
       } catch (err) {
         console.warn(`[AgentManager] interruptPaneAndWaitReady: send C-c (composer clear) failed for pane ${paneId}:`, err);
         return false;
       }
-      return this.paneReachedReplReady(tmux, paneId, runtime, this.cleanComposerWaitMs);
+      return this.paneReachedReplReady(tmux, pane, runtime, this.cleanComposerWaitMs);
     } finally {
       this.compactInFlight.delete(cfg.id);
     }
   }
 
-  private async paneHasLiveTurn(tmux: TmuxManager, paneId: string, runtime: AgentRuntimeKind): Promise<boolean> {
+  private async paneHasLiveTurn(tmux: TmuxManager, pane: PaneRef, runtime: AgentRuntimeKind): Promise<boolean> {
+    const paneId = pane.paneId;
     let first: string;
     let firstTitle: string;
     try {
-      first = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
-      firstTitle = await tmux.readPaneTitle(paneId);
+      first = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+      firstTitle = await tmux.readPaneTitle(pane);
     } catch (err) {
       console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness capture failed for pane ${paneId}:`, err);
       return true;
@@ -3251,8 +3422,8 @@ export class AgentManager {
       let frame: string;
       let title: string;
       try {
-        frame = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
-        title = await tmux.readPaneTitle(paneId);
+        frame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+        title = await tmux.readPaneTitle(pane);
       } catch (err) {
         console.warn(`[AgentManager] interruptPaneAndWaitReady: liveness re-capture failed for pane ${paneId}:`, err);
         return true;
@@ -3264,10 +3435,11 @@ export class AgentManager {
     return false;
   }
 
-  private async paneRunsRuntime(tmux: TmuxManager, paneId: string, runtime: AgentRuntimeKind): Promise<boolean> {
+  private async paneRunsRuntime(tmux: TmuxManager, pane: PaneRef, runtime: AgentRuntimeKind): Promise<boolean> {
+    const paneId = pane.paneId;
     let proc: string;
     try {
-      proc = await tmux.displayMessage(paneId, '#{pane_current_command}');
+      proc = await tmux.displayMessage(pane, '#{pane_current_command}');
     } catch (err) {
       console.warn(`[AgentManager] interruptPaneAndWaitReady: proc-title read failed for pane ${paneId}:`, err);
       return false;
@@ -3281,12 +3453,13 @@ export class AgentManager {
 
   private async paneReachedReplReady(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     runtime: AgentRuntimeKind,
     timeoutMs: number,
   ): Promise<boolean> {
+    const paneId = pane.paneId;
     try {
-      await tmux.waitReplReady(paneId, runtime, { timeoutMs, scrollback: 0, titleIdleFastPath: true });
+      await tmux.waitReplReady(pane, runtime, { timeoutMs, scrollback: 0, titleIdleFastPath: true });
       return true;
     } catch (err) {
       console.warn(
@@ -3451,7 +3624,7 @@ export class AgentManager {
 
   private async pollPaneCommandStable(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     opts: { timeoutMs: number; expectShell?: boolean },
   ): Promise<string> {
     const deadline = Date.now() + opts.timeoutMs;
@@ -3459,14 +3632,19 @@ export class AgentManager {
     let last = '';
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 100));
-      const raw = await tmux.displayMessage(paneId, '#{pane_current_command}');
+      const raw = await tmux.displayMessage(pane, '#{pane_current_command}');
       last = raw.trim();
       if (opts.expectShell ? SHELL.test(last) : last !== '') return last;
     }
     return last;
   }
 
-  async restartReplOnly(agentId: string): Promise<void> {
+  async restartReplOnly(agentId: string, opts: { expectedGeneration?: number } = {}): Promise<void> {
+    // Re-verify the entry generation so a request that slept across a DELETE→recreate can't restart the NEW incarnation's REPL (claim check alone can't tell).
+    const genAtEntry = opts.expectedGeneration ?? this.deletionGenerationOf(agentId);
+    if (!this.deletionGateOpen(agentId, genAtEntry)) {
+      throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
+    }
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new Error(`Unknown agent: ${agentId}`);
     const runner = this.createRunnerFor(cfg);
@@ -3481,38 +3659,49 @@ export class AgentManager {
         `restart-repl: session claim mismatch (got "${snapshot.claim ?? 'null'}"); refusing to touch foreign session`,
       );
     }
-    const paneId = await tmux.getSinglePaneIdByRef(snapshot.ref);
-    await tmux.sendKeysToPane(paneId, 'C-c');
-    const cmd = await this.pollPaneCommandStable(tmux, paneId, { timeoutMs: 2_000 });
+    if (!this.deletionGateOpen(agentId, genAtEntry)) {
+      throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
+    }
+    const pane = await tmux.getSinglePaneByRef(snapshot.ref, agentId);
+    await tmux.sendKeysToPane(pane, 'C-c');
+    const cmd = await this.pollPaneCommandStable(tmux, pane, { timeoutMs: 2_000 });
     const RUNTIME = /^(?:claude|codex|node|opencode|qodercli(?:-[\d.]+)?|\d+\.\d+\.\d+)$/;
     const SHELL = /^(?:zsh|bash|sh|fish)$/;
     if (RUNTIME.test(cmd)) {
-      await tmux.sendKeysToPane(paneId, REPL_EXIT_COMMAND[cfg.runtime], 'Enter');
-      await this.pollPaneCommandStable(tmux, paneId, { timeoutMs: 2_000, expectShell: true });
+      await tmux.sendKeysToPane(pane, REPL_EXIT_COMMAND[cfg.runtime], 'Enter');
+      await this.pollPaneCommandStable(tmux, pane, { timeoutMs: 2_000, expectShell: true });
     } else if (!SHELL.test(cmd)) {
       throw new Error(`restart-repl precondition failed: unexpected pane state "${cmd}"`);
     }
 
     const project = this.getProjectConfig(cfg.projectId);
     if (!project) throw new Error(`restart-repl: project ${cfg.projectId} does not exist`);
+    // Re-verify before Workdir/skill/session-option side-effects: pane writes fail-closed on a stale PaneRef, but ensureWorkdir/skills would write old-cfg files under a recreated id.
+    if (!this.deletionGateOpen(agentId, genAtEntry)) {
+      throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
+    }
     const workdir = (await this.ensureWorkdir(cfg, project, runner)).workdir;
-    const paneWorkdir = await tmux.getPaneCurrentPath(paneId);
+    const paneWorkdir = await tmux.getPaneCurrentPath(pane);
     if (!await sameDirOnHost(runner, paneWorkdir, workdir)) {
       throw new Error(
         `restart-repl: pane Workdir ${paneWorkdir} does not match agent Workdir ${workdir}; ` +
         'use retry to rebuild the session safely',
       );
     }
+    if (!this.deletionGateOpen(agentId, genAtEntry)) {
+      throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
+    }
     await this.provisionRepoSkills(runner, cfg, workdir);
     await this.setSessionOptions(tmux, agentId, snapshot.ref, [[WORKDIR_SESSION_OPTION, workdir]]);
 
     const runtime = agentRuntimeKindFor(cfg);
     const relaunch = async (): Promise<void> => {
-      await tmux.sendKeysToPane(paneId, `${launchCommandIn(workdir, cfg)}\n`);
-      await tmux.handleTrustDialog(paneId, runtime, {
+      await tmux.sendKeysLiteral(pane, launchCommandIn(workdir, cfg));
+      await tmux.sendEnter(pane);
+      await tmux.handleTrustDialog(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.trustDialog,
       });
-      await tmux.waitReplReady(paneId, runtime, {
+      await tmux.waitReplReady(pane, runtime, {
         timeoutMs: this.bootstrapTimeoutsMs.waitReplReady,
         scrollback: 0,
       });
@@ -3520,11 +3709,12 @@ export class AgentManager {
     };
     await this.runUnderSkillDirLock(this.skillDirLockKey(cfg, workdir), relaunch);
 
+    // Final writeback is generation-gated too, so a DELETE→recreate reusing %0 can't persist the old incarnation's paneId onto the new agent.
     await this.agentStore.update(agentId, (state) => {
-      if (!state) return AGENT_STORE_NOOP;
+      if (!state || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
       return {
         ...state,
-        paneId,
+        paneId: pane.paneId,
         updatedAt: new Date().toISOString(),
       };
     });
@@ -3971,21 +4161,7 @@ export class AgentManager {
       const runner = this.createRunnerFor(cfg);
       const tmux = new TmuxManager(runner);
 
-      const boundState = await this.agentStore.get(id);
-      if (boundState?.taskId) {
-        try {
-          const released = await this.releaseAgentForTask(id, boundState.taskId, 'idle', {
-            allowAwaitingHuman: true,
-          });
-          if (!released) {
-            throw new Error(`could not safely release task ${boundState.taskId}`);
-          }
-        } catch (err) {
-          failures.push({ agentId: id, step: 'binding.release', error: err });
-          continue;
-        }
-      }
-
+      // No releaseAgentForTask: the binding dies with the state file in phase 3, and deletability was already enforced by the phase-1 API gates — so cleanup only stops watchers and kills the session.
       this.stopRuntimeMenuWatch(id);
 
       if (this.paneStreamerManager) {
@@ -4001,23 +4177,53 @@ export class AgentManager {
 
       try {
         await this.runUnderSessionLifecycle(id, async () => {
-          const snapshot = await tmux.getSessionSnapshot(id);
+          const cleanupOpts = { timeout: DELETE_CLEANUP_TIMEOUT_MS };
+          const snapshot = await tmux.getSessionSnapshot(id, cleanupOpts);
           if (!snapshot) return;
-          if (snapshot.claim !== id) {
-            console.warn(
-              `[AgentManager] cleanupRemovedAgentRuntime: skipping kill for ${id} ` +
-              `(claim=${snapshot.claim ?? 'null'}; not baxian-managed)`,
-            );
+          if (snapshot.claim === id) {
+            const outcome = await tmux.killSessionRef(snapshot.ref, { kind: 'equals', claim: id }, cleanupOpts);
+            if (outcome === 'refused') {
+              throw new Error(
+                `tmux generation/claim changed for ${id} before kill; retry DELETE to observe new state`,
+              );
+            }
+            if (outcome === 'killed') {
+              console.warn(`[AgentManager] cleanupRemovedAgentRuntime: killed session ${snapshot.ref.sessionId} for removed agent ${id}`);
+            }
             return;
           }
-          const outcome = await tmux.killSessionRef(snapshot.ref);
-          if (outcome === 'stale-server') {
-            console.warn(
-              `[AgentManager] cleanupRemovedAgentRuntime: tmux server generation changed for ${id} — leaving session untouched`,
-            );
-          } else if (outcome === 'killed') {
-            console.warn(`[AgentManager] cleanupRemovedAgentRuntime: killed session ${snapshot.ref.sessionId} for removed agent ${id}`);
+          if (snapshot.claim === null) {
+            // A nonce-owned unclaimed session is this project's own half-created leftover — reclaim it.
+            let nonceOwned: boolean;
+            try {
+              nonceOwned = await tmux.hasCreationNonce(id, cleanupOpts);
+            } catch (err) {
+              throw new Error(
+                `creation-nonce probe failed for ${id}; retry DELETE: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+            if (!nonceOwned) {
+              console.warn(
+                `[AgentManager] cleanupRemovedAgentRuntime: skipping ${id} ` +
+                `(unclaimed, no baxian creation nonce; foreign session)`,
+              );
+              return;
+            }
+            const outcome = await tmux.killSessionRef(snapshot.ref, { kind: 'unclaimed' }, cleanupOpts);
+            if (outcome === 'refused') {
+              throw new Error(
+                `half-created session for ${id} was claimed or its server changed before kill; retry DELETE`,
+              );
+            }
+            if (outcome === 'killed') {
+              console.warn(`[AgentManager] cleanupRemovedAgentRuntime: killed half-created leftover ${snapshot.ref.sessionId} for removed agent ${id}`);
+            }
+            return;
           }
+          console.warn(
+            `[AgentManager] cleanupRemovedAgentRuntime: skipping kill for ${id} ` +
+            `(claim=${snapshot.claim}; not baxian-managed)`,
+          );
         });
       } catch (err) {
         failures.push({ agentId: id, step: 'tmux', error: err });
@@ -4572,7 +4778,25 @@ export class AgentManager {
       // watcher 已消费）：pending 在场即重新拉入 review
       if (!['review', 'in_progress', 'fixing'].includes(task.status)) continue;
       try {
-        await this.dispatchReviewToQa(task.id, { bumpRound: false });
+        // 列表是旧快照：消费谓词按实时值复核（pending 仍在 + 状态允许），并把代际
+        // CAS（expectSignalToken + expectReviewDispatchPending）压进 dispatch 锁内
+        const live = await this.taskStore.get(task.id);
+        if (!live || live.reviewDispatchPending !== true) continue;
+        if (!['review', 'in_progress', 'fixing'].includes(live.status)) continue;
+        const entry = this.getPendingDispatchRetry(live.id);
+        if (entry?.kind === 'qa-recheck' && entry.signalToken === live.signalToken) {
+          // 同代 busy pending 在场：QA 已知忙碌，重派只会空转 release/acquire 并重置预算；
+          // 交给对账的观测门在空闲后消费
+          continue;
+        }
+        const qaPhase = live.reviewRound === 0 ? 'review' as const : undefined;
+        await this.dispatchReviewToQa(live.id, {
+          bumpRound: live.reviewRoundPending === true,
+          ...(qaPhase !== undefined ? { qaPhase } : {}),
+          ...(live.signalToken !== undefined ? { expectSignalToken: live.signalToken } : {}),
+          expectReviewDispatchPending: true,
+          fromStatus: ['review', 'in_progress', 'fixing'],
+        });
       } catch (err) {
         console.warn(`[AgentManager] retryPendingGitReviewDispatches: task=${task.id} still failing:`, err);
       }
@@ -5272,6 +5496,8 @@ export class AgentManager {
       | 'signalToken'
       | 'passToken'
       | 'failToken'
+      | 'reviewRoundPending'
+      | 'reviewDispatchPending'
       | 'phase'
       | 'batchIndex'
       | 'batchTotal'
@@ -5305,14 +5531,20 @@ export class AgentManager {
     });
   }
 
-  async bumpReviewRoundIfStillAt(taskId: string, expectedRound: number): Promise<void> {
+  // 送达即计轮：flag 是唯一入账凭据，与 verdict 公式（round + flag）按 token CAS 互斥消费，
+  // successor 换代或 verdict 先行都自然跳过，恰好一次
+  // 不设终态守卫：只写轮次不写 status（无复活风险），而终态任务的 recheck 派发是受支持的能力，
+  // 其送达的轮次同样要入账
+  async consumeReviewRoundIntent(taskId: string, expectedToken: string): Promise<void> {
     await this.withTaskLock(async () => {
-      const task = await this.taskStore.get(taskId);
-      if (!task || TERMINAL_STATUSES.includes(task.status)) return;
-      if ((task.reviewRound ?? 0) !== expectedRound) return;
-      task.reviewRound = expectedRound + 1;
-      task.updatedAt = new Date().toISOString();
-      await this.taskStore.set(task);
+      const fresh = await this.taskStore.get(taskId);
+      if (!fresh || fresh.signalToken !== expectedToken || fresh.reviewRoundPending !== true) return;
+      await this.taskStore.set({
+        ...fresh,
+        reviewRound: fresh.reviewRound + 1,
+        reviewRoundPending: undefined,
+        updatedAt: new Date().toISOString(),
+      });
     });
   }
 
@@ -5360,6 +5592,9 @@ export class AgentManager {
     reason?: { phase: string; message: string },
     expectedLockToken?: string,
   ): Promise<void> {
+    // Pin the incarnation: task rollback / intervention below await, and a DELETE→same-id recreate in that
+    // window must not let the final state write-back resurrect the deleted agent.
+    const genAtEntry = this.deletionGenerationOf(agentId);
     const existing = await this.agentStore.get(agentId);
     if (existing && existing.taskId !== undefined && existing.taskId !== taskId) {
       console.warn(
@@ -5416,10 +5651,13 @@ export class AgentManager {
     } else {
       const now = new Date().toISOString();
       await this.agentStore.update(agentId, (latest) => {
-        if (latest?.taskId === taskId && latest.lockToken !== expectedLockToken) return AGENT_STORE_NOOP;
-        if (latest?.taskId !== undefined && latest.taskId !== taskId) return AGENT_STORE_NOOP;
+        // Never resurrect a deleted/recreated incarnation: if the state is gone or the generation moved
+        // since entry, this rollback is stale — clear nothing rather than rebuild from the old snapshot.
+        if (!latest || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
+        if (latest.taskId === taskId && latest.lockToken !== expectedLockToken) return AGENT_STORE_NOOP;
+        if (latest.taskId !== undefined && latest.taskId !== taskId) return AGENT_STORE_NOOP;
         return {
-          ...(latest ?? existing ?? { id: agentId, projectId, updatedAt: now }),
+          ...latest,
           id: agentId,
           projectId,
           taskId: undefined,
@@ -5530,6 +5768,8 @@ export class AgentManager {
         return this.persistQueuedTask(unassigned, 'unassigned');
       }
 
+      // Capture generation before the first config/group read so a DELETE→same-id recreate in the read→commit window fails the gate.
+      const genAtEntry = this.deletionGenerationOf(input.preferredAgentId);
       const target = await this.pickAgent(projectId, input.preferredAgentId);
       const targetConfig = this.getAgentConfig(input.preferredAgentId)!;
       const group = this.findAgentGroup(input.preferredAgentId);
@@ -5540,6 +5780,16 @@ export class AgentManager {
       const researchFields = research
         ? { researchAgentId: research.id, phase: 'research' as const }
         : {};
+      // Pin EVERY participant's generation: a member (e.g. QA) deleted→reintroduced after the snapshot leaves isDeletionInFlight false and the preferred generation unchanged, yet the task would still carry its stale id.
+      const participantGens = new Map<string, number>(
+        [dev.id, ...(qa ? [qa.id] : []), ...(research ? [research.id] : [])]
+          .map(id => [id, this.deletionGenerationOf(id)] as const),
+      );
+      const participantsFresh = (): boolean =>
+        this.deletionGenerationOf(input.preferredAgentId) === genAtEntry
+        && !this.isDeletionInFlight(input.preferredAgentId)
+        && [...participantGens].every(([id, gen]) =>
+          this.deletionGenerationOf(id) === gen && !this.isDeletionInFlight(id));
       const queued: TaskState = {
         ...taskBase,
         agentId: '',
@@ -5548,16 +5798,79 @@ export class AgentManager {
         status: 'pending',
         ...(qa ? { qaAgentId: qa.id } : {}),
       };
+      // A DELETE→recreate of the preferred OR any participant after the group snapshot must not persist a
+      // pending task carrying its stale devAgentId/qaAgentId; reject and let the client re-select.
+      const persistQueuedOrReject = (reason: 'preferred_agent_busy' | 'agent_locked'): Promise<TaskState> => {
+        if (!participantsFresh()) {
+          throw new ApiError(409, `Agent ${input.preferredAgentId} or a group member is being deleted or recreated during task creation; please retry`);
+        }
+        return this.persistQueuedTask(queued, reason, input.preferredAgentId);
+      };
 
       if (!target) {
-        return this.persistQueuedTask(queued, 'preferred_agent_busy', input.preferredAgentId);
+        return persistQueuedOrReject('preferred_agent_busy');
       }
 
+      if (this.isDeletionInFlight(target.id)) {
+        return persistQueuedOrReject('agent_locked');
+      }
       const lockToken = await this.lockManager.acquire(target.id, taskId);
       if (!lockToken) {
-        return this.persistQueuedTask(queued, 'agent_locked', input.preferredAgentId);
+        return persistQueuedOrReject('agent_locked');
       }
 
+      // Three-step transaction (queued task → binding → in_progress): any failure leaves at worst a queued task and/or a stale binding to it, both reclaimable — never an active task with no binding.
+      const releaseLock = async (): Promise<void> => {
+        try {
+          await this.lockManager.releaseIfOwner(target.id, taskId, lockToken);
+        } catch (releaseErr) {
+          console.warn(`[AgentManager] createTask(${taskId}): lock release after failed assignment also failed:`, releaseErr);
+        }
+      };
+      try {
+        await this.taskStore.set(queued);
+      } catch (err) {
+        await releaseLock();
+        throw err;
+      }
+      let commit: Awaited<ReturnType<AgentStore['update']>>;
+      try {
+        commit = await this.agentStore.update(target.id, (existing) => {
+          if (existing === null && !this.bindingInitPredicate(target.id, genAtEntry)) return AGENT_STORE_NOOP;
+          if (!this.deletionGateOpen(target.id, genAtEntry)) return AGENT_STORE_NOOP;
+          return {
+            id: target.id,
+            projectId,
+            taskId,
+            lockToken,
+            bootstrappingTaskId: taskId,
+            updatedAt: now,
+            ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
+            ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
+            ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
+          };
+        });
+      } catch (err) {
+        await releaseLock();
+        throw err;
+      }
+      if (commit !== 'committed') {
+        await releaseLock();
+        return (await this.taskStore.get(taskId)) ?? queued;
+      }
+      // Binding-before-active: a DELETE slipping in after the binding commit sees a still-'pending' task and can rotate the lock; re-verify lock ownership + preferred/participant generations before the active write, else roll back.
+      if (this.isDeletionInFlight(target.id)
+          || !this.deletionGateOpen(target.id, genAtEntry)
+          || !participantsFresh()
+          || !(await this.lockManager.isOwner(target.id, taskId, lockToken))) {
+        await this.agentStore.update(target.id, (existing) => {
+          if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken) return AGENT_STORE_NOOP;
+          const { taskId: _t, lockToken: _l, bootstrappingTaskId: _b, ...rest } = existing;
+          return { ...rest, updatedAt: new Date().toISOString() };
+        });
+        await releaseLock();
+        return (await this.taskStore.get(taskId)) ?? queued;
+      }
       const task: TaskState = {
         ...taskBase,
         agentId: target.id,
@@ -5566,18 +5879,21 @@ export class AgentManager {
         ...researchFields,
         status: 'in_progress',
       };
-      await this.taskStore.set(task);
-      await this.agentStore.update(target.id, (existing) => ({
-        id: target.id,
-        projectId,
-        taskId,
-        lockToken,
-        bootstrappingTaskId: taskId,
-        updatedAt: now,
-        ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
-        ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
-        ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
-      }));
+      try {
+        await this.taskStore.set(task);
+      } catch (err) {
+        try {
+          await this.agentStore.update(target.id, (existing) => {
+            if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken) return AGENT_STORE_NOOP;
+            const { taskId: _t, lockToken: _l, bootstrappingTaskId: _b, ...rest } = existing;
+            return { ...rest, updatedAt: new Date().toISOString() };
+          });
+        } catch (rollbackErr) {
+          console.warn(`[AgentManager] createTask(${taskId}): binding rollback after task write failure also failed (stale-binding path will reclaim):`, rollbackErr);
+        }
+        await releaseLock();
+        throw err;
+      }
       await this.safeEmit({
         id: '',
         type: 'task.assigned',
@@ -5716,6 +6032,9 @@ export class AgentManager {
   ): Promise<{ path: string }> {
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new ApiError(404, `Unknown agent: ${agentId}`);
+    // Pin the incarnation before reading paneId: paneId equality is ABA-blind (a recreate reuses %0), so a
+    // DELETE→same-id recreate during the upload would otherwise paste the stale image into the new session.
+    const genAtEntry = this.deletionGenerationOf(agentId);
     const state = await this.agentStore.get(agentId);
     const paneId = state?.paneId;
     if (!paneId) throw new ApiError(409, `Agent ${agentId} has no live session`);
@@ -5724,6 +6043,9 @@ export class AgentManager {
     }
     try {
       const assertUploadStillValid = async (): Promise<void> => {
+        if (!this.deletionGateOpen(agentId, genAtEntry)) {
+          throw new ApiError(409, `Agent ${agentId} was deleted or recreated while uploading; image paste aborted`);
+        }
         const held = await this.agentStore.get(agentId);
         if (!held || held.paneId !== paneId) {
           throw new ApiError(409, `Agent ${agentId} session changed while uploading; image paste aborted`);
@@ -5743,7 +6065,10 @@ export class AgentManager {
       await writeImageToHost(runner, path, bytes);
       await assertUploadStillValid();
       const tmux = new TmuxManager(runner);
-      await tmux.injectPrompt(paneId, `${path} `, agentId);
+      const pane = await this.resolveClaimedPane(tmux, agentId, paneId);
+      // resolveClaimedPane resolved by the CURRENT same-name session; re-verify once more before injecting so a DELETE→recreate in that gap can't take the paste.
+      await assertUploadStillValid();
+      await tmux.injectPrompt(pane, `${path} `, agentId);
       return { path };
     } finally {
       this.compactInFlight.delete(agentId);
@@ -5775,9 +6100,10 @@ export class AgentManager {
         }
       };
       const tmux = new TmuxManager(this.createRunnerFor(cfg));
+      const pane = await this.resolveClaimedPane(tmux, agentId, paneId);
       const waitReady = async (): Promise<void> => {
         try {
-          await this.waitForReplPromptReady(tmux, paneId, cfg.runtime, this.manualCompactWaitMs);
+          await this.waitForReplPromptReady(tmux, pane, cfg.runtime, this.manualCompactWaitMs);
         } catch (err) {
           const detail = err instanceof Error ? err.message : String(err);
           throw new ApiError(409, `Agent ${agentId} runtime is not at an idle REPL prompt: ${detail}`);
@@ -5785,13 +6111,13 @@ export class AgentManager {
       };
       await waitReady();
       await assertSessionUnchanged();
-      await tmux.clearComposerDraft(paneId);
+      await tmux.clearComposerDraft(pane);
       await waitReady();
       await assertSessionUnchanged();
-      await tmux.sendKeysLiteral(paneId, command);
-      await tmux.sendEnter(paneId);
+      await tmux.sendKeysLiteral(pane, command);
+      await tmux.sendEnter(pane);
       guardHandedOff = true;
-      void this.waitForReplPromptReady(tmux, paneId, cfg.runtime, this.compactIdleWaitMs)
+      void this.waitForReplPromptReady(tmux, pane, cfg.runtime, this.compactIdleWaitMs)
         .catch(err => {
           console.warn(`[AgentManager] sendSlashCommand(${agentId}, ${command}) post idle wait failed:`, err);
         })
@@ -5811,31 +6137,135 @@ export class AgentManager {
     return this.sendSlashCommand(agentId, '/clear');
   }
 
+  registerPendingDispatchRetry(
+    taskId: string,
+    entry: Omit<PendingDispatchRetry, 'since' | 'budgetAlerted'>,
+    budgetOverride?: { since: number; budgetAlerted?: boolean },
+  ): void {
+    const prev = this.pendingDispatchRetryByTask.get(taskId);
+    // 预算随登记代走：同 kind 但 pass 换代（token/agent 变化）时必须重置 since 与告警标志。
+    // budgetOverride 供对账内部重排延续同一笔欠投递的预算——它只经 startSession 的 armedToken
+    // fence 注入，外部 successor 的登记结构上拿不到
+    const sameGeneration = prev?.kind === entry.kind
+      && prev.agentId === entry.agentId
+      && prev.signalToken === entry.signalToken;
+    const since = sameGeneration ? prev.since : (budgetOverride?.since ?? Date.now());
+    const budgetAlerted = sameGeneration
+      ? prev.budgetAlerted === true
+      : budgetOverride?.budgetAlerted === true;
+    this.pendingDispatchRetryByTask.set(taskId, {
+      ...entry,
+      since,
+      ...(budgetAlerted ? { budgetAlerted: true } : {}),
+    });
+  }
+
+  getPendingDispatchRetry(taskId: string): PendingDispatchRetry | undefined {
+    return this.pendingDispatchRetryByTask.get(taskId);
+  }
+
+  listPendingDispatchRetries(): ReadonlyMap<string, PendingDispatchRetry> {
+    return this.pendingDispatchRetryByTask;
+  }
+
+  clearPendingDispatchRetry(taskId: string): void {
+    this.pendingDispatchRetryByTask.delete(taskId);
+  }
+
+  clearPendingDispatchRetryIfMatches(
+    taskId: string,
+    expected: { agentId: string; signalToken: string },
+  ): void {
+    const entry = this.pendingDispatchRetryByTask.get(taskId);
+    if (entry?.agentId === expected.agentId && entry.signalToken === expected.signalToken) {
+      this.pendingDispatchRetryByTask.delete(taskId);
+    }
+  }
+
+  markPendingDispatchRetryBudgetAlerted(
+    taskId: string,
+    expected: { agentId: string; signalToken: string },
+  ): void {
+    const entry = this.pendingDispatchRetryByTask.get(taskId);
+    if (entry?.agentId === expected.agentId && entry.signalToken === expected.signalToken) {
+      this.pendingDispatchRetryByTask.set(taskId, { ...entry, budgetAlerted: true });
+    }
+  }
+
+
+  private async queueQaBusyPendingRetry(
+    taskId: string,
+    agentId: string,
+    phase: string,
+    createdSession: boolean,
+    err: unknown,
+    dispatch: { passToken?: string; pendingBudget?: { since: number; budgetAlerted?: boolean } },
+  ): Promise<EnsureSessionError | null> {
+    if (!(err instanceof ReplNotReadyError)) return null;
+    if (phase !== 'review' && phase !== 'recheck') return null;
+    // 无本次派发的 pass 令牌就不登记（宁走既有失败路径，不造无 fence 重试）；
+    // 令牌漂移说明 pass 已被接管，忙碌属于旧派发，不得登记到 successor 上
+    const passToken = dispatch.passToken;
+    if (!passToken) return null;
+    let current: TaskState | null;
+    try {
+      current = await this.taskStore.get(taskId);
+    } catch (readErr) {
+      console.warn(
+        `[AgentManager] startSession[${phase}]: busy on task ${taskId} but pass token could not be verified; ` +
+        `falling back to the non-pending failure path:`,
+        readErr,
+      );
+      return null;
+    }
+    if (current?.signalToken !== passToken) {
+      console.warn(
+        `[AgentManager] startSession[${phase}]: busy on task ${taskId} but the review pass was superseded ` +
+        `(expected ${passToken}, now ${current?.signalToken ?? 'gone'}); not queueing a pending retry`,
+      );
+      return null;
+    }
+    this.registerPendingDispatchRetry(taskId, {
+      kind: 'qa-recheck',
+      agentId,
+      signalToken: passToken,
+      qaPhase: phase,
+    }, dispatch.pendingBudget);
+    console.warn(
+      `[AgentManager] startSession[${phase}]: QA pane busy for task ${taskId}; ` +
+      `${phase} queued for redispatch when idle (${(err.message.split('\n')[0])})`,
+    );
+    return new EnsureSessionError(
+      { createdSession, agentId, handled: true, busyPending: true },
+      `QA REPL busy; ${phase} dispatch for task ${taskId} queued for redispatch when idle`,
+    );
+  }
+
   private async clearRuntimeForTaskBoundary(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     agentId: string,
     runtime: AgentConfig['runtime'],
     revalidate: () => Promise<void>,
   ): Promise<void> {
     await this.acquireCompactGuard(agentId);
     try {
-      await this.waitForReplPromptReady(tmux, paneId, runtime, this.cleanComposerWaitMs);
+      await this.waitForReplPromptReady(tmux, pane, runtime, this.cleanComposerWaitMs, { stableIdle: true });
       await revalidate();
-      await tmux.clearComposerDraft(paneId);
-      const baseline = await tmux.captureSettledSnapshot(paneId, {
+      await tmux.clearComposerDraft(pane);
+      const baseline = await tmux.captureSettledSnapshot(pane, {
         timeoutMs: this.dispatchSettleTimeoutMs,
       });
-      const baselineTitle = await tmux.readPaneTitle(paneId);
-      await tmux.sendKeysLiteral(paneId, '/clear');
-      await tmux.sendEnter(paneId);
-      await tmux.waitSubmitAck(paneId, baseline, runtime, {
+      const baselineTitle = await tmux.readPaneTitle(pane);
+      await tmux.sendKeysLiteral(pane, '/clear');
+      await tmux.sendEnter(pane);
+      await tmux.waitSubmitAck(pane, baseline, runtime, {
         timeoutMs: this.dispatchAckTimeoutMs,
         baselineTitle,
         acceptComposerChange: true,
       });
-      await this.waitForReplPromptReady(tmux, paneId, runtime, this.dispatchAckTimeoutMs);
-      if (await this.hasRuntimeSlashCommandRejection(tmux, paneId, '/clear')) {
+      await this.waitForReplPromptReady(tmux, pane, runtime, this.dispatchAckTimeoutMs, { stableIdle: true });
+      if (await this.hasRuntimeSlashCommandRejection(tmux, pane, '/clear')) {
         throw new Error('Runtime rejected /clear at the task boundary; refusing to reuse prior task context');
       }
       await revalidate();
@@ -5930,6 +6360,8 @@ export class AgentManager {
           error: `Task ${taskId} has no preferredAgentId; agentId is required in request body`,
         };
       }
+      // Capture generation before the first config/state read so a DELETE→same-id recreate in the read→commit window fails the gate.
+      const genAtEntry = this.deletionGenerationOf(agentId);
       const cfg = this.getAgentConfig(agentId);
       if (!cfg) return { task: fresh, errorCode: 400 as const, error: `Unknown agent: ${agentId}` };
       if (cfg.projectId !== fresh.projectId) {
@@ -5948,6 +6380,9 @@ export class AgentManager {
       const state = await this.agentStore.get(agentId);
       if (!canDispatchWithBinding(state)) {
         return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} is busy or awaiting human` };
+      }
+      if (this.isDeletionInFlight(agentId)) {
+        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} is being deleted` };
       }
       const lockToken = await this.lockManager.acquire(agentId, taskId);
       if (!lockToken) {
@@ -5968,6 +6403,14 @@ export class AgentManager {
         ? group?.find(agent => agent.role === 'qa')?.id
         : fresh.qaAgentId;
       const researchId = initiallyUnassigned && cfg.role === 'research' ? cfg.id : fresh.researchAgentId;
+      // Pin every participant's generation (mirror createTask) so a member deleted→recreated before the active write isn't baked in.
+      const participantGens = new Map<string, number>(
+        [devId, ...(qaId ? [qaId] : []), ...(researchId ? [researchId] : [])]
+          .map(pid => [pid, this.deletionGenerationOf(pid)] as const),
+      );
+      const participantsFresh = (): boolean =>
+        [...participantGens].every(([pid, gen]) =>
+          this.deletionGenerationOf(pid) === gen && !this.isDeletionInFlight(pid));
       const claimedTask: TaskState = {
         ...fresh,
         preferredAgentId: agentId,
@@ -5979,18 +6422,68 @@ export class AgentManager {
         status: 'in_progress',
         updatedAt: now,
       };
-      await this.taskStore.set(claimedTask);
-      await this.agentStore.update(agentId, (existing) => ({
-        id: agentId,
-        projectId: cfg.projectId,
-        taskId,
-        lockToken,
-        bootstrappingTaskId: taskId,
-        updatedAt: now,
-        ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
-        ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
-        ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
-      }));
+      // Binding-first: the fresh task snapshot already exists on disk, so a failure at any later
+      // step leaves at worst a stale binding to a still-unclaimed task — an existing reclaimable state.
+      const releaseLock = async (): Promise<void> => {
+        try {
+          await this.lockManager.releaseIfOwner(agentId, taskId, lockToken);
+        } catch (releaseErr) {
+          console.warn(`[AgentManager] claimTask(${taskId}): lock release after failed claim also failed:`, releaseErr);
+        }
+      };
+      let commit: Awaited<ReturnType<AgentStore['update']>>;
+      try {
+        commit = await this.agentStore.update(agentId, (existing) => {
+          if (existing === null && !this.bindingInitPredicate(agentId, genAtEntry)) return AGENT_STORE_NOOP;
+          if (!this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
+          return {
+            id: agentId,
+            projectId: cfg.projectId,
+            taskId,
+            lockToken,
+            bootstrappingTaskId: taskId,
+            updatedAt: now,
+            ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
+            ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
+            ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
+          };
+        });
+      } catch (err) {
+        await releaseLock();
+        throw err;
+      }
+      if (commit !== 'committed') {
+        await releaseLock();
+        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} is being deleted` };
+      }
+      // Re-verify lock ownership + preferred/participant generations before the active write, else a DELETE after the binding commit orphans it.
+      if (this.isDeletionInFlight(agentId)
+          || !this.deletionGateOpen(agentId, genAtEntry)
+          || !participantsFresh()
+          || !(await this.lockManager.isOwner(agentId, taskId, lockToken))) {
+        await this.agentStore.update(agentId, (existing) => {
+          if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken) return AGENT_STORE_NOOP;
+          const { taskId: _t, lockToken: _l, bootstrappingTaskId: _b, ...rest } = existing;
+          return { ...rest, updatedAt: new Date().toISOString() };
+        });
+        await releaseLock();
+        return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} is being deleted` };
+      }
+      try {
+        await this.taskStore.set(claimedTask);
+      } catch (err) {
+        try {
+          await this.agentStore.update(agentId, (existing) => {
+            if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken) return AGENT_STORE_NOOP;
+            const { taskId: _t, lockToken: _l, bootstrappingTaskId: _b, ...rest } = existing;
+            return { ...rest, updatedAt: new Date().toISOString() };
+          });
+        } catch (rollbackErr) {
+          console.warn(`[AgentManager] claimTask(${taskId}): binding rollback after task write failure also failed (stale-binding path will reclaim):`, rollbackErr);
+        }
+        await releaseLock();
+        throw err;
+      }
       await this.safeEmit({
         id: '',
         type: 'task.assigned',
@@ -6118,6 +6611,8 @@ export class AgentManager {
   ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) throw new Error(`Unknown agent: ${agentId}`);
+    // Pin the incarnation: a DELETE completing during dispatch bumps this, and every gated commit/side-effect below refuses the stale generation.
+    const genAtEntry = this.deletionGenerationOf(agentId);
 
     const task = await this.taskStore.get(taskId);
     if (!task) throw new Error(`Unknown task: ${taskId}`);
@@ -6175,6 +6670,11 @@ export class AgentManager {
       return false;
     }
     const assertOwner = async (): Promise<void> => {
+      // Also gate on the entry generation: a DELETE→same-id recreate can pass the task/lock check on the
+      // reused binding, so every Workdir/runtime side-effect guarded by assertOwner must fail closed on it.
+      if (!this.deletionGateOpen(agentId, genAtEntry)) {
+        throw new Error(`Agent ${agentId} is being deleted or was recreated for task ${taskId}; operation aborted`);
+      }
       const stateNow = await this.agentStore.get(agentId);
       if (stateNow?.taskId !== taskId || stateNow.lockToken !== lockToken) {
         throw new Error(`Agent ${agentId} binding changed for task ${taskId}; operation aborted`);
@@ -6187,9 +6687,9 @@ export class AgentManager {
       opts.dialogFailFromStatuses ?? PHASE_EXPECTED_STATUS[phase] ?? [...ACTIVE_TASK_STATUSES];
     let ensure: EnsureSessionResult;
     try {
-      ensure = await this.ensureSession(agentId, 'runtime');
+      ensure = await this.ensureSession(agentId, 'runtime', { expectedGeneration: genAtEntry });
     } catch (err) {
-      if (await this.handleDialogPendingFromRuntime(agentId, err, { expectedFromStatuses: dialogFailFromStatuses })) {
+      if (await this.handleDialogPendingFromRuntime(agentId, err, { expectedFromStatuses: dialogFailFromStatuses, expectedGeneration: genAtEntry })) {
         throw err;
       }
       if (err instanceof EnsureSessionError && err.partial.createdSession) {
@@ -6208,7 +6708,7 @@ export class AgentManager {
       }
       throw err;
     }
-    const { paneId, workdir } = ensure;
+    const { paneId, pane, workdir } = ensure;
 
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
@@ -6216,7 +6716,13 @@ export class AgentManager {
     const lockState = await this.agentStore.get(agentId);
     if (!lockState || lockState.taskId !== taskId || lockState.lockToken !== lockToken) return false;
     await assertOwner();
-    await this.waitForReplPromptReady(tmux, paneId, agent.runtime, this.cleanComposerWaitMs);
+    try {
+      await this.waitForReplPromptReady(tmux, pane, agent.runtime, this.cleanComposerWaitMs, { stableIdle: true });
+    } catch (err) {
+      const busyPend = await this.queueQaBusyPendingRetry(taskId, agentId, phase, ensure.createdSession, err, { passToken: opts.dispatchPassToken, pendingBudget: opts.dispatchPendingBudget });
+      if (busyPend) throw busyPend;
+      throw err;
+    }
 
     const isServerQaPhase = phase === 'server-review' || phase === 'server-recheck' || phase === 'server-spec-review';
     const isServerCodeReviewPhase = phase === 'server-review' || phase === 'server-recheck';
@@ -6252,10 +6758,12 @@ export class AgentManager {
       }
       await assertOwner();
       if (!ensure.freshRuntime) {
-        await this.clearRuntimeForTaskBoundary(tmux, paneId, agentId, agent.runtime, assertOwner);
+        await this.clearRuntimeForTaskBoundary(tmux, pane, agentId, agent.runtime, assertOwner);
         if (ensure.skillsStale) await this.tagSessionSkillsVersion(tmux, agentId, ensure.sessionRef);
       }
     } catch (err) {
+      const busyPend = await this.queueQaBusyPendingRetry(taskId, agentId, phase, ensure.createdSession, err, { passToken: opts.dispatchPassToken, pendingBudget: opts.dispatchPendingBudget });
+      if (busyPend) throw busyPend;
       const message = err instanceof Error ? err.message : String(err);
       const holdPhase = err instanceof DirtyWorkdirError
         ? 'dirty-workdir'
@@ -6428,9 +6936,17 @@ export class AgentManager {
     let agentMarkedRunning = false;
     try {
       let cancelHoldWon = false;
-      await this.agentStore.update(agentId, (existing) => {
+      let deletedDuringDispatch = false;
+      const runningCommit = await this.agentStore.update(agentId, (existing) => {
         if (isCancelCleanupHold(existing)) { cancelHoldWon = true; return AGENT_STORE_NOOP; }
+        // Binding must already exist and still hold our lock; never re-create a deleted agent's state nor write under a bumped deletion generation (ABA).
+        if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken
+            || !this.deletionGateOpen(agentId, genAtEntry)) {
+          deletedDuringDispatch = true;
+          return AGENT_STORE_NOOP;
+        }
         return {
+          ...existing,
           id: agentId,
           projectId: agent.projectId,
           paneId,
@@ -6440,7 +6956,6 @@ export class AgentManager {
           startedAt: now,
           bootstrappingTaskId: taskId,
           updatedAt: now,
-          ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
         };
       });
       if (cancelHoldWon) {
@@ -6451,9 +6966,46 @@ export class AgentManager {
         await cleanupCheckoutOrHold();
         return false;
       }
+      if (deletedDuringDispatch || runningCommit !== 'committed') {
+        console.warn(
+          `[AgentManager] startSession[${phase}]: agent ${agentId} binding vanished or was deleted/recreated ` +
+          `during dispatch; not marking running (no orphan state)`,
+        );
+        return false;
+      }
       agentMarkedRunning = true;
 
-      await this.injectAndAwaitAck(tmux, paneId, prompt, agentId, agent.runtime);
+      // armed pass 的 fence 延伸到最终 paste：checkout//clear/artifacts 的 await 窗口里 pass 可被
+      // push/其他 dispatcher 轮换，旧 prompt 不得注入 successor；guard 在 composer/paste/Enter
+      // 的 task-mutation 队列槽内复核（与轮换串行），漂移即放弃投递。
+      // cancel 只写终态不轮换 token，故 fence 须同时复核任务仍处本相位的可投递状态
+      const passDeliverableStatuses =
+        opts.dialogFailFromStatuses ?? PHASE_EXPECTED_STATUS[phase] ?? [...ACTIVE_TASK_STATUSES];
+      const passStillArmed = opts.dispatchPassToken !== undefined
+        ? async (): Promise<boolean> => {
+            const freshTask = await this.taskStore.get(taskId);
+            if (!freshTask || freshTask.signalToken !== opts.dispatchPassToken) return false;
+            return passDeliverableStatuses.includes(freshTask.status);
+          }
+        : undefined;
+      if (passStillArmed && !(await passStillArmed())) {
+        console.warn(
+          `[AgentManager] startSession[${phase}]: review pass superseded before injection for task ${taskId}; aborting paste`,
+        );
+        return false;
+      }
+      const injectResult = await this.injectAndAwaitAck(tmux, pane, prompt, agentId, agent.runtime, passStillArmed);
+      if (injectResult.aborted === true) {
+        console.warn(
+          `[AgentManager] startSession[${phase}]: injection fenced off (pass superseded) for task ${taskId}`,
+        );
+        return false;
+      }
+      // prompt 已确认投递：只 CAS 清理本次派发那一代的登记；successor 在窗口内登记的新 pending 不受影响，
+      // 且清理先于可失败的审计事件——事件写失败不能把已投递的 prompt 重新变回 pending
+      if (opts.dispatchPassToken !== undefined) {
+        this.clearPendingDispatchRetryIfMatches(taskId, { agentId, signalToken: opts.dispatchPassToken });
+      }
       try {
         await this.clearBootstrapMarker(agentId, taskId);
       } catch (clearErr) {
@@ -6481,6 +7033,13 @@ export class AgentManager {
       this.startRuntimeMenuWatch(agentId);
       return true;
     } catch (err) {
+      // 注入阶段的忙碌（预注入活回合检查）仍在任何按键之前：登记 pending 并保持 checkout/绑定原样，
+      // 在途回合还在使用该工作树，park/release 会拽走它
+      const injectBusyPend = await this.queueQaBusyPendingRetry(
+        taskId, agentId, phase, ensure.createdSession, err,
+        { passToken: opts.dispatchPassToken, pendingBudget: opts.dispatchPendingBudget },
+      );
+      if (injectBusyPend) throw injectBusyPend;
       const isAckUnknown = err instanceof DispatchTerminalError && err.reason === 'ack_unknown';
       if (!isAckUnknown) {
         await cleanupCheckoutOrHold();
@@ -6529,7 +7088,7 @@ export class AgentManager {
 
   private async injectAndAwaitAck(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     prompt: string,
     agentId: string,
     runtime: AgentConfig['runtime'],
@@ -6596,7 +7155,7 @@ export class AgentManager {
       if (guardBeforePaste && !(await guardBeforePaste())) {
         return { acked: false, composerDelivered: false, aborted: true };
       }
-      return await this.injectAndAwaitAckSteps(tmux, paneId, prompt, agentId, runtime, revalidate, guardBeforePaste);
+      return await this.injectAndAwaitAckSteps(tmux, pane, prompt, agentId, runtime, revalidate, guardBeforePaste);
     } finally {
       this.compactInFlight.delete(agentId);
     }
@@ -6604,21 +7163,27 @@ export class AgentManager {
 
   private async injectAndAwaitAckSteps(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     prompt: string,
     agentId: string,
     runtime: AgentConfig['runtime'],
     revalidate?: () => Promise<void>,
     guardBeforePaste?: () => Promise<boolean>,
   ): Promise<{ acked: boolean; composerDelivered: boolean; aborted?: boolean }> {
+    const paneId = pane.paneId;
     // 静态忙信号（文本忙样式/working title）可能是残稿或 stale title 冒充，一律由帧活性仲裁；ready 视图覆盖 stale title。
-    const preTitle = await tmux.readPaneTitle(paneId);
-    const preFrame = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+    const preTitle = await tmux.readPaneTitle(pane);
+    const preFrame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
     const staticBusy = hasOscTitleWorking(preTitle)
       ? (runtimeBusyCheck(preFrame, runtime) || !hasRuntimeReadyView(preFrame, runtime))
       : runtimeBusyCheck(preFrame, runtime);
-    if (staticBusy && await this.paneHasLiveTurn(tmux, paneId, runtime)) {
-      throw new Error(`pre-inject busy check: pane ${paneId} is still running a turn; dispatch aborted`);
+    if (staticBusy && await this.paneHasLiveTurn(tmux, pane, runtime)) {
+      throw new ReplNotReadyError(
+        paneId,
+        runtime,
+        preFrame,
+        `pre-inject busy check: pane ${paneId} is still running a turn; dispatch aborted`,
+      );
     }
     await revalidate?.();
     if (guardBeforePaste) {
@@ -6632,7 +7197,7 @@ export class AgentManager {
       try {
         pasted = await this.withTaskLock(async () => {
           if (!(await guardBeforePaste())) return false;
-          await tmux.clearComposerDraft(paneId);
+          await tmux.clearComposerDraft(pane);
           await tmux.pasteStagedBuffer(paneId, staged.buf);
           return true;
         });
@@ -6650,7 +7215,7 @@ export class AgentManager {
         }
         if (bufferConsumed) {
           try {
-            await tmux.clearComposerDraft(paneId);
+            await tmux.clearComposerDraft(pane);
           } catch (clearErr) {
             console.warn(`[AgentManager] composer scrub after unknown paste outcome failed for pane ${paneId}:`, clearErr);
           }
@@ -6666,25 +7231,25 @@ export class AgentManager {
         return { acked: false, composerDelivered: false, aborted: true };
       }
     } else {
-      await tmux.clearComposerDraft(paneId);
+      await tmux.clearComposerDraft(pane);
       await revalidate?.();
-      await tmux.injectPrompt(paneId, prompt, agentId);
+      await tmux.injectPrompt(pane, prompt, agentId);
     }
     let baseline: string;
     let baselineTitle = '';
     try {
-      baseline = await tmux.captureSettledSnapshot(paneId, { timeoutMs: this.dispatchSettleTimeoutMs });
-      baselineTitle = await tmux.readPaneTitle(paneId);
+      baseline = await tmux.captureSettledSnapshot(pane, { timeoutMs: this.dispatchSettleTimeoutMs });
+      baselineTitle = await tmux.readPaneTitle(pane);
       if (guardBeforePaste) {
         // The Enter is the actual submission; it takes the same fenced queue slot.
         const submitted = await this.withTaskLock(async () => {
           if (!(await guardBeforePaste())) return false;
-          await tmux.sendEnter(paneId);
+          await tmux.sendEnter(pane);
           return true;
         });
         if (!submitted) {
           try {
-            await tmux.clearComposerDraft(paneId);
+            await tmux.clearComposerDraft(pane);
           } catch (err) {
             // Fail closed: a submit-ready stale prompt could not be confirmed gone.
             const message = err instanceof Error ? err.message : String(err);
@@ -6695,10 +7260,10 @@ export class AgentManager {
           return { acked: false, composerDelivered: false, aborted: true };
         }
       } else {
-        await tmux.sendEnter(paneId);
+        await tmux.sendEnter(pane);
       }
     } catch (preAckErr) {
-      if (await this.clearComposerForReuse(tmux, paneId, agentId)) throw preAckErr;
+      if (await this.clearComposerForReuse(tmux, pane, agentId)) throw preAckErr;
       const message = preAckErr instanceof Error ? preAckErr.message : String(preAckErr);
       throw new DispatchTerminalError(
         'ack_unknown',
@@ -6707,7 +7272,7 @@ export class AgentManager {
     }
     let staleDuringResend = false;
     try {
-      await tmux.waitSubmitAck(paneId, baseline, runtime, {
+      await tmux.waitSubmitAck(pane, baseline, runtime, {
         timeoutMs: this.dispatchAckTimeoutMs,
         baselineTitle,
         resend: guardBeforePaste
@@ -6715,12 +7280,12 @@ export class AgentManager {
             // A resend is a fresh submission of whatever sits in the composer; it takes the same fence.
             const resent = await this.withTaskLock(async () => {
               if (!(await guardBeforePaste())) return false;
-              await tmux.sendEnter(paneId);
+              await tmux.sendEnter(pane);
               return true;
             });
             if (!resent) staleDuringResend = true;
           }
-          : () => tmux.sendEnter(paneId),
+          : () => tmux.sendEnter(pane),
         resendIntervalMs: this.dispatchAckResendIntervalMs,
       });
       return { acked: true, composerDelivered: true };
@@ -6731,7 +7296,7 @@ export class AgentManager {
       }
       if (staleDuringResend) {
         try {
-          await tmux.clearComposerDraft(paneId);
+          await tmux.clearComposerDraft(pane);
         } catch (scrubErr) {
           const scrubMessage = scrubErr instanceof Error ? scrubErr.message : String(scrubErr);
           throw new Error(
@@ -6758,9 +7323,10 @@ export class AgentManager {
     }
   }
 
-  private async clearComposerForReuse(tmux: TmuxManager, paneId: string, agentId: string): Promise<boolean> {
+  private async clearComposerForReuse(tmux: TmuxManager, pane: PaneRef, agentId: string): Promise<boolean> {
+    const paneId = pane.paneId;
     try {
-      await tmux.clearComposerDraft(paneId);
+      await tmux.clearComposerDraft(pane);
       return true;
     } catch (err) {
       console.warn(`[AgentManager] clearComposerForReuse: composer clear failed for pane ${paneId}:`, err);
@@ -6859,7 +7425,7 @@ export class AgentManager {
       }
       throw err;
     }
-    const { paneId } = ensure;
+    const { paneId, pane } = ensure;
 
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
@@ -7112,7 +7678,7 @@ export class AgentManager {
       return false;
     }
     const delivery = await this.injectAndAwaitAck(
-      tmux, paneId, prompt, agentId, agent.runtime, guardBeforeInject,
+      tmux, pane, prompt, agentId, agent.runtime, guardBeforeInject,
     );
     if (delivery.aborted) {
       console.warn(
@@ -7350,7 +7916,7 @@ export class AgentManager {
         if (await this.rollbackUndeliveredBootstrap(state)) continue;
         if (state.creationToken && !state.taskId) {
           const ct = state.creationToken;
-          const pane = result.paneId;
+          const pane = result.pane;
           const cfg = agentConfig;
           const agentId = state.id;
           void (async () => {
@@ -7362,7 +7928,7 @@ export class AgentManager {
                   awaitingPhase: _ap, awaitingReason: _ar, awaitingSince: _as,
                   ...ready
                 } = latest;
-                return { ...ready, paneId: pane, updatedAt: new Date().toISOString() };
+                return { ...ready, paneId: pane.paneId, updatedAt: new Date().toISOString() };
               });
             } else {
               await this.markGreetingFailed(agentId, ct);
@@ -7804,14 +8370,23 @@ export class AgentManager {
 
   async dispatchReviewToQa(
     taskId: string,
-    opts: { fromStatus?: TaskStatus[]; bumpRound?: boolean; expectSignalToken?: string } = {},
+    opts: {
+      fromStatus?: TaskStatus[];
+      bumpRound?: boolean;
+      expectSignalToken?: string;
+      qaPhase?: 'review' | 'recheck';
+      pendingBudget?: { since: number; budgetAlerted?: boolean };
+      expectReviewDispatchPending?: boolean;
+      // 返回的 task 是末尾重读的结果，未必仍属本次 pass；补派方据此判定返回值是否可用于延续世系
+      onPassArmed?: (armedToken: string) => void;
+    } = {},
   ): Promise<TaskState> {
     const claim = await this.withTaskLock(async () => {
       if (this.manualReviewInFlight.has(taskId)) {
-        throw new ApiError(409, `Manual review already in progress for task ${taskId}`);
+        throw new ApiError(409, `Manual review already in progress for task ${taskId}`, 'dispatch-in-flight');
       }
       if (this.markCompleteInFlight.has(taskId)) {
-        throw new ApiError(409, `Task ${taskId} is being completed (merge in progress); try again shortly`);
+        throw new ApiError(409, `Task ${taskId} is being completed (merge in progress); try again shortly`, 'dispatch-in-flight');
       }
       const task = await this.taskStore.get(taskId);
       if (!task) throw new ApiError(404, `Task ${taskId} not found`);
@@ -7819,12 +8394,21 @@ export class AgentManager {
         throw new ApiError(
           409,
           `Task ${taskId} status is ${task.status}; review dispatch requires ${opts.fromStatus.join('/')}`,
+          'dispatch-superseded',
         );
       }
       if (opts.expectSignalToken !== undefined && task.signalToken !== opts.expectSignalToken) {
         throw new ApiError(
           409,
           `Task ${taskId} review pass changed during redispatch (signalToken rotated); aborting`,
+          'dispatch-superseded',
+        );
+      }
+      if (opts.expectReviewDispatchPending === true && task.reviewDispatchPending !== true) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} review dispatch pending was already consumed; aborting stale sweep`,
+          'dispatch-superseded',
         );
       }
       if (task.reviewMode === 'server' || isSpecStagePhase(task.phase)) {
@@ -7872,7 +8456,14 @@ export class AgentManager {
         throw new ApiError(409, `Task ${taskId} QA participant ${qaId} is unavailable`);
       }
       this.manualReviewInFlight.add(taskId);
-      return { mode: 'github' as const, qaId, devAgentId: task.agentId, taskStatusAtClaim: task.status };
+      return {
+        mode: 'github' as const,
+        qaId,
+        devAgentId: task.agentId,
+        taskStatusAtClaim: task.status,
+        signalTokenAtClaim: task.signalToken,
+        reviewRoundAtClaim: task.reviewRound,
+      };
     });
 
     if (claim.mode === 'server') {
@@ -7880,12 +8471,20 @@ export class AgentManager {
     }
 
     try {
-      const { qaId, devAgentId, taskStatusAtClaim } = claim;
+      const { qaId, devAgentId, taskStatusAtClaim, signalTokenAtClaim, reviewRoundAtClaim } = claim;
       const isTerminal = TERMINAL_STATUSES.includes(taskStatusAtClaim);
-      const qaPhase: 'review' | 'recheck' =
-        taskStatusAtClaim === 'pending' || taskStatusAtClaim === 'in_progress'
+      // 相位恢复归标准入口自己（手工 review API 与各补派方一视同仁）：同代 pending 登记的
+      // 原始相位最权威；重启丢登记时以持久化 round=0 兜底——轮次送达才入账，故 0 即首评从未送达
+      const pendingEntry = this.getPendingDispatchRetry(taskId);
+      const queuedPhase = pendingEntry?.kind === 'qa-recheck'
+        && pendingEntry.signalToken === signalTokenAtClaim
+        ? pendingEntry.qaPhase
+        : undefined;
+      const qaPhase: 'review' | 'recheck' = opts.qaPhase
+        ?? queuedPhase
+        ?? (taskStatusAtClaim === 'pending' || taskStatusAtClaim === 'in_progress' || reviewRoundAtClaim === 0
           ? 'review'
-          : 'recheck';
+          : 'recheck');
 
       const prevQa = await this.agentStore.get(qaId);
       const resumingHeldDispatch = prevQa?.taskId === taskId && prevQa.status === 'awaiting_human';
@@ -7922,12 +8521,13 @@ export class AgentManager {
         }
       }
 
-      const acquired = await this.acquireAgentForTask(qaId, taskId, qaPhase);
+      let acquiredLockToken: string | undefined;
+      const acquired = await this.acquireAgentForTask(qaId, taskId, qaPhase, {
+        onAcquired: (lockToken) => { acquiredLockToken = lockToken; },
+      });
       if (!acquired) {
         throw new ApiError(409, `QA agent ${qaId} is busy or unavailable`);
       }
-      const acquiredClaim = await this.lockManager.claimOf(qaId);
-      const acquiredLockToken = acquiredClaim?.taskId === taskId ? acquiredClaim.token : undefined;
       const releaseOwnAcquire = acquiredLockToken !== undefined
         ? { expectedLockToken: acquiredLockToken }
         : {};
@@ -7959,20 +8559,23 @@ export class AgentManager {
         signalToken: pre?.signalToken,
         reviewHeadAnchorSha: pre?.reviewHeadAnchorSha,
         reviewDispatchedAt: pre?.reviewDispatchedAt,
+        reviewRoundPending: pre?.reviewRoundPending,
         passToken: pre?.passToken,
         failToken: pre?.failToken,
       };
 
       const isTerminalAtClaim = TERMINAL_STATUSES.includes(taskStatusAtClaim);
-      // 仅当恢复的是任务当前 review pass 时沿用轮次；任务已离开 review 的手工调用是新 pass，保留加轮
-      const bumpRound = opts.bumpRound !== false && !(resumingHeldDispatch && taskStatusAtClaim === 'review');
+      // 仅当恢复的是任务当前 review pass 时沿用轮次；任务已离开 review 的手工调用是新 pass，保留加轮。
+      // 显式 bumpRound:true 是补派方读到 reviewRoundPending 后的权威意图（该轮从未计数），越过恢复期抑制
+      const bumpRound = opts.bumpRound === true
+        || (opts.bumpRound !== false && !(resumingHeldDispatch && taskStatusAtClaim === 'review'));
       // 回滚在锁内判定 pass 是否已被并发接管并返回；仅未被接管时才释放本次 acquire 的 QA，
       // 否则会误清接管方 re-acquire 的同一 QA 绑定（同 task 同 agent，绕过 release 的 mismatch 保护）
       const abortDispatch = async (dispatchToken: string | undefined): Promise<void> => {
         const takenOver = await this.rollbackDispatchReviewPhase1(
-          taskId, taskStatusAtClaim, isTerminalAtClaim, snapshot, bumpRound, dispatchToken,
+          taskId, taskStatusAtClaim, isTerminalAtClaim, snapshot, dispatchToken,
         );
-        if (!takenOver) await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => undefined);
+        if (!takenOver) await this.releaseAgentForTask(qaId, taskId, 'idle', releaseOwnAcquire).catch(() => undefined);
         if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
       };
 
@@ -8001,7 +8604,7 @@ export class AgentManager {
         if (isGitDispatch && reviewAnchor === undefined) {
           // 无锚评审轮不可裁决（verdictEligible 要求 anchorSha 且 pane verdict 已退役）：
           // 派出去只会卡死在 review，fail loud 让调用方看到确定性原因或重试瞬态失败
-          const released = await this.releaseAgentForTask(qaId, taskId, 'idle').catch(() => false);
+          const released = await this.releaseAgentForTask(qaId, taskId, 'idle', releaseOwnAcquire).catch(() => false);
           if (!released) {
             // 预检失败叠加释放失败：QA 仍绑定会让下一次派发报 busy，必须显式暴露
             const blockedTask = await this.taskStore.get(taskId);
@@ -8027,6 +8630,9 @@ export class AgentManager {
             reviewHeadAnchorSha: reviewAnchor,
             reviewDispatchedAt: new Date().toISOString(),
             signalToken: createSignalToken(),
+            // 未计轮 intent 与进入 review 同一原子写：两写之间崩溃会留下「有派发可重放、却无轮次可补计」
+            // 的状态，恢复后首评仍停在旧轮
+            ...(bumpRound ? { reviewRoundPending: true } : {}),
             // pair/pending 与新轮锚点同一原子写可见（spec §7）：两写之间崩溃不得留下无 pending 的新轮
             ...(isGitDispatch ? { ...this.mintReviewTokenPair(), reviewDispatchPending: true } : {}),
           },
@@ -8035,7 +8641,7 @@ export class AgentManager {
           // fence 拒绝可能源于 successor 已换代并 re-acquire 同一 QA；释放必须钉在本次 acquire 的锁代上
           await this.releaseAgentForTask(qaId, taskId, 'idle', releaseOwnAcquire).catch(() => undefined);
           if (devParked) await this.emitManualReviewDevParkedQaFailedIntervention(devAgentId, taskId);
-          throw new ApiError(409, `Task ${taskId} status changed during dispatch; cannot enter review`);
+          throw new ApiError(409, `Task ${taskId} status changed during dispatch; cannot enter review`, 'dispatch-superseded');
         }
         transitionToken = preDispatched.task.signalToken;
       }
@@ -8056,7 +8662,9 @@ export class AgentManager {
         }
         await this.taskStore.set({
           ...fresh,
-          reviewRound: bumpRound ? fresh.reviewRound + 1 : fresh.reviewRound,
+          // 计轮送达时才落账：claim 段只持久化「未计轮」intent（与 push 直派链路同构），
+          // busy/hold/崩溃等一切未送达出口都保留 intent，任何补派方（含重启后）恰好补计一次
+          ...(bumpRound ? { reviewRoundPending: true } : {}),
           signalToken: armedToken,
           ...(fresh.reviewMode === 'git' ? { reviewDispatchPending: true } : {}),
           updatedAt: new Date().toISOString(),
@@ -8066,8 +8674,9 @@ export class AgentManager {
       if (!claim2.ok) {
         // 未写入 armedToken：task 仍持 transitionToken，或已被接管方 rotate/漂移 → 用 transitionToken 判 takeover
         await abortDispatch(transitionToken);
-        throw new ApiError(409, `Task ${taskId} left its review pass during dispatch (${claim2.reason})`);
+        throw new ApiError(409, `Task ${taskId} left its review pass during dispatch (${claim2.reason})`, 'dispatch-superseded');
       }
+      opts.onPassArmed?.(armedToken);
 
       const dispatchTaskAfterClaim = await this.taskStore.get(taskId);
       const armed = await this.setupPhaseSignalWatcher(
@@ -8090,6 +8699,7 @@ export class AgentManager {
           throw new ApiError(
             409,
             `Task ${taskId} left ${opts.fromStatus.join('/')} during dispatch (now ${preStart?.status ?? 'gone'})`,
+            'dispatch-superseded',
           );
         }
       }
@@ -8099,6 +8709,8 @@ export class AgentManager {
         started = await this.startSession(taskId, qaId, qaPhase, {
           bypassTaskStatusGate: true,
           dialogFailFromStatuses: [isTerminalAtClaim ? taskStatusAtClaim : 'review'],
+          dispatchPassToken: armedToken,
+          ...(opts.pendingBudget !== undefined ? { dispatchPendingBudget: opts.pendingBudget } : {}),
         });
       } catch (err) {
         if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') {
@@ -8113,6 +8725,13 @@ export class AgentManager {
           }
           throw err;
         }
+        if (err instanceof EnsureSessionError && err.partial.busyPending) {
+          // 遇忙不算失败：pass 保持 armed、QA 保持绑定、未计轮 intent 原样在库（送达时才消费），
+          // 由对账按 pending 登记补派
+          console.warn(`[AgentManager] dispatchReviewToQa: QA busy for ${taskId}; dispatch queued (${err.message})`);
+          const pending = await this.taskStore.get(taskId);
+          return pending!;
+        }
         if (!(err instanceof EnsureSessionError && err.partial.handled)) {
           await abortDispatch(armedToken);
         }
@@ -8122,6 +8741,7 @@ export class AgentManager {
         await abortDispatch(armedToken);
         throw new ApiError(500, `Failed to start QA review session for ${taskId}`);
       }
+      await this.consumeReviewRoundIntent(taskId, armedToken);
       await this.clearReviewDispatchPending(taskId, armedToken);
 
       const final = await this.taskStore.get(taskId);
@@ -8293,7 +8913,6 @@ export class AgentManager {
     originalStatus: TaskStatus,
     isTerminalAtClaim: boolean,
     snapshot: DispatchReviewSnapshot,
-    roundBumped: boolean,
     dispatchToken?: string,
   ): Promise<boolean> {
     let qaTakenOverInReview = false;
@@ -8303,27 +8922,24 @@ export class AgentManager {
       // only a concurrent cancel/fail into terminal drops the write; a terminal-at-claim recheck still restores snapshot fields
       if (!isTerminalAtClaim && TERMINAL_STATUSES.includes(fresh.status)) return;
       // transition 后的中间态恒为 review 且持有本次 dispatch 的 token；status 漂移（如 REQUEST_CHANGES→fixing）
-      // 或 review 内 token 换代（push recheck 接管）都表示 pass 已归并发推进方所有，只撤本次 dispatch 的轮次残留
+      // 或 review 内 token 换代（push recheck 接管）都表示 pass 已归并发推进方所有。
+      // 计轮送达时才落账，claim 段无轮次残留可撤——drift 后不覆盖接管方的任何写入
       const passTakenOver = dispatchToken !== undefined && fresh.signalToken !== dispatchToken;
       qaTakenOverInReview = !isTerminalAtClaim && fresh.status === 'review' && passTakenOver;
       const drifted = !isTerminalAtClaim && (fresh.status !== 'review' || passTakenOver);
-      // 只在本次 dispatch 仍拥有该 pass（未 drift）且确实 bump 过时才撤回 +1；
-      // drift 后 reviewRound 归接管方所有（它可能基于此再 bump），一律不减
-      const rolledRound = (!drifted && roundBumped) ? Math.max(0, fresh.reviewRound - 1) : fresh.reviewRound;
-      const next: TaskState = drifted
-        ? { ...fresh, reviewRound: rolledRound, updatedAt: new Date().toISOString() }
-        : {
-          ...fresh,
-          reviewRound: rolledRound,
-          qaAgentId: snapshot.qaAgentId,
-          signalToken: snapshot.signalToken,
-          reviewDispatchedAt: snapshot.reviewDispatchedAt,
-          // 本代新铸的 pair 从未交付 QA：不随快照恢复会让旧 QA 的在途 verdict 被拒、新 pair 无人知
-          passToken: snapshot.passToken,
-          failToken: snapshot.failToken,
-          updatedAt: new Date().toISOString(),
-        };
-      if (!isTerminalAtClaim && !drifted) {
+      if (drifted) return;
+      const next: TaskState = {
+        ...fresh,
+        qaAgentId: snapshot.qaAgentId,
+        signalToken: snapshot.signalToken,
+        reviewDispatchedAt: snapshot.reviewDispatchedAt,
+        reviewRoundPending: snapshot.reviewRoundPending,
+        // 本代新铸的 pair 从未交付 QA：不随快照恢复会让旧 QA 的在途 verdict 被拒、新 pair 无人知
+        passToken: snapshot.passToken,
+        failToken: snapshot.failToken,
+        updatedAt: new Date().toISOString(),
+      };
+      if (!isTerminalAtClaim) {
         next.status = originalStatus;
         next.reviewHeadAnchorSha = snapshot.reviewHeadAnchorSha;
       }
@@ -8782,6 +9398,9 @@ export class AgentManager {
   ): Promise<void> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) return;
+    // Pin the incarnation before the first state/paneId read: paneId equality is ABA-blind (a recreated
+    // agent reuses %0), so a DELETE→same-id recreate would otherwise let post-merge /clear hit a new session.
+    const genAtEntry = this.deletionGenerationOf(agentId);
     const state = await this.agentStore.get(agentId);
     if (!state) return;
     if (state.taskId && state.taskId !== ctx.taskId) return;
@@ -8793,10 +9412,12 @@ export class AgentManager {
     }
 
     if (!state.taskId) {
+      if (this.isDeletionInFlight(agentId)) return;
       const lockToken = await this.lockManager.acquire(agentId, ctx.taskId);
       if (!lockToken) return;
-      await this.agentStore.update(agentId, (existing) => {
+      const commit = await this.agentStore.update(agentId, (existing) => {
         if (!existing) return AGENT_STORE_NOOP;
+        if (!this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
         if (existing.taskId && existing.taskId !== ctx.taskId) return AGENT_STORE_NOOP;
         if (existing.creationToken) return AGENT_STORE_NOOP;
         if (existing.status === 'awaiting_human') return AGENT_STORE_NOOP;
@@ -8807,7 +9428,16 @@ export class AgentManager {
           lockToken,
           updatedAt: new Date().toISOString(),
         };
+      }).catch(async (err) => {
+        await this.lockManager.releaseIfOwner(agentId, ctx.taskId, lockToken).catch((releaseErr) => {
+          console.warn(`[AgentManager] postMergeCleanup(${agentId}): lock release after commit failure also failed:`, releaseErr);
+        });
+        throw err;
       });
+      if (commit !== 'committed') {
+        await this.lockManager.releaseIfOwner(agentId, ctx.taskId, lockToken);
+        return;
+      }
       const fresh = await this.agentStore.get(agentId);
       if (fresh?.taskId !== ctx.taskId || fresh.lockToken !== lockToken) {
         await this.lockManager.releaseIfOwner(agentId, ctx.taskId, lockToken);
@@ -8815,10 +9445,17 @@ export class AgentManager {
       }
     }
 
+    // A DELETE→recreate (gen bump) before this pane work must skip it, or /clear lands on the new incarnation's reused pane.
+    if (!this.deletionGateOpen(agentId, genAtEntry)) return;
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
     const runtime = agentRuntimeKindFor(agent);
-    void this.runPostMergeCompaction(tmux, state.paneId, agentId, ctx.taskId, runtime).catch(err =>
+    const expectedPaneId = state.paneId;
+    void (async () => {
+      if (!this.deletionGateOpen(agentId, genAtEntry)) return;
+      const pane = await this.resolveClaimedPane(tmux, agentId, expectedPaneId);
+      await this.runPostMergeCompaction(tmux, pane, agentId, ctx.taskId, runtime);
+    })().catch(err =>
       console.warn(`[AgentManager] runPostMergeCompaction(${agentId}) failed:`, err),
     );
   }
@@ -8838,14 +9475,14 @@ export class AgentManager {
 
   private async runPostMergeCompaction(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     agentId: string,
     originalTaskId: string,
     runtime: AgentRuntimeKind,
   ): Promise<void> {
     await this.acquireCompactGuard(agentId);
     try {
-      await this.runPostMergeCompactionSteps(tmux, paneId, agentId, originalTaskId, runtime);
+      await this.runPostMergeCompactionSteps(tmux, pane, agentId, originalTaskId, runtime);
     } finally {
       this.compactInFlight.delete(agentId);
     }
@@ -8874,11 +9511,12 @@ export class AgentManager {
 
   private async runPostMergeCompactionSteps(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     agentId: string,
     originalTaskId: string,
     runtime: AgentRuntimeKind,
   ): Promise<void> {
+    const paneId = pane.paneId;
     const initial = await this.agentStore.get(agentId);
     if (!initial || initial.taskId !== originalTaskId || initial.paneId !== paneId) return;
     const lockToken = await this.resolveTaskLockToken(initial, originalTaskId);
@@ -8896,14 +9534,14 @@ export class AgentManager {
     let cleared = false;
     let clearError: unknown;
     try {
-      cleared = await this.sendPostMergeSlashCommand(tmux, paneId, agentId, runtime, bindingStillOurs);
+      cleared = await this.sendPostMergeSlashCommand(tmux, pane, agentId, runtime, bindingStillOurs);
     } catch (err) {
       clearError = err;
     }
     if (!cleared) {
       if (await this.recoverPostMergeExitedRuntime(
         tmux,
-        paneId,
+        pane,
         agentId,
         originalTaskId,
         lockToken,
@@ -8917,7 +9555,7 @@ export class AgentManager {
         && clearError.message.includes('runtime rejected /clear')
       ) {
         try {
-          await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
+          await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
         } catch (err) {
           clearError = err;
         }
@@ -8946,15 +9584,16 @@ export class AgentManager {
 
   private async recoverPostMergeExitedRuntime(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     agentId: string,
     taskId: string,
     lockToken: string,
     runtime: AgentRuntimeKind,
   ): Promise<boolean> {
+    const paneId = pane.paneId;
     let paneExists = true;
     try {
-      if (hasReplProcTitle(await tmux.displayMessage(paneId, '#{pane_current_command}'), runtime)) return false;
+      if (hasReplProcTitle(await tmux.displayMessage(pane, '#{pane_current_command}'), runtime)) return false;
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       if (!/no server running|session not found|can't find (?:pane|session)|no such (?:pane|session)/i.test(detail)) {
@@ -8971,7 +9610,7 @@ export class AgentManager {
       || !(await this.lockManager.isOwner(agentId, taskId, lockToken))
     ) return false;
     try {
-      if (paneExists) await tmux.sendKeysToPane(paneId, 'C-c');
+      if (paneExists) await tmux.sendKeysToPane(pane, 'C-c');
       const ensure = await this.ensureSession(agentId, 'runtime');
       if (!ensure.freshRuntime) return false;
       await this.agentStore.update(agentId, (existing) => {
@@ -9001,7 +9640,7 @@ export class AgentManager {
 
   private async sendPostMergeSlashCommand(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     agentId: string,
     runtime: AgentRuntimeKind,
     bindingStillOurs: () => Promise<boolean>,
@@ -9009,16 +9648,16 @@ export class AgentManager {
     let rejection: Error | undefined;
     for (let attempt = 1; attempt <= 2; attempt++) {
       if (!await bindingStillOurs()) return false;
-      await tmux.clearComposerDraft(paneId);
-      await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
+      await tmux.clearComposerDraft(pane);
+      await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
       if (!await bindingStillOurs()) return false;
-      await tmux.sendKeysLiteral(paneId, '/clear');
-      await tmux.sendEnter(paneId);
+      await tmux.sendKeysLiteral(pane, '/clear');
+      await tmux.sendEnter(pane);
       await new Promise(r => setTimeout(r, this.compactIdlePollMs));
-      await this.waitForReplPromptReady(tmux, paneId, runtime, this.compactIdleWaitMs);
+      await this.waitForReplPromptReady(tmux, pane, runtime, this.compactIdleWaitMs);
       if (!await bindingStillOurs()) return false;
 
-      if (!await this.hasRuntimeSlashCommandRejection(tmux, paneId, '/clear')) return true;
+      if (!await this.hasRuntimeSlashCommandRejection(tmux, pane, '/clear')) return true;
 
       rejection = new Error('runtime rejected /clear because a task is still in progress');
       if (attempt < 2) {
@@ -9031,10 +9670,10 @@ export class AgentManager {
 
   private async hasRuntimeSlashCommandRejection(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     command: '/compact' | '/clear',
   ): Promise<boolean> {
-    const cap = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+    const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
     return this.runtimeSlashCommandRejectedPattern(command).test(cap);
   }
 
@@ -9044,25 +9683,30 @@ export class AgentManager {
 
   private async waitForReplPromptReady(
     tmux: TmuxManager,
-    paneId: string,
+    pane: PaneRef,
     runtime: AgentRuntimeKind,
     timeoutMs: number,
+    opts: { stableIdle?: boolean } = {},
   ): Promise<void> {
+    if (opts.stableIdle) {
+      return this.waitForReplPromptStableIdle(tmux, pane, runtime, timeoutMs);
+    }
+    const paneId = pane.paneId;
     const deadline = Date.now() + timeoutMs;
-    await tmux.waitReplReady(paneId, runtime, {
+    await tmux.waitReplReady(pane, runtime, {
       timeoutMs,
       intervalMs: this.compactIdlePollMs,
       titleIdleFastPath: true,
     });
     await new Promise(r => setTimeout(r, this.compactIdlePollMs));
     while (true) {
-      const current = await tmux.displayMessage(paneId, '#{pane_current_command}');
+      const current = await tmux.displayMessage(pane, '#{pane_current_command}');
       if (!hasReplProcTitle(current, runtime)) {
         throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
       }
-      const cap = await tmux.capturePaneById(paneId, { ansi: false, scrollback: 0 });
+      const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
       const ready = hasRuntimeReadyView(cap, runtime)
-        || (screenAllowsTitleIdle(cap, runtime) && hasOscTitleIdle(await tmux.readPaneTitle(paneId), runtime));
+        || (screenAllowsTitleIdle(cap, runtime) && hasOscTitleIdle(await tmux.readPaneTitle(pane), runtime));
       if (detectRuntimeMenu(cap) || (!ready && detectStartupDialog(cap, runtime))) {
         throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
       }
@@ -9073,9 +9717,49 @@ export class AgentManager {
         return;
       }
       if (Date.now() >= deadline) {
-        throw new Error(`waitForReplPromptReady: pane ${paneId} stayed busy past ${timeoutMs}ms`);
+        // 与 stableIdle 分支同一类型：忙碌超时是「常态忙」而非故障，调用方（release/派发）
+        // 据此延后重排；菜单/对话框/REPL 退出等仍是普通 Error，不得被当成可延后
+        throw new ReplNotReadyError(paneId, runtime, cap, `stayed busy past ${timeoutMs}ms`);
       }
       await new Promise(r => setTimeout(r, this.compactIdlePollMs));
+    }
+  }
+
+  // 注入前置门：codex 忙碌回合的工具间隙会闪现单帧 idle footer（#558 事故放大器），
+  // 连续 K 帧稳定就绪才放行，任何忙碌/不确定帧清零计数；超时按忙碌分类抛 ReplNotReadyError。
+  private async waitForReplPromptStableIdle(
+    tmux: TmuxManager,
+    pane: PaneRef,
+    runtime: AgentRuntimeKind,
+    timeoutMs: number,
+  ): Promise<void> {
+    const paneId = pane.paneId;
+    const samples = Math.max(1, this.readyStableSamples);
+    const spacing = this.readyStableSpacingMs;
+    const deadline = Date.now() + timeoutMs + (samples - 1) * spacing;
+    let streak = 0;
+    while (true) {
+      const current = await tmux.displayMessage(pane, '#{pane_current_command}');
+      if (!hasReplProcTitle(current, runtime)) {
+        throw new Error(`waitForReplPromptReady: pane ${paneId} pane_current_command=${current.trim()} (not runtime, REPL may have exited)`);
+      }
+      const cap = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
+      const ready = hasRuntimeReadyView(cap, runtime)
+        || (screenAllowsTitleIdle(cap, runtime) && hasOscTitleIdle(await tmux.readPaneTitle(pane), runtime));
+      if (detectRuntimeMenu(cap) || (!ready && detectStartupDialog(cap, runtime))) {
+        throw new Error(`waitForReplPromptReady: pane ${paneId} shows menu/dialog, not a ready REPL prompt`);
+      }
+      streak = ready && !runtimeBusyCheck(cap, runtime) ? streak + 1 : 0;
+      if (streak >= samples) return;
+      if (Date.now() >= deadline) {
+        throw new ReplNotReadyError(
+          paneId,
+          runtime,
+          cap,
+          `stable idle not confirmed within ${timeoutMs}ms (+${(samples - 1) * spacing}ms stability window)`,
+        );
+      }
+      await new Promise(r => setTimeout(r, spacing));
     }
   }
 
@@ -9201,6 +9885,7 @@ export class AgentManager {
     taskId: string,
     restore: {
       status: TaskStatus; signalToken?: string; reviewHeadAnchorSha?: string; reviewDispatchedAt?: string;
+      reviewRoundPending?: boolean;
       passToken?: string; failToken?: string; restorePair?: boolean;
     },
     opts: { expect?: { status: TaskStatus; signalToken?: string }; rearmSkipSnapshot?: boolean } = {},
@@ -9218,6 +9903,7 @@ export class AgentManager {
         signalToken: restore.signalToken,
         reviewHeadAnchorSha: restore.reviewHeadAnchorSha,
         reviewDispatchedAt: restore.reviewDispatchedAt,
+        reviewRoundPending: restore.reviewRoundPending,
         ...(restore.restorePair === true
           ? { passToken: restore.passToken, failToken: restore.failToken }
           : {}),
@@ -10225,7 +10911,7 @@ export class AgentManager {
       // would linger in base..HEAD and flag tasks that leak nothing.
       const fetch = await execNetwork(
         runner,
-        `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin --quiet`,
+        `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin --quiet`,
       );
       if (fetch.exitCode !== 0) {
         throw new Error(`lineage fetch failed in ${workdir}: ${fetch.stderr.trim()}`);
@@ -10364,6 +11050,8 @@ export class AgentManager {
   ): Promise<void> {
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new Error(`injectTextToAgent: unknown agent ${agentId}`);
+    // Pin the incarnation before reading state so a DELETE→recreate reusing %0 can't route the text to the new session.
+    const genAtEntry = this.deletionGenerationOf(agentId);
     await this.acquireCompactGuard(agentId);
     try {
       const state = await this.agentStore.get(agentId);
@@ -10401,8 +11089,18 @@ export class AgentManager {
         await this.assertTaskLockOwner(agentId, taskId, lockToken);
       }
       const tmux = new TmuxManager(this.createRunnerFor(cfg));
-      await tmux.injectPrompt(paneId, text, agentId);
-      await tmux.sendEnter(paneId);
+      const pane = await this.resolveClaimedPane(tmux, agentId, paneId);
+      // resolveClaimedPane resolved by the CURRENT same-name session; re-verify incarnation + binding before paste (same as the image path).
+      if (!this.deletionGateOpen(agentId, genAtEntry)) {
+        throw new Error(`injectTextToAgent: agent ${agentId} was deleted or recreated before paste`);
+      }
+      const afterResolve = await this.agentStore.get(agentId);
+      if (!afterResolve || afterResolve.paneId !== paneId || afterResolve.taskId !== taskId
+        || (taskId !== undefined && afterResolve.lockToken !== lockToken)) {
+        throw new Error(`injectTextToAgent: agent ${agentId} binding changed before paste`);
+      }
+      await tmux.injectPrompt(pane, text, agentId);
+      await tmux.sendEnter(pane);
     } finally {
       this.compactInFlight.delete(agentId);
     }
@@ -10563,14 +11261,17 @@ export class AgentManager {
     taskId: string,
   ): boolean {
     // 人工介入/重建中的 pane 不发 /clear;confirm 语义要求解绑,落回直接释放
-    if (!state.paneId || state.status === 'awaiting_human' || state.creationToken) return false;
+    const expectedPaneId = state.paneId;
+    if (!expectedPaneId || state.status === 'awaiting_human' || state.creationToken) return false;
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) return false;
     const tmux = new TmuxManager(this.createRunnerFor(cfg));
-    void this.runPostMergeCompaction(tmux, state.paneId, agentId, taskId, agentRuntimeKindFor(cfg))
-      .catch(err =>
-        console.warn(`[AgentManager] releaseTaskAgents compaction(${agentId}) failed:`, err),
-      );
+    void (async () => {
+      const pane = await this.resolveClaimedPane(tmux, agentId, expectedPaneId);
+      await this.runPostMergeCompaction(tmux, pane, agentId, taskId, agentRuntimeKindFor(cfg));
+    })().catch(err =>
+      console.warn(`[AgentManager] releaseTaskAgents compaction(${agentId}) failed:`, err),
+    );
     return true;
   }
 
@@ -10587,13 +11288,15 @@ export class AgentManager {
 
     const prev = this.repoMergeQueue.get(task.projectId) ?? Promise.resolve();
     const run = prev.then(async () => {
+      // fetch/push reach a remote derived from THIS Workdir; a rebound Workdir would redirect the push to a foreign repo, so each mutation carries the canonical self-guard in its own command.
+      const guard = `${canonicalSelfGuard(workdir)} && `;
       const cd = `cd ${shellQuote(workdir)} && `;
       const db = await runner.exec(`${cd}git symbolic-ref --short refs/remotes/origin/HEAD`);
       const defaultBranch = db.stdout.trim().replace(/^origin\//, '');
       if (db.exitCode !== 0 || defaultBranch === '') {
         throw new Error(`ffMergeBranch: cannot resolve default branch: ${db.stderr.trim() || 'empty origin/HEAD'}`);
       }
-      const fetch = await execNetwork(runner, `${cd}${GIT_NET_ENV} git fetch origin`);
+      const fetch = await execNetwork(runner, `${guard}${cd}${GIT_NET_ENV} git fetch origin`);
       if (fetch.exitCode !== 0) {
         throw new Error(`ffMergeBranch [git fetch] failed: ${fetch.stderr.trim()}`);
       }
@@ -10610,7 +11313,7 @@ export class AgentManager {
       }
       const push = await execNetwork(
         runner,
-        `${cd}${GIT_NET_ENV} git push origin ${shellQuote(`origin/${branch}`)}:${shellQuote(defaultBranch)}`,
+        `${guard}${cd}${GIT_NET_ENV} git push origin ${shellQuote(`origin/${branch}`)}:${shellQuote(defaultBranch)}`,
       );
       if (push.exitCode !== 0) {
         throw new Error(`ffMergeBranch [push] failed: ${push.stderr.trim() || push.stdout.trim()}`);

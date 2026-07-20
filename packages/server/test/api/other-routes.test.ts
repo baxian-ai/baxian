@@ -295,6 +295,46 @@ describe('PATCH /api/config', () => {
     expect(app.ctx.config.project[0].agent.flat().some(agent => agent.id === 'dev-1')).toBe(true);
   });
 
+  it('rejects re-introducing an agent id whose DELETE is in flight (tombstone gate)', async () => {
+    await seedConfigPath(app, tempDir);
+    app.ctx.agentManager.tryClaimDeletion(['ghost-dev']);
+    const nextProjects = app.ctx.config.project.map(project => ({
+      ...project,
+      agent: [
+        ...project.agent,
+        [{ id: 'ghost-dev', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: join(tempDir, 'ghost-dev') }],
+      ],
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/being deleted.*cannot keep or \(re\)introduce/);
+    expect(app.ctx.config.project[0].agent.flat().some(agent => agent.id === 'ghost-dev')).toBe(false);
+
+    app.ctx.agentManager.releaseDeletionClaim(['ghost-dev']);
+  });
+
+  it('rejects MOVING an existing agent id whose DELETE is in flight to another project (tombstone bypass)', async () => {
+    await seedConfigPath(app, tempDir);
+    // dev-1 already exists in project 0; a concurrent DELETE holds its tombstone.
+    const movingId = app.ctx.config.project[0].agent.flat()[0].id;
+    app.ctx.agentManager.tryClaimDeletion([movingId]);
+    // A PATCH that keeps the SAME id (host/workdir unchanged) but relocates it to another project must NOT
+    // slip past the tombstone just because the id is still in the current config.
+    const nextProjects = app.ctx.config.project.map((project, i) => ({
+      ...project,
+      id: i === 0 ? `${project.id}-moved` : project.id,
+    }));
+
+    const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/being deleted.*cannot keep/);
+
+    app.ctx.agentManager.releaseDeletionClaim([movingId]);
+  });
+
   it('allows an idle agent to change Workdir and releases only its old canonical owner claim', async () => {
     const configPath = await seedConfigPath(app, tempDir);
     const currentWorkdir = app.ctx.config.project[0].agent[0][0].workdir!;

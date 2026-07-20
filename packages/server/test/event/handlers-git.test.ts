@@ -240,6 +240,57 @@ describe('review.submitted (git)', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it('APPROVE 原子消费 durable reviewDispatchPending（verdict 即送达证据，#563 R33）', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+      reviewDispatchPending: true,
+    }));
+    await eventBus.emit(reviewSubmitted({
+      action: 'APPROVE', headSha: SHA1, currentHeadSha: SHA1,
+      reviewPassToken: 'ffff00001111', verdictToken: 'abcdef123456',
+      verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64) },
+    }));
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('approved');
+    expect(task?.reviewDispatchPending).toBeUndefined();
+  });
+
+  it('REQUEST_CHANGES 原子消费 durable reviewDispatchPending（fixing 态不被 sweep 拽回 review，#563 R33）', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+      reviewDispatchPending: true,
+    }));
+    await eventBus.emit(reviewSubmitted({
+      action: 'REQUEST_CHANGES', headSha: SHA1, currentHeadSha: SHA1,
+      reviewPassToken: 'ffff00001111', verdictToken: '123456abcdef',
+      verdictCarrier: { sourceKey: 'reviews', id: 'r2', bodyDigest: 'a'.repeat(64) },
+    }));
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('fixing');
+    expect(task?.reviewDispatchPending).toBeUndefined();
+  });
+
+  it('max_rounds 原子消费 durable reviewDispatchPending（终局同样不给 sweep 留凭据，#563 R33）', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 3,
+      reviewDispatchPending: true,
+    }));
+    await eventBus.emit(reviewSubmitted({
+      action: 'REQUEST_CHANGES', headSha: SHA1, currentHeadSha: SHA1,
+      reviewPassToken: 'ffff00001111', verdictToken: '123456abcdef',
+      verdictCarrier: { sourceKey: 'reviews', id: 'r3', bodyDigest: 'b'.repeat(64) },
+    }));
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('max_rounds');
+    expect(task?.reviewDispatchPending).toBeUndefined();
+  });
+
   it('updates the stored head from the engine-verified current head', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
@@ -868,8 +919,99 @@ describe('fourth review round fixes', () => {
     expect(task?.status).toBe('review');
     expect(task?.reviewDispatchPending).toBe(true);
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(task!);
+    // 直派在 startSession 成功后才计轮：失败后的 sweep 补派带上持久化的未计轮 intent 与首评相位（#563 R16/R17/CX2），
+    // 并把实时代际（expectSignalToken + expectReviewDispatchPending）压进 dispatch 锁内复核（#563 R21）
+    expect(task?.reviewRoundPending).toBe(true);
     await manager.retryPendingGitReviewDispatches();
-    expect(dispatchSpy).toHaveBeenCalledWith('task-1', { bumpRound: false });
+    expect(dispatchSpy).toHaveBeenCalledWith('task-1', {
+      bumpRound: true,
+      qaPhase: 'review',
+      expectSignalToken: task!.signalToken,
+      expectReviewDispatchPending: true,
+      fromStatus: ['review', 'in_progress', 'fixing'],
+    });
+  });
+
+  it('初次 git review 成功后按 dispatchToken 清掉持久化 pending，sweep 不再重派健康首评（#563 R27）', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('review');
+    expect(task?.reviewDispatchPending).toBeUndefined();
+
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+    await manager.retryPendingGitReviewDispatches();
+    expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
+  it('git 首评 arm 失败回滚保留 transition 写入的未计轮 intent（与 durable pending 同持，#563 CX-5.4）', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async (taskId) => {
+      const fresh = (await taskStore.get(taskId as string))!;
+      await taskStore.set({ ...fresh, signalToken: 'rot-tok-11111', updatedAt: new Date().toISOString() });
+      return { token: 'rot-tok-11111', armed: false };
+    });
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('in_progress');
+    expect(task?.reviewDispatchPending).toBe(true);
+    expect(task?.reviewRoundPending).toBe(true);
+  });
+
+  it('git 首评 startSession 失败回滚保留未计轮 intent（pr.updated 起点，#563 CX-5.4）', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1', prNumber: 42, latestHeadSha: SHA1 }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async (taskId) => {
+      const fresh = (await taskStore.get(taskId as string))!;
+      await taskStore.set({ ...fresh, signalToken: 'rot-tok-22222', updatedAt: new Date().toISOString() });
+      return { token: 'rot-tok-22222', armed: true };
+    });
+    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { prNumber: 42, headSha: SHA2, action: 'synchronize' },
+    });
+
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('in_progress');
+    expect(task?.reviewDispatchPending).toBe(true);
+    expect(task?.reviewRoundPending).toBe(true);
+  });
+
+  it('sweep 消费谓词按实时值复核：pending 已被清掉的旧快照不再重派（#563 R21）', async () => {
+    await taskStore.set(gitTask());
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    const stale = await taskStore.get('task-1');
+    expect(stale?.reviewDispatchPending).toBe(true);
+    vi.spyOn(manager, 'listActiveGitTasks').mockResolvedValue([stale!]);
+    await taskStore.set({ ...(stale!), reviewDispatchPending: undefined, updatedAt: new Date().toISOString() } as never);
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
+  it('sweep 对同代 busy pending 让位（不空转 release/acquire），交对账观测门消费（#563 CX-3.2）', async () => {
+    await taskStore.set(gitTask());
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    const live = await taskStore.get('task-1');
+    manager.registerPendingDispatchRetry('task-1', {
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: live!.signalToken!,
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(manager.getPendingDispatchRetry('task-1')).toBeTruthy();
   });
 
   it('recovery re-arms instead of re-injecting while the delivered prompt is still running', async () => {
@@ -924,7 +1066,12 @@ describe('fifth review round fixes', () => {
     }));
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(gitTask());
     await manager.retryPendingGitReviewDispatches();
-    expect(dispatchSpy).toHaveBeenCalledWith('task-1', { bumpRound: false });
+    expect(dispatchSpy).toHaveBeenCalledWith('task-1', {
+      bumpRound: false,
+      expectSignalToken: 'ffff00001111',
+      expectReviewDispatchPending: true,
+      fromStatus: ['review', 'in_progress', 'fixing'],
+    });
   });
 
   it('keeps a sibling generation pending when a stale clear arrives with the old token', async () => {

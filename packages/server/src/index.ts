@@ -37,6 +37,7 @@ import { isGitHubRepo, repoSlug } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
+import { DispatchReconciler } from './agent/dispatch-reconciler.js';
 import { buildApp } from './app.js';
 import { RestartCoordinator } from './lifecycle/restart.js';
 import { consumeRestartSentinel } from './lifecycle/restart-sentinel.js';
@@ -230,6 +231,7 @@ export async function startServer(configPath?: string): Promise<void> {
     registerServerEventHandlers(eventBus, agentManager);
     await agentManager.setupRecoveredPostApproveSignals();
     await agentManager.setupRecoveredSpecSignals();
+    paneStreamerManager.startupScan((config.project ?? []).flatMap((p) => (p.agent ?? []).flat()));
 
     const snapshotCtx = { agentManager, agentStore, taskStore, tmuxSessionStatusStore, errorRecordStore, petStore };
     const eventPublisher = new EventPublisher(eventBroker, snapshotCtx, taskStore);
@@ -241,6 +243,17 @@ export async function startServer(configPath?: string): Promise<void> {
     const onBootstrapAgentAffected = (ids: string[]) => {
       for (const id of ids) eventPublisher.publishAgentChange('set', id);
     };
+
+    const dispatchReconciler = new DispatchReconciler({
+      manager: agentManager,
+      taskStore,
+      agentStore,
+      statusStore: tmuxSessionStatusStore,
+      eventBus,
+      intervalMs: config.server.dispatchReconcileIntervalMs,
+      busyWaitBudgetMs: config.server.dispatchBusyWaitBudgetMs,
+      maxAttempts: config.server.dispatchReconcileMaxAttempts,
+    });
 
     const bootstrapPoller = new BootstrapPoller({
       config,
@@ -331,6 +344,7 @@ export async function startServer(configPath?: string): Promise<void> {
         tmuxSessionStatusStore,
         tmuxProbePoller,
         bootstrapPoller,
+        dispatchReconciler,
         configPath: cfgPath,
         stateDir,
         poller,
@@ -365,6 +379,7 @@ export async function startServer(configPath?: string): Promise<void> {
     await app.listen({ port: config.server.port, host });
     tmuxProbePoller.start();
     bootstrapPoller.start();
+    dispatchReconciler.start();
     console.log(formatServerRunningMessage(host, config.server.port, Boolean(config.server.https)));
   } catch (err) {
     await releaseLockBestEffort();

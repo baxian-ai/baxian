@@ -149,7 +149,7 @@ function RoundBlock({
           role="dev"
           label={isSpec ? t.review.submitSpecDraft : t.review.submitCodeChanges}
           summary={devSummary(t, round)}
-          onClick={() => onOpen(round.phase, round.round, '')}
+          onClick={() => onOpen(round.phase, round.round, '#diff')}
         />
         {partialBatches.map((b, i) => (
           <TurnRow
@@ -157,7 +157,7 @@ function RoundBlock({
             role="qa"
             label={t.review.batchTurn(i + 1)}
             summary={findingsSummary(t, b)}
-            onClick={() => onOpen(round.phase, round.round, '#review')}
+            onClick={() => onOpen(round.phase, round.round, `#batch-${i}`)}
           />
         ))}
         {round.findings && (
@@ -187,7 +187,7 @@ function RoundBlock({
                 : (round.phase === 'spec' ? t.taskDetail.specReject : t.taskDetail.codeReject)}
             badge={<span className={VERDICT_CLASS[round.userDecision.verdict]}>{round.userDecision.verdict}</span>}
             summary={round.userDecision.comments ?? ''}
-            onClick={() => onOpen(round.phase, round.round, '#review')}
+            onClick={() => onOpen(round.phase, round.round, '#user-decision')}
           />
         )}
         {inProgress && <InProgressRow t={t} task={task} round={round} />}

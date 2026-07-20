@@ -1,5 +1,6 @@
 import type { CommandRunner, RemoteShellMode } from './runner.js';
 import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshEnv } from './runner.js';
+import { ancestorSymlinkGuard } from './repo-store.js';
 import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
 import { isGitHubRepo, redactGitCredentials, repoSlug } from '../shared/index.js';
@@ -133,18 +134,6 @@ export async function runPreflight(
 
   results.push(await probeTmux(runner, projectId));
 
-  if (agent.mode === 'remote') {
-    results.push(
-      await probeBinary(
-        runner,
-        'openssl',
-        'openssl',
-        (path) => `openssl found at ${path}`,
-        'Please install openssl on the agent host (used to decode skill/task files during injection)',
-      ),
-    );
-  }
-
   const isAuto = !agent.workdir;
   if (isAuto) {
     await runAutoModePreflight(runner, agent.id, repo, results);
@@ -213,22 +202,34 @@ async function runAutoModePreflight(
   results: PreflightResult[],
 ): Promise<void> {
   const gh = isGitHubRepo(repo);
-  const root = `~/.baxian/agents/${agentId}`;
+  // ~ is expanded by the remote shell to $HOME; physicalize it first so the agent dir is created
+  // through a proven symlink-free chain, not the raw logical path (a rebound .baxian → external dir).
+  const homeProbe = await runner.exec('cd ~ && pwd -P');
+  const home = homeProbe.stdout.trim();
+  if (homeProbe.exitCode !== 0 || home === '') {
+    results.push({
+      step: 'workdir',
+      ok: false,
+      message: `Cannot resolve physical home: ${homeProbe.stderr || homeProbe.stdout}`,
+    });
+    return;
+  }
+  const root = `${home}/.baxian/agents/${agentId}`;
   const absRepoPath = `${root}/repo`;
-  const mk = await runner.exec(`mkdir -p ${root} && test -w ${root}`);
+  const mk = await runner.exec(`${ancestorSymlinkGuard(home, root)} && mkdir -p ${shellQuote(root)} && test -w ${shellQuote(root)}`);
   if (mk.exitCode !== 0) {
     results.push({
       step: 'workdir',
       ok: false,
-      message: `Cannot create or write to ${root}: ${mk.stderr || mk.stdout}`,
+      message: `Cannot create or write to ${root} (symlink-safe): ${mk.stderr || mk.stdout}`,
     });
     return;
   }
 
-  const dirCheck = await runner.exec(`test -d ${absRepoPath}`);
+  const dirCheck = await runner.exec(`test -d ${shellQuote(absRepoPath)}`);
   if (dirCheck.exitCode === 0) {
     const gitCheck = await runner.exec(
-      `cd ${absRepoPath} && ` +
+      `cd ${shellQuote(absRepoPath)} && ` +
       `test "$(pwd -P)" = "$(cd "$(git rev-parse --show-toplevel)" && pwd -P)" && ` +
       `test "$(git rev-parse --is-bare-repository)" = false && ` +
       `test -d .git && test "$(git rev-parse --git-common-dir)" = .git && ` +

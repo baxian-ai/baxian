@@ -27,10 +27,21 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 });
 
-function createFakePty(): MinimalPty {
+// The streamer probes attach capability with `tmux -V` before attaching; answer
+// with a pre-3.2 version so these WS-mechanics tests skip flag/follow behavior.
+function createProbeAwarePty(cmd: { args: string[] }): MinimalPty {
+  const isProbe = cmd.args.some((a) => typeof a === 'string' && a.includes('tmux -V'));
+  let dataCb: ((data: string) => void) | null = null;
+  let exitCb: ((e: { exitCode: number }) => void) | null = null;
+  if (isProbe) {
+    queueMicrotask(() => {
+      dataCb?.('tmux 3.0a\n');
+      exitCb?.({ exitCode: 0 });
+    });
+  }
   return {
-    onData() { return { dispose: () => undefined }; },
-    onExit() { return { dispose: () => undefined }; },
+    onData(cb) { dataCb = cb; return { dispose: () => undefined }; },
+    onExit(cb) { exitCb = cb; return { dispose: () => undefined }; },
     resize() { },
     write() { },
     kill() { },
@@ -46,10 +57,21 @@ async function startApp(opts?: {
     ctx.config = { ...ctx.config, server: { ...ctx.config.server, token: opts.configToken } };
   }
   if (opts?.withPaneStreamerManager) {
-    const ptyFactory: PtyFactory = () => createFakePty();
+    const ptyFactory: PtyFactory = (cmd) => createProbeAwarePty(cmd);
     ctx.paneStreamerManager = new PaneStreamerManager({
       runnerFactory: () => ({
-        exec: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
+        // list-sessions answers a self-claimed snapshot so the attach ownership gate passes.
+        exec: vi.fn().mockImplementation(async (cmd: string) => {
+          if (cmd.includes('list-sessions')) {
+            const name = /#\{==:#\{session_name\},([^}]+)\}/.exec(cmd)?.[1] ?? 'dev-1';
+            return { stdout: `4242|1700000000|$1|${name}\n`, stderr: '', exitCode: 0 };
+          }
+          if (cmd.includes('display-message')) {
+            // Well-formed geometry so no test run emits standing geometry warnings.
+            return { stdout: '200 50 on latest |4242|1700000000|$1|dev-1|3.0a|#{e|<=:1,2}\n', stderr: '', exitCode: 0 };
+          }
+          return { stdout: '', stderr: '', exitCode: 0 };
+        }),
         writeFile: vi.fn().mockResolvedValue(undefined),
         execWithStdin: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
       }),
@@ -134,6 +156,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 1500): Promise<void> {
 interface FakeStreamerCallbacks {
   onLive?: (data: string, seq: number) => void;
   onSessionGone?: () => void;
+  onSnapshotRefresh?: (snapshot: { cols: number; rows: number; data: string }, seq: number) => void;
 }
 
 function makeFakeStreamer(): {
@@ -141,12 +164,15 @@ function makeFakeStreamer(): {
     subscribeAtomic: ReturnType<typeof vi.fn>;
     getSnapshotAtomic: ReturnType<typeof vi.fn>;
     resize: ReturnType<typeof vi.fn>;
+    acquireFullHold: ReturnType<typeof vi.fn>;
   };
   callbacks: FakeStreamerCallbacks;
   unsubscribe: ReturnType<typeof vi.fn>;
+  releaseFullHold: ReturnType<typeof vi.fn>;
 } {
   const callbacks: FakeStreamerCallbacks = {};
   const unsubscribe = vi.fn();
+  const releaseFullHold = vi.fn();
   const streamer = {
     subscribeAtomic: vi.fn(async (cbs: FakeStreamerCallbacks) => {
       Object.assign(callbacks, cbs);
@@ -157,8 +183,9 @@ function makeFakeStreamer(): {
       snapshotSeq: 8,
     })),
     resize: vi.fn(async () => undefined),
+    acquireFullHold: vi.fn(() => releaseFullHold),
   };
-  return { streamer, callbacks, unsubscribe };
+  return { streamer, callbacks, unsubscribe, releaseFullHold };
 }
 
 function fakePsm(
@@ -1022,5 +1049,99 @@ describe('streamWsPlugin /api/stream — pty unavailable', () => {
       vi.doUnmock('node-pty');
       vi.resetModules();
     }
+  });
+});
+
+describe('streamWsPlugin /api/stream — full-hold lifecycle + preview snapshot refresh', () => {
+  it('full activate acquires a hold on the exact streamer; unsubscribe releases exactly once', async () => {
+    const { streamer, releaseFullHold } = makeFakeStreamer();
+    const { app, port: p } = await startApp();
+    runningApp = app;
+    app.ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    await subscribeActive(ws, reader, 'sub-full', 'full');
+    expect(streamer.acquireFullHold).toHaveBeenCalledTimes(1);
+    expect(releaseFullHold).not.toHaveBeenCalled();
+
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-full' });
+    await waitFor(() => releaseFullHold.mock.calls.length === 1);
+    send(ws, { op: 'unsubscribe', subscriberId: 'sub-full' });
+    await flushAsyncWork();
+    expect(releaseFullHold).toHaveBeenCalledTimes(1);
+    ws.close();
+  });
+
+  it('preview subscribers never acquire a hold', async () => {
+    const { streamer } = makeFakeStreamer();
+    const { app, port: p } = await startApp();
+    runningApp = app;
+    app.ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    await subscribeActive(ws, reader, 'sub-prev', 'preview');
+    expect(streamer.acquireFullHold).not.toHaveBeenCalled();
+    ws.close();
+  });
+
+  it('socket close releases an active full hold', async () => {
+    const { streamer, releaseFullHold } = makeFakeStreamer();
+    const { app, port: p } = await startApp();
+    runningApp = app;
+    app.ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    await subscribeActive(ws, reader, 'sub-full', 'full');
+    ws.close();
+    await waitFor(() => releaseFullHold.mock.calls.length === 1);
+  });
+
+  it('session_gone releases the full hold via the shared releaseSub path', async () => {
+    const { streamer, callbacks, releaseFullHold } = makeFakeStreamer();
+    const { app, port: p } = await startApp();
+    runningApp = app;
+    app.ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    await subscribeActive(ws, reader, 'sub-full', 'full');
+    callbacks.onSessionGone?.();
+    await waitFor(() => releaseFullHold.mock.calls.length === 1);
+    ws.close();
+  });
+
+  it('onSnapshotRefresh re-baselines ACTIVE preview subscribers only; full subscribers never receive it', async () => {
+    const { streamer, callbacks } = makeFakeStreamer();
+    const { app, port: p } = await startApp();
+    runningApp = app;
+    app.ctx.paneStreamerManager = fakePsm(streamer);
+    const ws = openWs(p);
+    const reader = attachMessageReader(ws);
+    await waitOpen(ws);
+
+    await subscribeActive(ws, reader, 'sub-prev', 'preview');
+    await subscribeActive(ws, reader, 'sub-full', 'full');
+
+    callbacks.onSnapshotRefresh?.({ cols: 141, rows: 32, data: 'REFRESHED' }, 99);
+    const msg = await reader.next();
+    expect(msg).toMatchObject({
+      type: 'snapshot',
+      subscriberId: 'sub-prev',
+      cols: 141,
+      rows: 32,
+      data: 'REFRESHED',
+      snapshotSeq: 99,
+    });
+    // Nothing else queued for the full subscriber: the next frame is our ping pong.
+    const pong = await pingBarrier(ws, reader);
+    expect(pong.type).toBe('pong');
+    ws.close();
   });
 });

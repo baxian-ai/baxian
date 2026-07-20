@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { CommandRunner, ExecOptions, ExecResult } from './runner.js';
-import { shellQuote, SshRunner } from './runner.js';
-import { execOutcomeUnknown } from './net-exec.js';
+import { shellQuote } from './runner.js';
+import { execOutcomeUnknown, isTransientNetworkFailure } from './net-exec.js';
 import { isHorizontalRule, tailNonEmpty } from './detect/region.js';
 import { MAX_PROMPT_BYTES } from './prompt.js';
 
@@ -22,20 +22,73 @@ export interface TmuxSessionSnapshot {
   claim: string | null;
 }
 
-export type KillSessionOutcome = 'killed' | 'absent' | 'stale-server' | 'refused';
+export type KillSessionOutcome = 'killed' | 'absent' | 'refused';
+
+// The claim condition a kill must prove server-side, in the same command as the kill itself.
+export type KillClaimCond =
+  | { kind: 'unclaimed' }
+  | { kind: 'equals'; claim: string }
+  | { kind: 'emptyOr'; claim: string };
 
 export const CREATION_NONCE_ENV = 'BAXIAN_CREATION_NONCE';
 const SESSION_REF_FORMAT = '#{pid}|#{start_time}|#{session_id}';
-const STALE_SERVER_MARKER = 'BX_STALE_SERVER';
 const REFUSED_MARKER = 'BX_KILL_REFUSED';
 const TARGET_GONE_MARKER = 'BX_TARGET_GONE';
+const PANE_OK_MARKER = 'BX_PANE_OK';
 
-// Values embedded in tmux command strings; reject rather than escape what tmux quoting can't hold.
-function tmuxSingleQuote(value: string): string {
-  if (value.includes("'") || value.includes('\n')) {
-    throw new Error(`tmux option value ${JSON.stringify(value)} contains unsupported characters`);
+// %n and $n are reused by a fresh server; every pane op re-proves generation+session+pane+claim
+// inside the executing server itself.
+export interface PaneRef {
+  session: TmuxSessionRef;
+  paneId: string;
+  claim: string;
+}
+
+export class PaneGoneError extends Error {
+  constructor(public readonly target: string, detail: string) {
+    super(`tmux target ${target} is gone or no longer owned: ${detail}`);
+    this.name = 'PaneGoneError';
   }
-  return `'${value}'`;
+}
+
+function assertPaneId(paneId: string): void {
+  if (!/^%\d+$/.test(paneId)) {
+    throw new Error(`tmux: malformed pane id ${JSON.stringify(paneId)}`);
+  }
+}
+
+function assertPaneRef(pane: PaneRef): void {
+  assertSessionRef(pane.session);
+  assertPaneId(pane.paneId);
+  assertPlainSessionName(pane.claim);
+}
+
+function generationCond(ref: TmuxSessionRef): string {
+  return `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
+}
+
+function sessionCond(ref: TmuxSessionRef, claim: string): string {
+  return `#{&&:#{&&:${generationCond(ref)},#{==:#{session_id},${ref.sessionId}}},#{==:#{@baxian-agent-id},${claim}}}`;
+}
+
+function paneCond(pane: PaneRef): string {
+  const sess = `#{&&:#{==:#{session_id},${pane.session.sessionId}},#{==:#{pane_id},${pane.paneId}}}`;
+  return `#{&&:#{&&:${generationCond(pane.session)},${sess}},#{==:#{@baxian-agent-id},${pane.claim}}}`;
+}
+
+function assertPlainFormat(fmt: string): void {
+  if (fmt.includes("'") || fmt.includes('\n')) {
+    throw new Error(`tmux format ${JSON.stringify(fmt)} contains unsupported characters`);
+  }
+}
+
+// Newline/NUL cannot survive tmux command re-parsing; everything else round-trips via '\'' splicing.
+export function tmuxQuote(value: string): string {
+  if (value.includes('\n') || value.includes('\0')) {
+    throw new Error(`tmux argument ${JSON.stringify(value)} contains unsupported characters (newline/NUL)`);
+  }
+  if (value === '') return "''";
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function assertSessionRef(ref: TmuxSessionRef): void {
@@ -60,6 +113,107 @@ function assertPlainSessionName(name: string): void {
 export interface PaneInfo {
   paneId: string;
   current: string;
+}
+
+// full: server proves format arithmetic (probe evaluates to 1) — triple ∧ claim ∧ gen guard.
+// legacy: server version parses below 3.2 — triple ∧ claim guard, no numeric gen compare.
+// null: unknown — owner writes are forbidden entirely (fail closed).
+export type OwnerWriteCapability = 'full' | 'legacy' | null;
+
+export interface WindowGeometry {
+  width: number;
+  height: number;
+  statusLines: number;
+  sizeMode: string;
+  ownerGen: number | null;
+  ref: TmuxSessionRef;
+  claim: string;
+  ownerWriteCapability: OwnerWriteCapability;
+}
+
+// One read carries geometry, owner state, non-reusable session identity, the
+// session claim, and a feature probe evaluated by the same server that will
+// evaluate write guards (plus its version for the legacy determination).
+const WINDOW_GEOMETRY_FORMAT =
+  '#{window_width} #{window_height} #{status} #{window-size} ' +
+  '#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}';
+
+const TMUX_VERSION_RE = /^(?:next-)?(\d+)\.(\d+)/;
+
+export function classifyOwnerWriteCapability(versionRaw: string, probeRaw: string): OwnerWriteCapability {
+  if (probeRaw === '1') return 'full';
+  const m = TMUX_VERSION_RE.exec(versionRaw.trim());
+  if (!m) return null;
+  const major = parseInt(m[1], 10);
+  const minor = parseInt(m[2], 10);
+  if (major > 3 || (major === 3 && minor >= 2)) {
+    // A >=3.2 server whose arithmetic probe did NOT evaluate is contradictory
+    // evidence — never downgrade it to an unguarded-adjacent path.
+    return null;
+  }
+  return 'legacy';
+}
+
+export interface TtySize {
+  cols: number;
+  rows: number;
+}
+
+// A client's usable content area excludes its status line(s); tmux only keeps the
+// scroll-optimized incremental stream for clients whose content area matches the
+// window size, so both conversions must stay N-aware or geometry runs away.
+export function contentArea(tty: TtySize, statusLines: number): TtySize {
+  return { cols: tty.cols, rows: Math.max(1, tty.rows - statusLines) };
+}
+
+export function desiredTty(geometry: { width: number; height: number; statusLines: number }): TtySize {
+  return { cols: geometry.width, rows: geometry.height + geometry.statusLines };
+}
+
+export function parseStatusLines(raw: string): number {
+  if (raw === 'off') return 0;
+  if (raw === 'on') return 1;
+  if (/^[2-5]$/.test(raw)) return parseInt(raw, 10);
+  throw new Error(`tmux: unrecognized status value ${JSON.stringify(raw)}`);
+}
+
+export function parseWindowGeometry(stdout: string): WindowGeometry {
+  const line = stdout.replace(/\n+$/, '');
+  const m = /^(\d+) (\d+) (\S+) (\S*) ([^|]*)\|(\d+)\|(\d+)\|(\$\d+)\|([^|]*)\|([^|]*)\|(.*)$/.exec(line);
+  if (!m) {
+    throw new Error(`tmux: unparseable window geometry ${JSON.stringify(line)}`);
+  }
+  const [, w, h, status, sizeMode, genRaw, pid, start, sessionId, claim, versionRaw, probeRaw] = m;
+  const width = parseInt(w, 10);
+  const height = parseInt(h, 10);
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
+    throw new Error(`tmux: invalid window geometry ${w}x${h}`);
+  }
+  let ownerGen: number | null = null;
+  if (genRaw !== '') {
+    const parsed = Number(genRaw);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      throw new Error(`tmux: invalid @bx_owner_gen ${JSON.stringify(genRaw)}`);
+    }
+    ownerGen = parsed;
+  }
+  return {
+    width,
+    height,
+    statusLines: parseStatusLines(status),
+    sizeMode,
+    ownerGen,
+    ref: { serverPid: pid, serverStart: start, sessionId },
+    claim,
+    ownerWriteCapability: classifyOwnerWriteCapability(versionRaw, probeRaw),
+  };
+}
+
+export class SessionAbsentError extends Error {
+  constructor(name: string, detail: string) {
+    super(`tmux session ${name} is absent: ${detail}`);
+    this.name = 'SessionAbsentError';
+  }
 }
 
 export interface CapturePaneOpts {
@@ -556,15 +710,20 @@ export class TmuxManager {
     );
   }
 
-  private async readCreationNonce(name: string): Promise<string | null> {
+  private async readCreationNonce(name: string, opts?: ExecOptions): Promise<string | null> {
     assertPlainSessionName(name);
     const result = await run(
       this.runner,
       `tmux show-environment -t ${shellQuote(`=${name}:`)} ${CREATION_NONCE_ENV}`,
+      opts,
     );
     if (result.exitCode === 0) {
       const line = result.stdout.trim();
       return line.startsWith(`${CREATION_NONCE_ENV}=`) ? line.slice(CREATION_NONCE_ENV.length + 1) : null;
+    }
+    // Transient-network / 255 markers on either stream must NOT be read as "no nonce"; treat as unknown.
+    if (tmuxProbeOutcomeUnknown(result)) {
+      throw new Error(`tmux creation-nonce probe for ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && (isUnknownTmuxVariable(result.stderr) || isSessionAbsent(result.stderr))) {
       return null;
@@ -573,12 +732,13 @@ export class TmuxManager {
   }
 
   // Ref and claim come from one round trip — the claim can't belong to a different session.
-  async getSessionSnapshot(name: string): Promise<TmuxSessionSnapshot | null> {
+  async getSessionSnapshot(name: string, opts?: ExecOptions): Promise<TmuxSessionSnapshot | null> {
     assertPlainSessionName(name);
     const result = await run(
       this.runner,
       `tmux list-sessions -F '${SESSION_REF_FORMAT}|#{@baxian-agent-id}' ` +
         `-f ${shellQuote(`#{==:#{session_name},${name}}`)}`,
+      opts,
     );
     if (result.exitCode === 0) {
       const line = result.stdout.trim();
@@ -591,32 +751,34 @@ export class TmuxManager {
       const claim = line.slice(sep + 1);
       return { ref, claim: claim === '' ? null : claim };
     }
+    if (tmuxProbeOutcomeUnknown(result)) {
+      throw new Error(`tmux getSessionSnapshot ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+    }
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return null;
     throw new Error(`tmux getSessionSnapshot ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
   }
 
-  async hasCreationNonce(name: string): Promise<boolean> {
-    return (await this.readCreationNonce(name)) !== null;
+  async hasCreationNonce(name: string, opts?: ExecOptions): Promise<boolean> {
+    return (await this.readCreationNonce(name, opts)) !== null;
   }
 
-  // With a dead id and a single surviving session, tmux target lookup silently
-  // falls back to that survivor — and a fresh server reissues the same $n. Every
-  // by-ref write re-proves id AND server generation inside the server itself.
+  // Every session-option write re-proves generation+session+claim inside the server itself;
+  // expectedClaim '' is the fresh-create batch writing the claim onto a still-unclaimed session.
   async setSessionOptionsIfAlive(
     ref: TmuxSessionRef,
     entries: ReadonlyArray<readonly [string, string]>,
+    opts: { expectedClaim: string },
   ): Promise<'applied' | 'gone'> {
     assertSessionRef(ref);
+    if (opts.expectedClaim !== '') assertPlainSessionName(opts.expectedClaim);
     if (entries.length === 0) return 'applied';
     const sets = entries
-      .map(([key, value]) => `set-option -t '${ref.sessionId}' ${key} ${tmuxSingleQuote(value)}`)
+      .map(([key, value]) => `set-option -t '${ref.sessionId}' ${key} ${tmuxQuote(value)}`)
       .join(' ; ');
-    const generation = `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
-    const cond = `#{&&:${generation},#{==:#{session_id},${ref.sessionId}}}`;
     const result = await run(
       this.runner,
       `tmux if-shell -t ${shellQuote(ref.sessionId)} ` +
-        `-F ${shellQuote(cond)} ` +
+        `-F ${shellQuote(sessionCond(ref, opts.expectedClaim))} ` +
         `${shellQuote(sets)} ` +
         `${shellQuote(`display-message -p ${TARGET_GONE_MARKER}`)}`,
     );
@@ -629,21 +791,74 @@ export class TmuxManager {
     );
   }
 
-  // list-panes -a with an exact id+generation filter cannot fall back to another
-  // session, and a fresh server reissuing the same $n fails the generation half.
-  async getSinglePaneIdByRef(ref: TmuxSessionRef): Promise<string> {
+  async getSessionOptionByRef(ref: TmuxSessionRef, claim: string, key: string): Promise<string | null> {
     assertSessionRef(ref);
-    const generation = `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
+    assertPlainSessionName(claim);
+    assertPlainFormat(key);
+    const result = await run(
+      this.runner,
+      `tmux if-shell -t ${shellQuote(ref.sessionId)} ` +
+        `-F ${shellQuote(sessionCond(ref, claim))} ` +
+        `${shellQuote(`display-message -p -t '${ref.sessionId}' '${PANE_OK_MARKER}#{${key}}'`)} ` +
+        `${shellQuote(`display-message -p ${TARGET_GONE_MARKER}`)}`,
+    );
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
+      throw new PaneGoneError(ref.sessionId, result.stderr.trim());
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(`tmux getSessionOptionByRef ${ref.sessionId} ${key} failed: ${result.stderr}`);
+    }
+    const firstLine = result.stdout.split('\n', 1)[0];
+    if (!firstLine.startsWith(PANE_OK_MARKER)) {
+      throw new PaneGoneError(ref.sessionId, 'identity condition failed');
+    }
+    const value = firstLine.slice(PANE_OK_MARKER.length);
+    return value === '' ? null : value;
+  }
+
+  // The web-terminal resize path: size change and window-size pin ride one claim-checked command.
+  async resizeWindowByRef(ref: TmuxSessionRef, claim: string, cols: number, rows: number): Promise<void> {
+    assertSessionRef(ref);
+    assertPlainSessionName(claim);
+    if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
+      throw new Error(`tmux resizeWindowByRef: invalid dimensions ${cols}x${rows}`);
+    }
+    const inner = `resize-window -t '${ref.sessionId}' -x ${cols} -y ${rows} ; ` +
+      `set-option -t '${ref.sessionId}' window-size latest`;
+    const result = await run(
+      this.runner,
+      `tmux if-shell -t ${shellQuote(ref.sessionId)} ` +
+        `-F ${shellQuote(sessionCond(ref, claim))} ` +
+        `${shellQuote(inner)} ` +
+        `${shellQuote(`display-message -p ${TARGET_GONE_MARKER}`)}`,
+    );
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
+      throw new PaneGoneError(ref.sessionId, result.stderr.trim());
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(`tmux resizeWindowByRef ${ref.sessionId} failed: ${result.stderr}`);
+    }
+    if (result.stdout.includes(TARGET_GONE_MARKER)) {
+      throw new PaneGoneError(ref.sessionId, 'identity condition failed');
+    }
+  }
+
+  // list-panes -a with an exact generation+session+claim filter cannot fall back to another
+  // session, and a fresh server reissuing the same $n fails the generation half.
+  async getSinglePaneByRef(ref: TmuxSessionRef, claim: string, opts?: ExecOptions): Promise<PaneRef> {
+    assertSessionRef(ref);
+    assertPlainSessionName(claim);
     const result = await run(
       this.runner,
       `tmux list-panes -a -F '#{pane_id} #{pane_current_command}' ` +
-        `-f ${shellQuote(`#{&&:${generation},#{==:#{session_id},${ref.sessionId}}}`)}`,
+        `-f ${shellQuote(sessionCond(ref, claim))}`,
+      opts,
     );
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
       throw new Error(`tmux session ${ref.sessionId} is gone (no server)`);
     }
     if (result.exitCode !== 0) {
-      throw new Error(`tmux getSinglePaneIdByRef ${ref.sessionId} failed: ${result.stderr}`);
+      throw new Error(`tmux getSinglePaneByRef ${ref.sessionId} failed: ${result.stderr}`);
     }
     const panes = result.stdout.split('\n').map(l => l.trim()).filter(Boolean);
     if (panes.length === 0) {
@@ -654,77 +869,155 @@ export class TmuxManager {
         `tmux session ${ref.sessionId} has ${panes.length} panes; baxian expects exactly one — external split-window not supported`,
       );
     }
-    return panes[0].split(' ')[0];
+    const paneId = panes[0].split(' ')[0];
+    assertPaneId(paneId);
+    return { session: ref, paneId, claim };
   }
 
-  // Generation (and opted-in claim-still-empty) are evaluated inside the killing server itself.
-  async killSessionRef(
-    ref: TmuxSessionRef,
-    opts: { onlyIfUnclaimed?: boolean } = {},
-  ): Promise<KillSessionOutcome> {
+  // Generation AND the caller-declared claim condition are evaluated inside the killing server itself.
+  async killSessionRef(ref: TmuxSessionRef, claimCond: KillClaimCond, opts?: ExecOptions): Promise<KillSessionOutcome> {
     assertSessionRef(ref);
-    const generation = `#{&&:#{==:#{pid},${ref.serverPid}},#{==:#{start_time},${ref.serverStart}}}`;
-    const cond = opts.onlyIfUnclaimed
-      ? `#{&&:${generation},#{==:#{@baxian-agent-id},}}`
-      : generation;
-    const marker = opts.onlyIfUnclaimed ? REFUSED_MARKER : STALE_SERVER_MARKER;
-    const target = opts.onlyIfUnclaimed ? `-t ${shellQuote(ref.sessionId)} ` : '';
+    let claimClause: string;
+    if (claimCond.kind === 'unclaimed') {
+      claimClause = '#{==:#{@baxian-agent-id},}';
+    } else {
+      assertPlainSessionName(claimCond.claim);
+      claimClause = claimCond.kind === 'equals'
+        ? `#{==:#{@baxian-agent-id},${claimCond.claim}}`
+        : `#{||:#{==:#{@baxian-agent-id},},#{==:#{@baxian-agent-id},${claimCond.claim}}}`;
+    }
+    const cond = `#{&&:#{&&:${generationCond(ref)},#{==:#{session_id},${ref.sessionId}}},${claimClause}}`;
     const result = await run(
       this.runner,
-      `tmux if-shell ${target}-F ${shellQuote(cond)} ` +
+      `tmux if-shell -t ${shellQuote(ref.sessionId)} -F ${shellQuote(cond)} ` +
         `${shellQuote(`kill-session -t '${ref.sessionId}'`)} ` +
-        `${shellQuote(`display-message -p ${marker}`)}`,
+        `${shellQuote(`display-message -p ${REFUSED_MARKER}`)}`,
+      opts,
     );
     if (result.exitCode === 0) {
-      if (result.stdout.includes(REFUSED_MARKER)) return 'refused';
-      return result.stdout.includes(STALE_SERVER_MARKER) ? 'stale-server' : 'killed';
+      return result.stdout.includes(REFUSED_MARKER) ? 'refused' : 'killed';
+    }
+    // Transient / 255 must not be read as "absent" — a stuck kill would otherwise let DELETE drop the session.
+    if (tmuxProbeOutcomeUnknown(result)) {
+      throw new Error(`tmux killSessionRef ${ref.sessionId} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return 'absent';
-    if (result.exitCode === 255) {
-      throw new Error(`tmux killSessionRef ${ref.sessionId} runner error (ssh/exec layer): ${result.stderr}`);
-    }
     throw new Error(`tmux killSessionRef ${ref.sessionId} unexpected exit ${result.exitCode}: ${result.stderr}`);
   }
 
-  async sendInput(name: string, data: string): Promise<void> {
-    if (data.length === 0) return;
-    const bufName = `bx-input-${randomUUID()}`;
-    const payload = Buffer.from(data, 'utf8');
-    const loadCmd = `tmux load-buffer -b ${shellQuote(bufName)} -`;
-    const pasteCmd = `tmux paste-buffer -d -b ${shellQuote(bufName)} -t ${shellQuote(`=${name}:`)}`;
-    const deleteCmd = `tmux delete-buffer -b ${shellQuote(bufName)}`;
-
-    try {
-      const r1 = this.runner instanceof SshRunner
-        ? await this.runner.execRawRemoteWithStdin(loadCmd, payload)
-        : await this.runner.execWithStdin(loadCmd, payload);
-      if (r1.exitCode !== 0) {
-        throw new Error(`tmux sendInput ${name} load-buffer failed: ${r1.stderr || 'unknown error'}`);
-      }
-      const r2 = await run(this.runner, pasteCmd);
-      if (r2.exitCode !== 0) {
-        throw new Error(`tmux sendInput ${name} paste-buffer failed: ${r2.stderr || 'unknown error'}`);
-      }
-    } finally {
-      try {
-        const del = await run(this.runner, deleteCmd);
-        // paste -d already deleted it on success; absent is the norm, not a leak.
-        if (del.exitCode !== 0 && !isUnknownTmuxBuffer(del.stderr)) {
-          console.warn(`[tmux] sendInput ${name}: delete-buffer failed (input may linger in tmux): ${del.stderr.trim() || `exit ${del.exitCode}`}`);
-        }
-      } catch (err) {
-        console.warn(`[tmux] sendInput ${name}: delete-buffer failed (input may linger in tmux):`, err);
-      }
-    }
-  }
-
-  async resizeWindow(name: string, cols: number, rows: number): Promise<void> {
+  private async guardedPaneWrite(pane: PaneRef, inner: string[], opts?: ExecOptions): Promise<void> {
+    assertPaneRef(pane);
     const result = await run(
       this.runner,
-      `tmux resize-window -t ${shellQuote(`=${name}`)} -x ${cols} -y ${rows}`,
+      `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(paneCond(pane))} ` +
+        `${shellQuote(inner.join(' ; '))} ` +
+        `${shellQuote(`display-message -p ${TARGET_GONE_MARKER}`)}`,
+      opts,
+    );
+    if (result.exitCode === 0) {
+      if (result.stdout.includes(TARGET_GONE_MARKER)) {
+        throw new PaneGoneError(pane.paneId, 'identity condition failed');
+      }
+      return;
+    }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
+      throw new PaneGoneError(pane.paneId, result.stderr.trim());
+    }
+    throw new Error(`tmux guarded write to ${pane.paneId} failed (exit ${result.exitCode}): ${result.stderr}`);
+  }
+
+  // Marker-first read: the FIRST line decides ok/gone, so pane text can never spoof the verdict.
+  private async guardedPaneRead(
+    pane: PaneRef,
+    headerFmt: string,
+    extra: string[] = [],
+    opts?: ExecOptions,
+  ): Promise<{ header: string; body: string }> {
+    assertPaneRef(pane);
+    assertPlainFormat(headerFmt);
+    const inner = [
+      `display-message -p -t ${pane.paneId} '${PANE_OK_MARKER}${headerFmt}'`,
+      ...extra,
+    ].join(' ; ');
+    const result = await run(
+      this.runner,
+      `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(paneCond(pane))} ` +
+        `${shellQuote(inner)} ` +
+        `${shellQuote(`display-message -p ${TARGET_GONE_MARKER}`)}`,
+      opts,
+    );
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
+      throw new PaneGoneError(pane.paneId, result.stderr.trim());
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(`tmux guarded read of ${pane.paneId} failed (exit ${result.exitCode}): ${result.stderr}`);
+    }
+    const nl = result.stdout.indexOf('\n');
+    const firstLine = nl === -1 ? result.stdout : result.stdout.slice(0, nl);
+    if (!firstLine.startsWith(PANE_OK_MARKER)) {
+      throw new PaneGoneError(pane.paneId, 'identity condition failed');
+    }
+    return {
+      header: firstLine.slice(PANE_OK_MARKER.length),
+      body: nl === -1 ? '' : result.stdout.slice(nl + 1),
+    };
+  }
+
+  // Absent / transient / other failures are distinct outcomes: SSH flakes and
+  // exit 255 must never be read as "session gone" (three-state discipline).
+  async getWindowGeometry(name: string, opts?: ExecOptions): Promise<WindowGeometry> {
+    assertPlainSessionName(name);
+    const result = await run(
+      this.runner,
+      `tmux display-message -p -t ${shellQuote(`=${name}:`)} ${shellQuote(WINDOW_GEOMETRY_FORMAT)}`,
+      opts,
+    );
+    if (result.exitCode === 0) return parseWindowGeometry(result.stdout);
+    if (tmuxProbeOutcomeUnknown(result)) {
+      throw new Error(`tmux getWindowGeometry ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+    }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
+      throw new SessionAbsentError(name, result.stderr.trim());
+    }
+    throw new Error(`tmux getWindowGeometry ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
+  }
+
+  // The guard re-evaluates identity + claim (+ generation when the server proves
+  // format arithmetic) inside the tmux server at execution time: a delayed write —
+  // stale gen, a same-name session rebuilt after ours died, or a foreign/unclaimed
+  // same-name session — lands as a no-op instead of mutating a window we don't own.
+  async ownerWrite(
+    name: string,
+    ref: TmuxSessionRef,
+    claim: string,
+    gen: number | null,
+    mode: 'manual' | 'latest',
+    resizeTo: { cols: number; rows: number } | undefined,
+    opts?: ExecOptions,
+  ): Promise<void> {
+    assertPlainSessionName(name);
+    assertSessionRef(ref);
+    assertPlainSessionName(claim);
+    if (gen !== null && (!Number.isSafeInteger(gen) || gen < 0)) {
+      throw new Error(`tmux ownerWrite ${name}: invalid generation ${gen}`);
+    }
+    const target = `=${name}:`;
+    const identityAndClaim = sessionCond(ref, claim);
+    const guard = gen === null
+      ? identityAndClaim
+      : `#{&&:${identityAndClaim},#{?#{@bx_owner_gen},#{e|<=:#{@bx_owner_gen},${gen}},1}}`;
+    const actions = [
+      ...(gen !== null ? [`set-option -t "${target}" @bx_owner_gen ${gen}`] : []),
+      `set-option -t "${target}" window-size ${mode}`,
+      ...(resizeTo ? [`resize-window -t "${target}" -x ${resizeTo.cols} -y ${resizeTo.rows}`] : []),
+    ].join(' ; ');
+    const result = await run(
+      this.runner,
+      `tmux if-shell -F -t ${shellQuote(target)} ${shellQuote(guard)} ${shellQuote(actions)} ''`,
+      opts,
     );
     if (result.exitCode !== 0) {
-      throw new Error(`tmux resizeWindow ${name} failed: ${result.stderr}`);
+      throw new Error(`tmux ownerWrite ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
     }
   }
 
@@ -735,80 +1028,30 @@ export class TmuxManager {
       opts,
     );
     if (result.exitCode === 0) return true;
-    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return false;
-    if (result.exitCode === 255) {
-      throw new Error(`tmux hasSession ${name} runner error (ssh/exec layer): ${result.stderr}`);
+    if (tmuxProbeOutcomeUnknown(result)) {
+      throw new Error(`tmux hasSession ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
+    if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return false;
     throw new Error(`tmux hasSession ${name} unexpected exit ${result.exitCode}: ${result.stderr}`);
   }
 
-  async listPanes(name: string, opts?: ExecOptions): Promise<PaneInfo[]> {
-    const result = await run(
-      this.runner,
-      `tmux list-panes -t ${shellQuote(`=${name}`)} -F '#{pane_id} #{pane_current_command}'`,
-      opts,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux listPanes ${name} failed: ${result.stderr}`);
-    }
-    return result.stdout
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .map(line => {
-        const idx = line.indexOf(' ');
-        return idx === -1
-          ? { paneId: line, current: '' }
-          : { paneId: line.slice(0, idx), current: line.slice(idx + 1) };
-      });
+  async displayMessage(pane: PaneRef, fmt: string, opts?: ExecOptions): Promise<string> {
+    const { header } = await this.guardedPaneRead(pane, fmt, [], opts);
+    return header;
   }
 
-  async getSinglePaneId(name: string, opts?: ExecOptions): Promise<string> {
-    const panes = await this.listPanes(name, opts);
-    if (panes.length === 0) {
-      throw new Error(`tmux session ${name} has no panes`);
-    }
-    if (panes.length > 1) {
-      throw new Error(
-        `tmux session ${name} has ${panes.length} panes; baxian expects exactly one — external split-window not supported`,
-      );
-    }
-    return panes[0].paneId;
-  }
-
-  async displayMessage(paneId: string, fmt: string, opts?: ExecOptions): Promise<string> {
-    const result = await run(
-      this.runner,
-      `tmux display-message -p -t ${shellQuote(paneId)} ${shellQuote(fmt)}`,
-      opts,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux displayMessage ${paneId} failed: ${result.stderr}`);
-    }
-    return result.stdout.replace(/\n$/, '');
-  }
-
-  async getPaneCurrentPath(paneId: string, opts?: ExecOptions): Promise<string> {
-    const path = await this.displayMessage(paneId, '#{pane_current_path}', opts);
-    if (path === '') throw new Error(`tmux pane ${paneId} has an empty current path`);
+  async getPaneCurrentPath(pane: PaneRef, opts?: ExecOptions): Promise<string> {
+    const path = await this.displayMessage(pane, '#{pane_current_path}', opts);
+    if (path === '') throw new Error(`tmux pane ${pane.paneId} has an empty current path`);
     return path;
   }
 
-  async readPaneTitle(paneId: string, opts?: ExecOptions): Promise<string> {
+  // A gone pane reads as an empty title on purpose: title is an advisory signal, never an authority.
+  async readPaneTitle(pane: PaneRef, opts?: ExecOptions): Promise<string> {
     try {
-      return await this.displayMessage(paneId, '#{pane_title}', opts);
+      return await this.displayMessage(pane, '#{pane_title}', opts);
     } catch {
       return '';
-    }
-  }
-
-  async setOption(name: string, key: string, value: string): Promise<void> {
-    const result = await run(
-      this.runner,
-      `tmux set-option -t ${shellQuote(`=${name}:`)} ${shellQuote(key)} ${shellQuote(value)}`,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux setOption ${name} ${key} failed: ${result.stderr}`);
     }
   }
 
@@ -836,52 +1079,20 @@ export class TmuxManager {
     }
   }
 
-  async getOption(name: string, key: string): Promise<string | null> {
-    const result = await run(
-      this.runner,
-      `tmux show-option -t ${shellQuote(`=${name}:`)} -v ${shellQuote(key)}`,
-    );
-    if (result.exitCode === 0) {
-      const trimmed = result.stdout.replace(/\n$/, '');
-      return trimmed === '' ? null : trimmed;
-    }
-    if (result.exitCode === 1) return null;
-    throw new Error(`tmux getOption ${name} ${key} unexpected exit ${result.exitCode}: ${result.stderr}`);
-  }
-
-  async sendKeysToPane(paneId: string, ...keys: string[]): Promise<void> {
+  async sendKeysToPane(pane: PaneRef, ...keys: string[]): Promise<void> {
     if (keys.length === 0) return;
-    const args = keys.map(k => shellQuote(k)).join(' ');
-    const result = await run(
-      this.runner,
-      `tmux send-keys -t ${shellQuote(paneId)} ${args}`,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux sendKeys ${paneId} failed: ${result.stderr}`);
-    }
+    await this.guardedPaneWrite(pane, [
+      `send-keys -t ${pane.paneId} ${keys.map(k => tmuxQuote(k)).join(' ')}`,
+    ]);
   }
 
-  async sendKeysLiteral(paneId: string, text: string): Promise<void> {
-    const result = await run(
-      this.runner,
-      `tmux send-keys -l -t ${shellQuote(paneId)} ${shellQuote(text)}`,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux sendKeysLiteral ${paneId} failed: ${result.stderr}`);
-    }
+  async sendKeysLiteral(pane: PaneRef, text: string): Promise<void> {
+    await this.guardedPaneWrite(pane, [
+      `send-keys -l -t ${pane.paneId} ${tmuxQuote(text)}`,
+    ]);
   }
 
-  async sendKeys(name: string, keys: string): Promise<void> {
-    const result = await run(
-      this.runner,
-      `tmux send-keys -t ${shellQuote(name)} ${shellQuote(keys)} Enter`,
-    );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux sendKeys ${name} failed: ${result.stderr}`);
-    }
-  }
-
-  async capturePaneById(paneId: string, opts: CapturePaneOpts = {}): Promise<string> {
+  async capturePaneById(pane: PaneRef, opts: CapturePaneOpts = {}): Promise<string> {
     const ansi = opts.ansi ?? false;
     const scrollback = opts.scrollback;
     const flags: string[] = ['-p', '-J'];
@@ -892,39 +1103,103 @@ export class TmuxManager {
       flags.push('-S', '0');
     }
     const execOpts = opts.timeoutMs ? { timeout: opts.timeoutMs } : undefined;
-    const result = await run(
-      this.runner,
-      `tmux capture-pane ${flags.join(' ')} -t ${shellQuote(paneId)}`,
+    const { body } = await this.guardedPaneRead(
+      pane,
+      '',
+      [`capture-pane ${flags.join(' ')} -t ${pane.paneId}`],
       execOpts,
     );
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux capturePane ${paneId} failed: ${result.stderr || 'unknown error'}`);
-    }
-    return result.stdout;
+    return body;
   }
 
-  async injectPrompt(
-    paneId: string,
-    prompt: string,
-    agentId: string,
-  ): Promise<{ pasted: boolean }> {
+  // Probe-gated stdin load (bytes reach a buffer only on a five-field identity match, no openssl) then a claim-checked paste; once the load is confirmed, any paste non-success reconciles the named buffer so nothing leaks.
+  async injectPrompt(pane: PaneRef, prompt: string, agentId: string): Promise<void> {
+    assertPaneRef(pane);
     const bytes = Buffer.byteLength(prompt, 'utf8');
     if (bytes > MAX_PROMPT_BYTES) {
       throw new Error(
-        `tmux injectPrompt ${paneId} prompt too large: ${bytes} bytes > ${MAX_PROMPT_BYTES}`,
+        `tmux injectPrompt ${pane.paneId} prompt too large: ${bytes} bytes > ${MAX_PROMPT_BYTES}`,
       );
     }
-    const promptB64 = Buffer.from(prompt, 'utf8').toString('base64');
     const buf = `baxian-${agentId}-${randomUUID()}`;
-    const cmd =
-      `printf '%s' ${shellQuote(promptB64)} | openssl base64 -d -A | ` +
-      `tmux load-buffer -b ${shellQuote(buf)} - && ` +
-      `tmux paste-buffer -b ${shellQuote(buf)} -t ${shellQuote(paneId)} -d -p -r`;
-    const result = await run(this.runner, cmd);
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux injectPrompt ${paneId} failed: ${result.stderr}`);
+    const payload = Buffer.from(prompt, 'utf8');
+    const probeFmt = '#{pid}|#{start_time}|#{session_id}|#{pane_id}|#{@baxian-agent-id}';
+    const expected = [
+      pane.session.serverPid, pane.session.serverStart, pane.session.sessionId,
+      pane.paneId, pane.claim,
+    ].join('|');
+    const loadCmd =
+      `[ "$(tmux display-message -p -t ${shellQuote(pane.paneId)} '${probeFmt}')" = ${shellQuote(expected)} ] && ` +
+      `tmux load-buffer -b ${shellQuote(buf)} -`;
+    // Step 1 — probe-gated load via execWithStdin (login-shell PATH resolves tmux); a failed gate/load leaves NO buffer, only an unknown outcome reconciles.
+    let loaded: ExecResult;
+    try {
+      loaded = await this.runner.execWithStdin(loadCmd, payload);
+    } catch (err) {
+      await this.reconcileInjectBuffer(buf, `load exec rejected: ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(
+        `tmux injectPrompt ${pane.paneId} failed (load exec layer): ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
-    return { pasted: true };
+    if (loaded.exitCode !== 0) {
+      if (execOutcomeUnknown(loaded)) {
+        await this.reconcileInjectBuffer(buf, `load outcome unknown (exit ${loaded.exitCode}): ${loaded.stderr.trim()}`);
+        throw new Error(`tmux injectPrompt ${pane.paneId} load outcome unknown (exit ${loaded.exitCode}): ${loaded.stderr}`);
+      }
+      if (isSessionAbsent(loaded.stderr)) throw new PaneGoneError(pane.paneId, loaded.stderr.trim());
+      throw new PaneGoneError(
+        pane.paneId,
+        `identity probe or buffer load failed before any buffer was created: ${loaded.stderr.trim() || 'probe mismatch'}`,
+      );
+    }
+    // Step 2 — the buffer now exists. Any non-success here may leave it behind → reconcile by name.
+    const pasteCmd =
+      `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(paneCond(pane))} ` +
+        `${shellQuote(`paste-buffer -b ${buf} -t ${pane.paneId} -d -p -r`)} ` +
+        `${shellQuote(`delete-buffer -b ${buf} ; display-message -p ${TARGET_GONE_MARKER}`)}`;
+    let pasted: ExecResult;
+    try {
+      pasted = await run(this.runner, pasteCmd);
+    } catch (err) {
+      await this.reconcileInjectBuffer(buf, `paste exec rejected: ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(
+        `tmux injectPrompt ${pane.paneId} failed (paste exec layer): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (pasted.exitCode === 0) {
+      if (pasted.stdout.includes(TARGET_GONE_MARKER)) {
+        throw new PaneGoneError(pane.paneId, 'identity condition failed at paste (buffer self-cleaned)');
+      }
+      return;
+    }
+    // Non-zero after a confirmed load (e.g. pane vanished before if-shell resolved -t, returning
+    // "can't find pane") does NOT run the else-branch, so the buffer lingers — reconcile by name.
+    await this.reconcileInjectBuffer(buf, `paste failed (exit ${pasted.exitCode}): ${pasted.stderr.trim()}`);
+    if (pasted.exitCode === 1 && (isSessionAbsent(pasted.stderr) || isTargetGone(pasted.stderr))) {
+      throw new PaneGoneError(pane.paneId, pasted.stderr.trim() || 'pane gone before paste');
+    }
+    throw new Error(`tmux injectPrompt ${pane.paneId} paste failed (exit ${pasted.exitCode}): ${pasted.stderr}`);
+  }
+
+  // The uuid buffer name is the non-rebindable credential: deleting it by name on any server removes only this call's bytes, so reconciliation ignores generation.
+  private async reconcileInjectBuffer(buf: string, cause: string): Promise<void> {
+    try {
+      const del = await run(this.runner, `tmux delete-buffer -b ${shellQuote(buf)}`);
+      if (del.exitCode === 0) {
+        console.warn(`[tmux] injectPrompt reconcile: removed leftover buffer ${buf} (${cause})`);
+        return;
+      }
+      if (del.exitCode === 1 && (isUnknownTmuxBuffer(del.stderr) || isSessionAbsent(del.stderr))) return;
+      console.warn(
+        `[tmux] injectPrompt reconcile: buffer ${buf} cleanup NOT confirmed ` +
+          `(exit ${del.exitCode}: ${del.stderr.trim()}); prompt may linger in tmux (${cause})`,
+      );
+    } catch (err) {
+      console.warn(
+        `[tmux] injectPrompt reconcile: buffer ${buf} cleanup NOT confirmed; prompt may linger in tmux (${cause}):`,
+        err,
+      );
+    }
   }
 
   // Staging split from pasting lets a caller fence the paste after every await the staging exec hides.
@@ -935,15 +1210,13 @@ export class TmuxManager {
         `tmux stagePromptBuffer ${paneId} prompt too large: ${bytes} bytes > ${MAX_PROMPT_BYTES}`,
       );
     }
-    const promptB64 = Buffer.from(prompt, 'utf8').toString('base64');
     const buf = `baxian-${agentId}-${randomUUID()}`;
+    const payload = Buffer.from(prompt, 'utf8');
     let result: ExecResult;
     let transportErr: unknown;
     try {
-      result = await run(
-        this.runner,
-        `printf '%s' ${shellQuote(promptB64)} | openssl base64 -d -A | tmux load-buffer -b ${shellQuote(buf)} -`,
-      );
+      // Raw stdin load (no openssl) — same transport as injectPrompt, keeping the guard path openssl-free.
+      result = await this.runner.execWithStdin(`tmux load-buffer -b ${shellQuote(buf)} -`, payload);
     } catch (err) {
       transportErr = err;
       result = { stdout: '', stderr: '', exitCode: 255 };
@@ -995,43 +1268,34 @@ export class TmuxManager {
     }
   }
 
-  async capturePaneSnapshot(paneId: string): Promise<string> {
-    const SEP = '___bx-snap-sep___';
-    const cmd =
-      `tmux capture-pane -t ${shellQuote(paneId)} -e -p && ` +
-      `printf '%s\\n' ${shellQuote(SEP)} && ` +
-      `tmux display-message -t ${shellQuote(paneId)} -p '#{history_size}'`;
-    const result = await run(this.runner, cmd);
-    if (result.exitCode !== 0) {
-      throw new Error(`tmux capturePaneSnapshot ${paneId} failed: ${result.stderr || 'unknown error'}`);
-    }
-    const idx = result.stdout.lastIndexOf(`${SEP}\n`);
-    if (idx < 0) {
-      throw new Error(`tmux capturePaneSnapshot ${paneId}: separator missing in output`);
-    }
-    const visible = stripAnsi(result.stdout.slice(0, idx));
-    const history = result.stdout.slice(idx + SEP.length + 1).trim();
-    return `${visible}\n---history_size:${history}---`;
+  async capturePaneSnapshot(pane: PaneRef): Promise<string> {
+    const { header, body } = await this.guardedPaneRead(
+      pane,
+      '|#{history_size}',
+      [`capture-pane -t ${pane.paneId} -e -p`],
+    );
+    const history = header.replace(/^\|/, '').trim();
+    return `${stripAnsi(body)}\n---history_size:${history}---`;
   }
 
-  async sendEnter(paneId: string): Promise<void> {
-    await this.sendKeysToPane(paneId, 'Enter');
+  async sendEnter(pane: PaneRef): Promise<void> {
+    await this.sendKeysToPane(pane, 'Enter');
   }
 
   // 空格先弄脏 composer——空 composer 上 C-c 会退出 codex；间隔防止连发被 codex 粘贴检测合并。
-  async clearComposerDraft(paneId: string): Promise<void> {
-    await this.sendKeysLiteral(paneId, ' ');
+  async clearComposerDraft(pane: PaneRef): Promise<void> {
+    await this.sendKeysLiteral(pane, ' ');
     await sleep(COMPOSER_DIRTY_SETTLE_MS);
-    await this.sendKeysToPane(paneId, 'C-c');
+    await this.sendKeysToPane(pane, 'C-c');
   }
 
-  async captureSettledSnapshot(paneId: string, opts: WaitOpts = {}): Promise<string> {
+  async captureSettledSnapshot(pane: PaneRef, opts: WaitOpts = {}): Promise<string> {
     const deadline = Date.now() + (opts.timeoutMs ?? 3_000);
     const interval = Math.max(opts.intervalMs ?? 150, MIN_POLL_INTERVAL_MS);
-    let prev = await this.capturePaneSnapshot(paneId);
+    let prev = await this.capturePaneSnapshot(pane);
     while (Date.now() < deadline) {
       await sleep(interval);
-      const cur = await this.capturePaneSnapshot(paneId);
+      const cur = await this.capturePaneSnapshot(pane);
       if (cur === prev) return cur;
       prev = cur;
     }
@@ -1039,7 +1303,7 @@ export class TmuxManager {
   }
 
   async waitSubmitAck(
-    paneId: string,
+    pane: PaneRef,
     baseline: string,
     runtime: AgentRuntimeKind,
     opts: WaitSubmitAckOpts = {},
@@ -1048,19 +1312,19 @@ export class TmuxManager {
     const interval = Math.max(opts.intervalMs ?? 100, MIN_POLL_INTERVAL_MS);
     const composerBaseline = stripHistorySuffix(baseline);
     if (submitAckBusy(composerBaseline, runtime)) {
-      throw new Error(`runtime ack timeout (paneId=${paneId}): pane already busy at baseline`);
+      throw new Error(`runtime ack timeout (paneId=${pane.paneId}): pane already busy at baseline`);
     }
     // Width-independent busy authority: at narrow width the in-pane "working" line soft-wraps out of regex range, but the OSC title still transitions idle→working. Prefer the caller's PRE-Enter sample; reading here would race a runtime that flips to working right after submit.
-    const baselineTitle = opts.baselineTitle ?? await this.readPaneTitle(paneId);
+    const baselineTitle = opts.baselineTitle ?? await this.readPaneTitle(pane);
     if (hasOscTitleWorking(baselineTitle)) {
-      throw new Error(`runtime ack timeout (paneId=${paneId}): pane already busy at baseline`);
+      throw new Error(`runtime ack timeout (paneId=${pane.paneId}): pane already busy at baseline`);
     }
     const resendIntervalMs = Math.max(opts.resendIntervalMs ?? 3_000, interval);
     let lastResend = Date.now();
     while (Date.now() < deadline) {
-      const visible = stripHistorySuffix(await this.capturePaneSnapshot(paneId));
+      const visible = stripHistorySuffix(await this.capturePaneSnapshot(pane));
       if (submitAckBusy(visible, runtime)) return;
-      const title = await this.readPaneTitle(paneId);
+      const title = await this.readPaneTitle(pane);
       if (hasOscTitleWorking(title) && title !== baselineTitle) return;
       if (opts.acceptComposerChange && visible !== composerBaseline) return;
       const bottomLine = bottomNonBlankLine(visible);
@@ -1086,11 +1350,11 @@ export class TmuxManager {
       }
       await sleep(interval);
     }
-    throw new Error(`runtime ack timeout (paneId=${paneId})`);
+    throw new Error(`runtime ack timeout (paneId=${pane.paneId})`);
   }
 
   async handleTrustDialog(
-    paneId: string,
+    pane: PaneRef,
     runtime: AgentRuntimeKind,
     opts: WaitOpts = {},
   ): Promise<boolean> {
@@ -1098,16 +1362,16 @@ export class TmuxManager {
     const interval = opts.intervalMs ?? 500;
     const dialogPattern = TRUST_DIALOGS[runtime];
     while (Date.now() < deadline) {
-      const cap = await this.capturePaneById(paneId, { ansi: true, scrollback: 50 });
+      const cap = await this.capturePaneById(pane, { ansi: true, scrollback: 50 });
       const stripped = stripAnsi(cap);
       if (dialogPattern.test(stripped)) {
-        await this.sendKeysToPane(paneId, 'Enter');
+        await this.sendKeysToPane(pane, 'Enter');
         await sleep(800);
         return true;
       }
-      const current = await this.displayMessage(paneId, '#{pane_current_command}');
+      const current = await this.displayMessage(pane, '#{pane_current_command}');
       if (hasReplProcTitle(current, runtime)) {
-        const freshStripped = stripAnsi(await this.capturePaneById(paneId, { ansi: false, scrollback: 0 }));
+        const freshStripped = stripAnsi(await this.capturePaneById(pane, { ansi: false, scrollback: 0 }));
         if (hasRuntimeReadyView(freshStripped, runtime)) return false;
       }
       await sleep(interval);
@@ -1116,29 +1380,18 @@ export class TmuxManager {
   }
 
   async classifyPaneForAdopt(
-    paneId: string,
+    pane: PaneRef,
     runtime: AgentRuntimeKind,
     opts?: ExecOptions,
   ): Promise<AdoptPaneState> {
-    const SEP = '___bx-classify-sep___';
-    const result = await this.runner.exec(
-      `tmux display-message -p -t ${shellQuote(paneId)} '#{pane_current_command}' ` +
-        `&& printf '%s\\n' ${shellQuote(SEP)} ` +
-        `&& tmux capture-pane -p -t ${shellQuote(paneId)} -e -S 0`,
+    const { header, body } = await this.guardedPaneRead(
+      pane,
+      '#{pane_current_command}',
+      [`capture-pane -p -t ${pane.paneId} -e -S 0`],
       opts,
     );
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `classifyPaneForAdopt(${paneId}) tmux probe failed: ${result.stderr || 'unknown error'}`,
-      );
-    }
-    const sepIdx = result.stdout.indexOf(SEP);
-    if (sepIdx < 0) {
-      throw new Error(`classifyPaneForAdopt(${paneId}): separator missing in output`);
-    }
-    const current = result.stdout.slice(0, sepIdx).split('\n')[0]?.trim() ?? '';
-    const captureStart = result.stdout.indexOf('\n', sepIdx) + 1;
-    const stripped = stripAnsi(result.stdout.slice(captureStart));
+    const current = header.trim();
+    const stripped = stripAnsi(body);
 
     if (REPL_PROC_TITLES[runtime].test(current)) {
       if (READY_ANCHORS[runtime].test(stripped)) return { kind: 'live-runtime' };
@@ -1151,7 +1404,7 @@ export class TmuxManager {
   }
 
   async waitReplReady(
-    paneId: string,
+    pane: PaneRef,
     runtime: AgentRuntimeKind,
     opts: WaitReplReadyOpts = {},
   ): Promise<void> {
@@ -1164,32 +1417,32 @@ export class TmuxManager {
     let lastStripped = '';
     let lastTitle: string | undefined;
     while (Date.now() < deadline) {
-      const current = await this.displayMessage(paneId, '#{pane_current_command}', cmdOpts);
+      const current = await this.displayMessage(pane, '#{pane_current_command}', cmdOpts);
       if (failFastOnShell && SHELL_PROC_TITLES.test(current)) {
         throw new ReplNotReadyError(
-          paneId,
+          pane.paneId,
           runtime,
           lastStripped,
           `pane_current_command=${current} (shell), failFastOnShell triggered`,
         );
       }
-      const cap = await this.capturePaneById(paneId, { ansi: true, scrollback, timeoutMs: opts.perCommandTimeoutMs });
+      const cap = await this.capturePaneById(pane, { ansi: true, scrollback, timeoutMs: opts.perCommandTimeoutMs });
       const stripped = stripAnsi(cap);
       lastStripped = stripped;
       if (procTitle.test(current)) {
         if (hasRuntimeReadyView(stripped, runtime)) return;
         if (opts.titleIdleFastPath && screenAllowsTitleIdle(stripped, runtime)) {
-          lastTitle = await this.readPaneTitle(paneId, cmdOpts);
+          lastTitle = await this.readPaneTitle(pane, cmdOpts);
           if (hasOscTitleIdle(lastTitle, runtime)) return;
         }
       }
       await sleep(interval);
     }
     if (opts.titleIdleFastPath && lastTitle === undefined) {
-      lastTitle = await this.readPaneTitle(paneId, cmdOpts);
+      lastTitle = await this.readPaneTitle(pane, cmdOpts);
     }
     throw new ReplNotReadyError(
-      paneId,
+      pane.paneId,
       runtime,
       lastStripped,
       lastTitle === undefined ? undefined : `paneTitle=${JSON.stringify(lastTitle)}`,
@@ -1214,4 +1467,23 @@ function isSessionAbsent(stderr: string): boolean {
     s.includes('no such session') ||
     (s.includes('error connecting to') && s.includes('no such file or directory'))
   );
+}
+
+// A tmux probe outcome is UNKNOWN (not "absent") when exit 255 (ssh/exec layer) or an INDEPENDENT
+// transient marker appears. The local "error connecting to <socket> (No such file)" absence itself
+// matches the generic "error connecting to" transient pattern, so it is stripped before deciding —
+// only a remaining genuine transient (ssh drop, connection reset, …) makes the outcome unknown.
+function tmuxProbeOutcomeUnknown(result: Pick<ExecResult, 'exitCode' | 'stdout' | 'stderr'>): boolean {
+  if (result.exitCode === 255) return true;
+  const stderrSansSocketAbsence = (result.stderr || '').replace(
+    /error connecting to \S+ \(no such file or directory\)/gi,
+    '',
+  );
+  return isTransientNetworkFailure(stderrSansSocketAbsence) || isTransientNetworkFailure(result.stdout);
+}
+
+// A pane/window that vanished (distinct from a whole-session/server absence).
+function isTargetGone(stderr: string): boolean {
+  const s = (stderr || '').trim().toLowerCase();
+  return /can'?t find (?:pane|window)/.test(s) || s.includes('no such pane') || s.includes('no such window');
 }

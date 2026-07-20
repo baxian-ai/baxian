@@ -71,12 +71,17 @@ beforeEach(async () => {
   await writeFile(configPath, JSON.stringify(ctx.config, null, 2));
   ctx.configPath = configPath;
   app = await buildApp(ctx);
-  vi.spyOn(app.ctx.agentManager, 'ensureSession').mockResolvedValue({
+  vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async (agentId) => ({
     ok: true,
     createdSession: true,
     paneId: '%0',
+    pane: {
+      session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' },
+      paneId: '%0',
+      claim: agentId,
+    },
     workdir: '/tmp/test',
-  });
+  }));
   vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockResolvedValue();
 
   const originalInject = app.inject.bind(app);
@@ -430,6 +435,20 @@ describe('POST /api/projects/:projectId/agents', () => {
     const response = await addAgent('pp', { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', yolo: true });
     expect(response.statusCode).toBe(409);
     expect(vi.mocked(app.ctx.agentManager.ensureSession)).not.toHaveBeenCalled();
+  });
+
+  it('returns 409 when the agent id is tombstoned by an in-flight deletion (same-id rebuild blocked)', async () => {
+    await createProject('td');
+    app.ctx.agentManager.tryClaimDeletion(['td-dev']);
+
+    const response = await addAgent('td', devAgent('td-dev'));
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/being deleted/);
+    expect(findProject('td').agent).toEqual([]);
+    expect(await app.ctx.agentStore.get('td-dev')).toBeNull();
+
+    app.ctx.agentManager.releaseDeletionClaim(['td-dev']);
   });
 
   it('returns 400 when role=qa but no pairWith provided', async () => {
@@ -864,7 +883,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(404);
   });
 
-  it('Phase 3 saveConfig fails → 500 + rollbackPerTargetState + lock released', async () => {
+  it('Phase 3 saveConfig fails → 500 + rollbackPerTargetState + acquired lock released for clean retry', async () => {
     await projectWithDev('da-rb', 'da-rb-dev');
     await seedAgent('da-rb-dev', 'da-rb', { paneId: '%0', workdir: '/tmp/repo' });
 
@@ -886,11 +905,16 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(phase3Hit).toBe(true);
     expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
 
+    // saveConfig fails BEFORE any state delete (reordered) → the agent state is fully intact, not restored.
     const stateAfter = await app.ctx.agentStore.get('da-rb-dev');
-    expect(stateAfter?.paneId).toBeUndefined();
+    expect(stateAfter?.paneId).toBe('%0');
     expect(stateAfter?.workdir).toBe('/tmp/repo');
 
-    expect(await app.ctx.lockManager.isLocked('da-rb-dev')).toBe(false);
+    // This attempt's freshly-acquired delete-owner lock is released so a retry DELETE (unbound agent)
+    // does not EEXIST-collide; the generation stays 0 (bumped only after commit) and tombstone cleared.
+    expect(await app.ctx.lockManager.claimOf('da-rb-dev')).toBeNull();
+    expect(app.ctx.agentManager.deletionGenerationOf('da-rb-dev')).toBe(0);
+    expect(app.ctx.agentManager.isDeletionInFlight('da-rb-dev')).toBe(false);
   });
 
   it('returns 500 when no config path is configured', async () => {
@@ -1093,7 +1117,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(await app.ctx.agentStore.get('cf2-dev')).toMatchObject({ id: 'cf2-dev', projectId: 'cf2' });
   });
 
-  it('cleanup rollback restores an exact task lock after the old generation was released', async () => {
+  it('claim rotation: a delayed old-owner release cannot free the lock mid-DELETE; rollback restores it', async () => {
     await projectWithDev('cf-lock', 'cf-lock-dev');
     await seedTask('cf-lock-task', 'cf-lock', {
       agentId: 'cf-lock-dev', preferredAgentId: 'cf-lock-dev', status: 'failed',
@@ -1102,8 +1126,11 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     await seedAgent('cf-lock-dev', 'cf-lock', {
       taskId: 'cf-lock-task', lockToken: oldToken!, paneId: '%5',
     });
+    let releaseReturnedTrue: boolean | null = null;
     vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockImplementation(async () => {
-      await app.ctx.lockManager.releaseIfOwner('cf-lock-dev', 'cf-lock-task', oldToken!);
+      // Phase 1 already rotated the claim onto the deletion owner, so this stale-token release is a
+      // harmless no-op (the shared-token race is closed) — it must NOT free the lock file.
+      releaseReturnedTrue = await app.ctx.lockManager.releaseIfOwner('cf-lock-dev', 'cf-lock-task', oldToken!);
       await app.ctx.agentStore.update('cf-lock-dev', state => ({
         ...state!, taskId: undefined, lockToken: undefined, updatedAt: now(),
       }));
@@ -1115,12 +1142,102 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     const response = await del('/api/projects/cf-lock/agents/cf-lock-dev');
 
     expect(response.statusCode).toBe(502);
+    expect(releaseReturnedTrue).toBe(false);
     const restored = (await app.ctx.agentStore.get('cf-lock-dev'))!;
     expect(restored.taskId).toBe('cf-lock-task');
-    expect(restored.lockToken).not.toBe(oldToken);
-    expect(await app.ctx.lockManager.isOwner(
-      'cf-lock-dev', 'cf-lock-task', restored.lockToken!,
-    )).toBe(true);
+    // Rollback rotates the claim back to the original owner, so the original token is valid again.
+    expect(restored.lockToken).toBe(oldToken);
+    expect(await app.ctx.lockManager.isOwner('cf-lock-dev', 'cf-lock-task', oldToken!)).toBe(true);
+  });
+
+  it('claim rotation rollback re-derives a drifted state.lockToken from the live claim', async () => {
+    // The recorded state.lockToken drifted from the lock file's actual token (same task). Rotation
+    // rotates off the REAL token; on rollback, rollbackPerTargetState re-derives the token from the
+    // restored claim (claim.taskId === original.taskId ⟹ lockToken = claim.token), so the binding
+    // is releasable regardless of the drifted seed. Guards against a stuck, unreleasable binding.
+    await projectWithDev('cf-drift', 'cf-drift-dev');
+    await seedTask('cf-drift-task', 'cf-drift', {
+      agentId: 'cf-drift-dev', preferredAgentId: 'cf-drift-dev', status: 'failed',
+    });
+    const realToken = await app.ctx.lockManager.acquire('cf-drift-dev', 'cf-drift-task');
+    await seedAgent('cf-drift-dev', 'cf-drift', {
+      taskId: 'cf-drift-task', lockToken: 'drifted-stale-token', paneId: '%6',
+    });
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockRejectedValue(
+      new CleanupFailedError('cleanup failed', [
+        { agentId: 'cf-drift-dev', step: 'tmux', error: new Error('ssh down') },
+      ]),
+    );
+
+    const response = await del('/api/projects/cf-drift/agents/cf-drift-dev');
+
+    expect(response.statusCode).toBe(502);
+    const restored = (await app.ctx.agentStore.get('cf-drift-dev'))!;
+    expect(restored.taskId).toBe('cf-drift-task');
+    expect(restored.lockToken).toBe(realToken);
+    expect(restored.lockToken).not.toBe('drifted-stale-token');
+    expect(await app.ctx.lockManager.isOwner('cf-drift-dev', 'cf-drift-task', realToken!)).toBe(true);
+    // End-to-end: the binding is releasable again (drift fix means resolveTaskLockToken finds the token).
+    expect(await app.ctx.agentManager.releaseAgentForTask('cf-drift-dev', 'cf-drift-task', 'idle')).toBe(true);
+    expect(await app.ctx.lockManager.isLocked('cf-drift-dev')).toBe(false);
+  });
+
+  it('DELETE pre-commit throw after rotating one target rolls the original owners back (not release)', async () => {
+    await createProject('cf-rb');
+    await addAgent('cf-rb', devAgent('cf-rb-dev'));
+    await addAgent('cf-rb', qaAgent('cf-rb-qa', 'cf-rb-dev'));
+    await seedTask('cf-rb-td', 'cf-rb', { agentId: 'cf-rb-dev', preferredAgentId: 'cf-rb-dev', status: 'failed' });
+    await seedTask('cf-rb-tq', 'cf-rb', { agentId: 'cf-rb-qa', preferredAgentId: 'cf-rb-qa', status: 'failed' });
+    const devToken = await app.ctx.lockManager.acquire('cf-rb-dev', 'cf-rb-td');
+    const qaToken = await app.ctx.lockManager.acquire('cf-rb-qa', 'cf-rb-tq');
+    await seedAgent('cf-rb-dev', 'cf-rb', { taskId: 'cf-rb-td', lockToken: devToken!, paneId: '%1' });
+    await seedAgent('cf-rb-qa', 'cf-rb', { taskId: 'cf-rb-tq', lockToken: qaToken!, paneId: '%2' });
+
+    // Rotation processes the sorted targets; throw on the SECOND target's claimOf, after the first rotated.
+    let claimOfCalls = 0;
+    const realClaimOf = app.ctx.lockManager.claimOf.bind(app.ctx.lockManager);
+    vi.spyOn(app.ctx.lockManager, 'claimOf').mockImplementation(async (id: string) => {
+      claimOfCalls += 1;
+      if (claimOfCalls === 2) throw new Error('injected claimOf outage mid-rotation');
+      return realClaimOf(id);
+    });
+
+    const response = await del('/api/projects/cf-rb/agents/cf-rb-dev');
+    expect(response.statusCode).toBe(500);
+    // Nothing committed: both agents still in config.
+    expect(findProject('cf-rb').agent.flat().map(a => a.id).sort()).toEqual(['cf-rb-dev', 'cf-rb-qa']);
+    // The already-rotated target's ORIGINAL owner is restored (rollback), not released to nobody.
+    expect(await app.ctx.lockManager.isOwner('cf-rb-dev', 'cf-rb-td', devToken!)).toBe(true);
+    expect(await app.ctx.lockManager.isOwner('cf-rb-qa', 'cf-rb-tq', qaToken!)).toBe(true);
+  });
+
+  it('DELETE rollback surfaces a failed lock restore instead of reporting success', async () => {
+    await projectWithDev('cf-rbf', 'cf-rbf-dev');
+    await seedTask('cf-rbf-t', 'cf-rbf', { agentId: 'cf-rbf-dev', preferredAgentId: 'cf-rbf-dev', status: 'failed' });
+    const token = await app.ctx.lockManager.acquire('cf-rbf-dev', 'cf-rbf-t');
+    await seedAgent('cf-rbf-dev', 'cf-rbf', { taskId: 'cf-rbf-t', lockToken: token!, paneId: '%1' });
+
+    // Forward rotation (→ deletion owner) works; the rollback (→ original owner) reports false.
+    const realRotate = app.ctx.lockManager.rotateClaim.bind(app.ctx.lockManager);
+    vi.spyOn(app.ctx.lockManager, 'rotateClaim').mockImplementation(
+      async (id: string, expected: unknown, to: { taskId: string; token: string }) => {
+        if (typeof to.taskId === 'string' && to.taskId.startsWith('deletion:')) {
+          return realRotate(id, expected as never, to);
+        }
+        return false;
+      },
+    );
+    // Cleanup fails → triggers the rollback path, which now hits the false rotate-back.
+    vi.spyOn(app.ctx.agentManager, 'cleanupRemovedAgentRuntime').mockRejectedValue(
+      new CleanupFailedError('cleanup failed', [{ agentId: 'cf-rbf-dev', step: 'tmux', error: new Error('ssh down') }]),
+    );
+
+    const response = await del('/api/projects/cf-rbf/agents/cf-rbf-dev');
+    // A failed restore is surfaced as an error, not silently reported as a clean rollback.
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/could not be restored|rollback/i);
+    // Config left intact (nothing committed).
+    expect(findProject('cf-rbf').agent.flat().map(a => a.id)).toEqual(['cf-rbf-dev']);
   });
 
   it('config changed during cleanup → phase3 recomputes the removal from the fresh config', async () => {
@@ -1138,20 +1255,122 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(app.ctx.config.project.some(p => p.id === 'concurrent')).toBe(true);
   });
 
-  it('post-commit best-effort cleanup failures (store delete / purge / pet unassign) do not block deletion', async () => {
+  it('replaceConfig throwing AFTER the config commit fail-stops: the id stays tombstoned past the request (POST 409)', async () => {
+    await projectWithDev('dv1', 'dv1-dev');
+    // A post-commit in-memory switch failure is a program bug: the diverged id must keep returning 409
+    // for re-introduction (POST /agents) even after the DELETE request's finally releases its claim.
+    vi.spyOn(app.ctx.agentManager, 'replaceConfig').mockImplementationOnce(() => { throw new Error('memory switch boom'); });
+
+    const del1 = await del('/api/projects/dv1/agents/dv1-dev');
+    expect(del1.statusCode).toBe(200); // disk committed → deletion reported (with warnings)
+    expect(JSON.parse(del1.body).warnings === undefined || Array.isArray(JSON.parse(del1.body).warnings)).toBe(true);
+
+    // After the request fully returned, the tombstone persists (fail-stop) → recreate is refused.
+    expect(app.ctx.agentManager.isDeletionInFlight('dv1-dev')).toBe(true);
+    const recreate = await app.inject({
+      method: 'POST', url: '/api/projects/dv1/agents',
+      payload: { id: 'dv1-dev', runtime: 'claude-code', role: 'dev', mode: 'local' },
+    });
+    expect(recreate.statusCode).toBe(409);
+    expect(JSON.parse(recreate.body).error).toMatch(/being deleted|diverged/);
+  });
+
+  it('post-commit best-effort cleanup failures (purge / pet unassign) do not block deletion', async () => {
     await projectWithDev('be1', 'be1-dev');
     app.ctx.errorRecordStore = { purgeAgent: vi.fn().mockRejectedValue(new Error('io')) } as never;
-    vi.spyOn(app.ctx.agentStore, 'delete').mockRejectedValue(new Error('io'));
     vi.spyOn(app.ctx.petStore!, 'setAssignment').mockRejectedValue(new Error('io'));
 
     const response = await del('/api/projects/be1/agents/be1-dev');
     expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).removed).toEqual(['be1-dev']);
+    const body = JSON.parse(response.body);
+    expect(body.removed).toEqual(['be1-dev']);
+    expect(body.warnings).toBeUndefined();
     expect(findProject('be1').agent).toEqual([]);
     expect(await app.ctx.lockManager.isLocked('be1-dev')).toBe(false);
   });
 
-  it('phase3 saveConfig failure with no prior agent state → rollback deletes the marker row', async () => {
+  it('post-commit agent-state delete failure → 200 + warning (config committed, reclaimable orphan state, lock released)', async () => {
+    await projectWithDev('be2', 'be2-dev');
+    vi.spyOn(app.ctx.agentStore, 'delete').mockRejectedValue(new Error('io'));
+
+    const response = await del('/api/projects/be2/agents/be2-dev');
+
+    // saveConfig commits FIRST (reorder); a post-commit state-delete failure is a surfaced warning, not a 502.
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.removed).toEqual(['be2-dev']);
+    expect(body.warnings).toEqual(
+      expect.arrayContaining([expect.stringMatching(/agent be2-dev state delete failed post-commit/)]));
+    // config committed: the agent row is gone from memory and disk.
+    expect(findProject('be2').agent.flat().map(a => a.id)).toEqual([]);
+    const onDisk = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
+    expect(onDisk.project.find(p => p.id === 'be2')!.agent.flat().map(a => a.id)).toEqual([]);
+    // delete failed → reclaimable orphan state remains; deletion-owner lock released, generation bumped past commit.
+    expect(await app.ctx.agentStore.get('be2-dev')).toMatchObject({ id: 'be2-dev', projectId: 'be2' });
+    expect(await app.ctx.lockManager.claimOf('be2-dev')).toBeNull();
+    expect(app.ctx.agentManager.deletionGenerationOf('be2-dev')).toBe(1);
+    expect(app.ctx.agentManager.isDeletionInFlight('be2-dev')).toBe(false);
+  });
+
+  it('pair delete with a post-commit second state-delete failure → 200 + warning; first state gone, second orphaned', async () => {
+    await projectWithDev('be3', 'be3-dev');
+    await addAgent('be3', qaAgent('be3-qa', 'be3-dev'));
+    await seedAgent('be3-dev', 'be3', { workdir: '/tmp/be3', paneId: '%7' });
+    const realDelete = app.ctx.agentStore.delete.bind(app.ctx.agentStore);
+    vi.spyOn(app.ctx.agentStore, 'delete').mockImplementation(async (id) => {
+      if (id === 'be3-qa') throw new Error('io');
+      return realDelete(id);
+    });
+
+    const response = await del('/api/projects/be3/agents/be3-dev');
+
+    // Config commits both removals first; the be3-qa state-delete failure is a post-commit warning, not a 502.
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).warnings).toEqual(
+      expect.arrayContaining([expect.stringMatching(/agent be3-qa state delete failed post-commit/)]));
+    expect(findProject('be3').agent.flat()).toHaveLength(0);
+    // be3-dev delete succeeded (state gone); be3-qa delete failed (reclaimable orphan remains).
+    expect(await app.ctx.agentStore.get('be3-dev')).toBeNull();
+    expect(await app.ctx.agentStore.get('be3-qa')).not.toBeNull();
+  });
+
+  it('phase 3 commits the config BEFORE deleting agent state, then bumps the deletion generation', async () => {
+    await projectWithDev('ord1', 'ord1-dev');
+    const order: string[] = [];
+    const realDelete = app.ctx.agentStore.delete.bind(app.ctx.agentStore);
+    vi.spyOn(app.ctx.agentStore, 'delete').mockImplementation(async (id) => {
+      order.push(`delete:${id}`);
+      return realDelete(id);
+    });
+    const realSave = loaderModule.saveConfig;
+    vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
+      order.push('saveConfig');
+      return realSave(path, config);
+    });
+
+    const response = await del('/api/projects/ord1/agents/ord1-dev');
+
+    expect(response.statusCode).toBe(200);
+    expect(order).toEqual(['saveConfig', 'delete:ord1-dev']);
+    expect(app.ctx.agentManager.deletionGenerationOf('ord1-dev')).toBe(1);
+  });
+
+  it('post-commit lock release failure → 200 with warnings[] (deletion committed, not rolled back)', async () => {
+    await projectWithDev('wl1', 'wl1-dev');
+    vi.spyOn(app.ctx.lockManager, 'releaseIfOwner').mockRejectedValue(new Error('lock fs io'));
+
+    const response = await del('/api/projects/wl1/agents/wl1-dev');
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.removed).toEqual(['wl1-dev']);
+    expect(body.warnings).toEqual([expect.stringMatching(/lock release for wl1-dev failed: lock fs io/)]);
+    expect(findProject('wl1').agent).toEqual([]);
+    expect(await app.ctx.agentStore.get('wl1-dev')).toBeNull();
+    expect(await app.ctx.lockManager.isLocked('wl1-dev')).toBe(true);
+  });
+
+  it('saveConfig failure with no prior agent state → 500, config intact, deletion lock rolled back for retry', async () => {
     await projectWithDev('rb0', 'rb0-dev');
     await app.ctx.agentStore.delete('rb0-dev');
     const realSave = loaderModule.saveConfig;
@@ -1168,9 +1387,12 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
     expect(await app.ctx.agentStore.get('rb0-dev')).toBeNull();
     expect(findProject('rb0').agent.flat().map(a => a.id)).toEqual(['rb0-dev']);
+    // freshly-acquired deletion-owner lock rolled back so a retry DELETE re-rotates cleanly (no EEXIST).
+    expect(await app.ctx.lockManager.claimOf('rb0-dev')).toBeNull();
+    expect(app.ctx.agentManager.deletionGenerationOf('rb0-dev')).toBe(0);
   });
 
-  it('rollback agentStore.set failure is logged; DELETE still reports the persist failure (500)', async () => {
+  it('saveConfig failure never deletes agent state (reorder: state delete is strictly post-commit)', async () => {
     await projectWithDev('rb2', 'rb2-dev');
     await seedAgent('rb2-dev', 'rb2', { paneId: '%1' });
     const realSave = loaderModule.saveConfig;
@@ -1181,11 +1403,14 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       }
       return realSave(path, config);
     });
-    vi.spyOn(app.ctx.agentStore, 'set').mockRejectedValue(new Error('io broken'));
+    const deleteSpy = vi.spyOn(app.ctx.agentStore, 'delete');
 
     const response = await del('/api/projects/rb2/agents/rb2-dev');
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
+    // saveConfig is the commit point; a failure there must NOT have deleted state — no orphan, fully retry-able.
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(await app.ctx.agentStore.get('rb2-dev')).toMatchObject({ id: 'rb2-dev', paneId: '%1' });
   });
 });
 
@@ -1271,7 +1496,20 @@ describe('POST /api/projects/:projectId/agents/:agentId/restart-repl', () => {
     const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
 
     expect(response.statusCode).toBe(200);
-    expect(restartSpy).toHaveBeenCalledWith('dev-1');
+    expect(restartSpy).toHaveBeenCalledWith('dev-1', { expectedGeneration: 0 });
+  });
+
+  it('restart-repl during DELETE (deletionInFlight): 409, restartReplOnly not invoked', async () => {
+    app.ctx.agentManager.tryClaimDeletion(['dev-1']);
+    const restartSpy = vi.spyOn(app.ctx.agentManager, 'restartReplOnly').mockResolvedValue();
+
+    const response = await post('/api/projects/proj/agents/dev-1/restart-repl');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/being deleted/);
+    expect(restartSpy).not.toHaveBeenCalled();
+
+    app.ctx.agentManager.releaseDeletionClaim(['dev-1']);
   });
 
   it('QA with stale binding acquires lock; release on failure does not deadlock', async () => {
@@ -1749,6 +1987,37 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(stateAfter?.awaitingSince).toBeUndefined();
   });
 
+  it('retry fails closed (409) when a DELETE→recreate bumps the generation during ensureSession (no stale cleanup)', async () => {
+    await seedAgent('dev-1', 'proj', {
+      paneId: '%old',
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      awaitingReason: 'startup dialog',
+      awaitingSince: now(),
+    });
+    app.ctx.tmuxSessionStatusStore.set('dev-1', { tmuxSessionStatus: 'absent' });
+    // ensureSession succeeds, but a concurrent DELETE→recreate bumps the generation during it, so the paneId
+    // write no-ops. The endpoint must fail closed and NOT run the retry cleanup against the new incarnation.
+    vi.spyOn(app.ctx.agentManager, 'ensureSession').mockImplementation(async (agentId) => {
+      app.ctx.agentManager.bumpDeletionGeneration(agentId);
+      return {
+        ok: true, createdSession: true, paneId: '%0',
+        pane: { session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' }, paneId: '%0', claim: agentId },
+        workdir: '/tmp/test',
+      };
+    });
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/deleted or recreated during retry/);
+    // The stale awaiting_human cleanup must NOT have run: the agent's state is left untouched.
+    const stateAfter = await app.ctx.agentStore.get('dev-1');
+    expect(stateAfter?.status).toBe('awaiting_human');
+    expect(stateAfter?.awaitingPhase).toBe('agent_dialog_pending');
+    expect(stateAfter?.paneId).toBe('%old');
+  });
+
   it('unknown tmux probe status still lets retry attempt recovery', async () => {
     await seedAgent('dev-1', 'proj');
 
@@ -1789,7 +2058,11 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     const body = JSON.parse(response.body);
     expect(body.runtimeStatus).toBe('pending');
     expect(body.message).toMatch(/web terminal/);
-    expect(handleSpy).toHaveBeenCalledWith('dev-1', expect.any(EnsureSessionError));
+    expect(handleSpy).toHaveBeenCalledWith(
+      'dev-1',
+      expect.any(EnsureSessionError),
+      expect.objectContaining({ expectedGeneration: expect.any(Number) }),
+    );
   });
 
   it('creationToken pending → 409 (operator-action hint, not 500)', async () => {
@@ -1798,6 +2071,18 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
     expect(response.statusCode).toBe(409);
     const body = JSON.parse(response.body);
     expect(body.error).toMatch(/being created/);
+  });
+
+  it('retry during DELETE (deletionInFlight): 409, ensureSession not invoked', async () => {
+    app.ctx.agentManager.tryClaimDeletion(['dev-1']);
+
+    const response = await post('/api/projects/proj/agents/dev-1/retry');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/being deleted/);
+    expect(vi.mocked(app.ctx.agentManager.ensureSession)).not.toHaveBeenCalled();
+
+    app.ctx.agentManager.releaseDeletionClaim(['dev-1']);
   });
 
   it('returns 404 when agent is not in the project', async () => {
@@ -1833,7 +2118,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
 
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('repl never became ready');
-    expect(killSpy).toHaveBeenCalledWith(REF);
+    expect(killSpy).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
     expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
     warn.mockRestore();
   });
@@ -1885,7 +2170,7 @@ describe('POST /api/projects/:projectId/agents/:agentId/retry', () => {
 
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('repl never became ready');
-    expect(killSpy).toHaveBeenCalledWith(REF);
+    expect(killSpy).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
     expect(await app.ctx.lockManager.isLocked('dev-1')).toBe(false);
     warn.mockRestore();
   });

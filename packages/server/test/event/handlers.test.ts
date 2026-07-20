@@ -3,6 +3,8 @@ import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentManager, DispatchTerminalError, EnsureSessionError } from '../../src/agent/manager.js';
+import { ReplNotReadyError } from '../../src/agent/tmux.js';
+import { DirtyWorkdirError } from '../../src/agent/branch.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -262,7 +264,7 @@ describe('pr.created handler', () => {
     expect(task!.status).toBe('review');
     expect(task!.prNumber).toBe(58);
     expect(task!.prUrl).toBe('https://github.com/user/repo/pull/58');
-    expect(startSpy).toHaveBeenCalledWith('task-001', 'qa-1', 'review');
+    expect(startSpy).toHaveBeenCalledWith('task-001', 'qa-1', 'review', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-001');
     expect(updateSpy).not.toHaveBeenCalledWith('task-001', { qaAgentId: 'qa-1' });
   });
@@ -276,7 +278,9 @@ describe('pr.created handler', () => {
     await emitPrCreated('task-noarm', { prNumber: 58, prUrl: 'https://github.com/user/repo/pull/58' });
 
     expect(startSpy).not.toHaveBeenCalled();
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-noarm', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-noarm', 'idle', expect.objectContaining({ expectedLockToken: expect.any(String) }),
+    );
     const task = await taskStore.get('task-noarm');
     expect(task!.status).toBe('in_progress');
     expect(task!.signalToken).toBe('dev-token');
@@ -493,7 +497,7 @@ describe('pr.created handler', () => {
 
     const task = await taskStore.get('task-001b');
     expect(task!.status).toBe('review');
-    expect(startSpy).toHaveBeenCalledWith('task-001b', 'qa-1', 'review');
+    expect(startSpy).toHaveBeenCalledWith('task-001b', 'qa-1', 'review', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
   });
 
   it('cancelled task → no-op (terminal guard)', async () => {
@@ -598,7 +602,7 @@ describe('pr.created handler', () => {
 
     await emitPrCreated('task-rb-rollback', { prNumber: 80 });
 
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-rb-rollback', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-rb-rollback', 'idle', expect.any(Object));
     const intervention = findIntervention('task-rb-rollback');
     expect(intervention!.data.phase).toBe('qa-review-start-failed');
   });
@@ -855,9 +859,14 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     await seedTask({ id: 'task-rr-race', status: 'in_progress', reviewRound: 0 });
     await seedDevAgent('task-rr-race');
     vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    // 忠实模拟 verdict 落库：按 max(1, round + intent) 计轮并原子清掉 intent（与 APPROVE transition 同构）
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
       const t = await taskStore.get('task-rr-race');
-      await taskStore.set({ ...t!, status: 'approved', reviewRound: 1 });
+      await taskStore.set({
+        ...t!, status: 'approved',
+        reviewRound: Math.max(1, t!.reviewRound + (t!.reviewRoundPending === true ? 1 : 0)),
+        reviewRoundPending: undefined,
+      });
       return true;
     });
 
@@ -873,7 +882,11 @@ describe('reviewRound 1-based bump (first review pass → Round 1)', () => {
     stubManager({ releaseAgentForTask: true, markAgentWaiting: true, acquireAgentForTask: true });
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
       const t = await taskStore.get('task-rr-appr-race');
-      await taskStore.set({ ...t!, status: 'approved', reviewRound: 1 });
+      await taskStore.set({
+        ...t!, status: 'approved',
+        reviewRound: Math.max(1, t!.reviewRound + (t!.reviewRoundPending === true ? 1 : 0)),
+        reviewRoundPending: undefined,
+      });
       return true;
     });
 
@@ -893,7 +906,7 @@ describe('pr.updated handler', () => {
 
     const task = await taskStore.get('task-up1');
     expect(task!.status).toBe('review');
-    expect(startSpy).toHaveBeenCalledWith('task-up1', 'qa-1', 'review');
+    expect(startSpy).toHaveBeenCalledWith('task-up1', 'qa-1', 'review', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
   });
 
   it('spec phase: pr.updated push early-exits — no transition, no recheck dispatch', async () => {
@@ -1286,7 +1299,7 @@ describe('pr.updated handler', () => {
 
     await emitPrUpdated('task-up-p', { prNumber: 62, kind: 'push' });
 
-    expect(startSpy).toHaveBeenCalledWith('task-up-p', 'qa-1', 'recheck');
+    expect(startSpy).toHaveBeenCalledWith('task-up-p', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
     const task = await taskStore.get('task-up-p');
     expect(task!.status).toBe('review');
   });
@@ -1323,8 +1336,8 @@ describe('pr.updated handler', () => {
 
     await emitPrUpdated('task-up-rr', { prNumber: 70, kind: 'push' });
 
-    expect(stopSpy).toHaveBeenCalledWith('qa-1', 'task-up-rr', 'idle');
-    expect(startSpy).toHaveBeenCalledWith('task-up-rr', 'qa-1', 'recheck');
+    expect(stopSpy).toHaveBeenCalledWith('qa-1', 'task-up-rr', 'idle', expect.objectContaining({ deferWhenBusy: true }));
+    expect(startSpy).toHaveBeenCalledWith('task-up-rr', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
     expect(stopSpy.mock.invocationCallOrder[0]).toBeLessThan(
       startSpy.mock.invocationCallOrder[0],
     );
@@ -1438,6 +1451,335 @@ describe('pr.updated handler', () => {
     expect(String(intervention!.data.note)).not.toContain('Resume the QA agent or POST');
   });
 
+  it('push 转移持久化未计轮 intent：in_progress 起点写 reviewRoundPending，成功计轮后清除（R16/R17）', async () => {
+    await seedTask({ id: 'task-up-rrp', status: 'in_progress', reviewRound: 0, prNumber: 66, qaAgentId: 'qa-1' });
+    let flagAtStart: boolean | undefined;
+    vi.spyOn(manager, 'startSession').mockImplementation(async (taskId) => {
+      flagAtStart = (await taskStore.get(taskId))?.reviewRoundPending;
+      return true;
+    });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-rrp', { prNumber: 66, kind: 'push' });
+
+    expect(flagAtStart).toBe(true);
+    const task = await taskStore.get('task-up-rrp');
+    expect(task!.reviewRound).toBe(1);
+    expect(task!.reviewRoundPending).toBeUndefined();
+  });
+
+  it('push fixing 起点轮次已在 fix 入口计过：不写未计轮 intent（R16 边界）', async () => {
+    await seedTask({ id: 'task-up-rrf', status: 'fixing', reviewRound: 2, prNumber: 67, qaAgentId: 'qa-1' });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true, startSession: true });
+
+    await emitPrUpdated('task-up-rrf', { prNumber: 67, kind: 'push' });
+
+    const task = await taskStore.get('task-up-rrf');
+    expect(task!.status).toBe('review');
+    expect(task!.reviewRoundPending).toBeUndefined();
+    expect(task!.reviewRound).toBe(2);
+  });
+
+  it('review→review 再推时保留未送达首评的 intent：flag 不被清、phase 仍为 review（#563 CX-3.1）', async () => {
+    await seedTask({
+      id: 'task-up-r0', status: 'review', reviewRound: 0, prNumber: 68,
+      qaAgentId: 'qa-1', reviewRoundPending: true, signalToken: 'first-pass-1',
+    });
+    let phaseAtStart: string | undefined;
+    vi.spyOn(manager, 'startSession').mockImplementation(async (_taskId, _agentId, phase) => {
+      phaseAtStart = phase as string;
+      return true;
+    });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-r0', { prNumber: 68, kind: 'push' });
+
+    expect(phaseAtStart).toBe('review');
+    const task = await taskStore.get('task-up-r0');
+    // 派发时相位仍是首评（此前从未送达）；本次确认送达即消费 intent，后续 push 才不会再replay 首评
+    expect(task!.reviewRound).toBe(1);
+    expect(task!.reviewRoundPending).toBeUndefined();
+  });
+
+  it('锁代由 acquire 原子交出：事后 binding 被 successor 改写也不影响本次 fence（#563 R44）', async () => {
+    await seedTask({ id: 'task-cr-atomic', status: 'in_progress', reviewRound: 0, prNumber: 75, qaAgentId: 'qa-1' });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-cr-atomic',
+      lockToken: 'lock-mine', updatedAt: new Date().toISOString(),
+    });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (agentId, taskId, _phase, opts) => {
+      opts?.onAcquired?.('lock-mine');
+      // successor 在 acquire 返回后立刻重绑同一 QA：事后重读只会读到它的代
+      await agentStore.set({
+        id: agentId, projectId: 'proj', taskId: taskId as string,
+        lockToken: 'lock-successor', updatedAt: new Date().toISOString(),
+      });
+      return true;
+    });
+    stubManager({ markAgentWaiting: true });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+
+    await emitPrCreated('task-cr-atomic', { prNumber: 75, headSha: HEAD_SHA });
+
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-cr-atomic', 'idle', expect.objectContaining({ expectedLockToken: 'lock-mine' }),
+    );
+  });
+
+  it('pr.created：arm 失败回滚后的释放同样钉住本次 acquire 世代（#563 R44）', async () => {
+    await seedTask({ id: 'task-cr-armgen', status: 'in_progress', reviewRound: 0, prNumber: 76, qaAgentId: 'qa-1' });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-arm1');
+      return true;
+    });
+    stubManager({ markAgentWaiting: true, rollbackVerdictArmFailure: true });
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok-arm1', armed: false });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await emitPrCreated('task-cr-armgen', { prNumber: 76, headSha: HEAD_SHA });
+
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-cr-armgen', 'idle', expect.objectContaining({ expectedLockToken: 'lock-arm1' }),
+    );
+  });
+
+  it('pr.updated：arm 失败与 start-not-true 的回滚后释放都钉住本次 acquire 世代（#563 R44）', async () => {
+    await seedTask({
+      id: 'task-up-armgen', status: 'fixing', reviewRound: 1, prNumber: 77, qaAgentId: 'qa-1',
+    });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-arm2');
+      return true;
+    });
+    stubManager({ markAgentWaiting: true, rollbackVerdictArmFailure: true });
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok-arm2', armed: false });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+
+    await emitPrUpdated('task-up-armgen', { prNumber: 77, kind: 'push' });
+
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-up-armgen', 'idle', expect.objectContaining({ expectedLockToken: 'lock-arm2' }),
+    );
+  });
+
+  it('pr.created：startSession 因 pass 换代返回 false 时，释放按本次 acquire 的锁代（不误清 successor 绑定）（#563 R40）', async () => {
+    await seedTask({ id: 'task-cr-lockgen', status: 'in_progress', reviewRound: 0, prNumber: 73, qaAgentId: 'qa-1' });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-cr-lockgen',
+      lockToken: 'lock-a', updatedAt: new Date().toISOString(),
+    });
+    stubManager({ markAgentWaiting: true });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-a');
+      return true;
+    });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+    // successor 在 startSession 期间接管：重新 acquire 同一 QA（锁代变为 lock-b），本次派发遂放弃
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      await agentStore.set({
+        id: 'qa-1', projectId: 'proj', taskId: 'task-cr-lockgen',
+        lockToken: 'lock-b', updatedAt: new Date().toISOString(),
+      });
+      return false;
+    });
+
+    await emitPrCreated('task-cr-lockgen', { prNumber: 73, headSha: HEAD_SHA });
+
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-cr-lockgen', 'idle', expect.objectContaining({ expectedLockToken: 'lock-a' }),
+    );
+  });
+
+  it('pr.updated：startSession 返回 false 的兜底释放同样钉在本次 acquire 的锁代上（#563 R40）', async () => {
+    await seedTask({
+      id: 'task-up-lockgen', status: 'approved', reviewRound: 1, prNumber: 74, qaAgentId: 'qa-1',
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-up-lockgen',
+      lockToken: 'lock-c', updatedAt: new Date().toISOString(),
+    });
+    stubManager({ markAgentWaiting: true });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-c');
+      return true;
+    });
+    const releaseSpy = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(false);
+
+    await emitPrUpdated('task-up-lockgen', { prNumber: 74, kind: 'push' });
+
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-up-lockgen', 'idle', expect.objectContaining({ expectedLockToken: 'lock-c' }),
+    );
+  });
+
+  it('review→review：QA 仍忙导致 release 被拒（未落 hold）→ 登记 pending 交对账，不发 intervention（#563 R38）', async () => {
+    await seedTask({
+      id: 'task-up-busyrel', status: 'review', reviewRound: 1, prNumber: 71,
+      qaAgentId: 'qa-1', signalToken: 'pass-busy1',
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-up-busyrel',
+      updatedAt: new Date().toISOString(),
+    });
+    // 忙碌拒绝的形状：QA 仍绑定、未落 hold
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await emitPrUpdated('task-up-busyrel', { prNumber: 71, kind: 'push' });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(findIntervention('task-up-busyrel', 'qa-release-failed-cannot-recheck')).toBeUndefined();
+    const task = await taskStore.get('task-up-busyrel');
+    expect(manager.getPendingDispatchRetry('task-up-busyrel')).toMatchObject({
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: task!.signalToken, qaPhase: 'recheck',
+    });
+  });
+
+  it('review→review：QA 持续忙碌（stayed-busy 超时形态）也能登记 pending 自动补派（#563 R45）', async () => {
+    await seedTask({
+      id: 'task-up-busytype', status: 'review', reviewRound: 1, prNumber: 82,
+      qaAgentId: 'qa-1', signalToken: 'pass-busytype',
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-up-busytype',
+      workdir: join(tempDir, 'worktrees', 'qa'), updatedAt: new Date().toISOString(),
+    });
+    // release 内部的就绪等待因持续忙碌超时：现在与 stableIdle 分支同为 ReplNotReadyError
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', '', 'stayed busy past 5000ms'));
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    const startSpy = vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    await emitPrUpdated('task-up-busytype', { prNumber: 82, kind: 'push' });
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(findIntervention('task-up-busytype', 'qa-release-failed-cannot-recheck')).toBeUndefined();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.status).toBeUndefined();
+    const task = await taskStore.get('task-up-busytype');
+    expect(manager.getPendingDispatchRetry('task-up-busytype')).toMatchObject({
+      kind: 'qa-recheck', agentId: 'qa-1', signalToken: task!.signalToken,
+    });
+  });
+
+  it('review→review：release 失败且 QA 已落 hold → 仍走 intervention，不登记 pending（#563 R38 边界）', async () => {
+    await seedTask({
+      id: 'task-up-heldrel', status: 'review', reviewRound: 1, prNumber: 72,
+      qaAgentId: 'qa-1', signalToken: 'pass-held1',
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-up-heldrel',
+      status: 'awaiting_human', awaitingPhase: 'branch-cleanup-pending',
+      awaitingReason: 'checkout cleanup failed', awaitingSince: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+
+    await emitPrUpdated('task-up-heldrel', { prNumber: 72, kind: 'push' });
+
+    expect(findIntervention('task-up-heldrel', 'qa-release-failed-cannot-recheck')).toBeTruthy();
+    expect(manager.getPendingDispatchRetry('task-up-heldrel')).toBeUndefined();
+  });
+
+  it('review→review 首评仍未送达（busyPending）时 intent 原样保留（#563 CX-3.1 本意）', async () => {
+    await seedTask({
+      id: 'task-up-r0b', status: 'review', reviewRound: 0, prNumber: 78,
+      qaAgentId: 'qa-1', reviewRoundPending: true, signalToken: 'first-pass-2',
+    });
+    vi.spyOn(manager, 'startSession').mockRejectedValue(new EnsureSessionError(
+      { createdSession: false, agentId: 'qa-1', handled: true, busyPending: true },
+      'QA REPL busy; review dispatch queued',
+    ));
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-r0b', { prNumber: 78, kind: 'push' });
+
+    const task = await taskStore.get('task-up-r0b');
+    expect(task!.reviewRound).toBe(0);
+    expect(task!.reviewRoundPending).toBe(true);
+  });
+
+  it('送达后 intent 消费按本次 dispatchToken CAS：successor 换代则不动它的 intent（#563 R34）', async () => {
+    await seedTask({ id: 'task-up-cas', status: 'in_progress', reviewRound: 0, prNumber: 79, qaAgentId: 'qa-1' });
+    // 送达成功后、收尾计轮前，并发 push/手工重派换代并留下自己的未计轮 intent
+    vi.spyOn(manager, 'startSession').mockImplementation(async (taskId) => {
+      const fresh = (await taskStore.get(taskId as string))!;
+      await taskStore.set({
+        ...fresh, signalToken: 'successor-tok-9', reviewRoundPending: true,
+        updatedAt: new Date().toISOString(),
+      });
+      return true;
+    });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-cas', { prNumber: 79, kind: 'push' });
+
+    const task = await taskStore.get('task-up-cas');
+    expect(task!.signalToken).toBe('successor-tok-9');
+    expect(task!.reviewRound).toBe(0);
+    expect(task!.reviewRoundPending).toBe(true);
+  });
+
+  it('APPROVE 消费残留的未计轮 intent：崩溃窗口后的 verdict 仍补计该轮（#563 CX-3.4）', async () => {
+    await seedTask({
+      id: 'task-appr-rrp', status: 'review', reviewRound: 2, prNumber: 69,
+      qaAgentId: 'qa-1', reviewRoundPending: true,
+      latestHeadSha: 'a'.repeat(40), reviewHeadAnchorSha: 'a'.repeat(40),
+    });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true, continueSession: true });
+
+    await emitReview('task-appr-rrp', { action: 'APPROVE', prNumber: 69, headSha: 'a'.repeat(40) });
+
+    const task = await taskStore.get('task-appr-rrp');
+    expect(task!.status).toBe('approved');
+    expect(task!.reviewRound).toBe(3);
+    expect(task!.reviewRoundPending).toBeUndefined();
+  });
+
+  it('REQUEST_CHANGES 的轮次计算并入残留 intent：fixing 轮次不再少计（#563 CX-3.4）', async () => {
+    await seedTask({
+      id: 'task-rc-rrp', status: 'review', reviewRound: 1, prNumber: 70,
+      qaAgentId: 'qa-1', reviewRoundPending: true,
+    });
+    stubManager({ releaseAgentForTask: true, markAgentWaiting: true, continueSession: true });
+
+    await emitReview('task-rc-rrp', { action: 'REQUEST_CHANGES', prNumber: 70 });
+
+    const task = await taskStore.get('task-rc-rrp');
+    expect(task!.status).toBe('fixing');
+    expect(task!.reviewRound).toBe(3);
+    expect(task!.reviewRoundPending).toBeUndefined();
+  });
+
+  it('push recheck 遇忙 busyPending → 不落 hold、不发 intervention，pass 保持 armed 交对账补派（#558 M2 B1）', async () => {
+    await seedTask({ id: 'task-up-busy', status: 'fixing', reviewRound: 1, prNumber: 65 });
+    const busyErr = new EnsureSessionError(
+      { createdSession: false, agentId: 'qa-1', handled: true, busyPending: true },
+      'QA REPL busy; recheck dispatch for task task-up-busy queued for redispatch when idle',
+    );
+    // busyPending 的语义：startSession 已登记 pending（未落 hold）后才抛错，测试按同一时序登记
+    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
+      manager.registerPendingDispatchRetry('task-up-busy', { kind: 'qa-recheck', agentId: 'qa-1' });
+      throw busyErr;
+    });
+    const { releaseAgentForTask: releaseSpy } = stubManager({ releaseAgentForTask: true, markAgentWaiting: true });
+
+    await emitPrUpdated('task-up-busy', { prNumber: 65, kind: 'push' });
+
+    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(findIntervention('task-up-busy')).toBeFalsy();
+    expect((await taskStore.get('task-up-busy'))!.status).toBe('review');
+    expect((await agentStore.get('qa-1'))?.status).toBeUndefined();
+    expect(manager.getPendingDispatchRetry('task-up-busy')).toMatchObject({ kind: 'qa-recheck', agentId: 'qa-1' });
+  });
+
   it('push kind after QA approval transitions approved → review and starts QA recheck', async () => {
     await seedTask({ id: 'task-up-approved', status: 'approved', reviewRound: 1, prNumber: 73, qaAgentId: 'qa-1' });
     const { startSession: startSpy, releaseAgentForTask: releaseSpy, markAgentWaiting: markWaitSpy } = stubManager({ startSession: true, releaseAgentForTask: true, markAgentWaiting: true });
@@ -1451,7 +1793,7 @@ describe('pr.updated handler', () => {
       'task-up-approved',
       'waiting',
     );
-    expect(startSpy).toHaveBeenCalledWith('task-up-approved', 'qa-1', 'recheck');
+    expect(startSpy).toHaveBeenCalledWith('task-up-approved', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
     expect(releaseSpy.mock.invocationCallOrder[0]).toBeLessThan(
       startSpy.mock.invocationCallOrder[0],
     );
@@ -1571,7 +1913,7 @@ describe('pr.updated handler', () => {
     const task = await taskStore.get('task-up-mr-push');
     expect(task!.status).toBe('review');
     expect(releaseSpy).toHaveBeenCalledWith('dev-1', 'task-up-mr-push', 'waiting');
-    expect(startSpy).toHaveBeenCalledWith('task-up-mr-push', 'qa-1', 'recheck');
+    expect(startSpy).toHaveBeenCalledWith('task-up-mr-push', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
   });
 
   it('post-approve complete signal with dev wait-gate failure does not auto-merge', async () => {
@@ -1771,7 +2113,7 @@ describe('pr.updated handler', () => {
 
     await emitPrUpdated('task-up2', { prNumber: 51 });
 
-    expect(startSpy).toHaveBeenCalledWith('task-up2', 'qa-1', 'recheck');
+    expect(startSpy).toHaveBeenCalledWith('task-up2', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
   });
 
   it('in_progress without prNumber (task or event) → defer (no transition, no startSession)', async () => {
@@ -1793,7 +2135,7 @@ describe('pr.updated handler', () => {
 
     const task = await taskStore.get('task-haspr');
     expect(task!.status).toBe('review');
-    expect(startSpy).toHaveBeenCalledWith('task-haspr', 'qa-1', 'review');
+    expect(startSpy).toHaveBeenCalledWith('task-haspr', 'qa-1', 'review', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
   });
 
   it('fixing without event prNumber → still catch-up (fixing implies prior review/PR)', async () => {
@@ -1802,7 +2144,7 @@ describe('pr.updated handler', () => {
 
     await emitPrUpdated('task-fix-no-pr', {});
 
-    expect(startSpy).toHaveBeenCalledWith('task-fix-no-pr', 'qa-1', 'recheck');
+    expect(startSpy).toHaveBeenCalledWith('task-fix-no-pr', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
   });
 
   it('startSession success → markAgentWaiting without rewriting the QA participant', async () => {
@@ -1837,13 +2179,19 @@ describe('pr.updated handler', () => {
   it('recheck verdict watcher fails to arm → rolls back to fixing + restores token, releases QA + intervention', async () => {
     await seedTask({ id: 'task-up-noarm', status: 'fixing', reviewRound: 1, prNumber: 71, signalToken: 'fixing-token' });
     await seedDevAgent('task-up-noarm');
-    const { releaseAgentForTask: releaseSpy, startSession: startSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true, startSession: true });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-gen-0');
+      return true;
+    });
+    const { releaseAgentForTask: releaseSpy, startSession: startSpy } = stubManager({ releaseAgentForTask: true, startSession: true });
     stubRotateSignalWritingStore('task-up-noarm', 'rotated', false);
 
     await emitPrUpdated('task-up-noarm', { prNumber: 71 });
 
     expect(startSpy).not.toHaveBeenCalled();
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-noarm', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-up-noarm', 'idle', expect.objectContaining({ expectedLockToken: expect.any(String) }),
+    );
     const task = await taskStore.get('task-up-noarm');
     expect(task!.status).toBe('fixing');
     expect(task!.signalToken).toBe('fixing-token');
@@ -1869,8 +2217,12 @@ describe('pr.updated handler', () => {
       reviewHeadAnchorSha: HEAD_SHA, reviewDispatchedAt: dispatchedAt,
     });
     await seedDevAgent('task-up-rb3');
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-gen-1');
+      return true;
+    });
     const { releaseAgentForTask: releaseSpy } = stubManager({
-      acquireAgentForTask: true, releaseAgentForTask: true,
+      releaseAgentForTask: true,
     });
     vi.spyOn(manager, 'startSession').mockRejectedValue(new Error('git fetch failed'));
 
@@ -1883,7 +2235,9 @@ describe('pr.updated handler', () => {
     expect(task!.reviewDispatchedAt).toBe(dispatchedAt);
     expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
     expect(task!.qaAgentId).toBe('qa-1');
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-rb3', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-up-rb3', 'idle', expect.objectContaining({ expectedLockToken: expect.any(String) }),
+    );
   });
 
   it('recheck startSession failure after concurrent pass takeover → rollback skipped, new pass untouched', async () => {
@@ -1922,7 +2276,11 @@ describe('pr.updated handler', () => {
 
   it('startSession failure with task cancelled mid-dispatch → QA still released (terminal is not a takeover)', async () => {
     await seedTask({ id: 'task-up-cxrace', status: 'fixing', reviewRound: 1, prNumber: 79, signalToken: 'tok-cxrace' });
-    const { releaseAgentForTask: releaseSpy } = stubManager({ acquireAgentForTask: true, releaseAgentForTask: true });
+    vi.spyOn(manager, 'acquireAgentForTask').mockImplementation(async (_a, _t, _p, opts) => {
+      opts?.onAcquired?.('lock-gen-2');
+      return true;
+    });
+    const { releaseAgentForTask: releaseSpy } = stubManager({ releaseAgentForTask: true });
     vi.spyOn(manager, 'startSession').mockImplementation(async () => {
       const fresh = await taskStore.get('task-up-cxrace');
       await taskStore.set({ ...fresh!, status: 'cancelled', updatedAt: new Date().toISOString() });
@@ -1934,7 +2292,9 @@ describe('pr.updated handler', () => {
     const task = await taskStore.get('task-up-cxrace');
     expect(task!.status).toBe('cancelled');
     expect(task!.signalToken).not.toBe('tok-cxrace');
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-up-cxrace', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1', 'task-up-cxrace', 'idle', expect.objectContaining({ expectedLockToken: expect.any(String) }),
+    );
   });
 
   it('cancelled task → no-op', async () => {
@@ -2003,7 +2363,7 @@ describe('pr.fix.submitted handler (dev pr-fixed completion)', () => {
     expect(task!.status).toBe('review');
     expect(task!.reviewHeadAnchorSha).toBe(NEXT_HEAD_SHA);
     expect(task!.latestHeadSha).toBe(NEXT_HEAD_SHA);
-    expect(startSpy).toHaveBeenCalledWith('task-pf-commit', 'qa-1', 'recheck');
+    expect(startSpy).toHaveBeenCalledWith('task-pf-commit', 'qa-1', 'recheck', expect.objectContaining({ dispatchPassToken: expect.any(String) }));
     expect(replySpy).not.toHaveBeenCalled();
   });
 
@@ -3085,7 +3445,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
     const task = await taskStore.get('task-mr-rc');
     expect(task!.status).toBe('fixing');
     expect(task!.reviewRound).toBe(2);
-    expect(continueSpy).toHaveBeenCalledWith('task-mr-rc', 'dev-1', 'fix');
+    expect(continueSpy).toHaveBeenCalledWith('task-mr-rc', 'dev-1', 'fix', expect.objectContaining({ signalToken: expect.any(String), guardBeforeInject: expect.any(Function) }));
   });
 
   it('within rounds → fixing + reviewRound++ + continueSession + releaseAgentForTask QA', async () => {
@@ -3098,7 +3458,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(task!.status).toBe('fixing');
     expect(task!.reviewRound).toBe(2);
     expect(stopSpy).toHaveBeenCalledWith('qa-1', 'task-r1', 'idle', { allowAwaitingHuman: true });
-    expect(continueSpy).toHaveBeenCalledWith('task-r1', 'dev-1', 'fix');
+    expect(continueSpy).toHaveBeenCalledWith('task-r1', 'dev-1', 'fix', expect.objectContaining({ signalToken: expect.any(String), guardBeforeInject: expect.any(Function) }));
   });
 
   it('approved + REQUEST_CHANGES clears post-approve token and dispatches dev fix', async () => {
@@ -3118,7 +3478,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
       'waiting',
     );
     expect(acquireSpy).toHaveBeenCalledWith('dev-1', 'task-r-approved', 'fix');
-    expect(continueSpy).toHaveBeenCalledWith('task-r-approved', 'dev-1', 'fix');
+    expect(continueSpy).toHaveBeenCalledWith('task-r-approved', 'dev-1', 'fix', expect.objectContaining({ signalToken: expect.any(String), guardBeforeInject: expect.any(Function) }));
   });
 
   it('approved + REQUEST_CHANGES leaves task approved when dev cannot be interrupted for fix', async () => {
@@ -3175,7 +3535,7 @@ describe('review.submitted REQUEST_CHANGES', () => {
 
     await emitReview('task-r-rel-fail', { action: 'REQUEST_CHANGES', prNumber: 33 });
 
-    expect(continueSpy).toHaveBeenCalledWith('task-r-rel-fail', 'dev-1', 'fix');
+    expect(continueSpy).toHaveBeenCalledWith('task-r-rel-fail', 'dev-1', 'fix', expect.objectContaining({ signalToken: expect.any(String), guardBeforeInject: expect.any(Function) }));
     const intervention = findIntervention('task-r-rel-fail');
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('qa-release-failed-but-dev-dispatched');
@@ -3206,6 +3566,58 @@ describe('review.submitted REQUEST_CHANGES', () => {
     expect(intervention).toBeTruthy();
     expect(intervention!.data.phase).toBe('fix-resume-failed');
     expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-r2b');
+  });
+
+  it.each([
+    ['DirtyWorkdirError（dev 回合中工作区未提交）', () => new DirtyWorkdirError('/tmp/repo')],
+    ['ReplNotReadyError（dev pane 忙碌）', () => new ReplNotReadyError('%1', 'claude-code', '', 'pre-inject busy check')],
+  ])('fix continue 遇 %s → 登记 dev-fix pending、不发 fix-resume-failed（#558 M2 B1-dev）', async (_name, mkErr) => {
+    await seedTask({ id: 'task-r-busy', status: 'review', reviewRound: 1, prNumber: 312, qaAgentId: 'qa-1' });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    const markWaitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
+    vi.spyOn(manager, 'continueSession').mockRejectedValue(mkErr());
+
+    await emitReview('task-r-busy', { action: 'REQUEST_CHANGES', prNumber: 312 });
+
+    const task = await taskStore.get('task-r-busy');
+    expect(task!.status).toBe('fixing');
+    expect(findIntervention('task-r-busy')).toBeFalsy();
+    expect(markWaitSpy).toHaveBeenCalledWith('dev-1', 'task-r-busy');
+    expect(manager.getPendingDispatchRetry('task-r-busy')).toMatchObject({
+      kind: 'dev-fix',
+      agentId: 'dev-1',
+      signalToken: task!.signalToken,
+    });
+  });
+
+  it('dev 停驻失败（markAgentWaiting=false）时忙碌分类不得静默降级 pending：发 fix-resume-failed 且不登记（R13）', async () => {
+    await seedTask({ id: 'task-r-park', status: 'review', reviewRound: 1, prNumber: 313, qaAgentId: 'qa-1' });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(false);
+    vi.spyOn(manager, 'continueSession').mockRejectedValue(new DirtyWorkdirError('/tmp/repo'));
+
+    await emitReview('task-r-park', { action: 'REQUEST_CHANGES', prNumber: 313 });
+
+    const intervention = findIntervention('task-r-park');
+    expect(intervention).toBeTruthy();
+    expect(intervention!.data.phase).toBe('fix-resume-failed');
+    expect(manager.getPendingDispatchRetry('task-r-park')).toBeUndefined();
+  });
+
+  it('dev 停驻抛错（reject→false）同样走 intervention 而非 pending（R13）', async () => {
+    await seedTask({ id: 'task-r-park2', status: 'review', reviewRound: 1, prNumber: 314, qaAgentId: 'qa-1' });
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'markAgentWaiting').mockRejectedValue(new Error('store IO failure'));
+    vi.spyOn(manager, 'continueSession').mockRejectedValue(
+      new ReplNotReadyError('%1', 'claude-code', '', 'pre-inject busy check'),
+    );
+
+    await emitReview('task-r-park2', { action: 'REQUEST_CHANGES', prNumber: 314 });
+
+    const intervention = findIntervention('task-r-park2');
+    expect(intervention).toBeTruthy();
+    expect(intervention!.data.phase).toBe('fix-resume-failed');
+    expect(manager.getPendingDispatchRetry('task-r-park2')).toBeUndefined();
   });
 
   it('honors live config: manager.replaceConfig lowering rounds takes effect on the very next REQUEST_CHANGES', async () => {
@@ -3312,7 +3724,7 @@ describe('review.submitted late-review catch-up', () => {
     const task = await taskStore.get('task-late2');
     expect(task!.status).toBe('fixing');
     expect(task!.reviewRound).toBe(2);
-    expect(continueSpy).toHaveBeenCalledWith('task-late2', 'dev-1', 'fix');
+    expect(continueSpy).toHaveBeenCalledWith('task-late2', 'dev-1', 'fix', expect.objectContaining({ signalToken: expect.any(String), guardBeforeInject: expect.any(Function) }));
   });
 
   it('in_progress + event has NO prNumber → no catch-up, no transition', async () => {
@@ -3402,7 +3814,7 @@ describe('event-driven release does not interrupt agent mid-action', () => {
     expect(interrupts).toHaveLength(0);
 
     expect(acquireSpy).toHaveBeenCalledWith('dev-1', 'task-busy-redispatch', 'fix');
-    expect(continueSpy).toHaveBeenCalledWith('task-busy-redispatch', 'dev-1', 'fix');
+    expect(continueSpy).toHaveBeenCalledWith('task-busy-redispatch', 'dev-1', 'fix', expect.objectContaining({ signalToken: expect.any(String), guardBeforeInject: expect.any(Function) }));
   });
 
   it('REQUEST_CHANGES on approved + post-approve completion still active: emits intervention + skips fix dispatch (avoid prompt collision)', async () => {

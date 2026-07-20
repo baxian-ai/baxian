@@ -24,6 +24,7 @@ import { saveConfig, prepareConfig, ConfigValidationError } from '../config/load
 import { withConfigLock } from '../config/mutex.js';
 import { redactProjects } from './config.js';
 import { CleanupFailedError } from '../agent/manager.js';
+import { AGENT_STORE_NOOP } from '../state/agent-store.js';
 import { applyConfigHotReload } from '../config/hot-reload.js';
 
 interface CheckRun {
@@ -309,6 +310,13 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (existsGlobally) {
         return reply.status(409).send({ error: `Agent id "${agentInput.id}" already exists` });
       }
+      // A tombstone in flight (or retained after a DELETE memory-switch divergence) must block a
+      // same-id rebuild, else the fail-stop could be silently bypassed.
+      if (app.ctx.agentManager.isDeletionInFlight(agentInput.id)) {
+        return reply.status(409).send({
+          error: `Agent id "${agentInput.id}" is being deleted (or its deletion diverged); retry later or restart the server`,
+        });
+      }
       const workdirConflict = findConfiguredWorkdirConflict(app.ctx.config, agentInput);
       if (workdirConflict) {
         return reply.status(409).send({
@@ -373,6 +381,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       app.ctx.agentManager.replaceConfig(validated);
       app.ctx.tmuxProbePoller?.replaceConfig(validated);
       app.ctx.bootstrapPoller?.replaceConfig(validated);
+      app.ctx.dispatchReconciler?.replaceConfig(validated);
 
       creationToken = randomUUID();
       const now = new Date().toISOString();
@@ -417,32 +426,56 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const originalStates: Map<string, AgentBindingFacts | null> = new Map();
       let originalConfigHash = '';
       let validatedAfterRemove: BaxianConfig | null = null;
-      const deleteOwner = 'maintenance:delete-agent';
-      const acquiredLocks = new Map<string, { taskId: string; token: string }>();
-      const releaseAcquiredLocks = async (): Promise<void> => {
-        for (const [id, claim] of acquiredLocks) {
-          await app.ctx.lockManager.releaseIfOwner(id, claim.taskId, claim.token);
+      // Per-attempt deletion owner: phase 1 rotates every claim onto it (so a concurrent maintenance release with the old shared token fails owner-scoped); phase 3 releases it, rollback rotates back to the original.
+      const deletionOwner = `deletion:${randomUUID()}`;
+      const rotatedClaims = new Map<string, { deletionToken: string; original: { taskId: string; token: string } | null }>();
+      const releaseDeletionClaims = async (): Promise<void> => {
+        for (const [id, r] of rotatedClaims) {
+          await app.ctx.lockManager.releaseIfOwner(id, deletionOwner, r.deletionToken);
         }
-        acquiredLocks.clear();
+        rotatedClaims.clear();
+      };
+      const rollbackClaims = async (): Promise<void> => {
+        const failures: string[] = [];
+        const restored: string[] = [];
+        for (const [id, r] of rotatedClaims) {
+          try {
+            const ok = r.original
+              ? await app.ctx.lockManager.rotateClaim(id, { taskId: deletionOwner, token: r.deletionToken }, r.original)
+              : await app.ctx.lockManager.releaseIfOwner(id, deletionOwner, r.deletionToken);
+            if (ok) restored.push(id);
+            else failures.push(`${id}: deletion-owner claim no longer held; original owner not restored`);
+          } catch (err) {
+            failures.push(`${id}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+        // Clear only successfully-restored entries; keep failed ones as evidence for the caller/finally.
+        for (const id of restored) rotatedClaims.delete(id);
+        if (failures.length > 0) {
+          throw new AggregateError(failures.map(f => new Error(f)), `lock rollback failed for ${failures.length} target(s)`);
+        }
       };
       const rollbackAndRelease = async (): Promise<Error | null> => {
         let rollbackError: Error | null = null;
+        // Rotate claims back to their original owners FIRST, so state restore sees the original claim.
         try {
-          await rollbackPerTargetState(app, targets, originalStates);
+          await rollbackClaims();
         } catch (err) {
           rollbackError = err instanceof Error ? err : new Error(String(err));
         }
         try {
-          await releaseAcquiredLocks();
+          await rollbackPerTargetState(app, targets, originalStates);
         } catch (err) {
-          const releaseError = err instanceof Error ? err : new Error(String(err));
+          const restoreError = err instanceof Error ? err : new Error(String(err));
           rollbackError = rollbackError
-            ? new AggregateError([rollbackError, releaseError], 'Agent deletion rollback and lock release failed')
-            : releaseError;
+            ? new AggregateError([rollbackError, restoreError], 'Agent deletion rollback and lock release failed')
+            : restoreError;
         }
         return rollbackError;
       };
       let claimedTargets: string[] = [];
+      // True only after saveConfig commits: pre-commit escapes must rollback to the original owners; post-commit just releases.
+      let committed = false;
 
       try {
       const phase1Result = await withConfigLock(async () => {
@@ -457,84 +490,77 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
         targets = app.ctx.agentManager.prepareRemoveTargets(agentId).targets.slice().sort();
 
-        for (const id of targets) {
-          const state = await app.ctx.agentStore.get(id);
-          const task = state?.taskId ? await app.ctx.taskStore.get(state.taskId) : null;
-          if (task && TASK_ACTIVE_STATUS_SET.has(task.status)) {
-            return reply.status(409).send({
-              error:
-                `Agent "${id}" is still active on task ${task.id}; cancel the task before deleting ` +
-                `(prevents orphan task / tmux session / lock / Workdir binding).`,
-            });
+        // Scan + tombstone-claim run atomically under the manager's task lock, blocking a concurrent createTask/dispatchPendingTask from committing onto a target mid-delete.
+        const claim = await app.ctx.agentManager.scanActiveThenClaimDeletion(targets);
+        if (!claim.ok) {
+          switch (claim.code) {
+            case 'active':
+              return reply.status(409).send({
+                error:
+                  `Agent "${claim.agentId}" is still active on task ${claim.taskId}; cancel the task before deleting ` +
+                  `(prevents orphan task / tmux session / lock / Workdir binding).`,
+              });
+            case 'bootstrapping':
+              return reply.status(409).send({
+                error:
+                  `Agent "${claim.agentId}" is bootstrapping; retry shortly or wait for it to enter awaiting_human state.`,
+              });
+            case 'referencing':
+              return reply.status(409).send({
+                error:
+                  `Agent "${agentId}" is referenced by active task ${claim.taskId}; ` +
+                  `cancel or finish that task before deleting (would dangle its dev/QA/retry reference).`,
+              });
+            case 'already-deleting':
+              return reply.status(409).send({
+                error: `Agent "${claim.agentId}" deletion already in progress; please wait and retry`,
+              });
           }
-          if (state?.status === 'awaiting_human') continue;
-          if (state?.creationToken) {
-            return reply.status(409).send({
-              error:
-                `Agent "${id}" is bootstrapping; retry shortly or wait for it to enter awaiting_human state.`,
-            });
-          }
-        }
-
-        const targetSet = new Set(targets);
-        const referencing = (await app.ctx.taskStore.list({})).find(t =>
-          TASK_ACTIVE_STATUS_SET.has(t.status)
-          && ((t.preferredAgentId !== '' && targetSet.has(t.preferredAgentId))
-            || (!!t.agentId && targetSet.has(t.agentId))
-            || (!!t.devAgentId && targetSet.has(t.devAgentId))
-            || (!!t.qaAgentId && targetSet.has(t.qaAgentId))
-            || (!!t.researchAgentId && targetSet.has(t.researchAgentId))),
-        );
-        if (referencing) {
-          return reply.status(409).send({
-            error:
-              `Agent "${agentId}" is referenced by active task ${referencing.id}; ` +
-              `cancel or finish that task before deleting (would dangle its dev/QA/retry reference).`,
-          });
-        }
-
-        const conflict = app.ctx.agentManager.tryClaimDeletion(targets);
-        if (conflict) {
-          return reply.status(409).send({
-            error: `Agent "${conflict}" deletion already in progress; please wait and retry`,
-          });
         }
         claimedTargets = targets.slice();
 
         for (const id of targets) {
           const state = await app.ctx.agentStore.get(id);
-          if (state?.taskId) {
-            let token = state.lockToken;
-            if (!token || !(await app.ctx.lockManager.isOwner(id, state.taskId, token))) {
-              const claim = await app.ctx.lockManager.claimOf(id);
-              token = claim?.taskId === state.taskId ? claim.token : undefined;
-              if (!token && claim === null) {
-                token = await app.ctx.lockManager.acquire(id, state.taskId) ?? undefined;
-                if (token) acquiredLocks.set(id, { taskId: state.taskId, token });
-              }
-            }
-            if (token && await app.ctx.lockManager.isOwner(id, state.taskId, token)) {
-              await app.ctx.agentStore.update(id, (latest) => {
-                if (!latest || latest.taskId !== state.taskId || latest.lockToken === token) return latest;
-                return { ...latest, lockToken: token, updatedAt: new Date().toISOString() };
-              });
-            }
-            if (!token || !(await app.ctx.lockManager.isOwner(id, state.taskId, token))) {
-              await releaseAcquiredLocks();
+          const claim = await app.ctx.lockManager.claimOf(id);
+          const deletionToken = randomUUID();
+          if (claim === null) {
+            // No lock file (unbound, or a stale binding whose lock is gone): rotate from unbound == acquire.
+            const ok = await app.ctx.lockManager.rotateClaim(id, { unbound: true }, { taskId: deletionOwner, token: deletionToken });
+            if (!ok) {
+              await rollbackClaims();
               return reply.status(409).send({
-                error: `Agent "${id}" has a stale task binding whose exclusive lock is owned by another operation; retry after it finishes.`,
+                error: `Agent "${id}" is currently locked by another op; please retry later`,
               });
             }
+            rotatedClaims.set(id, { deletionToken, original: null });
             continue;
           }
-          const token = await app.ctx.lockManager.acquire(id, deleteOwner);
-          if (!token) {
-            await releaseAcquiredLocks();
+          // A lock exists — only rotate it if it belongs to THIS agent's (now-terminal) task binding;
+          // a lock owned by an unrelated live op must not be stolen.
+          if (state?.taskId && claim.taskId !== state.taskId) {
+            await rollbackClaims();
+            return reply.status(409).send({
+              error: `Agent "${id}" has a stale task binding whose exclusive lock is owned by another operation; retry after it finishes.`,
+            });
+          }
+          if (!state?.taskId) {
+            await rollbackClaims();
             return reply.status(409).send({
               error: `Agent "${id}" is currently locked by another op; please retry later`,
             });
           }
-          acquiredLocks.set(id, { taskId: deleteOwner, token });
+          const ok = await app.ctx.lockManager.rotateClaim(
+            id,
+            { taskId: claim.taskId, token: claim.token },
+            { taskId: deletionOwner, token: deletionToken },
+          );
+          if (!ok) {
+            await rollbackClaims();
+            return reply.status(409).send({
+              error: `Agent "${id}" lock changed while claiming it for deletion; please retry.`,
+            });
+          }
+          rotatedClaims.set(id, { deletionToken, original: { taskId: claim.taskId, token: claim.token } });
         }
 
         for (const id of targets) {
@@ -547,7 +573,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         try {
           validatedAfterRemove = prepareConfig(removeRequest);
         } catch (err) {
-          await releaseAcquiredLocks();
+          await rollbackClaims();
           if (err instanceof ConfigValidationError) {
             return reply.status(400).send({ error: 'Invalid config', details: err.errors });
           }
@@ -603,56 +629,100 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           }
           throw err;
         }
+
+        // Its only caller (saveConfig failure) runs before any state delete, so recovery is just rotating each claim back to its original owner.
+        const restoreForRetry = async (): Promise<Error | null> => {
+          try {
+            await rollbackClaims();
+            return null;
+          } catch (e) {
+            return e instanceof Error ? e : new Error(String(e));
+          }
+        };
+
+        // Step 1 — commit config (atomic saveConfig) BEFORE any state delete: a crash between the two would else leave config referencing an agent whose state is gone, behind a stuck deletion:<uuid> lock (unrecoverable wedge).
+        const warnings: string[] = [];
         try {
           await saveConfig(app.ctx.configPath!, validated);
         } catch (err) {
           app.log.error({ err, targets },
-            'DELETE /agents Phase 3 saveConfig failed; restoring agent state and exact locks');
-          const rollbackError = await rollbackAndRelease();
-          if (rollbackError) {
-            app.log.error({ err: rollbackError, targets }, 'DELETE /agents rollback after saveConfig failed');
+            'DELETE /agents Phase 3 saveConfig failed; releasing acquired locks (no state was deleted yet)');
+          const restoreError = await restoreForRetry();
+          if (restoreError) {
             return reply.status(500).send({
-              error: `failed to persist config and restore agent state safely: ${rollbackError.message}`,
+              error: `failed to persist config and roll the deletion locks back safely: ${restoreError.message}`,
             });
           }
           return reply.status(500).send({
-            error: 'failed to persist config after runtime cleanup; agent state and exact task locks were restored',
+            error: 'failed to persist config after runtime cleanup; this attempt\'s locks were released and agent state left intact',
           });
         }
-        app.ctx.config = validated;
-        app.ctx.agentManager.replaceConfig(validated);
-        app.ctx.tmuxProbePoller?.replaceConfig(validated);
-        app.ctx.bootstrapPoller?.replaceConfig(validated);
+        // Disk committed — point of no return. Bump the generation before any memory switch that could throw.
+        committed = true;
+        for (const id of targets) app.ctx.agentManager.bumpDeletionGeneration(id);
+
+        // Step 2 — delete agent state POST-commit (best-effort): config already dropped these agents, so a failure here leaves only reclaimable orphan state.
         for (const id of targets) {
           try {
             await app.ctx.agentStore.delete(id);
           } catch (delErr) {
-            app.log.warn({ err: delErr, agentId: id },
-              'DELETE /agents Phase 3 agentStore.delete failed');
+            const msg = `agent ${id} state delete failed post-commit (reclaimable orphan state): ${delErr instanceof Error ? delErr.message : String(delErr)}`;
+            app.log.error({ err: delErr, agentId: id, targets }, `DELETE /agents Phase 3 ${msg}`);
+            warnings.push(msg);
+          }
+        }
+
+        // Step 3 — in-memory switch (never reverts; pollers cleared once). A throw here is a program bug: fail-stop by retaining the tombstone so nothing re-creates the id.
+        try {
+          app.ctx.config = validated;
+          app.ctx.agentManager.replaceConfig(validated);
+          app.ctx.tmuxProbePoller?.replaceConfig(validated);
+          app.ctx.bootstrapPoller?.replaceConfig(validated);
+          app.ctx.dispatchReconciler?.replaceConfig(validated);
+        } catch (err) {
+          for (const id of targets) app.ctx.agentManager.retainTombstoneForDivergence(id);
+          app.log.fatal({ err, targets },
+            'DELETE /agents Phase 3 replaceConfig threw AFTER disk commit; tombstone retained, restart advised');
+        }
+
+        // Step 4 — owner-scoped release of the deletion-owner claims + best-effort side cleanup; past the commit point, failures are surfaced as warnings, never rolled back.
+        for (const id of targets) {
+          const rotated = rotatedClaims.get(id);
+          if (rotated) {
+            try {
+              await app.ctx.lockManager.releaseIfOwner(id, deletionOwner, rotated.deletionToken);
+              rotatedClaims.delete(id);
+            } catch (releaseErr) {
+              warnings.push(`lock release for ${id} failed: ${releaseErr instanceof Error ? releaseErr.message : String(releaseErr)}`);
+              app.log.warn({ err: releaseErr, agentId: id }, 'DELETE /agents Phase 3 lock release failed (post-commit)');
+            }
           }
           if (app.ctx.errorRecordStore) {
             try {
               await app.ctx.errorRecordStore.purgeAgent(id);
             } catch (purgeErr) {
-              app.log.warn({ err: purgeErr, agentId: id },
-                'DELETE /agents errorRecordStore.purgeAgent failed');
+              app.log.warn({ err: purgeErr, agentId: id }, 'DELETE /agents errorRecordStore.purgeAgent failed');
             }
           }
           if (app.ctx.petStore) {
             try {
               await app.ctx.petStore.setAssignment(id, null);
             } catch (petErr) {
-              app.log.warn({ err: petErr, agentId: id },
-                'DELETE /agents petStore.setAssignment(null) failed');
+              app.log.warn({ err: petErr, agentId: id }, 'DELETE /agents petStore.setAssignment(null) failed');
             }
           }
-          const claim = acquiredLocks.get(id);
-          if (claim) await app.ctx.lockManager.releaseIfOwner(id, claim.taskId, claim.token);
         }
-        return reply.send({ removed: targets, restartRequired: false });
+        return reply.send({ removed: targets, restartRequired: false, ...(warnings.length ? { warnings } : {}) });
       });
       return phase3Result;
       } finally {
+        // Leftover rotated claims (normal paths clear them): pre-commit escapes roll back to the original owners; releasing pre-commit would strand a lockless binding. Post-commit the agents are gone, so just release.
+        if (rotatedClaims.size > 0) {
+          const cleanup = committed ? releaseDeletionClaims() : rollbackClaims();
+          await cleanup.catch((err) => {
+            app.log.error({ err, committed }, 'DELETE /agents: leftover deletion-claim cleanup failed');
+          });
+        }
         if (claimedTargets.length > 0) {
           app.ctx.agentManager.releaseDeletionClaim(claimedTargets);
         }
@@ -703,6 +773,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
       const guard = await rejectIfOpInProgress(app, agentId);
       if (guard) return reply.status(guard.status).send({ error: guard.error });
+      if (app.ctx.agentManager.isDeletionInFlight(agentId)) {
+        return reply.status(409).send({ error: `Agent "${agentId}" is being deleted; restart-repl not allowed.` });
+      }
+      const genAtEntry = app.ctx.agentManager.deletionGenerationOf(agentId);
 
       const owner = await resolveLockOwnership(app, agentId);
       const maintenanceOwner = 'maintenance:restart-repl';
@@ -730,7 +804,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       try {
-        await app.ctx.agentManager.restartReplOnly(agentId);
+        await app.ctx.agentManager.restartReplOnly(agentId, { expectedGeneration: genAtEntry });
       } catch (err) {
         if (maintenanceToken && acquiredMaintenanceLock) {
           await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
@@ -753,6 +827,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (!cfg || cfg.projectId !== projectId) {
         return reply.status(404).send({ error: `Agent "${agentId}" not found in project "${projectId}"` });
       }
+      if (app.ctx.agentManager.isDeletionInFlight(agentId)) {
+        return reply.status(409).send({ error: `Agent "${agentId}" is being deleted; retry not allowed.` });
+      }
+      const genAtEntry = app.ctx.agentManager.deletionGenerationOf(agentId);
       const stateBefore = await app.ctx.agentStore.get(agentId);
       if (stateBefore?.creationToken) {
         return reply.status(409).send({
@@ -786,16 +864,28 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
 
       try {
-        const result = await app.ctx.agentManager.ensureSession(agentId, 'runtime');
+        const result = await app.ctx.agentManager.ensureSession(agentId, 'runtime', { expectedGeneration: genAtEntry });
         const now = new Date().toISOString();
-        const stateAfter = await app.ctx.agentStore.get(agentId);
-        await app.ctx.agentStore.set({
-          ...(stateAfter ?? { id: agentId, projectId, updatedAt: now }),
-          paneId: result.paneId,
-          updatedAt: now,
+        // Generation-gated: a DELETE→recreate during ensureSession leaves a NEW state, so an existing-only check would bind the stale paneId to the wrong incarnation.
+        const paneCommit = await app.ctx.agentStore.update(agentId, (existing) => {
+          if (!existing
+              || app.ctx.agentManager.isDeletionInFlight(agentId)
+              || app.ctx.agentManager.deletionGenerationOf(agentId) !== genAtEntry) {
+            return AGENT_STORE_NOOP;
+          }
+          return { ...existing, paneId: result.paneId, updatedAt: now };
         });
+        // No-op ⇒ a DELETE→recreate raced ensureSession; fail closed rather than run stale retry cleanup against the new incarnation.
+        if (paneCommit !== 'committed') {
+          if (maintenanceToken && acquiredMaintenanceLock) {
+            await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
+          }
+          return reply.status(409).send({
+            error: `Agent "${agentId}" was deleted or recreated during retry; re-run retry against the current agent`,
+          });
+        }
       } catch (err) {
-        if (await app.ctx.agentManager.handleDialogPendingFromRuntime(agentId, err)) {
+        if (await app.ctx.agentManager.handleDialogPendingFromRuntime(agentId, err, { expectedGeneration: genAtEntry })) {
           if (maintenanceToken && acquiredMaintenanceLock) {
             await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
           }

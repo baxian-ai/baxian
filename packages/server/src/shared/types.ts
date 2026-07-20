@@ -70,6 +70,9 @@ export interface ServerConfig {
   tmuxProbeTimeoutMs: number;
   tmuxProbeConcurrency: number;
   bootstrapRetryIntervalMs: number;
+  dispatchReconcileIntervalMs: number;
+  dispatchBusyWaitBudgetMs: number;
+  dispatchReconcileMaxAttempts: number;
 }
 
 export interface BaxianConfig {
@@ -208,6 +211,8 @@ export interface TaskState {
   prFeedbackReceivedAt?: string;
   fixDispatchedAt?: string;
   reviewRound: number;
+  // 本 pass 的轮次尚未计入（直派路径在 startSession 成功后才 bump）；补派/重启重放据此恰好补计一次
+  reviewRoundPending?: boolean;
   specReviewRound?: number;
   phase?: TaskPhase;
   images?: string[];

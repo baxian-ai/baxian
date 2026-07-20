@@ -40,7 +40,7 @@ const present: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
 const absent: ExecResult = { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
 const unreachable: ExecResult = { stdout: '', stderr: 'ssh timeout', exitCode: 255 };
 const oneClaudePane: ExecResult = { stdout: '%1 claude\n', stderr: '', exitCode: 0 };
-const liveRuntimePane: ExecResult = { stdout: 'claude\n___bx-classify-sep___\n> ', stderr: '', exitCode: 0 };
+const liveRuntimePane: ExecResult = { stdout: 'claude\n> ', stderr: '', exitCode: 0 };
 const readyCapture: ExecResult = { stdout: '> ', stderr: '', exitCode: 0 };
 const emptyPaneTitle: ExecResult = { stdout: '', stderr: '', exitCode: 0 };
 
@@ -49,14 +49,24 @@ function text(stdout: string): ExecResult {
 }
 
 const codexPane: ExecResult = text('%1 node\n');
-const codexRuntimePane: ExecResult = text('node\n___bx-classify-sep___\n› ');
+const codexRuntimePane: ExecResult = text('node\n› ');
+
+const PANE_OK = 'BX_PANE_OK';
+const SESSION_REF_LINE = '4242|1700000000|$1';
+const CLASSIFY_MARKER = `${PANE_OK}#{pane_current_command}`;
+
+function defaultSessionSnapshot(cmd: string): ExecResult {
+  const name = /#\{==:#\{session_name\},([^}]*)\}/.exec(cmd)?.[1] ?? 'dev-1';
+  return text(`${SESSION_REF_LINE}|${name}\n`);
+}
 
 type Branch = ExecResult | ((cmd: string) => ExecResult | Promise<ExecResult>);
 
 interface ExecOverrides {
   hasSession?: Branch;
+  sessionSnapshot?: Branch;
   listPanes?: Branch;
-  classifySep?: Branch;
+  classify?: Branch;
   capturePane?: Branch;
   paneTitle?: Branch;
   paneWidth?: Branch;
@@ -66,22 +76,35 @@ function resolveBranch(branch: Branch, cmd: string): ExecResult | Promise<ExecRe
   return typeof branch === 'function' ? branch(cmd) : branch;
 }
 
+// Fixtures stay raw pane content; the mock speaks the guarded-read marker protocol (tmux.ts guardedPaneRead).
+async function markerHeader(branch: Branch, cmd: string): Promise<ExecResult> {
+  const result = await resolveBranch(branch, cmd);
+  return { ...result, stdout: `${PANE_OK}${result.stdout}` };
+}
+
+async function markerBody(branch: Branch, cmd: string): Promise<ExecResult> {
+  const result = await resolveBranch(branch, cmd);
+  return { ...result, stdout: `${PANE_OK}\n${result.stdout}` };
+}
+
 function makeExec(overrides: ExecOverrides = {}): CommandRunner['exec'] {
   const branches = {
     hasSession: overrides.hasSession ?? present,
+    sessionSnapshot: overrides.sessionSnapshot ?? defaultSessionSnapshot,
     listPanes: overrides.listPanes ?? oneClaudePane,
-    classifySep: overrides.classifySep ?? liveRuntimePane,
+    classify: overrides.classify ?? liveRuntimePane,
     capturePane: overrides.capturePane ?? readyCapture,
     paneTitle: overrides.paneTitle ?? emptyPaneTitle,
     paneWidth: overrides.paneWidth ?? text('80'),
   };
   return vi.fn(async (cmd: string) => {
     if (cmd.includes('has-session')) return resolveBranch(branches.hasSession, cmd);
+    if (cmd.includes('list-sessions')) return resolveBranch(branches.sessionSnapshot, cmd);
     if (cmd.includes('list-panes')) return resolveBranch(branches.listPanes, cmd);
-    if (cmd.includes('___bx-classify-sep___')) return resolveBranch(branches.classifySep, cmd);
-    if (cmd.includes('capture-pane')) return resolveBranch(branches.capturePane, cmd);
-    if (cmd.includes('pane_title')) return resolveBranch(branches.paneTitle, cmd);
-    if (cmd.includes('pane_width')) return resolveBranch(branches.paneWidth, cmd);
+    if (cmd.includes(CLASSIFY_MARKER)) return markerHeader(branches.classify, cmd);
+    if (cmd.includes('pane_title')) return markerHeader(branches.paneTitle, cmd);
+    if (cmd.includes('pane_width')) return markerHeader(branches.paneWidth, cmd);
+    if (cmd.includes('capture-pane')) return markerBody(branches.capturePane, cmd);
     return present;
   });
 }
@@ -281,7 +304,7 @@ describe('TmuxProbePoller', () => {
       agentId: 'qa-1',
       exec: makeExec({
         listPanes: codexPane,
-        classifySep: codexRuntimePane,
+        classify: codexRuntimePane,
         capturePane: text('• Working (2m 30s • esc to interrup…'),
       }),
       steps: [{}],
@@ -295,7 +318,7 @@ describe('TmuxProbePoller', () => {
 
   it('classifies unsupported foreground processes as unsafe runtime observations', async () => {
     await runProbeScenario({
-      exec: makeExec({ classifySep: text('vim\n___bx-classify-sep___\nediting') }),
+      exec: makeExec({ classify: text('vim\nediting') }),
       steps: [{}],
       expectMatch: {
         tmuxSessionStatus: 'present',
@@ -386,12 +409,12 @@ describe('TmuxProbePoller', () => {
     });
 
     it('clears baseline when paneState leaves live-runtime, so re-entry gets a fresh 5-min grace period', async () => {
-      const shellPane: ExecResult = text('zsh\n___bx-classify-sep___\n$ ');
+      const shellPane: ExecResult = text('zsh\n$ ');
       let scenario: 'live' | 'shell' = 'live';
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({
-          classifySep: () => (scenario === 'live' ? liveRuntimePane : shellPane),
+          classify: () => (scenario === 'live' ? liveRuntimePane : shellPane),
           capturePane: idleCapture,
         }),
         steps: [
@@ -558,7 +581,7 @@ describe('TmuxProbePoller', () => {
         agents: [codexAgent],
         agentId: 'qa-1',
         binding: { taskId: 'task-001' },
-        exec: makeExec({ listPanes: codexPane, classifySep: codexRuntimePane, capturePane: staleWorkingIdle }),
+        exec: makeExec({ listPanes: codexPane, classify: codexRuntimePane, capturePane: staleWorkingIdle }),
         steps: [{}, { advance: SIX_MIN }],
         expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
       });
@@ -669,8 +692,9 @@ describe('TmuxProbePoller', () => {
 
     expect(runnerFactory).toHaveBeenCalledTimes(1);
     expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes('has-session'))).toBe(true);
+    expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes('list-sessions'))).toBe(true);
     expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes('list-panes'))).toBe(true);
-    expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes('___bx-classify-sep___'))).toBe(true);
+    expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes(CLASSIFY_MARKER))).toBe(true);
   });
 
   it('turns runner construction failures into unreachable observations without aborting the poll', async () => {
@@ -713,25 +737,26 @@ describe('TmuxProbePoller', () => {
       reason: 'PANE_PROBE_FAILED',
       operation: 'tmux-probe',
     });
-    expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes('___bx-classify-sep___'))).toBe(false);
+    expect((exec as ReturnType<typeof vi.fn>).mock.calls.some(([cmd]) => cmd.includes(CLASSIFY_MARKER))).toBe(false);
   });
 
-  it('passes timeout to the runner and limits concurrent probes', async () => {
+  it('passes timeout to the runner (incl. the present-session snapshot probe) and limits concurrent probes', async () => {
     let active = 0;
     let maxActive = 0;
-    const timeouts: Array<number | undefined> = [];
+    const calls: Array<{ cmd: string; timeout: number | undefined }> = [];
     const agents = Array.from({ length: 6 }, (_, i) => makeAgent(`agent-${i}`));
     const poller = makePoller({
       config: makeConfig(agents),
       probeTimeoutMs: 123,
       concurrency: 2,
       runnerFactory: () => ({
-        exec: async (_cmd, options) => {
-          timeouts.push(options?.timeout);
+        exec: async (cmd, options) => {
+          calls.push({ cmd, timeout: options?.timeout });
           active += 1;
           maxActive = Math.max(maxActive, active);
           await new Promise(resolve => setTimeout(resolve, 1));
           active -= 1;
+          if (cmd.includes('list-sessions')) return defaultSessionSnapshot(cmd);
           return present;
         },
       }),
@@ -739,10 +764,16 @@ describe('TmuxProbePoller', () => {
 
     await poller.pollOnce();
 
-    const boundedCalls = timeouts.filter(t => t !== undefined);
+    const boundedCalls = calls.map(c => c.timeout).filter(t => t !== undefined);
     expect(boundedCalls.length).toBeGreaterThanOrEqual(6);
     expect(boundedCalls.every(t => t === 123)).toBe(true);
     expect(maxActive).toBe(2);
+    // Every step of the snapshot→pane chain must be bounded, else a stuck remote list-sessions /
+    // list-panes pins the poller worker. Assert both probes carry the deadline.
+    const listSessions = calls.find(c => c.cmd.includes('list-sessions'));
+    expect(listSessions?.timeout).toBe(123);
+    const listPanes = calls.find(c => c.cmd.includes('list-panes'));
+    expect(listPanes?.timeout).toBe(123);
   });
 
   it('start() schedules periodic polls and stop() halts them; double-start is idempotent', async () => {
@@ -825,7 +856,7 @@ describe('TmuxProbePoller', () => {
       config: makeConfig([ag1, ag2]),
       store,
       runnerFactory: agent => ({
-        exec: vi.fn(async () => results.get(agent.id)!),
+        exec: makeExec({ hasSession: results.get(agent.id)! }),
       }) as unknown as CommandRunner,
       failureThreshold: 1,
     });
@@ -1078,8 +1109,13 @@ describe('TmuxSessionStatusStore onChange', () => {
 });
 
 describe('TmuxProbePoller triggers reconcileFailedAgent on absent', () => {
-  it('calls agentManager.reconcileFailedAgent only when probe returns absent', async () => {
-    const agents = [makeAgent('dev-1'), makeAgent('dev-2'), makeAgent('dev-3')];
+  it('calls reconcileFailedAgent on absent and on present-but-foreign, not on healthy/unreachable', async () => {
+    // dev-1 healthy present (owned snapshot + live pane) → no reconcile
+    // dev-2 absent (has-session can't find the session) → reconcile
+    // dev-3 unreachable (ssh dead, exit 255) → no reconcile
+    // dev-4 has-session present but empty snapshot (session vanished between probes) → reconcile
+    // dev-5 has-session present but foreign claim (fresh server reissued the name) → reconcile
+    const agents = ['dev-1', 'dev-2', 'dev-3', 'dev-4', 'dev-5'].map(makeAgent);
     const cfg = makeConfig(agents);
     const calls: string[] = [];
     const stubAgentManager = {
@@ -1087,23 +1123,27 @@ describe('TmuxProbePoller triggers reconcileFailedAgent on absent', () => {
       reconcileFailedAgent: async (id: string) => { calls.push(id); return true; },
     } as unknown as import('../../src/agent/manager.js').AgentManager;
 
-    const results = new Map<string, ExecResult>([
-      ['dev-1', { stdout: '', stderr: '', exitCode: 0 }],
-      ['dev-2', { stdout: '', stderr: "can't find session: dev-2", exitCode: 1 }],
-      ['dev-3', { stdout: '', stderr: 'ssh dead', exitCode: 255 }],
-    ]);
+    const foreignSnapshot = text(`${SESSION_REF_LINE}|not-dev-5\n`);
+    const execByAgent: Record<string, CommandRunner['exec']> = {
+      'dev-1': makeExec(),
+      'dev-2': makeExec({ hasSession: absent }),
+      'dev-3': makeExec({ hasSession: unreachable }),
+      'dev-4': makeExec({ hasSession: present, sessionSnapshot: text('') }),
+      'dev-5': makeExec({ hasSession: present, sessionSnapshot: foreignSnapshot }),
+    };
 
     const poller = new TmuxProbePoller({
       config: cfg,
       store: new TmuxSessionStatusStore(),
       agentManager: stubAgentManager,
+      concurrency: 1,
       runnerFactory: agent => ({
-        exec: vi.fn().mockResolvedValue(results.get(agent.id)),
+        exec: execByAgent[agent.id],
         writeFile: async () => {},
       } as unknown as CommandRunner),
     });
     await poller.pollOnce();
 
-    expect(calls).toEqual(['dev-2']);
+    expect(calls.sort()).toEqual(['dev-2', 'dev-4', 'dev-5']);
   });
 });

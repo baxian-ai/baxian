@@ -1,8 +1,10 @@
-import { useNavigate, useParams } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import type { GithubReviewItem, GithubReviewVerdict } from '../shared/index.js';
 import {
   GITHUB_REVIEW_VERDICT_CLASS,
   groupGithubReviewRounds,
+  githubReviewItemAnchor,
   githubReviewItemKey,
   githubReviewRevision,
   githubReviewRoundKey,
@@ -10,6 +12,7 @@ import {
 } from '../shared/github-review.js';
 import { useTask } from '../hooks/use-events.ts';
 import { useGithubReview } from '../hooks/use-github-review.ts';
+import { MarkdownLite } from '../components/markdown-lite.tsx';
 import { useT, type Messages } from '../i18n/index.tsx';
 
 const VERDICT_LABEL: Record<GithubReviewVerdict, string> = {
@@ -40,13 +43,48 @@ export function GithubReviewPage() {
   const t = useT();
   const { taskId = '' } = useParams();
   const navigate = useNavigate();
+  const { hash } = useLocation();
   const { data: task } = useTask(taskId);
   const revision = task ? githubReviewRevision(task) : undefined;
   const { data, loaded, error } = useGithubReview(taskId, revision);
+  const [flashId, setFlashId] = useState<string | null>(null);
 
   const prNumber = data?.prNumber ?? task?.prNumber;
   const prUrl = data?.prUrl ?? task?.prUrl;
   const rounds = data ? groupGithubReviewRounds(data.items) : [];
+  const itemsReady = loaded && !error && data?.available === true && data.items.length > 0;
+
+  const landedRef = useRef<string | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(flashTimerRef.current), []);
+
+  // 依赖 data（对象身份）而非布尔：同 task 重拉补进目标记录时要能重试定位；
+  // 落点以 landedRef 只执行一次，后续轮询刷新不会反复抢滚动。flash 计时器放
+  // ref 而不是 effect cleanup——数据刷新触发的 cleanup 会误杀 2s 归零。
+  useEffect(() => {
+    let anchor: string | null = null;
+    if (hash) {
+      try {
+        anchor = decodeURIComponent(hash.slice(1));
+      } catch {
+        anchor = null;
+      }
+    }
+    if (!anchor) {
+      landedRef.current = null;
+      setFlashId(null);
+      return;
+    }
+    if (landedRef.current === anchor) return;
+    if (!itemsReady || !data) return;
+    const el = document.getElementById(anchor);
+    if (!el) return;
+    landedRef.current = anchor;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setFlashId(anchor);
+    clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = setTimeout(() => setFlashId(null), 2000);
+  }, [itemsReady, data, hash]);
 
   return (
     <div className="mx-auto w-full max-w-5xl">
@@ -85,7 +123,7 @@ export function GithubReviewPage() {
             )}
             <div className="space-y-5">
               {rounds.map((round, i) => (
-                <RoundBlock key={githubReviewRoundKey(round, String(i))} round={round} index={i} />
+                <RoundBlock key={githubReviewRoundKey(round, String(i))} round={round} index={i} flashId={flashId} />
               ))}
             </div>
           </>
@@ -94,7 +132,7 @@ export function GithubReviewPage() {
   );
 }
 
-function RoundBlock({ round, index }: { round: GithubReviewRound; index: number }) {
+function RoundBlock({ round, index, flashId }: { round: GithubReviewRound; index: number; flashId: string | null }) {
   const t = useT();
   const label = round.review ? t.agents.round(index + 1) : t.status.in_progress;
   return (
@@ -102,19 +140,24 @@ function RoundBlock({ round, index }: { round: GithubReviewRound; index: number 
       <div className="mb-1.5 text-xs font-medium text-og-700">{label}</div>
       <div className="space-y-2">
         {round.items.map((it, itemIndex) => (
-          <ItemRow key={githubReviewItemKey(it, `${index}-${itemIndex}`)} item={it} />
+          <ItemRow key={githubReviewItemKey(it, `${index}-${itemIndex}`)} item={it} flashId={flashId} />
         ))}
-        {round.review && <ReviewBlock item={round.review} />}
+        {round.review && <ReviewBlock item={round.review} flashId={flashId} />}
       </div>
     </div>
   );
 }
 
-function ItemRow({ item }: { item: GithubReviewItem }) {
+function itemCardClass(item: GithubReviewItem, flashId: string | null): string {
+  const anchor = githubReviewItemAnchor(item);
+  return `card p-3 text-sm${anchor && anchor === flashId ? ' ring-2 ring-accent' : ''}`;
+}
+
+function ItemRow({ item, flashId }: { item: GithubReviewItem; flashId: string | null }) {
   const t = useT();
   if (item.kind === 'commit') {
     return (
-      <div className="card p-3 text-sm">
+      <div id={githubReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
         <div className="mb-1 flex flex-wrap items-center gap-2">
           <span className="pill shrink-0">{t.githubReview.commitPill}</span>
           {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
@@ -127,7 +170,7 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
   }
   const isInline = item.kind === 'review-comment';
   return (
-    <div className="card p-3 text-sm">
+    <div id={githubReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
       <div className="mb-1 flex flex-wrap items-center gap-2">
         <span className="pill shrink-0">{isInline ? t.githubReview.inlineComment : t.githubReview.comment}</span>
         {item.author && <span className="font-medium text-og-700">{item.author}</span>}
@@ -144,11 +187,11 @@ function ItemRow({ item }: { item: GithubReviewItem }) {
   );
 }
 
-function ReviewBlock({ item }: { item: GithubReviewItem }) {
+function ReviewBlock({ item, flashId }: { item: GithubReviewItem; flashId: string | null }) {
   const t = useT();
   const verdict = item.verdict ?? 'comment';
   return (
-    <div className="card p-3 text-sm">
+    <div id={githubReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
       <div className="mb-1 flex flex-wrap items-center gap-2">
         <span className="shrink-0 min-w-[1.75rem] text-xs font-semibold tracking-wide text-og-600">
           {t.review.roleQa}
@@ -168,7 +211,9 @@ function Body({ item, placeholder }: { item: GithubReviewItem; placeholder?: str
   return (
     <>
       {item.body ? (
-        <div className="whitespace-pre-wrap break-words text-og-800">{item.body}</div>
+        <div className="text-og-800">
+          <MarkdownLite text={item.body} />
+        </div>
       ) : placeholder ? (
         <div className="text-og-400">{placeholder}</div>
       ) : null}

@@ -16,6 +16,7 @@ function mockRunner(responses: Record<string, ExecResult>): CommandRunner {
       for (const [pattern, result] of Object.entries(responses)) {
         if (cmd.includes(pattern)) return result;
       }
+      if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
       if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
       if (cmd.startsWith('command -v')) return OK_PATH;
       return OK_EMPTY;
@@ -89,23 +90,17 @@ describe('runPreflight', () => {
     expect(result.message).toContain('/usr/bin/tmux');
   });
 
-  it('skips openssl check for local agents (LocalRunner.writeFile uses fs)', async () => {
-    const runner = mockRunner({ 'command -v openssl': FAIL });
-    const results = await runPreflight(runner, makeAgent(), 'user/repo');
-    expect(results.find(r => r.step === 'openssl')).toBeUndefined();
-  });
-
-  it('detects missing openssl on remote agents (SshRunner.writeFile decodes via openssl)', async () => {
+  it('no longer probes openssl on remote agents (injection uses tmux load-buffer, not openssl)', async () => {
     vi.spyOn(LocalRunner.prototype, 'exec').mockResolvedValue({ stdout: 'ok\n', stderr: '', exitCode: 0 });
     const remoteAgent = makeAgent({
       mode: 'remote',
       host: { hostname: 'remote.example.com', user: 'agent' },
     });
+    // Even with openssl unavailable, a remote agent must not get a preflight failure for it.
     const runner = mockRunner({ 'command -v openssl': FAIL });
     const results = await runPreflight(runner, remoteAgent, 'user/repo', { hostname: 'remote.example.com', user: 'agent' });
-    const openssl = results.find(r => r.step === 'openssl');
-    expect(openssl?.ok).toBe(false);
-    expect(openssl?.message).toContain('install openssl');
+    expect(results.find(r => r.step === 'openssl')).toBeUndefined();
+    expect(results.find(r => r.step === 'tmux')?.ok).toBe(true);
   });
 
   it('uses a fresh (noMux) ssh connection for the remote reachability check so a stale master cannot mask invalid creds', async () => {
@@ -131,17 +126,6 @@ describe('runPreflight', () => {
     });
     await runPreflight(mockRunner({}), remoteAgent, 'user/repo', { hostname: 'remote.example.com', user: 'agent' });
     expect(ensureSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('passes openssl check on remote agents when available', async () => {
-    vi.spyOn(LocalRunner.prototype, 'exec').mockResolvedValue({ stdout: 'ok\n', stderr: '', exitCode: 0 });
-    const remoteAgent = makeAgent({
-      mode: 'remote',
-      host: { hostname: 'remote.example.com', user: 'agent' },
-    });
-    const runner = mockRunner({});
-    const results = await runPreflight(runner, remoteAgent, 'user/repo', { hostname: 'remote.example.com', user: 'agent' });
-    expect(results.find(r => r.step === 'openssl')?.ok).toBe(true);
   });
 
   it('detects bad workdir', async () => {
@@ -174,7 +158,7 @@ describe('runPreflight', () => {
     expect(results.find(r => r.step === 'gh-repo')?.ok).toBe(false);
   });
 
-  it('binary probes match the runtime mode of each binary: claude/codex use login-interactive (tmux pane); tmux/openssl + other ops stay on default login (-lc)', async () => {
+  it('binary probes match the runtime mode of each binary: claude/codex use login-interactive (tmux pane); tmux + other ops stay on default login (-lc)', async () => {
     vi.spyOn(LocalRunner.prototype, 'exec').mockResolvedValue({ stdout: 'ok\n', stderr: '', exitCode: 0 });
 
     const calls: Array<{ cmd: string; opts?: { remoteShell?: string } }> = [];
@@ -193,9 +177,6 @@ describe('runPreflight', () => {
 
     const tmuxWhich = calls.find(c => c.cmd === 'command -v tmux');
     expect(tmuxWhich?.opts?.remoteShell).toBeUndefined();
-
-    const opensslWhich = calls.find(c => c.cmd === 'command -v openssl');
-    expect(opensslWhich?.opts?.remoteShell).toBeUndefined();
 
     const otherCalls = calls.filter(c => /^(git |gh |mkdir |test )/.test(c.cmd));
     expect(otherCalls.length).toBeGreaterThan(0);
@@ -227,19 +208,16 @@ describe('runPreflight', () => {
     expect(tmux?.message).not.toContain('found at');
   });
 
-  it('cli/tmux/openssl probe rejection (timeout / abort / spawn error) is converted into a per-step failure result, not propagated as a thrown error that would 500 the /projects/:id/checks API', async () => {
+  it('cli/tmux probe rejection (timeout / abort / spawn error) is converted into a per-step failure result, not propagated as a thrown error that would 500 the /projects/:id/checks API', async () => {
     vi.spyOn(LocalRunner.prototype, 'exec').mockResolvedValue({ stdout: 'ok\n', stderr: '', exitCode: 0 });
 
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd === 'command -v claude') {
-          throw new Error('Command timed out after 5000ms');
+          throw new Error('spawn ssh ENOENT');
         }
         if (cmd === 'command -v tmux') {
           throw new Error('Command timed out after 5000ms');
-        }
-        if (cmd === 'command -v openssl') {
-          throw new Error('spawn ssh ENOENT');
         }
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
@@ -255,16 +233,12 @@ describe('runPreflight', () => {
 
     const cli = results.find(r => r.step === 'cli');
     expect(cli?.ok).toBe(false);
-    expect(cli?.message).toMatch(/timed out/i);
+    expect(cli?.message).toMatch(/probe failed/i);
+    expect(cli?.message).toMatch(/spawn ssh ENOENT/);
 
     const tmux = results.find(r => r.step === 'tmux');
     expect(tmux?.ok).toBe(false);
     expect(tmux?.message).toMatch(/timed out/i);
-
-    const openssl = results.find(r => r.step === 'openssl');
-    expect(openssl?.ok).toBe(false);
-    expect(openssl?.message).toMatch(/probe failed/i);
-    expect(openssl?.message).toMatch(/spawn ssh ENOENT/);
   });
 });
 
@@ -285,7 +259,7 @@ describe('runPreflight — auto mode', () => {
     const runner = mockRunner({});
     await runPreflight(runner, makeAutoAgent(), 'Owner/Repo');
     const calls = execCmds(runner);
-    expect(calls.some(c => c.includes('test -d ~/.baxian/agents/dev-auto/repo'))).toBe(true);
+    expect(calls.some(c => c.includes("test -d '/home/owner/.baxian/agents/dev-auto/repo'"))).toBe(true);
     expect(calls.some(c => /test -d .*Owner\/Repo/.test(c))).toBe(false);
   });
 
@@ -323,8 +297,9 @@ describe('runPreflight — auto mode', () => {
   it('reports workdir failure when existing repo dir is not a git repo', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd.startsWith('mkdir -p') && cmd.includes('.baxian/agents/dev-auto')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return OK_EMPTY;
+        if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('mkdir -p') && cmd.includes('.baxian/agents/dev-auto')) return OK_EMPTY;
+        if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return OK_EMPTY;
         if (cmd.includes('rev-parse --show-toplevel')) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
@@ -339,8 +314,9 @@ describe('runPreflight — auto mode', () => {
   it('passes workdir when existing repo dir is a valid git repo', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return OK_EMPTY;
+        if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('mkdir -p')) return OK_EMPTY;
+        if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return OK_EMPTY;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),
@@ -354,8 +330,9 @@ describe('runPreflight — auto mode', () => {
   it('rejects a bare repository at the managed clone path', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return OK_EMPTY;
+        if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('mkdir -p')) return OK_EMPTY;
+        if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return OK_EMPTY;
         if (cmd.includes('rev-parse --is-bare-repository')) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
@@ -370,8 +347,9 @@ describe('runPreflight — auto mode', () => {
   it('passes workdir when nothing exists yet (clone will create it)', async () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
-        if (cmd.startsWith('mkdir -p')) return OK_EMPTY;
-        if (cmd === `test -d ~/.baxian/agents/dev-auto/repo`) return FAIL;
+        if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('mkdir -p')) return OK_EMPTY;
+        if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
         return OK_EMPTY;
       }),

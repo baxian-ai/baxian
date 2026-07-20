@@ -3,7 +3,7 @@ import { BRANCH_PREFIX, isValidBranchName } from '../shared/index.js';
 import { execNetwork, GIT_NET_ENV } from './net-exec.js';
 import type { CommandRunner } from './runner.js';
 import { shellQuote } from './runner.js';
-import { ensureBaxianRuntimeDirsSafe } from './repo-store.js';
+import { ensureBaxianRuntimeDirsSafe, stageFileGuarded, canonicalSelfGuard, ancestorSymlinkGuard } from './repo-store.js';
 
 export interface AutoDeleteIdentity {
   taskId?: string;
@@ -57,8 +57,9 @@ export class BranchManager {
   constructor(private runner: CommandRunner) {}
 
   async assertClean(workdir: string): Promise<void> {
+    // --no-optional-locks: a plain `git status` may refresh and write the index; keep it read-only.
     const result = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} status --porcelain=v1 -z ` +
+      `git -C ${shellQuote(workdir)} --no-optional-locks status --porcelain=v1 -z ` +
         `--untracked-files=all --ignore-submodules=none`,
     );
     if (result.exitCode !== 0) {
@@ -170,7 +171,7 @@ export class BranchManager {
     const remoteRef = `refs/remotes/origin/${branch}`;
     const fetch = await execNetwork(
       this.runner,
-      `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
+      `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
         `${shellQuote(`+refs/heads/${branch}:${remoteRef}`)}`,
     );
     if (fetch.exitCode !== 0) throw new Error(`Failed to fetch branch ${branch}: ${fetch.stderr.trim()}`);
@@ -211,12 +212,13 @@ export class BranchManager {
     await this.switchDetached(workdir, opts.baseSha);
     await ensureBaxianRuntimeDirsSafe(this.runner, workdir);
     const patchFile = `${workdir}/.baxian/review-inbox/.materialize-${randomBytes(8).toString('hex')}.patch`;
-    await this.runner.writeFile(patchFile, opts.patch);
+    // Guarded staged write (not raw writeFile): attacker-influenced patch content must never land through a rebound Workdir ancestor.
+    await stageFileGuarded(this.runner, workdir, patchFile, opts.patch);
     let operationError: unknown;
     try {
       if (opts.patch.trim() !== '') {
         const apply = await this.runner.exec(
-          `git -C ${shellQuote(workdir)} apply --index --binary ${shellQuote(patchFile)}`,
+          `${canonicalSelfGuard(workdir)} && git -C ${shellQuote(workdir)} apply --index --binary ${shellQuote(patchFile)}`,
         );
         if (apply.exitCode !== 0) {
           throw new Error(`Review patch apply failed: ${apply.stderr.trim()}`);
@@ -233,7 +235,10 @@ export class BranchManager {
       operationError = err;
       throw err;
     } finally {
-      const removed = await this.runner.exec(`rm -f ${shellQuote(patchFile)}`);
+      // Same-command ancestor guard as the write: a rebound Workdir ancestor must never let the rm escape.
+      const removed = await this.runner.exec(
+        `${ancestorSymlinkGuard(workdir, patchFile)} && rm -f ${shellQuote(patchFile)}`,
+      );
       if (removed.exitCode !== 0) {
         const cleanupError = new Error(`Review patch cleanup failed: ${removed.stderr.trim()}`);
         if (operationError !== undefined) {
@@ -303,7 +308,7 @@ export class BranchManager {
     try {
       fetched = await execNetwork(
         this.runner,
-        `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
+        `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin -- ` +
           `${shellQuote(`+refs/heads/${identity.taskBranch}:${remoteRef}`)}`,
       );
     } catch (err) {
@@ -354,7 +359,7 @@ export class BranchManager {
     await this.switchDetached(workdir, await this.resolveCommit(workdir, 'origin/HEAD'));
     await assertOwner();
     const deleted = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} branch -d -- ${shellQuote(identity.taskBranch)}`,
+      `${canonicalSelfGuard(workdir)} && git -C ${shellQuote(workdir)} branch -d -- ${shellQuote(identity.taskBranch)}`,
     );
     if (deleted.exitCode !== 0) {
       return {
@@ -426,7 +431,8 @@ export class BranchManager {
     await this.verifyUpstreamIfPresent(workdir, branch);
     if (await this.readUpstream(workdir, branch)) return;
     const configured = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.remote`)} origin && ` +
+      `${canonicalSelfGuard(workdir)} && ` +
+        `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.remote`)} origin && ` +
         `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.merge`)} ` +
         `${shellQuote(`refs/heads/${branch}`)}`,
     );
@@ -450,7 +456,8 @@ export class BranchManager {
   private async markTaskBranch(workdir: string, branch: string, taskId: string): Promise<void> {
     const marker = shellQuote(`branch.${branch}.baxian-task-id`);
     const configured = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} config --local ${marker} ${shellQuote(taskId)} && ` +
+      `${canonicalSelfGuard(workdir)} && ` +
+        `git -C ${shellQuote(workdir)} config --local ${marker} ${shellQuote(taskId)} && ` +
         `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.remote`)} origin && ` +
         `git -C ${shellQuote(workdir)} config --local ${shellQuote(`branch.${branch}.merge`)} ` +
         `${shellQuote(`refs/heads/${branch}`)}`,
@@ -472,16 +479,17 @@ export class BranchManager {
     }
   }
 
+  // canonicalSelfGuard rides every Workdir tree/ref mutation so a rebound ancestor can't redirect it to an external repo.
   private async fetch(workdir: string): Promise<void> {
     const result = await execNetwork(
       this.runner,
-      `${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin --prune`,
+      `${canonicalSelfGuard(workdir)} && ${GIT_NET_ENV} git -C ${shellQuote(workdir)} fetch origin --prune`,
     );
     if (result.exitCode !== 0) throw new Error(`git fetch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 
   private async switch(workdir: string, args: string): Promise<void> {
-    const result = await this.runner.exec(`git -C ${shellQuote(workdir)} switch ${args}`);
+    const result = await this.runner.exec(`${canonicalSelfGuard(workdir)} && git -C ${shellQuote(workdir)} switch ${args}`);
     if (result.exitCode !== 0) throw new Error(`git switch failed in ${workdir}: ${result.stderr.trim()}`);
   }
 
@@ -524,7 +532,7 @@ export class BranchManager {
       'GIT_COMMITTER_EMAIL=baxian-review@localhost',
     ].join(' ');
     const result = await this.runner.exec(
-      `${identity} git -C ${shellQuote(workdir)} -c user.email=baxian-review@localhost ` +
+      `${canonicalSelfGuard(workdir)} && ${identity} git -C ${shellQuote(workdir)} -c user.email=baxian-review@localhost ` +
         `-c user.name=${shellQuote('baxian review')} commit --no-gpg-sign --no-verify -q ` +
         `-m ${shellQuote(`baxian review head ${headSha}`)}`,
     );

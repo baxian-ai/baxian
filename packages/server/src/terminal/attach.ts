@@ -7,36 +7,72 @@ export interface AttachCommand {
   env?: Record<string, string>;
 }
 
-export function buildAttachInteractiveCommand(agent: AgentConfig, host?: HostConfig): AttachCommand {
-  if (agent.mode === 'remote') {
-    if (!host) throw new Error(`Remote agent ${agent.id} has no resolved host`);
-    return {
-      file: 'ssh',
-      args: [
-        ...sshAuthArgs(host),
-        '-o', 'ConnectTimeout=10',
-        ...(host.port !== undefined ? ['-p', String(host.port)] : []),
-        '-e', 'none',
-        '-t',
-        '--',
-        sshTarget(host),
-        wrapRemoteCommand(
-          `tmux set-option -g focus-events on 2>/dev/null || true; ` +
-            `tmux set-option -g set-clipboard external 2>/dev/null || true; ` +
-            `tmux -u attach-session -t ${shellQuote(`=${agent.id}`)}`,
-          'login-interactive',
-        ),
-      ],
-    };
-  }
+export interface AttachExpectedRef {
+  serverPid: string;
+  serverStart: string;
+  sessionId: string;
+  claim: string;
+}
+
+// Re-prove identity in the same shell right before exec so a server-restart same-name successor is never attached.
+function attachGenerationGuard(target: string, expected: AttachExpectedRef): string {
+  const identity = `${expected.serverPid}|${expected.serverStart}|${expected.sessionId}|${expected.claim}`;
+  // display-message takes the format as its message argument (-p to print); it has no -F flag.
+  const probe = `tmux display-message -p -t ${target} '#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}' 2>/dev/null`;
+  return `[ "$(${probe})" = ${shellQuote(identity)} ] || { echo BX_ATTACH_GENERATION_MISMATCH >&2; exit 47; }`;
+}
+
+function remoteCommand(agent: AgentConfig, host: HostConfig | undefined, payload: string): AttachCommand {
+  if (!host) throw new Error(`Remote agent ${agent.id} has no resolved host`);
+  return {
+    file: 'ssh',
+    args: [
+      ...sshAuthArgs(host),
+      '-o', 'ConnectTimeout=10',
+      ...(host.port !== undefined ? ['-p', String(host.port)] : []),
+      '-e', 'none',
+      '-t',
+      '--',
+      sshTarget(host),
+      wrapRemoteCommand(payload, 'login-interactive'),
+    ],
+  };
+}
+
+export function buildAttachInteractiveCommand(
+  agent: AgentConfig,
+  host?: HostConfig,
+  expected?: AttachExpectedRef,
+  opts: { ignoreSize?: boolean } = {},
+): AttachCommand {
   const target = shellQuote(`=${agent.id}`);
+  const guard = expected ? `${attachGenerationGuard(target, expected)}; ` : '';
+  const flag = opts.ignoreSize ? '-f ignore-size ' : '';
+  if (agent.mode === 'remote') {
+    return remoteCommand(
+      agent,
+      host,
+      `tmux set-option -g focus-events on 2>/dev/null || true; ` +
+        `tmux set-option -g set-clipboard external 2>/dev/null || true; ` +
+        `${guard}tmux -u attach-session ${flag}-t ${target}`,
+    );
+  }
   return {
     file: 'sh',
     args: [
       '-c',
       `tmux set-option -gq focus-events on 2>/dev/null || true; ` +
         `tmux set-option -g set-clipboard external 2>/dev/null || true; ` +
-        `exec tmux -u attach-session -t ${target}`,
+        `${guard}exec tmux -u attach-session ${flag}-t ${target}`,
     ],
   };
+}
+
+// The probe must resolve tmux in the SAME shell context the interactive attach uses
+// (login-interactive remotely), or PATH skew can gate the flag on a different binary.
+export function buildAttachProbeCommand(agent: AgentConfig, host?: HostConfig): AttachCommand {
+  if (agent.mode === 'remote') {
+    return remoteCommand(agent, host, 'tmux -V');
+  }
+  return { file: 'sh', args: ['-c', 'exec tmux -V'] };
 }

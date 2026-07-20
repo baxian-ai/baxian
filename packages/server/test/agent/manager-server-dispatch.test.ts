@@ -58,14 +58,15 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean; siblingPr
   const lockManager = new LockManager(join(tempDir, 'locks'));
   const updateAgent = agentStore.update.bind(agentStore);
   vi.spyOn(agentStore, 'update').mockImplementation(async (id, update) => {
-    await updateAgent(id, update);
+    const commit = await updateAgent(id, update);
     const state = await agentStore.get(id);
-    if (!state?.taskId || await lockManager.isLocked(id)) return;
+    if (!state?.taskId || await lockManager.isLocked(id)) return commit;
     const token = await lockManager.acquire(id, state.taskId);
-    if (!token) return;
+    if (!token) return commit;
     await updateAgent(id, latest => latest?.taskId === state.taskId
       ? { ...latest, lockToken: token, updatedAt: new Date().toISOString() }
       : latest);
+    return commit;
   });
   const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   const events: BaxianEvent[] = [];

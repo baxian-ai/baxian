@@ -442,6 +442,8 @@ export const enUS = {
     notSubmitted: 'Review not submitted yet.',
     noFindingsThisRound: 'No findings this round.',
     devResponsesHeading: 'Dev responses',
+    userDecisionHeading: 'User decision',
+    loadExternalImage: 'Load external image',
     roundNotFound: (phase: string, round: string) => `Review round not found (${phase} round ${round}).`,
     loadFailed: (detail: string) => `Failed to load review records: ${detail}`,
     loadingRecords: 'Loading review records…',

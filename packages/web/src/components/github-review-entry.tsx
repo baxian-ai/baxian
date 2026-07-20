@@ -4,6 +4,7 @@ import type { GithubReviewItem, TaskState } from '../shared/index.js';
 import {
   GITHUB_REVIEW_VERDICT_CLASS,
   groupGithubReviewRounds,
+  githubReviewItemAnchor,
   githubReviewItemKey,
   githubReviewRevision,
   githubReviewRoundKey,
@@ -83,8 +84,8 @@ export function GithubReviewEntry({ task }: Props) {
   const revision = githubReviewRevision(task);
   const { data, loaded, error } = useGithubReview(task.id, revision);
 
-  function open() {
-    navigate(`/tasks/${encodeURIComponent(task.id)}/github-review`);
+  function open(anchor?: string) {
+    navigate(`/tasks/${encodeURIComponent(task.id)}/github-review${anchor ? `#${anchor}` : ''}`);
   }
 
   if (error) {
@@ -155,7 +156,7 @@ function RoundBlock({
 }: {
   round: GithubReviewRound;
   index: number;
-  onOpen: () => void;
+  onOpen: (anchor?: string) => void;
 }) {
   const t = useT();
   const label = round.review ? t.agents.round(index + 1) : t.status.in_progress;
@@ -172,7 +173,7 @@ function RoundBlock({
   );
 }
 
-function GithubTurnRow({ item, onOpen }: { item: GithubReviewItem; onOpen: () => void }) {
+function GithubTurnRow({ item, onOpen }: { item: GithubReviewItem; onOpen: (anchor?: string) => void }) {
   const t = useT();
   const verdict = item.kind === 'review' ? item.verdict : undefined;
   return (
@@ -181,7 +182,7 @@ function GithubTurnRow({ item, onOpen }: { item: GithubReviewItem; onOpen: () =>
       label={itemLabel(t, item)}
       badge={verdict ? <span className={GITHUB_REVIEW_VERDICT_CLASS[verdict]}>{verdict}</span> : undefined}
       summary={itemSummary(t, item)}
-      onClick={onOpen}
+      onClick={() => onOpen(githubReviewItemAnchor(item))}
     />
   );
 }

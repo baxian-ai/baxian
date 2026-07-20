@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -32,7 +32,9 @@ async function run(command: string): Promise<string> {
 }
 
 beforeEach(async () => {
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-branch-'));
+  // realpath so the Workdir path is canonical (matches production's pwd -P workdir); the guarded git
+  // commands re-prove `cd && pwd -P == workdir`, which a symlinked /var tmpdir would otherwise fail.
+  tempDir = await realpath(await mkdtemp(join(tmpdir(), 'baxian-branch-')));
   origin = join(tempDir, 'origin.git');
   seed = join(tempDir, 'seed');
   workdir = join(tempDir, 'agent');
@@ -332,6 +334,57 @@ describe('BranchManager', () => {
       patch: '',
       baseSha: await run(`git -C ${shellQuote(workdir)} rev-parse HEAD`),
     })).rejects.toThrow(/metadata is incomplete/i);
+  });
+
+  it('fails closed when an intermediate Workdir ancestor is a symlink (guarded git never writes through it)', async () => {
+    // A real clone at <tempDir>/real/agent, reached via a symlinked parent so `cd && pwd -P` != the given path.
+    const realParent = join(tempDir, 'real');
+    await mkdir(realParent, { recursive: true });
+    const realWorkdir = join(realParent, 'agent');
+    await run(`git clone -q ${shellQuote(origin)} ${shellQuote(realWorkdir)}`);
+    await symlink(realParent, join(tempDir, 'linked'));
+    const viaSymlink = join(tempDir, 'linked', 'agent'); // same inode, but the path text has a symlink component
+
+    // switchToTaskBranch's first Workdir mutation is the guarded fetch → the canonical self-guard rejects it.
+    await expect(
+      new BranchManager(local).switchToTaskBranch(viaSymlink, 'task-x', 'bx/task-x', true),
+    ).rejects.toThrow(/fetch/i);
+    // The remote-tracking ref was NOT written into the real repo through the rebound path.
+    const ref = await local.exec(`git -C ${shellQuote(realWorkdir)} rev-parse --verify -q refs/remotes/origin/bx/task-x`);
+    expect(ref.exitCode).not.toBe(0);
+  });
+
+  it('materializeReviewHead cleans up its temp patch behind the full ancestor symlink guard', async () => {
+    const baseSha = 'a'.repeat(40);
+    const headSha = 'c'.repeat(40);
+    const headTree = 'b'.repeat(40);
+    const commands: string[] = [];
+    const runner = {
+      exec: vi.fn(async (cmd: string) => {
+        commands.push(cmd);
+        if (cmd.includes('rev-parse --verify') && cmd.includes('HEAD^{tree}')) return { stdout: headTree, stderr: '', exitCode: 0 };
+        if (cmd.includes('rev-parse --verify') && cmd.includes('HEAD^{commit}')) return { stdout: baseSha, stderr: '', exitCode: 0 };
+        if (cmd.includes('rev-parse --verify')) return { stdout: baseSha, stderr: '', exitCode: 0 };
+        if (cmd.includes('cat-file -e')) return { stdout: '', stderr: '', exitCode: 1 };
+        if (cmd.includes('diff --cached --quiet')) return { stdout: '', stderr: '', exitCode: 0 };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }),
+      execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+      writeFile: vi.fn(async () => {}),
+    } as unknown as CommandRunner;
+
+    const result = await new BranchManager(runner).materializeReviewHead('/repo/wt', {
+      patch: '', baseSha, headSha, headTree,
+    });
+    expect(result).toEqual({ mode: 'head' });
+
+    const rmCmd = commands.find(c => c.includes('rm -f') && c.includes('.materialize-'));
+    expect(rmCmd).toBeDefined();
+    // The full ancestor chain (canonical root + per-component non-symlink checks) precedes the rm.
+    expect(rmCmd).toContain('pwd -P');
+    expect(rmCmd).toContain("[ ! -L '/repo/wt/.baxian'");
+    expect(rmCmd).toContain("[ ! -L '/repo/wt/.baxian/review-inbox'");
+    expect(rmCmd!.indexOf('[ ! -L')).toBeLessThan(rmCmd!.indexOf('rm -f'));
   });
 
   it('refuses an existing task branch that tracks a different upstream', async () => {
@@ -698,8 +751,11 @@ describe('BranchManager', () => {
     const runtimeRunner: CommandRunner = {
       exec: async (command, options) => {
         if (command.includes('tmux has-session')) return { stdout: '', stderr: '', exitCode: 0 };
-        if (command.includes('tmux show-option') && command.includes('@baxian-agent-id')) {
-          return { stdout: 'dev-1\n', stderr: '', exitCode: 0 };
+        if (command.includes('tmux list-sessions')) {
+          return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+        }
+        if (command.includes('tmux list-panes')) {
+          return { stdout: '%7 codex\n', stderr: '', exitCode: 0 };
         }
         return local.exec(command, options);
       },

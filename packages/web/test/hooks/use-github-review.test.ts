@@ -68,17 +68,33 @@ describe('useGithubReview', () => {
     expect(result.current.data?.items).toHaveLength(2);
   });
 
-  it('skips the duplicate refetch once an available result has loaded (undefined→value)', async () => {
-    ghMock.mockResolvedValue(convo(1));
+  it('refetches on the first revision arrival even after a successful undefined-revision load', async () => {
+    ghMock.mockResolvedValueOnce(convo(1)).mockResolvedValueOnce(convo(3));
     const { result, rerender } = renderHook(({ id, rev }) => useGithubReview(id, rev), {
       initialProps: { id: 'task-a', rev: undefined as string | undefined },
     });
     await waitFor(() => expect(result.current.loaded).toBe(true));
     expect(ghMock).toHaveBeenCalledTimes(1);
-    rerender({ id: 'task-a', rev: '1:sha:review' });
-    await Promise.resolve();
-    expect(ghMock).toHaveBeenCalledTimes(1);
-    expect(result.current.data?.items).toHaveLength(1);
+    rerender({ id: 'task-a', rev: '1:sha:review:7' });
+    await waitFor(() => expect(result.current.data?.items).toHaveLength(3));
+    expect(ghMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops a late undefined-revision response arriving after the revision-keyed refetch', async () => {
+    let resolveFirst: (v: GithubReviewConversation) => void = () => {};
+    ghMock
+      .mockReturnValueOnce(new Promise<GithubReviewConversation>((r) => { resolveFirst = r; }))
+      .mockResolvedValueOnce(convo(3));
+    const { result, rerender } = renderHook(({ id, rev }) => useGithubReview(id, rev), {
+      initialProps: { id: 'task-a', rev: undefined as string | undefined },
+    });
+    rerender({ id: 'task-a', rev: '1:sha:review:9' });
+    await waitFor(() => expect(result.current.data?.items).toHaveLength(3));
+
+    resolveFirst(convo(1));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(result.current.data?.items).toHaveLength(3);
+    expect(ghMock).toHaveBeenCalledTimes(2);
   });
 
   it('refetches when the first result was unavailable and revision then resolves (no stale no-pr)', async () => {

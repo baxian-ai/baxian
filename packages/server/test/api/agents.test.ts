@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { AgentBindingFacts, AgentSnapshot } from '../../src/shared/index.js';
 import * as imageInput from '../../src/agent/image-input.js';
+import { TmuxManager } from '../../src/agent/tmux.js';
 import { requesters, setupApiHarness, teardownApiHarness, type ApiHarness } from './helpers.js';
 
 const PNG_B64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]).toString('base64');
@@ -106,9 +107,19 @@ describe('GET /api/agents/:id', () => {
 describe('POST /api/agents/:id/images', () => {
   it('writes the image to the agent host and returns its path', async () => {
     await setAgent({ id: 'dev-1', paneId: '%1' });
-    const res = await post('/api/agents/dev-1/images', { dataBase64: PNG_B64 });
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).path).toMatch(/^\/tmp\/baxian\/upload\/dev-1\/[0-9a-f-]+\.png$/);
+    const REF = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+    const snapshotSpy = vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot')
+      .mockResolvedValue({ ref: REF, claim: 'dev-1' });
+    const paneSpy = vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef')
+      .mockResolvedValue({ session: REF, paneId: '%1', claim: 'dev-1' });
+    try {
+      const res = await post('/api/agents/dev-1/images', { dataBase64: PNG_B64 });
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).path).toMatch(/^\/tmp\/baxian\/upload\/dev-1\/[0-9a-f-]+\.png$/);
+    } finally {
+      snapshotSpy.mockRestore();
+      paneSpy.mockRestore();
+    }
   });
 
   it('400 for a non-image payload', async () => {

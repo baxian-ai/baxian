@@ -157,7 +157,7 @@ describe('AgentManager.ensureSession', () => {
   }
 
   function makeMockExec(
-    overrides: { trustDialogReady?: boolean } = {},
+    _overrides: { trustDialogReady?: boolean } = {},
   ): (cmd: string) => Promise<ExecResult> {
     return async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('has-session')) {
@@ -171,7 +171,7 @@ describe('AgentManager.ensureSession', () => {
         const m = cmd.match(/-s '([^']+)'/);
         const name = m?.[1] ?? '';
         const sessionId = `$${nextSessionId++}`;
-        tmuxSessions.set(name, { claim: name, readyOnce: false, sessionId });
+        tmuxSessions.set(name, { claim: '', readyOnce: false, sessionId });
         return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('list-sessions')) {
@@ -184,17 +184,23 @@ describe('AgentManager.ensureSession', () => {
       if (cmd.includes('if-shell')) {
         const sid = cmd.match(/\$\d+/)?.[0];
         const entry = [...tmuxSessions.entries()].find(([, sess]) => sess.sessionId === sid);
-        if (cmd.includes('BX_TARGET_GONE')) {
-          if (!entry) return { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 };
-          const claimM = cmd.match(/@baxian-agent-id '\\''([^']+)'/);
-          if (claimM) entry[1].claim = claimM[1];
+        if (cmd.includes('BX_KILL_REFUSED')) {
+          if (!entry) return { stdout: '', stderr: `can't find session: ${sid}`, exitCode: 1 };
+          const allowEmpty = cmd.includes('#{==:#{@baxian-agent-id},}');
+          const required = cmd.match(/#\{==:#\{@baxian-agent-id\},([^},]+)\}/)?.[1];
+          const claimOk = (allowEmpty && entry[1].claim === '')
+            || (required !== undefined && entry[1].claim === required);
+          if (!claimOk) return { stdout: 'BX_KILL_REFUSED\n', stderr: '', exitCode: 0 };
+          tmuxSessions.delete(entry[0]);
           return { stdout: '', stderr: '', exitCode: 0 };
         }
-        if (cmd.includes('BX_KILL_REFUSED') && entry && entry[1].claim !== '') {
-          return { stdout: 'BX_KILL_REFUSED\n', stderr: '', exitCode: 0 };
+        if (!entry) return { stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 };
+        const claimM = cmd.match(/@baxian-agent-id '\\''([^']+)'/);
+        if (claimM) {
+          entry[1].claim = claimM[1];
+          return { stdout: '', stderr: '', exitCode: 0 };
         }
-        if (entry) tmuxSessions.delete(entry[0]);
-        return { stdout: '', stderr: '', exitCode: 0 };
+        // guarded pane/session ops fall through to the content handlers below
       }
       if (cmd.includes('show-environment')) {
         return { stdout: '', stderr: 'unknown variable: BAXIAN_CREATION_NONCE', exitCode: 1 };
@@ -237,29 +243,27 @@ describe('AgentManager.ensureSession', () => {
       if (cmd.includes('send-keys')) {
         return { stdout: '', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+      if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
         return {
-          stdout: 'claude\n___bx-classify-sep___\n⏵⏵ bypass permissions on\n',
+          stdout: 'BX_PANE_OKclaude\n⏵⏵ bypass permissions on\n',
           stderr: '', exitCode: 0,
         };
       }
       if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-        return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK/tmp/repo\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('BX_PANE_OK#{@baxian-skills-version}')) {
+        return { stdout: `BX_PANE_OK${currentSkillsVersion}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('capture-pane')) {
-        if (overrides.trustDialogReady) {
-          return {
-            stdout: '⏵⏵ bypass permissions on\n',
-            stderr: '', exitCode: 0,
-          };
-        }
+        const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
         return {
-          stdout: '⏵⏵ bypass permissions on\n',
+          stdout: `${header}\n⏵⏵ bypass permissions on\n`,
           stderr: '', exitCode: 0,
         };
       }
       if (cmd.includes('display-message')) {
-        return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes('BX_SKILLS_NON_GIT')) {
         return { stdout: 'BX_SKILLS_OK\n', stderr: '', exitCode: 0 };
@@ -464,8 +468,8 @@ describe('AgentManager.ensureSession', () => {
   it('runtime mode, shell relaunch path tags the session with the skills version (so the next adopt is not seen stale)', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
-      c => c.includes('display-message') && c.includes('capture-pane'),
-      { stdout: 'zsh\n___bx-classify-sep___\n' },
+      c => c.includes('pane_current_command') && c.includes('capture-pane'),
+      { stdout: 'BX_PANE_OKzsh\n' },
     );
     await manager.ensureSession('dev-1', 'runtime');
     expect(setOptionCalls('@baxian-skills-version').length).toBeGreaterThan(0);
@@ -474,8 +478,8 @@ describe('AgentManager.ensureSession', () => {
   it('runtime mode, live REPL with stale skills defers retagging until task-boundary /clear succeeds', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
-      c => c.includes('show-option') && c.includes('@baxian-skills-version'),
-      { stdout: 'stale-version\n' },
+      c => c.includes('BX_PANE_OK#{@baxian-skills-version}'),
+      { stdout: 'BX_PANE_OKstale-version\n' },
     );
     const result = await manager.ensureSession('dev-1', 'runtime');
     expect(result.createdSession).toBe(false);
@@ -489,7 +493,7 @@ describe('AgentManager.ensureSession', () => {
   it('runtime mode, a tmux probe failure during the skills-version check surfaces as EnsureSessionError (does NOT kill the live REPL)', async () => {
     tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
     overrideExec(
-      c => c.includes('show-option') && c.includes('@baxian-skills-version'),
+      c => c.includes('BX_PANE_OK#{@baxian-skills-version}'),
       { stderr: 'tmux probe boom', exitCode: 2 },
     );
     await expect(manager.ensureSession('dev-1', 'runtime')).rejects.toThrow(/skills-version probe failed/);
@@ -585,8 +589,8 @@ describe('AgentManager.ensureSession', () => {
         return { stdout: `9999|1700000000|${sessionId}\n`, stderr: '', exitCode: 0 };
       }
       if (cmd.includes('list-panes')) return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
-      if (cmd.includes('capture-pane')) return { stdout: screen, stderr: '', exitCode: 0 };
-      if (cmd.includes('display-message')) return { stdout: 'node\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('capture-pane')) return { stdout: `BX_PANE_OK\n${screen}`, stderr: '', exitCode: 0 };
+      if (cmd.includes('display-message')) return { stdout: 'BX_PANE_OKnode\n', stderr: '', exitCode: 0 };
       return makeMockExec()(cmd);
     });
     try {
@@ -624,6 +628,36 @@ describe('AgentManager.ensureSession', () => {
       expect(await manager.acquireAgentForTask('dev-1', 'task-1', phase)).toBe(true);
     },
   );
+
+  it('acquireAgentForTask refuses while a deletion tombstone is in flight', async () => {
+    expect(manager.tryClaimDeletion(['dev-1'])).toBeNull();
+    expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
+    expect(await manager['agentStore'].get('dev-1')).toBeNull();
+    manager.releaseDeletionClaim(['dev-1']);
+  });
+
+  it('acquireAgentForTask is ABA-safe: a bumped deletion generation NOOPs a suspended commit', async () => {
+    // Simulate an allocation that captured its generation, then a full DELETE (bump) landing before
+    // the store commit runs: the updater must refuse to write the stale incarnation's binding.
+    const realGenOf = manager.deletionGenerationOf.bind(manager);
+    let firstCall = true;
+    const spy = vi.spyOn(manager, 'deletionGenerationOf').mockImplementation((id: string) => {
+      // entry capture sees 0; the in-updater re-check sees the post-DELETE bump (1).
+      if (firstCall) { firstCall = false; return 0; }
+      return id === 'dev-1' ? 1 : realGenOf(id);
+    });
+    expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
+    expect(await manager['agentStore'].get('dev-1')).toBeNull();
+    // the lock the allocation grabbed must have been released, not leaked
+    expect(await manager['lockManager'].claimOf('dev-1')).toBeNull();
+    spy.mockRestore();
+  });
+
+  it('acquireAgentForTask still lazily initializes a config-only agent with no prior state', async () => {
+    expect(await manager['agentStore'].get('dev-1')).toBeNull();
+    expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(true);
+    expect((await manager['agentStore'].get('dev-1'))?.taskId).toBe('task-1');
+  });
 
   it('releaseAgentForTask returns false on stale taskId (do not touch new assignment)', async () => {
     await manager.acquireAgentForTask('dev-1', 'task-1', 'develop');
@@ -811,7 +845,7 @@ describe('AgentManager.ensureSession', () => {
     vi.spyOn(m, 'provisionRepoSkills').mockResolvedValue(undefined);
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-        return { stdout: '/tmp/wrong-directory\n', stderr: '', exitCode: 0 };
+        return { stdout: 'BX_PANE_OK/tmp/wrong-directory\n', stderr: '', exitCode: 0 };
       }
       if (cmd.includes("cd -P '/tmp/wrong-directory'")) {
         return { stdout: '/tmp/wrong-directory\n', stderr: '', exitCode: 0 };
@@ -828,7 +862,7 @@ describe('AgentManager.ensureSession', () => {
   });
 
   function classifyOutput(proc: string, screen: string): string {
-    return `${proc}\n___bx-classify-sep___\n${screen}`;
+    return `BX_PANE_OK${proc}\n${screen}`;
   }
 
   async function expectAdoptError(pattern: RegExp): Promise<EnsureSessionError> {
@@ -852,14 +886,14 @@ describe('AgentManager.ensureSession', () => {
         c => c.includes('list-sessions'),
         { stderr: 'tmux snapshot probe boom', exitCode: 2 },
       );
-      const err = await expectAdoptError(/session snapshot failed/);
+      const err = await expectAdoptError(/tmux probe failed/);
       expect(err.partial.createdSession).toBe(false);
     });
 
     it('adopts when logical and physical Workdir paths identify the same directory', async () => {
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
         if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-          return { stdout: '/private/tmp/repo\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK/private/tmp/repo\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes("cd -P '/private/tmp/repo'") || cmd.includes("cd -P '/tmp/repo'")) {
           return { stdout: '/private/tmp/repo\n', stderr: '', exitCode: 0 };
@@ -915,7 +949,7 @@ describe('AgentManager.ensureSession', () => {
     it('auto-answers a trust dialog and adopts the pane as a fresh runtime', async () => {
       let enterSent = false;
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+        if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
           return { stdout: classifyOutput('claude', TRUST_SCREEN), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('send-keys') && cmd.includes("'Enter'")) {
@@ -924,7 +958,7 @@ describe('AgentManager.ensureSession', () => {
         }
         if (cmd.includes('capture-pane')) {
           return {
-            stdout: enterSent ? '⏵⏵ bypass permissions on\n' : TRUST_SCREEN,
+            stdout: `BX_PANE_OK\n${enterSent ? '⏵⏵ bypass permissions on\n' : TRUST_SCREEN}`,
             stderr: '', exitCode: 0,
           };
         }
@@ -941,7 +975,7 @@ describe('AgentManager.ensureSession', () => {
     it('reports dialogPending when a startup dialog appears after the trust auto-answer', async () => {
       let enterSent = false;
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+        if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
           return { stdout: classifyOutput('claude', TRUST_SCREEN), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('send-keys') && cmd.includes("'Enter'")) {
@@ -950,7 +984,7 @@ describe('AgentManager.ensureSession', () => {
         }
         if (cmd.includes('capture-pane')) {
           return {
-            stdout: enterSent ? 'Press enter to continue\n' : TRUST_SCREEN,
+            stdout: `BX_PANE_OK\n${enterSent ? 'Press enter to continue\n' : TRUST_SCREEN}`,
             stderr: '', exitCode: 0,
           };
         }
@@ -963,7 +997,7 @@ describe('AgentManager.ensureSession', () => {
 
     it('wraps a trust-dialog handling crash as EnsureSessionError', async () => {
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+        if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
           return { stdout: classifyOutput('claude', TRUST_SCREEN), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
@@ -977,17 +1011,17 @@ describe('AgentManager.ensureSession', () => {
 
     it('shell relaunch blocked on a startup dialog reports dialogPending', async () => {
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+        if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
           return { stdout: classifyOutput('zsh', '$ \n'), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          return { stdout: 'Press enter to continue\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK\nPress enter to continue\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-          return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK/tmp/repo\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message')) {
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
         }
         return makeMockExec({ trustDialogReady: true })(cmd);
       });
@@ -998,17 +1032,17 @@ describe('AgentManager.ensureSession', () => {
 
     it('shell relaunch that never becomes ready fails as REPL relaunch failed', async () => {
       runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('display-message') && cmd.includes('capture-pane')) {
+        if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
           return { stdout: classifyOutput('zsh', '$ \n'), stderr: '', exitCode: 0 };
         }
         if (cmd.includes('capture-pane')) {
-          return { stdout: 'still booting...\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK\nstill booting...\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-          return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK/tmp/repo\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message')) {
-          return { stdout: 'claude\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
         }
         return makeMockExec({ trustDialogReady: true })(cmd);
       });
@@ -1037,7 +1071,7 @@ describe('AgentManager.ensureSession', () => {
       ).mockResolvedValue({ workdir: '/tmp/auto-repo', repoStore: {} });
       overrideExec(
         command => command.includes('display-message') && command.includes('pane_current_path'),
-        { stdout: '/tmp/auto-repo\n' },
+        { stdout: 'BX_PANE_OK/tmp/auto-repo\n' },
       );
 
       await manager.ensureSession('dev-1', 'runtime');
@@ -1052,9 +1086,9 @@ describe('AgentManager.ensureSession', () => {
         .rejects.toThrow(/skill provisioning failed/);
     });
 
-    it('wraps a tmux has-session probe failure', async () => {
+    it('wraps a tmux session-probe failure', async () => {
       overrideExec(
-        c => c.includes('has-session'),
+        c => c.includes('list-sessions'),
         { stderr: 'tmux socket weirdness', exitCode: 2 },
       );
       await expect(manager.ensureSession('dev-1', 'runtime'))
@@ -1083,10 +1117,10 @@ describe('AgentManager.ensureSession', () => {
           return { stdout: '', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-          return { stdout: '/tmp/repo\n', stderr: '', exitCode: 0 };
+          return { stdout: 'BX_PANE_OK/tmp/repo\n', stderr: '', exitCode: 0 };
         }
         if (cmd.includes('display-message') && !cmd.includes('capture-pane')) {
-          return { stdout: exited ? 'zsh\n' : 'claude\n', stderr: '', exitCode: 0 };
+          return { stdout: exited ? 'BX_PANE_OKzsh\n' : 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
         }
         return makeMockExec({ trustDialogReady: true })(cmd);
       });
@@ -1102,7 +1136,7 @@ describe('AgentManager.ensureSession', () => {
       tmuxSessions.set('dev-1', { claim: 'dev-1', readyOnce: true, sessionId: `$${nextSessionId++}` });
       overrideExec(
         c => c.includes('display-message') && !c.includes('capture-pane'),
-        { stdout: 'vim\n' },
+        { stdout: 'BX_PANE_OKvim\n' },
       );
       await expect(manager.restartReplOnly('dev-1')).rejects.toThrow(/unexpected pane state "vim"/);
     });

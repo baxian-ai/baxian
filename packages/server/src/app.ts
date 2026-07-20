@@ -13,6 +13,7 @@ import type { GitHubPoller } from './github/poller.js';
 import type { CommandRunner } from './agent/runner.js';
 import type { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import type { BootstrapPoller } from './agent/bootstrap-poller.js';
+import type { DispatchReconciler } from './agent/dispatch-reconciler.js';
 import type { PaneStreamerManager } from './agent/pane-streamer-manager.js';
 import type { RestartCoordinator } from './lifecycle/restart.js';
 import type { EventBroker } from './event/broker.js';
@@ -44,6 +45,7 @@ export interface AppContext {
   tmuxSessionStatusStore: TmuxSessionStatusStore;
   tmuxProbePoller?: TmuxProbePoller;
   bootstrapPoller?: BootstrapPoller;
+  dispatchReconciler?: DispatchReconciler;
   configPath?: string;
   stateDir?: string;
   poller?: GitHubPoller;
@@ -133,6 +135,7 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
   app.addHook('onClose', async () => {
     app.ctx.tmuxProbePoller?.stop();
     app.ctx.bootstrapPoller?.stop();
+    app.ctx.dispatchReconciler?.stop();
     app.ctx.poller?.stop();
     try {
       await app.ctx.paneStreamerManager?.destroyAll();

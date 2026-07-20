@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -409,13 +409,13 @@ describe('readFindings / readResponse', () => {
     await transport.deleteResponse(DEV);
     const rm = calls.find(c => c.includes('rm -f --') && c.includes('response.json'));
     expect(rm).toBeDefined();
-    expect(rm).toContain("[ ! -L '/wt/dev' ]");
+    expect(rm).toContain(`[ "$(cd -- '/wt/dev' 2>/dev/null && pwd -P)" = '/wt/dev' ]`);
     expect(rm).toContain("[ ! -L '/wt/dev/.baxian/review' ]");
     expect(rm).toContain("[ ! -L '/wt/dev/.baxian/review/response.json' ] && rm -f --");
   });
 
   it('fails closed instead of deleting when the exchange dir has been swapped for a symlink (real fs)', async () => {
-    const worktree = await mkdtemp(join(tmpdir(), 'review-exchange-symlink-'));
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), 'review-exchange-symlink-')));
     const outside = await mkdtemp(join(tmpdir(), 'review-exchange-outside-'));
     try {
       const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
@@ -452,7 +452,7 @@ describe('clearDispatchOutputs', () => {
   });
 
   it('removes Research handoff documents before the next real develop dispatch', async () => {
-    const worktree = await mkdtemp(join(tmpdir(), 'review-develop-cleanup-'));
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), 'review-develop-cleanup-')));
     const runner = new LocalRunner();
     const specPath = join(worktree, '.baxian', 'spec.md');
     const researchDir = join(worktree, '.baxian', 'research');
@@ -645,6 +645,7 @@ describe('deliverToInbox', () => {
   it('mv failure removes the temp file and throws deliver-failed, final name never targeted twice', async () => {
     const { transport, calls } = makeTransport([
       { match: c => c.includes('mv -f --'), result: { exitCode: 1, stderr: 'disk full' } },
+      { match: c => c.includes('rm -f --') && c.includes('.tmp-'), result: { stdout: 'BX_SWEEP_REMOVED' } },
     ]);
     await expect(
       transport.deliverToInbox(QA, QA_WT, 'diff-round-1.patch', 'x'),
@@ -662,7 +663,9 @@ describe('deliverToInbox', () => {
       await expect(
         transport.deliverToInbox(QA, QA_WT, 'diff-round-1.patch', 'x'),
       ).rejects.toThrow(expect.objectContaining({ reason: 'deliver-failed' }));
-      expect(warn.mock.calls.some(c => String(c[0]).includes('failed to remove stray tmp'))).toBe(true);
+      expect(warn.mock.calls.some(c =>
+        String(c[0]).includes('[fs] sweep') && String(c[0]).includes('outcome UNKNOWN') && String(c[0]).includes('exit 255'),
+      )).toBe(true);
     } finally {
       warn.mockRestore();
     }
@@ -678,7 +681,9 @@ describe('deliverToInbox', () => {
       await expect(
         transport.replaceSpecDocuments(QA, '/wt/qa', [{ relPath: '.baxian/spec.md', content: 'x' }], async () => {}),
       ).rejects.toThrow(expect.objectContaining({ reason: 'spec-seed-failed' }));
-      expect(warn.mock.calls.some(c => String(c[0]).includes('failed to remove stray tmp'))).toBe(true);
+      expect(warn.mock.calls.some(c =>
+        String(c[0]).includes('[fs] sweep') && String(c[0]).includes('rm: permission denied'),
+      )).toBe(true);
     } finally {
       warn.mockRestore();
     }
@@ -739,7 +744,7 @@ describe('deliverToInbox', () => {
 
 describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
   it('delivers a >10KB multibyte payload byte-identical to the final file, with a clean inbox dir', async () => {
-    const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-e2e-'));
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), 'review-inbox-e2e-')));
     try {
       const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
       expect(initialized.exitCode).toBe(0);
@@ -770,7 +775,7 @@ describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
 
   it('fails closed on a directory-shaped inbox filename and leaves no nested tmp behind (real fs)', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-dirfinal-'));
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), 'review-inbox-dirfinal-')));
     try {
       const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);
       expect(initialized.exitCode).toBe(0);
@@ -794,7 +799,7 @@ describe('deliverToInbox (e2e: real LocalRunner, real worktree dir)', () => {
   });
 
   it('rejects a .baxian symlink before writing outside the Workdir', async () => {
-    const worktree = await mkdtemp(join(tmpdir(), 'review-inbox-symlink-'));
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), 'review-inbox-symlink-')));
     const outside = await mkdtemp(join(tmpdir(), 'review-inbox-outside-'));
     try {
       const initialized = await new LocalRunner().exec(`git -C ${shellQuote(worktree)} init -q`);

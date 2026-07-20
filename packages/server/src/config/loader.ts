@@ -1,10 +1,14 @@
-import { readFile, writeFile, access, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, access, mkdir, stat, open, rename, rm, realpath } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { isRecord, type AfterDone, type BaxianConfig, type HostConfig, type ProjectConfig, type ReviewMode, type ServerConfig } from '../shared/index.js';
 import {
   CONFIG_FILE,
   DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
+  DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS,
+  DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS,
+  DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS,
   DEFAULT_GITHUB_POLL_INTERVAL_MS,
   DEFAULT_REVIEW_ROUNDS,
   DEFAULT_SERVER_HOST,
@@ -117,9 +121,45 @@ export async function createDefaultConfig(path: string): Promise<void> {
   await writeFile(path, JSON.stringify(DEFAULT_CONFIG_TEMPLATE, null, 2) + '\n');
 }
 
+// Atomic + credential-safe (config can hold a plaintext HostConfig.password): O_EXCL temp with the target's mode, rename-swapped over the realpath'd target so a symlink keeps its link and a failure leaves the original untouched.
 export async function saveConfig(configPath: string, config: BaxianConfig): Promise<void> {
   await backupConfig(configPath);
-  await writeFile(configPath, JSON.stringify(config, null, 2) + '\n');
+  const physical = await realpathOrSelf(configPath);
+  let mode = 0o600;
+  try {
+    mode = (await stat(physical)).mode & 0o777;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw err;
+  }
+  const tmp = `${physical}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const cleanupTmp = async (): Promise<void> => {
+    await rm(tmp, { force: true }).catch((rmErr) => {
+      console.warn(`[config] failed to remove config temp ${tmp}:`, rmErr);
+    });
+  };
+  // close() shares the cleanup path: a deferred write/fsync error surfaced at close (ENOSPC/NFS) must not leave the plaintext temp behind.
+  let handle;
+  try {
+    handle = await open(tmp, 'wx', mode);
+    await handle.writeFile(JSON.stringify(config, null, 2) + '\n');
+    await handle.chmod(mode);
+    await handle.close();
+    handle = undefined;
+    await rename(tmp, physical);
+  } catch (err) {
+    if (handle) await handle.close().catch(() => undefined);
+    await cleanupTmp();
+    throw err;
+  }
+}
+
+async function realpathOrSelf(p: string): Promise<string> {
+  try {
+    return await realpath(p);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return p;
+    throw err;
+  }
 }
 
 
@@ -189,6 +229,9 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
       tmuxProbeTimeoutMs: isFiniteNumber(sv.tmuxProbeTimeoutMs) ? sv.tmuxProbeTimeoutMs : DEFAULT_TMUX_PROBE_TIMEOUT_MS,
       tmuxProbeConcurrency: isFiniteNumber(sv.tmuxProbeConcurrency) ? sv.tmuxProbeConcurrency : DEFAULT_TMUX_PROBE_CONCURRENCY,
       bootstrapRetryIntervalMs: isFiniteNumber(sv.bootstrapRetryIntervalMs) ? sv.bootstrapRetryIntervalMs : DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
+      dispatchReconcileIntervalMs: isFiniteNumber(sv.dispatchReconcileIntervalMs) ? sv.dispatchReconcileIntervalMs : DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS,
+      dispatchBusyWaitBudgetMs: isFiniteNumber(sv.dispatchBusyWaitBudgetMs) ? sv.dispatchBusyWaitBudgetMs : DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS,
+      dispatchReconcileMaxAttempts: isFiniteNumber(sv.dispatchReconcileMaxAttempts) ? sv.dispatchReconcileMaxAttempts : DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS,
     },
     host: hosts,
     project: projects.map(p => applyProjectDefaults(p, reviewMode)),

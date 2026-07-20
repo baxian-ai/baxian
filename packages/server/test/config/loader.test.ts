@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, writeFile, rm, readdir, readFile, realpath, stat } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, writeFile, rm, readdir, readFile, realpath, stat, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -269,6 +269,25 @@ describe('prepareConfig type guards', () => {
     expect(config.server.bootstrapRetryIntervalMs).toBe(60_000);
   });
 
+  it('passes through dispatch reconcile knobs', () => {
+    const config = withServer({
+      port: 3000,
+      dispatchReconcileIntervalMs: 15_000,
+      dispatchBusyWaitBudgetMs: 600_000,
+      dispatchReconcileMaxAttempts: 5,
+    });
+    expect(config.server.dispatchReconcileIntervalMs).toBe(15_000);
+    expect(config.server.dispatchBusyWaitBudgetMs).toBe(600_000);
+    expect(config.server.dispatchReconcileMaxAttempts).toBe(5);
+  });
+
+  it('defaults dispatch reconcile knobs when absent', () => {
+    const config = withServer({ port: 3000 });
+    expect(config.server.dispatchReconcileIntervalMs).toBe(30_000);
+    expect(config.server.dispatchBusyWaitBudgetMs).toBe(1_800_000);
+    expect(config.server.dispatchReconcileMaxAttempts).toBe(3);
+  });
+
   it('falls back to default rounds when review.rounds is non-finite', () => {
     const cfg = prepareConfig({
       review: { rounds: NaN },
@@ -461,6 +480,31 @@ describe('saveConfig', () => {
 
     const config = await loadConfig(path);
     expect(config.project[0].id).toBe('myproj');
+  });
+
+  it('preserves a restrictive file mode and leaves no temp file behind', async () => {
+    const path = join(tempDir, 'baxian.json');
+    await writeFile(path, JSON.stringify({ old: true }));
+    await chmod(path, 0o600);
+
+    await saveConfig(path, { ...VALID_CONFIG } as BaxianConfig);
+
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    const files = await readdir(tempDir);
+    expect(files.filter(f => f.endsWith('.tmp'))).toHaveLength(0);
+  });
+
+  it('rewrites the target of a symlinked config path without breaking the link', async () => {
+    const target = join(tempDir, 'real-config.json');
+    await writeFile(target, JSON.stringify({ old: true }));
+    const link = join(tempDir, 'baxian.json');
+    await symlink(target, link);
+
+    await saveConfig(link, { ...VALID_CONFIG } as BaxianConfig);
+
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    const config = await loadConfig(target);
+    expect(config.server.port).toBe(8080);
   });
 });
 

@@ -191,6 +191,19 @@ describe('TaskStore', () => {
 });
 
 describe('TaskStore sanitize', () => {
+  it('reviewRoundPending 持久化并校验类型：boolean 通过、字符串 "true" 抛错（#563 R24）', async () => {
+    await store.set({ ...makeTask('task-rrp'), reviewRoundPending: true });
+    const loaded = await store.get('task-rrp');
+    expect(loaded?.reviewRoundPending).toBe(true);
+
+    await writeUnsanitizedTask('task-rrp-bad', {
+      title: 'T', description: 'D',
+      status: 'review', reviewRound: 1,
+      reviewRoundPending: 'true',
+    });
+    await expect(store.get('task-rrp-bad')).rejects.toThrow(/reviewRoundPending/);
+  });
+
   it('strips schema-foreign fields on get', async () => {
     await writeUnsanitizedTask('task-100', {
       title: 'Old task',

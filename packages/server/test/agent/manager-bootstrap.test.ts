@@ -31,6 +31,9 @@ const CONFIG: BaxianConfig = {
   }],
 };
 
+const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+const PANE = { session: REF, paneId: '%0', claim: 'dev-1' };
+
 let tempDir: string;
 let manager: AgentManager;
 let agentStore: AgentStore;
@@ -93,6 +96,7 @@ describe('AgentManager.startBootstrapAsync', () => {
       ok: true,
       createdSession: true,
       paneId: '%0',
+      pane: PANE,
       workdir: '/tmp/repo',
     });
 
@@ -119,6 +123,7 @@ describe('AgentManager.startBootstrapAsync', () => {
       ok: true,
       createdSession: true,
       paneId: '%0',
+      pane: PANE,
       workdir: '/tmp/repo',
     });
 
@@ -151,8 +156,6 @@ describe('AgentManager.startBootstrapAsync', () => {
     )).toBe(true);
   });
 
-  const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
-
   // killSession-by-name no longer exists on TmuxManager, so a regression to
   // name-based kills cannot even compile; only the ref path needs watching.
   function spyKills(): { byRef: ReturnType<typeof vi.spyOn> } {
@@ -170,7 +173,7 @@ describe('AgentManager.startBootstrapAsync', () => {
 
     await manager.startBootstrapAsync('dev-1', 'token-abc');
 
-    expect(kills.byRef).toHaveBeenCalledWith(REF);
+    expect(kills.byRef).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
     expect(warn.mock.calls.some(c => String(c[0]).includes('killed created session $7'))).toBe(true);
   });
 
@@ -248,7 +251,7 @@ describe('AgentManager.startBootstrapAsync', () => {
     await bootstrap;
 
     expect(killByRef).toHaveBeenCalledTimes(1);
-    expect(killByRef).toHaveBeenCalledWith(REF);
+    expect(killByRef).toHaveBeenCalledWith(REF, { kind: 'emptyOr', claim: 'dev-1' });
   });
 
   it('leaves a created dialog-blocked session untouched when the token has rotated', async () => {
@@ -311,6 +314,7 @@ describe('AgentManager.startBootstrapAsync', () => {
       ok: true,
       createdSession: true,
       paneId: '%0',
+      pane: PANE,
       workdir: '/tmp/repo',
     });
 
@@ -340,7 +344,7 @@ describe('AgentManager greeting capability gate', () => {
       phaseSignalWatcher,
     });
     vi.spyOn(mgr, 'ensureSession').mockResolvedValue({
-      ok: true, createdSession: true, paneId: '%0', workdir: '/tmp/repo',
+      ok: true, createdSession: true, paneId: '%0', pane: PANE, workdir: '/tmp/repo',
     });
     const injectSpy = vi.spyOn(mgr as unknown as {
       injectAndAwaitAckSteps: (...a: unknown[]) => Promise<unknown>;
@@ -495,6 +499,8 @@ describe('AgentManager greeting capability gate', () => {
   it('regreetHeldAgent clears the hold when the re-greet passes', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('matched');
     const { mgr } = makeManagerWithWatcher(awaitOnce);
+    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref: REF, claim: 'dev-1' });
+    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue(PANE);
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
@@ -510,6 +516,8 @@ describe('AgentManager greeting capability gate', () => {
   it('regreetHeldAgent keeps the hold when the re-greet fails', async () => {
     const awaitOnce = vi.fn().mockResolvedValue('timeout');
     const { mgr } = makeManagerWithWatcher(awaitOnce);
+    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref: REF, claim: 'dev-1' });
+    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue(PANE);
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
@@ -526,6 +534,8 @@ describe('AgentManager greeting capability gate', () => {
       return 'matched';
     });
     const { mgr } = makeManagerWithWatcher(awaitOnce);
+    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref: REF, claim: 'dev-1' });
+    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue(PANE);
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'greeting_failed', awaitingSince: NOW, updatedAt: NOW,
@@ -714,7 +724,7 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       awaitingPhase: 'agent_dialog_pending',
       awaitingReason: 'startup dialog',
       awaitingSince: NOW,
-      paneId: '%old',
+      paneId: '%1',
       updatedAt: NOW,
     });
 
@@ -729,17 +739,20 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
 
     const dispatchRunner: CommandRunner = {
       exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
+        if (cmd.includes('list-sessions')) {
+          return { stdout: '9999|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+        }
         if (cmd.includes('list-panes')) {
-          return { stdout: '%new node\n', stderr: '', exitCode: 0 };
+          return { stdout: '%2 node\n', stderr: '', exitCode: 0 };
         }
-        if (cmd.includes('%old')) {
-          return { stdout: '', stderr: "can't find pane: %old", exitCode: 1 };
+        if (cmd.includes('%1') && !cmd.includes('%2')) {
+          return { stdout: '', stderr: "can't find pane: %1", exitCode: 1 };
         }
-        if (cmd.includes('display-message') && cmd.includes('%new')) {
-          return { stdout: 'node\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('capture-pane') && cmd.includes('%2')) {
+          return { stdout: `BX_PANE_OK\n${READY_CODEX}`, stderr: '', exitCode: 0 };
         }
-        if (cmd.includes('capture-pane') && cmd.includes('%new')) {
-          return { stdout: READY_CODEX, stderr: '', exitCode: 0 };
+        if (cmd.includes('display-message') && cmd.includes('%2')) {
+          return { stdout: 'BX_PANE_OKnode\n', stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }),
@@ -775,11 +788,11 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
           token: string | undefined,
           opts: { expectedPaneId?: string; expectedTaskId?: string },
         ) => Promise<void>;
-      }).slowPollDialogPending('dev-1', undefined, { expectedPaneId: '%old', expectedTaskId: undefined });
+      }).slowPollDialogPending('dev-1', undefined, { expectedPaneId: '%1', expectedTaskId: undefined });
 
       const state = await realGet('dev-1');
       expect(state?.awaitingPhase).toBe('agent_dialog_resolved_runtime');
-      expect(state?.paneId).toBe('%new');
+      expect(state?.paneId).toBe('%2');
       expect(events.some(e =>
         e.type === 'human.intervention'
         && (e.data as { phase?: string }).phase === 'agent_dialog_resolved_runtime',

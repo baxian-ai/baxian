@@ -451,7 +451,7 @@ describe('git QA dispatch anchoring', () => {
     driver.prView = new Error('HTTP 502');
     const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({ status: 502 });
-    expect(release).toHaveBeenCalledWith('qa-1', 'task-1', 'idle');
+    expect(release).toHaveBeenCalledWith('qa-1', 'task-1', 'idle', expect.any(Object));
     expect(driver.ops.some(o => o.op === 'merge')).toBe(false);
   });
 });
@@ -494,7 +494,7 @@ describe('manual dispatch binding recheck', () => {
     await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({
       status: 409, message: expect.stringContaining('binding draft'),
     });
-    expect(release).toHaveBeenCalledWith('qa-1', 'task-1', 'idle');
+    expect(release).toHaveBeenCalledWith('qa-1', 'task-1', 'idle', expect.any(Object));
   });
 });
 

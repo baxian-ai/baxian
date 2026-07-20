@@ -123,11 +123,11 @@ describe('AgentStore', () => {
     expect(fired).toEqual([['delete', 'nonexistent']]);
   });
 
-  it('delete does NOT fire onChange when unlink fails for non-ENOENT reasons', async () => {
+  it('delete throws and does NOT fire onChange when unlink fails for non-ENOENT reasons', async () => {
     const dir = join(agentsDir(), 'stuck.json');
     await mkdir(dir, { recursive: true });
     const fired = captureChanges();
-    await store.delete('stuck');
+    await expect(store.delete('stuck')).rejects.toThrow();
     expect(fired).toEqual([]);
   });
 
@@ -173,6 +173,34 @@ describe('AgentStore.update', () => {
     const before = await store.get('dev-x');
     await store.update('dev-x', () => AGENT_STORE_NOOP);
     expect(await store.get('dev-x')).toEqual(before);
+  });
+
+  it('update reports its commit result as committed / noop / deleted', async () => {
+    expect(await store.update('dev-x', () => makeState('dev-x'))).toBe('committed');
+    expect(await store.update('dev-x', () => AGENT_STORE_NOOP)).toBe('noop');
+    expect(await store.update('dev-x', () => null)).toBe('deleted');
+    // On an absent agent, a null updater is a confirmed no-op deletion (ENOENT is not an error).
+    expect(await store.update('gone', () => null)).toBe('deleted');
+  });
+
+  it('serializes public set/delete on the same per-id chain as update (no reentrant deadlock)', async () => {
+    // update reads null then re-sets; a delete queued behind it must observe the write, not race it.
+    await store.set(makeState('dev-x', { taskId: 't1' }));
+    const order: string[] = [];
+    const p1 = store.update('dev-x', (e) => { order.push('update'); return { ...e!, taskId: 't2', updatedAt: NOW }; });
+    const p2 = store.delete('dev-x').then(() => order.push('delete'));
+    const p3 = store.set(makeState('dev-x', { taskId: 't3' })).then(() => order.push('set'));
+    await Promise.all([p1, p2, p3]);
+    expect(order).toEqual(['update', 'delete', 'set']);
+    expect((await store.get('dev-x'))?.taskId).toBe('t3');
+  });
+
+  it('a delete queued behind an update that read null does not resurrect the file', async () => {
+    await store.set(makeState('dev-x'));
+    const del = store.update('dev-x', () => null);
+    const noop = store.update('dev-x', (existing) => existing === null ? AGENT_STORE_NOOP : makeState('dev-x'));
+    await Promise.all([del, noop]);
+    expect(await store.get('dev-x')).toBeNull();
   });
 
   it('persists in-place mutation when updater returns existing reference (NOT a no-op)', async () => {

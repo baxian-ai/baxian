@@ -101,6 +101,23 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
     errors,
   );
   validateOptionalBoundedInteger(
+    config.server.dispatchReconcileIntervalMs,
+    'server.dispatchReconcileIntervalMs',
+    1000,
+    2_147_483_647,
+    errors,
+  );
+  validateOptionalPositiveInteger(
+    config.server.dispatchBusyWaitBudgetMs,
+    'server.dispatchBusyWaitBudgetMs',
+    errors,
+  );
+  validateOptionalPositiveInteger(
+    config.server.dispatchReconcileMaxAttempts,
+    'server.dispatchReconcileMaxAttempts',
+    errors,
+  );
+  validateOptionalBoundedInteger(
     config.server.githubPollIntervalMs,
     'server.githubPollIntervalMs',
     1000,

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, detectRuntimePendingPrompt, detectRuntimeOverlay, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, hasOscTitleIdle, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import { TmuxManager, PaneGoneError, SessionAbsentError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, detectRuntimePendingPrompt, detectRuntimeOverlay, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, hasOscTitleIdle, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
 type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
@@ -21,9 +22,18 @@ const lastCmd = (runner: { exec: ExecMock }): string => {
   return String(calls[calls.length - 1][0]);
 };
 
-const SNAP_SEP = '___bx-snap-sep___';
+const PANE: PaneRef = {
+  session: { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' },
+  paneId: '%7',
+  claim: 'dev-1',
+};
+
+// guardedPaneRead marker-first protocol: first stdout line carries BX_PANE_OK + header format,
+// subsequent lines are the body (capture-pane output).
+const okHeader = (value: string): string => `BX_PANE_OK${value}\n`;
+const okBody = (content: string): string => `BX_PANE_OK\n${content}`;
 const composeSnapStdout = (visible: string, history: string | number): string =>
-  `${visible}${SNAP_SEP}\n${history}\n`;
+  `BX_PANE_OK|${history}\n${visible}`;
 const buildSnapshot = (visible: string, history: number): string =>
   `${visible}\n---history_size:${history}---`;
 
@@ -125,112 +135,41 @@ describe('TmuxManager', () => {
     });
   });
 
-  describe('resizeWindow', () => {
-    it('uses `=name` exact target so prefix collisions cannot resize the wrong session', async () => {
-      await tmux.resizeWindow('dev', 100, 30);
+  describe('resizeWindowByRef', () => {
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+
+    it('rides the size change and the window-size pin on one claim-checked if-shell', async () => {
+      primeExec('');
+      await tmux.resizeWindowByRef(REF, 'dev-1', 100, 30);
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux resize-window');
-      expect(cmd).toContain("-t '=dev'");
+      expect(cmd).toContain("tmux if-shell -t '$7'");
+      expect(cmd).toContain('resize-window');
       expect(cmd).toContain('-x 100');
       expect(cmd).toContain('-y 30');
+      expect(cmd).toContain('window-size latest');
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+      expect(cmd).toContain('BX_TARGET_GONE');
     });
 
-    it('throws on non-zero exit', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'window not found', exitCode: 1 });
-      await expect(tmux.resizeWindow('dev', 80, 24)).rejects.toThrow(/window not found/);
-    });
-  });
-
-  describe('sendInput (load-buffer + paste-buffer + cleanup)', () => {
-    it('runs load-buffer (stdin) → paste-buffer → delete-buffer in order', async () => {
-      runner.exec.mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 });
-      await tmux.sendInput('dev-1', 'hello world');
-      const execWithStdinMock = (runner as unknown as { execWithStdin: ExecMock }).execWithStdin;
-      expect(execWithStdinMock).toHaveBeenCalledTimes(1);
-      const loadCmd = execWithStdinMock.mock.calls[0][0] as string;
-      expect(loadCmd).toContain('tmux load-buffer -b');
-      expect(loadCmd).toContain("'bx-input-");
-      expect(runner.exec).toHaveBeenCalledTimes(2);
-      const pasteCmd = runner.exec.mock.calls[0][0] as string;
-      const deleteCmd = runner.exec.mock.calls[1][0] as string;
-      expect(pasteCmd).toContain('tmux paste-buffer');
-      expect(pasteCmd).toContain("-d -b 'bx-input-");
-      expect(pasteCmd).toContain("-t '=dev-1:'");
-      expect(deleteCmd).toContain('tmux delete-buffer -b');
+    it('throws PaneGoneError instead of resizing a mismatched session', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24)).rejects.toThrow(PaneGoneError);
     });
 
-    it('uses `=<name>:` target — `=` for exact-match, trailing `:` so paste-buffer can derive the active pane', async () => {
-      await tmux.sendInput('dev', 'x');
-      const pasteCmd = runner.exec.mock.calls[0][0] as string;
-      expect(pasteCmd).toContain("-t '=dev:'");
-      expect(pasteCmd).not.toMatch(/-t '=dev'(?!:)/);
-      expect(pasteCmd).not.toMatch(/-t 'dev'(?!-)/);
+    it('throws PaneGoneError when the server is gone', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
+      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24)).rejects.toThrow(PaneGoneError);
     });
 
-    it('passes raw bytes (incl. utf8 multibyte + control chars) via stdin Buffer', async () => {
-      const data = '中文 🚀 \x03\x1b[A\r\n';
-      await tmux.sendInput('dev', data);
-      const execWithStdinMock = (runner as unknown as { execWithStdin: ExecMock }).execWithStdin;
-      const stdinBuf = execWithStdinMock.mock.calls[0][1] as Buffer;
-      expect(stdinBuf).toBeInstanceOf(Buffer);
-      expect(stdinBuf.toString('utf8')).toBe(data);
-    });
-
-    it('still calls delete-buffer even when paste-buffer fails (leak prevention)', async () => {
-      const execWithStdinMock = (runner as unknown as { execWithStdin: ExecMock }).execWithStdin;
-      execWithStdinMock.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 });
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find pane", exitCode: 1 });
-      primeExec('');
-      await expect(tmux.sendInput('dev', 'data')).rejects.toThrow(/paste-buffer failed/);
-      expect(runner.exec).toHaveBeenCalledTimes(2);
-      const deleteCmd = runner.exec.mock.calls[1][0] as string;
-      expect(deleteCmd).toContain('tmux delete-buffer -b');
-    });
-
-    it('throws when load-buffer (stdin path) fails — does not call paste', async () => {
-      const execWithStdinMock = (runner as unknown as { execWithStdin: ExecMock }).execWithStdin;
-      execWithStdinMock.mockResolvedValueOnce({ stdout: '', stderr: 'no server', exitCode: 1 });
-      await expect(tmux.sendInput('dev', 'x')).rejects.toThrow(/load-buffer failed/);
-      expect(runner.exec).toHaveBeenCalledTimes(1);
-      const cmd = runner.exec.mock.calls[0][0] as string;
-      expect(cmd).toContain('tmux delete-buffer');
-    });
-
-    it('is a no-op when data is empty', async () => {
-      await tmux.sendInput('dev', '');
+    it('rejects non-positive or non-integer dimensions before any exec', async () => {
+      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 0, 24)).rejects.toThrow(/invalid dimensions/);
+      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24.5)).rejects.toThrow(/invalid dimensions/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
 
-    it('does not warn when delete-buffer finds the buffer already consumed by paste -d', async () => {
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      primeExec('');
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'unknown buffer: bx-input-x', exitCode: 1 });
-      await tmux.sendInput('dev', 'data');
-      expect(warn).not.toHaveBeenCalled();
-      warn.mockRestore();
-    });
-
-    it('warns when delete-buffer fails for any other reason', async () => {
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      primeExec('');
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'server exited unexpectedly', exitCode: 1 });
-      await tmux.sendInput('dev', 'data');
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('input may linger in tmux'));
-      warn.mockRestore();
-    });
-
-    it('uses unique buffer names per call (random uuid prefix)', async () => {
-      await tmux.sendInput('dev', 'a');
-      await tmux.sendInput('dev', 'b');
-      const execWithStdinMock = (runner as unknown as { execWithStdin: ExecMock }).execWithStdin;
-      const cmd1 = execWithStdinMock.mock.calls[0][0] as string;
-      const cmd2 = execWithStdinMock.mock.calls[1][0] as string;
-      const bufFromCmd = (s: string): string => {
-        const m = /'(bx-input-[0-9a-f-]+)'/.exec(s);
-        if (!m) throw new Error(`no buffer name in: ${s}`);
-        return m[1];
-      };
-      expect(bufFromCmd(cmd1)).not.toBe(bufFromCmd(cmd2));
+    it('throws on other non-zero exits', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'window not found', exitCode: 1 });
+      await expect(tmux.resizeWindowByRef(REF, 'dev-1', 80, 24)).rejects.toThrow(/window not found/);
     });
   });
 
@@ -260,43 +199,49 @@ describe('TmuxManager', () => {
 
     it('kills through a server-generation-checked if-shell, never a bare name', async () => {
       primeExec('');
-      expect(await tmux.killSessionRef(REF)).toBe('killed');
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('killed');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux if-shell -F');
+      expect(cmd).toContain("tmux if-shell -t '$7' -F");
       expect(cmd).toContain('#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}');
       expect(cmd).toContain(`kill-session -t '\\''$7'\\'`);
-      expect(cmd).toContain('BX_STALE_SERVER');
+      expect(cmd).toContain('BX_KILL_REFUSED');
     });
 
-    it('reports stale-server without killing when the generation check fails', async () => {
-      primeExec('BX_STALE_SERVER\n');
-      expect(await tmux.killSessionRef(REF)).toBe('stale-server');
+    it('reports refused without killing when the generation/claim check fails server-side', async () => {
+      primeExec('BX_KILL_REFUSED\n');
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('refused');
     });
 
     it('treats a vanished session as absent (idempotent)', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $7", exitCode: 1 });
-      expect(await tmux.killSessionRef(REF)).toBe('absent');
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('absent');
     });
 
     it('treats a dead server as absent', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/tmux-501/default', exitCode: 1 });
-      expect(await tmux.killSessionRef(REF)).toBe('absent');
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('absent');
     });
 
     it('throws on an ssh-layer failure instead of guessing', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
-      await expect(tmux.killSessionRef(REF)).rejects.toThrow(/runner error/);
+      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).rejects.toThrow(/outcome unknown/);
     });
 
     it('refuses to run with a malformed ref (defense against credential corruption)', async () => {
-      await expect(tmux.killSessionRef({ sessionId: 'dev', serverPid: '1', serverStart: '2' }))
+      await expect(tmux.killSessionRef({ sessionId: 'dev', serverPid: '1', serverStart: '2' }, { kind: 'unclaimed' }))
         .rejects.toThrow(/malformed session ref/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
 
-    it('onlyIfUnclaimed adds the claim-empty condition, a session target, and its own marker', async () => {
+    it('refuses to run with a claim that could alter tmux filter syntax', async () => {
+      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'a,b}' }))
+        .rejects.toThrow(/unsupported characters/);
+      expect(runner.exec).not.toHaveBeenCalled();
+    });
+
+    it('unclaimed adds the claim-empty condition, a session target, and the refused marker', async () => {
       primeExec('');
-      expect(await tmux.killSessionRef(REF, { onlyIfUnclaimed: true })).toBe('killed');
+      expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('killed');
       const cmd = lastCmd(runner);
       expect(cmd).toContain("-t '$7'");
       expect(cmd).toContain('#{==:#{@baxian-agent-id},}');
@@ -304,9 +249,23 @@ describe('TmuxManager', () => {
       expect(cmd).toContain('BX_KILL_REFUSED');
     });
 
-    it('onlyIfUnclaimed reports refused without killing when the server declines', async () => {
+    it('unclaimed reports refused without killing when the server declines', async () => {
       primeExec('BX_KILL_REFUSED\n');
-      expect(await tmux.killSessionRef(REF, { onlyIfUnclaimed: true })).toBe('refused');
+      expect(await tmux.killSessionRef(REF, { kind: 'unclaimed' })).toBe('refused');
+    });
+
+    it('equals binds the kill to the exact claim (no empty-claim escape hatch)', async () => {
+      primeExec('');
+      expect(await tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).toBe('killed');
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+      expect(cmd).not.toContain('#{||:');
+    });
+
+    it('emptyOr accepts an unclaimed session or the exact claim', async () => {
+      primeExec('');
+      expect(await tmux.killSessionRef(REF, { kind: 'emptyOr', claim: 'dev-1' })).toBe('killed');
+      expect(lastCmd(runner)).toContain('#{||:#{==:#{@baxian-agent-id},},#{==:#{@baxian-agent-id},dev-1}}');
     });
   });
 
@@ -418,54 +377,72 @@ describe('TmuxManager', () => {
   describe('setSessionOptionsIfAlive', () => {
     const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
 
-    it('batches all options into one identity-checked if-shell command', async () => {
+    it('batches all options into one identity-checked if-shell command (fresh-create batch, empty expectedClaim)', async () => {
       primeExec('');
-      expect(await tmux.setSessionOptionsIfAlive(REF, [['@baxian-agent-id', 'dev'], ['mouse', 'on']])).toBe('applied');
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['@baxian-agent-id', 'dev'], ['mouse', 'on']], { expectedClaim: '' })).toBe('applied');
       expect(runner.exec).toHaveBeenCalledTimes(1);
       const cmd = lastCmd(runner);
       expect(cmd).toContain("tmux if-shell -t '$7'");
       expect(cmd).toContain('#{&&:#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}},#{==:#{session_id},$7}}');
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},}');
       expect(cmd).toContain("set-option -t '\\''$7'\\'' @baxian-agent-id '\\''dev'\\''");
       expect(cmd).toContain("set-option -t '\\''$7'\\'' mouse '\\''on'\\''");
       expect(cmd).toContain('BX_TARGET_GONE');
     });
 
+    it('binds a non-empty expectedClaim into the same server-side condition', async () => {
+      primeExec('');
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'dev-1' })).toBe('applied');
+      expect(lastCmd(runner)).toContain('#{==:#{@baxian-agent-id},dev-1}');
+    });
+
     it('reports gone instead of configuring a fallback session', async () => {
       primeExec('BX_TARGET_GONE\n');
-      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']])).toBe('gone');
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'dev-1' })).toBe('gone');
     });
 
     it('treats a dead server as gone', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
-      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']])).toBe('gone');
+      expect(await tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'dev-1' })).toBe('gone');
     });
 
-    it('rejects option values tmux quoting cannot hold', async () => {
-      await expect(tmux.setSessionOptionsIfAlive(REF, [['@k', "a'b"]])).rejects.toThrow(/unsupported characters/);
+    it('rejects option values tmux quoting cannot hold (newline)', async () => {
+      await expect(tmux.setSessionOptionsIfAlive(REF, [['@k', 'a\nb']], { expectedClaim: 'dev-1' })).rejects.toThrow(/unsupported characters/);
+      expect(runner.exec).not.toHaveBeenCalled();
+    });
+
+    it('rejects an expectedClaim that could alter tmux filter syntax', async () => {
+      await expect(tmux.setSessionOptionsIfAlive(REF, [['mouse', 'on']], { expectedClaim: 'a,b}' })).rejects.toThrow(/unsupported characters/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
   });
 
-  describe('getSinglePaneIdByRef', () => {
+  describe('getSinglePaneByRef', () => {
     const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
 
-    it('resolves the pane through an exact session_id filter', async () => {
+    it('resolves a claim-bound PaneRef through an exact generation+session+claim filter', async () => {
       primeExec('%3 zsh\n');
-      expect(await tmux.getSinglePaneIdByRef(REF)).toBe('%3');
+      expect(await tmux.getSinglePaneByRef(REF, 'dev-1')).toEqual({ session: REF, paneId: '%3', claim: 'dev-1' });
       const cmd = lastCmd(runner);
       expect(cmd).toContain('list-panes -a');
       expect(cmd).toContain('#{==:#{session_id},$7}');
       expect(cmd).toContain('#{==:#{pid},4242}');
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
     });
 
     it('reports the session gone when nothing matches the filter', async () => {
       primeExec('');
-      await expect(tmux.getSinglePaneIdByRef(REF)).rejects.toThrow(/gone/);
+      await expect(tmux.getSinglePaneByRef(REF, 'dev-1')).rejects.toThrow(/gone/);
     });
 
     it('refuses multi-pane sessions', async () => {
       primeExec('%1 zsh\n%2 zsh\n');
-      await expect(tmux.getSinglePaneIdByRef(REF)).rejects.toThrow(/expects exactly one/);
+      await expect(tmux.getSinglePaneByRef(REF, 'dev-1')).rejects.toThrow(/expects exactly one/);
+    });
+
+    it('rejects a malformed claim before any exec', async () => {
+      await expect(tmux.getSinglePaneByRef(REF, 'a,b}')).rejects.toThrow(/unsupported characters/);
+      expect(runner.exec).not.toHaveBeenCalled();
     });
   });
 
@@ -506,210 +483,294 @@ describe('TmuxManager', () => {
     });
 
     it.each([
-      ['exit 255 (ssh layer) — does not silently report absence', 'ssh: timeout', 255, /runner error/],
+      ['exit 255 (ssh layer) — does not silently report absence', 'ssh: timeout', 255, /outcome unknown/],
       ['unexpected exit (not absence-classified)', 'permission denied', 7, /unexpected exit 7/],
       ['exit=1 with empty stderr (do NOT silently treat as absent)', '', 1, /unexpected exit 1/],
+      // exit 1 + an absence marker AND an INDEPENDENT transient (not the socket-absence) → unknown, not absent.
+      ['exit 1 with mixed absence + independent transient', "can't find session: dev\nconnection reset by peer", 1, /outcome unknown/],
     ])('throws on %s', async (_label, stderr, exitCode, pattern) => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode });
       await expect(tmux.hasSession('dev')).rejects.toThrow(pattern);
     });
   });
 
-  describe('listPanes', () => {
-    it('parses `paneId pane_current_command` lines', async () => {
-      primeExec('%0 zsh\n%1 claude\n');
-      const panes = await tmux.listPanes('dev');
-      expect(panes).toEqual([
-        { paneId: '%0', current: 'zsh' },
-        { paneId: '%1', current: 'claude' },
-      ]);
-      expect(lastCmd(runner)).toContain("-t '=dev'");
-      expect(lastCmd(runner)).toContain("-F '#{pane_id} #{pane_current_command}'");
-    });
-
-    it.each([
-      ['single-pane session', '%0 node\n', [{ paneId: '%0', current: 'node' }]],
-      ['paneId without command', '%0\n', [{ paneId: '%0', current: '' }]],
-    ])('handles %s', async (_label, stdout, expected) => {
-      primeExec(stdout);
-      expect(await tmux.listPanes('dev')).toEqual(expected);
-    });
-  });
-
-  describe('getSinglePaneId', () => {
-    it('returns the only pane id when there is exactly one', async () => {
-      primeExec('%0 claude\n');
-      expect(await tmux.getSinglePaneId('dev')).toBe('%0');
-    });
-
-    it.each([
-      ['zero panes (session damaged)', '', /no panes/],
-      ['multiple panes (does not silently pick the first one)', '%0 zsh\n%1 vim\n', /expects exactly one/],
-    ])('throws when %s', async (_label, stdout, pattern) => {
-      primeExec(stdout);
-      await expect(tmux.getSinglePaneId('dev')).rejects.toThrow(pattern);
-    });
-  });
-
   describe('displayMessage', () => {
-    it('queries pane_current_command via display-message -p', async () => {
-      primeExec('claude\n');
-      const out = await tmux.displayMessage('%0', '#{pane_current_command}');
+    it('queries pane_current_command through the identity-guarded marker-first read', async () => {
+      primeExec(okHeader('claude'));
+      const out = await tmux.displayMessage(PANE, '#{pane_current_command}');
       expect(out).toBe('claude');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('display-message -p');
-      expect(cmd).toContain("-t '%0'");
+      expect(cmd).toContain("tmux if-shell -t '%7'");
+      expect(cmd).toContain('display-message -p -t %7');
       expect(cmd).toContain('#{pane_current_command}');
+      expect(cmd).toContain('BX_PANE_OK');
+      expect(cmd).toContain('BX_TARGET_GONE');
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+      expect(cmd).toContain('#{==:#{pane_id},%7}');
+    });
+
+    it('throws PaneGoneError when the identity condition fails server-side', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.displayMessage(PANE, '#{pane_current_command}')).rejects.toThrow(PaneGoneError);
+    });
+
+    it('rejects formats that could break out of tmux quoting', async () => {
+      await expect(tmux.displayMessage(PANE, "#{pane_title}'")).rejects.toThrow(/unsupported characters/);
+      expect(runner.exec).not.toHaveBeenCalled();
     });
   });
 
-  describe('setOption / getOption (session-scoped target needs trailing colon)', () => {
-    it('setOption uses `=name:` exact target', async () => {
-      await tmux.setOption('dev', '@baxian-agent-id', 'dev');
+  describe('getSessionOptionByRef', () => {
+    const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
+
+    it('reads the option through a claim-checked marker-first command', async () => {
+      primeExec(okHeader('1.2.3'));
+      expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).toBe('1.2.3');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux set-option');
-      expect(cmd).toContain("-t '=dev:'");
-      expect(cmd).toContain("'@baxian-agent-id'");
+      expect(cmd).toContain("tmux if-shell -t '$7'");
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+      expect(cmd).toContain('#{@baxian-skills-version}');
+      expect(cmd).toContain('BX_PANE_OK');
+      expect(cmd).toContain('BX_TARGET_GONE');
     });
 
-    it('getOption returns the value when present', async () => {
-      primeExec('dev\n');
-      expect(await tmux.getOption('dev', '@baxian-agent-id')).toBe('dev');
-      expect(lastCmd(runner)).toContain("-t '=dev:'");
+    it('maps an unset/empty option to null', async () => {
+      primeExec(okHeader(''));
+      expect(await tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).toBeNull();
     });
 
-    it.each([
-      ['option is unset (exit 1)', { stdout: '', stderr: 'option not set', exitCode: 1 }],
-      ['value is empty string', { stdout: '\n', stderr: '', exitCode: 0 }],
-    ])('getOption returns null when %s', async (_label, result) => {
-      runner.exec.mockResolvedValueOnce(result);
-      expect(await tmux.getOption('dev', '@baxian-agent-id')).toBeNull();
+    it('throws PaneGoneError when the identity condition fails', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).rejects.toThrow(PaneGoneError);
+    });
+
+    it('throws PaneGoneError when the server is gone', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no server running on /tmp/x', exitCode: 1 });
+      await expect(tmux.getSessionOptionByRef(REF, 'dev-1', '@baxian-skills-version')).rejects.toThrow(PaneGoneError);
     });
   });
 
-  describe('sendKeysToPane / sendKeysLiteral (pane id without `=` prefix)', () => {
-    it('sendKeysToPane targets raw pane id and quotes each key', async () => {
-      await tmux.sendKeysToPane('%0', 'C-c');
+  describe('sendKeysToPane / sendKeysLiteral (identity-guarded pane writes)', () => {
+    it('sendKeysToPane wraps send-keys in an if-shell bound to generation+session+pane+claim', async () => {
+      await tmux.sendKeysToPane(PANE, 'C-c');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux send-keys');
-      expect(cmd).toContain("-t '%0'");
-      expect(cmd).not.toContain("'=%0'");
+      expect(cmd).toContain("tmux if-shell -t '%7'");
+      expect(cmd).toContain('send-keys -t %7');
+      expect(cmd).toContain("'C-c'");
+      expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+      expect(cmd).toContain('#{==:#{pane_id},%7}');
+      expect(cmd).toContain('#{==:#{session_id},$1}');
+      expect(cmd).toContain('#{==:#{pid},4242}');
+      expect(cmd).toContain('BX_TARGET_GONE');
     });
 
     it('sendKeysToPane forwards multiple key tokens (e.g., text + Enter)', async () => {
-      await tmux.sendKeysToPane('%0', 'echo hi', 'Enter');
+      await tmux.sendKeysToPane(PANE, 'echo hi', 'Enter');
       const cmd = lastCmd(runner);
       expect(cmd).toContain("'echo hi'");
       expect(cmd).toContain("'Enter'");
     });
 
     it('sendKeysLiteral uses send-keys -l (literal mode, no key parsing)', async () => {
-      await tmux.sendKeysLiteral('%0', 'literal-text');
+      await tmux.sendKeysLiteral(PANE, 'literal-text');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux send-keys -l');
-      expect(cmd).toContain("-t '%0'");
+      expect(cmd).toContain('send-keys -l -t %7');
       expect(cmd).toContain("'literal-text'");
+      expect(cmd).toContain('BX_TARGET_GONE');
     });
 
     it('sendKeysToPane is a noop when keys are empty (no exec)', async () => {
-      await tmux.sendKeysToPane('%0');
+      await tmux.sendKeysToPane(PANE);
       expect(runner.exec).not.toHaveBeenCalled();
+    });
+
+    it('throws PaneGoneError instead of typing into a recycled pane', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.sendKeysToPane(PANE, 'Enter')).rejects.toThrow(PaneGoneError);
+    });
+
+    it('throws PaneGoneError when the session/server is gone', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find session: $1", exitCode: 1 });
+      await expect(tmux.sendKeysToPane(PANE, 'Enter')).rejects.toThrow(PaneGoneError);
+    });
+  });
+
+  describe('sendEnter', () => {
+    it('sends the Enter key through the guarded pane write', async () => {
+      await tmux.sendEnter(PANE);
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("tmux if-shell -t '%7'");
+      expect(cmd).toContain('send-keys -t %7');
+      expect(cmd).toContain("'Enter'");
+      expect(cmd).toContain('BX_TARGET_GONE');
     });
   });
 
   describe('clearComposerDraft (dirty-then-C-c: safe on empty and drafted composers)', () => {
     it('injects a literal space before C-c so C-c always hits a non-empty composer', async () => {
-      await tmux.clearComposerDraft('%0');
+      await tmux.clearComposerDraft(PANE);
       const cmds = runner.exec.mock.calls.map(c => String(c[0]));
       expect(cmds).toHaveLength(2);
-      expect(cmds[0]).toContain('tmux send-keys -l');
-      expect(cmds[0]).toContain("-t '%0'");
+      expect(cmds[0]).toContain('send-keys -l -t %7');
       expect(cmds[0]).toContain("' '");
-      expect(cmds[1]).toContain('tmux send-keys');
+      expect(cmds[1]).toContain('send-keys -t %7');
       expect(cmds[1]).toContain("'C-c'");
       expect(cmds[1]).not.toContain('send-keys -l');
     });
 
     it('propagates failure when the space injection fails (no blind C-c on unknown composer)', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'no such pane', exitCode: 1 });
-      await expect(tmux.clearComposerDraft('%0')).rejects.toThrow(/sendKeysLiteral/);
+      await expect(tmux.clearComposerDraft(PANE)).rejects.toThrow(/guarded write/);
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops before C-c when the pane identity is gone', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.clearComposerDraft(PANE)).rejects.toThrow(PaneGoneError);
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe('sendKeys (raw session-name target; prefer sendKeysToPane in new code)', () => {
-    it('sends `keys + Enter` to the session via raw target', async () => {
-      await tmux.sendKeys('dev', 'claude -p "hi"');
-      const cmd = lastCmd(runner);
-      expect(cmd).toContain('tmux send-keys');
-      expect(cmd).toContain("-t 'dev'");
-      expect(cmd).toContain('Enter');
-    });
-  });
-
   describe('capturePaneById', () => {
-    it('default flags: -p -J (no ANSI for v1 plain preview)', async () => {
-      primeExec('content\n');
-      await tmux.capturePaneById('%0');
+    it('default flags: -p -J (no ANSI for v1 plain preview) inside the guarded read', async () => {
+      primeExec(okBody('content\n'));
+      expect(await tmux.capturePaneById(PANE)).toBe('content\n');
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('-p');
-      expect(cmd).toContain('-J');
+      expect(cmd).toContain("tmux if-shell -t '%7'");
+      expect(cmd).toContain('capture-pane -p -J');
       expect(cmd).not.toMatch(/(^|\s)-e(\s|$)/);
-      expect(cmd).toContain("-t '%0'");
+      expect(cmd).toContain('-t %7');
+      expect(cmd).toContain('BX_PANE_OK');
+      expect(cmd).toContain('BX_TARGET_GONE');
     });
 
     it('opts.ansi=true adds -e (ANSI escape passthrough)', async () => {
-      primeExec('');
-      await tmux.capturePaneById('%0', { ansi: true });
+      primeExec(okBody(''));
+      await tmux.capturePaneById(PANE, { ansi: true });
       const cmd = lastCmd(runner);
       expect(cmd).toMatch(/(^|\s)-e(\s|$)/);
     });
 
     it('opts.scrollback>0 adds -S -<n>', async () => {
-      primeExec('');
-      await tmux.capturePaneById('%0', { scrollback: 2000 });
+      primeExec(okBody(''));
+      await tmux.capturePaneById(PANE, { scrollback: 2000 });
       const cmd = lastCmd(runner);
       expect(cmd).toContain('-S');
       expect(cmd).toContain('-2000');
     });
+
+    it('throws PaneGoneError when the identity condition fails', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.capturePaneById(PANE)).rejects.toThrow(PaneGoneError);
+    });
   });
 
-  describe('injectPrompt (paste-buffer + bracketed paste with named buffer)', () => {
-    it('emits a single composite command: load-buffer + paste-buffer', async () => {
-      await tmux.injectPrompt('%0', 'hello world', 'dev-1');
+  describe('injectPrompt (probe-gated stdin load → claim-checked paste-or-self-clean)', () => {
+    const stdinMock = (r: typeof runner): ExecMock =>
+      (r as unknown as { execWithStdin: ExecMock }).execWithStdin;
+
+    it('loads via probe-gated stdin (no openssl), then a separate guarded paste', async () => {
+      await tmux.injectPrompt(PANE, 'hello world', 'dev-1');
+      // step 1: load via execWithStdin (raw bytes on stdin, no openssl/base64)
+      const stdin = stdinMock(runner);
+      expect(stdin).toHaveBeenCalledTimes(1);
+      const loadCmd = stdin.mock.calls[0][0] as string;
+      const payload = stdin.mock.calls[0][1] as Buffer;
+      expect(loadCmd).not.toContain('openssl');
+      expect(loadCmd).toContain('tmux load-buffer');
+      expect(loadCmd).toContain('[ "$(tmux display-message -p -t ');
+      expect(payload.toString('utf8')).toBe('hello world');
+      // step 2: paste via exec — the claim-checked if-shell with self-clean else branch
       expect(runner.exec).toHaveBeenCalledTimes(1);
-      const cmd = lastCmd(runner);
-      expect(cmd).toContain('printf');
-      expect(cmd).toContain('openssl base64 -d -A');
-      expect(cmd).toContain('tmux load-buffer');
-      expect(cmd).toContain('tmux paste-buffer');
-      expect(cmd).toContain("-t '%0'");
-      expect(cmd).toMatch(/baxian-dev-1-[0-9a-f-]{36}/);
-      expect(cmd).toMatch(/-d -p -r/);
+      const pasteCmd = lastCmd(runner);
+      expect(pasteCmd).toContain("tmux if-shell -t '%7'");
+      expect(pasteCmd).toContain('paste-buffer');
+      expect(pasteCmd).toMatch(/-d -p -r/);
+      expect(pasteCmd).toContain('delete-buffer');
+      expect(pasteCmd).toContain('BX_TARGET_GONE');
+      expect(pasteCmd).toMatch(/baxian-dev-1-[0-9a-f-]{36}/);
     });
 
-    it('rejects on paste-buffer non-zero exit (concrete error message)', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'paste failed', exitCode: 5 });
-      await expect(tmux.injectPrompt('%0', 'x', 'dev-1')).rejects.toThrow(/paste failed/);
+    it('probe-gates the load: the five-field identity test precedes load-buffer in the load command', async () => {
+      await tmux.injectPrompt(PANE, 'x', 'dev-1');
+      const loadCmd = stdinMock(runner).mock.calls[0][0] as string;
+      expect(loadCmd).toContain('#{pid}|#{start_time}|#{session_id}|#{pane_id}|#{@baxian-agent-id}');
+      expect(loadCmd).toContain("'4242|1700000000|$1|%7|dev-1'");
+      expect(loadCmd.indexOf('display-message')).toBeLessThan(loadCmd.indexOf('load-buffer'));
+    });
+
+    it('throws PaneGoneError when the identity probe fails before load (no buffer, no reconcile)', async () => {
+      stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 });
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/before any buffer was created/);
+      // no paste and no reconcile: nothing was loaded
+      expect(runner.exec).not.toHaveBeenCalled();
+    });
+
+    it('throws PaneGoneError when the paste-time condition fails (buffer self-cleaned server-side)', async () => {
+      primeExec('BX_TARGET_GONE\n');
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(PaneGoneError);
+      expect(lastCmd(runner)).toContain('delete-buffer');
+    });
+
+    it('reconciles the loaded buffer by unique name when the pane vanishes AFTER load (exit 1 can\'t find pane)', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // load succeeds (execWithStdin default), paste fails with a pane-gone error → buffer lingers
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find pane: %7", exitCode: 1 });
+      primeExec('');
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(PaneGoneError);
+      // 2 exec calls: the failed paste + the by-name delete-buffer reconciliation
+      expect(runner.exec).toHaveBeenCalledTimes(2);
+      const deleteCmd = lastCmd(runner);
+      expect(deleteCmd).toContain('tmux delete-buffer -b');
+      expect(deleteCmd).toMatch(/baxian-dev-1-[0-9a-f-]{36}/);
+      warn.mockRestore();
+    });
+
+    it('reconciles by name when the load outcome is unknown (exit 255)', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
+      primeExec('');
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/load outcome unknown/);
+      // reconcile delete-buffer issued via exec even though the load exec was unknown
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      expect(lastCmd(runner)).toContain('tmux delete-buffer -b');
+      warn.mockRestore();
+    });
+
+    it('reconciles then rejects on a plain paste non-zero exit', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'paste boom', exitCode: 5 });
+      primeExec('');
+      await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/paste failed/);
+      expect(lastCmd(runner)).toContain('tmux delete-buffer -b');
+      warn.mockRestore();
     });
 
     it('accepts a prompt at exactly 80KB (boundary inside the cap)', async () => {
       const cap = 80 * 1024;
       const prompt = 'x'.repeat(cap);
-      await expect(tmux.injectPrompt('%0', prompt, 'dev-1')).resolves.toEqual({ pasted: true });
+      await expect(tmux.injectPrompt(PANE, prompt, 'dev-1')).resolves.toBeUndefined();
+      expect(stdinMock(runner)).toHaveBeenCalledTimes(1);
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
 
-    it('stagePromptBuffer + pasteStagedBuffer split the inject into separate execs on one named buffer', async () => {
+    it('stagePromptBuffer loads via stdin (no openssl); pasteStagedBuffer pastes on the same named buffer', async () => {
       const { buf } = await tmux.stagePromptBuffer('%0', 'hello world', 'dev-1');
       expect(buf).toMatch(/^baxian-dev-1-[0-9a-f-]{36}$/);
       await tmux.pasteStagedBuffer('%0', buf);
 
-      expect(runner.exec).toHaveBeenCalledTimes(2);
-      const [loadCmd, pasteCmd] = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
+      // load via execWithStdin (raw stdin, no openssl); paste via exec
+      const stdin = stdinMock(runner);
+      expect(stdin).toHaveBeenCalledTimes(1);
+      const loadCmd = stdin.mock.calls[0][0] as string;
+      const payload = stdin.mock.calls[0][1] as Buffer;
       expect(loadCmd).toContain('tmux load-buffer');
+      expect(loadCmd).not.toContain('openssl');
       expect(loadCmd).not.toContain('paste-buffer');
       expect(loadCmd).toContain(buf);
+      expect(payload.toString('utf8')).toBe('hello world');
+      expect(runner.exec).toHaveBeenCalledTimes(1);
+      const pasteCmd = String(runner.exec.mock.calls[0][0]);
       expect(pasteCmd).toContain('tmux paste-buffer');
       expect(pasteCmd).toContain(buf);
       expect(pasteCmd).toMatch(/-d -p -r/);
@@ -724,10 +785,7 @@ describe('TmuxManager', () => {
     });
 
     it('reconciles an unknown-outcome staging by retiring the buffer before rethrowing', async () => {
-      runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'connection reset', exitCode: 255 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      });
+      stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'connection reset', exitCode: 255 });
 
       await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/outcome unknown/);
       const cmds = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
@@ -735,10 +793,7 @@ describe('TmuxManager', () => {
     });
 
     it('staging transport failure retires the possibly-created buffer before rethrowing', async () => {
-      runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('load-buffer')) throw new Error('ssh channel died');
-        return { stdout: '', stderr: '', exitCode: 0 };
-      });
+      stdinMock(runner).mockRejectedValueOnce(new Error('ssh channel died'));
 
       await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/ssh channel died/);
       const cmds = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
@@ -747,8 +802,8 @@ describe('TmuxManager', () => {
 
     it('an unconfirmed cleanup is loud and keeps the buffer credential in the error', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'connection reset', exitCode: 255 });
       runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'connection reset', exitCode: 255 };
         if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'connection reset by peer', exitCode: 255 };
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -768,8 +823,8 @@ describe('TmuxManager', () => {
     it('a definite missing-buffer answer counts as retired, not a cleanup failure', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+      stdinMock(runner).mockResolvedValue({ stdout: '', stderr: 'connection reset', exitCode: 255 });
       runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'connection reset', exitCode: 255 };
         if (cmd.includes('delete-buffer')) return { stdout: '', stderr: 'no buffer baxian-dev-1-x', exitCode: 1 };
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -784,8 +839,8 @@ describe('TmuxManager', () => {
 
     it('a transport-thrown load with an unprobeable cleanup logs the surviving credential', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      stdinMock(runner).mockRejectedValueOnce(new Error('ssh channel died'));
       runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('load-buffer')) throw new Error('ssh channel died');
         if (cmd.includes('delete-buffer')) return { stdout: '', stderr: '', exitCode: 255 };
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -798,10 +853,7 @@ describe('TmuxManager', () => {
     });
 
     it('a definite staging failure does not probe the buffer', async () => {
-      runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('load-buffer')) return { stdout: '', stderr: 'bad option', exitCode: 1 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      });
+      stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'bad option', exitCode: 1 });
 
       await expect(tmux.stagePromptBuffer('%0', 'prompt', 'dev-1')).rejects.toThrow(/bad option/);
       const cmds = runner.exec.mock.calls.map((call: unknown[]) => String(call[0]));
@@ -817,20 +869,22 @@ describe('TmuxManager', () => {
     it('rejects a prompt over 80KB before issuing any tmux command (deterministic error)', async () => {
       const cap = 80 * 1024;
       const prompt = 'x'.repeat(cap + 1);
-      await expect(tmux.injectPrompt('%0', prompt, 'dev-1')).rejects.toThrow(/prompt too large/);
+      await expect(tmux.injectPrompt(PANE, prompt, 'dev-1')).rejects.toThrow(/prompt too large/);
       expect(runner.exec).not.toHaveBeenCalled();
     });
   });
 
   describe('capturePaneSnapshot', () => {
-    it('runs capture-pane + display-message in a single shell exec (atomic snapshot)', async () => {
+    it('runs the marker-first display-message + capture-pane in one guarded exec (atomic snapshot)', async () => {
       primeExec(composeSnapStdout('\x1b[32mready\x1b[0m\nline two\n', 42));
-      const snap = await tmux.capturePaneSnapshot('%0');
+      const snap = await tmux.capturePaneSnapshot(PANE);
       expect(runner.exec).toHaveBeenCalledTimes(1);
       const cmd = lastCmd(runner);
-      expect(cmd).toContain('capture-pane');
-      expect(cmd).toContain('display-message');
+      expect(cmd).toContain("tmux if-shell -t '%7'");
+      expect(cmd).toContain('capture-pane -t %7 -e -p');
+      expect(cmd).toContain('display-message -p -t %7');
       expect(cmd).toContain('#{history_size}');
+      expect(cmd).toContain('BX_TARGET_GONE');
       expect(snap).toContain('ready');
       expect(snap).toContain('line two');
       expect(snap).not.toContain('\x1b[');
@@ -838,13 +892,13 @@ describe('TmuxManager', () => {
     });
 
     it('throws when the shell command exits non-zero', async () => {
-      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'pane gone', exitCode: 1 });
-      await expect(tmux.capturePaneSnapshot('%0')).rejects.toThrow(/capturePaneSnapshot.*pane gone/);
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'pane gone', exitCode: 2 });
+      await expect(tmux.capturePaneSnapshot(PANE)).rejects.toThrow(/guarded read.*pane gone/);
     });
 
-    it('throws if the separator is missing (defensive against tmux/shell drift)', async () => {
+    it('throws PaneGoneError when the ok marker is missing (identity condition failed)', async () => {
       primeExec('visible only\n42\n');
-      await expect(tmux.capturePaneSnapshot('%0')).rejects.toThrow(/separator missing/);
+      await expect(tmux.capturePaneSnapshot(PANE)).rejects.toThrow(PaneGoneError);
     });
   });
 
@@ -876,7 +930,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('idle composer\n', 0);
       primeSnapshot('idle composer\n', 0);
       primeSnapshot('working\n  esc to interrupt\n', 0);
-      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 1500, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
@@ -884,7 +938,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
       primeTitle('~/repo');        // baseline: idle title
       primeTitle('⠹ Reviewing');   // OSC spinner appears once the runtime starts working
-      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
@@ -892,7 +946,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
       primeTitle('⠹ Reviewing');   // already working at entry (a prior turn; narrow pane hid the in-pane busy line)
       primeTitle('⠸ Reviewing');   // spinner rotates — must NOT be read as this prompt's idle→working ack
-      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/pane already busy at baseline/);
     });
 
@@ -900,7 +954,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
       primeTitle('⠹ Reviewing'); // runtime flipped the OSC title to working immediately after Enter — the first read the loop sees
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50, baselineTitle: '~/repo' }),
+        tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50, baselineTitle: '~/repo' }),
       ).resolves.toBeUndefined();
     });
 
@@ -908,7 +962,7 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('composer still open\n', 5);
       let h = 5;
       runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout('composer still open\n', ++h), stderr: '', exitCode: 0 }));
-      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/runtime ack timeout/);
     });
 
@@ -916,21 +970,21 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('do X\n  esc to interrupt\n', 3);
       let n = 0;
       runner.exec.mockImplementation(async () => ({ stdout: composeSnapStdout(`do X\n  esc to interrupt\n[Image #1] frame ${n++}\n`, 3), stderr: '', exitCode: 0 }));
-      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/runtime ack timeout/);
     });
 
     it('codex: stale esc-to-interrupt above → prompt is NOT busy baseline (position-aware)', async () => {
       const baseline = buildBaseline('Working on it…\n  esc to interrupt\n→ baxian git:(main)\n', 0);
       primeSnapshot('· Thinking… (2s)\n→ baxian git:(main)\n', 0);
-      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
     it('codex: pasted prompt containing "Working (8s)" is NOT busy baseline', async () => {
       const baseline = buildBaseline('→ baxian git:(main)\nPlease explain this log:\nWorking (8s)\n', 0);
       primeSnapshot('· Thinking… (2s)\n  esc to interrupt\n', 0);
-      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
@@ -938,14 +992,14 @@ describe('TmuxManager', () => {
       const baseline = buildBaseline('→ baxian git:(main)\nidle prompt text\n', 0);
       const lines = ['· Thinking… (2s)', ...Array(12).fill(''), '→ baxian git:(main)'].join('\n') + '\n';
       primeSnapshot(lines, 0);
-      await expect(tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
     it('throws "runtime ack timeout" when the pane stays idle (swallowed Enter)', async () => {
       const baseline = buildBaseline('idle composer\n', 0);
       runner.exec.mockResolvedValue({ stdout: composeSnapStdout('idle composer\n', 0), stderr: '', exitCode: 0 });
-      await expect(tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
+      await expect(tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/runtime ack timeout/);
     });
 
@@ -959,7 +1013,7 @@ describe('TmuxManager', () => {
       }));
       const resend = vi.fn(async () => { submitted = true; });
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
     });
@@ -975,7 +1029,7 @@ describe('TmuxManager', () => {
       }));
       const resend = vi.fn(async () => { submitted = true; });
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
     });
@@ -990,7 +1044,7 @@ describe('TmuxManager', () => {
       }));
       const resend = vi.fn(async () => { submitted = true; });
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
     });
@@ -1004,7 +1058,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1020,7 +1074,7 @@ describe('TmuxManager', () => {
       }));
       const resend = vi.fn(async () => { submitted = true; });
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
     });
@@ -1034,7 +1088,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'opencode', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'opencode', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1048,7 +1102,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'qodercli', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'qodercli', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1062,7 +1116,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1076,7 +1130,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1094,7 +1148,7 @@ describe('TmuxManager', () => {
       }));
       const resend = vi.fn(async () => { submitted = true; });
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 2000, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).resolves.toBeUndefined();
       expect(resend).toHaveBeenCalled();
     });
@@ -1108,7 +1162,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1122,7 +1176,7 @@ describe('TmuxManager', () => {
       });
       const resend = vi.fn(async () => undefined);
       await expect(
-        tmux.waitSubmitAck('%0', baseline, 'claude-code', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
+        tmux.waitSubmitAck(PANE, baseline, 'claude-code', { timeoutMs: 250, intervalMs: 50, resend, resendIntervalMs: 50 }),
       ).rejects.toThrow(/runtime ack timeout/);
       expect(resend).not.toHaveBeenCalled();
     });
@@ -1137,7 +1191,7 @@ describe('TmuxManager', () => {
       primeSnapshot('attaching\n', 0);
       primeSnapshot('settled\n', 0);
       primeSnapshot('settled\n', 0);
-      const snap = await tmux.captureSettledSnapshot('%0', { timeoutMs: 2000, intervalMs: 10 });
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10 });
       expect(snap).toBe(buildSnapshot('settled\n', 0));
     });
 
@@ -1146,7 +1200,7 @@ describe('TmuxManager', () => {
       primeSnapshot('f2\n', 0);
       primeSnapshot('f3\n', 0);
       primeSnapshot('f3\n', 0);
-      const snap = await tmux.captureSettledSnapshot('%0', { timeoutMs: 2000, intervalMs: 10 });
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 10 });
       expect(snap).toBe(buildSnapshot('f3\n', 0));
       expect(runner.exec.mock.calls.length).toBeGreaterThanOrEqual(4);
     });
@@ -1157,7 +1211,7 @@ describe('TmuxManager', () => {
         stdout: composeSnapStdout(`frame ${n++}\n`, 0),
         stderr: '', exitCode: 0,
       }));
-      const snap = await tmux.captureSettledSnapshot('%0', { timeoutMs: 80, intervalMs: 20 });
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 80, intervalMs: 20 });
       expect(snap).toMatch(/^frame \d+\n\n---history_size:0---$/);
       expect(runner.exec.mock.calls.length).toBeGreaterThanOrEqual(2);
     });
@@ -1165,15 +1219,15 @@ describe('TmuxManager', () => {
     it('floors a zero poll interval so it cannot busy-spin, and still settles', async () => {
       primeSnapshot('settled\n', 0);
       primeSnapshot('settled\n', 0);
-      const snap = await tmux.captureSettledSnapshot('%0', { timeoutMs: 2000, intervalMs: 0 });
+      const snap = await tmux.captureSettledSnapshot(PANE, { timeoutMs: 2000, intervalMs: 0 });
       expect(snap).toBe(buildSnapshot('settled\n', 0));
     });
   });
 
   describe('handleTrustDialog', () => {
     it('detects the claude trust dialog and sends Enter', async () => {
-      primeExec('Quick safety check\n❯ 1. Yes, I trust this folder\n', '');
-      const answered = await tmux.handleTrustDialog('%0', 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
+      primeExec(okBody('Quick safety check\n❯ 1. Yes, I trust this folder\n'), '');
+      const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 50 });
       expect(answered).toBe(true);
       const sentKeys = runner.exec.mock.calls[1][0] as string;
       expect(sentKeys).toContain('send-keys');
@@ -1181,32 +1235,43 @@ describe('TmuxManager', () => {
     });
 
     it('returns false (already past dialog) when ready anchor is already visible', async () => {
-      primeExec('⏵⏵ bypass permissions on\n', '2.1.129\n');
-      const answered = await tmux.handleTrustDialog('%0', 'claude-code', { timeoutMs: 200, intervalMs: 50 });
+      primeExec(okBody('⏵⏵ bypass permissions on\n'), okHeader('2.1.129'), okBody('⏵⏵ bypass permissions on\n'));
+      const answered = await tmux.handleTrustDialog(PANE, 'claude-code', { timeoutMs: 200, intervalMs: 50 });
       expect(answered).toBe(false);
     });
 
     it('returns false early for codex → prompt when runtime is running', async () => {
-      primeExec('→ baxian git:(main)\n', 'codex\n', '→ baxian git:(main)\n');
-      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 200, intervalMs: 50 });
+      primeExec(okBody('→ baxian git:(main)\n'), okHeader('codex'), okBody('→ baxian git:(main)\n'));
+      const answered = await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 200, intervalMs: 50 });
       expect(answered).toBe(false);
     });
 
     it('stale shell → on first capture does not early-exit when fresh capture shows dialog', async () => {
-      primeExec('→ baxian git:(main)\n', 'codex\n', 'Do you trust the contents of this folder?\n› 1. Yes, continue\n', 'Do you trust the contents of this folder?\n› 1. Yes, continue\n', '');
-      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 2000, intervalMs: 50 });
+      primeExec(
+        okBody('→ baxian git:(main)\n'),
+        okHeader('codex'),
+        okBody('Do you trust the contents of this folder?\n› 1. Yes, continue\n'),
+        okBody('Do you trust the contents of this folder?\n› 1. Yes, continue\n'),
+        '',
+      );
+      const answered = await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 2000, intervalMs: 50 });
       expect(answered).toBe(true);
     });
 
     it('does not early-exit on shell → prompt before runtime starts, then handles trust dialog', async () => {
-      primeExec('→ baxian git:(main)\n', 'zsh\n', 'Do you trust the contents of this folder?\n› 1. Yes, continue\n', '');
-      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 2000, intervalMs: 50 });
+      primeExec(
+        okBody('→ baxian git:(main)\n'),
+        okHeader('zsh'),
+        okBody('Do you trust the contents of this folder?\n› 1. Yes, continue\n'),
+        '',
+      );
+      const answered = await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 2000, intervalMs: 50 });
       expect(answered).toBe(true);
     });
 
     it('detects codex dialog text (different from claude phrasing)', async () => {
-      primeExec('Do you trust the contents of this folder?\n› 1. Yes, continue\n', '');
-      const answered = await tmux.handleTrustDialog('%0', 'codex', { timeoutMs: 1000, intervalMs: 50 });
+      primeExec(okBody('Do you trust the contents of this folder?\n› 1. Yes, continue\n'), '');
+      const answered = await tmux.handleTrustDialog(PANE, 'codex', { timeoutMs: 1000, intervalMs: 50 });
       expect(answered).toBe(true);
     });
   });
@@ -1254,42 +1319,43 @@ describe('TmuxManager', () => {
         'codex' as const,
       ],
     ])('%s', async (_label, procTitle, anchor, runtimeKind) => {
-      primeExec(procTitle, anchor);
+      primeExec(okHeader(procTitle.trim()), okBody(anchor));
       await expect(
-        tmux.waitReplReady('%0', runtimeKind, { timeoutMs: 1000, intervalMs: 30 }),
+        tmux.waitReplReady(PANE, runtimeKind, { timeoutMs: 1000, intervalMs: 30 }),
       ).resolves.toBeUndefined();
     });
 
     it('codex: does not accept an idle-prompt-shaped snippet while output continues after it', async () => {
       runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('display-message')) {
-          return { stdout: 'node\n', stderr: '', exitCode: 0 };
+        if (cmd.includes('pane_current_command')) {
+          return { stdout: okHeader('node'), stderr: '', exitCode: 0 };
         }
         return {
-          stdout:
+          stdout: okBody(
             'Running generated regression tests\n\n' +
             '› Find and fix a bug in @filename\n\n' +
             '  gpt-5.5 xhigh · ~/.baxian/repos/baxian-ai/baxian\n\n' +
             'Still working on the request...\n',
+          ),
           stderr: '',
           exitCode: 0,
         };
       });
       await expect(
-        tmux.waitReplReady('%0', 'codex', { timeoutMs: 120, intervalMs: 30 }),
+        tmux.waitReplReady(PANE, 'codex', { timeoutMs: 120, intervalMs: 30 }),
       ).rejects.toThrow(/repl not ready/);
     });
 
     it('keeps polling when only the proc title matches (anchor still missing)', async () => {
-      primeExec('node\n', 'still booting\n', 'node\n', 'permissions: YOLO mode\n');
-      await expect(tmux.waitReplReady('%0', 'codex', { timeoutMs: 2000, intervalMs: 30 })).resolves.toBeUndefined();
+      primeExec(okHeader('node'), okBody('still booting\n'), okHeader('node'), okBody('permissions: YOLO mode\n'));
+      await expect(tmux.waitReplReady(PANE, 'codex', { timeoutMs: 2000, intervalMs: 30 })).resolves.toBeUndefined();
       expect(runner.exec.mock.calls.length).toBeGreaterThanOrEqual(4);
     });
 
     it('failFastOnShell:true aborts immediately when proc_current_command is a shell', async () => {
-      primeExec('zsh\n');
+      primeExec(okHeader('zsh'));
       await expect(
-        tmux.waitReplReady('%0', 'claude-code', {
+        tmux.waitReplReady(PANE, 'claude-code', {
           timeoutMs: 5000, intervalMs: 30, failFastOnShell: true,
         }),
       ).rejects.toThrow(/failFastOnShell/);
@@ -1299,9 +1365,9 @@ describe('TmuxManager', () => {
       ['throws on overall timeout when anchor never appears', 'codex' as const],
       ['claude-code: pane_current_command=node never satisfies claude (node belongs to codex only)', 'claude-code' as const],
     ])('%s', async (_label, runtimeKind) => {
-      runner.exec.mockResolvedValue({ stdout: 'node\n', stderr: '', exitCode: 0 });
+      runner.exec.mockResolvedValue({ stdout: okHeader('node'), stderr: '', exitCode: 0 });
       await expect(
-        tmux.waitReplReady('%0', runtimeKind, { timeoutMs: 200, intervalMs: 50 }),
+        tmux.waitReplReady(PANE, runtimeKind, { timeoutMs: 200, intervalMs: 50 }),
       ).rejects.toThrow(/repl not ready/);
     });
 
@@ -1309,8 +1375,8 @@ describe('TmuxManager', () => {
       ['default scrollback is 0 (visible-only) so a stale anchor in scrollback cannot satisfy ready', undefined, /-S 0/],
       ['opts.scrollback override still works for callers that want history (e.g., trust dialog)', 50, /-S -50/],
     ])('%s', async (_label, scrollback, pattern) => {
-      primeExec('codex\n', 'permissions: YOLO mode\n');
-      await tmux.waitReplReady('%0', 'codex', { timeoutMs: 1000, intervalMs: 30, scrollback });
+      primeExec(okHeader('codex'), okBody('permissions: YOLO mode\n'));
+      await tmux.waitReplReady(PANE, 'codex', { timeoutMs: 1000, intervalMs: 30, scrollback });
       const captureCmd = runner.exec.mock.calls[1][0] as string;
       expect(captureCmd).toMatch(pattern);
     });
@@ -1328,30 +1394,30 @@ describe('TmuxManager', () => {
 
       function mockPaneState(procTitle: string, screen: string, title: string): void {
         runner.exec.mockImplementation(async (cmd: string) => {
-          if (cmd.includes('pane_current_command')) return { stdout: `${procTitle}\n`, stderr: '', exitCode: 0 };
-          if (cmd.includes('pane_title')) return { stdout: `${title}\n`, stderr: '', exitCode: 0 };
-          return { stdout: screen, stderr: '', exitCode: 0 };
+          if (cmd.includes('pane_current_command')) return { stdout: okHeader(procTitle), stderr: '', exitCode: 0 };
+          if (cmd.includes('pane_title')) return { stdout: okHeader(title), stderr: '', exitCode: 0 };
+          return { stdout: okBody(screen), stderr: '', exitCode: 0 };
         });
       }
 
       it('claude-code: narrow-pane reflowed idle screen (no anchor, no ❯) + "✳ " title → ready', async () => {
         mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
         ).resolves.toBeUndefined();
       });
 
       it('claude-code: same narrow screen + braille working title → keeps polling to timeout', async () => {
         mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '⠹ 分析 baxian 服务 DEV agent 不遵照指示问题');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
       it('claude-code: "✳ " title does not shortcut an actively busy screen (esc to interrupt in tail)', async () => {
         mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '✳ 部署服务');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1362,28 +1428,28 @@ describe('TmuxManager', () => {
           '✳ Claude Code',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
       it('fast path is opt-in: narrow idle screen + "✳ " title still times out without the flag', async () => {
         mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '✳ 分析 baxian 服务 DEV agent 不遵照指示问题');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30 }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30 }),
         ).rejects.toThrow(/repl not ready/);
       });
 
       it('codex: cwd-shaped title is not an idle signal (fast path is claude-code only)', async () => {
         mockPaneState('node', 'Still working on the request...\n', 'baxian');
         await expect(
-          tmux.waitReplReady('%6', 'codex', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'codex', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
       it('timeout error carries the last observed pane title for diagnosis', async () => {
         mockPaneState('2.1.199', NARROW_IDLE_SCREEN, '⠹ 分析 baxian');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/paneTitle=/);
       });
 
@@ -1394,7 +1460,7 @@ describe('TmuxManager', () => {
           '✳ 清理构建产物',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1405,7 +1471,7 @@ describe('TmuxManager', () => {
           '✳ 等待合并策略选择',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1413,14 +1479,14 @@ describe('TmuxManager', () => {
         const history = '…上文引用：do you want to proceed? 的行为分析\n' + '正文\n'.repeat(16);
         mockPaneState('2.1.199', history + NARROW_IDLE_SCREEN, '✳ 分析报告');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
         ).resolves.toBeUndefined();
       });
 
       it('does not read the pane title while the screen is visibly busy (sync short-circuit first)', async () => {
         mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '✳ 部署服务');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
         const titleReads = runner.exec.mock.calls.filter(c => String(c[0]).includes('pane_title'));
         expect(titleReads.length).toBe(1);
@@ -1429,7 +1495,7 @@ describe('TmuxManager', () => {
       it('timeout on a busy screen still reports the pane title via the failure-path fallback read', async () => {
         mockPaneState('2.1.199', `${NARROW_IDLE_SCREEN}\nesc to interrupt\n`, '⠹ 部署服务');
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/paneTitle="⠹ 部署服务"/);
       });
 
@@ -1440,7 +1506,7 @@ describe('TmuxManager', () => {
           '✳ 发布 1.2.37',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1451,7 +1517,7 @@ describe('TmuxManager', () => {
           '✳ 分析日志',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1462,7 +1528,7 @@ describe('TmuxManager', () => {
           '✳ 收尾合并',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
         ).resolves.toBeUndefined();
       });
 
@@ -1473,7 +1539,7 @@ describe('TmuxManager', () => {
           '✳ 补充权限检测',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
         ).resolves.toBeUndefined();
       });
 
@@ -1484,7 +1550,7 @@ describe('TmuxManager', () => {
           '✳ 会话管理',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1495,7 +1561,7 @@ describe('TmuxManager', () => {
           '✳ 跑测试收尾',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 1000, intervalMs: 30, titleIdleFastPath: true }),
         ).resolves.toBeUndefined();
       });
 
@@ -1506,7 +1572,7 @@ describe('TmuxManager', () => {
           '✳ 执行构建脚本',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
 
@@ -1517,19 +1583,22 @@ describe('TmuxManager', () => {
           '✳ 制定实施计划',
         );
         await expect(
-          tmux.waitReplReady('%6', 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
+          tmux.waitReplReady(PANE, 'claude-code', { timeoutMs: 150, intervalMs: 30, titleIdleFastPath: true }),
         ).rejects.toThrow(/repl not ready/);
       });
     });
   });
 
   describe('readPaneTitle', () => {
-    it('reads pane title via display-message #{pane_title}', async () => {
+    it('reads pane title via the guarded display-message #{pane_title}', async () => {
       runner.exec.mockResolvedValueOnce({
-        stdout: '⠋ Reading file\n', stderr: '', exitCode: 0,
+        stdout: okHeader('⠋ Reading file'), stderr: '', exitCode: 0,
       });
-      const title = await tmux.readPaneTitle('%1');
-      expect(lastCmd(runner)).toBe("tmux display-message -p -t '%1' '#{pane_title}'");
+      const title = await tmux.readPaneTitle(PANE);
+      const cmd = lastCmd(runner);
+      expect(cmd).toContain("tmux if-shell -t '%7'");
+      expect(cmd).toContain('#{pane_title}');
+      expect(cmd).toContain('BX_PANE_OK');
       expect(title).toBe('⠋ Reading file');
     });
 
@@ -1537,15 +1606,37 @@ describe('TmuxManager', () => {
       runner.exec.mockResolvedValueOnce({
         stdout: '', stderr: 'pane not found', exitCode: 1,
       });
-      const title = await tmux.readPaneTitle('%1');
+      const title = await tmux.readPaneTitle(PANE);
       expect(title).toBe('');
+    });
+
+    it('returns empty string when the pane identity is gone (advisory signal, never authority)', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 });
+      expect(await tmux.readPaneTitle(PANE)).toBe('');
+    });
+  });
+
+  describe('getPaneCurrentPath', () => {
+    it('reads pane_current_path through the guarded read', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: okHeader('/home/user/wt'), stderr: '', exitCode: 0 });
+      expect(await tmux.getPaneCurrentPath(PANE)).toBe('/home/user/wt');
+      expect(lastCmd(runner)).toContain('#{pane_current_path}');
+    });
+
+    it('throws on an empty current path', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: okHeader(''), stderr: '', exitCode: 0 });
+      await expect(tmux.getPaneCurrentPath(PANE)).rejects.toThrow(/empty current path/);
+    });
+
+    it('propagates PaneGoneError (unlike readPaneTitle it is not advisory)', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: 'BX_TARGET_GONE\n', stderr: '', exitCode: 0 });
+      await expect(tmux.getPaneCurrentPath(PANE)).rejects.toThrow(PaneGoneError);
     });
   });
 
   describe('classifyPaneForAdopt', () => {
-    const SEP = '___bx-classify-sep___';
     const composeProbeOut = (procTitle: string, capture: string): string =>
-      `${procTitle}\n${SEP}\n${capture}`;
+      `BX_PANE_OK${procTitle}\n${capture}`;
 
     it.each([
       [
@@ -1586,13 +1677,13 @@ describe('TmuxManager', () => {
       ],
     ])('%s', async (_label, procTitle, capture, runtimeKind, expectedKind) => {
       primeExec(composeProbeOut(procTitle, capture));
-      const result = await tmux.classifyPaneForAdopt('%0', runtimeKind);
+      const result = await tmux.classifyPaneForAdopt(PANE, runtimeKind);
       expect(result).toEqual({ kind: expectedKind });
     });
 
     it('codex+node: also adopts as live-runtime — session claim check is the boundary, no in-pane process verification', async () => {
       primeExec(composeProbeOut('node', '› next prompt\n'));
-      const result = await tmux.classifyPaneForAdopt('%0', 'codex');
+      const result = await tmux.classifyPaneForAdopt(PANE, 'codex');
       expect(result).toEqual({ kind: 'live-runtime' });
       expect(runner.exec).toHaveBeenCalledTimes(1);
     });
@@ -1600,14 +1691,14 @@ describe('TmuxManager', () => {
     it('returns "shell" for shells outside the original whitelist (dash/ksh/nu) — recovery path must not refuse them', async () => {
       for (const sh of ['dash', 'ksh', 'nu']) {
         primeExec(composeProbeOut(sh, '$ \n'));
-        const result = await tmux.classifyPaneForAdopt('%0', 'codex');
+        const result = await tmux.classifyPaneForAdopt(PANE, 'codex');
         expect(result).toEqual({ kind: 'shell' });
       }
     });
 
     it('returns "other" when foreground is a non-runtime non-shell process (vim) — does NOT trip dialog regex from buffer text', async () => {
       primeExec(composeProbeOut('vim', 'README excerpt: Press enter to continue.\n'));
-      const result = await tmux.classifyPaneForAdopt('%0', 'codex');
+      const result = await tmux.classifyPaneForAdopt(PANE, 'codex');
       expect(result.kind).toBe('other');
       if (result.kind === 'other') {
         expect(result.paneCurrentCommand).toBe('vim');
@@ -1616,7 +1707,7 @@ describe('TmuxManager', () => {
 
     it('returns "startup-dialog" only when procTitle matches runtime AND dialog text is visible', async () => {
       primeExec(composeProbeOut('codex', 'Update available\nPress enter to continue\n'));
-      const result = await tmux.classifyPaneForAdopt('%0', 'codex');
+      const result = await tmux.classifyPaneForAdopt(PANE, 'codex');
       expect(result.kind).toBe('startup-dialog');
       if (result.kind === 'startup-dialog') {
         expect(result.lastScreen).toContain('Press enter to continue');
@@ -1628,14 +1719,40 @@ describe('TmuxManager', () => {
           'codex',
           'Welcome to Codex\nSign in with ChatGPT\nProvide your own API key\n',
         ));
-      const result = await tmux.classifyPaneForAdopt('%0', 'codex');
+      const result = await tmux.classifyPaneForAdopt(PANE, 'codex');
       expect(result.kind).toBe('startup-dialog');
     });
 
-    it('throws when separator is missing in tmux output (parse error)', async () => {
+    it('throws PaneGoneError when the ok marker is missing from the probe output', async () => {
       primeExec('codex\nincomplete output\n');
-      await expect(tmux.classifyPaneForAdopt('%0', 'codex')).rejects.toThrow(/separator missing/);
+      await expect(tmux.classifyPaneForAdopt(PANE, 'codex')).rejects.toThrow(PaneGoneError);
     });
+  });
+});
+
+describe('tmuxQuote', () => {
+  it('wraps a plain value in single quotes', () => {
+    expect(tmuxQuote('hello')).toBe("'hello'");
+  });
+
+  it("escapes embedded single quotes via '\\'' splicing", () => {
+    expect(tmuxQuote("a'b")).toBe("'a'\\''b'");
+  });
+
+  it('quotes the empty string as a pair of quotes', () => {
+    expect(tmuxQuote('')).toBe("''");
+  });
+
+  it('round-trips values the old quoting rejected (spaces, unicode, tmux format braces)', () => {
+    expect(tmuxQuote('✳ 分析 baxian')).toBe("'✳ 分析 baxian'");
+    expect(tmuxQuote('#{pane_id}')).toBe("'#{pane_id}'");
+  });
+
+  it.each([
+    ['newline', 'a\nb'],
+    ['NUL', 'a\0b'],
+  ])('throws on %s (cannot survive tmux command re-parsing)', (_label, value) => {
+    expect(() => tmuxQuote(value)).toThrow(/unsupported characters/);
   });
 });
 
@@ -2520,5 +2637,157 @@ describe('hasActiveSpinnerInTail (active-region-scoped, used for stuck-busy)', (
     const screen = ['· Wrangling… (24s)', ...Array(12).fill(''), '❯ '].join('\n');
     expect(hasActiveSpinner(screen)).toBe(true);
     expect(hasActiveSpinnerInTail(screen)).toBe(false);
+  });
+});
+
+describe('window geometry read (eleven-field single read)', () => {
+  const GEOM_LINE = '200 50 on latest 42|123|1700000000|$7|dev-1|3.6a|1\n';
+
+  it('getWindowGeometry issues one display-message carrying geometry, owner state, identity, claim, version, and the feature probe', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: GEOM_LINE, stderr: '', exitCode: 0 });
+    const tmux = new TmuxManager(runner);
+    const geom = await tmux.getWindowGeometry('dev-1', { timeout: 1234 });
+    const cmd = lastCmd(runner);
+    expect(cmd).toContain("display-message -p -t '=dev-1:'");
+    expect(cmd).toContain('#{window_width} #{window_height} #{status} #{window-size}');
+    expect(cmd).toContain('#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}');
+    expect(runner.exec.mock.calls.at(-1)?.[1]).toEqual({ timeout: 1234 });
+    expect(geom).toEqual({
+      width: 200,
+      height: 50,
+      statusLines: 1,
+      sizeMode: 'latest',
+      ownerGen: 42,
+      ref: { serverPid: '123', serverStart: '1700000000', sessionId: '$7' },
+      claim: 'dev-1',
+      ownerWriteCapability: 'full',
+    });
+  });
+
+  it('getWindowGeometry three-state failures: proven-absent is typed, transient exit 255 is NOT absent', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '', stderr: "can't find session: dev-1", exitCode: 1 });
+    const tmux = new TmuxManager(runner);
+    await expect(tmux.getWindowGeometry('dev-1')).rejects.toBeInstanceOf(SessionAbsentError);
+
+    runner.exec.mockResolvedValue({ stdout: '', stderr: 'ssh: connect to host x: Connection timed out', exitCode: 255 });
+    const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(SessionAbsentError);
+    expect(String(err)).toMatch(/outcome unknown/);
+  });
+
+  it.each([
+    ['off status → 0 lines', '120 40 off latest |1|2|$3|dev-1|3.6a|1', 0],
+    ['on status → 1 line', '120 40 on latest |1|2|$3|dev-1|3.6a|1', 1],
+    ['multi-row status "3" → 3 lines', '120 40 3 latest |1|2|$3|dev-1|3.6a|1', 3],
+  ])('parseWindowGeometry: %s', (_name, line, statusLines) => {
+    expect(parseWindowGeometry(line).statusLines).toBe(statusLines);
+  });
+
+  it('parseWindowGeometry: unset owner gen is null; empty claim is preserved (unclaimed session)', () => {
+    const geom = parseWindowGeometry('80 24 on manual |9|8|$1||3.1c|#{e|<=:1,2}');
+    expect(geom.ownerGen).toBeNull();
+    expect(geom.sizeMode).toBe('manual');
+    expect(geom.claim).toBe('');
+    expect(geom.ownerWriteCapability).toBe('legacy');
+  });
+
+  it.each([
+    ['probe evaluates to 1 → full regardless of version text', '3.1c', '1', 'full'],
+    ['literal echo + parseable pre-3.2 version → legacy', '3.1c', '#{e|<=:1,2}', 'legacy'],
+    ['literal echo + parseable 3.0 version → legacy', '3.0a', '#{e|<=:1,2}', 'legacy'],
+    ['empty probe + >=3.2 version is contradictory → unknown', '3.6a', '', null],
+    ['garbage probe + garbage version → unknown', 'openbsd-tmux', 'garbage', null],
+    ['empty probe + empty version → unknown', '', '', null],
+  ])('classifyOwnerWriteCapability: %s', (_name, version, probe, expected) => {
+    expect(classifyOwnerWriteCapability(version, probe)).toBe(expected);
+  });
+
+  it.each([
+    ['garbage', 'not a geometry line'],
+    ['unknown status value', '80 24 blinking latest |1|2|$3|dev-1|3.6a|1'],
+    ['non-numeric owner gen', '80 24 on latest abc|1|2|$3|dev-1|3.6a|1'],
+    ['zero width', '0 24 on latest |1|2|$3|dev-1|3.6a|1'],
+    ['missing claim/version fields (old nine-field line)', '80 24 on latest |1|2|$3|1'],
+  ])('parseWindowGeometry rejects %s', (_name, line) => {
+    expect(() => parseWindowGeometry(line)).toThrow();
+  });
+
+  it('parseStatusLines rejects values outside off/on/2-5', () => {
+    expect(() => parseStatusLines('6')).toThrow(/status/);
+    expect(() => parseStatusLines('yes')).toThrow(/status/);
+  });
+
+  it('contentArea subtracts status lines with a floor of one row; desiredTty adds them back (runaway guard)', () => {
+    expect(contentArea({ cols: 100, rows: 31 }, 1)).toEqual({ cols: 100, rows: 30 });
+    expect(contentArea({ cols: 100, rows: 2 }, 3)).toEqual({ cols: 100, rows: 1 });
+    expect(desiredTty({ width: 100, height: 30, statusLines: 1 })).toEqual({ cols: 100, rows: 31 });
+    const roundTrip = desiredTty({ width: 100, height: 30, statusLines: 1 });
+    expect(contentArea(roundTrip, 1)).toEqual({ cols: 100, rows: 30 });
+  });
+});
+
+describe('ownerWrite (session-triple ∧ claim ∧ generation server-side guard)', () => {
+  const REF = { serverPid: '123', serverStart: '1700000000', sessionId: '$7' };
+
+  it('full capability: single if-shell whose guard binds pid, start_time, session_id, claim, and monotonic gen', async () => {
+    const runner = mockRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.ownerWrite('dev-1', REF, 'dev-1', 99, 'manual', { cols: 120, rows: 30 }, { timeout: 500 });
+    const cmd = lastCmd(runner);
+    expect(cmd).toContain("if-shell -F -t '=dev-1:'");
+    expect(cmd).toContain('#{==:#{pid},123}');
+    expect(cmd).toContain('#{==:#{start_time},1700000000}');
+    expect(cmd).toContain('#{==:#{session_id},$7}');
+    expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+    expect(cmd).toContain('#{?#{@bx_owner_gen},#{e|<=:#{@bx_owner_gen},99},1}');
+    expect(cmd).toContain('set-option -t "=dev-1:" @bx_owner_gen 99');
+    expect(cmd).toContain('set-option -t "=dev-1:" window-size manual');
+    expect(cmd).toContain('resize-window -t "=dev-1:" -x 120 -y 30');
+    expect(runner.exec.mock.calls.at(-1)?.[1]).toEqual({ timeout: 500 });
+  });
+
+  it('legacy (gen=null): triple ∧ claim guard only — still an if-shell, no numeric compare, no gen write', async () => {
+    const runner = mockRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.ownerWrite('dev-1', REF, 'dev-1', null, 'manual', undefined);
+    const cmd = lastCmd(runner);
+    expect(cmd).toContain('if-shell -F');
+    expect(cmd).toContain('#{==:#{@baxian-agent-id},dev-1}');
+    expect(cmd).toContain('#{==:#{session_id},$7}');
+    expect(cmd).not.toContain('e|<=');
+    expect(cmd).not.toContain('@bx_owner_gen');
+  });
+
+  it('latest mode omits the resize action', async () => {
+    const runner = mockRunner();
+    const tmux = new TmuxManager(runner);
+    await tmux.ownerWrite('dev-1', REF, 'dev-1', 100, 'latest', undefined);
+    const cmd = lastCmd(runner);
+    expect(cmd).toContain('window-size latest');
+    expect(cmd).not.toContain('resize-window');
+  });
+
+  it('rejects malformed refs, claims, and generations before touching tmux', async () => {
+    const runner = mockRunner();
+    const tmux = new TmuxManager(runner);
+    await expect(
+      tmux.ownerWrite('dev-1', { serverPid: 'x', serverStart: '1', sessionId: '$1' }, 'dev-1', 1, 'latest', undefined),
+    ).rejects.toThrow(/malformed session ref/);
+    await expect(
+      tmux.ownerWrite('dev-1', REF, 'bad claim!', 1, 'latest', undefined),
+    ).rejects.toThrow(/unsupported characters/);
+    await expect(
+      tmux.ownerWrite('dev-1', REF, 'dev-1', -5, 'latest', undefined),
+    ).rejects.toThrow(/invalid generation/);
+    expect(runner.exec).not.toHaveBeenCalled();
+  });
+
+  it('propagates a non-zero exit as an error (outcome handling stays with the caller)', async () => {
+    const runner = mockRunner();
+    runner.exec.mockResolvedValue({ stdout: '', stderr: 'boom', exitCode: 1 });
+    const tmux = new TmuxManager(runner);
+    await expect(tmux.ownerWrite('dev-1', REF, 'dev-1', 1, 'latest', undefined)).rejects.toThrow(/boom/);
   });
 });

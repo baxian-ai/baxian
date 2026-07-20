@@ -1091,4 +1091,64 @@ describe('GET /api/tasks/:id/github-review', () => {
     expect(body.items).toHaveLength(1);
     expect(body.items[0]).toMatchObject({ kind: 'review', verdict: 'approve' });
   });
+
+  function countingRunner(): { runner: CommandRunner; commands: string[] } {
+    const commands: string[] = [];
+    const runner: CommandRunner = {
+      exec: async (cmd: string): Promise<ExecResult> => {
+        commands.push(cmd);
+        return { stdout: '', stderr: '', exitCode: 0 };
+      },
+      writeFile: async () => undefined,
+      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    };
+    return { runner, commands };
+  }
+
+  it('serves consecutive same-revision GETs from cache: gh runs once', async () => {
+    const { runner, commands } = countingRunner();
+    app.ctx.githubRunner = runner;
+    await seedTask({ id: 'gh-cache', prNumber: 7 });
+    await get('/api/tasks/gh-cache/github-review');
+    const afterFirst = commands.length;
+    const res = await get('/api/tasks/gh-cache/github-review');
+    expect(afterFirst).toBe(4);
+    expect(commands.length).toBe(4);
+    expect(JSON.parse(res.body).available).toBe(true);
+  });
+
+  it('rebuilds when a revision field changes (reviewDispatchedAt)', async () => {
+    const { runner, commands } = countingRunner();
+    app.ctx.githubRunner = runner;
+    await seedTask({ id: 'gh-rev', prNumber: 7 });
+    await get('/api/tasks/gh-rev/github-review');
+    await seedTask({ id: 'gh-rev', prNumber: 7, reviewDispatchedAt: '2026-07-01T00:00:00Z' });
+    await get('/api/tasks/gh-rev/github-review');
+    expect(commands.length).toBe(8);
+  });
+
+  it('rebuilds when only prNumber changes (PR rebind)', async () => {
+    const { runner, commands } = countingRunner();
+    app.ctx.githubRunner = runner;
+    await seedTask({ id: 'gh-rebind', prNumber: 7 });
+    await get('/api/tasks/gh-rebind/github-review');
+    await seedTask({ id: 'gh-rebind', prNumber: 9 });
+    const res = await get('/api/tasks/gh-rebind/github-review');
+    expect(commands.length).toBe(8);
+    expect(commands.slice(4).every((c) => c.includes('/9'))).toBe(true);
+    expect(JSON.parse(res.body).prNumber).toBe(9);
+  });
+
+  it('rebuilds when the project repo slug changes', async () => {
+    const { runner, commands } = countingRunner();
+    app.ctx.githubRunner = runner;
+    await seedTask({ id: 'gh-slug', prNumber: 7 });
+    await get('/api/tasks/gh-slug/github-review');
+    const project = app.ctx.agentManager.getProjectConfig('proj');
+    if (!project) throw new Error('test project missing');
+    project.repo = 'user/moved';
+    await get('/api/tasks/gh-slug/github-review');
+    expect(commands.length).toBe(8);
+    expect(commands.slice(4).every((c) => c.includes('repos/user/moved/'))).toBe(true);
+  });
 });

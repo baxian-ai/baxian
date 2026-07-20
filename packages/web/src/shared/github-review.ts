@@ -30,11 +30,17 @@ export function githubReviewItemKey(item: GithubReviewItem, fallback: string): s
   return `${item.kind}-${item.id || item.commitSha || item.createdAt || item.body || fallback}`;
 }
 
+export function githubReviewItemAnchor(item: GithubReviewItem): string | undefined {
+  return item.id ? `gh-${item.kind}-${item.id}` : undefined;
+}
+
 export function githubReviewRoundKey(round: GithubReviewRound, fallback: string): string {
   if (round.review) return `round-${githubReviewItemKey(round.review, fallback)}`;
   return `round-in-progress-${round.items[0] ? githubReviewItemKey(round.items[0], fallback) : fallback}`;
 }
 
-export function githubReviewRevision(task: Pick<TaskState, 'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt'>): string {
-  return `${task.reviewRound}:${task.latestHeadSha ?? ''}:${task.status}:${task.reviewDispatchedAt ?? ''}:${task.prFeedbackReceivedAt ?? ''}`;
+// 字段必须保持 server/src/github/pr-conversation-cache.ts 服务端 revision 的前缀子集：
+// 这里任何触发重拉的变化在服务端缓存必然 miss。prNumber 在列，PR 重绑定即重拉。
+export function githubReviewRevision(task: Pick<TaskState, 'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber'>): string {
+  return `${task.reviewRound}:${task.latestHeadSha ?? ''}:${task.status}:${task.reviewDispatchedAt ?? ''}:${task.prFeedbackReceivedAt ?? ''}:${task.prNumber ?? ''}`;
 }

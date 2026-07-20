@@ -68,4 +68,28 @@ describe('LockManager', () => {
       expect.objectContaining({ agentId: 'qa-1', taskId: 'task-42', token: qaToken }),
     ]);
   });
+
+  describe('rotateClaim', () => {
+    it('re-owners a matching claim and makes the old owner fail owner-scoped release', async () => {
+      const taskToken = (await locks.acquire('dev-1', 'task-a'))!;
+      const delToken = 'deletion-token-xyz';
+      expect(await locks.rotateClaim('dev-1', { taskId: 'task-a', token: taskToken }, { taskId: 'deletion:attempt-1', token: delToken })).toBe(true);
+      expect(await locks.claimOf('dev-1')).toMatchObject({ taskId: 'deletion:attempt-1', token: delToken });
+      // a concurrent maintenance release of the old token is now harmless
+      expect(await locks.releaseIfOwner('dev-1', 'task-a', taskToken)).toBe(false);
+      expect(await locks.isOwner('dev-1', 'deletion:attempt-1', delToken)).toBe(true);
+    });
+
+    it('rotates an unbound agent onto a deletion owner', async () => {
+      expect(await locks.rotateClaim('dev-1', { unbound: true }, { taskId: 'deletion:attempt-1', token: 'd1' })).toBe(true);
+      expect(await locks.claimOf('dev-1')).toMatchObject({ taskId: 'deletion:attempt-1', token: 'd1' });
+    });
+
+    it('refuses to rotate when expected does not hold (stale token or unexpected binding)', async () => {
+      const t = (await locks.acquire('dev-1', 'task-a'))!;
+      expect(await locks.rotateClaim('dev-1', { taskId: 'task-a', token: 'wrong' }, { taskId: 'deletion:x', token: 'd' })).toBe(false);
+      expect(await locks.rotateClaim('dev-1', { unbound: true }, { taskId: 'deletion:x', token: 'd' })).toBe(false);
+      expect(await locks.isOwner('dev-1', 'task-a', t)).toBe(true);
+    });
+  });
 });

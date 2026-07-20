@@ -126,15 +126,25 @@ describe('GithubReviewEntry', () => {
     expect(qa.className).not.toContain('font-medium');
   });
 
-  it('navigates to the review page on click', async () => {
+  it('navigates to the review page anchored at the clicked record', async () => {
     ghMock.mockResolvedValue({
       available: true,
-      items: [{ kind: 'review', id: 'r1', body: 'ok', verdict: 'approve' }],
+      items: [
+        { kind: 'commit', id: 'c1', body: 'fix: thing', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
+        { kind: 'review-comment', id: '21', body: 'nit', path: 'a.ts', line: 12, createdAt: '2026-06-01T10:05:00Z' },
+        { kind: 'review', id: 'r1', body: 'ok', verdict: 'approve', createdAt: '2026-06-01T10:10:00Z' },
+      ],
     } as GithubReviewConversation);
     renderEntry(task({ id: 'task-42', reviewMode: 'github' }));
-    const row = await screen.findByText('Review');
-    fireEvent.click(row.closest('button')!);
-    expect(navigateMock).toHaveBeenCalledWith('/tasks/task-42/github-review');
+
+    fireEvent.click((await screen.findByText('Submit code changes')).closest('button')!);
+    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/github-review#gh-commit-c1');
+
+    fireEvent.click(screen.getByText('Inline comment').closest('button')!);
+    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/github-review#gh-review-comment-21');
+
+    fireEvent.click(screen.getByText('Review').closest('button')!);
+    expect(navigateMock).toHaveBeenLastCalledWith('/tasks/task-42/github-review#gh-review-r1');
   });
 
   it('shows an empty hint when the PR has no review items', async () => {
@@ -224,6 +234,37 @@ describe('GithubReviewEntry', () => {
 
     await waitFor(() => expect(ghMock).toHaveBeenCalledTimes(2));
     expect(await screen.findByText(/human · a.ts:7 · new inline reply/)).toBeTruthy();
+  });
+
+  it('refetches when only prNumber changes (PR rebind)', async () => {
+    ghMock
+      .mockResolvedValueOnce({
+        available: true,
+        prNumber: 7,
+        items: [{ kind: 'review', id: 'r1', body: 'old pr review', verdict: 'comment' }],
+      } as GithubReviewConversation)
+      .mockResolvedValueOnce({
+        available: true,
+        prNumber: 9,
+        items: [{ kind: 'review', id: 'r2', body: 'rebound pr review', verdict: 'comment' }],
+      } as GithubReviewConversation);
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <GithubReviewEntry task={task({ reviewMode: 'github', prNumber: 7 })} />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('old pr review')).toBeTruthy();
+    expect(ghMock).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <MemoryRouter>
+        <GithubReviewEntry task={task({ reviewMode: 'github', prNumber: 9 })} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(ghMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('rebound pr review')).toBeTruthy();
   });
 
   it('shows unavailable reasons and falls back unknown reasons to no-pr', async () => {

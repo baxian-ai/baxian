@@ -7,9 +7,13 @@ export type AgentStoreListener = (kind: AgentStoreChangeKind, agentId: string) =
 
 export const AGENT_STORE_NOOP = Symbol.for('@baxian/agent-store-noop');
 export type AgentStoreUpdateResult = AgentBindingFacts | null | typeof AGENT_STORE_NOOP;
+export type AgentStoreCommit = 'committed' | 'noop' | 'deleted';
 
 // a store id becomes a filename; constrain it so a path-like id can't escape the store dir
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
+// Unpredictable so a crash can't leave a guessable half-written state file behind.
+let tmpCounter = 0;
 
 export class AgentStore {
   private listeners = new Set<AgentStoreListener>();
@@ -34,10 +38,25 @@ export class AgentStore {
     return normalizeBinding(JSON.parse(content) as Record<string, unknown>, id);
   }
 
+  // Single serialization gate: set/delete/update all run under the same per-id chain (public ones via setLocked/deleteLocked, which only run inside here) so a set/delete can't interleave an update's read-modify-write.
+  private async runExclusive<T>(id: string, body: () => Promise<T>): Promise<T> {
+    const prev = this.mutex.get(id) ?? Promise.resolve();
+    const task = prev.then(body, body);
+    const chain: Promise<unknown> = task.then(() => undefined, () => undefined).finally(() => {
+      if (this.mutex.get(id) === chain) this.mutex.delete(id);
+    });
+    this.mutex.set(id, chain);
+    return task;
+  }
+
   async set(state: AgentBindingFacts): Promise<void> {
+    await this.runExclusive(state.id, () => this.setLocked(state));
+  }
+
+  private async setLocked(state: AgentBindingFacts): Promise<void> {
     const binding = normalizeBinding(state as unknown as Record<string, unknown>, state.id);
     const final = this.path(state.id);
-    const tmp = `${final}.${process.pid}.${Date.now()}.tmp`;
+    const tmp = `${final}.${process.pid}.${tmpCounter++}.tmp`;
     await writeFile(tmp, JSON.stringify(binding, null, 2) + '\n');
     await rename(tmp, final);
     this.fire('set', state.id);
@@ -46,23 +65,18 @@ export class AgentStore {
   async update(
     id: string,
     updater: (existing: AgentBindingFacts | null) => AgentStoreUpdateResult,
-  ): Promise<void> {
-    const prev = this.mutex.get(id) ?? Promise.resolve();
-    const task = prev.then(async () => {
+  ): Promise<AgentStoreCommit> {
+    return this.runExclusive(id, async () => {
       const existing = await this.get(id);
       const result = updater(existing);
-      if (result === AGENT_STORE_NOOP) return;
+      if (result === AGENT_STORE_NOOP) return 'noop';
       if (result === null) {
-        await this.delete(id);
-        return;
+        await this.deleteLocked(id);
+        return 'deleted';
       }
-      await this.set(result);
+      await this.setLocked(result);
+      return 'committed';
     });
-    const chain: Promise<unknown> = task.catch(() => undefined).finally(() => {
-      if (this.mutex.get(id) === chain) this.mutex.delete(id);
-    });
-    this.mutex.set(id, chain);
-    return task;
   }
 
   async list(): Promise<AgentBindingFacts[]> {
@@ -86,14 +100,19 @@ export class AgentStore {
   }
 
   async delete(id: string): Promise<void> {
+    await this.runExclusive(id, () => this.deleteLocked(id));
+  }
+
+  // A non-ENOENT unlink failure now throws so callers (e.g. DELETE phase 3) can treat the
+  // deletion as unconfirmed and roll back instead of reporting a removal that did not happen.
+  private async deleteLocked(id: string): Promise<void> {
     if (!SAFE_ID.test(id)) return;
     try {
       await unlink(this.path(id));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (code !== 'ENOENT') {
-        console.error(`[AgentStore] delete ${id} failed; not broadcasting:`, err);
-        return;
+        throw new Error(`[AgentStore] delete ${id} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     this.fire('delete', id);

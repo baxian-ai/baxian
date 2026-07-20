@@ -75,14 +75,15 @@ async function makeFixture(
   const lockManager = new LockManager(join(tempDir, 'locks'));
   const updateAgent = agentStore.update.bind(agentStore);
   vi.spyOn(agentStore, 'update').mockImplementation(async (id, update) => {
-    await updateAgent(id, update);
+    const commit = await updateAgent(id, update);
     const state = await agentStore.get(id);
-    if (!state?.taskId || await lockManager.isLocked(id)) return;
+    if (!state?.taskId || await lockManager.isLocked(id)) return commit;
     const token = await lockManager.acquire(id, state.taskId);
-    if (!token) return;
+    if (!token) return commit;
     await updateAgent(id, latest => latest?.taskId === state.taskId
       ? { ...latest, lockToken: token, updatedAt: new Date().toISOString() }
       : latest);
+    return commit;
   });
   const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   const events: { type: string; data?: Record<string, unknown> }[] = [];
@@ -102,26 +103,29 @@ async function makeFixture(
 }
 
 function claimedSessionExec(cmd: string): Partial<ExecResult> {
-  const agentId = cmd.match(/=([^':\s]+)/)?.[1];
-  if (agentId && cmd.includes('tmux show-option') && cmd.includes('@baxian-agent-id')) {
-    return { stdout: `${agentId}\n` };
+  const sessionName = cmd.match(/session_name},([^}]+)}/)?.[1];
+  if (sessionName && cmd.includes('tmux list-sessions')) {
+    return { stdout: `4242|1700000000|${sessionName === 'qa-1' ? '$2' : '$1'}|${sessionName}\n` };
   }
-  if (agentId && cmd.includes('tmux list-panes')) {
-    return { stdout: `${agentId === 'qa-1' ? '%2 codex' : '%1 claude'}\n` };
+  const claim = cmd.match(/@baxian-agent-id},([^}]+)}/)?.[1];
+  if (claim && cmd.includes('tmux list-panes')) {
+    return { stdout: `${claim === 'qa-1' ? '%2 codex' : '%1 claude'}\n` };
+  }
+  if (claim && cmd.includes('capture-pane')) {
+    return { stdout: cmd.includes('history_size') ? 'BX_PANE_OK|100\n' : 'BX_PANE_OK\n' };
   }
   return {};
 }
 
 function readyPaneExec(cmd: string): Partial<ExecResult> {
-  const runtimeFact = claimedSessionExec(cmd);
-  if (runtimeFact.stdout !== undefined) return runtimeFact;
-  if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-    return { stdout: 'claude\n' };
-  }
   if (cmd.includes('capture-pane')) {
-    return { stdout: '⏵⏵ bypass permissions on /tmp/repo\n\n>' };
+    const header = cmd.includes('history_size') ? 'BX_PANE_OK|100' : 'BX_PANE_OK';
+    return { stdout: `${header}\n⏵⏵ bypass permissions on /tmp/repo\n\n>` };
   }
-  return {};
+  if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
+    return { stdout: 'BX_PANE_OKclaude\n' };
+  }
+  return claimedSessionExec(cmd);
 }
 
 function bindAgent(
@@ -461,7 +465,7 @@ describe('cancel closes a published PR but preserves remote branches', () => {
 describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marker)', () => {
   it('approved + publishDispatchedAt + prNumber → interrupts the dev FIRST, then closes the PR remotely', async () => {
     const { manager, taskStore, agentStore, execCalls } = await makeFixture('auto', 'pr', readyPaneExec);
-    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', paneId: '%5' });
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', paneId: '%1' });
     await taskStore.set(approvedPrMarkerFixture());
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
@@ -473,7 +477,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
 
   it('approved + publishDispatchedAt without prNumber interrupts the dev but preserves the remote branch', async () => {
     const { manager, taskStore, agentStore, execCalls } = await makeFixture('auto', 'branch', readyPaneExec);
-    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', workdir: '/repo/dev', paneId: '%5' });
+    await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', workdir: '/repo/dev', paneId: '%1' });
     await taskStore.set(taskFixture({
       status: 'approved', afterDone: 'branch',
       publishDispatchedAt: '2026-06-10T01:00:00.000Z',

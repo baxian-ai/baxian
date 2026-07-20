@@ -21,7 +21,7 @@ import {
 } from '../shared/index.js';
 import { shellQuote, type CommandRunner, type ExecResult } from './runner.js';
 import { GIT_NET_ENV, execNetwork } from './net-exec.js';
-import { ancestorSymlinkGuard, ensureBaxianRuntimeDirsSafe, guardedRemoveClause, moveFileIntoPlace, stageFileGuarded, sweepStrayFile } from './repo-store.js';
+import { ancestorSymlinkGuard, canonicalSelfGuard, ensureBaxianRuntimeDirsSafe, guardedRemoveClause, moveFileIntoPlace, stageFileGuarded, sweepStrayFile } from './repo-store.js';
 
 
 export class ReviewExchangeError extends Error {
@@ -177,7 +177,9 @@ export class ReviewTransport {
       const documents = await this.readSpecDocuments(devAgent);
       return { content: renderSpecDocuments(documents), documents };
     }
-    const cd = `cd ${shellQuote(wt)} && `;
+    // Every review read/fetch cd's into the Workdir; fold the canonical self-guard into that cd so a
+    // mid-read ancestor rebind can't redirect symbolic-ref/rev-parse/diff to an external repo and leak it.
+    const cd = `${canonicalSelfGuard(wt)} && cd ${shellQuote(wt)} && `;
     let fetch: ExecResult;
     try {
       fetch = await execNetwork(runner, `${cd}${GIT_NET_ENV} git fetch origin --quiet`);

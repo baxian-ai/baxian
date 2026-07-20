@@ -299,24 +299,29 @@ export class TmuxProbePoller {
     }
 
     this.failureCounts.delete(agent.id);
-    if (result.tmuxSessionStatus !== 'present') {
+    const presentProbe = result.tmuxSessionStatus === 'present' && tmux
+      ? await this.observePresentSession(agent, tmux, now)
+      : {};
+    // present hasSession() but no owned pane (undefined) = foreign/gone name reuse; publish absent so reconcile runs, not a stale present.
+    const effectiveStatus: TmuxSessionStatus =
+      result.tmuxSessionStatus === 'present' && presentProbe === undefined
+        ? 'absent'
+        : result.tmuxSessionStatus;
+    const presentDetails = presentProbe === undefined ? {} : presentProbe;
+
+    if (effectiveStatus !== 'present') {
       this.lastRecordedIssue.delete(agent.id);
       this.resetDetectionBaseline(agent.id);
     }
-    const presentDetails = result.tmuxSessionStatus === 'present' && tmux
-      ? await this.observePresentSession(agent, tmux, now)
-      : {};
-    if (presentDetails !== undefined) {
-      this.commitObservation(agent, {
-        tmuxSessionStatus: result.tmuxSessionStatus,
-        observedAt: now,
-        ...(result.tmuxSessionStatus === 'present' ? { lastPresentAt: now } : {}),
-        ...presentDetails,
-      });
-    }
-    this.logTransition(agent.id, previous, result.tmuxSessionStatus);
+    this.commitObservation(agent, {
+      tmuxSessionStatus: effectiveStatus,
+      observedAt: now,
+      ...(effectiveStatus === 'present' ? { lastPresentAt: now } : {}),
+      ...presentDetails,
+    });
+    this.logTransition(agent.id, previous, effectiveStatus);
 
-    if (result.tmuxSessionStatus === 'absent') {
+    if (effectiveStatus === 'absent') {
       try {
         await this.agentManager.reconcileFailedAgent(agent.id);
       } catch (err) {
@@ -331,13 +336,18 @@ export class TmuxProbePoller {
     occurredAt: string,
   ): Promise<Partial<TmuxSessionObservation> | undefined> {
     try {
-      const paneId = await tmux.getSinglePaneId(agent.id, { timeout: this.probeTimeoutMs });
-      const paneState = await tmux.classifyPaneForAdopt(paneId, agent.runtime, { timeout: this.probeTimeoutMs });
+      // Resolve the pane by generation+claim, not by name: a fresh server can reissue the
+      // session name to a foreign session, and polling it would read someone else's pane.
+      // A missing timeout lets a stuck remote list-sessions pin the poller worker indefinitely.
+      const snapshot = await tmux.getSessionSnapshot(agent.id, { timeout: this.probeTimeoutMs });
+      if (!snapshot || snapshot.claim !== agent.id) return undefined;
+      const pane = await tmux.getSinglePaneByRef(snapshot.ref, agent.id, { timeout: this.probeTimeoutMs });
+      const paneState = await tmux.classifyPaneForAdopt(pane, agent.runtime, { timeout: this.probeTimeoutMs });
       const liveRuntime = paneState.kind === 'live-runtime';
-      // the four reads only depend on paneId — run the round-trips concurrently
+      // the four reads only depend on the pane — run the round-trips concurrently
       const [runtimeScreen, currentTaskId, oscTitle, paneWidth] = liveRuntime
         ? await Promise.all([
-            tmux.capturePaneById(paneId, {
+            tmux.capturePaneById(pane, {
               ansi: false,
               scrollback: 0,
               timeoutMs: this.probeTimeoutMs,
@@ -345,8 +355,8 @@ export class TmuxProbePoller {
             this.agentStore
               ? this.agentStore.get(agent.id).then((binding) => binding?.taskId ?? null)
               : Promise.resolve(null),
-            tmux.readPaneTitle(paneId, { timeout: this.probeTimeoutMs }).catch(() => ''),
-            tmux.displayMessage(paneId, '#{pane_width}', { timeout: this.probeTimeoutMs })
+            tmux.readPaneTitle(pane, { timeout: this.probeTimeoutMs }).catch(() => ''),
+            tmux.displayMessage(pane, '#{pane_width}', { timeout: this.probeTimeoutMs })
               .then((raw) => parseInt(raw, 10) || 0)
               .catch(() => 0),
           ])

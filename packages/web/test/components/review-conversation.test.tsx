@@ -217,6 +217,42 @@ describe('ReviewConversation server mode', () => {
     expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/2#review');
   });
 
+  it('routes dev submit, response, and user decision rows to their own anchors', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(2, {
+        findings: { round: 2, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'm' }] },
+        response: { round: 2, responses: [{ findingId: 'f-1', action: 'fix', rationale: 'done' }] },
+        userDecision: { verdict: 'request-changes', comments: '还差一点', at: 'now' },
+      }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 2 }));
+
+    fireEvent.click((await screen.findByText('Submit code changes')).closest('button')!);
+    expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/2#diff');
+
+    fireEvent.click(screen.getByText('Response').closest('button')!);
+    expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/2#response');
+
+    fireEvent.click(screen.getByText('Request changes').closest('button')!);
+    expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/2#user-decision');
+  });
+
+  it('routes each partial batch row to its own batch anchor', async () => {
+    reviewsMock.mockResolvedValue([
+      codeRound(1, { batchFindings: [
+        { round: 1, verdict: 'request-changes', findings: [{ id: 'b0-1', severity: 'major', message: 'm' }] },
+        { round: 1, verdict: 'approve', findings: [] },
+      ] }),
+    ] as ReviewRound[]);
+    renderConv(makeTask({ reviewRound: 1, status: 'review', batchIndex: 1, batchTotal: 2 }));
+
+    fireEvent.click((await screen.findByText('Review (batch 1)')).closest('button')!);
+    expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/1#batch-0');
+
+    fireEvent.click(screen.getByText('Review (batch 2)').closest('button')!);
+    expect(screen.getByTestId('loc').textContent).toBe('/tasks/task-1/rounds/code/1#batch-1');
+  });
+
   it('refetches and grows as reviewRound advances', async () => {
     reviewsMock.mockResolvedValueOnce([codeRound(1, { findings: { round: 1, verdict: 'request-changes', findings: [] } })] as ReviewRound[]);
     const { rerender } = render(

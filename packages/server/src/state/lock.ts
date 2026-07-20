@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export interface AgentLockClaim {
@@ -44,6 +44,32 @@ export class LockManager {
         if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return false;
         throw err;
       }
+    });
+  }
+
+  // Atomically re-owner a claim (DELETE moves a stale task lock onto its deletion owner) so a concurrent releaseIfOwner(expected) fails owner-scoped; false if expected no longer holds.
+  async rotateClaim(
+    agentId: string,
+    expected: { taskId: string; token: string } | { unbound: true },
+    to: { taskId: string; token: string },
+  ): Promise<boolean> {
+    return this.runExclusive(agentId, async () => {
+      const claim = await this.readClaim(agentId);
+      if ('unbound' in expected) {
+        if (claim) return false;
+      } else if (!claim || claim.taskId !== expected.taskId || claim.token !== expected.token) {
+        return false;
+      }
+      const next: AgentLockClaim = {
+        agentId,
+        taskId: to.taskId,
+        token: to.token,
+        acquiredAt: new Date().toISOString(),
+      };
+      const tmp = `${this.path(agentId)}.${process.pid}.rotate`;
+      await writeFile(tmp, JSON.stringify(next) + '\n');
+      await rename(tmp, this.path(agentId));
+      return true;
     });
   }
 

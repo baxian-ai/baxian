@@ -29,15 +29,25 @@ export function readTtyDimensions(stdout: { columns?: number; rows?: number }): 
   return { cols, rows };
 }
 
+// The window-size write targets the session by name, which a fresh tmux server can reissue to a
+// foreign session; gate it on our claim so a same-name stranger's window is never touched. The CLI
+// has no server-generation credential, but the claim equality alone excludes any foreign session.
+function claimGatedWindowSize(agentId: string): string {
+  const cond = `#{==:#{@baxian-agent-id},${agentId}}`;
+  const set = `set-option -t '=${agentId}:' window-size latest`;
+  return `tmux if-shell -t '=${agentId}:' -F '${cond}' '${set}' ''`;
+}
+
 export function buildLocalAttachCommands(
   agentId: string,
   _dims: TtyDimensions | null,
 ): AttachCommand[] {
+  const cond = `#{==:#{@baxian-agent-id},${agentId}}`;
   return [
     {
       kind: 'configure',
       file: 'tmux',
-      args: ['set-option', '-t', `=${agentId}:`, 'window-size', 'latest'],
+      args: ['if-shell', '-t', `=${agentId}:`, '-F', cond, `set-option -t '=${agentId}:' window-size latest`, ''],
     },
     {
       kind: 'configure',
@@ -54,9 +64,7 @@ export function buildRemoteAttachSshArgs(
   _dims: TtyDimensions | null,
 ): string[] {
   const quotedId = shellQuote(`=${agentId}`);
-  const quotedWindow = shellQuote(`=${agentId}:`);
-  const autoSizePrefix =
-    `tmux set-option -t ${quotedWindow} window-size latest 2>/dev/null || true; `;
+  const autoSizePrefix = `${claimGatedWindowSize(agentId)} 2>/dev/null || true; `;
   const focusEventsPrefix = 'tmux set-option -g focus-events on 2>/dev/null || true; ';
   return [
     '-o', 'ConnectTimeout=10',

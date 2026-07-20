@@ -33,7 +33,7 @@ describe('buildLocalAttachCommands', () => {
   it('restores tmux auto-size and enables focus-events, then attaches when dims given', () => {
     const cmds = buildLocalAttachCommands('dev-1', { cols: 180, rows: 48 });
     expect(cmds).toEqual([
-      { kind: 'configure', file: 'tmux', args: ['set-option', '-t', '=dev-1:', 'window-size', 'latest'] },
+      { kind: 'configure', file: 'tmux', args: ['if-shell', '-t', '=dev-1:', '-F', '#{==:#{@baxian-agent-id},dev-1}', "set-option -t '=dev-1:' window-size latest", ''] },
       { kind: 'configure', file: 'tmux', args: ['set-option', '-g', 'focus-events', 'on'] },
       { kind: 'attach', file: 'tmux', args: ['-u', 'attach-session', '-t', '=dev-1'] },
     ]);
@@ -42,7 +42,7 @@ describe('buildLocalAttachCommands', () => {
   it('restores tmux auto-size even when dims is null (e.g. piped stdout, no tty)', () => {
     const cmds = buildLocalAttachCommands('dev-1', null);
     expect(cmds).toEqual([
-      { kind: 'configure', file: 'tmux', args: ['set-option', '-t', '=dev-1:', 'window-size', 'latest'] },
+      { kind: 'configure', file: 'tmux', args: ['if-shell', '-t', '=dev-1:', '-F', '#{==:#{@baxian-agent-id},dev-1}', "set-option -t '=dev-1:' window-size latest", ''] },
       { kind: 'configure', file: 'tmux', args: ['set-option', '-g', 'focus-events', 'on'] },
       { kind: 'attach', file: 'tmux', args: ['-u', 'attach-session', '-t', '=dev-1'] },
     ]);

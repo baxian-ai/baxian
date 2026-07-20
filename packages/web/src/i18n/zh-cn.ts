@@ -442,6 +442,8 @@ export const zhCN: Messages = {
     notSubmitted: '评审尚未提交。',
     noFindingsThisRound: '本轮无 findings。',
     devResponsesHeading: 'Dev 反馈',
+    userDecisionHeading: '用户裁决',
+    loadExternalImage: '加载外部图片',
     roundNotFound: (phase, round) => `未找到该轮评审（${phase} 第 ${round} 轮）。`,
     loadFailed: (detail) => `加载评审记录失败：${detail}`,
     loadingRecords: '加载评审记录…',

@@ -1,0 +1,229 @@
+import { describe, it, expect } from 'vitest';
+import type { GithubReviewItem } from '../../src/shared/index.js';
+import {
+  PrConversationCache,
+  githubReviewRevision,
+  type PrConversationPayload,
+} from '../../src/github/pr-conversation-cache.js';
+
+function convo(label: string, error?: string): PrConversationPayload {
+  const items: GithubReviewItem[] = [{ kind: 'issue-comment', id: label, body: label }];
+  return { items, ...(error ? { error } : {}) };
+}
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function counting(payload: PrConversationPayload) {
+  let calls = 0;
+  return {
+    build: () => {
+      calls++;
+      return Promise.resolve(payload);
+    },
+    calls: () => calls,
+  };
+}
+
+describe('githubReviewRevision (server)', () => {
+  it('joins the web fields plus prNumber and repoSlug', () => {
+    const rev = githubReviewRevision(
+      {
+        reviewRound: 3,
+        latestHeadSha: 'abc123',
+        status: 'review',
+        reviewDispatchedAt: '2026-07-01T10:00:00Z',
+        prFeedbackReceivedAt: '2026-07-02T11:00:00Z',
+        prNumber: 7,
+      },
+      'owner/repo',
+    );
+    expect(rev).toBe('3:abc123:review:2026-07-01T10:00:00Z:2026-07-02T11:00:00Z:7:owner/repo');
+  });
+
+  it('renders absent optional fields as empty slots', () => {
+    const rev = githubReviewRevision({ reviewRound: 0, status: 'pending' }, 'o/r');
+    expect(rev).toBe('0::pending::::o/r');
+  });
+
+  it('changes when only prNumber changes', () => {
+    const base = { reviewRound: 1, status: 'review' as const };
+    expect(githubReviewRevision({ ...base, prNumber: 7 }, 'o/r'))
+      .not.toBe(githubReviewRevision({ ...base, prNumber: 9 }, 'o/r'));
+  });
+
+  it('changes when only repoSlug changes', () => {
+    const base = { reviewRound: 1, status: 'review' as const, prNumber: 7 };
+    expect(githubReviewRevision(base, 'o/r'))
+      .not.toBe(githubReviewRevision(base, 'o/moved'));
+  });
+});
+
+describe('PrConversationCache', () => {
+  it('serves a fresh same-revision entry without rebuilding', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now });
+    const b = counting(convo('a'));
+    expect(await cache.get('t1', 'r1', b.build)).toEqual(convo('a'));
+    now += 1_000;
+    expect(await cache.get('t1', 'r1', b.build)).toEqual(convo('a'));
+    expect(b.calls()).toBe(1);
+  });
+
+  it('rebuilds when the revision changes', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const b1 = counting(convo('a'));
+    const b2 = counting(convo('b'));
+    await cache.get('t1', 'r1', b1.build);
+    expect(await cache.get('t1', 'r2', b2.build)).toEqual(convo('b'));
+    expect(b2.calls()).toBe(1);
+  });
+
+  it('rebuilds after the TTL expires', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ ttlMs: 100, now: () => now });
+    const b1 = counting(convo('a'));
+    const b2 = counting(convo('b'));
+    await cache.get('t1', 'r1', b1.build);
+    now = 100;
+    expect(await cache.get('t1', 'r1', b2.build)).toEqual(convo('b'));
+    expect(b2.calls()).toBe(1);
+  });
+
+  it('does not cache payloads that carry an error', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const failing = counting(convo('a', 'reviews: boom'));
+    expect(await cache.get('t1', 'r1', failing.build)).toEqual(convo('a', 'reviews: boom'));
+    await cache.get('t1', 'r1', failing.build);
+    expect(failing.calls()).toBe(2);
+  });
+
+  it('shares one in-flight build across same-revision concurrent gets', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const d = deferred<PrConversationPayload>();
+    let calls = 0;
+    const build = () => {
+      calls++;
+      return d.promise;
+    };
+    const p1 = cache.get('t1', 'r1', build);
+    const p2 = cache.get('t1', 'r1', build);
+    d.resolve(convo('a'));
+    expect(await p1).toEqual(convo('a'));
+    expect(await p2).toEqual(convo('a'));
+    expect(calls).toBe(1);
+  });
+
+  it('does not share an in-flight build across revisions: the newer revision builds itself', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const dA = deferred<PrConversationPayload>();
+    const dB = deferred<PrConversationPayload>();
+    const pA = cache.get('t1', 'rA', () => dA.promise);
+    const pB = cache.get('t1', 'rB', () => dB.promise);
+    dB.resolve(convo('b'));
+    expect(await pB).toEqual(convo('b'));
+    dA.resolve(convo('a'));
+    expect(await pA).toEqual(convo('a'));
+  });
+
+  it('a superseded build settling late neither overwrites the cache nor clears the successor registration', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    const dA = deferred<PrConversationPayload>();
+    const dB = deferred<PrConversationPayload>();
+    const pA = cache.get('t1', 'rA', () => dA.promise);
+    const pB = cache.get('t1', 'rB', () => dB.promise);
+
+    dA.resolve(convo('a'));
+    await pA;
+
+    // A settled while superseded: B's registration must survive, so a third
+    // same-revision get joins B's in-flight build instead of starting a new one.
+    let extraCalls = 0;
+    const pB2 = cache.get('t1', 'rB', () => {
+      extraCalls++;
+      return Promise.resolve(convo('x'));
+    });
+    dB.resolve(convo('b'));
+    expect(await pB).toEqual(convo('b'));
+    expect(await pB2).toEqual(convo('b'));
+    expect(extraCalls).toBe(0);
+
+    // And the store must hold B's payload, not A's.
+    const after = counting(convo('never'));
+    expect(await cache.get('t1', 'rB', after.build)).toEqual(convo('b'));
+    expect(after.calls()).toBe(0);
+  });
+
+  it('propagates a rejected build, caches nothing, and recovers on the next get', async () => {
+    const cache = new PrConversationCache({ now: () => 0 });
+    await expect(
+      cache.get('t1', 'r1', () => Promise.reject(new Error('gh exploded'))),
+    ).rejects.toThrow('gh exploded');
+    const ok = counting(convo('a'));
+    expect(await cache.get('t1', 'r1', ok.build)).toEqual(convo('a'));
+    expect(ok.calls()).toBe(1);
+  });
+
+  it('does not cache payloads larger than maxPayloadBytes', async () => {
+    const cache = new PrConversationCache({ now: () => 0, maxPayloadBytes: 64 });
+    const big = counting(convo('x'.repeat(200)));
+    await cache.get('t1', 'r1', big.build);
+    await cache.get('t1', 'r1', big.build);
+    expect(big.calls()).toBe(2);
+    expect(cache.stats().entries).toBe(0);
+  });
+
+  it('evicts oldest entries by fetchedAt until within the total byte budget', async () => {
+    let now = 0;
+    const small = convo('s');
+    const bytesOf = (p: PrConversationPayload) => Buffer.byteLength(JSON.stringify(p), 'utf8');
+    const cache = new PrConversationCache({
+      now: () => now,
+      maxTotalBytes: bytesOf(small) * 2,
+    });
+    await cache.get('t1', 'r1', () => Promise.resolve(small));
+    now = 1;
+    await cache.get('t2', 'r1', () => Promise.resolve(small));
+    now = 2;
+    await cache.get('t3', 'r1', () => Promise.resolve(small));
+    expect(cache.stats().entries).toBe(2);
+    const rebuilt = counting(convo('s'));
+    now = 3;
+    await cache.get('t1', 'r1', rebuilt.build);
+    expect(rebuilt.calls()).toBe(1);
+  });
+
+  it('evicts the oldest entry beyond maxEntries', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ now: () => now, maxEntries: 2 });
+    await cache.get('t1', 'r1', () => Promise.resolve(convo('a')));
+    now = 1;
+    await cache.get('t2', 'r1', () => Promise.resolve(convo('b')));
+    now = 2;
+    await cache.get('t3', 'r1', () => Promise.resolve(convo('c')));
+    expect(cache.stats().entries).toBe(2);
+    const rebuilt = counting(convo('a'));
+    await cache.get('t1', 'r1', rebuilt.build);
+    expect(rebuilt.calls()).toBe(1);
+  });
+
+  it('sweeps expired cold entries on any get, including other keys', async () => {
+    let now = 0;
+    const cache = new PrConversationCache({ ttlMs: 100, now: () => now });
+    await cache.get('cold', 'r1', () => Promise.resolve(convo('cold')));
+    expect(cache.stats().entries).toBe(1);
+    now = 150;
+    await cache.get('hot', 'r1', () => Promise.resolve(convo('hot')));
+    expect(cache.stats().entries).toBe(1);
+    expect(cache.stats().totalBytes).toBe(
+      Buffer.byteLength(JSON.stringify(convo('hot')), 'utf8'),
+    );
+  });
+});

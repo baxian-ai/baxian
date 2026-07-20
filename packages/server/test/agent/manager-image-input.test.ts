@@ -3,6 +3,7 @@ import { mkdtemp, rm, mkdir, writeFile, readdir, readFile } from 'node:fs/promis
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentManager } from '../../src/agent/manager.js';
+import { TmuxManager } from '../../src/agent/tmux.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -60,6 +61,7 @@ beforeEach(async () => {
   mockRunner = {
     exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
     writeFile: vi.fn<(p: string, c: Buffer | string) => Promise<void>>().mockResolvedValue(undefined),
+    execWithStdin: vi.fn<(cmd: string, stdin: Buffer) => Promise<ExecResult>>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
   };
 
   const config: BaxianConfig = {
@@ -90,6 +92,9 @@ afterEach(async () => {
 describe('attachImageToRunningAgent (entry A)', () => {
   it('writes to agent host and injects the path, returning it', async () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%1', updatedAt: new Date().toISOString() });
+    const ref = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
+    vi.spyOn(TmuxManager.prototype, 'getSessionSnapshot').mockResolvedValue({ ref, claim: 'dev-1' });
+    vi.spyOn(TmuxManager.prototype, 'getSinglePaneByRef').mockResolvedValue({ session: ref, paneId: '%1', claim: 'dev-1' });
 
     const { path } = await manager.attachImageToRunningAgent('dev-1', PNG, 'png');
 

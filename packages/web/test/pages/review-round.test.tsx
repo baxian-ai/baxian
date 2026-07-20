@@ -293,6 +293,89 @@ describe('ReviewRoundPage', () => {
     expect(interdiffMock).not.toHaveBeenCalledWith('task-1', 3);
   });
 
+  it('renders spec content, finding messages, and rationales as basic markdown', async () => {
+    reviewsMock.mockResolvedValue([
+      {
+        round: 1, phase: 'spec', content: '# Title\n\n**bold** body', startedAt: 'now',
+        documents: [{ relPath: '.baxian/spec.md', content: '# Title\n\n**bold** body' }],
+        findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'minor', message: 'has `code` span' }] },
+        response: { round: 1, responses: [{ findingId: 'f-1', action: 'fix', rationale: '*italic* done' }] },
+      },
+    ] as ReviewRound[]);
+    renderAt('/tasks/task-1/rounds/spec/1');
+
+    await screen.findByText('Spec draft');
+    const h1 = document.querySelector('h1.text-\\[18px\\]');
+    expect(h1?.textContent).toBe('# Title');
+    expect(Array.from(document.querySelectorAll('strong')).some((el) => el.textContent === 'bold')).toBe(true);
+    expect(Array.from(document.querySelectorAll('code')).some((el) => el.textContent === 'code')).toBe(true);
+    expect(Array.from(document.querySelectorAll('em')).some((el) => el.textContent === 'italic')).toBe(true);
+  });
+
+  it('gives partial batch blocks positional ids for list-row anchors', async () => {
+    reviewsMock.mockResolvedValue([
+      {
+        round: 1, phase: 'code',
+        content: 'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new',
+        startedAt: 'now',
+        batchFindings: [
+          { round: 1, verdict: 'request-changes', findings: [{ id: 'b0-1', severity: 'major', message: 'batch0 msg' }] },
+          { round: 1, verdict: 'approve', findings: [] },
+        ],
+      },
+    ] as ReviewRound[]);
+    renderAt('/tasks/task-1/rounds/code/1');
+    await screen.findByText('batch0 msg');
+    expect(document.getElementById('batch-0')).not.toBeNull();
+    expect(document.getElementById('batch-1')).not.toBeNull();
+  });
+
+  it('renders the response section even when the response list is empty', async () => {
+    reviewsMock.mockResolvedValue([
+      {
+        round: 1, phase: 'code', content: '@@ -1 +1 @@\n-old\n+new', startedAt: 'now',
+        findings: { round: 1, verdict: 'approve', findings: [] },
+        response: { round: 1, responses: [] },
+      },
+    ] as ReviewRound[]);
+    renderAt('/tasks/task-1/rounds/code/1');
+    await screen.findByText('Dev responses');
+    expect(document.getElementById('response')).not.toBeNull();
+    expect(screen.getByText('No content')).toBeTruthy();
+  });
+
+  it('renders a user decision section with verdict pill, markdown comments, and timestamp', async () => {
+    reviewsMock.mockResolvedValue([
+      {
+        round: 1, phase: 'spec', content: '# spec', startedAt: 'now',
+        documents: [{ relPath: '.baxian/spec.md', content: '# spec' }],
+        findings: { round: 1, verdict: 'approve', findings: [] },
+        userDecision: { verdict: 'request-changes', comments: '**must** cover edge cases', at: '2026-06-29T10:07:00Z' },
+      },
+    ] as ReviewRound[]);
+    renderAt('/tasks/task-1/rounds/spec/1');
+
+    await screen.findByText('User decision');
+    const section = document.getElementById('user-decision');
+    expect(section).not.toBeNull();
+    expect(section?.querySelector('.pill-warn')?.textContent).toBe('request-changes');
+    expect(Array.from(section?.querySelectorAll('strong') ?? []).some((el) => el.textContent === 'must')).toBe(true);
+    expect(section?.textContent).toContain('2026-06-29 10:07');
+  });
+
+  it('omits the user decision section when the round has none', async () => {
+    reviewsMock.mockResolvedValue([
+      {
+        round: 1, phase: 'code', content: '@@ -1 +1 @@\n-old\n+new', startedAt: 'now',
+        findings: { round: 1, verdict: 'approve', findings: [] },
+      },
+    ] as ReviewRound[]);
+    renderAt('/tasks/task-1/rounds/code/1');
+    await screen.findByText('QA review');
+    expect(document.getElementById('user-decision')).toBeNull();
+    expect(screen.queryByText('User decision')).toBeNull();
+  });
+
   it('gives batch findings unique DOM anchors when batches reuse the same raw id', async () => {
     reviewsMock.mockResolvedValue([
       {

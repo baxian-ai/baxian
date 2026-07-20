@@ -6,8 +6,12 @@ import type { AgentConfig, HostConfig } from '../../src/shared/index.js';
 import {
   PaneStreamer,
   ensureSpawnHelperExecutable,
+  normalizeFollowIntervalMs,
+  parseAttachFlagCapability,
   type MinimalPty,
+  type ProbeHandle,
   type PtyFactory,
+  type StreamerGeometryHooks,
   type SubscriberCallbacks,
 } from '../../src/agent/pane-streamer.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
@@ -17,8 +21,14 @@ type ExecMock = ReturnType<typeof vi.fn<(cmd: string, options?: ExecOptions) => 
 
 function mockRunner(): CommandRunner & { exec: ExecMock } {
   return {
-    exec: vi.fn<(cmd: string, options?: ExecOptions) => Promise<ExecResult>>().mockResolvedValue({
-      stdout: '', stderr: '', exitCode: 0,
+    // Default: the session is present and self-claimed (claim == the queried session name), so the
+    // attach/reattach ownership gate passes for whatever agent id the streamer is probing.
+    exec: vi.fn<(cmd: string, options?: ExecOptions) => Promise<ExecResult>>().mockImplementation(async (cmd: string) => {
+      if (cmd.includes('list-sessions')) {
+        const name = /#\{==:#\{session_name\},([^}]+)\}/.exec(cmd)?.[1] ?? 'dev-1';
+        return { stdout: `4242|1700000000|$1|${name}\n`, stderr: '', exitCode: 0 };
+      }
+      return { stdout: '', stderr: '', exitCode: 0 };
     }),
     writeFile: vi.fn<(p: string, c: Buffer | string) => Promise<void>>().mockResolvedValue(undefined),
     execWithStdin: vi.fn<(cmd: string, stdin: Buffer) => Promise<ExecResult>>().mockResolvedValue({
@@ -78,7 +88,7 @@ const TEST_AGENT: AgentConfig = {
   mode: 'local',
 };
 
-type StreamerOptions = Omit<NonNullable<ConstructorParameters<typeof PaneStreamer>[4]>, 'ptyFactory'>;
+type StreamerOptions = Omit<NonNullable<ConstructorParameters<typeof PaneStreamer>[3]>, 'ptyFactory'>;
 
 interface MakeStreamerOpts extends StreamerOptions {
   agent?: AgentConfig;
@@ -125,19 +135,33 @@ function tick(): Promise<void> {
 const execCmds = (runner: ReturnType<typeof mockRunner>): string[] =>
   runner.exec.mock.calls.map((c: unknown[]) => c[0] as string);
 
-const findCmd = (runner: ReturnType<typeof mockRunner>, pred: (cmd: string) => boolean): string | undefined =>
-  execCmds(runner).find(pred);
-
 async function expectDims(streamer: PaneStreamer, cols: number, rows: number): Promise<void> {
   const { snapshot } = await streamer.getSnapshotAtomic();
   expect(snapshot.cols).toBe(cols);
   expect(snapshot.rows).toBe(rows);
 }
 
+// Present + owned at the initial attach probe, then gone on the reconnect probe (models a session
+// that vanishes while attached — the reconnect ownership gate must fire onSessionGone).
 function mockSessionGone(runner: ReturnType<typeof mockRunner>): void {
+  let probes = 0;
+  runner.exec.mockImplementation(async (cmd: string) => {
+    if (cmd.includes('list-sessions')) {
+      probes += 1;
+      return probes <= 2
+        ? { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }
+        : { stdout: '', stderr: '', exitCode: 0 };
+    }
+    return { stdout: '', stderr: '', exitCode: 0 };
+  });
+}
+
+const SESSION_REF_LINE = '4242|1700000000|$1';
+
+function mockSessionSnapshot(runner: ReturnType<typeof mockRunner>, claim = 'dev-1'): void {
   runner.exec.mockImplementation(async (cmd: string) =>
-    cmd.includes('has-session')
-      ? { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }
+    cmd.includes('list-sessions')
+      ? { stdout: `${SESSION_REF_LINE}|${claim}\n`, stderr: '', exitCode: 0 }
       : { stdout: '', stderr: '', exitCode: 0 },
   );
 }
@@ -203,6 +227,22 @@ let _sessionGoneCalls: number;
 let cbs: SubscriberCallbacks;
 
 const NOOP_CBS: SubscriberCallbacks = { onLive: () => undefined, onSessionGone: () => undefined };
+
+function stubGeometryHooks(overrides: Partial<StreamerGeometryHooks> = {}): StreamerGeometryHooks {
+  return {
+    fullHolds: () => 0,
+    acquireFullHold: () => () => undefined,
+    readGeometry: async () => { throw new Error('no geometry in stub'); },
+    // Answer the attach-capability probe with a pre-3.2 tmux so hook-based tests
+    // stay off the flag/follow paths unless they opt in explicitly. The probe
+    // body is intentionally NOT started: admission-refused probes create nothing.
+    raceProbe: (<T>(_start: () => ProbeHandle<T>) => Promise.resolve('tmux 3.0a\n' as T)) as StreamerGeometryHooks['raceProbe'],
+    noteManualSeen: () => undefined,
+    recordFullTarget: () => undefined,
+    commitOwnerResize: async () => undefined,
+    ...overrides,
+  };
+}
 
 beforeEach(() => {
   liveCalls = [];
@@ -356,14 +396,17 @@ describe('PaneStreamer', () => {
       }, { ptyFactory: factory, reattachDelayMs: 1000, random: () => 0 });
     });
 
-    it('bounds the attach-exit tmux session probe with a timeout', async () => {
-      const ptys = makePtys(2);
+    it('bounds the ownership probe with a timeout and does NOT spawn a PTY while the probe stays uncertain (fail-closed backoff)', async () => {
+      const ptys = makePtys(3);
       const { factory, calls, expectAfter } = countingFactory(ptys);
       const runner = mockRunner();
+      let probes = 0;
       runner.exec.mockImplementation(async (cmd: string, options?: ExecOptions) => {
-        if (cmd.includes('has-session')) {
+        if (cmd.includes('list-sessions')) {
           expect(options?.timeout).toBe(1234);
-          throw new Error('probe timeout');
+          probes += 1;
+          if (probes <= 2) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }; // initial attach + post-attach handshake: owned
+          throw new Error('probe timeout'); // reconnect probes: transport-uncertain
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -375,7 +418,9 @@ describe('PaneStreamer', () => {
         expect(warnSpy).toHaveBeenCalledWith(
           '[pane-streamer] dev-1 attach failing; backing off retries: probe timeout',
         );
-        await expectAfter(1000, 2);
+        // Uncertain probe must NOT spawn a replacement PTY — it only backs off and re-probes.
+        await expectAfter(1000, 1);
+        await expectAfter(2000, 1);
       }, { ptyFactory: factory, runner, reattachDelayMs: 1000, sessionProbeTimeoutMs: 1234 });
     });
 
@@ -397,6 +442,61 @@ describe('PaneStreamer', () => {
         await flush(streamer);
         expect(liveCalls.map(c => c.data)).toEqual(['after']);
       }, { ptyFactory: factory, reattachDelayMs: 1000, random: () => 0 });
+    });
+
+    it('treats a REISSUED generation (server restart, same name AND same claim) as gone — not the original session', async () => {
+      // The canonical ABA: a new tmux server reuses the session name AND baxian re-adopts it (same
+      // claim), but the generation (pid/start_time) differs. It is NOT the session we pinned.
+      const ptys = makePtys(2);
+      const { factory, calls } = countingFactory(ptys);
+      let probes = 0;
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('list-sessions')) {
+          probes += 1;
+          // probe 1 (initial attach) pins pid 4242; probe 2 (reconnect) is a fresh server pid 9999.
+          const pid = probes <= 2 ? '4242' : '9999';
+          return { stdout: `${pid}|1700000000|$1|dev-1\n`, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      let gone = 0;
+      const { streamer } = makeStreamer({ ptyFactory: factory, runner });
+      await streamer.subscribeAtomic({ onLive: () => undefined, onSessionGone: () => { gone++; } });
+      expect(calls()).toBe(1);
+
+      ptys[0].emitExit(0);
+      await tick();
+      expect(gone).toBe(1);
+      expect(calls()).toBe(1); // never reattached into the reissued generation
+      expect(streamer.isDestroyed()).toBe(true);
+    });
+
+    it('treats a fresh servers same-name FOREIGN session as gone on reconnect (does not reattach into it)', async () => {
+      // Initial attach: our claim. Reconnect probe: same name but a DIFFERENT claim (a new tmux server
+      // reissued the name to another agent's session) — must be treated as gone, never reattached into.
+      const ptys = makePtys(2);
+      const { factory, calls } = countingFactory(ptys);
+      let probes = 0;
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('list-sessions')) {
+          probes += 1;
+          const claim = probes <= 2 ? 'dev-1' : 'someone-else';
+          return { stdout: `4242|1700000000|$1|${claim}\n`, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      let gone = 0;
+      const { streamer } = makeStreamer({ ptyFactory: factory, runner });
+      await streamer.subscribeAtomic({ onLive: () => undefined, onSessionGone: () => { gone++; } });
+      expect(calls()).toBe(1);
+
+      ptys[0].emitExit(0);
+      await tick();
+      expect(gone).toBe(1);
+      expect(calls()).toBe(1); // never reattached into the foreign session
+      expect(streamer.isDestroyed()).toBe(true);
     });
 
     it('fires onSessionGone for all subscribers when tmux session is gone', async () => {
@@ -423,36 +523,118 @@ describe('PaneStreamer', () => {
       await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow(/destroyed/);
     });
 
-    it('kills a replacement PTY if tmux disappears during the session-gone probe window', async () => {
+    it('does not reattach and marks gone when the reconnect ownership probe resolves foreign/absent', async () => {
       const ptys = makePtys(2);
       const { factory, calls } = countingFactory(ptys);
       let resolveProbe!: (value: ExecResult) => void;
       let probeStarted!: () => void;
       const probeStartedPromise = new Promise<void>((resolve) => { probeStarted = resolve; });
+      let probes = 0;
       const runner = mockRunner();
       runner.exec.mockImplementation(async (cmd: string) => {
-        if (cmd.includes('has-session')) {
+        if (cmd.includes('list-sessions')) {
+          probes += 1;
+          // probes 1-2 = initial attach + post-attach handshake (owned); probe 3 = the delayed reconnect probe.
+          if (probes <= 2) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
           probeStarted();
-          return new Promise<ExecResult>((resolve) => { resolveProbe = resolve; });
+          return new Promise<ExecResult>((resolve) => { resolveProbe = resolve; }); // reconnect probe: delayed
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
       const { streamer } = makeStreamer({ ptyFactory: factory, runner, reattachDelayMs: 1000 });
       await streamer.subscribeAtomic(cbs);
+      expect(calls()).toBe(1);
 
       ptys[0].emitExit(0);
       await probeStartedPromise;
-      await streamer.sendInput('x');
-      expect(calls()).toBe(2);
-      expect(ptys[1].writes).toEqual(['x']);
-      expect(ptys[1].killCalled).toBe(0);
+      // The reconnect probe is still pending: no replacement PTY is spawned into an unverified session.
+      expect(calls()).toBe(1);
 
-      resolveProbe({ stdout: '', stderr: "can't find session: dev-1", exitCode: 1 });
+      resolveProbe({ stdout: '', stderr: '', exitCode: 0 }); // no matching session → gone/foreign
       await tick();
 
       expect(streamer.isDestroyed()).toBe(true);
-      expect(ptys[1].killCalled).toBe(1);
+      expect(calls()).toBe(1); // never reattached
       expect(_sessionGoneCalls).toBe(1);
+    });
+
+    it('post-attach handshake tears down before Web I/O when the connected session is a reissued generation', async () => {
+      // probe→restart→same-name→attach: a server restart lands between the guard probe and attach-session,
+      // so the PTY connects to a fresh-server successor. The post-attach handshake (probe 2) must catch the
+      // new generation and tear down BEFORE any data is broadcast, rather than stream a foreign session.
+      const ptys = makePtys(2);
+      const { factory, calls } = countingFactory(ptys);
+      let probes = 0;
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('list-sessions')) {
+          probes += 1;
+          const pid = probes === 1 ? '4242' : '9999'; // probe 1 pins 4242; post-attach handshake sees fresh 9999
+          return { stdout: `${pid}|1700000000|$1|dev-1\n`, stderr: '', exitCode: 0 };
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      const { streamer } = makeStreamer({ ptyFactory: factory, runner });
+
+      await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow(/destroyed/i);
+      expect(streamer.isDestroyed()).toBe(true);
+      expect(calls()).toBe(1); // the attach PTY was spawned then killed; the foreign session was never streamed
+    });
+
+    it('post-attach handshake fails closed on an uncertain probe: tears down the PTY, never streams unverified', async () => {
+      const ptys = makePtys(2);
+      const { factory } = countingFactory(ptys);
+      let probes = 0;
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('list-sessions')) {
+          probes += 1;
+          if (probes === 1) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }; // pre-attach: owned
+          throw new Error('probe timeout'); // post-attach handshake: transport-uncertain
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      const live: string[] = [];
+      const { streamer } = makeStreamer({ ptyFactory: factory, runner, reattachDelayMs: 100_000 });
+      await streamer.subscribeAtomic({ onLive: (d) => live.push(d), onSessionGone: () => undefined });
+
+      // The uncertain post-attach probe tore the just-attached PTY down (fail closed); nothing was streamed.
+      expect(ptys[0].killCalled).toBeGreaterThanOrEqual(1);
+      expect(live).toEqual([]);
+      streamer.destroy();
+    });
+
+    it('quarantines PTY output during the handshake and discards it when the session proves foreign (never streams unverified bytes)', async () => {
+      const ptys = makePtys(1);
+      const { factory } = countingFactory(ptys);
+      let probes = 0;
+      let resolvePostAttach!: (v: ExecResult) => void;
+      let postAttachStarted!: () => void;
+      const postAttachStartedP = new Promise<void>((r) => { postAttachStarted = r; });
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (cmd.includes('list-sessions')) {
+          probes += 1;
+          if (probes === 1) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }; // pre-attach: owned
+          postAttachStarted();
+          return new Promise<ExecResult>((resolve) => { resolvePostAttach = resolve; }); // post-attach: delayed
+        }
+        return { stdout: '', stderr: '', exitCode: 0 };
+      });
+      const live: string[] = [];
+      const { streamer } = makeStreamer({ ptyFactory: factory, runner });
+      const subP = streamer.subscribeAtomic({ onLive: (d) => live.push(d), onSessionGone: () => undefined }).catch(() => undefined);
+
+      await postAttachStartedP; // PTY attached + onData wired; handshake pending
+      ptys[0].emitData('unverified-foreign-bytes');
+      await tick();
+      expect(live).toEqual([]); // quarantined, not broadcast while unverified
+
+      resolvePostAttach({ stdout: '9999|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }); // fresh server → foreign
+      await subP;
+      await tick();
+      expect(live).toEqual([]); // the unverified bytes were discarded, never streamed
+      expect(streamer.isDestroyed()).toBe(true);
     });
   });
 
@@ -593,88 +775,54 @@ describe('PaneStreamer', () => {
   });
 
   describe('resize', () => {
-    it('updates headless cols/rows + calls TmuxManager.resizeWindow', async () => {
-      const { streamer, runner } = await subscribed();
-      await streamer.resize(160, 40);
-      const resizeCmd = findCmd(runner, c => c.includes('tmux resize-window'));
-      expect(resizeCmd).toBeDefined();
-      expect(resizeCmd).toContain('-x 160');
-      expect(resizeCmd).toContain('-y 40');
-      expect(resizeCmd).toContain("-t '=dev-1'");
-      await expectDims(streamer, 160, 40);
-      streamer.destroy();
-    });
-
-    it('restores window-size=latest after explicit web resize so the latest attached client controls size', async () => {
-      const { streamer, runner } = await subscribed();
-      await streamer.resize(160, 40);
-      const latestCall = findCmd(runner, c =>
-        c.includes('tmux set-option') && c.includes('window-size') && c.includes('latest'),
-      );
-      expect(latestCall).toBeDefined();
-      streamer.destroy();
-    });
-
-    it('also resizes the attach PTY so tmux client viewport tracks web terminal (mouse hit-testing depends on it)', async () => {
-      const { streamer, fakePty } = await subscribed();
-      const beforeResizes = fakePty.resizeCalls.length;
-      await streamer.resize(160, 40);
-      expect(fakePty.resizeCalls.slice(beforeResizes)).toEqual([{ cols: 160, rows: 40 }]);
-      streamer.destroy();
-    });
-
-    it('still resizes tmux when requested dimensions match headless so web can reclaim latest sizing', async () => {
+it('without geometry hooks: local pty+headless resize only, zero tmux writes', async () => {
       const { streamer, runner, fakePty } = await subscribed();
+      mockSessionSnapshot(runner);
       const beforeExecs = runner.exec.mock.calls.length;
-      await streamer.resize(200, 50);
-      expect(runner.exec.mock.calls.length).toBeGreaterThan(beforeExecs);
-      const resizeCmd = findCmd(runner, c =>
-        c.includes('tmux resize-window') && c.includes('-x 200') && c.includes('-y 50'),
-      );
-      expect(resizeCmd).toBeDefined();
-      expect(fakePty.resizeCalls).toEqual([{ cols: 200, rows: 50 }]);
-      await expectDims(streamer, 200, 50);
+      await streamer.resize(160, 40);
+      expect(fakePty.resizeCalls).toEqual([{ cols: 160, rows: 40 }]);
+      await expectDims(streamer, 160, 40);
+      expect(runner.exec.mock.calls.length).toBe(beforeExecs);
       streamer.destroy();
     });
 
-    it('still resizes PTY/headless when window-size=latest repair fails after tmux resize succeeds', async () => {
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      try {
-        const { streamer, runner, fakePty } = await subscribed();
-        runner.exec.mockImplementation(async (cmd: string) =>
-          cmd.includes('set-option') && cmd.includes('window-size') && cmd.includes('latest')
-            ? { stdout: '', stderr: 'bad option', exitCode: 1 }
-            : { stdout: '', stderr: '', exitCode: 0 },
-        );
-        await streamer.resize(160, 40);
-        expect(fakePty.resizeCalls).toEqual([{ cols: 160, rows: 40 }]);
-        await expectDims(streamer, 160, 40);
-        expect(warnSpy).toHaveBeenCalledWith(
-          '[pane-streamer] set window-size=latest failed after resize(dev-1):',
-          expect.any(Error),
-        );
-        streamer.destroy();
-      } finally {
-        warnSpy.mockRestore();
-      }
+    it('with geometry hooks: records full target before committing the owner write', async () => {
+      const calls: string[] = [];
+      const hooks = stubGeometryHooks({
+        recordFullTarget: (size) => { calls.push(`target:${size.cols}x${size.rows}`); },
+        commitOwnerResize: async () => { calls.push('commit'); },
+      });
+      const { streamer, fakePty } = await subscribed({ geometry: hooks });
+      await streamer.resize(120, 30);
+      expect(calls).toEqual(['target:120x30', 'commit']);
+      expect(fakePty.resizeCalls.at(-1)).toEqual({ cols: 120, rows: 30 });
+      await expectDims(streamer, 120, 30);
+      streamer.destroy();
     });
 
-    it('tmux resize failure leaves headless dims AND PTY size unchanged (atomic rollback)', async () => {
-      const { streamer, runner, fakePty } = await subscribed();
-      const beforeCols = (await streamer.getSnapshotAtomic()).snapshot.cols;
-      const beforeRows = (await streamer.getSnapshotAtomic()).snapshot.rows;
-      const beforePtyResizes = fakePty.resizeCalls.length;
-      runner.exec.mockImplementationOnce(async (cmd: string) =>
-        cmd.includes('resize-window')
-          ? { stdout: '', stderr: 'session not found', exitCode: 1 }
-          : { stdout: '', stderr: '', exitCode: 0 },
-      );
-      await expect(streamer.resize(999, 999)).rejects.toThrow();
-      const after = await streamer.getSnapshotAtomic();
-      expect(after.snapshot.cols).toBe(beforeCols);
-      expect(after.snapshot.rows).toBe(beforeRows);
-      expect(fakePty.resizeCalls.length).toBe(beforePtyResizes);
+    it('owner commit rejection propagates but the local stream keeps the new size (target survives in owner state)', async () => {
+      const hooks = stubGeometryHooks({
+        commitOwnerResize: async () => { throw new Error('deadline'); },
+      });
+      const { streamer, fakePty } = await subscribed({ geometry: hooks });
+      await expect(streamer.resize(90, 22)).rejects.toThrow('deadline');
+      expect(fakePty.resizeCalls.at(-1)).toEqual({ cols: 90, rows: 22 });
+      await expectDims(streamer, 90, 22);
       streamer.destroy();
+    });
+
+    it('resize schedules a preview snapshot refresh with the new geometry', async () => {
+      const hooks = stubGeometryHooks();
+      const made = makeStreamer({ geometry: hooks });
+      const refreshes: Array<{ cols: number; rows: number }> = [];
+      await made.streamer.subscribeAtomic({
+        ...cbs,
+        onSnapshotRefresh: (snap) => { refreshes.push({ cols: snap.cols, rows: snap.rows }); },
+      });
+      await made.streamer.resize(100, 25);
+      await flush(made.streamer);
+      expect(refreshes.at(-1)).toEqual({ cols: 100, rows: 25 });
+      made.streamer.destroy();
     });
   });
 
@@ -840,5 +988,479 @@ describe('ensureSpawnHelperExecutable', () => {
     expect(() =>
       ensureSpawnHelperExecutable('', { chmod: mustNotRun, load: mustNotRun, canExecute: () => false }),
     ).not.toThrow();
+  });
+});
+
+describe('attach capability handshake', () => {
+  function recordingFactory(probeOutputs: Array<string | null>): {
+    factory: PtyFactory;
+    attachCmds: string[];
+    probeCount: () => number;
+  } {
+    let probes = 0;
+    const attachCmds: string[] = [];
+    const factory: PtyFactory = (cmd) => {
+      const script = cmd.args.join(' ');
+      if (script.includes('tmux -V')) {
+        const out = probeOutputs[Math.min(probes, probeOutputs.length - 1)];
+        probes++;
+        const pty = createFakePty();
+        queueMicrotask(() => {
+          if (out !== null) pty.emitData(out);
+          pty.emitExit(0);
+        });
+        return pty;
+      }
+      attachCmds.push(script);
+      return createFakePty();
+    };
+    return { factory, attachCmds, probeCount: () => probes };
+  }
+
+  it('parseAttachFlagCapability: >=3.2 true, <3.2 false, garbage null', () => {
+    expect(parseAttachFlagCapability('tmux 3.2a\n')).toBe(true);
+    expect(parseAttachFlagCapability('tmux 3.6a\n')).toBe(true);
+    expect(parseAttachFlagCapability('tmux next-3.7\n')).toBe(true);
+    expect(parseAttachFlagCapability('tmux 3.1c\n')).toBe(false);
+    expect(parseAttachFlagCapability('tmux 2.9\n')).toBe(false);
+    expect(parseAttachFlagCapability('zsh: command not found\n')).toBeNull();
+  });
+
+  it('known >=3.2: attach carries -f ignore-size and the capability is cached per instance', async () => {
+    const { factory, attachCmds, probeCount } = recordingFactory(['tmux 3.6a\n']);
+    const { streamer } = makeStreamer({
+      ptyFactory: factory,
+      geometry: stubGeometryHooks({ raceProbe: (start) => start().result }),
+    });
+    await streamer.subscribeAtomic(cbs);
+    expect(attachCmds[0]).toContain('attach-session -f ignore-size -t');
+    expect(probeCount()).toBe(1);
+    streamer.destroy();
+  });
+
+  it('known <3.2: no flag, cached (no re-probe on reattach)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const ptys = [createFakePty(), createFakePty()];
+      let attaches = 0;
+      const attachCmds: string[] = [];
+      let probes = 0;
+      const factory: PtyFactory = (cmd) => {
+        const script = cmd.args.join(' ');
+        if (script.includes('tmux -V')) {
+          probes++;
+          const pty = createFakePty();
+          queueMicrotask(() => { pty.emitData('tmux 3.1c\n'); pty.emitExit(0); });
+          return pty;
+        }
+        attachCmds.push(script);
+        return ptys[attaches++];
+      };
+      const { streamer } = makeStreamer({
+        ptyFactory: factory,
+        geometry: stubGeometryHooks({ raceProbe: (start) => start().result }),
+        reattachDelayMs: 0,
+      });
+      await streamer.subscribeAtomic(cbs);
+      expect(attachCmds[0]).not.toContain('ignore-size');
+      ptys[0].emitExit();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(attaches).toBe(2);
+      expect(attachCmds[1]).not.toContain('ignore-size');
+      expect(probes).toBe(1);
+      streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('unparseable probe output: flagless this spawn, NOT cached (re-probed on reattach)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const ptys = [createFakePty(), createFakePty()];
+      let attaches = 0;
+      const attachCmds: string[] = [];
+      let probes = 0;
+      const factory: PtyFactory = (cmd) => {
+        const script = cmd.args.join(' ');
+        if (script.includes('tmux -V')) {
+          const out = probes === 0 ? 'command not found\n' : 'tmux 3.6a\n';
+          probes++;
+          const pty = createFakePty();
+          queueMicrotask(() => { pty.emitData(out); pty.emitExit(0); });
+          return pty;
+        }
+        attachCmds.push(script);
+        return ptys[attaches++];
+      };
+      const { streamer } = makeStreamer({
+        ptyFactory: factory,
+        geometry: stubGeometryHooks({ raceProbe: (start) => start().result }),
+        reattachDelayMs: 0,
+      });
+      await streamer.subscribeAtomic(cbs);
+      expect(attachCmds[0]).not.toContain('ignore-size');
+      ptys[0].emitExit();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(probes).toBe(2);
+      expect(attachCmds[1]).toContain('ignore-size');
+      streamer.destroy();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('probe rejection (deadline/admission): flagless spawn, subscribe still completes', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const attachCmds: string[] = [];
+      const factory: PtyFactory = (cmd) => {
+        const script = cmd.args.join(' ');
+        if (!script.includes('tmux -V')) attachCmds.push(script);
+        return createFakePty();
+      };
+      const hooks = stubGeometryHooks({
+        raceProbe: () => Promise.reject(new Error('geometry settle deadline (6000ms) exceeded')),
+      });
+      const { streamer } = makeStreamer({ ptyFactory: factory, geometry: hooks });
+      const result = await streamer.subscribeAtomic(cbs);
+      expect(result.snapshot.cols).toBe(200);
+      expect(attachCmds[0]).not.toContain('ignore-size');
+      streamer.destroy();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe('spawn geometry baseline', () => {
+  const GEOM = (w: number, h: number, mode = 'latest'): import('../../src/agent/tmux.js').WindowGeometry => ({
+    width: w,
+    height: h,
+    statusLines: 1,
+    sizeMode: mode,
+    ownerGen: null,
+    ref: { serverPid: '1', serverStart: '2', sessionId: '$3' },
+    fencedCapable: true,
+  });
+
+  it('flagged + holds==0: headless AND pty spawn at desiredTty (W + status lines)', async () => {
+    const { factory, attachSizes } = sizeRecordingFactory();
+    const hooks = stubGeometryHooks({
+      raceProbe: probeAnswer('tmux 3.6a\n'),
+      readGeometry: async () => GEOM(100, 30),
+    });
+    const made = makeStreamer({ ptyFactory: factory, geometry: hooks });
+    const result = await made.streamer.subscribeAtomic(cbs);
+    // subscribeAtomic snapshot is taken after spawn: already at the aligned size.
+    expect(result.snapshot.cols).toBe(100);
+    expect(result.snapshot.rows).toBe(31);
+    expect(attachSizes[0]).toEqual({ cols: 100, rows: 31 });
+    made.streamer.destroy();
+  });
+
+  it('reattach baseline change re-baselines an ACTIVE preview via snapshot refresh (no stale geometry residue)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let width = 100;
+      const attachPtys = [createFakePty(), createFakePty()];
+      let attaches = 0;
+      const factory: PtyFactory = (cmd) => {
+        if (cmd.args.join(' ').includes('tmux -V')) {
+          const pty = createFakePty();
+          queueMicrotask(() => { pty.emitData('tmux 3.6a\n'); pty.emitExit(0); });
+          return pty;
+        }
+        return attachPtys[attaches++];
+      };
+      const hooks = stubGeometryHooks({
+        raceProbe: (start) => start().result,
+        readGeometry: async () => GEOM(width, 30),
+      });
+      const made = makeStreamer({ ptyFactory: factory, geometry: hooks, reattachDelayMs: 0 });
+      const refreshes: Array<{ cols: number; rows: number }> = [];
+      await made.streamer.subscribeAtomic({
+        ...cbs,
+        onSnapshotRefresh: (snap) => refreshes.push({ cols: snap.cols, rows: snap.rows }),
+      });
+      expect(made.streamer.size).toEqual({ cols: 100, rows: 31 });
+
+      width = 120;
+      attachPtys[0].emitExit();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(attaches).toBe(2);
+      expect(made.streamer.size).toEqual({ cols: 120, rows: 31 });
+      made.streamer._waitForChainDrain();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(refreshes.at(-1)).toEqual({ cols: 120, rows: 31 });
+      made.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('geometry read failure: spawn keeps current headless size (todays behavior)', async () => {
+    const { factory, attachSizes } = sizeRecordingFactory();
+    const hooks = stubGeometryHooks({
+      raceProbe: probeAnswer('tmux 3.6a\n'),
+      readGeometry: async () => { throw new Error('deadline'); },
+    });
+    const made = makeStreamer({ ptyFactory: factory, geometry: hooks });
+    const result = await made.streamer.subscribeAtomic(cbs);
+    expect(result.snapshot.cols).toBe(200);
+    expect(result.snapshot.rows).toBe(50);
+    expect(attachSizes[0]).toEqual({ cols: 200, rows: 50 });
+    made.streamer.destroy();
+  });
+
+  it('holds>0: baseline skipped entirely (web owns geometry), zero geometry reads', async () => {
+    let reads = 0;
+    const { factory, attachSizes } = sizeRecordingFactory();
+    const hooks = stubGeometryHooks({
+      raceProbe: probeAnswer('tmux 3.6a\n'),
+      fullHolds: () => 1,
+      readGeometry: async () => { reads++; return GEOM(100, 30); },
+    });
+    const made = makeStreamer({ ptyFactory: factory, geometry: hooks });
+    await made.streamer.subscribeAtomic(cbs);
+    expect(reads).toBe(0);
+    expect(attachSizes[0]).toEqual({ cols: 200, rows: 50 });
+    made.streamer.destroy();
+  });
+
+  it('holds flipping 0→1 during the read: baseline abandoned (zero change)', async () => {
+    let holds = 0;
+    const { factory, attachSizes } = sizeRecordingFactory();
+    const hooks = stubGeometryHooks({
+      raceProbe: probeAnswer('tmux 3.6a\n'),
+      fullHolds: () => holds,
+      readGeometry: async () => {
+        holds = 1;
+        return GEOM(100, 30);
+      },
+    });
+    const made = makeStreamer({ ptyFactory: factory, geometry: hooks });
+    const result = await made.streamer.subscribeAtomic(cbs);
+    expect(result.snapshot.cols).toBe(200);
+    expect(attachSizes[0]).toEqual({ cols: 200, rows: 50 });
+    made.streamer.destroy();
+  });
+
+  function sizeRecordingFactory(): { factory: PtyFactory; attachSizes: Array<{ cols: number; rows: number }> } {
+    const attachSizes: Array<{ cols: number; rows: number }> = [];
+    const factory: PtyFactory = (cmd, cols, rows) => {
+      const script = cmd.args.join(' ');
+      if (script.includes('tmux -V')) {
+        const pty = createFakePty();
+        queueMicrotask(() => { pty.emitData('tmux 3.6a\n'); pty.emitExit(0); });
+        return pty;
+      }
+      attachSizes.push({ cols, rows });
+      return createFakePty();
+    };
+    return { factory, attachSizes };
+  }
+
+  function probeAnswer(version: string): StreamerGeometryHooks['raceProbe'] {
+    return (<T>(_start: () => ProbeHandle<T>) => Promise.resolve(version as T)) as StreamerGeometryHooks['raceProbe'];
+  }
+});
+
+describe('viewport follow tick', () => {
+  const GEOM = (w: number, h: number, mode = 'latest'): import('../../src/agent/tmux.js').WindowGeometry => ({
+    width: w,
+    height: h,
+    statusLines: 1,
+    sizeMode: mode,
+    ownerGen: null,
+    ref: { serverPid: '1', serverStart: '2', sessionId: '$3' },
+    fencedCapable: true,
+  });
+
+  function flaggedFactory(attachPty: FakePty): PtyFactory {
+    return (cmd) => {
+      if (cmd.args.join(' ').includes('tmux -V')) {
+        const pty = createFakePty();
+        queueMicrotask(() => { pty.emitData('tmux 3.6a\n'); pty.emitExit(0); });
+        return pty;
+      }
+      return attachPty;
+    };
+  }
+
+  async function followHarness(opts: {
+    geom: () => Promise<import('../../src/agent/tmux.js').WindowGeometry>;
+    holds?: () => number;
+    noteManualSeen?: () => void;
+  }): Promise<{ streamer: PaneStreamer; attachPty: FakePty; reads: () => number }> {
+    let reads = 0;
+    const attachPty = createFakePty();
+    const hooks = stubGeometryHooks({
+      raceProbe: (start) => start().result,
+      fullHolds: opts.holds ?? (() => 0),
+      readGeometry: async () => { reads++; return opts.geom(); },
+      noteManualSeen: opts.noteManualSeen ?? (() => undefined),
+    });
+    const made = makeStreamer({
+      ptyFactory: flaggedFactory(attachPty),
+      geometry: hooks,
+      windowFollowIntervalMs: 200,
+    });
+    await made.streamer.subscribeAtomic(cbs);
+    return { streamer: made.streamer, attachPty, reads: () => reads };
+  }
+
+  it('external W change: pty+headless follow desiredTty and previews get a refresh', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      let width = 100;
+      const h = await followHarness({ geom: async () => GEOM(width, 30) });
+      expect(h.streamer.size).toEqual({ cols: 100, rows: 31 });
+
+      width = 140;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(h.streamer.size).toEqual({ cols: 140, rows: 31 });
+      expect(h.attachPty.resizeCalls.at(-1)).toEqual({ cols: 140, rows: 31 });
+      h.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('geometry unchanged: tick is a pure read, zero resizes', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      const h = await followHarness({ geom: async () => GEOM(100, 30) });
+      const before = h.attachPty.resizeCalls.length;
+      await vi.advanceTimersByTimeAsync(650);
+      expect(h.reads()).toBeGreaterThanOrEqual(2);
+      expect(h.attachPty.resizeCalls.length).toBe(before);
+      h.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('manual sizeMode: reports to the owner reconciler and never writes itself', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      let manualSeen = 0;
+      const h = await followHarness({
+        geom: async () => GEOM(100, 30, 'manual'),
+        noteManualSeen: () => { manualSeen++; },
+      });
+      const before = h.attachPty.resizeCalls.length;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(manualSeen).toBe(1);
+      expect(h.attachPty.resizeCalls.length).toBe(before);
+      h.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds>0 suspends follow reads entirely', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      const h = await followHarness({ geom: async () => GEOM(100, 30), holds: () => 1 });
+      const baseline = h.reads();
+      await vi.advanceTimersByTimeAsync(650);
+      expect(h.reads()).toBe(baseline);
+      h.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('read failures warn once, stay silent, and recovery is logged', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      let fail = true;
+      const h = await followHarness({
+        geom: async () => {
+          if (fail) throw new Error('ssh flake');
+          return GEOM(100, 30);
+        },
+      });
+      await vi.advanceTimersByTimeAsync(650);
+      const followWarns = warnSpy.mock.calls.filter((c) => String(c[0]).includes('follow geometry read failing'));
+      expect(followWarns.length).toBe(1);
+
+      fail = false;
+      await vi.advanceTimersByTimeAsync(250);
+      const recoveries = logSpy.mock.calls.filter((c) => String(c[0]).includes('follow geometry read recovered'));
+      expect(recoveries.length).toBe(1);
+      h.streamer.destroy();
+    } finally {
+      warnSpy.mockRestore();
+      logSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('singleflight: a hung read spans intervals without stacking concurrent reads', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      let tickReads = 0;
+      let baselineDone = false;
+      let release: (() => void) | null = null;
+      const h = await followHarness({
+        geom: () => {
+          // The spawn baseline read must complete or subscribe never returns.
+          if (!baselineDone) {
+            baselineDone = true;
+            return Promise.resolve(GEOM(100, 30));
+          }
+          tickReads++;
+          return new Promise((resolve) => {
+            release = () => resolve(GEOM(100, 30));
+          });
+        },
+      });
+      await vi.advanceTimersByTimeAsync(850);
+      expect(tickReads).toBe(1);
+      release!();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(tickReads).toBe(2);
+      h.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('flagless pty (unknown capability) never arms the follow timer', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      let reads = 0;
+      const hooks = stubGeometryHooks({
+        raceProbe: () => Promise.reject(new Error('probe deadline')),
+        readGeometry: async () => { reads++; return GEOM(100, 30); },
+      });
+      const made = makeStreamer({ geometry: hooks, windowFollowIntervalMs: 200 });
+      await made.streamer.subscribeAtomic(cbs);
+      await vi.advanceTimersByTimeAsync(650);
+      expect(reads).toBe(0);
+      made.streamer.destroy();
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('normalizeFollowIntervalMs: invalid values fall back to the default, floor clamps apply, no disable value exists', () => {
+    expect(normalizeFollowIntervalMs(undefined)).toBe(1500);
+    expect(normalizeFollowIntervalMs(0)).toBe(1500);
+    expect(normalizeFollowIntervalMs(-5)).toBe(1500);
+    expect(normalizeFollowIntervalMs(Number.NaN)).toBe(1500);
+    expect(normalizeFollowIntervalMs(50)).toBe(200);
+    expect(normalizeFollowIntervalMs(2000)).toBe(2000);
   });
 });

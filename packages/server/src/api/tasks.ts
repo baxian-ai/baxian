@@ -13,6 +13,7 @@ import {
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
 import { createRunner } from '../agent/runner.js';
 import { buildGithubReviewConversation } from '../github/pr-conversation.js';
+import { PrConversationCache, githubReviewRevision } from '../github/pr-conversation-cache.js';
 import { enrichTaskSnapshot } from '../state/snapshot.js';
 
 const TITLE_MAX_LEN = 200;
@@ -98,6 +99,7 @@ interface DispatchTaskBody {
 }
 
 export async function taskRoutes(app: FastifyInstance): Promise<void> {
+  const prConversationCache = new PrConversationCache();
   app.get<{ Querystring: TaskQuery }>('/tasks', async (request, reply) => {
     const projectId = typeof request.query.projectId === 'string' ? request.query.projectId.trim() : '';
     if (projectId.length === 0) {
@@ -294,7 +296,13 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       return reply.send({ available: false, reason: 'not-github', items: empty });
     }
     const runner = app.ctx.githubRunner ?? createRunner('local');
-    const convo = await buildGithubReviewConversation(runner, repoSlug(repo), task.prNumber);
+    const slug = repoSlug(repo);
+    const prNumber = task.prNumber;
+    const convo = await prConversationCache.get(
+      task.id,
+      githubReviewRevision(task, slug),
+      () => buildGithubReviewConversation(runner, slug, prNumber),
+    );
     return reply.send({
       available: true,
       prNumber: task.prNumber,

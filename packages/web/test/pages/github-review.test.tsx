@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { GithubReviewConversation } from '../../src/shared/index.js';
 
@@ -56,6 +56,129 @@ describe('GithubReviewPage', () => {
     expect(screen.getByText('please fix')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
+  });
+
+  it('anchors every item card with a stable DOM id', async () => {
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [
+        { kind: 'review-comment', id: '21', body: 'nit', path: 'a.ts', line: 12, createdAt: '2026-06-01T10:00:00Z' },
+        { kind: 'commit', id: 'sha12345678', body: 'fix: thing', commitSha: 'sha12345678', createdAt: '2026-06-01T10:05:00Z' },
+        { kind: 'review', id: '11', body: 'please fix', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
+      ],
+    } as GithubReviewConversation);
+    renderAt('/tasks/task-1/github-review');
+    await screen.findByText('please fix');
+    expect(document.getElementById('gh-review-comment-21')).not.toBeNull();
+    expect(document.getElementById('gh-commit-sha12345678')).not.toBeNull();
+    expect(document.getElementById('gh-review-11')).not.toBeNull();
+  });
+
+  it('scrolls to and flashes the item targeted by the location hash', async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [
+        { kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
+        { kind: 'review', id: '11', body: 'please fix', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
+      ],
+    } as GithubReviewConversation);
+    renderAt('/tasks/task-1/github-review#gh-review-11');
+    await screen.findByText('please fix');
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(document.getElementById('gh-review-11')?.className).toContain('ring-2');
+    expect(document.getElementById('gh-commit-c1')?.className).not.toContain('ring-2');
+  });
+
+  it('retries the anchor when a same-task refetch adds the target record', async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    ghMock
+      .mockResolvedValueOnce({
+        available: true,
+        prNumber: 7,
+        items: [{ kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' }],
+      } as GithubReviewConversation)
+      .mockResolvedValueOnce({
+        available: true,
+        prNumber: 7,
+        items: [
+          { kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
+          { kind: 'review', id: '11', body: 'late review', verdict: 'approve', createdAt: '2026-06-01T10:10:00Z' },
+        ],
+      } as GithubReviewConversation);
+
+    const tree = () => (
+      <MemoryRouter initialEntries={['/tasks/task-1/github-review#gh-review-11']}>
+        <Routes>
+          <Route path="/tasks/:taskId/github-review" element={<GithubReviewPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    const view = render(tree());
+    await screen.findByText('fix');
+    expect(scrollSpy).not.toHaveBeenCalled();
+
+    useTaskMock.mockReturnValue({
+      data: { id: 'task-1', title: 'My Task', reviewRound: 2, status: 'review' },
+      loaded: true,
+      error: null,
+    });
+    view.rerender(tree());
+
+    await screen.findByText('late review');
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    expect(document.getElementById('gh-review-11')?.className).toContain('ring-2');
+  });
+
+  it('treats a malformed percent-encoded hash as an anchor miss instead of crashing', async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [{ kind: 'review', id: '11', body: 'ok', verdict: 'approve', createdAt: '2026-06-01T10:10:00Z' }],
+    } as GithubReviewConversation);
+    renderAt('/tasks/task-1/github-review#%E0%A4%A');
+    expect(await screen.findByText('ok')).toBeTruthy();
+    expect(scrollSpy).not.toHaveBeenCalled();
+    expect(document.querySelector('.ring-2')).toBeNull();
+  });
+
+  it('stays at the top without error when the hash matches no item', async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [{ kind: 'review', id: '11', body: 'ok', verdict: 'approve', createdAt: '2026-06-01T10:10:00Z' }],
+    } as GithubReviewConversation);
+    renderAt('/tasks/task-1/github-review#gh-review-gone');
+    await screen.findByText('ok');
+    expect(scrollSpy).not.toHaveBeenCalled();
+  });
+
+  it('renders review and comment bodies as basic markdown but keeps commit subjects literal', async () => {
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [
+        { kind: 'commit', id: 'c1', body: 'fix: keep **stars**', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
+        { kind: 'issue-comment', id: 'i1', body: 'see `path/file` please', createdAt: '2026-06-01T10:05:00Z' },
+        { kind: 'review', id: '11', body: '# Verdict\n**needs** work', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
+      ],
+    } as GithubReviewConversation);
+    renderAt('/tasks/task-1/github-review');
+    await screen.findByText(/needs/);
+    expect(document.querySelector('code')?.textContent).toBe('path/file');
+    const h1 = document.querySelector('h1.text-\\[18px\\]');
+    expect(h1?.textContent).toBe('# Verdict');
+    expect(Array.from(document.querySelectorAll('strong')).some((el) => el.textContent === 'needs')).toBe(true);
+    expect(document.getElementById('gh-commit-c1')?.textContent).toContain('fix: keep **stars**');
+    expect(document.getElementById('gh-commit-c1')?.querySelector('strong')).toBeNull();
   });
 
   it('shows a reason message when records are unavailable', async () => {

@@ -21,6 +21,7 @@ interface SubState {
   agentId: string;
   mode: StreamSubMode;
   phase: 'pending' | 'active' | 'released';
+  releaseFullHold?: () => void;
 }
 
 interface AgentEntry {
@@ -83,6 +84,12 @@ function handleConnection(
     if (!s || s.phase === 'released') return;
     s.phase = 'released';
     subs.delete(subscriberId);
+    try {
+      s.releaseFullHold?.();
+    } catch (err) {
+      console.warn('[stream-ws] releaseFullHold failed:', err);
+    }
+    s.releaseFullHold = undefined;
     const entry = agentSubs.get(s.agentId);
     if (entry && --entry.refcount <= 0) {
       try {
@@ -160,6 +167,22 @@ function handleConnection(
               if (s.agentId === agentId) releaseSub(sid);
             }
           },
+          // Server-side geometry changes (external attach follow, spawn baseline,
+          // mixed full+preview resize) re-baseline previews; full subscribers keep
+          // their own resize/ack contract and must not receive these.
+          onSnapshotRefresh: (snapshot, seq) => {
+            for (const [sid, s] of subs) {
+              if (s.agentId !== agentId || s.mode !== 'preview' || s.phase !== 'active') continue;
+              safeSend({
+                type: 'snapshot',
+                subscriberId: sid,
+                cols: snapshot.cols,
+                rows: snapshot.rows,
+                data: snapshot.data,
+                snapshotSeq: seq,
+              });
+            }
+          },
         });
         snapshot = result.snapshot;
         snapshotSeq = result.snapshotSeq;
@@ -190,6 +213,9 @@ function handleConnection(
         agentEntry.unsubscribe = installUnsub;
       }
       subState.phase = 'active';
+      if (mode === 'full') {
+        subState.releaseFullHold = streamer.acquireFullHold();
+      }
       safeSend({
         type: 'snapshot',
         subscriberId,

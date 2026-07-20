@@ -162,6 +162,16 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         const currentWorkdirs = agentWorkdirRefs(current.project);
         const nextHosts = agentHostRefs(validated.project);
         const nextWorkdirs = agentWorkdirRefs(validated.project);
+        // A hot reload must not resurrect OR retain an id whose DELETE is in flight/diverged (fail-stop):
+        // checking only new ids let a PATCH move an existing deleting id (host/workdir unchanged) to another
+        // project and survive the DELETE's hash-mismatch removal. Any deleting id in the next config → 409.
+        for (const [agentId] of nextHosts) {
+          if (app.ctx.agentManager.isDeletionInFlight(agentId)) {
+            return reply.status(409).send({
+              error: `Agent id "${agentId}" is being deleted (or its deletion diverged); cannot keep or (re)introduce it via config reload`,
+            });
+          }
+        }
         const blockedHosts: string[] = [];
         const blockedWorkdirs: string[] = [];
         const blockedRemovals: string[] = [];
