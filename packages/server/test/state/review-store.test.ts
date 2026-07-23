@@ -2,8 +2,13 @@ import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ReviewStore } from '../../src/state/review-store.js';
-import type { ReviewRound } from '../../src/shared/index.js';
+import {
+  ReviewStore,
+  reviewFindingsDigest,
+  serverResponseFailureSignature,
+  sha256Hex,
+} from '../../src/state/review-store.js';
+import type { ReviewFindings, ReviewRound, ServerResponseFailure } from '../../src/shared/index.js';
 
 function round(overrides: Partial<ReviewRound> = {}): ReviewRound {
   return {
@@ -22,6 +27,34 @@ function specRound(roundNumber = 1, content = 'SPEC'): ReviewRound {
     content,
     documents: [{ relPath: '.baxian/spec.md', content }],
     startedAt: '2026-06-10T00:00:00.000Z',
+  };
+}
+
+const FINDINGS: ReviewFindings = {
+  round: 1,
+  verdict: 'request-changes',
+  findings: [
+    { id: 'f-2', severity: 'major', message: 'second' },
+    { id: 'f-1', severity: 'major', message: 'first' },
+  ],
+};
+
+function failure(
+  sourceToken: string,
+  failureSignature: string,
+  overrides: Partial<Omit<ServerResponseFailure, 'disposition'>> = {},
+): Omit<ServerResponseFailure, 'disposition'> {
+  return {
+    signalKind: 'code-fixed',
+    sourceToken,
+    successorToken: `${sourceToken.slice(0, 11)}f`,
+    failureSignature,
+    reason: 'coverage-gap',
+    missingFindingIds: ['f-1'],
+    unknownFindingIds: [],
+    schemaViolationCodes: [],
+    createdAt: '2026-06-10T00:01:00.000Z',
+    ...overrides,
   };
 }
 
@@ -111,6 +144,94 @@ describe.each([
       ...specRound(),
       content: 'tampered',
     })).rejects.toThrow('does not match documents');
+  });
+
+  it('digests the exact persisted aggregate findings JSON bytes', async () => {
+    await store.putRound('t1', 'code', round({ findings: FINDINGS }));
+    const persisted = (await store.getRound('t1', 'code', 1))!.findings!;
+    expect(reviewFindingsDigest(persisted)).toBe(sha256Hex(JSON.stringify(persisted)));
+    expect(reviewFindingsDigest(persisted)).not.toBe(
+      reviewFindingsDigest({ ...persisted, findings: [...persisted.findings].reverse() }),
+    );
+  });
+
+  it('uses a stable logical signature independent of raw response presentation', () => {
+    const digest = reviewFindingsDigest(FINDINGS);
+    const first = serverResponseFailureSignature({
+      phase: 'code', round: 1, findingsDigest: digest, reason: 'coverage-gap',
+      missingFindingIds: ['f-2', 'f-1'], unknownFindingIds: ['old-2', 'old-1'],
+    });
+    const rewritten = serverResponseFailureSignature({
+      phase: 'code', round: 1, findingsDigest: digest, reason: 'coverage-gap',
+      missingFindingIds: ['f-1', 'f-2'], unknownFindingIds: ['old-1', 'old-2'],
+    });
+    expect(rewritten).toBe(first);
+  });
+
+  it('archives exact raw responses idempotently and stops a repeated logical failure', async () => {
+    await store.putRound('t1', 'code', round({ findings: FINDINGS }));
+    const signature = serverResponseFailureSignature({
+      phase: 'code', round: 1, findingsDigest: reviewFindingsDigest(FINDINGS), reason: 'coverage-gap',
+      missingFindingIds: ['f-1'],
+    });
+    const raw = '{\n  "round": 1, "responses": []\n}\n';
+    const first = await store.recordServerResponseFailure('t1', 'code', 1, failure(
+      '000000000001', signature, { rawResponse: raw, responseDigest: sha256Hex(raw) },
+    ));
+    const duplicateDelivery = await store.recordServerResponseFailure('t1', 'code', 1, failure(
+      '000000000001', 'f'.repeat(64), { rawResponse: 'changed after retry' },
+    ));
+    const rewritten = await store.recordServerResponseFailure('t1', 'code', 1, failure(
+      '000000000002', signature, { rawResponse: '{"responses":[]}', responseDigest: sha256Hex('{"responses":[]}') },
+    ));
+
+    expect(first.disposition).toBe('auto-correct');
+    expect(first.rawResponse).toBe(raw);
+    expect(duplicateDelivery).toEqual(first);
+    expect(rewritten.disposition).toBe('hold-repeated-signature');
+    expect((await store.getRound('t1', 'code', 1))?.serverResponseFailures).toHaveLength(2);
+  });
+
+  it.each([
+    ['phase-mismatched signal kind', { signalKind: 'spec-fixed' }],
+    ['unknown failure reason', { reason: 'handler-failed' }],
+    ['reused successor token', { sourceToken: '00000000000f', successorToken: '00000000000f' }],
+  ])('rejects %s in persisted response-failure audit data', async (_label, override) => {
+    const signature = serverResponseFailureSignature({
+      phase: 'code',
+      round: 1,
+      findingsDigest: reviewFindingsDigest(FINDINGS),
+      reason: 'coverage-gap',
+      missingFindingIds: ['f-1'],
+    });
+    await expect(store.putRound('t1', 'code', round({
+      findings: FINDINGS,
+      serverResponseFailures: [{
+        ...failure('000000000001', signature),
+        disposition: 'auto-correct',
+        ...override,
+      } as ServerResponseFailure],
+    }))).rejects.toThrow();
+  });
+
+  it('allows at most three distinct automatic corrections under concurrent writes', async () => {
+    await store.putRound('t1', 'code', round({ findings: FINDINGS }));
+    const digest = reviewFindingsDigest(FINDINGS);
+    const entries = await Promise.all(Array.from({ length: 4 }, (_, index) => {
+      const missingFindingIds = [`f-${index + 10}`];
+      const signature = serverResponseFailureSignature({
+        phase: 'code', round: 1, findingsDigest: digest, reason: 'coverage-gap', missingFindingIds,
+      });
+      return store.recordServerResponseFailure('t1', 'code', 1, failure(
+        `00000000000${index + 1}`,
+        signature,
+        { missingFindingIds },
+      ));
+    }));
+
+    expect(entries.filter(entry => entry.disposition === 'auto-correct')).toHaveLength(3);
+    expect(entries.filter(entry => entry.disposition === 'hold-correction-limit')).toHaveLength(1);
+    expect((await store.getRound('t1', 'code', 1))?.serverResponseFailures).toHaveLength(4);
   });
 });
 

@@ -288,7 +288,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     >
       <form id="create-agent-form" onSubmit={handleSubmit} className="space-y-3">
         {error && (
-          <div className="rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
+          <div className="whitespace-pre-line rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
             {error}
           </div>
         )}

@@ -116,11 +116,20 @@ export interface BuildPromptOpts {
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
+  serverFindingsDigest?: string;
+  serverFeedbackCorrection?: ServerFeedbackCorrectionPrompt;
   serverPriorResponse?: string;
   serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   hasQaPartner?: boolean;
   platformCli?: PlatformCliDescriptor;
+}
+
+export interface ServerFeedbackCorrectionPrompt {
+  reason: string;
+  missingFindingIds?: string[];
+  unknownFindingIds?: string[];
+  schemaViolationCodes?: string[];
 }
 
 export function buildPromptInline(opts: BuildPromptOpts): string {
@@ -152,6 +161,8 @@ export function buildPromptInline(opts: BuildPromptOpts): string {
     serverBatch: opts.serverBatch,
     serverPriorFindings: opts.serverPriorFindings,
     serverPriorFindingsFile: opts.serverPriorFindingsFile,
+    serverFindingsDigest: opts.serverFindingsDigest,
+    serverFeedbackCorrection: opts.serverFeedbackCorrection,
     serverPriorResponse: opts.serverPriorResponse,
     serverPriorResponseFile: opts.serverPriorResponseFile,
     serverAfterDone: opts.serverAfterDone,
@@ -195,6 +206,8 @@ interface TaskBodyArgs {
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
+  serverFindingsDigest?: string;
+  serverFeedbackCorrection?: ServerFeedbackCorrectionPrompt;
   serverPriorResponse?: string;
   serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
@@ -221,6 +234,8 @@ interface PhasePromptCtx {
   serverBatch?: { index: number; total: number };
   serverPriorFindings?: string;
   serverPriorFindingsFile?: ReviewContentFileRef;
+  serverFindingsDigest?: string;
+  serverFeedbackCorrection?: ServerFeedbackCorrectionPrompt;
   serverPriorResponse?: string;
   serverPriorResponseFile?: ReviewContentFileRef;
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
@@ -298,26 +313,48 @@ const PHASE_PROMPT_BUILDERS: Record<DispatchPhase, PhasePromptBuilder> = {
       ],
     };
   },
-  'server-feedback': ({ task, currentSpecRound, serverPriorFindings, serverPriorFindingsFile }) => {
+  'server-feedback': ({
+    task,
+    currentSpecRound,
+    serverPriorFindings,
+    serverPriorFindingsFile,
+    serverFindingsDigest,
+    serverFeedbackCorrection,
+  }) => {
+    if (!serverFindingsDigest) throw new Error('server-feedback prompt requires findings digest');
     const isSpec = task.phase === 'spec';
     const round = isSpec ? (currentSpecRound ?? task.specReviewRound ?? 1) : Math.max(task.reviewRound, 1);
     return {
       fields: [
         `feedback: ${isSpec ? 'spec' : 'code'}`,
         `round: ${round}`,
+        `findings-digest: ${serverFindingsDigest}`,
         ...(serverPriorFindingsFile ? [fileField('findings-file', serverPriorFindingsFile)] : []),
+        ...(serverFeedbackCorrection ? [
+          `correction-reason: ${serverFeedbackCorrection.reason}`,
+          `missing-finding-ids: ${JSON.stringify(serverFeedbackCorrection.missingFindingIds ?? [])}`,
+          `unknown-finding-ids: ${JSON.stringify(serverFeedbackCorrection.unknownFindingIds ?? [])}`,
+          `schema-violation-codes: ${JSON.stringify(serverFeedbackCorrection.schemaViolationCodes ?? [])}`,
+        ] : []),
         `signal: ${isSpec ? 'spec-fixed' : 'code-fixed'}`,
       ],
       blocks: serverPriorFindings ? ['findings:', serverPriorFindings] : undefined,
     };
   },
-  'server-after-done': ({ task, serverAfterDone }) => ({
-    fields: [
-      `publish: ${serverAfterDone?.kind === 'pr' ? 'pr' : 'branch'}`,
-      `branch: ${serverAfterDone?.branch ?? task.branch ?? '<branch>'}`,
-      'signal: code-ready',
-    ],
-  }),
+  'server-after-done': ({ task, serverAfterDone }) => {
+    // publish: pr 走 baxian-server-feedback 的 PR 分支，它要显式 -R/--base/--head：
+    // 归一化 repo 身份与 base 快照都由 server 下发，agent 不现场推断远端。
+    const publishesPr = serverAfterDone?.kind === 'pr';
+    return {
+      fields: [
+        `publish: ${publishesPr ? 'pr' : 'branch'}`,
+        `branch: ${serverAfterDone?.branch ?? task.branch ?? '<branch>'}`,
+        ...(publishesPr && task.platformBinding ? [`repo: ${task.platformBinding.repoKey}`] : []),
+        ...(publishesPr && task.baseBranch ? [`base: ${task.baseBranch}`] : []),
+        'signal: code-ready',
+      ],
+    };
+  },
 };
 
 function buildServerReviewInstructions(
@@ -374,7 +411,8 @@ function buildTaskBody(args: TaskBodyArgs): string {
     currentSpecRound, imagePaths,
     serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
     serverReviewCheckout, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
-    serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
+    serverPriorFindings, serverPriorFindingsFile, serverFindingsDigest, serverFeedbackCorrection,
+    serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner, platformCli,
   } = args;
   if (phase === 'post-approve' && !signalToken) {
@@ -402,15 +440,14 @@ function buildTaskBody(args: TaskBodyArgs): string {
     task, signalToken, currentSpecRound, postApproveRedispatchCount,
     serverContent, serverContentFile, serverDiffstat, serverDiffstatFile, serverInterdiff, serverInterdiffFile,
     serverReviewCheckout, serverReviewFallbackReason, serverBaseSha, serverHeadSha, serverHeadTree, serverBatch,
-    serverPriorFindings, serverPriorFindingsFile, serverPriorResponse, serverPriorResponseFile,
+    serverPriorFindings, serverPriorFindingsFile, serverFindingsDigest, serverFeedbackCorrection,
+    serverPriorResponse, serverPriorResponseFile,
     serverAfterDone, hasQaPartner,
   });
 
   // exchange 只有 baxian-task-check（develop/code）消费，其余 phase 不输出
   const carriesExchange = phase === 'develop' || phase === 'code';
-  const exchange = task.reviewMode === 'server'
-    ? 'server-files'
-    : task.reviewMode === 'git' ? 'git-pr' : 'github-pr';
+  const exchange = task.reviewMode === 'server' ? 'server-files' : 'git-pr';
   const descriptor = [
     `phase: ${phase}`,
     `workdir: ${workdir}`,

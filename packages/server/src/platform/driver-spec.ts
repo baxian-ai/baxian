@@ -12,7 +12,9 @@ const ERROR_CLASS_RE = /^[A-Z][A-Z0-9_]*$/;
 
 // driverSchema 1 加载期契约（spec §5.3 增量⑥）：仅查「已声明字段合法」挡不住整键省略——
 // 漏 sourceProjectId 会让 fork 防护恒等式静默成立，装机期拒载优于运行期静默失败。
-const REQUIRED_OPS = ['listPrs', 'prView', 'projectView', 'listComments', 'merge', 'close', 'deleteBranch'] as const;
+const REQUIRED_OPS = [
+  'listPrs', 'prView', 'projectView', 'branchView', 'listComments', 'merge', 'close', 'deleteBranch',
+] as const;
 // treatAsSuccess 的语义是「错误已证明目标状态达成」的幂等写——权威读取没有这种状态，
 // 声明在读 op 上会把 404/权限失败折叠成空行集或截断页并以 ok 进完整性门。
 const TREAT_AS_SUCCESS_LABEL = [...WRITE_OPS].join('/');
@@ -21,7 +23,8 @@ const TREAT_AS_SUCCESS_LABEL = [...WRITE_OPS].join('/');
 const REQUIRED_OP_PLACEHOLDERS: ReadonlyArray<readonly [string, readonly string[][]]> = [
   ['merge', [['prNumber'], ['expectedHeadSha']]],
   ['close', [['prNumber']]],
-  ['deleteBranch', [['branch', 'branchEncoded']]],
+  ['deleteBranch', [['branch', 'branchEncoded'], ['expectedHeadSha'], ['remoteProjectId']]],
+  ['branchView', [['branch', 'branchEncoded'], ['remoteProjectId']]],
   ['prView', [['prNumber']]],
 ];
 const REQUIRED_MAP_FIELDS: Record<string, readonly string[]> = {
@@ -33,12 +36,13 @@ const REQUIRED_MAP_FIELDS: Record<string, readonly string[]> = {
     'prUrl', 'branch', 'headSha', 'state', 'draft', 'mergedAt',
     'sourceProjectId', 'targetProjectId', 'targetBranch',
   ],
-  projectView: ['defaultBranch'],
+  projectView: ['defaultBranch', 'remoteProjectId'],
+  branchView: ['remoteProjectId', 'headSha'],
 };
 const REQUIRED_COMMENT_SOURCE_FIELDS = ['id', 'body'] as const;
 const RESERVED_ERROR_CLASSES: ReadonlyArray<readonly [string, string]> = [
   ['ACCESS_DENIED', 'core'], ['RATE_LIMIT', 'core'], ['NOT_FOUND', 'core'],
-  ['MERGE_BLOCKED', 'merge'], ['REF_NOT_FOUND', 'deleteBranch'],
+  ['MERGE_BLOCKED', 'merge'],
 ];
 // Cf = 零宽空格/BOM/方向控制等不可见格式字符：trim() 不归一，肉眼与日志均不可见，键恒查不到。
 const INVISIBLE_FORMAT_RE = /\p{Cf}/u;
@@ -68,7 +72,8 @@ export function parseDriverSpec(
 
   // 先查 token 形状（防 {prNumber1} 等 typo 被"只认合法形状"的正则直接跳过），形状合法再查白名单。
   const checkPlaceholders = (s: string, ctx: string, allowed: ReadonlySet<string>) => {
-    for (const m of s.matchAll(PLACEHOLDER_TOKEN_RE)) {
+    const placeholderText = s.replace(/\\[{}]/g, '');
+    for (const m of placeholderText.matchAll(PLACEHOLDER_TOKEN_RE)) {
       const name = m[1];
       if (!VALID_PLACEHOLDER_NAME_RE.test(name)) {
         err(`${ctx}: malformed placeholder token {${name}}`);
@@ -77,7 +82,7 @@ export function parseDriverSpec(
       if (!allowed.has(name)) err(`${ctx}: unknown placeholder {${name}}`);
     }
     // 不成对/嵌套的大括号不构成完整 token，上面的扫描不报、渲染时字面量直进命令行——单独拒绝。
-    const stripped = s.replace(PLACEHOLDER_TOKEN_RE, '');
+    const stripped = placeholderText.replace(PLACEHOLDER_TOKEN_RE, '');
     if (stripped.includes('{') || stripped.includes('}')) {
       err(`${ctx}: unbalanced '{' or '}' in '${s}' (placeholders must be complete {name} tokens)`);
     }
@@ -200,6 +205,12 @@ export function parseDriverSpec(
       err(`${ctx}.parse must be 'json' | 'json-paged'`);
     } else if (op.parse === 'json-paged' && argvOk && !op.argv.join(' ').includes('{page}')) {
       err(`${ctx}.argv must include a {page} token when parse is 'json-paged'`);
+    }
+
+    if (op.responseEnvelope !== undefined && op.responseEnvelope !== 'graphql') {
+      err(`${ctx}.responseEnvelope must be 'graphql' when present`);
+    } else if (op.responseEnvelope === 'graphql' && op.parse === 'json-paged') {
+      err(`${ctx}.responseEnvelope 'graphql' is not supported on paged ops`);
     }
 
     if (op.flatten !== undefined && (typeof op.flatten !== 'string' || op.flatten.trim() === '')) {

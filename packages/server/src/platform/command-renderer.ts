@@ -1,5 +1,5 @@
 import { shellQuote } from '../agent/runner.js';
-import { isValidBranchName } from '../shared/constants.js';
+import { CONTROL_CHAR_RE, isValidBranchName } from '../shared/constants.js';
 import { ENV_KEY_PATTERN, SHA_HEX_SOURCE } from './types.js';
 
 export interface RenderContext {
@@ -10,6 +10,7 @@ export interface RenderContext {
   binary: string;
   prNumber?: number;
   expectedHeadSha?: string;
+  remoteProjectId?: string;
   branch?: string;
   page?: number;
 }
@@ -46,6 +47,16 @@ function placeholderValue(name: string, ctx: RenderContext & { minToolVersion?: 
       }
       return ctx.expectedHeadSha;
     }
+    case 'remoteProjectId': {
+      if (ctx.remoteProjectId === undefined
+        || ctx.remoteProjectId.trim() !== ctx.remoteProjectId
+        || ctx.remoteProjectId.length === 0
+        || ctx.remoteProjectId.length > 512
+        || CONTROL_CHAR_RE.test(ctx.remoteProjectId)) {
+        throw new PlaceholderValueError(`remoteProjectId must be a bounded platform id (got ${ctx.remoteProjectId})`);
+      }
+      return ctx.remoteProjectId;
+    }
     case 'branch': {
       if (ctx.branch === undefined) throw new PlaceholderValueError('branch required for {branch}');
       // 原样值进 URL 路径（GitHub refs 端点按字面 / 展开，spec §5.3 增量⑤）：入口同款
@@ -75,7 +86,11 @@ function placeholderValue(name: string, ctx: RenderContext & { minToolVersion?: 
 }
 
 function substitute(template: string, ctx: RenderContext & { minToolVersion?: string }): string {
-  return template.replace(PLACEHOLDER_RE, (_, name: string) => placeholderValue(name, ctx));
+  const escaped = template.replace(/\\\{/g, '\uE000').replace(/\\\}/g, '\uE001');
+  return escaped
+    .replace(PLACEHOLDER_RE, (_, name: string) => placeholderValue(name, ctx))
+    .replace(/\uE000/g, '{')
+    .replace(/\uE001/g, '}');
 }
 
 export function renderCommand(

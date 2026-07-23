@@ -5,12 +5,14 @@ import { tmpdir } from 'node:os';
 import { createServer, type AddressInfo } from 'node:net';
 import {
   formatServerRunningMessage,
-  migrateLegacyPollerStateFile,
   pickExistingPath,
   startServer,
 } from '../src/index.js';
 import { ProcessLock, ProcessLockError } from '../src/state/process-lock.js';
-import { readFile, writeFile, access } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
+import { initStateDir } from '../src/state/init.js';
+import { TaskStore } from '../src/state/task-store.js';
+import { EventLog } from '../src/event/log.js';
 
 let tempDir: string;
 let warnSpy: ReturnType<typeof vi.spyOn>;
@@ -55,70 +57,6 @@ describe('formatServerRunningMessage', () => {
     expect(formatServerRunningMessage('::', 3443, true)).toBe(
       'baxian server running on https://[::]:3443',
     );
-  });
-});
-
-describe('migrateLegacyPollerStateFile', () => {
-  let stateRoot: string;
-  beforeEach(async () => {
-    stateRoot = join(tempDir, 'state');
-    await mkdir(stateRoot, { recursive: true });
-  });
-
-  it('renames a legacy `poller-${projectId}.json` to the new repo-keyed path', async () => {
-    const legacy = join(stateRoot, 'poller-proj-a.json');
-    const target = join(stateRoot, 'poller-owner%2Frepo.json');
-    await writeFile(legacy, JSON.stringify({ pullsByHead: { 'bx/x': 'sha' } }));
-
-    await migrateLegacyPollerStateFile(tempDir, ['proj-a'], target);
-
-    await expect(readFile(target, 'utf-8')).resolves.toContain('bx/x');
-    await expect(access(legacy)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  it('keeps the existing new-style file and does not clobber it when both exist', async () => {
-    const legacy = join(stateRoot, 'poller-proj-b.json');
-    const target = join(stateRoot, 'poller-owner%2Frepo2.json');
-    await writeFile(legacy, JSON.stringify({ legacy: true }));
-    await writeFile(target, JSON.stringify({ current: true }));
-
-    await migrateLegacyPollerStateFile(tempDir, ['proj-b'], target);
-
-    await expect(readFile(target, 'utf-8')).resolves.toContain('"current":true');
-    await expect(readFile(legacy, 'utf-8')).resolves.toContain('"legacy":true');
-  });
-
-  it('is a silent no-op when no candidate legacy files exist (steady-state boot)', async () => {
-    const target = join(stateRoot, 'poller-owner%2Frepo3.json');
-    await expect(
-      migrateLegacyPollerStateFile(tempDir, ['no-such-project'], target),
-    ).resolves.toBeUndefined();
-    await expect(access(target)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  it('picks the first candidate that has a legacy file (shared-repo migration covers all duplicate projects)', async () => {
-    const legacyForA = join(stateRoot, 'poller-a.json');
-    await writeFile(legacyForA, JSON.stringify({ pullsByHead: { 'bx/old': 'sha-old' } }));
-    const target = join(stateRoot, 'poller-shared%2Frepo.json');
-
-    await migrateLegacyPollerStateFile(tempDir, ['x', 'a'], target);
-
-    await expect(readFile(target, 'utf-8')).resolves.toContain('sha-old');
-    await expect(access(legacyForA)).rejects.toMatchObject({ code: 'ENOENT' });
-  });
-
-  it('first-found-wins: if multiple candidates have legacy files, only the first is migrated; the rest are left for manual cleanup', async () => {
-    const legacyForX = join(stateRoot, 'poller-x.json');
-    const legacyForA = join(stateRoot, 'poller-a.json');
-    await writeFile(legacyForX, JSON.stringify({ from: 'x' }));
-    await writeFile(legacyForA, JSON.stringify({ from: 'a' }));
-    const target = join(stateRoot, 'poller-shared%2Frepo2.json');
-
-    await migrateLegacyPollerStateFile(tempDir, ['x', 'a'], target);
-
-    await expect(readFile(target, 'utf-8')).resolves.toContain('"from":"x"');
-    await expect(access(legacyForX)).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(readFile(legacyForA, 'utf-8')).resolves.toContain('"from":"a"');
   });
 });
 
@@ -195,6 +133,71 @@ describe('startServer', () => {
       for (const l of process.listeners('SIGINT')) if (!sigintBefore.has(l)) process.removeListener('SIGINT', l);
       for (const l of process.listeners('SIGTERM')) if (!sigtermBefore.has(l)) process.removeListener('SIGTERM', l);
       for (const l of process.listeners('exit')) if (!exitBefore.has(l)) process.removeListener('exit', l);
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  }, 30_000);
+
+  it('emits a repo-conflict intervention when a retained startup entry owns the live project repo', async () => {
+    const port = await getFreePort();
+    const cfgPath = join(tempDir, 'baxian.json');
+    const stateDir = join(tempDir, '.baxian');
+    await writeFile(cfgPath, JSON.stringify({
+      review: { rounds: 3, afterDone: 'branch' },
+      server: { port, host: '127.0.0.1', ...QUIET_INTERVALS },
+      host: [],
+      project: [
+        { id: 'b-live', repo: 'https://github.com/owner/repo.git', merge: null, agent: [] },
+        {
+          id: 'a-retained', repo: 'git@github.com:owner/repo.git', merge: null,
+          review: { mode: 'server' }, agent: [],
+        },
+      ],
+    }));
+    await initStateDir(stateDir);
+    const now = new Date().toISOString();
+    await new TaskStore(join(stateDir, 'state', 'tasks')).set({
+      id: 'task-retained', projectId: 'a-retained', title: 'retained', description: 'retained entry',
+      preferredAgentId: 'dev-retained', agentId: 'dev-retained', devAgentId: 'dev-retained',
+      reviewRound: 0, reviewMode: 'server', status: 'pending', afterDone: 'pr',
+      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      createdAt: now, updatedAt: now,
+    });
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const sigintBefore = new Set(process.listeners('SIGINT'));
+    const sigtermBefore = new Set(process.listeners('SIGTERM'));
+    const exitBefore = new Set(process.listeners('exit'));
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await startServer(cfgPath);
+
+      const events = await new EventLog(join(stateDir, 'events'))
+        .readDate(new Date().toISOString().slice(0, 10));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'human.intervention',
+        projectId: 'b-live',
+        data: {
+          phase: 'repo-conflict',
+          repoKey: 'github.com/owner/repo',
+          claimedBy: 'a-retained',
+        },
+      }));
+
+      const sigintHandler = process.listeners('SIGINT').find(listener => !sigintBefore.has(listener));
+      expect(sigintHandler).toBeDefined();
+      sigintHandler!();
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130), { timeout: 15_000 });
+    } finally {
+      for (const listener of process.listeners('SIGINT')) {
+        if (!sigintBefore.has(listener)) process.removeListener('SIGINT', listener);
+      }
+      for (const listener of process.listeners('SIGTERM')) {
+        if (!sigtermBefore.has(listener)) process.removeListener('SIGTERM', listener);
+      }
+      for (const listener of process.listeners('exit')) {
+        if (!exitBefore.has(listener)) process.removeListener('exit', listener);
+      }
       exitSpy.mockRestore();
       logSpy.mockRestore();
     }

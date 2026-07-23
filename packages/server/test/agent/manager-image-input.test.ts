@@ -236,6 +236,8 @@ describe('retryTask image preservation', () => {
       id, projectId: 'proj', title: `Task ${id}`, description: 'd',
       preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', reviewRound: 0,
       status: 'failed', branch: `bx/${id}`, createdAt: now, updatedAt: now,
+      reviewMode: 'git',
+      platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
       images: [filename],
     });
     if (writeStaged) {

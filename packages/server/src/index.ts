@@ -1,6 +1,5 @@
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { rename, stat } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
 import {
   loadConfig,
@@ -9,12 +8,11 @@ import {
   userConfigPath,
   createDefaultConfig,
 } from './config/loader.js';
-import { loadPluginsOrExplain, referencedGitTools, scanPluginSkillPools } from './platform/startup.js';
+import { loadPluginsOrExplain, planPlatformEntries, type PlatformEntryDeps, referencedGitTools, retainedPlatformProjectIds, scanPluginSkillPools } from './platform/startup.js';
 import { initStateDir } from './state/init.js';
 import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
 import { ErrorRecordStore } from './state/error-record-store.js';
-import { PostApproveStore } from './state/post-approve-store.js';
 import { ReviewStore } from './state/review-store.js';
 import { PetStore } from './state/pet-store.js';
 import { LockManager } from './state/lock.js';
@@ -29,11 +27,12 @@ import { EventPublisher } from './event/publish.js';
 import { autoBootstrapAgentIds, bootstrapAutoRepos } from './agent/bootstrap.js';
 import { registerEventHandlers, recoverGitPostApprovePending } from './event/handlers.js';
 import { registerServerEventHandlers } from './event/server-handlers.js';
-import { GitHubPoller, pollerStatePathFor } from './github/poller.js';
-import { resolveEventRouting } from './github/resolver.js';
+import { PlatformPoller, platformTaskView, type PlatformPollerOptions } from './platform/platform-poller.js';
+import { platformPollerStatePath } from './platform/comment-cursor.js';
+import { buildProjectDriver, makeDriverExec } from './platform/driver-host.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
 import type { AgentConfig, HostConfig } from './shared/index.js';
-import { isGitHubRepo, repoSlug } from './shared/index.js';
+import { repoIdentityKey } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
@@ -50,35 +49,6 @@ export function pickExistingPath(base: string, candidates: readonly string[]): s
   return resolve(base, candidates[0]);
 }
 
-export async function migrateLegacyPollerStateFile(
-  stateDir: string,
-  legacyProjectIds: string[],
-  newStatePath: string,
-): Promise<void> {
-  try {
-    await stat(newStatePath);
-    return;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.warn(`[startup] poller cursor migration: stat(${newStatePath}) failed:`, err);
-      return;
-    }
-  }
-  for (const legacyId of legacyProjectIds) {
-    const legacyPath = join(stateDir, 'state', `poller-${legacyId}.json`);
-    try {
-      await rename(legacyPath, newStatePath);
-      console.log(`[startup] migrated poller cursor ${legacyPath} → ${newStatePath}`);
-      return;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ENOENT') continue;
-      console.warn(`[startup] poller cursor migration ${legacyPath} → ${newStatePath} failed:`, err);
-      return;
-    }
-  }
-}
-
 function formatUrlHost(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
 }
@@ -86,6 +56,34 @@ function formatUrlHost(host: string): string {
 export function formatServerRunningMessage(host: string, port: number, https: boolean): string {
   const scheme = https ? 'https' : 'http';
   return `baxian server running on ${scheme}://${formatUrlHost(host)}:${port}`;
+}
+
+export function createPlatformPollerOptions(
+  agentManager: AgentManager,
+  eventBus: EventBus,
+): PlatformPollerOptions {
+  return {
+    onEvent: async (projectId, mapped) => {
+      const task = mapped.taskId === undefined ? undefined : await agentManager.getTask(mapped.taskId);
+      await eventBus.emit({
+        id: '',
+        type: mapped.type,
+        timestamp: new Date().toISOString(),
+        projectId: task?.projectId ?? projectId,
+        ...(task ? { taskId: task.id, ...(task.agentId ? { agentId: task.agentId } : {}) } : {}),
+        data: mapped.data,
+      });
+    },
+    tasks: async (projectId) =>
+      (await agentManager.listTasksForPlatformEntry(projectId)).map(platformTaskView),
+    task: async (taskId) => {
+      const task = await agentManager.getTask(taskId);
+      return task === null ? null : platformTaskView(task);
+    },
+    onCursorCommitted: (taskId, _prNumber, sourceKey, watermarkTime) =>
+      agentManager.pruneConsumedFeedback(taskId, sourceKey, watermarkTime),
+    onConversationRevision: (taskId) => agentManager.noteReviewConversationRevision(taskId),
+  };
 }
 
 export async function startServer(configPath?: string): Promise<void> {
@@ -103,7 +101,6 @@ export async function startServer(configPath?: string): Promise<void> {
     for (const line of pluginsResult.fatal) console.error(line);
     process.exit(1);
   }
-  // M3a：registry 注入 AgentManager 供 'git' 路径 live 解析；poller 装配切换留 M3c。
   const pluginRegistry = pluginsResult.registry;
 
   const processLock = new ProcessLock(stateDir);
@@ -164,7 +161,6 @@ export async function startServer(configPath?: string): Promise<void> {
     const agentStore = new AgentStore(`${stateDir}/state/agents`);
     const taskStore = new TaskStore(`${stateDir}/state/tasks`);
     const errorRecordStore = new ErrorRecordStore(`${stateDir}/state/errors`);
-    const postApproveStore = new PostApproveStore(`${stateDir}/state/post-approve`);
     const petStore = new PetStore(`${stateDir}/state/pets`);
     const lockManager = new LockManager(`${stateDir}/locks`);
     const eventLog = new EventLog(`${stateDir}/events`);
@@ -185,7 +181,13 @@ export async function startServer(configPath?: string): Promise<void> {
     });
 
     const reviewStore = new ReviewStore(`${stateDir}/state/reviews`);
-    const agentManager = new AgentManager({
+    const driverExec = makeDriverExec(createRunner('local'));
+    const platformEntryDeps: PlatformEntryDeps = {
+      driverFor: (project) => buildProjectDriver(project, pluginRegistry, driverExec),
+      statePathFor: (repoUrl) => platformPollerStatePath(stateDir, repoUrl),
+    };
+    let defaultBranchOf: (projectId: string) => string | undefined = () => undefined;
+    const agentManager: AgentManager = new AgentManager({
       config,
       agentStore,
       taskStore,
@@ -193,11 +195,11 @@ export async function startServer(configPath?: string): Promise<void> {
       eventBus,
       skillRegistry: registry,
       paneStreamerManager,
-      postApproveStore,
       pluginRegistry,
       errorRecordStore,
       reviewStore,
       imageStagingRoot: `${stateDir}/state/task-images`,
+      platformDefaultBranchOf: (projectId) => defaultBranchOf(projectId),
     });
     resolveHostRef = (agent) => resolveAgentHost(agentManager.getConfig().host, agent.host);
 
@@ -210,20 +212,17 @@ export async function startServer(configPath?: string): Promise<void> {
     });
     await agentManager.recover();
     registerEventHandlers(eventBus, agentManager);
-    // 'git' 专属恢复（阀关下无任务恒 no-op）：durable pendingRedispatch 的补派
     await recoverGitPostApprovePending(eventBus, agentManager).catch(err => {
       console.warn('[index] recoverGitPostApprovePending failed:', err);
     });
-    // outbox 的进程内重试（spec §6 至少一次）：closed-unmerged 锚会停子轮询、observed 缓存抑制
-    // 重复观察，滞留条目不能只等重启补投
     const gitOutboxFlusher = new PeriodicTaskRunner({
       name: 'GitMaintenance',
       intervalMs: 60_000,
-      // durable pending 的运行时消费（spec §6 至少一次）：outbox 补投 + post-approve 补派 + 评审派发重试
       run: async () => {
-        await agentManager.flushGitOutbox();
+        await agentManager.flushTaskOutboxes();
         await recoverGitPostApprovePending(eventBus, agentManager);
         await agentManager.retryPendingGitReviewDispatches();
+        await agentManager.retryGitRemoteCleanupIntents();
       },
       onError: e => console.warn('[GitMaintenance] sweep failed:', e),
     });
@@ -284,45 +283,29 @@ export async function startServer(configPath?: string): Promise<void> {
       onAgentAffected: onBootstrapAgentAffected,
     }).catch(err => console.error('[baxian] bootstrap failed:', err));
 
-    const poller = new GitHubPoller({
-      runner: createRunner('local'),
-      knownPrNumbersFor: async (projectId) => {
-        const tasks = await agentManager.listTasksByProject(projectId);
-        return new Set(
-          tasks
-            .filter(t => typeof t.prNumber === 'number' && t.agentId)
-            .map(t => t.prNumber!),
-        );
-      },
-      onEvent: async (projectId, mapped) => {
-        const routing = await resolveEventRouting(agentManager, mapped);
-        await eventBus.emit({
-          id: '',
-          type: mapped.type,
-          timestamp: new Date().toISOString(),
-          projectId,
-          ...(routing.taskId ? { taskId: routing.taskId } : {}),
-          ...(routing.agentId ? { agentId: routing.agentId } : {}),
-          data: mapped.data,
-        });
-      },
-    });
-    const seenRepos = new Set<string>();
-    for (const project of config.project) {
-      if (!isGitHubRepo(project.repo)) continue;
-      const repoKey = repoSlug(project.repo).toLowerCase();
-      if (seenRepos.has(repoKey)) continue;
-      seenRepos.add(repoKey);
-      const newStatePath = pollerStatePathFor(stateDir, repoKey);
-      const legacyIds = config.project
-        .filter(p => repoSlug(p.repo).toLowerCase() === repoKey)
-        .map(p => p.id);
-      await migrateLegacyPollerStateFile(stateDir, legacyIds, newStatePath);
-      poller.add({ projectId: project.id, repo: project.repo, statePath: newStatePath });
-    }
+    const poller = new PlatformPoller(createPlatformPollerOptions(agentManager, eventBus));
+    defaultBranchOf = (projectId) => {
+      const repo = agentManager.getConfig().project.find(p => p.id === projectId)?.repo;
+      return repo === undefined ? undefined : poller.defaultBranchSnapshot(repoIdentityKey(repo));
+    };
     poller.setLifecycleHook(() => {
       eventPublisher.publishPollersChange(() => poller.snapshots());
     });
+    const entryPlan = planPlatformEntries(config, {
+      ...platformEntryDeps,
+      retainedProjectIds: await retainedPlatformProjectIds(
+        config,
+        () => agentManager.listActiveGitTasks(),
+        (task, mismatch) => agentManager.emitPlatformBindingIntervention(task, mismatch),
+      ),
+    });
+    poller.reconcile(entryPlan.entries);
+    for (const conflict of entryPlan.conflicts) {
+      // 离线编辑绕过在线锁的同 repo 冲突:该项目 entry 不建,受保护项目 entry 保留(spec §5.5)
+      await agentManager.emitConfigIntervention(conflict.projectId, {
+        phase: 'repo-conflict', repoKey: conflict.repoKey, claimedBy: conflict.claimedBy,
+      }).catch(err => console.warn('[startup] repo-conflict intervention emit failed:', err));
+    }
     poller.start(config.server.githubPollIntervalMs);
 
     const httpsOpts = config.server.https
@@ -349,7 +332,7 @@ export async function startServer(configPath?: string): Promise<void> {
         configPath: cfgPath,
         stateDir,
         poller,
-        githubRunner: createRunner('local'),
+        platformEntryDeps,
         paneStreamerManager,
         eventBroker,
         errorRecordStore,

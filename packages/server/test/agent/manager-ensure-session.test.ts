@@ -149,6 +149,7 @@ describe('AgentManager.ensureSession', () => {
       devAgentId: 'dev-1',
       phase: 'code',
       branch: `bx/${id}`,
+      reviewMode: 'server',
       reviewRound: 0,
       status: 'in_progress',
       createdAt: now,
@@ -751,6 +752,27 @@ describe('AgentManager.ensureSession', () => {
     });
     expect(Number.isFinite(bytes)).toBe(true);
     expect(bytes).toBeGreaterThan(0);
+  });
+
+  it('previewPromptBytesForTaskInput includes the live platform CLI descriptor', () => {
+    const baseline = manager.previewPromptBytesForTaskInput('proj', {
+      title: 'hi',
+      description: 'do work',
+      preferredAgentId: 'dev-1',
+    });
+    const notes = '汉'.repeat(170);
+    manager.replaceConfig({
+      ...CONFIG,
+      project: [{ ...CONFIG.project[0], gitCli: { tool: 'gh', notes } }],
+    });
+
+    const withNotes = manager.previewPromptBytesForTaskInput('proj', {
+      title: 'hi',
+      description: 'do work',
+      preferredAgentId: 'dev-1',
+    });
+
+    expect(withNotes - baseline).toBeGreaterThanOrEqual(Buffer.byteLength(notes, 'utf8'));
   });
 
   it('replaceConfig: rebuilds agentIndex so newly added agents are visible', async () => {

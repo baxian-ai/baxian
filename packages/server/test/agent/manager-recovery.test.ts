@@ -19,7 +19,6 @@ import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
-import { PostApproveStore } from '../../src/state/post-approve-store.js';
 import { initStateDir } from '../../src/state/init.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
@@ -93,11 +92,22 @@ function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void>
     devAgentId: 'dev-1',
     branch: `bx/${overrides.id}`,
     reviewRound: 0,
+    reviewMode: 'git',
+    platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
     status: 'in_progress',
     createdAt: NOW,
     updatedAt: NOW,
     ...overrides,
   });
+}
+
+function postApproveEpisode(token: string, headSha: string): Partial<TaskState> {
+  return {
+    postApproveGeneration: 'feedfeedfeed',
+    postApproveHeadSha: headSha,
+    postApproveToken: token,
+    postApprovePhase: 'installed',
+  };
 }
 
 function mockEnsureSessionOk(overrides: Record<string, unknown> = {}): void {
@@ -180,7 +190,6 @@ beforeEach(async () => {
     eventBus,
     skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
     runnerFactory: () => noopRunner(),
-    postApproveStore: new PostApproveStore(join(tempDir, 'state', 'post-approve')),
   });
 });
 
@@ -667,11 +676,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
   it('sets up approved tasks with stored completion records', async () => {
     await seedTask({
       id: 'task-approved', reviewRound: 1, status: 'approved',
-      postApproveHeadSha: 'a'.repeat(40),
-    });
-    await manager.setPostApproveCompletion('task-approved', {
-      token: 'tok',
-      approvedHeadSha: 'a'.repeat(40),
+      ...postApproveEpisode('tok', 'a'.repeat(40)),
     });
     const watcher = {
       start: vi.fn(async () => true),
@@ -685,7 +690,6 @@ describe('setupRecoveredPostApproveSignals()', () => {
       eventBus: new EventBus(new EventLog(join(tempDir, 'events-2'))),
       skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
       runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
       phaseSignalWatcher: watcher as never,
     });
 
@@ -697,20 +701,15 @@ describe('setupRecoveredPostApproveSignals()', () => {
       agentId: 'dev-1',
       expectedKinds: 'pr-merge-ready',
       token: 'tok',
-      skipSnapshot: false,
       recovered: true,
       needInputInherit: true,
-      needInputSnapshotBlind: true,
-
-
-          });
+    });
   });
 
-  it('does not re-arm already merge-ready tasks with stale completion records', async () => {
-    await seedTask({ id: 'task-merge-ready', reviewRound: 1, status: 'merge-ready' });
-    await manager.setPostApproveCompletion('task-merge-ready', {
-      token: 'tok',
-      approvedHeadSha: 'a'.repeat(40),
+  it('does not install a post-approve watcher for an approved server publish task', async () => {
+    await seedTask({
+      id: 'task-server-approved', reviewMode: 'server', reviewRound: 1, status: 'approved',
+      afterDone: 'pr', publishDispatchedAt: NOW,
     });
     const watcher = {
       start: vi.fn(async () => true),
@@ -724,7 +723,6 @@ describe('setupRecoveredPostApproveSignals()', () => {
       eventBus: new EventBus(new EventLog(join(tempDir, 'events-merge-ready'))),
       skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
       runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
       phaseSignalWatcher: watcher as never,
     });
 
@@ -733,109 +731,15 @@ describe('setupRecoveredPostApproveSignals()', () => {
     expect(watcher.start).not.toHaveBeenCalled();
   });
 
-  it('a stored completion without a persisted approved head is not re-armed', async () => {
-    await seedTask({ id: 'task-approved-headless', reviewRound: 1, status: 'approved' });
-    await manager.setPostApproveCompletion('task-approved-headless', {
-      token: 'tok-a',
-      approvedHeadSha: 'a'.repeat(40),
-    });
-    const watcher = {
-      start: vi.fn(async () => true),
-      stop: vi.fn(),
-    };
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: new EventBus(new EventLog(join(tempDir, 'events-headless'))),
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
-      phaseSignalWatcher: watcher as never,
+  it('reports an approved git task whose persisted post-approve episode is incomplete', async () => {
+    await seedTask({
+      id: 'task-approved-incomplete', reviewRound: 1, status: 'approved',
     });
 
     await manager.setupRecoveredPostApproveSignals();
 
-    expect(watcher.start).not.toHaveBeenCalled();
-    await expect(manager.getPostApproveCompletion('task-approved-headless')).resolves.toMatchObject({
-      token: 'tok-a',
-    });
-  });
-
-  it('a stored completion bound to another episode head is retired without re-arming', async () => {
-    await seedTask({ id: 'task-approved-crossed', reviewRound: 1, status: 'approved' });
-    await manager.setPostApproveCompletion('task-approved-crossed', {
-      token: 'tok-a',
-      approvedHeadSha: 'a'.repeat(40),
-    });
-    const seeded = await taskStore.get('task-approved-crossed');
-    await taskStore.set({ ...seeded!, postApproveHeadSha: 'c'.repeat(40) });
-    const watcher = {
-      start: vi.fn(async () => true),
-      stop: vi.fn(),
-    };
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: new EventBus(new EventLog(join(tempDir, 'events-crossed'))),
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
-      phaseSignalWatcher: watcher as never,
-    });
-
-    await manager.setupRecoveredPostApproveSignals();
-
-    expect(watcher.start).not.toHaveBeenCalled();
-    await expect(manager.getPostApproveCompletion('task-approved-crossed')).resolves.toBeNull();
-  });
-
-  it('a leftover completion from a previous approved episode cannot push a rebooted approved task to merge-ready', async () => {
-    const token = 'stalepasstok';
-    // Episode A left its completion behind; episode B re-approved but crashed before persisting its head.
-    await seedTask({ id: 'task-approved-leftover', reviewRound: 2, status: 'approved' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-approved-leftover', paneId: '%1' });
-    await manager.setPostApproveCompletion('task-approved-leftover', {
-      token,
-      approvedHeadSha: 'a'.repeat(40),
-    });
-
-    const manualConfig: BaxianConfig = {
-      ...CONFIG,
-      project: CONFIG.project.map(p => ({ ...p, merge: null })),
-    };
-    const eventsDir = join(tempDir, 'events-post-approve-leftover');
-    await mkdir(eventsDir, { recursive: true });
-    const localBus = new EventBus(new EventLog(eventsDir));
-    const watcher = new PhaseSignalWatcher({
-      paneStreamerManager: snapshotPaneStreamerManager(`done\n${buildPhaseSignal('pr-merge-ready', token)}\n`),
-      eventBus: localBus,
-      resolveAgent: (id) => (
-        id === 'dev-1' ? { ...CONFIG.project[0]!.agent[0]![0]!, projectId: 'proj' } : undefined
-      ),
-    });
-    manager = new AgentManager({
-      config: manualConfig,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: localBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
-      phaseSignalWatcher: watcher,
-    });
-    registerEventHandlers(localBus, manager);
-
-    await manager.setupRecoveredPostApproveSignals();
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    expect((await taskStore.get('task-approved-leftover'))?.status).toBe('approved');
-    await expect(manager.getPostApproveCompletion('task-approved-leftover')).resolves.toMatchObject({
-      token,
+    expect(events.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-recovery-incomplete-episode',
     });
   });
 
@@ -843,13 +747,9 @@ describe('setupRecoveredPostApproveSignals()', () => {
     const token = 'posttok12345';
     await seedTask({
       id: 'task-approved-manual', reviewRound: 1, status: 'approved',
-      postApproveHeadSha: 'b'.repeat(40),
+      ...postApproveEpisode(token, 'b'.repeat(40)),
     });
     await seedAgent({ id: 'dev-1', taskId: 'task-approved-manual', paneId: '%1' });
-    await manager.setPostApproveCompletion('task-approved-manual', {
-      token,
-      approvedHeadSha: 'b'.repeat(40),
-    });
 
     const manualConfig: BaxianConfig = {
       ...CONFIG,
@@ -873,16 +773,56 @@ describe('setupRecoveredPostApproveSignals()', () => {
       eventBus: localBus,
       skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
       runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
       phaseSignalWatcher: watcher,
     });
     registerEventHandlers(localBus, manager);
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ ok: true, pendingCount: 0 });
 
     await manager.setupRecoveredPostApproveSignals();
     await waitForTaskStatus('task-approved-manual', 'merge-ready');
 
     expect((await taskStore.get('task-approved-manual'))?.status).toBe('merge-ready');
     await expect(manager.getPostApproveCompletion('task-approved-manual')).resolves.toBeNull();
+  });
+});
+
+describe('git review dispatch recovery', () => {
+  it('resets an unbound claimed lease to pending after restart', async () => {
+    await seedTask({
+      id: 'task-unbound-claim', reviewMode: 'git', status: 'in_progress', qaAgentId: 'qa-1',
+    });
+    const begun = await manager.beginGitReviewPass('task-unbound-claim', {
+      fromStatus: ['in_progress'], headSha: 'a'.repeat(40), bumpRound: true,
+    });
+    await manager.claimGitReviewDispatch('task-unbound-claim', begun!.task.reviewDispatch!.generation);
+
+    await manager.recoverClaimedGitReviewDispatches();
+
+    expect((await taskStore.get('task-unbound-claim'))?.reviewDispatch?.phase).toBe('pending');
+  });
+
+  it('marks a claimed lease uncertain when the QA binding may have received it', async () => {
+    await seedTask({
+      id: 'task-bound-claim', reviewMode: 'git', status: 'in_progress', qaAgentId: 'qa-1',
+    });
+    const begun = await manager.beginGitReviewPass('task-bound-claim', {
+      fromStatus: ['in_progress'], headSha: 'b'.repeat(40), bumpRound: true,
+    });
+    const claimed = await manager.claimGitReviewDispatch(
+      'task-bound-claim', begun!.task.reviewDispatch!.generation,
+    );
+    await seedAgent({ id: 'qa-1', taskId: 'task-bound-claim' });
+
+    await manager.recoverClaimedGitReviewDispatches();
+
+    expect((await taskStore.get('task-bound-claim'))?.reviewDispatch).toMatchObject({
+      phase: 'uncertain', claimId: claimed!.lease.claimId,
+    });
+    expect(events.find(event => event.type === 'human.intervention'
+      && event.taskId === 'task-bound-claim')?.data).toMatchObject({
+      phase: 'git-review-dispatch-recovery-uncertain',
+      generation: begun!.task.reviewDispatch!.generation,
+    });
   });
 });
 
@@ -906,7 +846,6 @@ describe('setupRecoveredSpecSignals()', () => {
       eventBus: localBus,
       skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
       runnerFactory: () => noopRunner(),
-      postApproveStore: manager['postApproveStore'],
       phaseSignalWatcher: watcher as never,
     });
     return { watcher, events: localEvents };
@@ -918,7 +857,7 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-1', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-done', 'pr-created'], token: 'tok-ready',
-        skipSnapshot: false, recovered: true, needInputInherit: true, needInputSnapshotBlind: true,       }],
+        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
     ['sets up spec-done for an in-progress Research task',
       {
         id: 'task-research',
@@ -931,13 +870,13 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-research', projectId: 'proj', agentId: 'research-1',
         expectedKinds: ['spec-done'], token: 'tok-research',
-        skipSnapshot: false, recovered: true, needInputInherit: true, needInputSnapshotBlind: true,       }],
+        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
     ['sets up pr-created for code-phase tasks (dispatched after spec approval)',
       { id: 'task-code', phase: 'code', signalToken: 'tok-code' },
       {
         taskId: 'task-code', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['pr-created'], token: 'tok-code', skipSnapshot: true, recovered: true,
-        needInputInherit: true, needInputSnapshotBlind: true,
+        needInputInherit: true,
       }],
     ['sets up spec-reviewed for spec-phase review tasks',
       { id: 'task-2', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec', signalToken: 'tok-review', status: 'review' },
@@ -951,25 +890,38 @@ describe('setupRecoveredSpecSignals()', () => {
       {
         taskId: 'task-3', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-fixed'], token: 'tok-fix',
-        skipSnapshot: false, recovered: true, needInputInherit: true, needInputSnapshotBlind: true,       }],
+        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
     ['sets up pr-fixed for code-phase fixing tasks',
       { id: 'task-code-fix', qaAgentId: 'qa-1', reviewRound: 1, phase: 'code', signalToken: 'tok-prfix', status: 'fixing', prNumber: 60 },
       {
         taskId: 'task-code-fix', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['pr-fixed'], token: 'tok-prfix',
-        skipSnapshot: false, recovered: true, needInputInherit: true, needInputSnapshotBlind: true,       }],
-    ['sets up PR verdict-choice {pr-approved, pr-changes-requested} for review-phase tasks with qaAgentId',
-      { id: 'task-pr-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review', signalToken: 'tok-verdict', prNumber: 50 },
+        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
+    ['recovers the server code-review watcher for review-phase tasks with qaAgentId',
+      {
+        id: 'task-pr-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review',
+        signalToken: 'tok-verdict', prNumber: 50, reviewMode: 'server', platformBinding: undefined,
+      },
       {
         taskId: 'task-pr-review', projectId: 'proj', agentId: 'qa-1',
-        expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'tok-verdict',
-        skipSnapshot: false, recovered: true, needInputInherit: true, needInputSnapshotBlind: true,       }],
+        expectedKinds: ['code-reviewed'], token: 'tok-verdict',
+        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
     ['sets up snapshot scan and read-file for github spec-review tasks',
-      { id: 'task-gh-spec', qaAgentId: 'qa-1', specReviewRound: 1, status: 'review', phase: 'spec', reviewMode: 'github', signalToken: 'tok-spec' },
+      { id: 'task-gh-spec', qaAgentId: 'qa-1', specReviewRound: 1, status: 'review', phase: 'spec', reviewMode: 'git', signalToken: 'tok-spec' },
       expect.objectContaining({
         taskId: 'task-gh-spec', agentId: 'qa-1', expectedKinds: ['spec-reviewed'],
         skipSnapshot: false, onReadFile: expect.any(Function),
       })],
+    ['restores the passive watcher for git code-review tasks',
+      {
+        id: 'task-git-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review',
+        phase: 'code', reviewMode: 'git', signalToken: 'tok-git-review',
+      },
+      {
+        taskId: 'task-git-review', projectId: 'proj', agentId: 'qa-1',
+        expectedKinds: [], token: 'tok-git-review', skipSnapshot: false,
+        recovered: true, needInputInherit: true,
+      }],
   ])('%s', async (_label, task, expectedArg) => {
     await seedTask(task);
     const { watcher } = await buildManagerWithSpecWatcher();
@@ -977,6 +929,21 @@ describe('setupRecoveredSpecSignals()', () => {
     await manager.setupRecoveredSpecSignals();
 
     expect(watcher.start).toHaveBeenCalledWith(expectedArg);
+  });
+
+  it('restores a passive git review watcher without a signal-waiting intervention', async () => {
+    await seedTask({
+      id: 'task-git-passive', qaAgentId: 'qa-1', reviewRound: 1, status: 'review',
+      phase: 'code', reviewMode: 'git', signalToken: 'tok-git-passive',
+    });
+    const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
+
+    await manager.setupRecoveredSpecSignals();
+
+    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({ expectedKinds: [] }));
+    expect(localEvents.some(event =>
+      event.type === 'human.intervention'
+      && event.data.phase === 'spec-signal-setup-during-recovery')).toBe(false);
   });
 
   it.each<[string, Partial<TaskState> & { id: string }]>([
@@ -1018,7 +985,7 @@ describe('setupRecoveredSpecSignals()', () => {
 
   it('skips snapshot and read-file for github code-phase tasks', async () => {
     await seedTask({
-      id: 'task-gh-code', phase: 'code', reviewMode: 'github', signalToken: 'tok-code',
+      id: 'task-gh-code', phase: 'code', reviewMode: 'git', signalToken: 'tok-code',
     });
     const { watcher } = await buildManagerWithSpecWatcher();
 

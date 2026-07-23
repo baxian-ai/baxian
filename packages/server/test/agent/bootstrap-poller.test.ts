@@ -121,6 +121,24 @@ describe('BootstrapPoller', () => {
     expect(ensureCalls).toBe(2);
   });
 
+  it('passes the plain-git clone decision through BootstrapPoller', async () => {
+    const repoStoreFactory = vi.fn(() => ({ ensure: async () => '/p' }));
+    const customToolConfig: BaxianConfig = {
+      ...config,
+      project: [{
+        ...config.project[0],
+        repo: 'https://github.com/user/repo.git',
+        gitCli: { tool: 'forge' },
+      }],
+    };
+    const poller = makePoller({ config: customToolConfig, repoStoreFactory });
+
+    await poller.pollOnce();
+
+    expect(repoStoreFactory).toHaveBeenCalledTimes(1);
+    expect(repoStoreFactory.mock.calls[0]?.[7]).toBe(false);
+  });
+
   it('runs branch reconciliation after a completed poll', async () => {
     const onPollComplete = vi.fn().mockResolvedValue(undefined);
     const poller = makePoller({ onPollComplete });

@@ -15,12 +15,22 @@ import type { AfterDone, BaxianConfig, MergeStrategy, TaskState } from '../../sr
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
 import { __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
+import { PluginRegistry } from '../../src/platform/plugin-registry.js';
+import { builtinPluginRoot } from '../../src/platform/plugin-roots.js';
 
 let tempDir: string;
+let pluginRegistry: PluginRegistry;
+const SERVER_HEAD_SHA = 'a'.repeat(40);
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-confirm-'));
   await initStateDir(tempDir);
+  const loaded = await PluginRegistry.load({
+    builtin: builtinPluginRoot(),
+    user: join(tempDir, 'plugins'),
+  });
+  expect(loaded.diagnostics).toEqual([]);
+  pluginRegistry = loaded.registry;
   vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockResolvedValue({ status: 'deleted' });
   vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
 });
@@ -38,6 +48,7 @@ function makeConfig(merge: MergeStrategy, afterDone: AfterDone): BaxianConfig {
     project: [{
       id: 'proj',
       repo: 'user/repo',
+      gitCli: { tool: 'gh', binary: '/opt/gh' },
       merge,
       agent: [[
         { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: join(tempDir, 'dev-1') },
@@ -52,7 +63,12 @@ interface Fixture {
   taskStore: TaskStore;
   agentStore: AgentStore;
   execCalls: string[];
-  events: { type: string; data?: Record<string, unknown> }[];
+  events: Array<{
+    type: string;
+    projectId: string;
+    taskId?: string;
+    data?: Record<string, unknown>;
+  }>;
 }
 
 async function makeFixture(
@@ -86,8 +102,10 @@ async function makeFixture(
     return commit;
   });
   const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
-  const events: { type: string; data?: Record<string, unknown> }[] = [];
-  eventBus.on('*', (e) => { events.push({ type: e.type, data: e.data }); });
+  const events: Fixture['events'] = [];
+  eventBus.on('*', (e) => {
+    events.push({ type: e.type, projectId: e.projectId, taskId: e.taskId, data: e.data });
+  });
   const manager = new AgentManager({
     config: makeConfig(merge, afterDone),
     agentStore,
@@ -96,9 +114,14 @@ async function makeFixture(
     eventBus,
     runnerFactory: () => runner,
     platformRunner: runner,
+    pluginRegistry,
     ...(reviewStore ? { reviewStore } : {}),
   });
-  Object.assign(manager, { compactIdlePollMs: 5, compactIdleWaitMs: 200 });
+  Object.assign(manager, {
+    compactIdlePollMs: 5,
+    compactIdleWaitMs: 200,
+    platformVerificationRetryDelayMs: 0,
+  });
   return { manager, taskStore, agentStore, execCalls, events };
 }
 
@@ -164,7 +187,7 @@ function recordAfterDone(manager: AgentManager, taskStore: TaskStore): string[] 
 }
 
 function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
-  return {
+  const task: TaskState = {
     id: 'task-1',
     projectId: 'proj',
     title: 'T',
@@ -183,6 +206,15 @@ function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
     updatedAt: '2026-06-10T00:00:00.000Z',
     ...overrides,
   };
+  if (task.reviewMode !== 'server' || task.platformBinding !== undefined
+    || (task.afterDone !== 'pr' && task.prNumber === undefined)) {
+    return task;
+  }
+  return {
+    ...task,
+    platformBinding: { mode: 'server', repoKey: 'github.com/user/repo', tool: 'gh' },
+    baseBranch: task.baseBranch ?? 'main',
+  };
 }
 
 function approvedPrMarkerFixture(overrides: Partial<TaskState> = {}): TaskState {
@@ -193,14 +225,94 @@ function approvedPrMarkerFixture(overrides: Partial<TaskState> = {}): TaskState 
   });
 }
 
+function isRemotePrMergeCommand(command: string, prNumber?: number): boolean {
+  const resource = prNumber === undefined ? '/pulls/' : `/pulls/${prNumber}/merge`;
+  return command.includes('/opt/gh')
+    && command.includes("'PUT'")
+    && command.includes(resource)
+    && command.includes('/merge');
+}
+
+function isRemotePrCloseCommand(command: string, prNumber?: number): boolean {
+  const resource = prNumber === undefined ? '/pulls/' : `/pulls/${prNumber}`;
+  return command.includes('/opt/gh')
+    && command.includes("'PATCH'")
+    && command.includes(resource)
+    && command.includes('state=closed');
+}
+
 function hasRemotePrClose(execCalls: string[]): boolean {
-  return execCalls.some(c => c.includes('gh pr close'));
+  return execCalls.some(command => isRemotePrCloseCommand(command));
 }
 
 function hasCleanupSkippedEvent(events: { type: string; data?: Record<string, unknown> }[]): boolean {
   return events.some(e => e.type === 'human.intervention'
     && e.data?.phase === 'cancel-published-artifact-cleanup-skipped');
 }
+
+function openPrPayload(branch = 'bx/task-1', targetBranch = 'main'): string {
+  return JSON.stringify({
+    html_url: 'https://github.com/user/repo/pull/17',
+    head: { ref: branch, sha: SERVER_HEAD_SHA, repo: { id: 101 } },
+    base: { ref: targetBranch, repo: { id: 101 } },
+    state: 'open',
+    draft: false,
+    merged_at: null,
+    mergeable_state: 'clean',
+  });
+}
+
+describe('server PR lifecycle driver binding', () => {
+  it('verifies a pane PR signal through the configured driver binary', async () => {
+    const { manager, taskStore, execCalls } = await makeFixture(null, 'pr', command =>
+      command.includes('/pulls/17') ? { stdout: openPrPayload() } : {});
+    await taskStore.set(taskFixture({ prNumber: 17 }));
+
+    await expect(manager.verifyPaneSignalPrNumber('task-1', 17)).resolves.toEqual({
+      headRefName: 'bx/task-1',
+      headSha: SERVER_HEAD_SHA,
+      targetBranch: 'main',
+    });
+    expect(execCalls.find(command => command.includes('/pulls/17'))).toContain("'/opt/gh'");
+  });
+
+  it('rejects a pane PR signal whose driver-reported branch does not match the task', async () => {
+    const { manager, taskStore, execCalls } = await makeFixture(null, 'pr', command =>
+      command.includes('/pulls/17') ? { stdout: openPrPayload('bx/other-task') } : {});
+    await taskStore.set(taskFixture({ prNumber: 17 }));
+
+    await expect(manager.verifyPaneSignalPrNumber('task-1', 17)).resolves.toBeUndefined();
+    expect(execCalls.filter(command => command.includes('/pulls/17'))).toHaveLength(1);
+  });
+
+  it('retries one transient pane PR verification failure and then succeeds', async () => {
+    let attempts = 0;
+    const { manager, taskStore, execCalls } = await makeFixture(null, 'pr', command => {
+      if (!command.includes('/pulls/17')) return {};
+      attempts += 1;
+      return attempts === 1
+        ? { exitCode: 255, stderr: 'ssh: connect: connection timed out' }
+        : { stdout: openPrPayload() };
+    });
+    await taskStore.set(taskFixture({ prNumber: 17 }));
+
+    await expect(manager.verifyPaneSignalPrNumber('task-1', 17)).resolves.toMatchObject({
+      headRefName: 'bx/task-1', headSha: SERVER_HEAD_SHA,
+    });
+    expect(execCalls.filter(command => command.includes('/pulls/17'))).toHaveLength(2);
+  });
+
+  it('surfaces a persistent transient pane PR verification failure after the bounded retry', async () => {
+    const { manager, taskStore, execCalls } = await makeFixture(null, 'pr', command =>
+      command.includes('/pulls/17')
+        ? { exitCode: 255, stderr: 'ssh: connect: connection timed out' }
+        : {});
+    await taskStore.set(taskFixture({ prNumber: 17 }));
+
+    await expect(manager.verifyPaneSignalPrNumber('task-1', 17)).rejects.toThrow(/prView/);
+    expect(execCalls.filter(command => command.includes('/pulls/17'))).toHaveLength(2);
+  });
+});
 
 describe('confirmHumanGate via markTaskComplete', () => {
   it('ready + afterDone:null → done', async () => {
@@ -243,42 +355,67 @@ describe('confirmHumanGate via markTaskComplete', () => {
     expect(task?.status).toBe('ready');
   });
 
-  it('ready + afterDone:pr + merge:auto → gh pr merge → merged via pr.merged chain', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
-    await taskStore.set(taskFixture({ prNumber: 7, latestHeadSha: 'head123' }));
+  it('ready + afterDone:pr + merge:auto → configured driver merge → merged via pr.merged chain', async () => {
+    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr', command =>
+      command.includes('/pulls/7') && !isRemotePrMergeCommand(command, 7)
+        ? { stdout: openPrPayload() }
+        : {});
+    await taskStore.set(taskFixture({ prNumber: 7, latestHeadSha: SERVER_HEAD_SHA }));
     await manager.markTaskComplete('task-1');
-    expect(execCalls.some(c => c.includes('gh pr merge 7') && c.includes('--squash') && c.includes("--match-head-commit 'head123'"))).toBe(true);
+    const mergeCommand = execCalls.find(command => isRemotePrMergeCommand(command, 7));
+    expect(mergeCommand).toContain("'/opt/gh'");
+    expect(mergeCommand).toContain('merge_method=squash');
+    expect(mergeCommand).toContain(`sha=${SERVER_HEAD_SHA}`);
   });
 
   it('merge-ready (github mode) + merge:null → done', async () => {
     const { manager, taskStore } = await makeFixture(null, null);
-    await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 9 }));
+    await taskStore.set(taskFixture({ status: 'merge-ready', prNumber: 9 }));
     const result = await manager.markTaskComplete('task-1');
     expect(result.status).toBe('done');
   });
 
-  it('merge-ready (github mode) + merge:auto → gh pr merge', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', null);
-    await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 9 }));
-    await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 9, latestHeadSha: 'h9' }));
+  it('merge-ready (server mode, published PR) + merge:auto → configured driver merge', async () => {
+    const { manager, taskStore, execCalls } = await makeFixture('auto', null, command =>
+      command.includes('/pulls/9') && !isRemotePrMergeCommand(command, 9)
+        ? { stdout: openPrPayload() }
+        : {});
+    await taskStore.set(taskFixture({ status: 'merge-ready', prNumber: 9 }));
+    await taskStore.set(taskFixture({ status: 'merge-ready', prNumber: 9, latestHeadSha: SERVER_HEAD_SHA }));
     await manager.markTaskComplete('task-1');
-    expect(execCalls.some(c => c.includes('gh pr merge 9'))).toBe(true);
+    expect(execCalls.some(command => isRemotePrMergeCommand(command, 9))).toBe(true);
   });
 
   it('merge:auto never asks GitHub to delete a user-defined branch', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
+    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr', command =>
+      command.includes('/pulls/7') && !isRemotePrMergeCommand(command, 7)
+        ? { stdout: openPrPayload('feature/user-owned') }
+        : {});
     await taskStore.set(taskFixture({
       branch: 'feature/user-owned',
       branchCreatedByBaxian: false,
       prNumber: 7,
-      latestHeadSha: 'head123',
+      latestHeadSha: SERVER_HEAD_SHA,
     }));
 
     await manager.markTaskComplete('task-1');
 
-    const merge = execCalls.find(c => c.includes('gh pr merge 7'));
+    const merge = execCalls.find(command => isRemotePrMergeCommand(command, 7));
     expect(merge).toBeDefined();
     expect(merge).not.toContain('--delete-branch');
+  });
+
+  it('refuses to merge a server PR retargeted away from its persisted base', async () => {
+    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr', command =>
+      command.includes('/pulls/7') && !isRemotePrMergeCommand(command, 7)
+        ? { stdout: openPrPayload('bx/task-1', 'release') }
+        : {});
+    await taskStore.set(taskFixture({ prNumber: 7, latestHeadSha: SERVER_HEAD_SHA }));
+
+    await expect(manager.markTaskComplete('task-1')).rejects.toThrow(/binding target/);
+
+    expect(execCalls.some(command => isRemotePrMergeCommand(command, 7))).toBe(false);
+    expect((await taskStore.get('task-1'))?.status).toBe('ready');
   });
 
   it('non-gate status keeps legacy behavior (409 for in_progress)', async () => {
@@ -445,11 +582,20 @@ describe('snapshot + resume semantics', () => {
 
 describe('cancel closes a published PR but preserves remote branches', () => {
   it('cancel of a published pr gate closes the PR remotely', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', 'pr');
-    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    const { manager, taskStore, execCalls, events } = await makeFixture('auto', 'pr');
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: SERVER_HEAD_SHA }));
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
-    expect(execCalls.some(c => c.includes('gh pr close 12'))).toBe(true);
+    expect(execCalls.some(command => isRemotePrCloseCommand(command, 12))).toBe(true);
+    expect(events.find(event => event.data?.operation === 'server-pr-close')).toMatchObject({
+      type: 'task.updated',
+      projectId: 'proj',
+      taskId: 'task-1',
+      data: {
+        status: 'cancelled', operation: 'server-pr-close', outcome: 'succeeded',
+        branch: 'bx/task-1', prNumber: 12,
+      },
+    });
   });
 
   it('cancel of a published branch gate keeps the remote branch', async () => {
@@ -470,7 +616,7 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
     const result = await manager.cancelTask('task-1');
     expect(result.status).toBe('cancelled');
     const interruptAt = execCalls.findIndex(c => c.includes('send-keys') && c.includes("'Escape'"));
-    const closeAt = execCalls.findIndex(c => c.includes('gh pr close 31'));
+    const closeAt = execCalls.findIndex(command => isRemotePrCloseCommand(command, 31));
     expect(interruptAt).toBeGreaterThanOrEqual(0);
     expect(closeAt).toBeGreaterThan(interruptAt);
   });
@@ -531,9 +677,9 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
   it('ready with a FAILED dev interrupt still retires remotely (publish already finished)', async () => {
     const { manager, taskStore, agentStore, execCalls, events } = await makeFixture('auto', 'pr');
     await bindAgent(agentStore, 'dev-1', { taskId: 'task-1', workdir: '/repo/dev' });
-    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: SERVER_HEAD_SHA }));
     await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close 12'))).toBe(true);
+    expect(execCalls.some(command => isRemotePrCloseCommand(command, 12))).toBe(true);
     expect(hasCleanupSkippedEvent(events)).toBe(false);
   });
 
@@ -553,11 +699,14 @@ describe('cancel retracts a dispatched-but-unconfirmed publish (approved + marke
 });
 
 describe('merge-ready cancel, Call review mode guard, and confirm head guard', () => {
-  it('merge-ready cancel closes the published PR', async () => {
-    const { manager, taskStore, execCalls } = await makeFixture('auto', null);
-    await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 21 }));
+  it('merge-ready cancel retires the PR through the platform driver', async () => {
+    const { manager, taskStore } = await makeFixture('auto', null);
+    await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'git', prNumber: 21 }));
+    const cleanup = vi.spyOn(manager, 'processGitRemoteCleanup').mockResolvedValue();
     await manager.cancelTask('task-1');
-    expect(execCalls.some(c => c.includes('gh pr close 21'))).toBe(true);
+    const intent = (await taskStore.get('task-1'))?.remoteCleanup;
+    expect(intent).toMatchObject({ stage: 'close-pending', prNumber: 21, branch: 'bx/task-1' });
+    expect(cleanup).toHaveBeenCalledWith('task-1', intent?.generation);
   });
 
   it('Call review refuses server-mode tasks parked at a gate (only in_progress/review/fixing dispatch)', async () => {
@@ -567,35 +716,36 @@ describe('merge-ready cancel, Call review mode guard, and confirm head guard', (
   });
 
   it.each(['review', 'fixing', 'approved'] as const)(
-    'cancelling a github task at %s closes the open PR and preserves the remote branch',
+    'cancelling a git task at %s retires the PR through the platform driver',
     async (status) => {
-      const { manager, taskStore, execCalls } = await makeFixture(null, 'pr');
-      await taskStore.set(taskFixture({ status, reviewMode: 'github', prNumber: 33 }));
+      const { manager, taskStore } = await makeFixture(null, 'pr');
+      await taskStore.set(taskFixture({ status, reviewMode: 'git', prNumber: 33 }));
+      const cleanup = vi.spyOn(manager, 'processGitRemoteCleanup').mockResolvedValue();
 
       const result = await manager.cancelTask('task-1');
 
       expect(result.status).toBe('cancelled');
-      expect(execCalls.some(c => c.includes('gh pr close 33'))).toBe(true);
-      expect(execCalls.some(c => c.includes('git push origin --delete'))).toBe(false);
-      expect(execCalls.some(c => c.includes('--delete-branch'))).toBe(false);
+      const intent = (await taskStore.get('task-1'))?.remoteCleanup;
+      expect(intent).toMatchObject({ stage: 'close-pending', prNumber: 33, branch: 'bx/task-1' });
+      expect(cleanup).toHaveBeenCalledWith('task-1', intent?.generation);
     },
   );
 
   it('a terminal re-cancel cleans stale bindings but never touches the remote PR', async () => {
     const { manager, taskStore, agentStore, execCalls } = await makeFixture(null, 'pr', readyPaneExec);
-    await taskStore.set(taskFixture({ status: 'cancelled', reviewMode: 'github', prNumber: 44 }));
+    await taskStore.set(taskFixture({ status: 'cancelled', prNumber: 44 }));
     await bindToTask(agentStore, 'dev-1', new Date().toISOString());
 
     const result = await manager.cancelTask('task-1');
 
     expect(result.status).toBe('cancelled');
-    expect(execCalls.some(c => c.includes('gh pr close'))).toBe(false);
+    expect(hasRemotePrClose(execCalls)).toBe(false);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
   });
 
   it('merge-ready confirm without recorded head → 409', async () => {
     const { manager, taskStore } = await makeFixture('auto', null);
-    await taskStore.set(taskFixture({ status: 'merge-ready', reviewMode: 'github', prNumber: 9, latestHeadSha: undefined }));
+    await taskStore.set(taskFixture({ status: 'merge-ready', prNumber: 9, latestHeadSha: undefined }));
     await expect(manager.markTaskComplete('task-1')).rejects.toThrow(/no approved head/);
   });
 });
@@ -848,13 +998,14 @@ describe('cancel PR closure and remote-branch preservation', () => {
 
   it('closes the PR without deleting its remote branch', async () => {
     const { manager, taskStore, execCalls, events } = await makeFixture('auto', 'pr', () => ({}));
-    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: SERVER_HEAD_SHA }));
 
     const result = await manager.cancelTask('task-1');
 
     expect(result.status).toBe('cancelled');
-    const closeCmd = execCalls.find(c => c.includes('gh pr close'));
+    const closeCmd = execCalls.find(command => isRemotePrCloseCommand(command, 12));
     expect(closeCmd).toBeDefined();
+    expect(closeCmd).toContain("'/opt/gh'");
     expect(closeCmd).not.toContain('--delete-branch');
     expect(execCalls.some(c => c.includes('git/refs/heads/'))).toBe(false);
     expect(execCalls.some(c => c.includes('git push origin --delete'))).toBe(false);
@@ -870,12 +1021,12 @@ describe('cancel PR closure and remote-branch preservation', () => {
       branch: 'feature/user-owned',
       branchCreatedByBaxian: false,
       prNumber: 12,
-      latestHeadSha: 'h1',
+      latestHeadSha: SERVER_HEAD_SHA,
     }));
 
     await manager.cancelTask('task-1');
 
-    expect(execCalls.some(c => c.includes('gh pr close 12'))).toBe(true);
+    expect(execCalls.some(command => isRemotePrCloseCommand(command, 12))).toBe(true);
     expect(execCalls.some(c => c.includes('git/refs/heads/'))).toBe(false);
     expect(execCalls.some(c => c.includes('git push origin --delete'))).toBe(false);
   });
@@ -885,7 +1036,7 @@ describe('cancel PR closure and remote-branch preservation', () => {
       cmd.includes('git/refs/heads/')
         ? { exitCode: 1, stderr: 'dial tcp 20.205.243.166:443: i/o timeout' }
         : {});
-    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: SERVER_HEAD_SHA }));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const result = await manager.cancelTask('task-1');
@@ -902,7 +1053,7 @@ describe('cancel PR closure and remote-branch preservation', () => {
       cmd.includes('git/refs/heads/')
         ? { exitCode: 1, stderr: 'gh: Reference does not exist (HTTP 422)' }
         : {});
-    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: SERVER_HEAD_SHA }));
 
     const result = await manager.cancelTask('task-1');
 
@@ -912,10 +1063,10 @@ describe('cancel PR closure and remote-branch preservation', () => {
       && e.data?.phase === 'cancel-published-artifact-cleanup-failed')).toBe(false);
   });
 
-  it('emits cleanup-failed (still cancelled) when gh pr close fails', async () => {
+  it('emits cleanup-failed (still cancelled) when the configured close operation fails', async () => {
     const { manager, taskStore, events } = await makeFixture('auto', 'pr', cmd =>
-      cmd.includes('gh pr close') ? { exitCode: 1, stderr: 'PR already closed upstream' } : {});
-    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: 'h1' }));
+      isRemotePrCloseCommand(cmd, 12) ? { exitCode: 1, stderr: 'PR already closed upstream' } : {});
+    await taskStore.set(taskFixture({ status: 'ready', afterDone: 'pr', prNumber: 12, latestHeadSha: SERVER_HEAD_SHA }));
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const result = await manager.cancelTask('task-1');

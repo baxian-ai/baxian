@@ -5,6 +5,8 @@ import { parseJsonResponse, parseJsonPagedPage } from './response-parser.js';
 import { mapResponse } from './field-mapper.js';
 import { validateRows, type NormalizedRow } from './row-schema.js';
 import { isGitHubRepo, repoSlug, parseRepoUrlParts } from '../shared/git-url.js';
+import { isRecord } from '../shared/index.js';
+import { createHash } from 'node:crypto';
 
 export const DRIVER_MAX_BUFFER = 64 * 1024 * 1024;
 export const DRIVER_EXEC_TIMEOUT_MS = 60_000;
@@ -53,6 +55,7 @@ export function safeDriverErrorText(err: unknown): string {
 export interface OpVars {
   prNumber?: number;
   expectedHeadSha?: string;
+  remoteProjectId?: string;
   branch?: string;
 }
 
@@ -89,12 +92,18 @@ interface PagedOpts {
 
 export class GitDriver {
   private readonly errorMatchers: Array<{ class: string; regexes: RegExp[] }>;
+  readonly preflightIdentity: string;
 
   constructor(
     private readonly plugin: { spec: DriverSpec; manifest?: { minToolVersion: string } },
     private readonly ctx: RenderContext,
     private readonly exec: DriverExec,
   ) {
+    this.preflightIdentity = createHash('sha256').update(JSON.stringify({
+      preflight: plugin.spec.preflight,
+      minToolVersion: plugin.manifest?.minToolVersion ?? '',
+      ctx,
+    }), 'utf8').digest('hex');
     // 声明期常量模式一次编译（无 g 标志，test 无 lastIndex 状态）；失败风暴期每次 exec 免重编译。
     this.errorMatchers = plugin.spec.errorClasses.map(c => ({
       class: c.class,
@@ -199,13 +208,47 @@ export class GitDriver {
   ): Promise<DriverExecResult | 'treated-success'> {
     const cmd = renderCommand(op, { ...this.ctx, ...vars });
     const result = await this.exec(cmd, { timeout: DRIVER_EXEC_TIMEOUT_MS, maxBuffer: DRIVER_MAX_BUFFER });
-    if (result.exitCode === 0) return result;
-    const cls = this.classify(`${result.stderr}\n${result.stdout}`);
+    if (result.exitCode === 0) {
+      if (op.responseEnvelope === 'graphql') this.assertGraphqlEnvelope(opName, result);
+      return result;
+    }
+    const output = `${result.stderr}\n${result.stdout}`;
+    const cls = this.classify(output);
     if (cls !== undefined && op.treatAsSuccess?.includes(cls)) return 'treated-success';
     throw new DriverOpError(
-      `op ${opName} failed (exit ${result.exitCode}${cls ? `, class ${cls}` : ''}): ${tail(result.stderr || result.stdout)}`,
-      { opName, errorClass: cls, exitCode: result.exitCode, stderrTail: tail(result.stderr) },
+      `op ${opName} failed (exit ${result.exitCode}${cls ? `, class ${cls}` : ''}): ${tail(output.trim())}`,
+      { opName, errorClass: cls, exitCode: result.exitCode, stderrTail: tail(output.trim()) },
     );
+  }
+
+  private assertGraphqlEnvelope(opName: string, result: DriverExecResult): void {
+    const { stdout, stderr } = result;
+    const errorInfo = () => ({
+      opName,
+      errorClass: this.classify(`${stderr}\n${stdout}`),
+      exitCode: 0,
+      stderrTail: tail(stdout),
+    });
+    let payload: unknown;
+    try {
+      payload = parseJsonResponse(stdout);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new DriverOpError(`op ${opName} returned an invalid GraphQL envelope: ${message}`, errorInfo());
+    }
+    if (!isRecord(payload)) {
+      throw new DriverOpError(`op ${opName} returned a malformed GraphQL envelope`, errorInfo());
+    }
+    const errors = payload.errors;
+    if (errors !== undefined && !Array.isArray(errors)) {
+      throw new DriverOpError(`op ${opName} returned malformed GraphQL errors`, errorInfo());
+    }
+    if (Array.isArray(errors) && errors.length > 0) {
+      throw new DriverOpError(`op ${opName} failed with GraphQL errors: ${tail(JSON.stringify(errors))}`, errorInfo());
+    }
+    if (!Object.hasOwn(payload, 'data')) {
+      throw new DriverOpError(`op ${opName} returned a GraphQL envelope without data`, errorInfo());
+    }
   }
 
   private async runPaged(rowOp: string, op: DriverOp, vars: OpVars, opts: PagedOpts): Promise<NormalizedRow[]> {

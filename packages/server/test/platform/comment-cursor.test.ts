@@ -125,6 +125,41 @@ describe('generations and cross-source independence', () => {
     await reloaded.load();
     expect(reloaded.classify(reloaded.source('task-a', 42, 'c'), [comment('1', 'x', T0)], FAR_CUTOFF).fresh).toHaveLength(1);
   });
+
+  it('persists PR adoption delivery and drops it with the task generation', async () => {
+    await store.markAdoptionDelivered('task-a', 42);
+    const reloaded = new CommentCursorStore(path, REPO);
+    await reloaded.load();
+    expect(reloaded.isAdoptionDelivered('task-a', 42)).toBe(true);
+    expect(reloaded.generations()).toContain('task-a');
+    await reloaded.dropGeneration('task-a');
+    expect(reloaded.isAdoptionDelivered('task-a', 42)).toBe(false);
+  });
+
+  it('persists pending adoption work and clears it on delivery or generation cleanup', async () => {
+    await store.markAdoptionPending('task-a', 42);
+    const reloaded = new CommentCursorStore(path, REPO);
+    await reloaded.load();
+    expect(reloaded.pendingAdoptions()).toEqual([{ taskId: 'task-a', prNumber: 42 }]);
+    expect(reloaded.isAdoptionPending('task-a', 42)).toBe(true);
+
+    await reloaded.markAdoptionDelivered('task-a', 42);
+    expect(reloaded.isAdoptionPending('task-a', 42)).toBe(false);
+    await reloaded.markAdoptionPending('task-b', 43);
+    await reloaded.dropGeneration('task-b');
+    expect(reloaded.pendingAdoptions()).toEqual([]);
+  });
+
+  it('clears only the matching pending adoption generation', async () => {
+    await store.markAdoptionPending('task-a', 42);
+    await store.clearAdoptionPending('task-a', 43);
+    expect(store.isAdoptionPending('task-a', 42)).toBe(true);
+
+    await store.clearAdoptionPending('task-a', 42);
+    const reloaded = new CommentCursorStore(path, REPO);
+    await reloaded.load();
+    expect(reloaded.isAdoptionPending('task-a', 42)).toBe(false);
+  });
 });
 
 describe('listPrs cursor', () => {
@@ -188,8 +223,10 @@ describe('state file structural validation', () => {
     return fresh.load();
   };
   const VALID = {
-    version: 1, repoUrl: REPO,
+    version: 3, repoUrl: REPO,
     listPrs: { watermarkTime: T0 },
+    adoptions: { t1: 42 },
+    pendingAdoptions: { t2: 43 },
     generations: { t1: { '42': { c: { watermarkTime: T0, bucket: { '1': 'a'.repeat(64) }, ledger: {} } } } },
   };
 
@@ -201,6 +238,8 @@ describe('state file structural validation', () => {
     await expect(writeState({ ...VALID, version: 2 })).rejects.toThrow(/version/);
     await expect(writeState({ ...VALID, listPrs: { watermarkTime: '999' } })).rejects.toThrow(/structure/);
     await expect(writeState({ ...VALID, listPrs: 42 })).rejects.toThrow(/structure/);
+    await expect(writeState({ ...VALID, adoptions: { t1: 0 } })).rejects.toThrow(/structure/);
+    await expect(writeState({ ...VALID, pendingAdoptions: { t2: 0 } })).rejects.toThrow(/structure/);
     await expect(writeState({
       ...VALID,
       generations: { t1: { '42': { c: { watermarkTime: 'soon', bucket: {}, ledger: {} } } } },

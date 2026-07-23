@@ -27,7 +27,12 @@ const MINIMAL = {
     projectView: {
       argv: ['{binary}', 'api', 'projects/{repoPathEncoded}'],
       parse: 'json',
-      map: { defaultBranch: 'default_branch' },
+      map: { defaultBranch: 'default_branch', remoteProjectId: 'id' },
+    },
+    branchView: {
+      argv: ['{binary}', 'api', 'projects/{remoteProjectId}/repository/branches/{branchEncoded}'],
+      parse: 'json',
+      map: { remoteProjectId: 'project_id', headSha: { sources: ['commit.id'], optional: true } },
     },
     listComments: {
       argv: ['{binary}', 'api', 'projects/{repoPathEncoded}/merge_requests/{prNumber}/notes?page={page}'],
@@ -41,7 +46,7 @@ const MINIMAL = {
       argv: ['{binary}', 'api', '-X', 'PUT', 'projects/{repoPathEncoded}/merge_requests/{prNumber}', '-f', 'state_event=close'],
     },
     deleteBranch: {
-      argv: ['{binary}', 'api', '-X', 'DELETE', 'projects/{repoPathEncoded}/repository/branches/{branchEncoded}'],
+      argv: ['{binary}', 'api', '-X', 'DELETE', 'projects/{remoteProjectId}/repository/branches/{branchEncoded}', '-f', 'expected={expectedHeadSha}'],
       treatAsSuccess: ['REF_NOT_FOUND'],
     },
   },
@@ -416,6 +421,20 @@ describe('parseDriverSpec', () => {
     expect(errMsgs(pagedMerge).join('\n')).toMatch(/ops\.merge\.parse must not be 'json-paged'/);
   });
 
+  it('allows only the GraphQL response envelope on non-paged ops', () => {
+    const valid = clone(MINIMAL);
+    valid.ops.deleteBranch.responseEnvelope = 'graphql';
+    expect('spec' in parseDriverSpec(j(valid), '/p/glab')).toBe(true);
+
+    const unknown = clone(MINIMAL);
+    unknown.ops.deleteBranch.responseEnvelope = 'rest';
+    expect(errMsgs(unknown).join('\n')).toMatch(/responseEnvelope must be 'graphql'/);
+
+    const paged = clone(MINIMAL);
+    paged.ops.listPrs.responseEnvelope = 'graphql';
+    expect(errMsgs(paged).join('\n')).toMatch(/responseEnvelope 'graphql' is not supported on paged ops/);
+  });
+
   it('requires lifecycle ops to consume their scope and atomicity placeholders', () => {
     const mergeNoSha = clone(MINIMAL);
     mergeNoSha.ops.merge.argv = ['{binary}', 'api', '-X', 'PUT', 'projects/{repoPathEncoded}/merge_requests/{prNumber}/merge'];
@@ -428,6 +447,14 @@ describe('parseDriverSpec', () => {
     const branchFixed = clone(MINIMAL);
     branchFixed.ops.deleteBranch.argv = ['{binary}', 'api', '-X', 'DELETE', 'projects/{repoPathEncoded}/repository/branches/fixed'];
     expect(errMsgs(branchFixed).join('\n')).toMatch(/ops\.deleteBranch must consume \{branch\} or \{branchEncoded\}/);
+
+    const deleteNoSha = clone(MINIMAL);
+    deleteNoSha.ops.deleteBranch.argv = ['{binary}', 'api', '-X', 'DELETE', 'projects/{remoteProjectId}/repository/branches/{branchEncoded}'];
+    expect(errMsgs(deleteNoSha).join('\n')).toMatch(/ops\.deleteBranch must consume \{expectedHeadSha\}/);
+
+    const branchViewNoProject = clone(MINIMAL);
+    branchViewNoProject.ops.branchView.argv = ['{binary}', 'api', 'repository/branches/{branchEncoded}'];
+    expect(errMsgs(branchViewNoProject).join('\n')).toMatch(/ops\.branchView must consume \{remoteProjectId\}/);
 
     const sourceNoPr = clone(MINIMAL);
     sourceNoPr.ops.listComments.argv = ['{binary}', 'api', 'projects/{repoPathEncoded}/notes?page={page}'];
@@ -747,7 +774,7 @@ describe('parseDriverSpec', () => {
       },
     };
     fullShape.ops.deleteBranch = {
-      argv: ['{binary}', 'api', '-X', 'DELETE', 'repos/{repoPath}/git/refs/heads/{branch}'],
+      argv: ['{binary}', 'api', '-X', 'DELETE', 'repos/{repoPath}/git/refs/heads/{branch}', '{expectedHeadSha}', '{remoteProjectId}'],
       treatAsSuccess: ['REF_NOT_FOUND'],
     };
     fullShape.preflight.push(
@@ -888,7 +915,7 @@ describe('parseDriverSpec: {branch} placeholder', () => {
   it('is allowed in op argv and env', () => {
     const spec = clone(MINIMAL);
     spec.ops.deleteBranch = {
-      argv: ['{binary}', 'api', '-X', 'DELETE', 'repos/{repoPath}/git/refs/heads/{branch}'],
+      argv: ['{binary}', 'api', '-X', 'DELETE', 'repos/{repoPath}/git/refs/heads/{branch}', '{expectedHeadSha}', '{remoteProjectId}'],
       env: { REF: '{branch}' },
     };
     const r = parseDriverSpec(j(spec), '/p/x');
@@ -958,10 +985,6 @@ describe('parseDriverSpec: driverSchema 1 load-time contract', () => {
     noMergeBlocked.errorClasses = (noMergeBlocked.errorClasses as Array<{ class: string }>).filter(c => c!.class !== 'MERGE_BLOCKED');
     expect(errMsgs(noMergeBlocked).join('\n')).toMatch(/errorClasses must declare 'MERGE_BLOCKED' \(reserved, required by merge\)/);
 
-    const noRefNotFound = clone(MINIMAL);
-    noRefNotFound.errorClasses = (noRefNotFound.errorClasses as Array<{ class: string }>).filter(c => c!.class !== 'REF_NOT_FOUND');
-    delete (noRefNotFound.ops.deleteBranch as Record<string, unknown>).treatAsSuccess;
-    expect(errMsgs(noRefNotFound).join('\n')).toMatch(/errorClasses must declare 'REF_NOT_FOUND' \(reserved, required by deleteBranch\)/);
   });
 });
 

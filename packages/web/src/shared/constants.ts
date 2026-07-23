@@ -49,6 +49,16 @@ export const TASK_IMAGE_MAX_COUNT = 4;
 
 export const REVIEW_VERDICT_TIMEOUT_MS = 10 * 60 * 1000;
 
+export function safeExternalHref(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 export const PET_ATLAS_WIDTH = 1536;
 export const PET_ATLAS_HEIGHT = 1872;
 export const PET_CELL_WIDTH = 192;

@@ -9,11 +9,12 @@ import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { initStateDir } from '../../src/state/init.js';
-import type { BaxianConfig, BaxianEvent, ReviewMode, TaskState } from '../../src/shared/index.js';
+import type { BaxianConfig, BaxianEvent, ReviewFindings, ReviewMode, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import type { ExecResult } from '../../src/agent/runner.js';
 import { __setNetExecSleepForTests } from '../../src/agent/net-exec.js';
 import { BranchManager } from '../../src/agent/branch.js';
+import { ReviewStore, reviewFindingsDigest, serverResponseFailureSignature } from '../../src/state/review-store.js';
 
 let tempDir: string;
 beforeEach(async () => {
@@ -74,8 +75,11 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean; siblingPr
   const watcher = {
     start: vi.fn(async () => true),
     stop: vi.fn(),
+    stopAgentIfToken: vi.fn(),
+    stopIfToken: vi.fn(),
     has: vi.fn(() => false),
   };
+  const reviewStore = new ReviewStore();
   const manager = new AgentManager({
     config: makeConfig(mode, opts),
     agentStore,
@@ -85,8 +89,9 @@ async function makeFixture(mode: ReviewMode, opts: { omitQa?: boolean; siblingPr
     runnerFactory: () => runner,
     platformRunner: runner,
     phaseSignalWatcher: watcher as never,
+    reviewStore,
   });
-  return { manager, taskStore, agentStore, lockManager, events, watcher, runner };
+  return { manager, taskStore, agentStore, lockManager, reviewStore, events, watcher, runner };
 }
 
 function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
@@ -94,33 +99,272 @@ function taskFixture(overrides: Partial<TaskState> = {}): TaskState {
     id: 'task-1', projectId: 'proj', title: 'T', description: 'D',
     preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1',
     phase: 'code',
+    reviewMode: 'server',
     reviewRound: 0, branch: 'bx/task-1', status: 'in_progress',
     createdAt: '2026-06-12T00:00:00.000Z', updatedAt: '2026-06-12T00:00:00.000Z',
     ...overrides,
   } as TaskState;
 }
 
+const RECOVERY_FINDINGS: ReviewFindings = {
+  round: 1,
+  verdict: 'request-changes',
+  findings: [{ id: 'f-1', severity: 'major', message: 'broken' }],
+};
+
+function recoveryTask(mode: 'classify-response' | 'correct-response' | 'hold'): TaskState {
+  const findingsDigest = reviewFindingsDigest(RECOVERY_FINDINGS);
+  return taskFixture({
+    reviewMode: 'server',
+    phase: 'code',
+    status: 'fixing',
+    reviewRound: 1,
+    signalToken: '222222222222',
+    serverSignalRecovery: {
+      mode,
+      signalKind: 'code-fixed',
+      phase: 'code',
+      round: 1,
+      sourceToken: '111111111111',
+      findingsDigest,
+      failureSignature: serverResponseFailureSignature({
+        phase: 'code', round: 1, findingsDigest, reason: 'coverage-gap', missingFindingIds: ['f-1'],
+      }),
+      responseDigest: 'c'.repeat(64),
+      reason: 'coverage-gap',
+      failurePhase: 'server-code-response-coverage-gap',
+      missingFindingIds: ['f-1'],
+      unknownFindingIds: [],
+      schemaViolationCodes: [],
+      createdAt: '2026-06-12T00:01:00.000Z',
+    },
+  });
+}
+
+async function seedRecoveryRound(fixture: Awaited<ReturnType<typeof makeFixture>>): Promise<void> {
+  await fixture.reviewStore.putRound('task-1', 'code', {
+    round: 1,
+    phase: 'code',
+    content: 'diff',
+    findings: RECOVERY_FINDINGS,
+    startedAt: '2026-06-12T00:00:00.000Z',
+  });
+}
+
+describe('server signal generation recovery', () => {
+  it('allows only one status+phase+round+source-token correction claim', async () => {
+    const f = await makeFixture('server');
+    const task = taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'fixing', reviewRound: 1, signalToken: '111111111111',
+    });
+    await f.taskStore.set(task);
+    const findingsDigest = reviewFindingsDigest(RECOVERY_FINDINGS);
+    const input = {
+      mode: 'classify-response' as const,
+      phase: 'code' as const,
+      round: 1,
+      findingsDigest,
+      failureSignature: serverResponseFailureSignature({
+        phase: 'code', round: 1, findingsDigest, reason: 'coverage-gap', missingFindingIds: ['f-1'],
+      }),
+      responseDigest: 'c'.repeat(64),
+      reason: 'coverage-gap' as const,
+      missingFindingIds: ['f-1'],
+      unknownFindingIds: [],
+      schemaViolationCodes: [],
+    };
+
+    const [first, second] = await Promise.all([
+      f.manager.claimServerSignalRecovery(task, 'dev-1', 'code-fixed', input),
+      f.manager.claimServerSignalRecovery(task, 'dev-1', 'code-fixed', input),
+    ]);
+
+    expect([first, second].filter(Boolean)).toHaveLength(1);
+    const stored = await f.taskStore.get(task.id);
+    expect(stored?.signalToken).not.toBe('111111111111');
+    expect(stored?.serverSignalRecovery?.sourceToken).toBe('111111111111');
+    expect(f.watcher.stopAgentIfToken).toHaveBeenCalledTimes(1);
+  });
+
+  it('fences a legacy spec entry whose phase and spec round are not materialized yet', async () => {
+    const f = await makeFixture('server');
+    const task = taskFixture({
+      reviewMode: 'server', phase: undefined, status: 'in_progress',
+      specReviewRound: undefined, signalToken: '111111111111',
+    });
+    await f.taskStore.set(task);
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: '2026-06-12T00:00:00.000Z',
+    }));
+
+    const claimed = await f.manager.holdConsumedServerSignal(task, 'dev-1', 'spec-done', {
+      phase: 'spec',
+      round: 0,
+      reason: 'handler-failed',
+      failurePhase: 'server-spec-content-read-failed',
+    });
+
+    expect(claimed?.signalToken).not.toBe('111111111111');
+    expect(claimed?.serverSignalRecovery).toMatchObject({ phase: 'spec', round: 0, mode: 'hold' });
+    await expect(f.manager.setServerSignalRecoveryMode(
+      'task-1', claimed!.signalToken!, 'hold',
+    )).resolves.not.toBeNull();
+  });
+
+  it('arms the successor watcher before correction injection and clears the guarded intent after delivery', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(recoveryTask('correct-response'));
+    await seedRecoveryRound(f);
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: '2026-06-12T00:00:00.000Z',
+    }));
+    const order: string[] = [];
+    f.watcher.start.mockImplementation(async () => {
+      order.push('arm');
+      return true;
+    });
+    vi.spyOn(f.manager, 'continueSession').mockImplementation(async (_taskId, _agentId, _phase, opts) => {
+      expect(await opts.armBeforeInject?.({})).toBe(true);
+      expect(await opts.guardBeforeInject?.()).toBe(true);
+      order.push('inject');
+      return true;
+    });
+
+    await expect(f.manager.dispatchServerFeedbackCorrection(
+      'task-1', JSON.stringify(RECOVERY_FINDINGS),
+    )).resolves.toBe(true);
+
+    expect(order).toEqual(['arm', 'inject']);
+    expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      token: '222222222222',
+      replaceFromToken: '111111111111',
+      onlyReplaceOwnToken: true,
+      skipSnapshot: true,
+    }));
+    expect((await f.taskStore.get('task-1'))?.serverSignalRecovery).toBeUndefined();
+  });
+
+  it('finishes a classify-response crash intent idempotently on startup', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(recoveryTask('classify-response'));
+    await seedRecoveryRound(f);
+    const deleteResponse = vi.fn(async () => undefined);
+    vi.spyOn(f.manager, 'getReviewTransport').mockReturnValue({
+      readResponseWithRaw: vi.fn(async () => ({
+        kind: 'invalid' as const,
+        raw: '{}',
+        responseDigest: 'c'.repeat(64),
+        error: new Error('invalid'),
+        schemaViolationCodes: ['response-not-object'],
+      })),
+      deleteResponse,
+    } as never);
+    const correction = vi.spyOn(f.manager, 'dispatchServerFeedbackCorrection').mockResolvedValue(true);
+
+    await f.manager.setupRecoveredSpecSignals();
+    await f.manager.setupRecoveredSpecSignals();
+
+    const stored = await f.reviewStore.getRound('task-1', 'code', 1);
+    expect(stored?.serverResponseFailures).toHaveLength(1);
+    expect(stored?.serverResponseFailures?.[0]).toMatchObject({
+      sourceToken: '111111111111', disposition: 'auto-correct', reason: 'coverage-gap',
+    });
+    expect(correction).toHaveBeenCalledTimes(2);
+    expect(deleteResponse).toHaveBeenCalledTimes(2);
+    expect(f.watcher.start).not.toHaveBeenCalled();
+  });
+
+  it('preserves a changed live response and holds instead of deleting it during recovery', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(recoveryTask('correct-response'));
+    await seedRecoveryRound(f);
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: '2026-06-12T00:00:00.000Z',
+    }));
+    const deleteResponse = vi.fn(async () => undefined);
+    vi.spyOn(f.manager, 'getReviewTransport').mockReturnValue({
+      readResponseWithRaw: vi.fn(async () => ({
+        kind: 'invalid' as const,
+        raw: '{"changed":true}',
+        responseDigest: 'd'.repeat(64),
+        error: new Error('invalid'),
+        schemaViolationCodes: ['unknown-schema-error'],
+      })),
+      deleteResponse,
+    } as never);
+    const correction = vi.spyOn(f.manager, 'dispatchServerFeedbackCorrection').mockResolvedValue(true);
+
+    await f.manager.setupRecoveredSpecSignals();
+
+    expect(deleteResponse).not.toHaveBeenCalled();
+    expect(correction).not.toHaveBeenCalled();
+    expect((await f.taskStore.get('task-1'))?.serverSignalRecovery?.mode).toBe('hold');
+    expect(f.events.some(event =>
+      event.data?.phase === 'server-code-feedback-recovery-response-changed')).toBe(true);
+  });
+
+  it('startup preserves a hold without arming an ordinary watcher', async () => {
+    const f = await makeFixture('server');
+    const task = recoveryTask('hold');
+    await f.taskStore.set(task);
+    const hold = vi.spyOn(f.manager, 'holdServerSignalRecovery').mockResolvedValue(task);
+
+    await f.manager.setupRecoveredSpecSignals();
+
+    expect(hold).toHaveBeenCalledWith(
+      'task-1', 'dev-1', '222222222222',
+      'server-code-response-coverage-gap',
+      expect.stringContaining('held for coverage-gap'),
+    );
+    expect(f.watcher.start).not.toHaveBeenCalled();
+  });
+
+  it('an explicit REPL Restart consumes a hold and replays feedback with a fresh token and digest', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(recoveryTask('hold'));
+    await seedRecoveryRound(f);
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: '2026-06-12T00:01:00.000Z',
+      status: 'awaiting_human', awaitingPhase: 'server-feedback-response-repeated',
+      awaitingReason: 'manual review required', awaitingSince: '2026-06-12T00:01:00.000Z',
+    }));
+    (f.manager as unknown as { phaseSignalWatcher?: unknown }).phaseSignalWatcher = undefined;
+    const continuation = vi.spyOn(f.manager, 'continueSession').mockResolvedValue(true);
+
+    await expect(f.manager.redispatchTaskPromptAfterReplRestart('dev-1', 'task-1')).resolves.toBe(true);
+
+    const stored = await f.taskStore.get('task-1');
+    expect(stored?.serverSignalRecovery).toBeUndefined();
+    expect(stored?.signalToken).not.toBe('222222222222');
+    expect(continuation).toHaveBeenCalledWith('task-1', 'dev-1', 'server-feedback', expect.objectContaining({
+      signalToken: stored?.signalToken,
+      serverFindingsDigest: reviewFindingsDigest(RECOVERY_FINDINGS),
+      serverPriorFindings: JSON.stringify(RECOVERY_FINDINGS),
+    }));
+  });
+});
+
 describe('server dispatch guards (spec unification)', () => {
-  it('dispatchServerReviewToQa rejects github task for code phase', async () => {
-    const f = await makeFixture('github');
-    await f.taskStore.set(taskFixture({ reviewMode: 'github', phase: 'code', signalToken: 't' }));
+  it('dispatchServerReviewToQa rejects a git task for code phase', async () => {
+    const f = await makeFixture('git');
+    await f.taskStore.set(taskFixture({ reviewMode: 'git', phase: 'code', signalToken: 't' }));
     await expect(
       f.manager.dispatchServerReviewToQa('task-1', { phase: 'code', content: 'diff' }),
     ).rejects.toThrow(/not in server review mode/);
   });
 
-  it('dispatchServerReviewToQa accepts github task for spec phase (proceeds past guard)', async () => {
-    const f = await makeFixture('github', { omitQa: true });
-    await f.taskStore.set(taskFixture({ reviewMode: 'github', phase: 'spec', qaAgentId: undefined, signalToken: 't' }));
+  it('dispatchServerReviewToQa accepts a git task for spec phase (proceeds past guard)', async () => {
+    const f = await makeFixture('git', { omitQa: true });
+    await f.taskStore.set(taskFixture({ reviewMode: 'git', phase: 'spec', qaAgentId: undefined, signalToken: 't' }));
     const result = await f.manager.dispatchServerReviewToQa('task-1', { phase: 'spec', content: 'spec text' });
     expect(result).toBeNull();
     expect(f.events.some(e => e.type === 'human.intervention'
       && e.data?.phase === 'server-review-no-qa-partner')).toBe(true);
   });
 
-  it('dispatchServerFixToDev rejects github task outside spec phase', async () => {
-    const f = await makeFixture('github');
-    await f.taskStore.set(taskFixture({ reviewMode: 'github', phase: 'code', status: 'review', signalToken: 't' }));
+  it('dispatchServerFixToDev rejects a git task outside spec phase', async () => {
+    const f = await makeFixture('git');
+    await f.taskStore.set(taskFixture({ reviewMode: 'git', phase: 'code', status: 'review', signalToken: 't' }));
     await expect(
       f.manager.dispatchServerFixToDev('task-1', '{}'),
     ).rejects.toThrow(/not in server review mode/);
@@ -129,10 +373,10 @@ describe('server dispatch guards (spec unification)', () => {
 
 describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s pre-inject hook', () => {
   it('defers the spec-reviewed read-file watcher arm into startSession (not eagerly before the session exists)', async () => {
-    const f = await makeFixture('github');
+    const f = await makeFixture('git');
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
-      reviewMode: 'github', phase: 'spec', status: 'in_progress',
+      reviewMode: 'git', phase: 'spec', status: 'in_progress',
       signalToken: 'orig-token', specReviewRound: 0,
     }));
     await f.agentStore.update('dev-1', () => ({
@@ -281,10 +525,10 @@ describe('dispatchServerReviewToQa arms the read-file watcher in startSession\'s
 
 describe('dispatchServerReviewToQa rollback restores originalPhase', () => {
   it('first spec dispatch failure restores the explicit spec phase', async () => {
-    const f = await makeFixture('github');
+    const f = await makeFixture('git');
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
-      reviewMode: 'github', phase: 'spec', status: 'in_progress',
+      reviewMode: 'git', phase: 'spec', status: 'in_progress',
       signalToken: 'orig-token', specReviewRound: 0,
     }));
     await f.agentStore.update('dev-1', () => ({
@@ -308,9 +552,9 @@ function interventionPhases(events: BaxianEvent[]): string[] {
 
 describe('dispatchServerReviewToQa failure & success paths', () => {
   it('no QA partner while fixing re-arms the *-fixed entry signal', async () => {
-    const f = await makeFixture('github', { omitQa: true });
+    const f = await makeFixture('git', { omitQa: true });
     await f.taskStore.set(taskFixture({
-      reviewMode: 'github', phase: 'spec', status: 'fixing',
+      reviewMode: 'git', phase: 'spec', status: 'fixing',
       qaAgentId: undefined, signalToken: 't', specReviewRound: 1,
     }));
 
@@ -350,10 +594,53 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
 
     const result = await f.manager.dispatchServerReviewToQa('task-1', { phase: 'code', content: 'diff', recheck: true });
 
-    expect(releaseSpy).toHaveBeenCalledWith('qa-1', 'task-1', 'idle');
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1',
+      'task-1',
+      'idle',
+      expect.objectContaining({ expectedLockToken: expect.any(String) }),
+    );
     expect(result?.status).toBe('review');
     expect(result?.reviewRound).toBe(2);
     expect((await f.agentStore.get('qa-1'))?.taskId).toBe('task-1');
+  });
+
+  it('restarts a failed spec dispatch while preserving the current round', async () => {
+    const f = await makeFixture('git');
+    const now = new Date().toISOString();
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'git', phase: 'spec', status: 'review',
+      signalToken: 't', specReviewRound: 10,
+    }));
+    await f.agentStore.update('qa-1', () => ({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', updatedAt: now,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: now,
+    }));
+    vi.spyOn(f.manager, 'startSession').mockResolvedValue(true);
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'spec',
+      content: 'persisted cap spec',
+      bumpRound: false,
+    });
+
+    expect(result).toMatchObject({ status: 'review', specReviewRound: 10 });
+  });
+
+  it('refuses to redispatch when there is no current review round', async () => {
+    const f = await makeFixture('git');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'git', phase: 'spec', status: 'review',
+      signalToken: 't', specReviewRound: 0,
+    }));
+
+    await expect(f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'spec',
+      content: 'missing persisted spec',
+      bumpRound: false,
+    })).rejects.toThrow('no current spec review round to redispatch');
   });
 
   it('a failed redispatch from review does not re-arm the dev entry signal (long consumed)', async () => {
@@ -387,6 +674,26 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
       agentId: 'dev-1', expectedKinds: 'code-fixed',
     }));
     expect((await f.taskStore.get('task-1'))?.status).toBe('fixing');
+  });
+
+  it('leaves a consumed review-dispatch failure to the handler without same-token re-arm or duplicate alert', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'fixing', signalToken: 't',
+    }));
+    await f.agentStore.update('qa-1', () => ({
+      id: 'qa-1', projectId: 'proj', taskId: 'someone-else', updatedAt: new Date().toISOString(),
+    }));
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code',
+      content: 'diff',
+      callerOwnsConsumedSignalFailure: true,
+    });
+
+    expect(result).toBeNull();
+    expect(f.watcher.start).not.toHaveBeenCalled();
+    expect(interventionPhases(f.events)).not.toContain('server-review-qa-acquire-failed');
   });
 
   it('dev park failure releases the QA, re-arms code-done and emits dev-park-failed', async () => {
@@ -423,6 +730,181 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
     expect((await f.agentStore.get('qa-1'))?.taskId).toBeUndefined();
   });
 
+  it('fresh dispatch fences the complete missing-value entry tuple before installing review', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', status: 'in_progress', phase: undefined, signalToken: undefined,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    const realTransition = f.manager.transitionTaskStatus.bind(f.manager);
+    let capturedGuard: Record<string, unknown> | undefined;
+    vi.spyOn(f.manager, 'transitionTaskStatus').mockImplementation(async (id, status, guard, patch) => {
+      if (status === 'review') {
+        capturedGuard = guard;
+        const current = await f.taskStore.get(id);
+        await f.taskStore.set({
+          ...current!, phase: 'code', signalToken: 'successor-pass', updatedAt: new Date().toISOString(),
+        });
+      }
+      return realTransition(id, status, guard, patch);
+    });
+    const startSpy = vi.spyOn(f.manager, 'startSession').mockResolvedValue(true);
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff',
+    });
+
+    expect(result).toBeNull();
+    expect(Object.hasOwn(capturedGuard ?? {}, 'expectPhase')).toBe(true);
+    expect(Object.hasOwn(capturedGuard ?? {}, 'expectSignalToken')).toBe(true);
+    expect(capturedGuard).toMatchObject({ fromStatus: ['in_progress'] });
+    expect(await f.taskStore.get('task-1')).toMatchObject({
+      status: 'in_progress', phase: 'code', signalToken: 'successor-pass',
+    });
+    expect((await f.agentStore.get('qa-1'))?.taskId).toBeUndefined();
+    expect(f.watcher.start).not.toHaveBeenCalled();
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
+  it('continuation fences the complete missing-value entry tuple before rebuilding review', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', status: 'review', phase: undefined, signalToken: undefined, reviewRound: 1,
+    }));
+    await f.agentStore.update('qa-1', () => ({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    const realTransition = f.manager.transitionTaskStatus.bind(f.manager);
+    let capturedGuard: Record<string, unknown> | undefined;
+    vi.spyOn(f.manager, 'transitionTaskStatus').mockImplementation(async (id, status, guard, patch) => {
+      if (status === 'review') {
+        capturedGuard = guard;
+        const current = await f.taskStore.get(id);
+        await f.taskStore.set({
+          ...current!, phase: 'code', signalToken: 'continuation-successor', updatedAt: new Date().toISOString(),
+        });
+      }
+      return realTransition(id, status, guard, patch);
+    });
+    const continueSpy = vi.spyOn(f.manager, 'continueSession').mockResolvedValue(true);
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'next batch', continuation: true,
+    });
+
+    expect(result).toBeNull();
+    expect(Object.hasOwn(capturedGuard ?? {}, 'expectPhase')).toBe(true);
+    expect(Object.hasOwn(capturedGuard ?? {}, 'expectSignalToken')).toBe(true);
+    expect(capturedGuard).toMatchObject({ fromStatus: ['review'] });
+    expect(await f.taskStore.get('task-1')).toMatchObject({
+      status: 'review', phase: 'code', signalToken: 'continuation-successor',
+    });
+    expect((await f.agentStore.get('qa-1'))?.taskId).toBe('task-1');
+    expect(f.watcher.start).not.toHaveBeenCalled();
+    expect(continueSpy).not.toHaveBeenCalled();
+  });
+
+  it('failed server dispatch cannot roll an installed pass over a review successor', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', status: 'in_progress', phase: undefined, signalToken: undefined,
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async () => {
+      const installed = await f.taskStore.get('task-1');
+      expect(installed?.status).toBe('review');
+      await f.taskStore.set({
+        ...installed!, phase: 'code', signalToken: 'later-review-pass', reviewRound: 7,
+        updatedAt: new Date().toISOString(),
+      });
+      return false;
+    });
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff',
+    });
+
+    expect(result).toBeNull();
+    expect(await f.taskStore.get('task-1')).toMatchObject({
+      status: 'review', phase: 'code', signalToken: 'later-review-pass', reviewRound: 7,
+    });
+    expect(f.watcher.start).not.toHaveBeenCalled();
+  });
+
+  it('session cleanup uses the fresh QA acquire generation and preserves a successor rebind', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', status: 'in_progress', phase: 'code', signalToken: 'entry-pass',
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    let successorLockToken: string | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async () => {
+      const acquired = await f.agentStore.get('qa-1');
+      expect(acquired?.lockToken).toEqual(expect.any(String));
+      expect(await f.lockManager.releaseIfOwner('qa-1', 'task-1', acquired!.lockToken!)).toBe(true);
+      await f.agentStore.update('qa-1', existing => existing && ({
+        id: existing.id, projectId: existing.projectId, updatedAt: new Date().toISOString(),
+      }));
+      expect(await f.manager.acquireAgentForTask('qa-1', 'task-1', 'review', {
+        onAcquired: token => { successorLockToken = token; },
+      })).toBe(true);
+      return false;
+    });
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff',
+    });
+
+    expect(result).toBeNull();
+    expect(successorLockToken).toEqual(expect.any(String));
+    expect(await f.agentStore.get('qa-1')).toMatchObject({
+      taskId: 'task-1', lockToken: successorLockToken,
+    });
+    expect(await f.lockManager.isOwner('qa-1', 'task-1', successorLockToken!)).toBe(true);
+  });
+
+  it('manual redispatch pre-release is fenced to the snapshotted QA generation', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', status: 'review', phase: 'code', signalToken: 'entry-pass', reviewRound: 1,
+    }));
+    await f.agentStore.update('qa-1', () => ({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    const entryLockToken = (await f.agentStore.get('qa-1'))!.lockToken!;
+    const realRelease = f.manager.releaseAgentForTask.bind(f.manager);
+    let successorLockToken: string | undefined;
+    vi.spyOn(f.manager, 'releaseAgentForTask').mockImplementationOnce(async (agentId, taskId, mode, opts) => {
+      expect(opts).toMatchObject({ expectedLockToken: entryLockToken });
+      expect(await f.lockManager.releaseIfOwner(agentId, taskId, entryLockToken)).toBe(true);
+      await f.agentStore.update(agentId, existing => existing && ({
+        id: existing.id, projectId: existing.projectId, updatedAt: new Date().toISOString(),
+      }));
+      expect(await f.manager.acquireAgentForTask(agentId, taskId, 'review', {
+        onAcquired: token => { successorLockToken = token; },
+      })).toBe(true);
+      return realRelease(agentId, taskId, mode, opts);
+    });
+    const startSpy = vi.spyOn(f.manager, 'startSession').mockResolvedValue(true);
+
+    const result = await f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff', recheck: true,
+    });
+
+    expect(result).toBeNull();
+    expect(successorLockToken).not.toBe(entryLockToken);
+    expect(await f.agentStore.get('qa-1')).toMatchObject({
+      taskId: 'task-1', lockToken: successorLockToken,
+    });
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
   it('a DispatchTerminalError from the QA session fails the task via failTaskForDispatchError', async () => {
     const f = await makeFixture('server');
     const NOW = new Date().toISOString();
@@ -441,8 +923,46 @@ describe('dispatchServerReviewToQa failure & success paths', () => {
       f.manager.dispatchServerReviewToQa('task-1', { phase: 'code', content: 'diff' }),
     ).rejects.toMatchObject({ reason: 'prompt_too_large' });
 
-    expect(failSpy).toHaveBeenCalledWith('task-1', 'server-review', 'qa-1', expect.anything());
+    expect(failSpy).toHaveBeenCalledWith(
+      'task-1',
+      'server-review',
+      'qa-1',
+      expect.anything(),
+      expect.objectContaining({ expectedLockToken: expect.any(String) }),
+    );
     expect(f.watcher.stop).toHaveBeenCalledWith('task-1');
+  });
+
+  it('terminal server dispatch cleanup preserves a successor QA lock generation', async () => {
+    const f = await makeFixture('server');
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'server', phase: 'code', status: 'in_progress', signalToken: 'entry-pass',
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'task-1', updatedAt: new Date().toISOString(),
+    }));
+    let successorLockToken: string | undefined;
+    vi.spyOn(f.manager, 'startSession').mockImplementation(async () => {
+      const acquired = await f.agentStore.get('qa-1');
+      expect(await f.lockManager.releaseIfOwner('qa-1', 'task-1', acquired!.lockToken!)).toBe(true);
+      await f.agentStore.update('qa-1', existing => existing && ({
+        id: existing.id, projectId: existing.projectId, updatedAt: new Date().toISOString(),
+      }));
+      expect(await f.manager.acquireAgentForTask('qa-1', 'task-1', 'review', {
+        onAcquired: token => { successorLockToken = token; },
+      })).toBe(true);
+      throw new DispatchTerminalError('prompt_too_large', 'diff too big');
+    });
+
+    await expect(f.manager.dispatchServerReviewToQa('task-1', {
+      phase: 'code', content: 'diff',
+    })).rejects.toMatchObject({ reason: 'prompt_too_large' });
+
+    expect((await f.taskStore.get('task-1'))?.status).toBe('failed');
+    expect(await f.agentStore.get('qa-1')).toMatchObject({
+      taskId: 'task-1', lockToken: successorLockToken,
+    });
+    expect(await f.lockManager.isOwner('qa-1', 'task-1', successorLockToken!)).toBe(true);
   });
 
   it('a delivered QA session leaves the task in review with the bumped round', async () => {
@@ -558,10 +1078,37 @@ describe('dispatchServerFixToDev failure & success paths', () => {
     expect(interventionPhases(f.events)).toContain('server-fix-dev-acquire-failed');
   });
 
-  it('spec continuation passes currentSpecRound and arms spec-fixed after delivery', async () => {
-    const f = await makeFixture('github');
+  it('leaves a consumed fix-dispatch failure to the handler without same-token re-arm or duplicate alert', async () => {
+    const f = await makeFixture('server');
     await f.taskStore.set(taskFixture({
-      reviewMode: 'github', phase: 'spec', status: 'review', signalToken: 't',
+      reviewMode: 'server', phase: 'code', status: 'review', signalToken: 't',
+    }));
+    await f.agentStore.update('dev-1', () => ({
+      id: 'dev-1', projectId: 'proj', taskId: 'someone-else', updatedAt: new Date().toISOString(),
+    }));
+
+    const result = await f.manager.dispatchServerFixToDev(
+      'task-1', '[]', { callerOwnsConsumedSignalFailure: true },
+    );
+
+    expect(result).toBeNull();
+    expect(f.watcher.start).not.toHaveBeenCalled();
+    expect(interventionPhases(f.events)).not.toContain('server-fix-dev-acquire-failed');
+  });
+
+  it('spec continuation passes currentSpecRound and arms spec-fixed after delivery', async () => {
+    const f = await makeFixture('git');
+    const findings = { ...RECOVERY_FINDINGS, round: 2 };
+    await f.reviewStore.putRound('task-1', 'spec', {
+      round: 2,
+      phase: 'spec',
+      content: '# spec',
+      documents: [{ relPath: '.baxian/spec.md', content: '# spec' }],
+      findings,
+      startedAt: '2026-06-12T00:00:00.000Z',
+    });
+    await f.taskStore.set(taskFixture({
+      reviewMode: 'git', phase: 'spec', status: 'review', signalToken: 't',
       qaAgentId: undefined, specReviewRound: 2,
     }));
     let seenOpts: Record<string, unknown> | undefined;
@@ -575,7 +1122,8 @@ describe('dispatchServerFixToDev failure & success paths', () => {
     expect(result).not.toBeNull();
     expect(seenOpts).toMatchObject({
       currentSpecRound: 2,
-      serverPriorFindings: '[{"note":"fix me"}]',
+      serverPriorFindings: JSON.stringify(findings),
+      serverFindingsDigest: reviewFindingsDigest(findings),
       bypassTaskStatusGate: true,
     });
     expect(f.watcher.start).toHaveBeenCalledWith(expect.objectContaining({
@@ -586,6 +1134,7 @@ describe('dispatchServerFixToDev failure & success paths', () => {
 
   it('a generic dispatch error rolls back to review, releases the dev and re-arms code-reviewed', async () => {
     const f = await makeFixture('server');
+    await seedRecoveryRound(f);
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
       reviewMode: 'server', phase: 'code', status: 'review', signalToken: 'orig-token',
@@ -608,6 +1157,7 @@ describe('dispatchServerFixToDev failure & success paths', () => {
 
   it('a DispatchTerminalError from the fix dispatch fails the task', async () => {
     const f = await makeFixture('server');
+    await seedRecoveryRound(f);
     const NOW = new Date().toISOString();
     await f.taskStore.set(taskFixture({
       reviewMode: 'server', phase: 'code', status: 'review', signalToken: 't',
@@ -935,9 +1485,9 @@ describe('findLineageViolation', () => {
 
 describe('dispatchServerReviewToQa forwards full content to startSession (split happens later)', () => {
   it('passes oversized spec content through untruncated', async () => {
-    const f = await makeFixture('github');
+    const f = await makeFixture('git');
     await f.taskStore.set(taskFixture({
-      reviewMode: 'github', phase: 'spec', status: 'in_progress',
+      reviewMode: 'git', phase: 'spec', status: 'in_progress',
       signalToken: 'orig-token', specReviewRound: 0,
     }));
     await f.agentStore.update('dev-1', () => ({

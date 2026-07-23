@@ -39,6 +39,7 @@ const REQUIRED_NON_NULL: Record<string, readonly string[]> = {
   listPrs: ['prNumber', 'prUrl', 'branch', 'headSha', 'state', 'draft', 'updatedAt', 'targetProjectId', 'targetBranch'],
   prView: ['prUrl', 'branch', 'headSha', 'state', 'draft', 'targetProjectId', 'targetBranch'],
   projectView: ['defaultBranch'],
+  branchView: ['remoteProjectId'],
   // body 可空：GitHub 纯 APPROVED review 可无正文，一行 null body 不得 fail closed 整个评论源
   // （消费端对非 string body 一律按空文本处理：无令牌、无 ack、不合成反馈）。
   listComments: ['id'],

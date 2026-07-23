@@ -52,7 +52,7 @@ export function prReviewRoundKey(round: PrReviewRound, fallback: string): string
   return `round-in-progress-${round.items[0] ? prReviewItemKey(round.items[0], fallback) : fallback}`;
 }
 
-// 字段必须保持 server/src/github/pr-conversation-cache.ts 服务端 revision 的前缀子集：
+// 字段必须保持 server/src/platform/pr-conversation-cache.ts 服务端 revision 的前缀子集：
 // 这里任何触发重拉的变化在服务端缓存必然 miss。prNumber 在列，PR 重绑定即重拉；
 // reviewConversationUpdatedAt 承载 git 时间线的展示刷新。
 export function prReviewRevision(task: Pick<TaskState, 'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt'>): string {

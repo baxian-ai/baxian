@@ -16,6 +16,7 @@ import {
   isSpecStagePhase,
   REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
+  safeExternalHref,
   type AgentConfig,
   type AgentSnapshot,
   type ReviewRound,
@@ -333,7 +334,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showReadyGate = task.status === 'ready';
     const showCodeMaxRounds = task.status === 'max_rounds' && !isSpecStagePhase(task.phase);
     const showSpecMaxRounds = task.status === 'max_rounds' && isSpecStagePhase(task.phase);
-    const branchUrl = branchTreeUrl(task.prUrl, task.branch ?? '');
+    const prHref = safeExternalHref(task.prUrl);
+    const branchUrl = branchTreeUrl(prHref ?? undefined, task.branch ?? '');
 
     return (
       <div>
@@ -383,9 +385,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             <div className="mt-1 text-og-700">
               {t.taskDetail.approvedBannerBody}
             </div>
-            {task.prUrl && (
+            {prHref && (
               <a
-                href={task.prUrl}
+                href={prHref}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn-secondary mt-3"
@@ -403,9 +405,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
               {t.taskDetail.readyGateBannerBody(task.reviewRound)}
             </div>
             <ReviewSummary taskId={task.id} />
-            {task.prUrl && (
+            {prHref && (
               <a
-                href={task.prUrl}
+                href={prHref}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn-secondary mt-3"
@@ -446,9 +448,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             <div className="mt-1 text-og-700">
               {t.taskDetail.mergeReadyBannerBody}
             </div>
-            {task.prUrl && (
+            {prHref && (
               <a
-                href={task.prUrl}
+                href={prHref}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="btn-secondary mt-3"
@@ -495,8 +497,8 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           <span className="text-og-500">
             PR:{' '}
             {task.prNumber ? (
-              task.prUrl ? (
-                <a href={task.prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">#{task.prNumber}</a>
+              prHref ? (
+                <a href={prHref} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">#{task.prNumber}</a>
               ) : (
                 <span className="font-mono text-og-800">#{task.prNumber}</span>
               )

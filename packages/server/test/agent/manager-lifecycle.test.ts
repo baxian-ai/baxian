@@ -53,6 +53,8 @@ async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise
     devAgentId: 'dev-1',
     phase: 'code',
     reviewRound: 0,
+    reviewMode: 'git',
+    platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
     status: 'in_progress',
     branch: `bx/${overrides.id}`,
     createdAt: now,

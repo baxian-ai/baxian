@@ -77,7 +77,6 @@ export function deadTokens(sources: VerdictSourceScan[]): Set<string> {
   return dead;
 }
 
-// 无状态：merge 前复核由 manager 独立调用，不依赖 poller 的 engine 实例（spec §6 merge 条）。
 export function recheckPassProvenance(
   record: PassProvenanceRecord,
   sources: VerdictSourceScan[],
@@ -86,7 +85,6 @@ export function recheckPassProvenance(
   const row = sources.find(s => s.key === record.carrier.sourceKey)?.rows.find(r => String(r.id) === record.carrier.id);
   if (row === undefined) return { ok: false, reason: 'carrier-row-missing' };
   if (rowBodyDigest(row) !== record.carrier.bodyDigest) return { ok: false, reason: 'carrier-body-edited' };
-  // digest 相同不代表载体真的携带该 pass 对：malformed provenance（普通评论行）不得复核通过
   if (!rowTokens(row).some(m => m.kind === 'pass' && m.token === record.token
     && m.anchorSha === record.anchorSha.toLowerCase())) {
     return { ok: false, reason: 'carrier-token-missing' };

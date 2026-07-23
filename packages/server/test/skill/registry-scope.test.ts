@@ -220,9 +220,16 @@ describe('AgentManager skill scope', () => {
     expect(scopeOf('ghost-agent')).toEqual({ pluginTools: [] });
   });
 
-  it('legacy modes always resolve to the bare core scope', () => {
+  it('server-mode agents resolve to the bare core scope', async () => {
+    await seedPlugin('gh');
+    vi.spyOn(manager, 'effectiveReviewMode').mockReturnValue('server');
     expect(scopeOf('dev-1')).toEqual({ pluginTools: [] });
     expect(scopeOf('dev-2')).toEqual({ pluginTools: [] });
+  });
+
+  it('git-mode agents pick up the plugin pool without any mode override (the default is git)', async () => {
+    await seedPlugin('gh');
+    expect(scopeOf('dev-1')).toEqual({ pluginTools: ['gh'] });
   });
 
   it('provisioning writes the scoped plugin skill and keeps it off legacy agents', async () => {

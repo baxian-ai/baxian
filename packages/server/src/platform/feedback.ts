@@ -29,9 +29,6 @@ export interface CommentSourceReader {
   ): Promise<NormalizedRow[]>;
 }
 
-// 单次全源抓取（poller 周期与 manager 权威复核共用）：行投影后释放正文、system 行统一过滤；
-// 失败源保留在 scans（ok=false）供完整性门/fail-closed 判定。onFailure 在失败源入列后立即
-// 调用——poller 以它承载 RATE_LIMIT 中止（抛错停止余下源），manager 侧默认继续扫完。
 export async function scanCommentSourcesOnce(
   driver: CommentSourceReader,
   prNumber: number,
@@ -83,8 +80,6 @@ function unackedRevision(
   return { id, digest };
 }
 
-// poller 事件合成矩阵的行谓词（spec §6）：令牌行走裁决通道、载体行是 dev 回复、已 ack 的
-// revision 已处置——三类都不合成反馈事件。
 export function feedbackEventTarget(
   row: NormalizedRow,
   sourceKey: string,
@@ -94,15 +89,11 @@ export function feedbackEventTarget(
   return unackedRevision(row, sourceKey, acks);
 }
 
-// 待 ack 集合（spec §6 矩阵②/§8）：目标 = 无标记人类评论 + fail 裁决正文（pass-only 行无 fix
-// 轮不入集合）；有效 ack 逐 revision 判定。事件合成与 no-op/merge 复核共用此一个定义。
 export function collectPendingFeedback(
   scans: readonly FeedbackSourceScan[],
   ctx: AckActorContext,
 ): PendingFeedbackResult {
   const acks = collectValidAcks(buildAckCarrierRows(scans), ctx);
-  // dismiss 是受信人类的显式解除（spec §7 令牌级撤销）：被判死的 fail 不再构成待 ack 目标，
-  // 复制到其它源的同 token 行同样出列
   const dead = deadTokens(scans.map(s => ({ ...s, scanStartedAt: 0 })));
   const pending: PendingFeedbackResult['pending'] = new Map();
   for (const scan of scans) {

@@ -81,6 +81,28 @@ describe('bootstrapAutoRepos', () => {
     expect(ensure).toHaveBeenCalledTimes(2);
   });
 
+  it.each<{ mode: 'git' | 'server'; tool: string; cloneViaGh: boolean | undefined }>([
+    { mode: 'git', tool: 'forge', cloneViaGh: false },
+    { mode: 'git', tool: 'gh', cloneViaGh: true },
+    { mode: 'server', tool: 'forge', cloneViaGh: undefined },
+  ])('passes cloneViaGh=$cloneViaGh in $mode mode with tool $tool', async ({ mode, tool, cloneViaGh }) => {
+    const repoStoreFactory = vi.fn(() => repoStore(async () => '/r'));
+    const config: BaxianConfig = {
+      ...baseConfig,
+      project: [{
+        ...baseConfig.project[0],
+        repo: 'https://github.com/u/r1.git',
+        review: { mode },
+        gitCli: { tool },
+      }],
+    };
+
+    await bootstrapAutoRepos(autoBootstrapDeps(repoStoreFactory, config));
+
+    expect(repoStoreFactory).toHaveBeenCalledTimes(2);
+    expect(repoStoreFactory.mock.calls.every(call => call[7] === cloneViaGh)).toBe(true);
+  });
+
   it('on success: emits agent.bootstrap_succeeded but does NOT create state files for never-dispatched agents', async () => {
     await bootstrapAutoRepos(autoBootstrapDeps(() => repoStore(async () => '/r')));
     expect(hasEvent('agent.bootstrap_succeeded')).toBe(true);

@@ -58,6 +58,18 @@ describe('buildProjectDriver', () => {
     expect(driver).toBeInstanceOf(GitDriver);
   });
 
+  it('gives equivalent reconstructed drivers a stable preflight identity', () => {
+    const first = buildProjectDriver(project(), registry, NO_EXEC)!;
+    const second = buildProjectDriver(project(), registry, NO_EXEC)!;
+    const differentBinary = buildProjectDriver(
+      project({ gitCli: { tool: 'gh', binary: '/opt/bin/gh' } }),
+      registry,
+      NO_EXEC,
+    )!;
+    expect(second.preflightIdentity).toBe(first.preflightIdentity);
+    expect(differentBinary.preflightIdentity).not.toBe(first.preflightIdentity);
+  });
+
   it('returns undefined when the tool is unresolvable or the plugin is absent', () => {
     expect(buildProjectDriver(project({ repo: 'https://git.corp.example.com/g/p.git' }), registry, NO_EXEC))
       .toBeUndefined();

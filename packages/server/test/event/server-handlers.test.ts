@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EventBus } from '../../src/event/bus.js';
 import { registerServerEventHandlers } from '../../src/event/server-handlers.js';
-import { ReviewStore } from '../../src/state/review-store.js';
+import { ReviewExchangeError } from '../../src/agent/review-transport.js';
+import {
+  ReviewStore,
+  reviewFindingsDigest,
+  sha256Hex,
+} from '../../src/state/review-store.js';
 import type { AgentManager, ServerReviewDriver } from '../../src/agent/manager.js';
 import type { EventLog } from '../../src/event/log.js';
 import type {
@@ -48,6 +53,7 @@ interface Fixture {
     readContent: ReturnType<typeof vi.fn>;
     readFindings: ReturnType<typeof vi.fn>;
     readResponse: ReturnType<typeof vi.fn>;
+    readResponseWithRaw: ReturnType<typeof vi.fn>;
     deleteFindings: ReturnType<typeof vi.fn>;
     deleteResponse: ReturnType<typeof vi.fn>;
     readFileRange: ReturnType<typeof vi.fn>;
@@ -70,6 +76,7 @@ function makeFixture(
     rounds?: number;
     afterDone?: 'pr' | 'branch' | null;
     verifyPr?: boolean;
+    verifiedHeadSha?: string;
     specApproval?: 'human' | null;
     hasQaPartner?: boolean;
     interdiff?: { ok: true; diff: string } | { ok: false; reason: string };
@@ -87,14 +94,22 @@ function makeFixture(
     computeCodeInterdiff: [],
     dispatchServerFixToDev: [],
     dispatchServerAfterDone: [],
+    dispatchServerFeedbackCorrection: [],
     transitionTaskStatus: [],
     updateTask: [],
+    updateTaskIfStatus: [],
     transitionToCodePhase: [],
     parkTaskAtSpecReady: [],
     setupPhaseSignal: [],
     holdAgentForUnarmedSignal: [],
+    claimServerSignalRecovery: [],
+    holdConsumedServerSignal: [],
+    setServerSignalRecoveryMode: [],
+    holdServerSignalRecovery: [],
     releaseAgentForTask: [],
   };
+  let successor = 0;
+  const nextToken = (): string => (++successor).toString(16).padStart(12, '0');
   const transport = {
     readContent: vi.fn(async (_task: TaskState, _agent: typeof DEV, phase: 'code' | 'spec') => {
       const content = 'diff --git a/a.ts b/a.ts\n+x';
@@ -111,6 +126,25 @@ function makeFixture(
     }),
     readFindings: vi.fn(async (): Promise<ReviewFindings | null> => null),
     readResponse: vi.fn(async (): Promise<ReviewResponse | null> => null),
+    readResponseWithRaw: vi.fn(async (snapshot: TaskState) => {
+      try {
+        const response = await transport.readResponse(snapshot, DEV);
+        if (!response) return { kind: 'absent' as const };
+        const phase = snapshot.phase === 'spec' ? 'spec' : 'code';
+        const round = phase === 'spec' ? Math.max(snapshot.specReviewRound ?? 1, 1) : Math.max(snapshot.reviewRound, 1);
+        const stored = await store.getRound(snapshot.id, phase, round);
+        const normalized = {
+          ...response,
+          token: response.token ?? snapshot.signalToken,
+          findingsDigest: response.findingsDigest
+            ?? (stored?.findings ? reviewFindingsDigest(stored.findings) : '0'.repeat(64)),
+        };
+        const raw = JSON.stringify(normalized);
+        return { kind: 'ok' as const, raw, responseDigest: sha256Hex(raw), response: normalized };
+      } catch (error) {
+        return { kind: 'unknown' as const, error };
+      }
+    }),
     deleteFindings: vi.fn(async () => undefined),
     deleteResponse: vi.fn(async () => undefined),
     readFileRange: vi.fn(async () => ''),
@@ -149,12 +183,90 @@ function makeFixture(
     ...(config.specApproval !== undefined ? { specApproval: config.specApproval } : {}),
     agent: [],
   };
+  const updateTaskIfStatus = vi.fn(async (
+    id: string,
+    expectedStatus: TaskState['status'],
+    patch: Partial<TaskState>,
+    alsoExpect: Partial<Pick<TaskState, 'signalToken' | 'phase' | 'reviewRound' | 'specReviewRound'>> = {},
+  ) => {
+    calls.updateTaskIfStatus.push([id, expectedStatus, patch, alsoExpect]);
+    if (id !== task.id || task.status !== expectedStatus) return false;
+    for (const [field, expected] of Object.entries(alsoExpect)) {
+      if (task[field as keyof TaskState] !== expected) return false;
+    }
+    Object.assign(task, patch);
+    return true;
+  });
+  const claimServerSignalRecovery = vi.fn(async (
+    entry: TaskState,
+    agentId: string,
+    signalKind: NonNullable<TaskState['serverSignalRecovery']>['signalKind'],
+    input: Omit<NonNullable<TaskState['serverSignalRecovery']>, 'signalKind' | 'sourceToken' | 'createdAt'>,
+  ) => {
+    calls.claimServerSignalRecovery.push([entry, agentId, signalKind, input]);
+    if (!entry.signalToken) return null;
+    const token = nextToken();
+    const recovery = {
+      ...input,
+      signalKind,
+      sourceToken: entry.signalToken,
+      missingFindingIds: [...(input.missingFindingIds ?? [])].sort(),
+      unknownFindingIds: [...(input.unknownFindingIds ?? [])].sort(),
+      schemaViolationCodes: [...(input.schemaViolationCodes ?? [])].sort(),
+      createdAt: '2026-06-10T00:01:00.000Z',
+    };
+    const guarded = await updateTaskIfStatus(entry.id, entry.status, {
+      signalToken: token,
+      serverSignalRecovery: recovery,
+    }, {
+      signalToken: entry.signalToken,
+      phase: entry.phase,
+      ...(input.phase === 'spec'
+        ? { specReviewRound: entry.specReviewRound }
+        : { reviewRound: entry.reviewRound }),
+    });
+    return guarded ? { ...task } : null;
+  });
+  const setServerSignalRecoveryMode = vi.fn(async (
+    id: string,
+    token: string,
+    mode: 'correct-response' | 'hold',
+  ) => {
+    calls.setServerSignalRecoveryMode.push([id, token, mode]);
+    if (id !== task.id || task.signalToken !== token || !task.serverSignalRecovery) return null;
+    task.serverSignalRecovery = { ...task.serverSignalRecovery, mode };
+    return { ...task };
+  });
+  const holdServerSignalRecovery = vi.fn(async (
+    id: string,
+    agentId: string,
+    token: string,
+    phase: string,
+    reason: string,
+  ) => {
+    calls.holdServerSignalRecovery.push([id, agentId, token, phase, reason]);
+    return setServerSignalRecoveryMode(id, token, 'hold');
+  });
+  const holdConsumedServerSignal = vi.fn(async (
+    entry: TaskState,
+    agentId: string,
+    signalKind: NonNullable<TaskState['serverSignalRecovery']>['signalKind'],
+    input: {
+      phase: 'spec' | 'code';
+      round: number;
+      reason: NonNullable<TaskState['serverSignalRecovery']>['reason'];
+      failurePhase: string;
+    },
+  ) => {
+    calls.holdConsumedServerSignal.push([entry, agentId, signalKind, input]);
+    return claimServerSignalRecovery(entry, agentId, signalKind, { mode: 'hold', ...input });
+  });
   const manager = {
     getReviewStore: () => store,
     getProjectConfig: (id: string) => (id === 'proj' ? projectConfig : undefined),
     parkTaskAtSpecReady,
     getReviewTransport: () => transport,
-    getTask: async () => task,
+    getTask: async () => ({ ...task }),
     getAgentConfig: (id: string) => (
       id === DEV.id ? DEV
       : id === RESEARCH.id ? RESEARCH
@@ -173,6 +285,11 @@ function makeFixture(
     releaseAgentForTask,
     getAgentState,
     updateTask,
+    updateTaskIfStatus,
+    claimServerSignalRecovery,
+    holdConsumedServerSignal,
+    setServerSignalRecoveryMode,
+    holdServerSignalRecovery,
     findLineageViolation,
     computeCodeInterdiff: vi.fn(async (id: string, round: number) => {
       calls.computeCodeInterdiff.push([id, round]);
@@ -184,10 +301,16 @@ function makeFixture(
       task.status = 'review';
       return task;
     }),
-    dispatchServerFixToDev: vi.fn(async (id: string, findings: string) => {
-      calls.dispatchServerFixToDev.push([id, findings]);
+    dispatchServerFixToDev: vi.fn(async (id: string, findings: string, findingsDigest?: string) => {
+      calls.dispatchServerFixToDev.push([id, findings, findingsDigest]);
       task.status = 'fixing';
       return task;
+    }),
+    dispatchServerFeedbackCorrection: vi.fn(async (id: string, findings: string) => {
+      calls.dispatchServerFeedbackCorrection.push([id, findings]);
+      if (id !== task.id || task.serverSignalRecovery?.mode !== 'correct-response') return false;
+      task.serverSignalRecovery = undefined;
+      return true;
     }),
     dispatchServerAfterDone: vi.fn(async (id: string, kind: string) => {
       calls.dispatchServerAfterDone.push([id, kind]);
@@ -202,9 +325,16 @@ function makeFixture(
       calls.holdAgentForUnarmedSignal.push([id, agentId, kinds]);
     }),
     verifyPaneSignalPrNumber: vi.fn(async () =>
-      (config.verifyPr ?? true) ? { headRefName: 'bx/t1', headSha: 'h'.repeat(40) } : undefined),
+      (config.verifyPr ?? true)
+        ? { headRefName: 'bx/t1', headSha: config.verifiedHeadSha ?? 'head123', targetBranch: 'main' }
+        : undefined),
     resolveAfterDone: (t: TaskState) =>
       t.afterDone !== undefined ? t.afterDone : (config.afterDone ?? null),
+    commitServerAfterDone: vi.fn(async () => {
+      const afterDone = task.afterDone !== undefined ? task.afterDone : (config.afterDone ?? null);
+      task.afterDone = afterDone;
+      return afterDone;
+    }),
     setServerReviewDriver: (d: ServerReviewDriver) => { driverRef.current = d; },
   } as unknown as AgentManager;
 
@@ -246,7 +376,7 @@ function putRound(
     ...(phase === 'spec' ? {
       documents: extra.documents ?? [{ relPath: '.baxian/spec.md', content }],
     } : {}),
-    startedAt: 'now',
+    startedAt: extra.startedAt ?? 'now',
   });
 }
 
@@ -269,6 +399,14 @@ async function runScenario(s: Scenario): Promise<Fixture> {
   const [type, kind, extra] = s.emit;
   await fx.emit(type, { token: 'tok123', kind, ...extra });
   return fx;
+}
+
+function expectConsumedSignalFenced(fx: Fixture, agentId: string, kind: string): void {
+  expect(fx.calls.setupPhaseSignal).toHaveLength(0);
+  const claim = fx.calls.claimServerSignalRecovery.find(call => call[1] === agentId && call[2] === kind);
+  expect(claim).toBeDefined();
+  expect((claim?.[0] as TaskState | undefined)?.signalToken).toBe('tok123');
+  expect(fx.task.signalToken).not.toBe('tok123');
 }
 
 function bigFile(path: string): string {
@@ -331,7 +469,7 @@ describe('server.code.ready', () => {
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('lineage violation blocks the review dispatch and re-arms the entry signal', async () => {
+  it('lineage violation blocks dispatch and fences the consumed entry signal', async () => {
     const fx = makeFixture();
     fx.findLineageViolation.mockResolvedValue({ taskId: 't-other', branch: 'bx/t-other', sha: 'a'.repeat(40) });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
@@ -343,17 +481,17 @@ describe('server.code.ready', () => {
       offendingTaskId: 't-other',
       offendingBranch: 'bx/t-other',
     });
-    expect(fx.calls.setupPhaseSignal).toEqual([['t1', 'dev-1', 'code-done']]);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-done');
   });
 
-  it('lineage check failure blocks the review dispatch and re-arms the entry signal', async () => {
+  it('lineage check failure blocks dispatch and fences the consumed entry signal', async () => {
     const fx = makeFixture();
     fx.findLineageViolation.mockRejectedValue(new Error('rev-list exploded'));
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
     const intervention = fx.emitted.find(e => e.type === 'human.intervention');
     expect(intervention?.data).toMatchObject({ phase: 'server-code-lineage-check-failed' });
-    expect(fx.calls.setupPhaseSignal).toEqual([['t1', 'dev-1', 'code-done']]);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-done');
   });
 
   it('round cap → max_rounds', async () => {
@@ -413,12 +551,12 @@ describe('no-QA auto-approve', () => {
     expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'branch']);
   });
 
-  it('code-done without QA partner → head capture failure re-arms code-done', async () => {
+  it('code-done without QA partner → head capture failure fences code-done', async () => {
     const fx = makeFixture({ qaAgentId: undefined }, { afterDone: 'branch' });
     fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git failed'));
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     expect(fx.calls.transitionTaskStatus).toHaveLength(0);
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-done']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-done');
     expect(fx.emitted.some(e => e.type === 'human.intervention'
       && (e.data as Record<string, unknown>)?.phase === 'server-code-auto-approve-head-capture-failed')).toBe(true);
   });
@@ -525,10 +663,124 @@ describe('server.code.fix.submitted', () => {
     expect(fx.emitted.some(e => e.type === 'human.intervention'
       && (e.data as { phase?: string }).phase === 'server-code-response-coverage-gap')).toBe(true);
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
   });
 
-  it('unknown findingId → intervention with unknownFindingIds, response not stored, re-armed', async () => {
+  it('ignores old-marker redraws and stops a rewritten response with the same logical gap', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponse.mockResolvedValue({ round: 1, responses: [] });
+
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    const correctionToken = fx.task.signalToken!;
+    const interventionCount = fx.emitted.filter(event => event.type === 'human.intervention').length;
+    for (let index = 0; index < 100; index++) {
+      await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+    }
+    expect(fx.calls.claimServerSignalRecovery).toHaveLength(1);
+    expect(fx.emitted.filter(event => event.type === 'human.intervention')).toHaveLength(interventionCount);
+
+    const findingsDigest = reviewFindingsDigest(FINDINGS_RC);
+    const raw = `{ "round": 1, "token": "${correctionToken}", "findingsDigest": "${findingsDigest}", "responses": [ ] }`;
+    fx.transport.readResponseWithRaw.mockResolvedValueOnce({
+      kind: 'ok',
+      raw,
+      responseDigest: sha256Hex(raw),
+      response: { round: 1, token: correctionToken, findingsDigest, responses: [] },
+    });
+    await fx.emit('server.code.fix.submitted', { token: correctionToken, kind: 'code-fixed' });
+
+    const stored = await fx.store.getRound('t1', 'code', 1);
+    expect(stored?.serverResponseFailures?.map(entry => entry.disposition)).toEqual([
+      'auto-correct',
+      'hold-repeated-signature',
+    ]);
+    expect(fx.calls.dispatchServerFeedbackCorrection).toHaveLength(1);
+    expect(fx.transport.deleteResponse).toHaveBeenCalledTimes(1);
+    expect(fx.task.serverSignalRecovery?.mode).toBe('hold');
+    expect(interventionPhases(fx)).toContain('server-feedback-response-repeated');
+  });
+
+  it('stops after three distinct automatic correction generations', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    const findingsDigest = reviewFindingsDigest(FINDINGS_RC);
+    const submit = async (response: ReviewResponse): Promise<void> => {
+      const raw = JSON.stringify(response);
+      fx.transport.readResponseWithRaw.mockResolvedValueOnce({
+        kind: 'ok', raw, responseDigest: sha256Hex(raw), response,
+      });
+      await fx.emit('server.code.fix.submitted', { token: fx.task.signalToken, kind: 'code-fixed' });
+    };
+
+    await submit({
+      round: 1, token: fx.task.signalToken, findingsDigest, responses: [],
+    });
+    await submit({
+      round: 1, token: 'ffffffffffff', findingsDigest,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'fixed' }],
+    });
+    await submit({
+      round: 1, token: fx.task.signalToken, findingsDigest: 'f'.repeat(64),
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'fixed' }],
+    });
+    await submit({
+      round: 2, token: fx.task.signalToken, findingsDigest,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'fixed' }],
+    });
+
+    const failures = (await fx.store.getRound('t1', 'code', 1))?.serverResponseFailures ?? [];
+    expect(failures.map(entry => entry.disposition)).toEqual([
+      'auto-correct', 'auto-correct', 'auto-correct', 'hold-correction-limit',
+    ]);
+    expect(fx.calls.dispatchServerFeedbackCorrection).toHaveLength(3);
+    expect(fx.task.serverSignalRecovery?.mode).toBe('hold');
+    expect(interventionPhases(fx)).toContain('server-feedback-correction-limit');
+  });
+
+  it('retries an unknown response read in-handler and preserves the source token on recovery', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    const unknown = {
+      kind: 'unknown' as const,
+      error: new ReviewExchangeError('read-unknown', 'ssh disconnected'),
+    };
+    const findingsDigest = reviewFindingsDigest(FINDINGS_RC);
+    const response: ReviewResponse = {
+      round: 1,
+      token: 'tok123',
+      findingsDigest,
+      responses: [{ findingId: 'f-1', action: 'fix', rationale: 'fixed' }],
+    };
+    const raw = JSON.stringify(response);
+    fx.transport.readResponseWithRaw
+      .mockResolvedValueOnce(unknown)
+      .mockResolvedValueOnce({ kind: 'ok', raw, responseDigest: sha256Hex(raw), response });
+
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+
+    expect(fx.transport.readResponseWithRaw).toHaveBeenCalledTimes(2);
+    expect(fx.calls.claimServerSignalRecovery).toHaveLength(0);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+  });
+
+  it('fences once and preserves the response after three unknown reads', async () => {
+    const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
+    await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
+    fx.transport.readResponseWithRaw.mockResolvedValue({
+      kind: 'unknown',
+      error: new ReviewExchangeError('read-unknown', 'ssh disconnected'),
+    });
+
+    await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
+
+    expect(fx.transport.readResponseWithRaw).toHaveBeenCalledTimes(3);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
+    expect(fx.transport.deleteResponse).not.toHaveBeenCalled();
+    expect(interventionPhases(fx)).toEqual(['server-code-response-read-failed']);
+  });
+
+  it('unknown findingId → intervention, audit, token fence, and correction dispatch', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
@@ -544,10 +796,10 @@ describe('server.code.fix.submitted', () => {
     expect(gap).toBeDefined();
     expect((gap?.data as { unknownFindingIds?: string[] }).unknownFindingIds).toContain('f99');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
-    expect(fx.transport.deleteResponse).not.toHaveBeenCalled();
+    expect(fx.transport.deleteResponse).toHaveBeenCalled();
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.response).toBeUndefined();
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
   });
 
   it('full coverage → response stored, recheck dispatched with priors', async () => {
@@ -676,7 +928,7 @@ describe('server.code.fix.submitted', () => {
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
     expect(fx.emitted.some(event =>
       event.type === 'human.intervention'
       && (event.data as { phase?: string }).phase === 'server-code-qa-unavailable-after-fix'
@@ -697,7 +949,7 @@ describe('server.code.fix.submitted', () => {
     expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'branch']);
   });
 
-  it('no QA: head capture failure re-arms code-fixed (not code-done)', async () => {
+  it('no QA: head capture failure fences code-fixed (not code-done)', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1, qaAgentId: undefined }, { afterDone: 'branch' });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
@@ -706,7 +958,7 @@ describe('server.code.fix.submitted', () => {
     });
     fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git failed'));
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
     expect(fx.calls.transitionTaskStatus).toHaveLength(0);
     expect(fx.calls.dispatchServerAfterDone).toHaveLength(0);
   });
@@ -754,7 +1006,7 @@ describe('server.code.published', () => {
   it('records prNumber and transitions to ready', async () => {
     const fx = makeFixture({ status: 'approved', reviewHeadAnchorSha: 'head123' });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready', prNumber: 42 });
-    expect(fx.calls.updateTask).toContainEqual(['t1', { prNumber: 42 }]);
+    expect(fx.calls.updateTask).toContainEqual(['t1', { prNumber: 42, baseBranch: 'main' }]);
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
   });
 });
@@ -926,7 +1178,7 @@ describe('server.spec flow', () => {
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
   });
 
-  it('spec-fixed unknown findingId → intervention with unknownFindingIds, response not stored, re-armed', async () => {
+  it('spec-fixed unknown findingId → intervention, audit, token fence, and correction dispatch', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1, {
       findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'gap', location: 'S1' }] },
@@ -944,10 +1196,10 @@ describe('server.spec flow', () => {
     expect(gap).toBeDefined();
     expect((gap?.data as { unknownFindingIds?: string[] }).unknownFindingIds).toContain('f99');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
-    expect(fx.transport.deleteResponse).not.toHaveBeenCalled();
+    expect(fx.transport.deleteResponse).toHaveBeenCalled();
     const round = await fx.store.getRound('t1', 'spec', 1);
     expect(round?.response).toBeUndefined();
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'spec-fixed');
   });
 });
 
@@ -1037,51 +1289,58 @@ describe('legacy batch compatibility', () => {
   });
 });
 
-describe('invalid exchange file re-arms the watcher', () => {
-  it('malformed findings.json → intervention + same-token code-reviewed re-arm', async () => {
+describe('invalid exchange file fences the consumed generation', () => {
+  it('malformed findings.json → intervention + code-reviewed token fence', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
     await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockRejectedValue(new Error('schema violation'));
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
+    expectConsumedSignalFenced(fx, 'qa-1', 'code-reviewed');
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
   });
 
-  it('malformed response.json → same-token code-fixed re-arm', async () => {
+  it('malformed response.json → code-fixed token fence', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
-    fx.transport.readResponse.mockRejectedValue(new Error('schema violation'));
+    const raw = '{"round":';
+    fx.transport.readResponseWithRaw.mockResolvedValue({
+      kind: 'invalid',
+      raw,
+      responseDigest: sha256Hex(raw),
+      error: new Error('schema violation'),
+      schemaViolationCodes: ['malformed-json'],
+    });
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
   });
 });
 
 describe('Codex resilience', () => {
-  it('findings missing (not stored) → intervention + re-arm code-reviewed', async () => {
+  it('findings missing (not stored) → intervention + code-reviewed token fence', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
     await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
+    expectConsumedSignalFenced(fx, 'qa-1', 'code-reviewed');
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
   });
 
-  it('stale round payload → deleted + re-arm, never routed', async () => {
+  it('stale round payload → preserved + token fence, never routed', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 2 });
     await putRound(fx.store, 'code', 2);
     fx.transport.readFindings.mockResolvedValue({ ...FINDINGS_RC, round: 1 });
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.transport.deleteFindings).toHaveBeenCalled();
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
+    expect(fx.transport.deleteFindings).not.toHaveBeenCalled();
+    expectConsumedSignalFenced(fx, 'qa-1', 'code-reviewed');
     expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
     const round = await fx.store.getRound('t1', 'code', 2);
     expect(round?.findings).toBeUndefined();
   });
 
-  it('afterDone:pr publish without PR number → re-arm code-ready, no ready transition', async () => {
+  it('afterDone:pr publish without PR number → fence code-ready, no ready transition', async () => {
     const fx = makeFixture({ status: 'approved' }, { afterDone: 'pr' });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-ready');
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
   });
 
@@ -1093,16 +1352,16 @@ describe('Codex resilience', () => {
   });
 });
 
-describe('content read failure re-arms the entry signal', () => {
-  it('code-done entry → re-arm code-done', async () => {
+describe('content read failure fences the entry signal', () => {
+  it('code-done entry → fence code-done', async () => {
     const fx = makeFixture();
     fx.transport.readContent.mockRejectedValue(new Error('fetch failed'));
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-done']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-done');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('code-fixed recheck entry → re-arm code-fixed', async () => {
+  it('code-fixed recheck entry → fence code-fixed', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
@@ -1111,7 +1370,7 @@ describe('content read failure re-arms the entry signal', () => {
     });
     fx.transport.readContent.mockRejectedValue(new Error('fetch failed'));
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
   });
 });
 
@@ -1121,13 +1380,13 @@ describe('afterDone snapshot', () => {
     await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(APPROVE_R1);
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.calls.updateTask).toContainEqual(['t1', { afterDone: 'pr' }]);
+    expect(fx.calls.dispatchServerAfterDone).toContainEqual(['t1', 'pr']);
   });
 
   it('publish gate reads the task snapshot, not live config', async () => {
     const fx = makeFixture({ status: 'approved', afterDone: 'pr' }, { afterDone: null });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-ready');
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
   });
 });
@@ -1136,7 +1395,7 @@ describe('published head guard', () => {
   it('publish with PR number captures the reviewed head sha', async () => {
     const fx = makeFixture({ status: 'approved', afterDone: 'pr', reviewHeadAnchorSha: 'head123' });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready', prNumber: 42 });
-    expect(fx.calls.updateTask).toContainEqual(['t1', { prNumber: 42 }]);
+    expect(fx.calls.updateTask).toContainEqual(['t1', { prNumber: 42, baseBranch: 'main' }]);
     expect(fx.calls.updateTask).toContainEqual(['t1', { latestHeadSha: 'head123' }]);
     expect(fx.calls.transitionTaskStatus).toContainEqual(['t1', 'ready']);
   });
@@ -1165,7 +1424,7 @@ describe('Codex: reviewed-head anchor', () => {
     expect(opts.reviewHeadAnchorSha).toBe('head123');
   });
 
-  it('captured content missing review head re-arms the entry signal and dispatches nothing (fail-closed)', async () => {
+  it('captured content missing review head fences the entry signal and dispatches nothing (fail-closed)', async () => {
     const fx = makeFixture();
     fx.transport.readContent.mockResolvedValueOnce({
       content: 'diff --git a/a b/a\n+x',
@@ -1173,7 +1432,7 @@ describe('Codex: reviewed-head anchor', () => {
       baseSha: 'base123',
     });
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-done']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-done');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
@@ -1190,6 +1449,27 @@ describe('Codex: reviewed-head anchor', () => {
     expect((mismatch?.data as { publishedHead?: string }).publishedHead).toBe('head123');
   });
 
+  it('remote PR head differing from the reviewed and published head refuses ready', async () => {
+    const remoteHead = 'remote-advanced';
+    const fx = makeFixture(
+      { status: 'approved', afterDone: 'pr', prNumber: 42, reviewHeadAnchorSha: 'head123' },
+      { verifiedHeadSha: remoteHead },
+    );
+    await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
+    expect(fx.calls.updateTask).not.toContainEqual(['t1', { latestHeadSha: 'head123' }]);
+    const mismatch = fx.emitted.find(
+      e => e.type === 'human.intervention'
+        && (e.data as { phase?: string }).phase === 'server-code-published-pr-head-mismatch',
+    );
+    expect(mismatch?.data).toMatchObject({
+      prNumber: 42,
+      remoteHead,
+      publishedHead: 'head123',
+      reviewedHead: 'head123',
+    });
+  });
+
   it('publish with NO recorded anchor refuses ready (fail-closed)', async () => {
     const fx = makeFixture({ status: 'approved', afterDone: 'pr' });
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready', prNumber: 42 });
@@ -1197,38 +1477,36 @@ describe('Codex: reviewed-head anchor', () => {
   });
 });
 
-describe('guard exits re-arm the consumed signal', () => {
-  type ReArmRow = [string, Partial<TaskState>, string, string, string, boolean, SeedRound?];
+describe('guard exits fence the consumed signal', () => {
+  type FenceRow = [string, Partial<TaskState>, string, string, string, SeedRound?];
 
-  const reArmCases: ReArmRow[] = [
-    ['code review dispatch with missing dev config re-arms code-done and holds on arm failure',
-      { agentId: 'ghost' }, 'server.code.ready', 'code-done', 'ghost', true],
-    ['code recheck entry (fixing) with missing dev config re-arms code-fixed and holds on arm failure',
-      { status: 'fixing', agentId: 'ghost', reviewRound: 1 }, 'server.code.fix.submitted', 'code-fixed', 'ghost', true],
-    ['code verdict with missing qa config re-arms code-reviewed and holds on arm failure',
-      { status: 'review', reviewRound: 1, qaAgentId: 'ghost' }, 'server.code.review.submitted', 'code-reviewed', 'ghost', true],
-    ['code verdict with missing round data re-arms code-reviewed without holding (arm succeeds)',
-      { status: 'review', reviewRound: 1 }, 'server.code.review.submitted', 'code-reviewed', 'qa-1', false],
-    ['code fix-submitted with missing stored findings re-arms code-fixed without holding (arm succeeds)',
-      { status: 'fixing', reviewRound: 1 }, 'server.code.fix.submitted', 'code-fixed', 'dev-1', false, { phase: 'code', round: 1 }],
-    ['spec review dispatch with missing dev config re-arms spec-done and holds on arm failure',
-      { phase: 'spec', status: 'in_progress', agentId: 'ghost' }, 'server.spec.ready', 'spec-done', 'ghost', true],
-    ['spec verdict with missing qa config re-arms spec-reviewed and holds on arm failure',
-      { phase: 'spec', status: 'review', specReviewRound: 1, qaAgentId: 'ghost' }, 'server.spec.review.submitted', 'spec-reviewed', 'ghost', true],
-    ['spec verdict with missing round data re-arms spec-reviewed without holding (arm succeeds)',
-      { phase: 'spec', status: 'review', specReviewRound: 1 }, 'server.spec.review.submitted', 'spec-reviewed', 'qa-1', false],
-    ['spec fix-submitted with missing dev config re-arms spec-fixed and holds on arm failure',
-      { phase: 'spec', status: 'fixing', specReviewRound: 1, agentId: 'ghost' }, 'server.spec.fix.submitted', 'spec-fixed', 'ghost', true],
-    ['spec fix-submitted with missing stored findings re-arms spec-fixed without holding (arm succeeds)',
-      { phase: 'spec', status: 'fixing', specReviewRound: 1 }, 'server.spec.fix.submitted', 'spec-fixed', 'dev-1', false, { phase: 'spec', round: 1 }],
+  const fenceCases: FenceRow[] = [
+    ['code review dispatch with missing dev config fences code-done',
+      { agentId: 'ghost' }, 'server.code.ready', 'code-done', 'ghost'],
+    ['code recheck entry with missing dev config fences code-fixed',
+      { status: 'fixing', agentId: 'ghost', reviewRound: 1 }, 'server.code.fix.submitted', 'code-fixed', 'ghost'],
+    ['code verdict with missing qa config fences code-reviewed',
+      { status: 'review', reviewRound: 1, qaAgentId: 'ghost' }, 'server.code.review.submitted', 'code-reviewed', 'ghost'],
+    ['code verdict with missing round data fences code-reviewed',
+      { status: 'review', reviewRound: 1 }, 'server.code.review.submitted', 'code-reviewed', 'qa-1'],
+    ['code fix-submitted with missing stored findings fences code-fixed',
+      { status: 'fixing', reviewRound: 1 }, 'server.code.fix.submitted', 'code-fixed', 'dev-1', { phase: 'code', round: 1 }],
+    ['spec review dispatch with missing dev config fences spec-done',
+      { phase: 'spec', status: 'in_progress', agentId: 'ghost' }, 'server.spec.ready', 'spec-done', 'ghost'],
+    ['spec verdict with missing qa config fences spec-reviewed',
+      { phase: 'spec', status: 'review', specReviewRound: 1, qaAgentId: 'ghost' }, 'server.spec.review.submitted', 'spec-reviewed', 'ghost'],
+    ['spec verdict with missing round data fences spec-reviewed',
+      { phase: 'spec', status: 'review', specReviewRound: 1 }, 'server.spec.review.submitted', 'spec-reviewed', 'qa-1'],
+    ['spec fix-submitted with missing dev config fences spec-fixed',
+      { phase: 'spec', status: 'fixing', specReviewRound: 1, agentId: 'ghost' }, 'server.spec.fix.submitted', 'spec-fixed', 'ghost'],
+    ['spec fix-submitted with missing stored findings fences spec-fixed',
+      { phase: 'spec', status: 'fixing', specReviewRound: 1 }, 'server.spec.fix.submitted', 'spec-fixed', 'dev-1', { phase: 'spec', round: 1 }],
   ];
 
-  it.each(reArmCases)('%s', async (_name, task, type, kind, agent, holds, seed) => {
+  it.each(fenceCases)('%s', async (_name, task, type, kind, agent, seed) => {
     const fx = await runScenario({ task, seed, emit: [type, kind] });
-    const armed = ['t1', agent, kind];
-    expect(fx.calls.setupPhaseSignal).toContainEqual(armed);
-    if (holds) expect(fx.calls.holdAgentForUnarmedSignal).toContainEqual(armed);
-    else expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
+    expectConsumedSignalFenced(fx, agent, kind);
+    expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
     if (type.endsWith('.ready')) expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
@@ -1237,6 +1515,7 @@ describe('guard exits re-arm the consumed signal', () => {
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
     expect(fx.calls.setupPhaseSignal).toHaveLength(0);
     expect(fx.calls.holdAgentForUnarmedSignal).toHaveLength(0);
+    expect(fx.calls.claimServerSignalRecovery.some(call => call[2] === 'code-done')).toBe(true);
     expect(fx.emitted.some(
       e => e.type === 'human.intervention'
         && (e.data as { phase?: string }).phase === 'server-code-review-no-dev-agent',
@@ -1264,16 +1543,22 @@ describe('legacy batch aggregation data', () => {
   });
 });
 
-describe('publish robustness: unverified PR number and putRound failure re-arm the entry signal', () => {
-  it('unverified PR number → intervention + code-ready re-arm, never recorded', async () => {
-    const fx = makeFixture({ status: 'approved', afterDone: 'pr' }, { verifyPr: false });
+describe('publish robustness and bounded round-store retry', () => {
+  it('unverified PR number → intervention + code-ready fence, never recorded', async () => {
+    const fx = makeFixture(
+      { status: 'approved', afterDone: 'pr', reviewHeadAnchorSha: 'head123' },
+      { verifyPr: false },
+    );
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready', prNumber: 999 });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-ready');
     expect(fx.calls.updateTask).not.toContainEqual(['t1', { prNumber: 999 }]);
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
+    expect(fx.emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'server-code-published-pr-number-unverified', prNumber: 999,
+    });
   });
 
-  it('putRound failure on code-done re-arms the entry signal', async () => {
+  it('a transient putRound failure on code-done retries in-handler and dispatches', async () => {
     const fx = makeFixture();
     const failingStore = fx.store as unknown as { putRound: (...a: unknown[]) => Promise<void> };
     const original = failingStore.putRound.bind(fx.store);
@@ -1283,13 +1568,14 @@ describe('publish robustness: unverified PR number and putRound failure re-arm t
       return original(...(a as Parameters<typeof original>));
     };
     await fx.emit('server.code.ready', { token: 'tok123', kind: 'code-done' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-done']);
-    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
+    expect(fx.calls.setupPhaseSignal).toHaveLength(0);
+    expect(fx.calls.claimServerSignalRecovery).toHaveLength(0);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
   });
 });
 
-describe('verdict-save failure re-arm', () => {
-  it('findings save failure re-arms code-reviewed; file is NOT deleted', async () => {
+describe('verdict-save bounded retry and fence', () => {
+  it('a transient findings save failure retries, deletes the file, and routes the verdict', async () => {
     const fx = makeFixture({ status: 'review', reviewRound: 1 });
     await putRound(fx.store, 'code', 1);
     fx.transport.readFindings.mockResolvedValue(FINDINGS_RC);
@@ -1302,12 +1588,12 @@ describe('verdict-save failure re-arm', () => {
       return original(...(a as Parameters<typeof original>));
     };
     await fx.emit('server.code.review.submitted', { token: 'tok123', kind: 'code-reviewed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'code-reviewed']);
-    expect(fx.transport.deleteFindings).not.toHaveBeenCalled();
-    expect(fx.calls.dispatchServerFixToDev).toHaveLength(0);
+    expect(fx.calls.setupPhaseSignal).toHaveLength(0);
+    expect(fx.transport.deleteFindings).toHaveBeenCalled();
+    expect(fx.calls.dispatchServerFixToDev).toHaveLength(1);
   });
 
-  it('response save failure re-arms code-fixed; file is NOT deleted', async () => {
+  it('persistent response save failure fences code-fixed and preserves the file', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
@@ -1316,7 +1602,7 @@ describe('verdict-save failure re-arm', () => {
     const failing = fx.store as unknown as { putRound: (...a: unknown[]) => Promise<void> };
     failing.putRound = async () => { throw new Error('disk full'); };
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
     expect(fx.transport.deleteResponse).not.toHaveBeenCalled();
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
@@ -1418,24 +1704,24 @@ describe('max_rounds releases runtime bindings and preserves participants', () =
   });
 });
 
-describe('gate relaxation: github tasks through server spec chain', () => {
-  it('server.spec.ready dispatches QA spec review for a github task', async () => {
-    const f = makeFixture({ reviewMode: 'github', phase: undefined, status: 'in_progress', specReviewRound: 0 });
+describe('gate relaxation: git tasks through server spec chain', () => {
+  it('server.spec.ready dispatches QA spec review for a git task', async () => {
+    const f = makeFixture({ reviewMode: 'git', phase: undefined, status: 'in_progress', specReviewRound: 0 });
     await f.emit('server.spec.ready', { token: 'tok123' });
     expect(f.calls.dispatchServerReviewToQa).toHaveLength(1);
     expect((f.calls.dispatchServerReviewToQa[0][1] as { phase: string }).phase).toBe('spec');
   });
 
-  it('server.spec.review.submitted routes approve verdict for a github task', async () => {
-    const f = makeFixture({ reviewMode: 'github', phase: 'spec', status: 'review', specReviewRound: 1 });
+  it('server.spec.review.submitted routes approve verdict for a git task', async () => {
+    const f = makeFixture({ reviewMode: 'git', phase: 'spec', status: 'review', specReviewRound: 1 });
     await putRound(f.store, 'spec', 1, { content: 'spec text' });
     f.transport.readFindings.mockResolvedValueOnce(APPROVE_R1);
     await f.emit('server.spec.review.submitted', { token: 'tok123' });
     expect(f.calls.transitionToCodePhase).toHaveLength(1);
   });
 
-  it('server.spec.fix.submitted processes a github task response', async () => {
-    const f = makeFixture({ reviewMode: 'github', phase: 'spec', status: 'fixing', specReviewRound: 1 });
+  it('server.spec.fix.submitted processes a git task response', async () => {
+    const f = makeFixture({ reviewMode: 'git', phase: 'spec', status: 'fixing', specReviewRound: 1 });
     await putRound(f.store, 'spec', 1, {
       content: 'spec text',
       findings: { round: 1, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: 'm' }] },
@@ -1447,9 +1733,9 @@ describe('gate relaxation: github tasks through server spec chain', () => {
     expect(f.calls.dispatchServerReviewToQa).toHaveLength(1);
   });
 
-  it('github task spec verdict at cap pauses to max_rounds and releases both agents', async () => {
+  it('git task spec verdict at cap pauses to max_rounds and releases both agents', async () => {
     const f = makeFixture(
-      { reviewMode: 'github', phase: 'spec', status: 'review', specReviewRound: 1 },
+      { reviewMode: 'git', phase: 'spec', status: 'review', specReviewRound: 1 },
       { rounds: 1 },
     );
     await putRound(f.store, 'spec', 1, { content: 'spec text' });
@@ -1463,24 +1749,24 @@ describe('gate relaxation: github tasks through server spec chain', () => {
     expect(f.calls.dispatchServerFixToDev).toHaveLength(0);
   });
 
-  it('server.code.ready still ignores github tasks', async () => {
-    const f = makeFixture({ reviewMode: 'github', phase: 'code', status: 'in_progress' });
+  it('server.code.ready still ignores git tasks', async () => {
+    const f = makeFixture({ reviewMode: 'git', phase: 'code', status: 'in_progress' });
     await f.emit('server.code.ready', { token: 'tok123' });
     expect(f.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('server.code.review.submitted still ignores github tasks', async () => {
-    const f = makeFixture({ reviewMode: 'github', phase: 'code', status: 'review', reviewRound: 1 });
+  it('server.code.review.submitted still ignores git tasks', async () => {
+    const f = makeFixture({ reviewMode: 'git', phase: 'code', status: 'review', reviewRound: 1 });
     await f.emit('server.code.review.submitted', { token: 'tok123' });
     expect(f.calls.dispatchServerFixToDev).toHaveLength(0);
     expect(f.calls.transitionTaskStatus).toHaveLength(0);
   });
 
-  it('spec gate still enforces token freshness for github tasks', async () => {
-    const f = makeFixture({ reviewMode: 'github', phase: undefined, status: 'in_progress' });
+  it('spec gate silently ignores a stale token for git tasks', async () => {
+    const f = makeFixture({ reviewMode: 'git', phase: undefined, status: 'in_progress' });
     await f.emit('server.spec.ready', { token: 'WRONG' });
     expect(f.calls.dispatchServerReviewToQa).toHaveLength(0);
-    expect(f.emitted.some(e => e.type === 'human.intervention')).toBe(true);
+    expect(f.emitted.some(e => e.type === 'human.intervention')).toBe(false);
   });
 });
 
@@ -1620,6 +1906,65 @@ describe('manual server review driver', () => {
     expect(opts.priorResponseJson).toBeUndefined();
   });
 
+  it('dispatchSpecReview replays the persisted cap round without rereading or overwriting it', async () => {
+    const fx = makeFixture(
+      { status: 'review', phase: 'spec', specReviewRound: 3 },
+      { rounds: 3 },
+    );
+    await putRound(fx.store, 'spec', 3, {
+      content: 'persisted cap spec',
+      documents: [{ relPath: '.baxian/spec.md', content: 'persisted cap spec' }],
+      startedAt: 'original-start',
+    });
+
+    const ok = await fx.driver.current!.dispatchSpecReview(fx.task, { bumpRound: false });
+
+    expect(ok).toBe(true);
+    expect(fx.transport.readContent).not.toHaveBeenCalled();
+    expect(await fx.store.getRound('t1', 'spec', 3)).toMatchObject({
+      round: 3,
+      content: 'persisted cap spec',
+      startedAt: 'original-start',
+    });
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'max_rounds']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    expect(fx.calls.dispatchServerReviewToQa[0]?.[1]).toMatchObject({
+      phase: 'spec',
+      content: 'persisted cap spec',
+      bumpRound: false,
+    });
+  });
+
+  it('dispatchCodeReview replays the persisted cap round without rereading or overwriting it', async () => {
+    const fx = makeFixture({ status: 'review', reviewRound: 3 }, { rounds: 3 });
+    await putRound(fx.store, 'code', 3, {
+      content: 'persisted cap diff',
+      baseSha: 'persisted-base',
+      headSha: 'persisted-head',
+      headTree: 'persisted-tree',
+      diffstat: ' 1 file changed',
+      startedAt: 'original-start',
+    });
+
+    const ok = await fx.driver.current!.dispatchCodeReview(fx.task, { bumpRound: false });
+
+    expect(ok).toBe(true);
+    expect(fx.transport.readContent).not.toHaveBeenCalled();
+    expect(await fx.store.getRound('t1', 'code', 3)).toMatchObject({
+      round: 3,
+      content: 'persisted cap diff',
+      startedAt: 'original-start',
+    });
+    expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'max_rounds']);
+    expect(fx.calls.dispatchServerReviewToQa).toHaveLength(1);
+    expect(fx.calls.dispatchServerReviewToQa[0]?.[1]).toMatchObject({
+      phase: 'code',
+      content: 'persisted cap diff',
+      reviewHeadAnchorSha: 'persisted-head',
+      bumpRound: false,
+    });
+  });
+
   it('dispatchCodeReview from fixing reads and stores the pending response file before the recheck', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
@@ -1629,10 +1974,15 @@ describe('manual server review driver', () => {
     const ok = await fx.driver.current!.dispatchCodeReview(fx.task);
 
     expect(ok).toBe(true);
+    const normalized = {
+      ...pending,
+      token: 'tok123',
+      findingsDigest: reviewFindingsDigest(FINDINGS_RC),
+    };
     const [, opts] = fx.calls.dispatchServerReviewToQa[0] as [string, { recheck: boolean; priorResponseJson?: string }];
     expect(opts.recheck).toBe(true);
-    expect(opts.priorResponseJson).toBe(JSON.stringify(pending));
-    expect((await fx.store.getRound('t1', 'code', 1))?.response).toEqual(pending);
+    expect(opts.priorResponseJson).toBe(JSON.stringify(normalized));
+    expect((await fx.store.getRound('t1', 'code', 1))?.response).toEqual(normalized);
     expect(fx.transport.deleteResponse).toHaveBeenCalled();
   });
 
@@ -1681,7 +2031,7 @@ describe('intervention emit failure containment', () => {
     });
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
-      await fx.emit('server.code.ready', { token: 'WRONG', kind: 'code-done' });
+      await fx.emit('server.code.ready', { kind: 'code-done' });
       expect(warnSpy).toHaveBeenCalledWith(
         '[ServerEventHandler] intervention emit failed:',
         expect.any(Error),
@@ -1780,17 +2130,17 @@ describe('code verdict approve transition refusal', () => {
 });
 
 describe('code fix response guards', () => {
-  it('response file missing with no stored response → intervention + code-fixed re-arm', async () => {
+  it('response file missing with no stored response → intervention + code-fixed correction generation', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue(null);
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(interventionPhases(fx)).toContain('server-code-response-missing');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('stale response round → deleted + re-arm, response never stored', async () => {
+  it('stale response round → archived, deleted, and replaced by a correction generation', async () => {
     const fx = makeFixture({ status: 'fixing', reviewRound: 1 });
     await putRound(fx.store, 'code', 1, { findings: FINDINGS_RC });
     fx.transport.readResponse.mockResolvedValue({
@@ -1800,7 +2150,7 @@ describe('code fix response guards', () => {
     await fx.emit('server.code.fix.submitted', { token: 'tok123', kind: 'code-fixed' });
     expect(interventionPhases(fx)).toContain('server-code-response-round-mismatch');
     expect(fx.transport.deleteResponse).toHaveBeenCalled();
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-fixed');
     const round = await fx.store.getRound('t1', 'code', 1);
     expect(round?.response).toBeUndefined();
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
@@ -1815,36 +2165,36 @@ describe('publish failure paths', () => {
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
   });
 
-  it('published head read failure → intervention + code-ready re-arm', async () => {
+  it('published head read failure → intervention + code-ready fence', async () => {
     const fx = makeFixture({ status: 'approved', reviewHeadAnchorSha: 'head123' });
     fx.transport.readHeadSha.mockRejectedValueOnce(new Error('git down'));
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
     expect(interventionPhases(fx)).toContain('server-code-published-head-capture-failed');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-ready');
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
   });
 
-  it('latestHeadSha persist failure → intervention + code-ready re-arm, no ready transition', async () => {
+  it('latestHeadSha persist failure → intervention + code-ready fence, no ready transition', async () => {
     const fx = makeFixture({ status: 'approved', reviewHeadAnchorSha: 'head123' });
     fx.updateTask.mockRejectedValueOnce(new Error('disk full'));
     await fx.emit('server.code.published', { token: 'tok123', kind: 'code-ready' });
     expect(interventionPhases(fx)).toContain('server-code-published-head-capture-failed');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'code-ready']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'code-ready');
     expect(fx.calls.transitionTaskStatus).not.toContainEqual(['t1', 'ready']);
   });
 });
 
 describe('spec review failure paths', () => {
-  it('spec content read failure → intervention + spec-done re-arm', async () => {
+  it('spec content read failure → intervention + spec-done fence', async () => {
     const fx = makeFixture({ phase: undefined, status: 'in_progress' });
     fx.transport.readContent.mockRejectedValue(new Error('read fail'));
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
     expect(interventionPhases(fx)).toContain('server-spec-content-read-failed');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-done']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'spec-done');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('spec round store failure → intervention + spec-done re-arm', async () => {
+  it('spec round store failure → intervention + spec-done fence', async () => {
     const fx = makeFixture({ phase: undefined, status: 'in_progress' });
     fx.transport.readContent.mockResolvedValue({
       content: '# Spec',
@@ -1854,37 +2204,37 @@ describe('spec review failure paths', () => {
     failing.putRound = async () => { throw new Error('disk full'); };
     await fx.emit('server.spec.ready', { token: 'tok123', kind: 'spec-done' });
     expect(interventionPhases(fx)).toContain('server-spec-round-store-failed');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-done']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'spec-done');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('spec findings read failure → intervention + spec-reviewed re-arm', async () => {
+  it('spec findings read failure → intervention + spec-reviewed fence', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1);
     fx.transport.readFindings.mockRejectedValue(new Error('bad json'));
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(interventionPhases(fx)).toContain('server-spec-findings-invalid');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
+    expectConsumedSignalFenced(fx, 'qa-1', 'spec-reviewed');
     expect(fx.calls.transitionToCodePhase).toHaveLength(0);
   });
 
-  it('spec findings missing (never stored) → intervention + spec-reviewed re-arm', async () => {
+  it('spec findings missing (never stored) → intervention + spec-reviewed fence', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1);
     fx.transport.readFindings.mockResolvedValue(null);
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(interventionPhases(fx)).toContain('server-spec-findings-missing');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
+    expectConsumedSignalFenced(fx, 'qa-1', 'spec-reviewed');
   });
 
-  it('stale spec findings round → deleted + re-arm, verdict never stored or routed', async () => {
+  it('stale spec findings round → preserved + fenced, verdict never stored or routed', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'review', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1);
     fx.transport.readFindings.mockResolvedValue({ ...APPROVE_R1, round: 2 });
     await fx.emit('server.spec.review.submitted', { token: 'tok123', kind: 'spec-reviewed' });
     expect(interventionPhases(fx)).toContain('server-spec-findings-round-mismatch');
-    expect(fx.transport.deleteFindings).toHaveBeenCalled();
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'qa-1', 'spec-reviewed']);
+    expect(fx.transport.deleteFindings).not.toHaveBeenCalled();
+    expectConsumedSignalFenced(fx, 'qa-1', 'spec-reviewed');
     const round = await fx.store.getRound('t1', 'spec', 1);
     expect(round?.findings).toBeUndefined();
     expect(fx.calls.transitionToCodePhase).toHaveLength(0);
@@ -1930,27 +2280,34 @@ describe('spec fix response guards', () => {
     } as ReviewFindings,
   };
 
-  it('spec response read failure → intervention + spec-fixed re-arm', async () => {
+  it('invalid spec response → intervention + spec-fixed correction generation', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1, SPEC_ROUND_FINDINGS);
-    fx.transport.readResponse.mockRejectedValue(new Error('corrupt'));
+    const raw = '{"round":';
+    fx.transport.readResponseWithRaw.mockResolvedValue({
+      kind: 'invalid',
+      raw,
+      responseDigest: sha256Hex(raw),
+      error: new Error('corrupt'),
+      schemaViolationCodes: ['malformed-json'],
+    });
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     expect(interventionPhases(fx)).toContain('server-spec-response-invalid');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'spec-fixed');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('spec response missing with none stored → intervention + spec-fixed re-arm', async () => {
+  it('spec response missing with none stored → intervention + spec-fixed correction generation', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1, SPEC_ROUND_FINDINGS);
     fx.transport.readResponse.mockResolvedValue(null);
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     expect(interventionPhases(fx)).toContain('server-spec-response-missing');
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'spec-fixed');
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);
   });
 
-  it('stale spec response round → deleted + re-arm, no re-dispatch', async () => {
+  it('stale spec response round → archived, deleted, and replaced by a correction generation', async () => {
     const fx = makeFixture({ phase: 'spec', status: 'fixing', specReviewRound: 1 });
     await putRound(fx.store, 'spec', 1, SPEC_ROUND_FINDINGS);
     fx.transport.readResponse.mockResolvedValue({
@@ -1960,7 +2317,7 @@ describe('spec fix response guards', () => {
     await fx.emit('server.spec.fix.submitted', { token: 'tok123', kind: 'spec-fixed' });
     expect(interventionPhases(fx)).toContain('server-spec-response-round-mismatch');
     expect(fx.transport.deleteResponse).toHaveBeenCalled();
-    expect(fx.calls.setupPhaseSignal).toContainEqual(['t1', 'dev-1', 'spec-fixed']);
+    expectConsumedSignalFenced(fx, 'dev-1', 'spec-fixed');
     const round = await fx.store.getRound('t1', 'spec', 1);
     expect(round?.response).toBeUndefined();
     expect(fx.calls.dispatchServerReviewToQa).toHaveLength(0);

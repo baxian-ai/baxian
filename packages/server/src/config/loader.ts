@@ -207,7 +207,7 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const hasHttps = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'https');
   const hasAllowedHosts = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'allowedHosts');
 
-  const reviewMode = (rv.mode === undefined ? 'github' : rv.mode) as ReviewMode;
+  const reviewMode = (rv.mode === undefined ? 'git' : rv.mode) as ReviewMode;
 
   return {
     ...(normalized.language !== undefined

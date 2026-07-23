@@ -3,7 +3,7 @@ import { LocalRunner, buildSshOptions, ensureMuxDir, shellQuote, sshTarget, sshE
 import { ancestorSymlinkGuard } from './repo-store.js';
 import { GH_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
 import type { AgentConfig, AgentRuntime, HostConfig } from '../shared/index.js';
-import { isGitHubRepo, redactGitCredentials, repoSlug } from '../shared/index.js';
+import { isGitHubRepo, parseGitRemote, redactGitCredentials, repoSlug } from '../shared/index.js';
 import { runDriverPreflightSteps, type DriverPreflightStep } from '../platform/preflight-exec.js';
 import type { RenderContext } from '../platform/command-renderer.js';
 import { safeDriverErrorText } from '../platform/git-driver.js';
@@ -111,6 +111,7 @@ export async function runPreflight(
   host?: HostConfig,
   projectId?: string,
   gitPlatform?: AgentGitPreflight,
+  options: { requireGitHubCli?: boolean; requireGitPush?: boolean } = {},
 ): Promise<PreflightResult[]> {
   repo = repo.trim();
   const results: PreflightResult[] = [];
@@ -150,18 +151,19 @@ export async function runPreflight(
   results.push(await probeTmux(runner, projectId));
 
   const isAuto = !agent.workdir;
-  const probe = gitPlatform === undefined
-    ? { urls: undefined }
-    : await gitLsRemoteProbeUrl(runner, repo, agent, gitPlatform);
+  let lsRemote: LsRemoteTarget = { skip: true };
+  const probe = await gitLsRemoteProbeUrl(runner, repo, agent, gitPlatform, {
+    requirePush: options.requireGitPush === true,
+  });
   if ('error' in probe) {
-    // 执行状态不明时不猜协议：探测失败即该检查项失败，ls-remote 跳过（猜错方向的提示更有害）。
     results.push({
       step: 'git',
       ok: false,
-      message: `cannot determine the push/clone channel on this host: ${probe.error}`,
+      message: `cannot determine the fetch/push/clone channel on this host: ${probe.error}`,
     });
+  } else {
+    lsRemote = { urls: probe.urls };
   }
-  const lsRemote = 'error' in probe ? { skip: true as const } : { urls: probe.urls };
   if (isAuto) {
     await runAutoModePreflight(runner, agent.id, repo, results, lsRemote);
   } else {
@@ -170,13 +172,18 @@ export async function runPreflight(
 
   if (gitPlatform !== undefined) {
     await runGitPlatformChecks(runner, agent, gitPlatform, results);
-  } else if (isGitHubRepo(repo)) {
+  } else if (isGitHubRepo(repo) && (options.requireGitHubCli ?? isAuto)) {
     const slug = repoSlug(repo);
-    const ghCheck = await runner.exec('gh auth status');
+    const ghCheck = await probeNetwork(runner, 'gh auth status');
+    const ghOutcomeUnknown = ghCheck.exitCode === 124 || execOutcomeUnknown(ghCheck);
     results.push({
       step: 'gh',
-      ok: ghCheck.exitCode === 0,
-      message: ghCheck.exitCode === 0 ? 'GitHub CLI authenticated' : 'Run "gh auth login" or set GITHUB_TOKEN',
+      ok: ghCheck.exitCode === 0 && !ghOutcomeUnknown,
+      message: ghCheck.exitCode === 0 && !ghOutcomeUnknown
+        ? 'GitHub CLI authenticated'
+        : ghOutcomeUnknown
+          ? 'Could not verify GitHub CLI authentication because the probe outcome is unknown — check network connectivity and retry'
+          : 'Run "gh auth login" or set GITHUB_TOKEN',
     });
 
     const ghRepoCheck = await probeNetwork(runner, `gh api repos/${slug}`);
@@ -193,14 +200,15 @@ export async function runPreflight(
 }
 
 // 探测通道必须等于运行期真正使用的通道，否则绿灯毫无诊断意义：
-//   manual Workdir —— origin 不被改写，publish 走 `git push origin` ⇒ 探测该 origin 的 push URL
+//   manual Workdir ——运行期始终 fetch origin，发布角色还会 push origin ⇒ 分别探测实际 URL
 //   auto + gh      —— clone 是 `gh repo clone <slug>`，显式 URL 被丢弃 ⇒ 探测 gh 的 git_protocol 通道
 //   auto + 其它 tool —— 朴素 `git clone <repo>` ⇒ 探测 repo 原文
 async function gitLsRemoteProbeUrl(
   runner: CommandRunner,
   repo: string,
   agent: AgentConfig,
-  git: AgentGitPreflight,
+  git?: AgentGitPreflight,
+  options: { requirePush: boolean } = { requirePush: false },
 ): Promise<{ urls: string[] } | { error: string }> {
   const read = async (cmd: string): Promise<{ value: string; lines: string[] } | { error: string }> => {
     try {
@@ -219,21 +227,27 @@ async function gitLsRemoteProbeUrl(
     }
   };
   if (agent.workdir !== undefined) {
-    // --all：配置了多个 remote.origin.pushurl 时 `git push origin` 会推向全部，只探第一个
-    // 会在「首个可达、后续失效」时误报绿灯。
-    const origin = await read(
-      `cd ${shellQuote(agent.workdir)} && git remote get-url --push --all origin`,
-    );
-    if ('error' in origin) return origin;
-    const urls = origin.value === '' ? [] : origin.lines;
-    if (urls.length === 0) {
-      return { error: `no push origin configured in ${agent.workdir} — publish would fail` };
+    const fetchOrigin = await read(`cd ${shellQuote(agent.workdir)} && git remote get-url origin`);
+    if ('error' in fetchOrigin) return fetchOrigin;
+    if (fetchOrigin.value === '') {
+      return { error: `no origin configured in ${agent.workdir} — fetch/checkout would fail` };
     }
-    return { urls };
+    const urls = [fetchOrigin.value];
+    if (options.requirePush) {
+      const pushOrigin = await read(
+        `cd ${shellQuote(agent.workdir)} && git remote get-url --push --all origin`,
+      );
+      if ('error' in pushOrigin) return pushOrigin;
+      if (pushOrigin.lines.length === 0) {
+        return { error: `no push origin configured in ${agent.workdir} — publish would fail` };
+      }
+      urls.push(...pushOrigin.lines);
+    }
+    return { urls: [...new Set(urls)] };
   }
-  if (git.tool !== 'gh' || !isGitHubRepo(repo)) return { urls: [repo] };
+  if ((git !== undefined && git.tool !== 'gh') || !isGitHubRepo(repo)) return { urls: [repo] };
   const slug = repoSlug(repo);
-  const hostname = git.renderCtx.hostname;
+  const hostname = git?.renderCtx.hostname ?? parseGitRemote(repo)?.host ?? 'github.com';
   const hostScoped = await read(`gh config get -h ${shellQuote(hostname)} git_protocol`);
   if ('error' in hostScoped) return hostScoped;
   let protocol = hostScoped.value;
@@ -356,14 +370,14 @@ async function runGitPlatformChecks(
   }
 }
 
-type LsRemoteTarget = { urls?: string[] } | { skip: true };
+type LsRemoteTarget = { urls: string[] } | { skip: true };
 
 async function runManualModePreflight(
   runner: CommandRunner,
   workdir: string,
   repo: string,
   results: PreflightResult[],
-  lsRemote: LsRemoteTarget = {},
+  lsRemote: LsRemoteTarget,
 ): Promise<void> {
   const workdirCheck = await runner.exec(
     `cd ${shellQuote(workdir)} && ` +
@@ -381,8 +395,7 @@ async function runManualModePreflight(
   });
 
   if ('skip' in lsRemote) return;
-  const targets = lsRemote.urls
-    ?? [isGitHubRepo(repo) ? `https://github.com/${repoSlug(repo)}.git` : repo];
+  const targets = lsRemote.urls;
   const failed: string[] = [];
   for (const url of targets) {
     const check = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(url)} HEAD`);
@@ -402,7 +415,7 @@ async function runAutoModePreflight(
   agentId: string,
   repo: string,
   results: PreflightResult[],
-  lsRemote: LsRemoteTarget = {},
+  lsRemote: LsRemoteTarget,
 ): Promise<void> {
   const gh = isGitHubRepo(repo);
   // ~ is expanded by the remote shell to $HOME; physicalize it first so the agent dir is created
@@ -474,21 +487,9 @@ async function runAutoModePreflight(
     return;
   }
 
-  const slug = repoSlug(repo);
-  let lsRemoteUrl: string;
-  let protocol: string;
-  if (lsRemoteOverride !== undefined) {
-    lsRemoteUrl = lsRemoteOverride;
-    protocol = lsRemoteOverride.startsWith('git@') || lsRemoteOverride.startsWith('ssh://')
-      ? 'ssh'
-      : 'https';
-  } else {
-    const proto = await runner.exec('gh config get git_protocol');
-    protocol = proto.stdout.trim() || 'https';
-    lsRemoteUrl = protocol === 'ssh'
-      ? `git@github.com:${slug}.git`
-      : `https://github.com/${slug}.git`;
-  }
+  if (lsRemoteOverride === undefined) return;
+  const lsRemoteUrl = lsRemoteOverride;
+  const protocol = lsRemoteUrl.startsWith('git@') || lsRemoteUrl.startsWith('ssh://') ? 'ssh' : 'https';
   const ls = await probeNetwork(runner, `${GIT_NET_ENV} git ls-remote ${shellQuote(lsRemoteUrl)} HEAD`);
   results.push({
     step: 'git',

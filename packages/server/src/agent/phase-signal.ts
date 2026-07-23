@@ -4,8 +4,6 @@ import { randomUUID } from 'node:crypto';
 export type PhaseSignalKind =
   | 'spec-fixed'
   | 'pr-created'
-  | 'pr-approved'
-  | 'pr-changes-requested'
   | 'pr-fixed'
   | 'pr-merge-ready'
   | 'spec-done'
@@ -16,11 +14,13 @@ export type PhaseSignalKind =
   | 'code-ready'
   | 'greeting';
 
+// spec §7：code 评审的裁决唯一经配对令牌评论产出，pane 侧只做 passive watch——
+// 仍布防以维持 need-input 徽标、session-gone 干预与重启恢复订阅，但没有任何 kind 能完成它。
+export const PASSIVE_VERDICT_WATCH: readonly PhaseSignalKind[] = [];
+
 export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
   'spec-fixed',
   'pr-created',
-  'pr-approved',
-  'pr-changes-requested',
   'pr-fixed',
   'pr-merge-ready',
   'spec-done',
@@ -35,8 +35,6 @@ export const PHASE_SIGNAL_KINDS: readonly PhaseSignalKind[] = [
 export type PhaseSignal =
   | { kind: 'spec-fixed'; token: string }
   | { kind: 'pr-created'; token: string; prNumber: number; actorB64?: string }
-  | { kind: 'pr-approved'; token: string }
-  | { kind: 'pr-changes-requested'; token: string }
   | { kind: 'pr-fixed'; token: string }
   | { kind: 'pr-merge-ready'; token: string }
   | { kind: 'spec-done'; token: string }
@@ -59,7 +57,7 @@ const COMPACT_SIGNAL_RE_PR_CREATED = new RegExp(
   'g',
 );
 const COMPACT_SIGNAL_RE_PLAIN = new RegExp(
-  `\\[bx:(spec-fixed|pr-approved|pr-changes-requested|pr-fixed|pr-merge-ready|spec-done|spec-reviewed|code-done|code-reviewed|code-fixed|greeting):(${TOKEN_RANGE})\\]`,
+  `\\[bx:(spec-fixed|pr-fixed|pr-merge-ready|spec-done|spec-reviewed|code-done|code-reviewed|code-fixed|greeting):(${TOKEN_RANGE})\\]`,
   'g',
 );
 const COMPACT_SIGNAL_RE_CODE_READY = new RegExp(
@@ -115,7 +113,6 @@ export function decodeSignalActorId(actorB64: string): string | undefined {
   const bytes = Buffer.from(actorB64, 'base64url');
   if (bytes.length === 0 || bytes.length > 128) return undefined;
   const text = bytes.toString('utf8');
-  // 精确相等比较要求无损解码：无效 UTF-8 会被替换字符吞掉差异，一律拒收
   if (!Buffer.from(text, 'utf8').equals(bytes)) return undefined;
   for (const ch of text) {
     const code = ch.codePointAt(0)!;

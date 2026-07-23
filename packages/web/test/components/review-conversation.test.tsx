@@ -61,33 +61,22 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe('ReviewConversation gating', () => {
-  it('renders nothing and does not fetch in github mode', () => {
+  it('renders nothing and does not fetch in git mode', () => {
     reviewsMock.mockResolvedValue([]);
     render(
       <MemoryRouter>
-        <ReviewConversation task={makeTask({ reviewMode: 'github' })} />
+        <ReviewConversation task={makeTask({ reviewMode: 'git' })} />
       </MemoryRouter>,
     );
     expect(screen.queryByText('Review records')).toBeNull();
     expect(reviewsMock).not.toHaveBeenCalled();
   });
 
-  it('renders nothing and does not fetch when reviewMode is undefined', () => {
-    reviewsMock.mockResolvedValue([]);
-    render(
-      <MemoryRouter>
-        <ReviewConversation task={makeTask({ reviewMode: undefined })} />
-      </MemoryRouter>,
-    );
-    expect(screen.queryByText('Review records')).toBeNull();
-    expect(reviewsMock).not.toHaveBeenCalled();
-  });
-
-  it('still renders for a github-mode SDD task that has spec rounds (specReviewRound > 0)', async () => {
+  it('still renders for a git-mode SDD task that has spec rounds (specReviewRound > 0)', async () => {
     reviewsMock.mockResolvedValue([
       specRound(1, 'spec', { findings: { round: 1, verdict: 'approve', findings: [] } }),
     ]);
-    renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
+    renderConv(makeTask({ reviewMode: 'git', specReviewRound: 1 }));
     expect(await screen.findByText('Spec review')).toBeTruthy();
     expect(reviewsMock).toHaveBeenCalled();
   });
@@ -100,16 +89,16 @@ describe('ReviewConversation github code-review group', () => {
       prNumber: 7,
       items: [
         { kind: 'review-comment', id: '21', body: 'nit', path: 'a.ts', line: 12 },
-        { kind: 'commit', id: 'c1', body: 'fix: thing', commitSha: 'c1' },
+        { kind: 'issue-comment', id: 'c1', body: 'fix: thing' },
         { kind: 'review', id: '11', body: 'please fix', verdict: 'request-changes' },
       ],
     });
-    renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 0 }));
+    renderConv(makeTask({ reviewMode: 'git', prNumber: 7, specReviewRound: 0 }));
     expect(screen.getByText('Review records')).toBeTruthy();
     expect(await screen.findByText('Round 1')).toBeTruthy();
     expect(screen.getByText('Code review')).toBeTruthy();
     expect(screen.getByText('Inline comment')).toBeTruthy();
-    expect(screen.getByText('Submit code changes')).toBeTruthy();
+    expect(screen.getByText('Comment')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(reviewsMock).not.toHaveBeenCalled();
     expect(prReviewMock).toHaveBeenCalledWith('task-1');
@@ -124,7 +113,7 @@ describe('ReviewConversation github code-review group', () => {
       prNumber: 7,
       items: [{ kind: 'review', id: '11', body: 'lgtm', verdict: 'approve' }],
     });
-    renderConv(makeTask({ reviewMode: 'github', prNumber: 7, specReviewRound: 1 }));
+    renderConv(makeTask({ reviewMode: 'git', prNumber: 7, specReviewRound: 1 }));
     expect(await screen.findByText('Spec review')).toBeTruthy();
     expect(screen.getByText('Code review')).toBeTruthy();
     expect(await screen.findAllByText('approve')).toHaveLength(2);
@@ -164,7 +153,7 @@ describe('ReviewConversation server mode', () => {
         userDecision: { verdict: 'request-changes', comments: '边界场景没有覆盖', at: 'now' },
       }),
     ]);
-    renderConv(makeTask({ reviewMode: 'github', specReviewRound: 1 }));
+    renderConv(makeTask({ reviewMode: 'git', specReviewRound: 1 }));
     expect(await screen.findByText('User')).toBeTruthy();
     expect(screen.getByText('Reject Spec')).toBeTruthy();
     expect(screen.getByText('边界场景没有覆盖')).toBeTruthy();

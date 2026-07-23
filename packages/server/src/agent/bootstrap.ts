@@ -7,6 +7,7 @@ import type { CommandRunner } from './runner.js';
 import { createRunner, resolveAgentHost } from './runner.js';
 import { RepoStore, type RepoStoreCache } from './repo-store.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
+import { projectReviewMode, resolveProjectTool } from '../config/validator.js';
 
 export interface BootstrapDeps {
   config: BaxianConfig;
@@ -23,6 +24,7 @@ export interface BootstrapDeps {
     cache: RepoStoreCache,
     agentId: string,
     workdir?: string,
+    cloneViaGh?: boolean,
   ) => RepoStore;
   onAgentAffected?: (agentIds: string[]) => void;
 }
@@ -90,12 +92,17 @@ export async function runSingleTarget(
     const runner = deps.runnerFactory
       ? deps.runnerFactory(rep)
       : createRunner(rep.mode, target.resolvedHost);
+    const cloneViaGh = projectReviewMode(deps.config, target.project) === 'git'
+      ? resolveProjectTool(target.project) === 'gh'
+      : undefined;
     const repoStore = deps.repoStoreFactory
       ? deps.repoStoreFactory(
           runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache, rep.id, rep.workdir,
+          cloneViaGh,
         )
       : new RepoStore(
           runner, target.project.repo, rep.mode, target.resolvedHost, deps.repoCache, rep.id, rep.workdir,
+          cloneViaGh,
         );
     workdir = await repoStore.ensure();
   } catch (err) {

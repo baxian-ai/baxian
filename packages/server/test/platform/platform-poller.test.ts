@@ -9,7 +9,7 @@ import { platformPollerStatePath, CommentCursorStore } from '../../src/platform/
 import { DriverOpError, type OpVars } from '../../src/platform/git-driver.js';
 import type { CommentSourceOp } from '../../src/platform/types.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
-import type { MappedEvent } from '../../src/github/mapper.js';
+import type { MappedEvent } from '../../src/platform/types.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
 import { repoIdentityKey } from '../../src/shared/git-url.js';
@@ -104,18 +104,25 @@ class FakeDriver implements PlatformDriver {
 
 let dir = '';
 let driver: FakeDriver;
-let tasks: PlatformTaskView[];
+type PlatformTaskFixture = Omit<PlatformTaskView, 'reviewMode'>
+  & Partial<Pick<PlatformTaskView, 'reviewMode'>>;
+let tasks: PlatformTaskFixture[];
 let events: MappedEvent[];
 let failEventMatch: ((e: MappedEvent) => boolean) | undefined;
 let clockNow = T0;
 
 function makePoller(extra: Partial<ConstructorParameters<typeof PlatformPoller>[0]> = {}) {
+  const materialize = (task: PlatformTaskFixture): PlatformTaskView => ({ reviewMode: 'git', ...task });
   const poller = new PlatformPoller({
     onEvent: (_projectId, event) => {
       if (failEventMatch?.(event)) throw new Error('delivery rejected');
       events.push(event);
     },
-    tasks: async () => tasks,
+    tasks: async () => tasks.map(materialize),
+    task: async taskId => {
+      const task = tasks.find(candidate => candidate.taskId === taskId);
+      return task === undefined ? null : materialize(task);
+    },
     now: () => clockNow,
     ...extra,
   });
@@ -159,6 +166,9 @@ describe('PlatformPoller: adoption predicate', () => {
     expect(ofType('pr.created')[0]!.data).toMatchObject({
       prNumber: 42, branch: 'bx/task-1', headSha: SHA1, targetBranch: 'main', prAuthorId: '77',
     });
+    const cursor = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await cursor.load();
+    expect(cursor.isAdoptionPending('task-5', 46)).toBe(false);
   });
 
   it('omits prAuthorId from adoption when the row does not carry one', async () => {
@@ -167,6 +177,210 @@ describe('PlatformPoller: adoption predicate', () => {
     await makePoller().poll();
     expect(ofType('pr.created')).toHaveLength(1);
     expect('prAuthorId' in ofType('pr.created')[0]!.data).toBe(false);
+  });
+
+  it('persists adoption delivery so an unbound server task is emitted only once across cycles and reloads', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' }];
+    driver.listPrsRows = [prRow()];
+    const onEvent = vi.fn((_projectId: string, event: MappedEvent) => {
+      events.push(event);
+      if (event.type === 'pr.created') tasks[0]!.prNumber = event.data.prNumber as number;
+    });
+    const first = makePoller({ onEvent });
+    await first.poll();
+    tasks[0]!.prNumber = undefined;
+    await first.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+
+    const reloaded = makePoller({ onEvent });
+    await reloaded.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+  });
+
+  it('suppresses an unchanged refused adoption, escalates once, and retries after the task generation changes', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main',
+      status: 'in_progress', phase: 'code', signalToken: 'aaaaaaaaaaaa',
+    }];
+    driver.listPrsRows = [prRow()];
+    const poller = makePoller();
+
+    await poller.poll();
+    await poller.poll();
+    await poller.poll();
+    await poller.poll();
+
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect(ofType('human.intervention')).toHaveLength(1);
+    expect(ofType('human.intervention')[0]!.data).toMatchObject({
+      reason: 'pr-adoption-deferred', taskId: 'task-1', status: 'in_progress', phase: 'code', cycles: 3,
+    });
+    const cursor = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await cursor.load();
+    expect(cursor.isAdoptionDelivered('task-1', 42)).toBe(false);
+    expect(cursor.isAdoptionPending('task-1', 42)).toBe(true);
+    expect(cursor.listPrsCursor().watermarkTime).not.toBeNull();
+
+    tasks[0]!.signalToken = 'bbbbbbbbbbbb';
+    await poller.poll();
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(2);
+    expect(ofType('human.intervention')).toHaveLength(1);
+  });
+
+  it('retries a durable refused adoption after reload even when listPrs has advanced past it', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main',
+      status: 'in_progress', phase: 'code', signalToken: 'aaaaaaaaaaaa',
+    }];
+    driver.listPrsRows = [prRow()];
+    await makePoller().poll();
+
+    driver.listPrsRows = [];
+    driver.prViews.set(42, prRow({ prNumber: undefined }));
+    const reloaded = makePoller({
+      onEvent: (_projectId, event) => {
+        events.push(event);
+        if (event.type === 'pr.created') tasks[0]!.prNumber = event.data.prNumber as number;
+      },
+    });
+    await reloaded.poll();
+
+    expect(ofType('pr.created')).toHaveLength(2);
+    const cursor = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await cursor.load();
+    expect(cursor.isAdoptionDelivered('task-1', 42)).toBe(true);
+    expect(cursor.isAdoptionPending('task-1', 42)).toBe(false);
+  });
+
+  it('retains a deferred-adoption fingerprint across a transient pending prView failure', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main',
+      status: 'fixing', phase: 'code', signalToken: 'aaaaaaaaaaaa',
+    }];
+    driver.listPrsRows = [prRow()];
+    const poller = makePoller();
+    await poller.poll();
+
+    driver.listPrsRows = [];
+    driver.prViews.set(42, new Error('temporary prView failure'));
+    await poller.poll();
+    driver.prViews.set(42, prRow({ prNumber: undefined }));
+    await poller.poll();
+    await poller.poll();
+
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect(ofType('human.intervention')).toHaveLength(1);
+    expect(ofType('human.intervention')[0]!.data).toMatchObject({
+      reason: 'pr-adoption-deferred', prNumber: 42, cycles: 3,
+    });
+  });
+
+  it('clears stale pending adoptions for missing, terminal, or differently bound tasks', async () => {
+    const statePath = platformPollerStatePath(dir, REPO);
+    const seed = new CommentCursorStore(statePath, REPO);
+    await seed.load();
+    await seed.markAdoptionPending('task-gone', 42);
+    await seed.markAdoptionPending('task-terminal', 43);
+    await seed.markAdoptionPending('task-rebound', 44);
+    tasks = [
+      { taskId: 'task-terminal', terminal: true },
+      { taskId: 'task-rebound', terminal: false, prNumber: 99 },
+    ];
+
+    await makePoller().poll();
+
+    const reloaded = new CommentCursorStore(statePath, REPO);
+    await reloaded.load();
+    expect(reloaded.pendingAdoptions()).toEqual([]);
+  });
+
+  it('converges a pending adoption already reflected by the task into delivered state', async () => {
+    const statePath = platformPollerStatePath(dir, REPO);
+    const seed = new CommentCursorStore(statePath, REPO);
+    await seed.load();
+    await seed.markAdoptionPending('task-1', 42);
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42 }];
+
+    await makePoller().poll();
+
+    const reloaded = new CommentCursorStore(statePath, REPO);
+    await reloaded.load();
+    expect(reloaded.isAdoptionDelivered('task-1', 42)).toBe(true);
+    expect(reloaded.isAdoptionPending('task-1', 42)).toBe(false);
+  });
+
+  it('clears pending adoption work when the listed PR no longer satisfies the adoption predicate', async () => {
+    const statePath = platformPollerStatePath(dir, REPO);
+    const seed = new CommentCursorStore(statePath, REPO);
+    await seed.load();
+    await seed.markAdoptionPending('task-1', 42);
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' }];
+    driver.listPrsRows = [prRow({ draft: true })];
+
+    await makePoller().poll();
+
+    const reloaded = new CommentCursorStore(statePath, REPO);
+    await reloaded.load();
+    expect(reloaded.isAdoptionPending('task-1', 42)).toBe(false);
+    expect(ofType('pr.created')).toHaveLength(0);
+  });
+
+  it('retries a failed deferred-adoption intervention without resending pr.created', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main',
+      status: 'fixing', phase: 'code', signalToken: 'aaaaaaaaaaaa',
+    }];
+    driver.listPrsRows = [prRow()];
+    const poller = makePoller();
+    await poller.poll();
+    await poller.poll();
+    failEventMatch = event => event.type === 'human.intervention';
+    await poller.poll();
+    expect(ofType('human.intervention')).toHaveLength(0);
+
+    failEventMatch = undefined;
+    await poller.poll();
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+    expect(ofType('human.intervention')).toHaveLength(1);
+  });
+
+  it('records adoption only after downstream delivery succeeds', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', expectedBase: 'main' }];
+    driver.listPrsRows = [prRow()];
+    failEventMatch = event => event.type === 'pr.created';
+    const poller = makePoller({
+      onEvent: (_projectId, event) => {
+        if (failEventMatch?.(event)) throw new Error('delivery rejected');
+        events.push(event);
+        if (event.type === 'pr.created') tasks[0]!.prNumber = event.data.prNumber as number;
+      },
+    });
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(0);
+
+    failEventMatch = undefined;
+    await poller.poll();
+    tasks[0]!.prNumber = undefined;
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+  });
+
+  it('preserves a refused adoption across a temporary default-branch probe failure', async () => {
+    tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1' }];
+    driver.listPrsRows = [prRow()];
+    const poller = makePoller();
+
+    await poller.poll();
+    expect(ofType('pr.created')).toHaveLength(1);
+
+    driver.projectViewError = new Error('projectView down');
+    await poller.poll();
+    driver.projectViewError = undefined;
+    await poller.poll();
+
+    expect(ofType('pr.created')).toHaveLength(1);
   });
 
   it('without a base snapshot compares against the cycle default branch and escalates mismatches', async () => {
@@ -186,6 +400,9 @@ describe('PlatformPoller: adoption predicate', () => {
     expect(intervention[0]!.data).toMatchObject({
       reason: 'base-mismatch', prNumber: 43, targetBranch: 'main', expectedBase: 'develop', taskId: 'task-2',
     });
+    const cursor = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await cursor.load();
+    expect(cursor.isAdoptionPending('task-2', 43)).toBe(false);
   });
 
   it('delivers a base-mismatch escalation once per condition, retries failed deliveries, and re-alerts on change', async () => {
@@ -283,6 +500,24 @@ describe('PlatformPoller: reopen and generations', () => {
     await check.load();
     expect(check.generations()).toEqual([]);
   });
+
+  it('keeps cursor generations for an authoritative live task hidden by the entry filter', async () => {
+    const statePath = platformPollerStatePath(dir, REPO);
+    const seed = new CommentCursorStore(statePath, REPO);
+    await seed.load();
+    await seed.commitSource('task-hidden', 42, 'issue-comments', [comment('1', 'x')], T0);
+    tasks = [];
+
+    await makePoller({
+      task: async taskId => taskId === 'task-hidden'
+        ? { taskId, terminal: false, reviewMode: 'git', branch: 'bx/task-hidden' }
+        : null,
+    }).poll();
+
+    const check = new CommentCursorStore(statePath, REPO);
+    await check.load();
+    expect(check.generations()).toEqual(['task-hidden']);
+  });
 });
 
 describe('PlatformPoller: pr lifecycle sub-poll', () => {
@@ -315,6 +550,27 @@ describe('PlatformPoller: pr lifecycle sub-poll', () => {
     const closed = ofType('pr.updated').filter(e => e.data.kind === 'closed-unmerged');
     expect(closed).toHaveLength(1);
     expect(events.some(e => e.data.kind === 'comment')).toBe(false);
+  });
+
+  it('limits server+PR tasks to lifecycle reads while preserving merge observation', async () => {
+    tasks = [{
+      taskId: 'task-1', terminal: false, reviewMode: 'server', branch: 'bx/task-1',
+      prNumber: 42, latestHeadSha: SHA1,
+    }];
+    driver.prViews.set(42, prRow({ headSha: SHA2 }));
+    driver.comments['issue-comments'] = [comment('1', 'not consumed by server review')];
+    const poller = makePoller();
+
+    await poller.poll();
+
+    expect(driver.calls).toContain('prView');
+    expect(driver.calls.filter(call => call.startsWith('listComments'))).toEqual([]);
+    expect(ofType('pr.updated')).toHaveLength(0);
+
+    events = [];
+    driver.prViews.set(42, prRow({ state: 'closed', mergedAt: OLD_TS }));
+    await poller.poll();
+    expect(ofType('pr.merged')).toHaveLength(1);
   });
 });
 
@@ -616,23 +872,33 @@ describe('PlatformPoller: listPrs cursor integrity', () => {
     expect(ofType('pr.created')[0]!.data.prNumber).toBe(60);
   });
 
-  it('freezes the listPrs watermark while a no-snapshot adoption is deferred', async () => {
+  it('advances listPrs while independently retaining a no-snapshot adoption', async () => {
     tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1' }];
     driver.projectViewError = new Error('projectView down');
     driver.listPrsRows = [prRow()];
-    const poller = makePoller();
+    const poller = makePoller({
+      onEvent: (_projectId, event) => {
+        events.push(event);
+        if (event.type === 'pr.created') tasks[0]!.prNumber = event.data.prNumber as number;
+      },
+    });
     await poller.poll();
-    const frozen = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
-    await frozen.load();
-    expect(frozen.listPrsCursor().watermarkTime).toBe(null);
+    const pending = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
+    await pending.load();
+    const initialWatermark = pending.listPrsCursor().watermarkTime;
+    expect(initialWatermark).not.toBe(null);
+    expect(pending.isAdoptionPending('task-1', 42)).toBe(true);
     expect(ofType('pr.created')).toHaveLength(0);
 
     driver.projectViewError = undefined;
+    driver.listPrsRows = [];
+    driver.prViews.set(42, prRow({ updatedAt: iso(T0 - 10_000) }));
     await poller.poll();
     expect(ofType('pr.created')).toHaveLength(1);
     const advanced = new CommentCursorStore(platformPollerStatePath(dir, REPO), REPO);
     await advanced.load();
-    expect(advanced.listPrsCursor().watermarkTime).not.toBe(null);
+    expect(advanced.listPrsCursor().watermarkTime).toBe(initialWatermark);
+    expect(advanced.isAdoptionPending('task-1', 42)).toBe(false);
   });
 });
 
@@ -857,7 +1123,9 @@ describe('PlatformPoller: rate limit backoff', () => {
   it('short-circuits the entry, skips until the backoff expires, and grows the window exponentially', async () => {
     tasks = [{ taskId: 'task-1', terminal: false, branch: 'bx/task-1', prNumber: 42, latestHeadSha: SHA1 }];
     driver.prViews.set(42, prRow());
-    driver.projectViewError = rateLimited('projectView');
+    driver.projectViewError = new DriverOpError('projectView rate limited', {
+      opName: 'projectView', errorClass: 'RATE_LIMIT', exitCode: 1,
+    });
     const poller = makePoller();
     await poller.poll();
     expect(driver.calls).toEqual(['projectView']);
@@ -884,7 +1152,9 @@ describe('PlatformPoller: rate limit backoff', () => {
     expect(driver.calls.length).toBeGreaterThan(1);
     expect(poller.snapshots()[0]!.rateLimitedUntil).toBe(undefined);
 
-    driver.projectViewError = rateLimited('projectView');
+    driver.projectViewError = new DriverOpError('projectView rate limited', {
+      opName: 'projectView', errorClass: 'RATE_LIMIT', exitCode: 1,
+    });
     clockNow = T0 + 400_000;
     await poller.poll();
     expect(poller.snapshots()[0]!.rateLimitedUntil).toBe(new Date(T0 + 400_000 + 60_000).toISOString());
@@ -973,6 +1243,28 @@ describe('PlatformPoller: server-track preflight gate', () => {
     clockNow = T0 + 30_000;
     await poller.poll();
     expect(driver.calls).toEqual([]);
+  });
+
+  it('expires the default-branch snapshot while rate-limit backoff skips refresh cycles', async () => {
+    const repoKey = repoIdentityKey(REPO);
+    const poller = makePoller();
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+
+    driver.projectViewError = new DriverOpError('projectView rate limited', {
+      opName: 'projectView', errorClass: 'RATE_LIMIT', exitCode: 1,
+    });
+    clockNow = T0 + 1_000;
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+
+    clockNow = T0 + 10_000;
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBe('main');
+
+    clockNow = T0 + 20_000;
+    await poller.poll();
+    expect(poller.defaultBranchSnapshot(repoKey)).toBeUndefined();
   });
 
   it('ages the default-branch cache on step-failing cycles so the snapshot expires', async () => {

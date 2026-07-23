@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import type { PrReviewItem, PrReviewVerdict } from '../shared/index.js';
+import { safeExternalHref, type PrReviewItem, type PrReviewVerdict } from '../shared/index.js';
 import {
   PR_REVIEW_VERDICT_CLASS,
   groupPrReviewRounds,
@@ -21,8 +21,8 @@ const VERDICT_LABEL: Record<PrReviewVerdict, string> = {
   comment: 'comment',
 };
 
-function reasonOf(reason?: string): 'server-mode' | 'no-pr' | 'not-github' | 'driver-unavailable' | undefined {
-  return reason === 'server-mode' || reason === 'no-pr' || reason === 'not-github' || reason === 'driver-unavailable'
+function reasonOf(reason?: string): 'server-mode' | 'no-pr' | 'driver-unavailable' | undefined {
+  return reason === 'server-mode' || reason === 'no-pr' || reason === 'driver-unavailable'
     ? reason
     : undefined;
 }
@@ -31,7 +31,6 @@ function reasonText(t: Messages): Record<NonNullable<ReturnType<typeof reasonOf>
   return {
     'server-mode': t.prReview.reasonServerMode,
     'no-pr': t.prReview.reasonNoPr,
-    'not-github': t.prReview.reasonNotGithub,
     'driver-unavailable': t.prReview.reasonDriverUnavailable,
   };
 }
@@ -54,6 +53,7 @@ export function PrReviewPage() {
 
   const prNumber = data?.prNumber ?? task?.prNumber;
   const prUrl = data?.prUrl ?? task?.prUrl;
+  const prHref = safeExternalHref(prUrl);
   const rounds = data ? groupPrReviewRounds(data.items) : [];
   const itemsReady = loaded && !error && data?.available === true && data.items.length > 0;
 
@@ -100,8 +100,8 @@ export function PrReviewPage() {
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
         <span className="pill">{t.prReview.codeReviewHeading}</span>
-        {prUrl && prNumber !== undefined && (
-          <a href={prUrl} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
+        {prHref && prNumber !== undefined && (
+          <a href={prHref} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
             {t.taskDetail.viewPr(prNumber)}
           </a>
         )}
@@ -163,19 +163,6 @@ function itemCardClass(item: PrReviewItem, flashId: string | null): string {
 
 function ItemRow({ item, flashId }: { item: PrReviewItem; flashId: string | null }) {
   const t = useT();
-  if (item.kind === 'commit') {
-    return (
-      <div id={prReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>
-        <div className="mb-1 flex flex-wrap items-center gap-2">
-          <span className="pill shrink-0">{t.prReview.commitPill}</span>
-          {item.commitSha && <span className="font-mono text-xs text-og-500">{item.commitSha.slice(0, 9)}</span>}
-          {item.author && <span className="text-xs text-og-400">{item.author}</span>}
-          {item.createdAt && <span className="text-xs text-og-400">{fmt(item.createdAt)}</span>}
-        </div>
-        {item.body && <div className="whitespace-pre-wrap break-words text-og-800">{item.body}</div>}
-      </div>
-    );
-  }
   const isInline = item.kind === 'review-comment';
   return (
     <div id={prReviewItemAnchor(item)} className={itemCardClass(item, flashId)}>

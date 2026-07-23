@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   isRecord,
   MAX_INLINE_CONTENT_BYTES,
@@ -20,19 +20,26 @@ import {
   type TaskState,
 } from '../shared/index.js';
 import { shellQuote, type CommandRunner, type ExecResult } from './runner.js';
-import { GIT_NET_ENV, execNetwork } from './net-exec.js';
-import { ancestorSymlinkGuard, canonicalSelfGuard, ensureBaxianRuntimeDirsSafe, guardedRemoveClause, moveFileIntoPlace, stageFileGuarded, sweepStrayFile } from './repo-store.js';
+import { GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
+import { ancestorSymlinkGuard, BaxianRuntimeDirsError, canonicalSelfGuard, ensureBaxianRuntimeDirsSafe, guardedRemoveClause, moveFileIntoPlace, stageFileGuarded, sweepStrayFile } from './repo-store.js';
 
 
 export class ReviewExchangeError extends Error {
   constructor(
     public readonly reason: string,
     message: string,
+    public readonly violationCode?: string,
   ) {
     super(message);
     this.name = 'ReviewExchangeError';
   }
 }
+
+export type ReviewResponseReadResult =
+  | { kind: 'ok'; raw: string; response: ReviewResponse; responseDigest: string }
+  | { kind: 'absent' }
+  | { kind: 'invalid'; raw: string; responseDigest: string; error: ReviewExchangeError; schemaViolationCodes: string[] }
+  | { kind: 'unknown'; error: ReviewExchangeError };
 
 export interface ReadContentResult {
   content: string;
@@ -101,28 +108,38 @@ export function validateReviewFindings(raw: unknown): ReviewFindings {
 }
 
 export function validateReviewResponse(raw: unknown): ReviewResponse {
-  if (!isRecord(raw)) throw new ReviewExchangeError('schema', 'response: not an object');
+  if (!isRecord(raw)) throw new ReviewExchangeError('schema', 'response: not an object', 'response-not-object');
   if (typeof raw.round !== 'number' || !Number.isInteger(raw.round) || raw.round < 1) {
-    throw new ReviewExchangeError('schema', 'response.round must be a positive integer');
+    throw new ReviewExchangeError('schema', 'response.round must be a positive integer', 'invalid-round');
+  }
+  if (typeof raw.token !== 'string' || !/^[0-9a-f]{12}$/.test(raw.token)) {
+    throw new ReviewExchangeError('schema', 'response.token must be a 12-hex signal token', 'missing-or-invalid-token');
+  }
+  if (typeof raw.findingsDigest !== 'string' || !/^[0-9a-f]{64}$/.test(raw.findingsDigest)) {
+    throw new ReviewExchangeError(
+      'schema',
+      'response.findingsDigest must be a lowercase SHA-256 digest',
+      'missing-or-invalid-findings-digest',
+    );
   }
   if (!Array.isArray(raw.responses)) {
-    throw new ReviewExchangeError('schema', 'response.responses must be an array');
+    throw new ReviewExchangeError('schema', 'response.responses must be an array', 'responses-not-array');
   }
   const responseIds = new Set<string>();
   for (const r of raw.responses) {
-    if (!isRecord(r)) throw new ReviewExchangeError('schema', 'response item: not an object');
+    if (!isRecord(r)) throw new ReviewExchangeError('schema', 'response item: not an object', 'response-item-not-object');
     if (typeof r.findingId !== 'string' || r.findingId.trim() === '') {
-      throw new ReviewExchangeError('schema', 'response.findingId must be a non-empty string');
+      throw new ReviewExchangeError('schema', 'response.findingId must be a non-empty string', 'invalid-finding-id');
     }
     if (responseIds.has(r.findingId)) {
-      throw new ReviewExchangeError('schema', `duplicate response findingId: ${r.findingId}`);
+      throw new ReviewExchangeError('schema', `duplicate response findingId: ${r.findingId}`, 'duplicate-finding-id');
     }
     responseIds.add(r.findingId);
     if (typeof r.action !== 'string' || !ACTIONS.has(r.action)) {
-      throw new ReviewExchangeError('schema', `response.action invalid: ${String(r.action)}`);
+      throw new ReviewExchangeError('schema', `response.action invalid: ${String(r.action)}`, 'invalid-action');
     }
     if (typeof r.rationale !== 'string' || r.rationale.trim() === '') {
-      throw new ReviewExchangeError('schema', `response.rationale missing for ${r.findingId}`);
+      throw new ReviewExchangeError('schema', `response.rationale missing for ${r.findingId}`, 'missing-rationale');
     }
   }
   return raw as unknown as ReviewResponse;
@@ -151,7 +168,7 @@ export class ReviewTransport {
     const result = await runner.exec(
       paths.map(p => guardedRemoveClause(workdir, p)).join(' && '),
     );
-    if (result.exitCode !== 0) {
+    if (execOutcomeUnknown(result) || result.exitCode !== 0) {
       throw new ReviewExchangeError(
         'artifact-cleanup-failed',
         `failed to clear stale dispatch outputs: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
@@ -160,7 +177,7 @@ export class ReviewTransport {
     if (resetsSpecDocuments) {
       const researchDir = `${workdir}/${RESEARCH_DOCS_DIR}`;
       const cleared = await runner.exec(guardedRemoveClause(workdir, researchDir, { recursive: true }));
-      if (cleared.exitCode !== 0) {
+      if (execOutcomeUnknown(cleared) || cleared.exitCode !== 0) {
         throw new ReviewExchangeError(
           'artifact-cleanup-failed',
           `failed to clear stale research docs: ${cleared.stderr.trim() || `exit ${cleared.exitCode}`}`,
@@ -356,9 +373,37 @@ export class ReviewTransport {
   }
 
   async readResponse(task: TaskState, devAgent: AgentConfig): Promise<ReviewResponse | null> {
-    const raw = await this.readExchangeFile(devAgent, 'response.json');
-    if (raw === null) return null;
-    return validateReviewResponse(this.parseJson(raw, 'response.json'));
+    const result = await this.readResponseWithRaw(task, devAgent);
+    if (result.kind === 'absent') return null;
+    if (result.kind === 'ok') return result.response;
+    throw result.error;
+  }
+
+  async readResponseWithRaw(_task: TaskState, devAgent: AgentConfig): Promise<ReviewResponseReadResult> {
+    let raw: string | null;
+    try {
+      raw = await this.readExchangeFile(devAgent, 'response.json');
+    } catch (err) {
+      const error = err instanceof ReviewExchangeError
+        ? err
+        : new ReviewExchangeError('read-unknown', err instanceof Error ? err.message : String(err));
+      if (error.reason === 'read-unknown' || error.reason === 'runtime-path-probe-failed') {
+        return { kind: 'unknown', error };
+      }
+      throw error;
+    }
+    if (raw === null) return { kind: 'absent' };
+    const responseDigest = createHash('sha256').update(raw, 'utf8').digest('hex');
+    try {
+      const response = validateReviewResponse(this.parseJson(raw, 'response.json'));
+      return { kind: 'ok', raw, response, responseDigest };
+    } catch (err) {
+      const error = err instanceof ReviewExchangeError
+        ? err
+        : new ReviewExchangeError('schema', err instanceof Error ? err.message : String(err), 'unknown-schema-error');
+      const violationCode = error.violationCode ?? (error.reason === 'parse' ? 'malformed-json' : 'unknown-schema-error');
+      return { kind: 'invalid', raw, responseDigest, error, schemaViolationCodes: [violationCode] };
+    }
   }
 
   async deleteFindings(qaAgent: AgentConfig): Promise<void> {
@@ -457,7 +502,21 @@ export class ReviewTransport {
     const wt = this.requireWorkdir(agent.id);
     const runner = this.deps.createRunnerFor(agent);
     await this.ensureRuntimeDirs(runner, wt);
-    const r = await runner.exec(`cat ${shellQuote(`${wt}/${REVIEW_EXCHANGE_DIR}/${name}`)}`);
+    let r: ExecResult;
+    try {
+      r = await runner.exec(`cat ${shellQuote(`${wt}/${REVIEW_EXCHANGE_DIR}/${name}`)}`);
+    } catch (err) {
+      throw new ReviewExchangeError(
+        'read-unknown',
+        `${name}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (execOutcomeUnknown(r)) {
+      throw new ReviewExchangeError(
+        'read-unknown',
+        `${name}: ${r.stderr.trim() || r.stdout.trim() || `exit ${r.exitCode}`}`,
+      );
+    }
     if (r.exitCode !== 0) {
       if (/no such file/i.test(r.stderr)) return null;
       throw new ReviewExchangeError('read-failed', `${name}: ${r.stderr.trim()}`);
@@ -471,7 +530,7 @@ export class ReviewTransport {
     await this.ensureRuntimeDirs(runner, wt);
     const target = `${wt}/${REVIEW_EXCHANGE_DIR}/${name}`;
     const rm = await runner.exec(guardedRemoveClause(wt, target));
-    if (rm.exitCode !== 0) {
+    if (execOutcomeUnknown(rm) || rm.exitCode !== 0) {
       throw new ReviewExchangeError(
         'artifact-cleanup-failed',
         `failed to delete ${target}: ${rm.stderr.trim() || `exit ${rm.exitCode}`}`,
@@ -484,7 +543,7 @@ export class ReviewTransport {
       await ensureBaxianRuntimeDirsSafe(runner, workdir);
     } catch (err) {
       throw new ReviewExchangeError(
-        'unsafe-runtime-path',
+        err instanceof BaxianRuntimeDirsError ? err.reason : 'runtime-path-probe-failed',
         err instanceof Error ? err.message : String(err),
       );
     }

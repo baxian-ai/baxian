@@ -123,6 +123,16 @@ describe('row-schema: projectView and booleans', () => {
   });
 });
 
+describe('row-schema: branchView', () => {
+  it('requires repository identity while allowing an absent ref', () => {
+    expect(() => validateRows('branchView', [{ remoteProjectId: null }])).toThrow(RowSchemaError);
+    expect(validateRows('branchView', [{ remoteProjectId: 'R_repo', headSha: undefined }]))
+      .toEqual([{ remoteProjectId: 'R_repo', headSha: undefined }]);
+    expect(validateRows('branchView', [{ remoteProjectId: 'R_repo', headSha: 'A'.repeat(40) }]))
+      .toEqual([{ remoteProjectId: 'R_repo', headSha: 'a'.repeat(40) }]);
+  });
+});
+
 describe('versionTimeOf', () => {
   it('prefers updatedAt, falls back to createdAt, and returns undefined when both missing', () => {
     expect(versionTimeOf({ updatedAt: '2026-07-17T00:00:02Z', createdAt: '2026-07-17T00:00:01Z' }))

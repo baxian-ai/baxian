@@ -4,7 +4,7 @@ import {
   type NeedInputCommitIntent,
   type NeedInputCommitResult,
 } from '../../src/agent/phase-signal-watcher.js';
-import { buildPhaseSignal, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
+import { buildPhaseSignal, PASSIVE_VERDICT_WATCH, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
 import type { AgentConfig, BaxianEvent, EventType } from '../../src/shared/index.js';
 import type { EventBus } from '../../src/event/bus.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
@@ -176,42 +176,18 @@ describe('PhaseSignalWatcher', () => {
   it('start() returns false when subscribeAtomic rejects (transient pane fault)', async () => {
     const { watcher, streamer } = makeWatcher();
     streamer.subscribeAtomic.mockRejectedValueOnce(new Error('streamer destroyed'));
-    const armed = await startWatch(watcher, { expectedKinds: 'pr-approved', token: 'tok123abc456' });
+    const armed = await startWatch(watcher, { expectedKinds: 'spec-reviewed', token: 'tok123abc456' });
     expect(armed).toBe(false);
     expect(watcher.has('t1')).toBe(false);
   });
 
-  it('multi-kind verdict watch: pr-approved match fires review.submitted', async () => {
+  it('a passive verdict watch stays armed and fires nothing when the pane prints a verdict', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'verdict12345';
-    await startWatch(watcher, { expectedKinds: ['pr-approved', 'pr-changes-requested'], token });
-    streamer.triggerLive(`${buildPhaseSignal('pr-approved', token)}\n`);
-    expect(captured).toHaveLength(1);
-    expect(captured[0].type).toBe('review.submitted');
-    expect(captured[0].data).toMatchObject({
-      kind: 'pr-approved',
-      token,
-      source: 'pane-signal',
-      action: 'APPROVE',
-    });
-  });
-
-  it('multi-kind verdict watch: pr-changes-requested also fires review.submitted', async () => {
-    const { watcher, streamer, captured } = makeWatcher();
-    const token = 'verdict67890';
-    await startWatch(watcher, {
-      expectedKinds: new Set<'pr-approved' | 'pr-changes-requested'>([
-        'pr-approved',
-        'pr-changes-requested',
-      ]),
-      token,
-    });
-    streamer.triggerLive(`${buildPhaseSignal('pr-changes-requested', token)}\n`);
-    expect(captured).toHaveLength(1);
-    expect(captured[0].data).toMatchObject({
-      kind: 'pr-changes-requested',
-      action: 'REQUEST_CHANGES',
-    });
+    await startWatch(watcher, { expectedKinds: PASSIVE_VERDICT_WATCH, token });
+    streamer.triggerLive(`[bx:pr-approved:${token}]\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1')).toBe(true);
   });
 
   it('ignores a signal whose kind is outside expectedKinds', async () => {
@@ -325,12 +301,12 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: ['pr-approved', 'pr-changes-requested'],
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed',
       token: 'qatok1234567', replaceScope: 'agent',
     });
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
     streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
@@ -342,12 +318,12 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qatok1234567',
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567',
     });
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
     expect(captured).toHaveLength(0);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -355,21 +331,21 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qatok1234567', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567', replaceScope: 'agent',
     });
     watcher.stopAgent('t1', DEV_AGENT.id);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
     watcher.stop('t1');
     expect(watcher.has('t1')).toBe(false);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(0);
   });
 
   it('an agent-scoped fenced arm ignores a sibling entry holding a rotated token', async () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qarotated456', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qarotated456', replaceScope: 'agent',
     });
     const armed = await startWatch(watcher, {
       expectedKinds: 'pr-created', token: 'devtok123456',
@@ -385,13 +361,80 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'pr-approved', token: 'qatok1234567', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567', replaceScope: 'agent',
     });
     watcher.stopIfToken('t1', 'devtok123456');
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-approved', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
+  });
+
+  it('stopAgentIfToken retires only the matching agent predecessor', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: 'sharedtok1234' });
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'sharedtok1234', replaceScope: 'agent',
+    });
+
+    watcher.stopAgentIfToken('t1', DEV_AGENT.id, 'sharedtok1234');
+
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'sharedtok1234')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('hands an old-token entry to the new token only after subscribing and preserves its sibling', async () => {
+    const { watcher, streamers, captured } = makeDualWatcher();
+    const oldToken = 'devoldtok1234';
+    const newToken = 'devnewtok1234';
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: oldToken, replaceScope: 'agent' });
+    await startWatch(watcher, {
+      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567', replaceScope: 'agent',
+    });
+    const claim = watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: newToken, replaceFromToken: oldToken,
+      onlyReplaceOwnToken: true, replaceScope: 'agent',
+    });
+    expect(claim).not.toBeNull();
+    const gate = streamers[DEV_AGENT.id]!.holdNextSubscribe();
+    const handoff = startWatch(watcher, {
+      expectedKinds: 'pr-created', token: newToken, replaceFromToken: oldToken,
+      onlyReplaceOwnToken: true, replaceScope: 'agent', armClaimId: claim!, skipSnapshot: true,
+    });
+    await flushMicrotasks();
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+    expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
+    gate.release();
+    expect(await handoff).toBe(true);
+    watcher.releaseArm(claim);
+
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', oldToken, 1)}\n`);
+    expect(captured).toHaveLength(0);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', newToken, 2)}\n`);
+    expect(captured.map(event => event.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
+  });
+
+  it('rejects a different pending hand-off token before either arm can install', async () => {
+    const { watcher } = makeWatcher();
+    const first = watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: 'newtoken11111', replaceFromToken: 'oldtoken11111',
+      onlyReplaceOwnToken: true, replaceScope: 'agent',
+    });
+    expect(first).not.toBeNull();
+    expect(watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: 'newtoken22222', replaceFromToken: 'oldtoken11111',
+      onlyReplaceOwnToken: true, replaceScope: 'agent',
+    })).toBeNull();
+    const sameToken = watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: 'newtoken11111', replaceFromToken: 'oldtoken11111',
+      onlyReplaceOwnToken: true, replaceScope: 'agent',
+    });
+    expect(sameToken).not.toBeNull();
+    watcher.releaseArm(first);
+    watcher.releaseArm(sameToken);
   });
 
   it('stopIfToken removes the entry only when the token matches', async () => {
@@ -532,10 +575,10 @@ describe('PhaseSignalWatcher', () => {
 
   it('expectedKindsFor(taskId): reports the watched set; empty Set after stop', async () => {
     const { watcher } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'introspct123' });
+    await startWatch(watcher, { expectedKinds: ['spec-reviewed', 'pr-fixed'], token: 'introspct123' });
     const armed = watcher.expectedKindsFor('t1');
-    expect(armed.has('pr-approved')).toBe(true);
-    expect(armed.has('pr-changes-requested')).toBe(true);
+    expect(armed.has('spec-reviewed')).toBe(true);
+    expect(armed.has('pr-fixed')).toBe(true);
     expect(armed.has('spec-done')).toBe(false);
     watcher.stop('t1');
     expect(watcher.expectedKindsFor('t1').size).toBe(0);
@@ -566,15 +609,6 @@ describe('kind → event type routing', () => {
     expect(captured[0].type).toBe(eventType);
   });
 
-  it('pr-approved / pr-changes-requested both route to review.submitted', async () => {
-    for (const kind of ['pr-approved', 'pr-changes-requested'] as const) {
-      const { watcher, streamer, captured } = makeWatcher();
-      const token = 'verdicttok12';
-      await startWatch(watcher, { expectedKinds: kind, token });
-      streamer.triggerLive(`${buildPhaseSignal(kind, token)}\n`);
-      expect(captured[0].type).toBe('review.submitted');
-    }
-  });
 });
 
 describe('server-chain signal watching', () => {
@@ -722,19 +756,20 @@ describe('need-input ask/answer watermark', () => {
     expect(await watcher.rearmNeedInput(DEV_AGENT.id)).toEqual(new Set(['old-task']));
   });
 
-  it('a same-token replay makes this token\'s pane unattributable, so it is not read', async () => {
+  it('a rotated token reads its own snapshot answer and ignores predecessor-token noise', async () => {
     const { watcher, streamer, commits } = makeWatcher();
-    // Two generations of the same ordinals are on screen and a framebuffer carries no
-    // time order, so neither the old answer nor the current ask can be attributed.
+    const oldToken = 'oldtoken12345';
+    const newToken = 'newtoken12345';
     streamer.setSnapshot(
-      `old [bx:need-input:${token}:1] old [bx:input-received:${token}:1] `
-      + `current [bx:need-input:${token}:1]`,
+      `old [bx:need-input:${oldToken}:1] old [bx:input-received:${oldToken}:1] `
+      + `current [bx:need-input:${newToken}:1] current [bx:input-received:${newToken}:1]`,
     );
     await startWatch(watcher, {
-      expectedKinds: 'pr-created', token, needInput: wm(3, 1, 0),
-      needInputInherit: true, needInputSnapshotBlind: true,
+      expectedKinds: 'pr-created', token: newToken, needInput: wm(3, 1, 0), needInputInherit: true,
     });
-    expect(commits).toEqual([]);
+    expect(commits).toEqual([{
+      agentId: DEV_AGENT.id, taskId: 't1', epoch: 3, askSeq: 1, answeredSeq: 1,
+    }]);
   });
 
   it('without a replay the snapshot ordinals are this generation\'s own record', async () => {
@@ -834,6 +869,29 @@ describe('need-input ask/answer watermark', () => {
     expect(commits).toEqual([intent(1, 3, 0)]);
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     expect(commits).toEqual([intent(1, 3, 0), intent(2, 1, 0)]);
+  });
+
+  it('a failed cross-token hand-off leaves the predecessor on its old epoch', async () => {
+    const { watcher, streamer, commits } = makeWatcher();
+    const oldToken = 'oldtoken12345';
+    const newToken = 'newtoken12345';
+    await startWatch(watcher, { expectedKinds: 'pr-created', token: oldToken, needInput: wm(1, 0, 0) });
+    streamer.triggerLive(`[bx:need-input:${oldToken}:1]\n`);
+    const claim = watcher.claimArm({
+      taskId: 't1', agentId: DEV_AGENT.id, token: newToken, replaceFromToken: oldToken,
+      onlyReplaceOwnToken: true, replaceScope: 'agent',
+    });
+    streamer.failNextSubscribe();
+
+    expect(await startWatch(watcher, {
+      expectedKinds: 'pr-created', token: newToken, needInput: wm(2, 0, 0),
+      replaceFromToken: oldToken, onlyReplaceOwnToken: true, replaceScope: 'agent',
+      armClaimId: claim!, skipSnapshot: true,
+    })).toBe(false);
+    watcher.releaseArm(claim);
+    streamer.triggerLive(`[bx:need-input:${oldToken}:2]\n`);
+
+    expect(commits).toEqual([intent(1, 1, 0), intent(1, 2, 0)]);
   });
 
   it('bare and stale-seq snapshot answers stay blind', async () => {
@@ -1021,7 +1079,7 @@ describe('need-input ask/answer watermark', () => {
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     await watcher.start({
       taskId: 't1', projectId: 'p1', agentId: QA_AGENT.id,
-      expectedKinds: ['pr-approved', 'pr-changes-requested'], token: 'tokQA12345678',
+      expectedKinds: 'spec-reviewed', token: 'tokQA12345678',
       needInput: { epoch: 1, askSeq: 0, answeredSeq: 0 },
     });
     expect(await watcher.start({
@@ -1030,8 +1088,8 @@ describe('need-input ask/answer watermark', () => {
       needInput: { epoch: 2, askSeq: 0, answeredSeq: 0 },
     })).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id].triggerLive('[bx:pr-approved:tokQA12345678]\n');
-    expect(captured.some(e => e.type === 'review.submitted')).toBe(true);
+    streamers[QA_AGENT.id].triggerLive('[bx:spec-reviewed:tokQA12345678]\n');
+    expect(captured.some(e => e.type === 'server.spec.review.submitted')).toBe(true);
   });
 
   it('a degraded fresh arm restarts ordinals so the new prompt cannot be swallowed', async () => {

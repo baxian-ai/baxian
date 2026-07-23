@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
@@ -6,12 +7,117 @@ import {
   isRecord,
   renderSpecDocuments,
   type ReviewPhase,
+  type ReviewFindings,
   type ReviewRound,
+  type ServerResponseFailure,
+  type ServerSignalRecoveryReason,
   type SpecDocument,
 } from '../shared/index.js';
 
 const ROUND_FILE_RE = /^round-(\d+)\.json$/;
 const PHASES: readonly ReviewPhase[] = ['spec', 'code'];
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const FAILURE_DISPOSITIONS = new Set([
+  'auto-correct', 'hold-repeated-signature', 'hold-correction-limit',
+]);
+const FAILURE_REASONS = new Set<ServerResponseFailureReason>([
+  'response-missing', 'response-invalid', 'round-mismatch', 'token-mismatch',
+  'findings-digest-mismatch', 'coverage-gap',
+]);
+
+export const SERVER_FEEDBACK_AUTO_CORRECTION_LIMIT = 3;
+
+type ServerResponseFailureReason = Extract<ServerSignalRecoveryReason,
+  | 'response-missing'
+  | 'response-invalid'
+  | 'round-mismatch'
+  | 'token-mismatch'
+  | 'findings-digest-mismatch'
+  | 'coverage-gap'>;
+
+export interface ServerResponseFailureSignatureInput {
+  phase: ReviewPhase;
+  round: number;
+  findingsDigest: string;
+  reason: ServerResponseFailureReason;
+  missingFindingIds?: readonly string[];
+  unknownFindingIds?: readonly string[];
+  schemaViolationCodes?: readonly string[];
+}
+
+export type RecordServerResponseFailureInput = Omit<ServerResponseFailure, 'disposition'>;
+
+export function sha256Hex(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+export function reviewFindingsDigest(findings: ReviewFindings): string {
+  return sha256Hex(JSON.stringify(findings));
+}
+
+export function serverResponseFailureSignature(input: ServerResponseFailureSignatureInput): string {
+  return sha256Hex(JSON.stringify({
+    version: 1,
+    phase: input.phase,
+    round: input.round,
+    findingsDigest: input.findingsDigest,
+    reason: input.reason,
+    missingFindingIds: [...(input.missingFindingIds ?? [])].sort(),
+    unknownFindingIds: [...(input.unknownFindingIds ?? [])].sort(),
+    schemaViolationCodes: [...(input.schemaViolationCodes ?? [])].sort(),
+  }));
+}
+
+function validateSortedStrings(value: unknown, field: string): void {
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.trim() === '')) {
+    throw new Error(`${field} must be an array of non-empty strings`);
+  }
+  const sorted = [...value].sort();
+  if (new Set(value).size !== value.length || value.some((item, index) => item !== sorted[index])) {
+    throw new Error(`${field} must be sorted and unique`);
+  }
+}
+
+function validateServerResponseFailures(value: unknown, phase: ReviewPhase): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) throw new Error('serverResponseFailures must be an array');
+  for (const [index, entry] of value.entries()) {
+    if (!isRecord(entry)) throw new Error(`serverResponseFailures[${index}] must be an object`);
+    for (const field of ['signalKind', 'sourceToken', 'successorToken', 'failureSignature', 'reason', 'createdAt']) {
+      if (typeof entry[field] !== 'string' || (entry[field] as string).trim() === '') {
+        throw new Error(`serverResponseFailures[${index}].${field} must be a non-empty string`);
+      }
+    }
+    if (entry.signalKind !== 'code-fixed' && entry.signalKind !== 'spec-fixed') {
+      throw new Error(`serverResponseFailures[${index}].signalKind is invalid`);
+    }
+    if ((entry.signalKind === 'code-fixed' ? 'code' : 'spec') !== phase) {
+      throw new Error(`serverResponseFailures[${index}].signalKind does not match round phase`);
+    }
+    if (entry.sourceToken === entry.successorToken) {
+      throw new Error(`serverResponseFailures[${index}] tokens must identify different generations`);
+    }
+    if (!SHA256_RE.test(entry.failureSignature as string)) {
+      throw new Error(`serverResponseFailures[${index}].failureSignature is invalid`);
+    }
+    if (!FAILURE_REASONS.has(entry.reason as ServerResponseFailureReason)) {
+      throw new Error(`serverResponseFailures[${index}].reason is invalid`);
+    }
+    if (entry.responseDigest !== undefined
+      && (typeof entry.responseDigest !== 'string' || !SHA256_RE.test(entry.responseDigest))) {
+      throw new Error(`serverResponseFailures[${index}].responseDigest is invalid`);
+    }
+    if (entry.rawResponse !== undefined && typeof entry.rawResponse !== 'string') {
+      throw new Error(`serverResponseFailures[${index}].rawResponse must be a string`);
+    }
+    if (typeof entry.disposition !== 'string' || !FAILURE_DISPOSITIONS.has(entry.disposition)) {
+      throw new Error(`serverResponseFailures[${index}].disposition is invalid`);
+    }
+    validateSortedStrings(entry.missingFindingIds, `serverResponseFailures[${index}].missingFindingIds`);
+    validateSortedStrings(entry.unknownFindingIds, `serverResponseFailures[${index}].unknownFindingIds`);
+    validateSortedStrings(entry.schemaViolationCodes, `serverResponseFailures[${index}].schemaViolationCodes`);
+  }
+}
 
 function parseDocuments(value: unknown): SpecDocument[] {
   if (!Array.isArray(value) || value.length === 0) {
@@ -49,6 +155,7 @@ function parseRound(value: unknown, phase: ReviewPhase, round: number): ReviewRo
   if (typeof value.content !== 'string' || typeof value.startedAt !== 'string') {
     throw new Error(`review round ${phase}/${round} is missing required content or startedAt`);
   }
+  validateServerResponseFailures(value.serverResponseFailures, phase);
   if (phase === 'spec') {
     const documents = parseDocuments(value.documents);
     if (value.content !== renderSpecDocuments(documents)) {
@@ -62,6 +169,7 @@ function parseRound(value: unknown, phase: ReviewPhase, round: number): ReviewRo
 
 export class ReviewStore {
   private readonly memory = new Map<string, ReviewRound>();
+  private readonly roundLocks = new Map<string, Promise<void>>();
 
   constructor(private readonly dir?: string) {}
 
@@ -81,6 +189,46 @@ export class ReviewStore {
   }
 
   async putRound(taskId: string, phase: ReviewPhase, data: ReviewRound): Promise<void> {
+    await this.withRoundLock(taskId, phase, data.round, async () => {
+      await this.writeRound(taskId, phase, data);
+    });
+  }
+
+  async recordServerResponseFailure(
+    taskId: string,
+    phase: ReviewPhase,
+    round: number,
+    input: RecordServerResponseFailureInput,
+  ): Promise<ServerResponseFailure> {
+    return this.withRoundLock(taskId, phase, round, async () => {
+      const stored = await this.getRound(taskId, phase, round);
+      if (!stored) throw new Error(`review round ${taskId}/${phase}/${round} not found`);
+      const existing = stored.serverResponseFailures?.find(entry =>
+        entry.signalKind === input.signalKind && entry.sourceToken === input.sourceToken,
+      );
+      if (existing) return existing;
+      const failures = stored.serverResponseFailures ?? [];
+      const disposition = failures.some(entry => entry.failureSignature === input.failureSignature)
+        ? 'hold-repeated-signature'
+        : failures.filter(entry => entry.disposition === 'auto-correct').length >= SERVER_FEEDBACK_AUTO_CORRECTION_LIMIT
+          ? 'hold-correction-limit'
+          : 'auto-correct';
+      const entry: ServerResponseFailure = {
+        ...input,
+        missingFindingIds: [...input.missingFindingIds].sort(),
+        unknownFindingIds: [...input.unknownFindingIds].sort(),
+        schemaViolationCodes: [...input.schemaViolationCodes].sort(),
+        disposition,
+      };
+      await this.writeRound(taskId, phase, {
+        ...stored,
+        serverResponseFailures: [...failures, entry],
+      });
+      return entry;
+    });
+  }
+
+  private async writeRound(taskId: string, phase: ReviewPhase, data: ReviewRound): Promise<void> {
     const parsed = parseRound(data, phase, data.round);
     if (!this.dir) {
       this.memory.set(this.key(taskId, phase, parsed.round), parsed);
@@ -92,6 +240,27 @@ export class ReviewStore {
     const tmp = `${final}.${process.pid}.${Date.now()}.tmp`;
     await writeFile(tmp, JSON.stringify(parsed, null, 2) + '\n');
     await rename(tmp, final);
+  }
+
+  private async withRoundLock<T>(
+    taskId: string,
+    phase: ReviewPhase,
+    round: number,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const key = this.key(taskId, phase, round);
+    const previous = this.roundLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    const queued = previous.then(() => current);
+    this.roundLocks.set(key, queued);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.roundLocks.get(key) === queued) this.roundLocks.delete(key);
+    }
   }
 
   async listRounds(taskId: string, phase?: ReviewPhase): Promise<ReviewRound[]> {

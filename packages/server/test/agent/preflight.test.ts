@@ -18,6 +18,12 @@ function mockRunner(responses: Record<string, ExecResult>): CommandRunner {
         if (cmd.includes(pattern)) return result;
       }
       if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('git remote get-url --push --all origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
+      if (cmd.includes('git remote get-url origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
       if (cmd.includes('rev-parse --show-toplevel')) return OK_TRUE;
       if (cmd.startsWith('command -v')) return OK_PATH;
       if (cmd.includes("'--version'")) return { stdout: 'gh version 2.40.0', stderr: '', exitCode: 0 };
@@ -41,7 +47,7 @@ describe('runPreflight', () => {
     const runner = mockRunner({});
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
     expect(results.every(r => r.ok)).toBe(true);
-    expect(results.length).toBeGreaterThanOrEqual(6);
+    expect(results.map(r => r.step).sort()).toEqual(['cli', 'git', 'tmux', 'workdir']);
   });
 
   it('detects missing CLI', async () => {
@@ -150,13 +156,53 @@ describe('runPreflight', () => {
 
   it('detects gh auth failure', async () => {
     const runner = mockRunner({ 'gh auth status': FAIL });
-    const results = await runPreflight(runner, makeAgent(), 'user/repo');
-    expect(results.find(r => r.step === 'gh')?.ok).toBe(false);
+    const results = await runPreflight(
+      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
+      { requireGitHubCli: true },
+    );
+    expect(results.find(r => r.step === 'gh')).toMatchObject({
+      ok: false,
+      message: 'Run "gh auth login" or set GITHUB_TOKEN',
+    });
+  });
+
+  it('bounds the gh auth probe and reports a timeout as an unknown outcome', async () => {
+    const fallback = mockRunner({});
+    const fallbackExec = fallback.exec.bind(fallback);
+    fallback.exec = vi.fn(async (cmd: string, options?: Parameters<CommandRunner['exec']>[1]) => {
+      if (cmd === 'gh auth status') throw new Error('Command timed out after 30000ms');
+      return fallbackExec(cmd, options);
+    });
+    const results = await runPreflight(
+      fallback, makeAgent(), 'user/repo', undefined, undefined, undefined,
+      { requireGitHubCli: true },
+    );
+    expect(results.find(r => r.step === 'gh')).toMatchObject({ ok: false });
+    expect(results.find(r => r.step === 'gh')?.message).toContain('outcome is unknown');
+    const call = (fallback.exec as ReturnType<typeof vi.fn>).mock.calls.find(c => c[0] === 'gh auth status');
+    expect(call?.[1]).toMatchObject({ timeout: 30_000 });
+  });
+
+  it('does not prescribe relogin when gh auth status fails with an indeterminate transport result', async () => {
+    const runner = mockRunner({
+      'gh auth status': { stdout: '', stderr: 'connection reset by peer', exitCode: 255 },
+    });
+    const results = await runPreflight(
+      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
+      { requireGitHubCli: true },
+    );
+    const gh = results.find(r => r.step === 'gh');
+    expect(gh).toMatchObject({ ok: false });
+    expect(gh?.message).toContain('outcome is unknown');
+    expect(gh?.message).not.toContain('gh auth login');
   });
 
   it('detects repo access failure via gh api', async () => {
     const runner = mockRunner({ 'gh api repos/': FAIL });
-    const results = await runPreflight(runner, makeAgent(), 'user/repo');
+    const results = await runPreflight(
+      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
+      { requireGitHubCli: true },
+    );
     expect(results.find(r => r.step === 'gh-repo')?.ok).toBe(false);
   });
 
@@ -180,7 +226,7 @@ describe('runPreflight', () => {
     const tmuxWhich = calls.find(c => c.cmd === 'command -v tmux');
     expect(tmuxWhich?.opts?.remoteShell).toBeUndefined();
 
-    const otherCalls = calls.filter(c => /^(git |gh |mkdir |test )/.test(c.cmd));
+    const otherCalls = calls.filter(c => /^(git |gh |mkdir |test |cd )/.test(c.cmd));
     expect(otherCalls.length).toBeGreaterThan(0);
     for (const c of otherCalls) {
       expect(c.opts?.remoteShell).toBeUndefined();
@@ -300,6 +346,9 @@ describe('runPreflight — auto mode', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('git remote get-url --push --all origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
         if (cmd.includes('mkdir -p') && cmd.includes('.baxian/agents/dev-auto')) return OK_EMPTY;
         if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return OK_EMPTY;
         if (cmd.includes('rev-parse --show-toplevel')) return FAIL;
@@ -317,6 +366,9 @@ describe('runPreflight — auto mode', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('git remote get-url --push --all origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
         if (cmd.includes('mkdir -p')) return OK_EMPTY;
         if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return OK_EMPTY;
         if (cmd.startsWith('command -v')) return OK_PATH;
@@ -333,6 +385,9 @@ describe('runPreflight — auto mode', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('git remote get-url --push --all origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
         if (cmd.includes('mkdir -p')) return OK_EMPTY;
         if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return OK_EMPTY;
         if (cmd.includes('rev-parse --is-bare-repository')) return FAIL;
@@ -350,6 +405,9 @@ describe('runPreflight — auto mode', () => {
     const runner: CommandRunner = {
       exec: vi.fn(async (cmd: string) => {
         if (cmd.includes('cd ~ && pwd -P')) return { stdout: '/home/owner\n', stderr: '', exitCode: 0 };
+      if (cmd.includes('git remote get-url --push --all origin')) {
+        return { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 };
+      }
         if (cmd.includes('mkdir -p')) return OK_EMPTY;
         if (cmd === `test -d '/home/owner/.baxian/agents/dev-auto/repo'`) return FAIL;
         if (cmd.startsWith('command -v')) return OK_PATH;
@@ -365,8 +423,8 @@ describe('runPreflight — auto mode', () => {
 describe('runPreflight — non-GitHub (generic git) repos', () => {
   const GL = 'https://gitlab.example.com/group/proj.git';
 
-  it('manual mode: skips gh checks, probes access via git ls-remote on the full URL', async () => {
-    const runner = mockRunner({});
+  it('manual mode: skips gh checks and probes fetch access through origin', async () => {
+    const runner = mockRunner({ 'git remote get-url origin': { stdout: `${GL}\n`, stderr: '', exitCode: 0 } });
     const results = await runPreflight(runner, makeAgent(), GL);
     expect(results.find(r => r.step === 'gh')).toBeUndefined();
     expect(results.find(r => r.step === 'gh-repo')).toBeUndefined();
@@ -413,11 +471,47 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
     expect(cmds.some(c => c.includes('  https'))).toBe(false);
   });
 
-  it('github repo still runs gh auth + gh api (regression anchor)', async () => {
+  it('a manual github server project skips gh when no PR workflow needs it', async () => {
     const runner = mockRunner({});
     const results = await runPreflight(runner, makeAgent(), 'user/repo');
+    expect(results.find(r => r.step === 'gh')).toBeUndefined();
+    expect(results.find(r => r.step === 'gh-repo')).toBeUndefined();
+    expect(execCmds(runner).some(c => c.includes('gh auth') || c.includes('gh api'))).toBe(false);
+  });
+
+  it('a fixed Workdir with no publish workflow still requires origin for fetch and checkout', async () => {
+    const runner = mockRunner({
+      'git remote get-url origin': { stdout: '', stderr: 'No such remote', exitCode: 2 },
+    });
+
+    const results = await runPreflight(
+      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
+      { requireGitHubCli: false, requireGitPush: false },
+    );
+
+    expect(results.find(r => r.step === 'workdir')?.ok).toBe(true);
+    expect(results.find(r => r.step === 'git')).toMatchObject({ ok: false });
+    expect(results.find(r => r.step === 'git')?.message).toContain('fetch/checkout would fail');
+    expect(execCmds(runner).some(c => c.includes('git remote get-url origin'))).toBe(true);
+    expect(execCmds(runner).some(c => c.includes('git ls-remote'))).toBe(false);
+  });
+
+  it('a manual github server project runs gh checks when PR publication is required', async () => {
+    const runner = mockRunner({});
+    const results = await runPreflight(
+      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
+      { requireGitHubCli: true },
+    );
     expect(results.find(r => r.step === 'gh')).toBeDefined();
     expect(results.find(r => r.step === 'gh-repo')).toBeDefined();
+  });
+
+  it('a non-github server project never touches gh', async () => {
+    const runner = mockRunner({ 'git remote get-url origin': { stdout: `${GL}\n`, stderr: '', exitCode: 0 } });
+    const results = await runPreflight(runner, makeAgent(), GL);
+    expect(results.find(r => r.step === 'gh')).toBeUndefined();
+    expect(results.find(r => r.step === 'gh-repo')).toBeUndefined();
+    expect(execCmds(runner).some(c => c.includes('gh auth') || c.includes('gh api'))).toBe(false);
   });
 });
 
@@ -561,12 +655,17 @@ describe('runPreflight — git platform track', () => {
     expect(results.find(r => r.step === 'platform-repo')).toBeDefined();
   });
 
-  it('probes the configured Workdir origin, not gh git_protocol (publish pushes to that origin)', async () => {
+  it('probes both configured fetch and push channels for a Workdir publisher', async () => {
     const runner = mockRunner({
+      'git remote get-url origin': { stdout: 'https://github.com/user/repo.git\n', stderr: '', exitCode: 0 },
       'git remote get-url --push': { stdout: 'git@github.com:user/repo.git\n', stderr: '', exitCode: 0 },
       "config get -h 'github.com' git_protocol": { stdout: 'https\n', stderr: '', exitCode: 0 },
     });
-    await runPreflight(runner, makeAgent({ workdir: '/tmp/code' }), 'https://github.com/user/repo.git', undefined, 'p1', gitPlatform());
+    await runPreflight(
+      runner, makeAgent({ workdir: '/tmp/code' }), 'https://github.com/user/repo.git', undefined, 'p1', gitPlatform(),
+      { requireGitPush: true },
+    );
+    expect(execCmds(runner).some(c => c.includes("git ls-remote 'https://github.com/user/repo.git'"))).toBe(true);
     expect(execCmds(runner).some(c => c.includes("git ls-remote 'git@github.com:user/repo.git'"))).toBe(true);
     expect(execCmds(runner).every(c => !c.includes('config get'))).toBe(true);
   });
@@ -579,7 +678,10 @@ describe('runPreflight — git platform track', () => {
 
   it('fails the git check when the configured Workdir has no push origin', async () => {
     const runner = mockRunner({ 'git remote get-url --push': { stdout: '', stderr: '', exitCode: 1 } });
-    const results = await runPreflight(runner, makeAgent({ workdir: '/tmp/code' }), 'user/repo', undefined, 'p1', gitPlatform());
+    const results = await runPreflight(
+      runner, makeAgent({ workdir: '/tmp/code' }), 'user/repo', undefined, 'p1', gitPlatform(),
+      { requireGitPush: true },
+    );
     const git = results.find(r => r.step === 'git');
     expect(git?.ok).toBe(false);
     expect(git?.message).toContain('no push origin');
@@ -670,7 +772,7 @@ describe('runPreflight — git platform track', () => {
 
   it('diagnoses an ssh:// origin failure toward SSH, not gh credential setup', async () => {
     const runner = mockRunner({
-      'git remote get-url --push': { stdout: 'ssh://git@github.com/user/repo.git\n', stderr: '', exitCode: 0 },
+      'git remote get-url origin': { stdout: 'ssh://git@github.com/user/repo.git\n', stderr: '', exitCode: 0 },
       'git ls-remote': FAIL,
     });
     const results = await runPreflight(

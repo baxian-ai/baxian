@@ -305,8 +305,26 @@ describe('response handling helpers', () => {
     const err = await api.tasks.get('t-1').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).status).toBe(422);
-    expect((err as ApiError).message).toBe('title required');
+    expect((err as ApiError).message).toBe('title required\ntitle: required');
     expect((err as ApiError).details).toEqual([{ path: 'title', message: 'required' }]);
+  });
+
+  it('renders every valid action detail and ignores malformed detail entries', async () => {
+    fetchSpy.mockImplementationOnce(async () => jsonResponse({
+      error: 'Invalid config',
+      details: [
+        { path: 'project[0].gitCli.tool', message: "declare a tool or use review.mode: 'server'" },
+        { path: 7, message: 'invalid path' },
+        null,
+      ],
+    }, 400));
+    const err = await api.projects.list().catch((e: unknown) => e) as ApiError;
+    expect(err.message).toBe(
+      "Invalid config\nproject[0].gitCli.tool: declare a tool or use review.mode: 'server'",
+    );
+    expect(err.details).toEqual([
+      { path: 'project[0].gitCli.tool', message: "declare a tool or use review.mode: 'server'" },
+    ]);
   });
 
   it('falls back to raw text message for non-JSON error bodies', async () => {

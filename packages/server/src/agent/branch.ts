@@ -9,13 +9,12 @@ export interface AutoDeleteIdentity {
   taskId?: string;
   taskBranch?: string;
   branchCreatedByBaxian?: boolean;
-  actualRef?: string;
 }
 
 export function isAutoDeletableTaskBranch(identity: AutoDeleteIdentity): boolean {
   if (!identity.taskId || !identity.branchCreatedByBaxian) return false;
   const branch = `${BRANCH_PREFIX}${identity.taskId}`;
-  return identity.taskBranch === branch && identity.actualRef === `refs/heads/${branch}`;
+  return identity.taskBranch === branch;
 }
 
 export class DirtyWorkdirError extends Error {
@@ -254,14 +253,14 @@ export class BranchManager {
 
   async cleanupTaskBranch(
     workdir: string,
-    identity: Omit<AutoDeleteIdentity, 'actualRef'>,
+    identity: AutoDeleteIdentity,
     assertOwner: () => Promise<void>,
   ): Promise<BranchCleanupResult> {
     if (!identity.taskId || !identity.taskBranch) {
       return { status: 'skipped', reason: 'missing task branch identity' };
     }
     const actualRef = `refs/heads/${identity.taskBranch}`;
-    if (!isAutoDeletableTaskBranch({ ...identity, actualRef })) {
+    if (!isAutoDeletableTaskBranch(identity)) {
       return { status: 'skipped', reason: 'branch is not provably baxian-owned' };
     }
     await this.assertClean(workdir);

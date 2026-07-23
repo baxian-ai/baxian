@@ -9,7 +9,6 @@ import type { TmuxSessionStatusStore, TmuxSessionObservation } from './tmux-prob
 import {
   type AgentManager,
   type PendingDispatchRetry,
-  isRecoverableQaDispatchHold,
 } from './manager.js';
 
 export interface DispatchReconcilerOptions {
@@ -25,10 +24,8 @@ export interface DispatchReconcilerOptions {
 
 type ReconcileAction =
   | 'pending-busy-cleared'
-  | 'hold-recoverable'
   | 'stalled-idle'
   | 'qa-unbound'
-  | 'anchor-refresh'
   | 'dev-fix-pending'
   | 'dev-fix-stalled-idle'
   | 'dev-fix-unbound';
@@ -102,10 +99,9 @@ export class DispatchReconciler {
     for (const task of tasks) {
       if (isSpecStagePhase(task.phase)) continue;
       try {
-        if (task.status === 'review' && task.reviewMode !== 'server') {
+        if (task.status === 'review' && task.reviewMode === 'git') {
           await this.reconcileReview(task);
-        } else if (task.status === 'fixing' && task.reviewMode !== 'server') {
-          // fix 续派与评审平台无关：github 与 git 模式共用 REQUEST_CHANGES → continueSession('fix') 链路
+        } else if (task.status === 'fixing' && task.reviewMode === 'git') {
           await this.reconcileFix(task);
         }
       } catch (err) {
@@ -152,40 +148,24 @@ export class DispatchReconciler {
     // 明确的 anchor≠head 才让位 push 事件路径；任一缺失时 push 路径可能永不触发（poller 的
     // push 判定要求 latestHeadSha 在场），pending/hold 这类「确定欠一次派发」的分支须自行补齐
     if (anchor !== undefined && head !== undefined && anchor !== head) return;
-    const anchorMissing = anchor === undefined || head === undefined;
-
     const qaState = await this.opts.agentStore.get(qaId);
     const entry = this.opts.manager.getPendingDispatchRetry(task.id);
     const observation = this.opts.statusStore.get(qaId);
     // git 模式的 hold 恢复归 sweep（durable pending 在场，60s 重试）；绑定丢失与送达后
     // 静默失联没有 durable 凭据（成功路径已清 pending），必须由对账兜底，否则永久停在 review。
-    // anchor 缺失时 git 不经 gh 探测——补派内的平台 driver 会重新锚定并 fail loud
-    const gitMode = task.reviewMode === 'git';
+    // anchor 缺失时补派内的平台 driver 会重新锚定并 fail loud。
 
     if (qaState?.taskId !== task.id) {
       const prev = this.unboundSeen.get(task.id);
       const seen = prev !== undefined && prev.passToken === task.signalToken ? prev.seen + 1 : 1;
       this.unboundSeen.set(task.id, { seen, passToken: task.signalToken });
       if (seen < UNBOUND_DWELL_CYCLES) return;
-      if (anchorMissing && !gitMode && !(await this.refreshMissingHead(task, qaId))) return;
       await this.redispatchReview(task, qaId, 'qa-unbound');
       return;
     }
     this.unboundSeen.delete(task.id);
 
     if (qaState.status === 'awaiting_human') {
-      if (gitMode) return;
-      if (!isRecoverableQaDispatchHold(qaState)) return;
-      // 旧 pass 残留的 pending 不得给新 pass 的 hold 重放供相位/预算：先按代清掉
-      const holdEntry = entry?.kind === 'qa-recheck' && entry.signalToken === task.signalToken ? entry : undefined;
-      if (entry !== undefined && holdEntry === undefined) {
-        this.opts.manager.clearPendingDispatchRetryIfMatches(task.id, {
-          agentId: entry.agentId,
-          signalToken: entry.signalToken,
-        });
-      }
-      if (anchorMissing && !(await this.refreshMissingHead(task, qaId))) return;
-      await this.redispatchReview(task, qaId, 'hold-recoverable', holdEntry);
       return;
     }
 
@@ -206,7 +186,6 @@ export class DispatchReconciler {
         await this.alertIfBudgetExhausted(task, entry, observation, qaId, awaitingAnswer);
         return;
       }
-      if (anchorMissing && !gitMode && !(await this.refreshMissingHead(task, qaId))) return;
       await this.redispatchReview(task, qaId, 'pending-busy-cleared', entry, {
         since: entry.since,
         ...(entry.budgetAlerted === true ? { budgetAlerted: true } : {}),
@@ -223,7 +202,6 @@ export class DispatchReconciler {
       && observedAfter(observation, task.reviewDispatchedAt)
       && qaState.needInput?.at === undefined
     ) {
-      if (anchorMissing && !gitMode && !(await this.refreshMissingHead(task, qaId))) return;
       await this.redispatchReview(task, qaId, 'stalled-idle');
     }
   }
@@ -387,20 +365,6 @@ export class DispatchReconciler {
     }
   }
 
-  // anchor/head 缺失是可达状态（首次 fetch 失败会被吞掉），沉默等待会让 pending/hold 永久搁浅：
-  // 有界地探测 live head，成功即放行（补派自身会重新锚定并持久化），失败计次直至升级 intervention。
-  private async refreshMissingHead(task: TaskState, agentId: string): Promise<boolean> {
-    if (!(await this.consumeAttempt(task, agentId, 'anchor-refresh'))) return false;
-    try {
-      await this.opts.manager.fetchPrHeadSha(task.id);
-      return true;
-    } catch (err) {
-      this.recordAttempt(task, task.signalToken);
-      console.warn(`[dispatch-reconciler] head refresh for ${task.id} failed (anchor/latestHead missing):`, err);
-      return false;
-    }
-  }
-
   private async redispatchReview(
     task: TaskState,
     qaId: string,
@@ -420,7 +384,8 @@ export class DispatchReconciler {
       result = await this.opts.manager.dispatchReviewToQa(task.id, {
         bumpRound: task.reviewRoundPending === true,
         fromStatus: ['review'],
-        ...(tokenAtDecision !== undefined ? { expectSignalToken: tokenAtDecision } : {}),
+        expectPhase: task.phase,
+        expectSignalToken: tokenAtDecision,
         ...(qaPhase !== undefined ? { qaPhase } : {}),
         ...(pendingBudget !== undefined ? { pendingBudget } : {}),
         onPassArmed: (armed) => { armedToken = armed; },

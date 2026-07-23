@@ -13,9 +13,11 @@ export interface SourceCursorView {
 }
 
 interface CursorFile {
-  version: 1;
+  version: 3;
   repoUrl: string;
   listPrs: { watermarkTime: number | null };
+  adoptions: Record<string, number>;
+  pendingAdoptions: Record<string, number>;
   generations: Record<string, Record<string, Record<string, SourceCursorView>>>;
 }
 
@@ -47,11 +49,19 @@ const isDigestMap = (v: unknown) => isRecord(v) && Object.values(v).every(x => t
 // 类型断言不校验磁盘内容：watermarkTime 落成字符串会参与数值强转、把历史行静默判旧——
 // 语法合法但结构损坏的文件与坏 JSON 同级：抛出而非带病运行。
 function validateCursorFile(parsed: CursorFile): void {
-  if (parsed.version !== 1) throw new Error(`cursor file version unsupported (got ${JSON.stringify(parsed.version)})`);
+  if (parsed.version !== 3) throw new Error(`cursor file version unsupported (got ${JSON.stringify(parsed.version)})`);
   const bad = (what: string): never => {
     throw new Error(`cursor file structure invalid: ${what}`);
   };
   if (!isRecord(parsed.listPrs) || !isWatermark(parsed.listPrs.watermarkTime)) bad('listPrs');
+  if (!isRecord(parsed.adoptions)
+    || Object.values(parsed.adoptions).some(value => !Number.isInteger(value) || (value as number) < 1)) {
+    bad('adoptions');
+  }
+  if (!isRecord(parsed.pendingAdoptions)
+    || Object.values(parsed.pendingAdoptions).some(value => !Number.isInteger(value) || (value as number) < 1)) {
+    bad('pendingAdoptions');
+  }
   if (!isRecord(parsed.generations)) bad('generations');
   for (const [taskId, prs] of Object.entries(parsed.generations)) {
     if (!isRecord(prs)) bad(`generations.${taskId}`);
@@ -84,7 +94,14 @@ function rebuildNullProto(parsed: CursorFile): CursorFile {
     }
     generations[taskId] = prDict;
   }
-  return { version: 1, repoUrl: parsed.repoUrl, listPrs: { watermarkTime: parsed.listPrs.watermarkTime }, generations };
+  return {
+    version: 3,
+    repoUrl: parsed.repoUrl,
+    listPrs: { watermarkTime: parsed.listPrs.watermarkTime },
+    adoptions: Object.assign(dict<number>(), parsed.adoptions),
+    pendingAdoptions: Object.assign(dict<number>(), parsed.pendingAdoptions),
+    generations,
+  };
 }
 
 let tmpSeq = 0;
@@ -96,7 +113,14 @@ export class CommentCursorStore {
 
   constructor(private readonly filePath: string, private readonly repoUrl: string) {
     this.repoKey = repoIdentityKey(repoUrl);
-    this.state = { version: 1, repoUrl, listPrs: { watermarkTime: null }, generations: dict() };
+    this.state = {
+      version: 3,
+      repoUrl,
+      listPrs: { watermarkTime: null },
+      adoptions: dict(),
+      pendingAdoptions: dict(),
+      generations: dict(),
+    };
   }
 
   async load(): Promise<void> {
@@ -208,12 +232,51 @@ export class CommentCursorStore {
   }
 
   generations(): string[] {
-    return Object.keys(this.state.generations);
+    return [...new Set([
+      ...Object.keys(this.state.generations),
+      ...Object.keys(this.state.adoptions),
+      ...Object.keys(this.state.pendingAdoptions),
+    ])];
   }
 
   async dropGeneration(taskId: string): Promise<void> {
-    if (!(taskId in this.state.generations)) return;
+    if (!(taskId in this.state.generations)
+      && !(taskId in this.state.adoptions)
+      && !(taskId in this.state.pendingAdoptions)) return;
     delete this.state.generations[taskId];
+    delete this.state.adoptions[taskId];
+    delete this.state.pendingAdoptions[taskId];
+    await this.persist();
+  }
+
+  isAdoptionDelivered(taskId: string, prNumber: number): boolean {
+    return this.state.adoptions[taskId] === prNumber;
+  }
+
+  async markAdoptionDelivered(taskId: string, prNumber: number): Promise<void> {
+    if (this.isAdoptionDelivered(taskId, prNumber) && !(taskId in this.state.pendingAdoptions)) return;
+    this.state.adoptions[taskId] = prNumber;
+    delete this.state.pendingAdoptions[taskId];
+    await this.persist();
+  }
+
+  pendingAdoptions(): Array<{ taskId: string; prNumber: number }> {
+    return Object.entries(this.state.pendingAdoptions).map(([taskId, prNumber]) => ({ taskId, prNumber }));
+  }
+
+  isAdoptionPending(taskId: string, prNumber: number): boolean {
+    return this.state.pendingAdoptions[taskId] === prNumber;
+  }
+
+  async markAdoptionPending(taskId: string, prNumber: number): Promise<void> {
+    if (this.isAdoptionDelivered(taskId, prNumber) || this.isAdoptionPending(taskId, prNumber)) return;
+    this.state.pendingAdoptions[taskId] = prNumber;
+    await this.persist();
+  }
+
+  async clearAdoptionPending(taskId: string, prNumber: number): Promise<void> {
+    if (!this.isAdoptionPending(taskId, prNumber)) return;
+    delete this.state.pendingAdoptions[taskId];
     await this.persist();
   }
 

@@ -283,12 +283,14 @@ it('editing a connection field clears the previous probe result', async () => {
 });
 
 it('surfaces a connectivity-gate error from create (does not silently swallow)', async () => {
-  createMock.mockRejectedValue(new Error('SSH 不通：检查地址 / 端口 / 密码或 key 认证'));
+  createMock.mockRejectedValue(new Error('SSH 不通\n检查地址 / 端口 / 密码或 key 认证'));
   render(<HostManagementModal open onClose={() => {}} />);
   fireEvent.click(await screen.findByText('+ Add host'));
   fireEvent.change(screen.getByLabelText('Host address'), { target: { value: 'h' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-  expect(await screen.findByText(/SSH 不通/)).toBeTruthy();
+  const banner = await screen.findByText(/SSH 不通/);
+  expect(banner.textContent).toBe('SSH 不通\n检查地址 / 端口 / 密码或 key 认证');
+  expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
 });
 
 it('deletes a host', async () => {

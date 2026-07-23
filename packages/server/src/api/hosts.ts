@@ -12,7 +12,7 @@ import {
 import { agentIsLive } from '../agent/liveness.js';
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
-import { applyConfigHotReload } from '../config/hot-reload.js';
+import { applyConfigHotReload, prepareConfigHotReload } from '../config/hot-reload.js';
 import { redactHosts } from './config.js';
 
 const REDACTED = '***';
@@ -159,9 +159,10 @@ function buildHostFromBody(body: HostBody, id: string, password: string | undefi
 async function persistHosts(app: FastifyInstance, hosts: HostConfig[]): Promise<BaxianConfig> {
   const merged: BaxianConfig = { ...app.ctx.config, host: hosts };
   const validated = prepareConfig(merged);
+  const hotReload = await prepareConfigHotReload(app.ctx, validated);
   await saveConfig(app.ctx.configPath!, validated);
   app.ctx.config = validated;
-  applyConfigHotReload(app.ctx, validated);
+  await applyConfigHotReload(app.ctx, validated, hotReload);
   return validated;
 }
 

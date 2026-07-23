@@ -23,6 +23,7 @@ export interface BootstrapPollerOptions {
     cache: RepoStoreCache,
     agentId: string,
     workdir?: string,
+    cloneViaGh?: boolean,
   ) => RepoStore;
   onAgentAffected?: (agentIds: string[]) => void;
   onPollComplete?: () => Promise<void>;

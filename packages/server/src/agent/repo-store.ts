@@ -26,17 +26,42 @@ const BAXIAN_RUNTIME_DIRS = [
   '.baxian/research',
 ] as const;
 
+export class BaxianRuntimeDirsError extends Error {
+  constructor(
+    public readonly reason: 'unsafe-runtime-path' | 'runtime-path-probe-failed',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'BaxianRuntimeDirsError';
+  }
+}
+
 export async function ensureBaxianRuntimeDirsSafe(
   runner: CommandRunner,
   absRepoPath: string,
 ): Promise<void> {
   const path = shellQuote(absRepoPath);
-  const tracked = await runner.exec(`git -C ${path} ls-files -- .baxian`);
-  if (tracked.exitCode !== 0) {
-    throw new Error(`Failed to inspect tracked .baxian paths in ${absRepoPath}: ${tracked.stderr}`);
+  let tracked: ExecResult;
+  try {
+    tracked = await runner.exec(`git -C ${path} ls-files -- .baxian`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new BaxianRuntimeDirsError(
+      'runtime-path-probe-failed',
+      `Failed to inspect tracked .baxian paths in ${absRepoPath}: ${message}`,
+    );
+  }
+  const trackedUnknown = execOutcomeUnknown(tracked);
+  if (trackedUnknown || tracked.exitCode !== 0) {
+    throw new BaxianRuntimeDirsError(
+      'runtime-path-probe-failed',
+      `${trackedUnknown ? 'Unknown result while inspecting' : 'Failed to inspect'} tracked .baxian paths in `
+      + `${absRepoPath}: ${tracked.stderr || tracked.stdout || `exit ${tracked.exitCode}`}`,
+    );
   }
   if (tracked.stdout.trim()) {
-    throw new Error(
+    throw new BaxianRuntimeDirsError(
+      'unsafe-runtime-path',
       `Workdir ${absRepoPath} tracks .baxian paths; baxian runtime files would modify project content.`,
     );
   }
@@ -51,11 +76,29 @@ export async function ensureBaxianRuntimeDirsSafe(
       `if [ -L "$p" ] || { [ -e "$p" ] && [ ! -d "$p" ]; }; then exit 9; fi; ` +
     `done && mkdir -p ${operands} && ` +
     `for p in ${operands}; do [ -d "$p" ] && [ ! -L "$p" ] || exit 9; done`;
-  const result = await runner.exec(`sh -c ${shellQuote(command)}`);
-  if (result.exitCode !== 0) {
-    throw new Error(
-      `Workdir ${absRepoPath} has an unsafe .baxian runtime path; ` +
-      `baxian requires real directories contained in the Workdir.`,
+  let result: ExecResult;
+  try {
+    result = await runner.exec(`sh -c ${shellQuote(command)}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new BaxianRuntimeDirsError(
+      'runtime-path-probe-failed',
+      `Could not verify .baxian runtime paths in ${absRepoPath}: ${message}`,
+    );
+  }
+  const guardUnknown = execOutcomeUnknown(result);
+  if (guardUnknown || result.exitCode !== 0) {
+    if (result.exitCode === 9 && !guardUnknown) {
+      throw new BaxianRuntimeDirsError(
+        'unsafe-runtime-path',
+        `Workdir ${absRepoPath} has an unsafe .baxian runtime path; `
+        + 'baxian requires real directories contained in the Workdir.',
+      );
+    }
+    throw new BaxianRuntimeDirsError(
+      'runtime-path-probe-failed',
+      `${guardUnknown ? 'Unknown result while verifying' : 'Failed to verify'} .baxian runtime paths in `
+      + `${absRepoPath}: ${result.stderr || result.stdout || `exit ${result.exitCode}`}`,
     );
   }
 }

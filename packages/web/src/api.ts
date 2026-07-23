@@ -75,15 +75,27 @@ export class ApiError extends Error {
   }
 }
 
+function parseApiErrorDetails(value: unknown): ApiErrorDetail[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const details = value.filter((detail): detail is ApiErrorDetail =>
+    typeof detail === 'object' && detail !== null
+    && typeof (detail as { path?: unknown }).path === 'string'
+    && typeof (detail as { message?: unknown }).message === 'string');
+  return details.length > 0 ? details : undefined;
+}
+
 async function throwApiError(res: Response): Promise<never> {
   const text = await res.text();
   let message = text || `HTTP ${res.status}`;
   let details: ApiErrorDetail[] | undefined;
   try {
-    const body = JSON.parse(text) as { error?: string; details?: ApiErrorDetail[] };
+    const body = JSON.parse(text) as { error?: string; details?: unknown };
     if (typeof body.error === 'string') message = body.error;
-    if (Array.isArray(body.details)) details = body.details;
+    details = parseApiErrorDetails(body.details);
   } catch {}
+  if (details !== undefined) {
+    message = `${message}\n${details.map(detail => `${detail.path}: ${detail.message}`).join('\n')}`;
+  }
   if (res.status === 401 && typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
   }

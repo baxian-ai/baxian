@@ -2,10 +2,10 @@ import { isAbsolute, normalize } from 'node:path';
 import { isBareRepoSlug,
   CONTROL_CHAR_RE, TOOL_PATTERN,
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
-  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
+  type AfterDone, type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
 } from '../shared/index.js';
 
-const VALID_REVIEW_MODES: ReadonlySet<string> = new Set(['github', 'server', 'git']);
+const VALID_REVIEW_MODES: ReadonlySet<string> = new Set(['git', 'server']);
 
 export interface ValidationError {
   path: string;
@@ -41,6 +41,8 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateProjectFields(config, errors);
   validateProjectReviewModes(config, errors);
   validateGitMode(config, errors);
+  validateServerPublishTool(config, errors);
+  validatePlatformRepoUniqueness(config, errors);
   validateProjectIds(config, errors);
   validateAgentFields(config, errors);
   validateAgentIds(config, errors);
@@ -58,7 +60,7 @@ function nonEmptyString(v: unknown): boolean {
 
 export function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
   const review = (project as { review?: unknown }).review;
-  return (isRecord(review) && review.mode !== undefined ? review.mode : (config.review.mode ?? 'github')) as ReviewMode;
+  return (isRecord(review) && review.mode !== undefined ? review.mode : (config.review.mode ?? 'git')) as ReviewMode;
 }
 
 // tool 解析的唯一定义（spec v2 §4）：显式 gitCli.tool 优先；github 仓库零配置自动 'gh'（内置插件）；
@@ -66,6 +68,20 @@ export function projectReviewMode(config: BaxianConfig, project: ProjectConfig):
 export function resolveProjectTool(project: ProjectConfig): string | undefined {
   if (isRecord(project.gitCli) && typeof project.gitCli.tool === 'string') return project.gitCli.tool;
   return nonEmptyString(project.repo) && isGitHubRepo(project.repo) ? 'gh' : undefined;
+}
+
+// afterDone 的唯一投影：非 github 仓库不支持开 PR，'pr'/未声明一律落到 'branch'。
+export function projectAfterDone(config: BaxianConfig, project: ProjectConfig): AfterDone {
+  if (!isGitHubRepo(project.repo)) {
+    const configured = config.review.afterDone;
+    return configured === 'pr' || configured === undefined ? 'branch' : configured;
+  }
+  return config.review.afterDone ?? null;
+}
+
+export function projectNeedsPlatformEntry(config: BaxianConfig, project: ProjectConfig): boolean {
+  if (resolveProjectTool(project) === undefined) return false;
+  return projectReviewMode(config, project) === 'git' || projectAfterDone(config, project) === 'pr';
 }
 
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {
@@ -128,7 +144,7 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
     errors.push({ path: 'review.rounds', message: 'review.rounds must be a positive integer' });
   }
   if (config.review.mode !== undefined && !VALID_REVIEW_MODES.has(config.review.mode)) {
-    errors.push({ path: 'review.mode', message: "review.mode must be 'github', 'server', or 'git'" });
+    errors.push({ path: 'review.mode', message: "review.mode must be 'git' or 'server'" });
   }
   const afterDone = config.review.afterDone;
   if (afterDone !== undefined && afterDone !== null && afterDone !== 'pr' && afterDone !== 'branch') {
@@ -186,30 +202,49 @@ function validateProjectReviewModes(config: BaxianConfig, errors: ValidationErro
         return;
       }
       if (review.mode !== undefined && !(typeof review.mode === 'string' && VALID_REVIEW_MODES.has(review.mode))) {
-        errors.push({ path: `${path}.review.mode`, message: "project.review.mode must be 'github', 'server', or 'git'" });
+        errors.push({ path: `${path}.review.mode`, message: "project.review.mode must be 'git' or 'server'" });
       }
     }
 
-    const mode = projectReviewMode(config, project);
-    if (
-      nonEmptyString(project.repo)
-      && !hasEmbeddedCredentials(project.repo)
-      && isValidRepo(project.repo)
-      && !isGitHubRepo(project.repo)
-      && mode !== 'server'
-      && mode !== 'git'
-    ) {
+  });
+}
+
+function validatePlatformRepoUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
+  // 查重范围 = platform entry 集合（spec §4/§5.5 同谓词）：共用一个 repo 就共用一份 cursor
+  // 与观察缓存，两个 entry 指向同一仓库会互相吞事件。都不进 entry 的项目共用 repo 无妨。
+  const seen = new Map<string, string>();
+  config.project.forEach((project, i) => {
+    if (!nonEmptyString(project.repo) || !projectNeedsPlatformEntry(config, project)) return;
+    const norm = repoIdentityKey(project.repo);
+    const prev = seen.get(norm);
+    if (prev !== undefined) {
       errors.push({
-        path: `${path}.review.mode`,
-        message: "non-GitHub projects require effective review.mode 'server'",
+        path: `project[${i}].repo`,
+        message: `normalized repo URL must be unique across platform-polled projects (already used by project '${prev}')`,
+      });
+    } else {
+      seen.set(norm, project.id);
+    }
+  });
+}
+
+// server 模式 + afterDone 解析 'pr' 的 agent 发布面走 baxian-server-feedback 的 gh 契约；
+// server 生命周期面复用 driver。gitCli 若声明 tool 必须为 'gh'，binary 仅覆盖 server 面可执行文件。
+function validateServerPublishTool(config: BaxianConfig, errors: ValidationError[]): void {
+  config.project.forEach((project, i) => {
+    if (!nonEmptyString(project.repo)) return;
+    if (projectReviewMode(config, project) !== 'server' || projectAfterDone(config, project) !== 'pr') return;
+    const gitCli = project.gitCli;
+    if (isRecord(gitCli) && typeof gitCli.tool === 'string' && gitCli.tool !== 'gh') {
+      errors.push({
+        path: `project[${i}].gitCli.tool`,
+        message: "server-mode projects that publish PRs (afterDone: 'pr') may only declare gitCli.tool 'gh' (the agent publish contract uses gh); drop the tool or use a git-mode project",
       });
     }
   });
 }
 
 function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void {
-  const seenGitRepos = new Map<string, string>();
-
   config.project.forEach((project, i) => {
     const path = `project[${i}]`;
     const gitCli = project.gitCli;
@@ -252,23 +287,6 @@ function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void 
       });
     }
 
-    const norm = repoIdentityKey(project.repo);
-    const prev = seenGitRepos.get(norm);
-    if (prev !== undefined) {
-      errors.push({
-        path: `${path}.repo`,
-        message: `normalized repo URL must be unique across git-mode projects (already used by project '${prev}')`,
-      });
-    } else {
-      seenGitRepos.set(norm, project.id);
-    }
-
-    // Temporary gate — the git-driver only exists on paper until M2/M3 wire up gitCli
-    // execution; remove this push once that lands, leaving the checks above intact.
-    errors.push({
-      path: `${path}.review.mode`,
-      message: "review.mode 'git' is not yet operational (git-driver M2/M3 pending); keep 'github' or 'server' until then",
-    });
   });
 }
 

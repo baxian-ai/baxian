@@ -93,6 +93,7 @@ describe('AgentManager.reconcileFailedAgent', () => {
       devAgentId: 'dev-1',
       phase: 'code',
       branch: 'bx/task-old',
+      reviewMode: 'server',
       reviewRound: 0,
       status: 'in_progress',
       createdAt: NOW,

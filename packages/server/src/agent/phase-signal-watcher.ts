@@ -26,8 +26,6 @@ const MATCH_BUFFER_CHARS = 1024;
 const KIND_TO_EVENT_TYPE: Record<Exclude<PhaseSignalKind, 'greeting'>, EventType> = {
   'spec-fixed': 'server.spec.fix.submitted',
   'pr-created': 'pr.created',
-  'pr-approved': 'review.submitted',
-  'pr-changes-requested': 'review.submitted',
   'pr-fixed': 'pr.fix.submitted',
   'pr-merge-ready': 'pr.updated',
   'spec-done': 'server.spec.ready',
@@ -86,9 +84,6 @@ export interface PhaseSignalWatcherStartArgs {
   onReadFile?: (req: ReadFileSignal) => void;
   // Watermark state established by the arm-time epoch bump (restore carries prior seqs).
   needInput?: { epoch: number; askSeq: number; answeredSeq: number };
-  // A same-token replay left two generations of identical ordinals on the pane; no
-  // framebuffer evidence can tell them apart, so the snapshot is not read at all.
-  needInputSnapshotBlind?: boolean;
   // Merge the evicted same-token entry's in-memory seqs into the replacement. Only a
   // restore arm wants this: a fresh replay restarts its ordinals at 1, and inherited
   // seqs would swallow the new prompt's questions.
@@ -97,10 +92,10 @@ export interface PhaseSignalWatcherStartArgs {
   recovered?: boolean;
   // A fenced (re)arm may replace its own token's watch but never a successor's rotated one.
   onlyReplaceOwnToken?: boolean;
+  // A token-rotating replay may hand off exactly its same-agent predecessor.
+  replaceFromToken?: string;
   // Claim from claimArm(), excluded from this arm's own ownership probes.
   armClaimId?: number;
-  // 'task' (default) evicts every entry of the task on arm; 'agent' touches only the
-  // same (taskId, agentId) entry so a sibling watch (git dev reconciliation) survives.
   replaceScope?: 'task' | 'agent';
 }
 
@@ -166,7 +161,10 @@ export class PhaseSignalWatcher {
     // this arm started against: a successor installed meanwhile owns a newer generation
     // and adopting ours would drag it back to a superseded watermark.
     const rejectArm = (): false => {
-      if (args.needInput !== undefined && predecessor && this.entries.get(key) === predecessor) {
+      if (args.needInput !== undefined
+        && predecessor
+        && this.entries.get(key) === predecessor
+        && (args.replaceFromToken === undefined || predecessor.expectedToken === args.token)) {
         this.migrateEntryGeneration(
           predecessor,
           args.needInput,
@@ -175,6 +173,7 @@ export class PhaseSignalWatcher {
       }
       return false;
     };
+    if (!this.ownsArmClaim(args, args.armClaimId)) return rejectArm();
     if (this.hasForeignTokenOwner(args, args.armClaimId)) return rejectArm();
     // Fence bookkeeping happens on ENTRY, before any await: even an arm that later
     // fails to subscribe leaves its generation/arrival behind to fence older stragglers.
@@ -210,9 +209,7 @@ export class PhaseSignalWatcher {
       askSeq: args.needInput?.askSeq ?? 0,
       answeredSeq: args.needInput?.answeredSeq ?? 0,
       epoch: args.needInput?.epoch ?? 0,
-      snapshotReconcile: args.needInputInherit === true
-        && args.needInput !== undefined
-        && args.needInputSnapshotBlind !== true,
+      snapshotReconcile: args.needInputInherit === true && args.needInput !== undefined,
       commitEnabled: args.needInput !== undefined,
       needInputBuffer: '',
       recovered: args.recovered ?? false,
@@ -330,6 +327,7 @@ export class PhaseSignalWatcher {
       agentId: string;
       token: string;
       onlyReplaceOwnToken?: boolean;
+      replaceFromToken?: string;
       replaceScope?: 'task' | 'agent';
     },
     selfArmId?: number,
@@ -340,7 +338,10 @@ export class PhaseSignalWatcher {
       agentId: args.agentId,
       ...(args.replaceScope ? { replaceScope: args.replaceScope } : {}),
     } as PhaseSignalWatcherStartArgs);
-    if (installed.some(entry => entry.expectedToken !== args.token)) return true;
+    const replaceFromToken = args.replaceScope === 'agent' ? args.replaceFromToken : undefined;
+    if (installed.some(entry =>
+      entry.expectedToken !== args.token && entry.expectedToken !== replaceFromToken,
+    )) return true;
     for (const [id, arm] of this.pendingArms) {
       if (id === selfArmId) continue;
       if (arm.taskId !== args.taskId) continue;
@@ -356,6 +357,7 @@ export class PhaseSignalWatcher {
     agentId: string;
     token: string;
     onlyReplaceOwnToken?: boolean;
+    replaceFromToken?: string;
     replaceScope?: 'task' | 'agent';
   }): boolean {
     return this.hasForeignTokenOwner(args);
@@ -369,6 +371,7 @@ export class PhaseSignalWatcher {
     agentId: string;
     token: string;
     onlyReplaceOwnToken?: boolean;
+    replaceFromToken?: string;
     replaceScope?: 'task' | 'agent';
   }): number | null {
     if (this.hasForeignTokenOwner(args)) return null;
@@ -379,6 +382,14 @@ export class PhaseSignalWatcher {
 
   releaseArm(armId: number | null | undefined): void {
     if (armId != null) this.pendingArms.delete(armId);
+  }
+
+  private ownsArmClaim(args: PhaseSignalWatcherStartArgs, armId: number | undefined): boolean {
+    if (armId === undefined) return true;
+    const claim = this.pendingArms.get(armId);
+    return claim?.taskId === args.taskId
+      && claim.agentId === args.agentId
+      && claim.token === args.token;
   }
 
   // Monotonic: never demote a generation a successor already owns. An in-memory lead
@@ -427,6 +438,11 @@ export class PhaseSignalWatcher {
     for (const entry of this.taskEntries(taskId)) {
       if (entry.expectedToken === expectedToken) this.dropEntry(entry);
     }
+  }
+
+  stopAgentIfToken(taskId: string, agentId: string, expectedToken: string): void {
+    const entry = this.entries.get(entryKey(taskId, agentId));
+    if (entry?.expectedToken === expectedToken) this.dropEntry(entry);
   }
 
   has(taskId: string, agentId?: string): boolean {
@@ -627,10 +643,6 @@ export class PhaseSignalWatcher {
     try { entry.unsubscribe(); } catch {}
     // The phase signal ends the dispatch: whatever question was open counts as closed.
     if (this.markAnswered(entry)) this.commitWatermark(entry);
-    const verdictAction: 'APPROVE' | 'REQUEST_CHANGES' | undefined =
-      signal.kind === 'pr-approved' ? 'APPROVE'
-      : signal.kind === 'pr-changes-requested' ? 'REQUEST_CHANGES'
-      : undefined;
     const event: BaxianEvent = {
       id: '',
       type: KIND_TO_EVENT_TYPE[signal.kind],
@@ -648,7 +660,6 @@ export class PhaseSignalWatcher {
         ...(signal.kind === 'code-ready' && signal.prNumber !== undefined
           ? { prNumber: signal.prNumber }
           : {}),
-        ...(verdictAction ? { action: verdictAction } : {}),
       },
     };
     void this.emitCompletion(event, entry, signal.kind);

@@ -85,7 +85,7 @@ describe('loadConfig', () => {
     expect(config.review.rounds).toBe(10);
     expect(config.server.port).toBe(3000);
     expect(config.project[0].merge).toBeNull();
-    expect(config.review.mode).toBe('github');
+    expect(config.review.mode).toBe('git');
     expect(config.project[0].review?.mode).toBeUndefined();
     expect(config.review.afterDone).toBeUndefined();
   });
@@ -296,12 +296,12 @@ describe('prepareConfig type guards', () => {
     expect(cfg.review.rounds).toBe(10);
   });
 
-  it('defaults review.mode to github but leaves an omitted project override and afterDone undefined', () => {
+  it('defaults review.mode to git but leaves an omitted project override and afterDone undefined', () => {
     const cfg = prepareConfig({
       review: { rounds: 10 },
       project: [PROJECT],
     });
-    expect(cfg.review.mode).toBe('github');
+    expect(cfg.review.mode).toBe('git');
     expect(cfg.project[0].review?.mode).toBeUndefined();
     expect(cfg.review.afterDone).toBeUndefined();
   });
@@ -311,13 +311,13 @@ describe('prepareConfig type guards', () => {
       review: { rounds: 10, mode: 'server' },
       project: [{
         ...PROJECT,
-        review: { mode: 'github' },
+        review: { mode: 'git' },
       }],
     });
-    expect(cfg.project[0].review?.mode).toBe('github');
+    expect(cfg.project[0].review?.mode).toBe('git');
   });
 
-  it('rejects non-github projects whose global fallback review.mode is github', () => {
+  it("rejects the retired 'github' review.mode at load time", () => {
     expect(() => prepareConfig({
       review: { rounds: 10, mode: 'github' },
       project: [{

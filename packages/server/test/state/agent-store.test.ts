@@ -61,6 +61,19 @@ describe('AgentStore', () => {
     expect(loaded?.needInput).toEqual({ epoch: 2, askSeq: 3, answeredSeq: 2, at: NOW });
   });
 
+  it('ignores a legacy cutoverToken and does not write it back', async () => {
+    const path = join(agentsDir(), 'dev-1.json');
+    await writeFile(path, JSON.stringify({
+      ...makeState('dev-1', { taskId: 'task-001' }),
+      needInput: { epoch: 2, askSeq: 1, answeredSeq: 0, at: NOW, cutoverToken: 'legacy-token' },
+    }));
+
+    const loaded = await store.get('dev-1');
+    expect(loaded?.needInput).toEqual({ epoch: 2, askSeq: 1, answeredSeq: 0, at: NOW });
+    await store.set(loaded!);
+    expect(await readFile(path, 'utf-8')).not.toContain('cutoverToken');
+  });
+
   it('migrates legacy flat needInputAt into an epoch-0 lit watermark', async () => {
     const state = makeState('dev-1', { taskId: 'task-001' });
     await store.set({ ...state, needInputAt: NOW } as never);

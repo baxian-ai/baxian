@@ -3,7 +3,7 @@ export type AgentRole = 'dev' | 'qa' | 'research';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
-export type ReviewMode = 'github' | 'server' | 'git';
+export type ReviewMode = 'git' | 'server';
 export type AfterDone = 'pr' | 'branch' | null;
 type SupportedLanguage = 'zh-CN' | 'en-US';
 
@@ -150,10 +150,6 @@ export interface NeedInputWatermark {
   askSeq?: number;
   answeredSeq?: number;
   at?: string;
-  // A same-token replay split this token's pane history into two generations that reuse
-  // the same ordinals: a framebuffer snapshot cannot attribute a literal to either, so
-  // this token's arms stop reading it. Dropped as soon as another token takes over.
-  cutoverToken?: string;
 }
 
 export interface AgentErrorSummary {
@@ -179,6 +175,45 @@ export interface AgentSnapshot {
   petId?: string;
 }
 
+export type ServerSignalKind =
+  | 'code-done'
+  | 'code-reviewed'
+  | 'code-fixed'
+  | 'code-ready'
+  | 'spec-done'
+  | 'spec-reviewed'
+  | 'spec-fixed';
+
+export type ServerSignalRecoveryReason =
+  | 'response-missing'
+  | 'response-invalid'
+  | 'round-mismatch'
+  | 'token-mismatch'
+  | 'findings-digest-mismatch'
+  | 'coverage-gap'
+  | 'fix-no-dev-agent'
+  | 'fix-findings-missing'
+  | 'response-read-failed'
+  | 'verdict-store-failed'
+  | 'handler-failed';
+
+export interface ServerSignalRecovery {
+  mode: 'classify-response' | 'correct-response' | 'hold';
+  signalKind: ServerSignalKind;
+  phase: 'spec' | 'code';
+  round: number;
+  sourceToken: string;
+  findingsDigest?: string;
+  failureSignature?: string;
+  responseDigest?: string;
+  reason: ServerSignalRecoveryReason;
+  failurePhase?: string;
+  missingFindingIds?: string[];
+  unknownFindingIds?: string[];
+  schemaViolationCodes?: string[];
+  createdAt: string;
+}
+
 export type PetSpritesheetExt = 'png' | 'webp';
 
 export interface PetMeta {
@@ -187,6 +222,35 @@ export interface PetMeta {
   description: string;
   ext: PetSpritesheetExt;
   createdAt: string;
+}
+
+export interface RemoteCleanupState {
+  generation: string;
+  stage: 'close-pending' | 'delete-pending' | 'manual';
+  prNumber: number;
+  branch: string;
+  expectedHeadSha?: string;
+  remoteProjectId?: string;
+  failure?: {
+    kind: 'config' | 'binding' | 'close' | 'persist' | 'delete' | 'probe' | 'tip-changed';
+    message: string;
+    at: string;
+  };
+  updatedAt: string;
+}
+
+export interface ReviewDispatchLease {
+  generation: string;
+  phase: 'pending' | 'claimed' | 'uncertain';
+  qaPhase: 'review' | 'recheck';
+  claimId?: string;
+  signalToken: string;
+  headSha: string;
+  passToken: string;
+  failToken: string;
+  effectiveRound: number;
+  claimedAt?: string;
+  updatedAt: string;
 }
 
 export interface TaskState {
@@ -213,6 +277,7 @@ export interface TaskState {
     reason: string;
     updatedAt: string;
   };
+  remoteCleanup?: RemoteCleanupState;
   // 释放时本地任务分支被清理（远端保留）的凭据；检出恢复只信这枚删除时刻的远端 tip
   branchLocalCleaned?: {
     remoteTipSha: string;
@@ -231,7 +296,8 @@ export interface TaskState {
   phase?: TaskPhase;
   images?: string[];
   signalToken?: string;
-  reviewMode?: ReviewMode;
+  serverSignalRecovery?: ServerSignalRecovery;
+  reviewMode: ReviewMode;
   batchIndex?: number;
   batchTotal?: number;
   // Persisted so recovery can re-arm read-file for a base fallback without
@@ -241,35 +307,22 @@ export interface TaskState {
   afterDone?: AfterDone;
   publishDispatchedAt?: string;
   // Deliberately cleared post-approve completion; a restart replay must not rebuild it while this stands.
-  postApproveRevoked?: { reason: 'request-changes' | 'redispatch-cap'; at: string };
+  postApproveRevoked?: { generation: string; reason: 'request-changes' | 'redispatch-cap'; at: string };
   // Approved head persisted at post-approve dispatch; the only SHA a completion rebuild may trust.
   postApproveHeadSha?: string;
   passToken?: string;
   failToken?: string;
-  // Publish-dispatch pr-created expectation survives review-round token rotation until
-  // actor reconciliation completes or the task terminates (spec §5.3 ④).
   pendingPrSignalToken?: string;
-  // 'git' post-approve completion token lives on the task so effect fields and consumption
-  // keys share one durable write (spec §6); legacy github keeps PostApproveStore until M3c.
   postApproveToken?: string;
-  // installed → prompt injected (delivered) → merge-ready received (signaled): recovery/sweep
-  // must not re-inject into a mid-prompt dev, and must redispatch once the signal was consumed.
+  postApproveGeneration?: string;
   postApprovePhase?: 'installed' | 'delivered' | 'signaled';
-  // Set inside the review-entering transition, cleared after the QA session starts: the
-  // same-head/same-PR replay guards stay permeable until a QA round provably dispatched.
-  reviewDispatchPending?: boolean;
-  // Identity trio snapshot at creation (spec §4): the lock covers online edits, this
-  // fingerprint fails offline edits closed before any platform op runs.
+  reviewDispatch?: ReviewDispatchLease;
   platformBinding?: { mode: string; repoKey: string; tool: string };
-  // expectedBase snapshot taken at adoption/signal verification; immutable afterwards (spec §6).
   baseBranch?: string;
   replyActorId?: string;
   replyActorStatus?: 'verified' | 'provisional';
-  // cleared keeps the generation counter across reopen so the next close mints a fresh event key.
   closedUnmergedAnchor?: { prNumber: number; generation: number; cleared?: boolean };
-  // Self-contained pair snapshot at acceptance: recheck must see the round's failToken even after re-mints.
   passProvenance?: { sourceKey: string; id: string; bodyDigest: string; token: string; failToken: string; anchorSha: string };
-  // revision key -> versionTime; effect fields and these keys persist in the same write (spec §6).
   consumedFeedback?: Record<string, number>;
   outbox?: Array<{ key: string; type: 'human.intervention'; data: Record<string, unknown> }>;
   pendingRedispatch?: boolean;
@@ -308,7 +361,35 @@ interface FindingResponse {
 
 export interface ReviewResponse {
   round: number;
+  token?: string;
+  findingsDigest?: string;
   responses: FindingResponse[];
+}
+
+export type ServerResponseFailureDisposition =
+  | 'auto-correct'
+  | 'hold-repeated-signature'
+  | 'hold-correction-limit';
+
+export interface ServerResponseFailure {
+  signalKind: Extract<ServerSignalKind, 'code-fixed' | 'spec-fixed'>;
+  sourceToken: string;
+  successorToken: string;
+  failureSignature: string;
+  responseDigest?: string;
+  rawResponse?: string;
+  reason: Extract<ServerSignalRecoveryReason,
+    | 'response-missing'
+    | 'response-invalid'
+    | 'round-mismatch'
+    | 'token-mismatch'
+    | 'findings-digest-mismatch'
+    | 'coverage-gap'>;
+  missingFindingIds: string[];
+  unknownFindingIds: string[];
+  schemaViolationCodes: string[];
+  disposition: ServerResponseFailureDisposition;
+  createdAt: string;
 }
 
 export interface ReviewContentFileRef {
@@ -342,6 +423,7 @@ interface ReviewRoundBase {
   headTree?: string;
   findings?: ReviewFindings;
   response?: ReviewResponse;
+  serverResponseFailures?: ServerResponseFailure[];
   batchFindings?: ReviewFindings[];
   userDecision?: SpecUserDecision;
   startedAt: string;
@@ -359,7 +441,7 @@ export interface CodeReviewRound extends ReviewRoundBase {
 
 export type ReviewRound = SpecReviewRound | CodeReviewRound;
 
-export type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
+export type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';
 
 export type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
 
@@ -516,6 +598,8 @@ export interface PollerSnapshot {
   lastPollDurationMs?: number;
   lastErrorAt?: string;
   lastErrorMessage?: string;
+  lastErrorClass?: string;
+  rateLimitedUntil?: string;
   consecutiveFailures: number;
   health: PollerHealth;
 }

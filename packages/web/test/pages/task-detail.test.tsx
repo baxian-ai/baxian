@@ -729,8 +729,8 @@ describe('TaskDetail page — actions & states', () => {
       expect((screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement).disabled).toBe(false);
     });
 
-    it('does not show the reject affordance for a github-mode ready task', () => {
-      openCodeReady({ reviewMode: 'github', prNumber: 5 });
+    it('does not show the reject affordance for a git-mode ready task', () => {
+      openCodeReady({ reviewMode: 'git', prNumber: 5 });
       expect(screen.queryByRole('button', { name: 'Request changes' })).toBeNull();
     });
 
@@ -771,6 +771,7 @@ describe('TaskDetail page — call review', () => {
     const dialog = await findConfirmDialog();
     expect(within(dialog).getByText('Start a QA re-review?')).toBeTruthy();
     expect(within(dialog).getByText(/QA agent will immediately start a new review round for task task-010/)).toBeTruthy();
+    expect(within(dialog).getByText(/continue only after verifying the QA pane did not receive it/)).toBeTruthy();
     await act(async () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Start re-review' }));
     });
@@ -843,7 +844,7 @@ describe('TaskDetail page — call review', () => {
     },
   );
 
-  it('spec-phase task reports the spec round in the toast (github mode without a PR)', async () => {
+  it('spec-phase task reports the spec round in the toast (git mode without a PR)', async () => {
     tasksReviewMock.mockResolvedValue(makeTask({ phase: 'spec', status: 'review', specReviewRound: 2, reviewRound: 0, prNumber: undefined, prUrl: undefined }));
     open({ phase: 'spec', status: 'review', specReviewRound: 1, prNumber: undefined, prUrl: undefined });
 
@@ -855,7 +856,7 @@ describe('TaskDetail page — call review', () => {
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
   });
 
-  it('github-mode code-phase task without a PR keeps Call review disabled with the no-PR tooltip', () => {
+  it('git-mode code-phase task without a PR keeps Call review disabled with the no-PR tooltip', () => {
     open({ status: 'review', prNumber: undefined, prUrl: undefined });
     const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
@@ -1035,6 +1036,17 @@ describe('TaskDetail page — PR/Branch fallbacks', () => {
     expect(within(section).queryByRole('link', { name: 'bx/task-010' })).toBeNull();
     expect(within(section).getByText('bx/task-010').className).toContain('font-mono');
   });
+
+  it.each(['javascript:alert(1)', 'not a url'])(
+    'renders untrusted PR URL input as plain text: %s',
+    (prUrl) => {
+      const { container } = open({ prUrl });
+      const section = container.querySelector('section')!;
+      expect(within(section).queryByRole('link', { name: '#55' })).toBeNull();
+      expect(within(section).queryByRole('link', { name: 'bx/task-010' })).toBeNull();
+      expect(screen.queryByRole('link', { name: 'View PR #55' })).toBeNull();
+    },
+  );
 
   it('renders dashes when the task has neither PR nor branch', () => {
     const { container } = open({ prNumber: undefined, prUrl: undefined, branch: undefined });

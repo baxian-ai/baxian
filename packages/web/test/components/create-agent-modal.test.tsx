@@ -234,7 +234,7 @@ it('keeps the QA radio disabled when the project has no unpaired dev', async () 
 });
 
 it('surfaces an addAgent failure inline and keeps the modal open', async () => {
-  addAgentMock.mockRejectedValue(new Error('id already used somewhere'));
+  addAgentMock.mockRejectedValue(new Error('id already used\nsomewhere else'));
   const { onClose, onCreated } = await renderReady();
   await fillValidDevForm();
 
@@ -242,7 +242,9 @@ it('surfaces an addAgent failure inline and keeps the modal open', async () => {
     fireEvent.click(submitButton());
   });
 
-  expect(screen.getByText('id already used somewhere')).toBeTruthy();
+  const banner = screen.getByText(/id already used/);
+  expect(banner.textContent).toBe('id already used\nsomewhere else');
+  expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
   expect(onClose).not.toHaveBeenCalled();
   expect(onCreated).not.toHaveBeenCalled();
   expect(submitButton().textContent).toBe('Add agent');

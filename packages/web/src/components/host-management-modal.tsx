@@ -250,7 +250,7 @@ export function HostManagementModal({ open, onClose }: Props) {
       footer={view === 'list' ? listFooter : formFooter}
     >
       {error && (
-        <div className="mb-3 rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
+        <div className="mb-3 whitespace-pre-line rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
           {error}
         </div>
       )}

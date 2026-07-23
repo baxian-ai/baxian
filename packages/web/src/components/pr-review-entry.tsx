@@ -22,17 +22,12 @@ function reasonText(t: Messages): Record<string, string> {
   return {
     'server-mode': t.prReview.reasonServerModeEntry,
     'no-pr': t.prReview.reasonNoPr,
-    'not-github': t.prReview.reasonNotGithub,
     'driver-unavailable': t.prReview.reasonDriverUnavailable,
   };
 }
 
 function firstLine(value?: string): string {
   return value?.trim().split('\n', 1)[0] ?? '';
-}
-
-function shortSha(item: PrReviewItem): string | undefined {
-  return item.commitSha?.slice(0, 9);
 }
 
 function inlineLocation(item: PrReviewItem): string | undefined {
@@ -47,11 +42,6 @@ function truncatedSuffix(t: Messages, item: PrReviewItem): string {
 function itemSummary(t: Messages, item: PrReviewItem): string {
   const body = firstLine(item.body);
   const suffix = truncatedSuffix(t, item);
-  if (item.kind === 'commit') {
-    const sha = shortSha(item);
-    if (sha && body) return `${sha} ${body}${suffix}`;
-    return `${body || sha || t.prReview.commitFallback}${suffix}`;
-  }
   if (item.kind === 'review-comment') {
     const loc = inlineLocation(item);
     if (item.inReplyTo) {
@@ -70,14 +60,13 @@ function itemSummary(t: Messages, item: PrReviewItem): string {
 
 function itemLabel(t: Messages, item: PrReviewItem): string {
   if (item.verdict !== undefined || item.kind === 'review') return t.review.reviewTurnLabel;
-  if (item.kind === 'commit') return t.review.submitCodeChanges;
   if (item.kind === 'review-comment') return item.inReplyTo ? t.review.responseTurnLabel : t.prReview.inlineComment;
   return t.prReview.comment;
 }
 
 function itemRole(item: PrReviewItem): 'dev' | 'qa' {
   if (item.verdict !== undefined) return 'qa';
-  return item.kind === 'commit' || item.kind === 'issue-comment' || item.inReplyTo ? 'dev' : 'qa';
+  return item.kind === 'issue-comment' || item.inReplyTo ? 'dev' : 'qa';
 }
 
 export function PrReviewEntry({ task }: Props) {

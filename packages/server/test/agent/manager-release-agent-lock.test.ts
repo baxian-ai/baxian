@@ -110,6 +110,7 @@ async function seedActiveBinding(): Promise<void> {
     phase: 'code',
     branch: 'bx/task-001',
     branchCreatedByBaxian: true,
+    reviewMode: 'server',
     reviewRound: 0,
     status: 'in_progress',
     createdAt: NOW,

@@ -25,8 +25,6 @@ export function checkPrBinding(prRow: NormalizedRow, expect: BindingExpectation)
 
 export type PrRejection = 'state' | 'draft' | BindingMismatch | 'unverifiable';
 
-// spec §6 统一收编谓词的完整形态（state/draft 在前），供信号验证与 merge 预检使用；
-// poller 子轮询对 state/draft 另有生命周期语义，只消费 checkPrBinding。
 export function checkOpenPrBinding(
   prRow: NormalizedRow,
   expect: BindingExpectation,

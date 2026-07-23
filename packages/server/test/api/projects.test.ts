@@ -56,10 +56,12 @@ function seedAgent(id: string, projectId: string, extra: Partial<AgentFacts> = {
 
 function seedTask(id: string, projectId: string, extra: Partial<TaskFacts> = {}): Promise<void> {
   const devAgentId = extra.devAgentId ?? extra.agentId ?? extra.preferredAgentId ?? '';
+  const reviewMode = app.ctx.agentManager.effectiveReviewMode(projectId);
   return app.ctx.taskStore.set({
     id, projectId, title: 't', description: 'd', reviewRound: 0,
     preferredAgentId: devAgentId, agentId: devAgentId, devAgentId,
-    phase: 'code', status: 'pending',
+    phase: 'code', reviewMode, status: 'pending',
+    ...app.ctx.agentManager.platformBindingFields(projectId),
     createdAt: now(), updatedAt: now(), ...extra,
   } as TaskFacts);
 }
@@ -126,10 +128,14 @@ describe('POST /api/projects', () => {
     const agentReplace = vi.spyOn(app.ctx.agentManager, 'replaceConfig');
     const tmuxReplace = vi.fn();
     const bootstrapReplace = vi.fn();
-    const pollerReplace = vi.fn();
+    const reconcile = vi.fn();
     app.ctx.tmuxProbePoller = { replaceConfig: tmuxReplace, stop: vi.fn() } as never;
     app.ctx.bootstrapPoller = { replaceConfig: bootstrapReplace, stop: vi.fn() } as never;
-    app.ctx.poller = { replaceConfig: pollerReplace, stop: vi.fn() } as never;
+    app.ctx.poller = { reconcile, reschedule: vi.fn(), stop: vi.fn() } as never;
+    app.ctx.platformEntryDeps = {
+      driverFor: () => ({ visibilityLagMs: 0, commentSources: [] }),
+      statePathFor: (repoUrl: string) => `${tempDir}/poller-${encodeURIComponent(repoUrl)}.json`,
+    } as never;
     app.ctx.stateDir = tempDir;
 
     const response = await post('/api/projects', { id: 'hot', repo: 'a/b' });
@@ -139,21 +145,21 @@ describe('POST /api/projects', () => {
     expect(agentReplace.mock.calls[0][0].project.some((p: { id: string }) => p.id === 'hot')).toBe(true);
     expect(tmuxReplace).toHaveBeenCalledTimes(1);
     expect(bootstrapReplace).toHaveBeenCalledTimes(1);
-    expect(pollerReplace).toHaveBeenCalledTimes(1);
-    const [validated, opts] = pollerReplace.mock.calls[0];
-    expect(validated.project.some((p: { id: string }) => p.id === 'hot')).toBe(true);
-    expect(typeof opts.statePathFor).toBe('function');
-    const path = opts.statePathFor({ repo: 'A/B' });
-    expect(path).toContain('poller-a%2Fb.json');
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    const entries = reconcile.mock.calls[0][0] as Array<{ projectId: string; repoUrl: string; statePath: string }>;
+    const added = entries.find(e => e.projectId === 'hot');
+    expect(added).toBeDefined();
+    expect(added!.repoUrl).toBe('a/b');
+    expect(added!.statePath).toContain('poller-a%2Fb.json');
   });
 
-  it('still hot-reloads when stateDir is unset (new poller entry created without statePath)', async () => {
-    const pollerReplace = vi.fn();
-    app.ctx.poller = { replaceConfig: pollerReplace, stop: vi.fn() } as never;
-    app.ctx.stateDir = undefined;
+  it('skips poller reconciliation when the platform deps are unavailable', async () => {
+    const reconcile = vi.fn();
+    app.ctx.poller = { reconcile, reschedule: vi.fn(), stop: vi.fn() } as never;
+    app.ctx.platformEntryDeps = undefined;
     const res = await post('/api/projects', { id: 'nopath', repo: 'c/d' });
     expect(res.statusCode).toBe(201);
-    expect(pollerReplace.mock.calls[0][1].statePathFor).toBeUndefined();
+    expect(reconcile).not.toHaveBeenCalled();
   });
 
   it('defaults merge to null when omitted', async () => {
@@ -204,10 +210,48 @@ describe('POST /api/projects', () => {
     expect(response.statusCode).toBe(status);
   });
 
+  it('rejects creating a project on a repo locked by another project\'s active tasks (§5.5)', async () => {
+    // 既有项目 proj(repo a/b) 有一个活动的绑定任务;新建 B 指向同一 repo 应 409
+    await createProject('proj-owner', { repo: 'https://github.com/shared/repo.git', review: { mode: 'server' } });
+    await app.ctx.taskStore.set({
+      id: 'task-lock', projectId: 'proj-owner', title: 'T', description: 'D',
+      preferredAgentId: '', agentId: '', devAgentId: '',
+      status: 'review', reviewMode: 'git', reviewRound: 1,
+      platformBinding: { mode: 'git', repoKey: 'github.com/shared/repo', tool: 'gh' },
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    } as never);
+
+    const response = await post('/api/projects', { id: 'intruder', repo: 'git@github.com:shared/repo.git' });
+
+    expect(response.statusCode).toBe(409);
+    const body = JSON.parse(response.body);
+    expect(body.tasks).toEqual(['task-lock']);
+    expect(body.details).toEqual([{
+      path: 'project.intruder.repo',
+      message: 'repo is locked by active tasks in project proj-owner: task-lock',
+    }]);
+    expect(body.error).toMatch(/locked by/);
+    expect(app.ctx.config.project.some(p => p.id === 'intruder')).toBe(false);
+  });
+
+  it('allows creating a project on a repo whose locking tasks have gone terminal', async () => {
+    await createProject('proj-done', { repo: 'https://github.com/free/repo.git', review: { mode: 'server' } });
+    await app.ctx.taskStore.set({
+      id: 'task-terminal', projectId: 'proj-done', title: 'T', description: 'D',
+      preferredAgentId: '', agentId: '', devAgentId: '',
+      status: 'merged', reviewMode: 'git', reviewRound: 1,
+      platformBinding: { mode: 'git', repoKey: 'github.com/free/repo', tool: 'gh' },
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    } as never);
+
+    const response = await post('/api/projects', { id: 'newcomer', repo: 'git@github.com:free/repo.git' });
+    expect(response.statusCode).toBe(201);
+  });
+
   it('creates a project from a git URL repo and stores it verbatim', async () => {
     for (const [id, repo] of [
       ['urlhttps', 'https://github.com/example-owner/example-repo.git'],
-      ['urlssh', 'git@github.com:example-owner/example-repo.git'],
+      ['urlssh', 'git@github.com:example-owner/other-repo.git'],
     ] as const) {
       const response = await post('/api/projects', { id, repo, merge: null });
       expect(response.statusCode).toBe(201);
@@ -368,7 +412,7 @@ describe('POST /api/projects/:id/checks', () => {
   it('adds a server-host check group for effective git projects even with zero agents', async () => {
     await createProject('proj-a');
     const gitPlatform = {
-      tool: 'gh', minToolVersion: '1.8.0', steps: [],
+      tool: 'gh', minToolVersion: '1.9.0', steps: [],
       renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'user/repo', binary: 'gh' },
       driverFor: () => ({ runOp: async () => [{}] }),
     };
@@ -386,6 +430,124 @@ describe('POST /api/projects/:id/checks', () => {
     expect(push?.ok).toBe(false);
     ctxSpy.mockRestore();
     driverSpy.mockRestore();
+  });
+
+  it('checks gh only on the fixed-workdir dev publisher plus the server platform channel', async () => {
+    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: 'pr' };
+    app.ctx.config.project[0]!.review = { mode: 'server' };
+    app.ctx.config.project[0]!.agent[0]!.push({
+      id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local',
+      workdir: join(tempDir, 'research-1'),
+    });
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
+    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'gh', ok: true, message: 'GitHub CLI authenticated' },
+    ]);
+    vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
+      runPreflightSteps: async () => [{ step: 'driver-preflight-1', ok: true, message: 'gh OK' }],
+      runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
+    } as never);
+
+    const response = await post('/api/projects/proj/checks', {});
+
+    expect(response.statusCode).toBe(201);
+    expect(runSpy).toHaveBeenCalledTimes(3);
+    expect(Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[6]]))).toEqual({
+      dev: { requireGitHubCli: true, requireGitPush: true },
+      qa: { requireGitHubCli: false, requireGitPush: false },
+      research: { requireGitHubCli: false, requireGitPush: false },
+    });
+    const body = JSON.parse(response.body) as {
+      server?: { results: Array<{ step: string; ok: boolean }> };
+    };
+    expect(body.server?.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ step: 'platform-repo', ok: true }),
+      expect.objectContaining({ step: 'platform-push', ok: true }),
+    ]));
+  });
+
+  it('skips platform CLI checks for fixed-workdir research but retains them for git review participants', async () => {
+    app.ctx.config.project[0]!.agent[0]!.push({
+      id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local',
+      workdir: join(tempDir, 'research-1'),
+    });
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
+    const gitPlatform = {
+      tool: 'gh', minToolVersion: '2.40.0', steps: [], agentCommands: [],
+      renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'owner/repo', binary: 'gh' },
+      driverFor: () => ({ runOp: async () => [{}] }),
+    };
+    vi.spyOn(app.ctx.agentManager, 'agentGitPreflightContext').mockReturnValue(gitPlatform as never);
+    vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
+      runPreflightSteps: async () => [],
+      runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
+    } as never);
+    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([]);
+
+    const response = await post('/api/projects/proj/checks', {});
+
+    expect(response.statusCode).toBe(201);
+    const contexts = Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[5]]));
+    expect(contexts.dev).toBe(gitPlatform);
+    expect(contexts.qa).toBe(gitPlatform);
+    expect(contexts.research).toBeUndefined();
+  });
+
+  it('still checks gh for an automatic-workdir QA because bootstrap clones through gh', async () => {
+    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: 'pr' };
+    app.ctx.config.project[0]!.review = { mode: 'server' };
+    app.ctx.config.project[0]!.agent[0]![1]!.workdir = undefined;
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
+    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'gh', ok: true, message: 'GitHub CLI authenticated' },
+    ]);
+    vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue({
+      runPreflightSteps: async () => [{ step: 'driver-preflight-1', ok: true, message: 'gh OK' }],
+      runOp: async () => [{ defaultBranch: 'main', pushPermitted: true }],
+    } as never);
+
+    const response = await post('/api/projects/proj/checks', {});
+
+    expect(response.statusCode).toBe(201);
+    const qaCall = runSpy.mock.calls.find(call => call[1].role === 'qa');
+    expect(qaCall?.[6]).toEqual({ requireGitHubCli: true, requireGitPush: false });
+  });
+
+  it('does not require gh on a fixed Workdir when server review only publishes a branch', async () => {
+    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: 'branch' };
+    app.ctx.config.project[0]!.review = { mode: 'server' };
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
+    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'git', ok: true, message: 'origin push access OK' },
+    ]);
+    const platformDriver = vi.spyOn(app.ctx.agentManager, 'platformDriverFor');
+
+    const response = await post('/api/projects/proj/checks', {});
+
+    expect(response.statusCode).toBe(201);
+    expect(Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[6]]))).toEqual({
+      dev: { requireGitHubCli: false, requireGitPush: true },
+      qa: { requireGitHubCli: false, requireGitPush: false },
+    });
+    expect(JSON.parse(response.body).server).toBeUndefined();
+    expect(platformDriver).not.toHaveBeenCalled();
+  });
+
+  it('does not require push for fixed Workdirs when server review does not publish', async () => {
+    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: null };
+    app.ctx.config.project[0]!.review = { mode: 'server' };
+    app.ctx.agentManager.replaceConfig(app.ctx.config);
+    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
+      { step: 'workdir', ok: true, message: 'clone root OK' },
+    ]);
+
+    const response = await post('/api/projects/proj/checks', {});
+
+    expect(response.statusCode).toBe(201);
+    for (const call of runSpy.mock.calls) {
+      expect(call[6]).toEqual({ requireGitHubCli: false, requireGitPush: false });
+    }
+    expect(JSON.parse(response.body).server).toBeUndefined();
   });
 });
 
@@ -2268,6 +2430,56 @@ describe('DELETE /api/projects/:id', () => {
     expect(agentReplace).toHaveBeenCalledTimes(1);
     expect(tmuxReplace).toHaveBeenCalledTimes(1);
     expect(bootstrapReplace).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to delete a project that still has platform-bound tasks, listing them', async () => {
+    await createProject('locked');
+    await app.ctx.taskStore.set({
+      id: 'task-locked', projectId: 'locked', title: 'T', description: 'D', preferredAgentId: '', agentId: '', devAgentId: '',
+      status: 'review', reviewMode: 'git', reviewRound: 1,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    } as never);
+
+    const response = await del('/api/projects/locked');
+
+    expect(response.statusCode).toBe(409);
+    const body = JSON.parse(response.body);
+    expect(body.tasks).toEqual(['task-locked']);
+    expect(body.details).toEqual([{
+      path: 'project.locked',
+      message: 'active platform-bound tasks prevent identity changes: task-locked',
+    }]);
+    expect(body.error).toMatch(/active platform-bound task/);
+    expect(app.ctx.config.project.some(p => p.id === 'locked')).toBe(true);
+  });
+
+  it('refuses the delete for a server task that already bound its publish target', async () => {
+    await createProject('locked-srv');
+    await app.ctx.taskStore.set({
+      id: 'task-srv', projectId: 'locked-srv', title: 'T', description: 'D', preferredAgentId: '', agentId: '', devAgentId: '',
+      status: 'approved', reviewMode: 'server', afterDone: 'pr', reviewRound: 1,
+      platformBinding: { mode: 'server', repoKey: 'github.com/a/b', tool: 'gh' },
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    } as never);
+
+    const response = await del('/api/projects/locked-srv');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).tasks).toEqual(['task-srv']);
+  });
+
+  it('allows the delete once the blocking task reaches a terminal status', async () => {
+    await createProject('unlocks');
+    const base = {
+      id: 'task-unlocks', projectId: 'unlocks', title: 'T', description: 'D', preferredAgentId: '', agentId: '', devAgentId: '',
+      reviewMode: 'git', reviewRound: 1,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+    await app.ctx.taskStore.set({ ...base, status: 'review' } as never);
+    expect((await del('/api/projects/unlocks')).statusCode).toBe(409);
+
+    await app.ctx.taskStore.set({ ...base, status: 'merged' } as never);
+    expect((await del('/api/projects/unlocks')).statusCode).toBe(200);
   });
 
   it('persists the removal to baxian.json', async () => {

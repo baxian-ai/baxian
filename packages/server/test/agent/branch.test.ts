@@ -61,22 +61,20 @@ afterEach(async () => {
 });
 
 describe('isAutoDeletableTaskBranch', () => {
-  it('accepts only a proven baxian branch with exact task branch and ref', () => {
+  it('accepts only a proven baxian branch with the exact task namespace', () => {
     expect(isAutoDeletableTaskBranch({
       taskId: 'task-1',
       taskBranch: 'bx/task-1',
       branchCreatedByBaxian: true,
-      actualRef: 'refs/heads/bx/task-1',
     })).toBe(true);
   });
 
   it.each([
-    { taskId: 'task-1', taskBranch: 'feature/foo', branchCreatedByBaxian: false, actualRef: 'refs/heads/feature/foo' },
-    { taskId: 'task-1', taskBranch: 'bx/task-1', branchCreatedByBaxian: false, actualRef: 'refs/heads/bx/task-1' },
-    { taskId: 'task-1', taskBranch: 'bx/task-2', branchCreatedByBaxian: true, actualRef: 'refs/heads/bx/task-2' },
-    { taskId: 'task-1', taskBranch: 'bx/task-1-backup', branchCreatedByBaxian: true, actualRef: 'refs/heads/bx/task-1-backup' },
-    { taskId: 'task-1', taskBranch: 'bx/task-1', branchCreatedByBaxian: true, actualRef: 'refs/heads/bx/other' },
-    { taskBranch: 'bx/task-1', branchCreatedByBaxian: true, actualRef: 'refs/heads/bx/task-1' },
+    { taskId: 'task-1', taskBranch: 'feature/foo', branchCreatedByBaxian: false },
+    { taskId: 'task-1', taskBranch: 'bx/task-1', branchCreatedByBaxian: false },
+    { taskId: 'task-1', taskBranch: 'bx/task-2', branchCreatedByBaxian: true },
+    { taskId: 'task-1', taskBranch: 'bx/task-1-backup', branchCreatedByBaxian: true },
+    { taskBranch: 'bx/task-1', branchCreatedByBaxian: true },
   ])('rejects non-exact or unproven identity %#', identity => {
     expect(isAutoDeletableTaskBranch(identity)).toBe(false);
   });
@@ -662,7 +660,7 @@ describe('BranchManager', () => {
     const autoTask: TaskState = {
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
       preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
+      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
     };
     const customTask: TaskState = {
       ...autoTask, id: 'task-2', title: 'custom', branch: 'bx/task-2', branchCreatedByBaxian: false,
@@ -723,7 +721,7 @@ describe('BranchManager', () => {
     const task: TaskState = {
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
       preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
+      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
     };
     await run(
       `git -C ${shellQuote(workdir)} switch -q -c bx/task-1 && ` +
@@ -805,7 +803,7 @@ describe('BranchManager', () => {
     await taskStore.set({
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
       preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged',
+      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, status: 'merged',
       branchCleanupSkipped: {
         agentId: 'dev-1',
         reason: 'remote branch is absent; preserving the local branch without retry',
@@ -876,7 +874,7 @@ describe('BranchManager', () => {
       id: 'task-1', projectId: 'proj', title: 'spec', description: '',
       preferredAgentId: 'research-1', agentId: '', devAgentId: 'dev-1',
       researchAgentId: 'research-1', phase: 'spec', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, specReviewRound: 2,
+      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, specReviewRound: 2,
       status: 'max_rounds', createdAt: now, updatedAt: now,
     });
     await reviewStore.putRound('task-1', 'spec', {

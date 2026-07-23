@@ -3,7 +3,7 @@ export type AgentRole = 'dev' | 'qa' | 'research';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
-export type ReviewMode = 'github' | 'server' | 'git';
+export type ReviewMode = 'git' | 'server';
 type AfterDone = 'pr' | 'branch' | null;
 export type SupportedLanguage = 'zh-CN' | 'en-US';
 
@@ -206,7 +206,7 @@ export interface TaskState {
   specReviewRound?: number;
   phase?: TaskPhase;
   signalToken?: string;
-  reviewMode?: ReviewMode;
+  reviewMode: ReviewMode;
   batchIndex?: number;
   batchTotal?: number;
   maxRoundsContinues?: number;
@@ -290,7 +290,7 @@ export interface CodeReviewRound extends ReviewRoundBase {
 
 export type ReviewRound = SpecReviewRound | CodeReviewRound;
 
-type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment' | 'commit';
+type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';
 
 export type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
 
@@ -315,7 +315,7 @@ export interface PrReviewItem {
 
 export interface PrReviewConversation {
   available: boolean;
-  reason?: 'server-mode' | 'no-pr' | 'not-github' | 'driver-unavailable';
+  reason?: 'server-mode' | 'no-pr' | 'driver-unavailable';
   prNumber?: number;
   prUrl?: string;
   items: PrReviewItem[];
@@ -426,6 +426,8 @@ export interface PollerSnapshot {
   lastPollDurationMs?: number;
   lastErrorAt?: string;
   lastErrorMessage?: string;
+  lastErrorClass?: string;
+  rateLimitedUntil?: string;
   consecutiveFailures: number;
   health: PollerHealth;
 }

@@ -1,6 +1,6 @@
 ---
 name: baxian-task-check
-description: Use when a baxian dispatch descriptor carries `phase: develop` or `phase: code` — the dev-side entry for analyzing and executing the task.
+description: "Use when a baxian dispatch descriptor carries `phase: develop` or `phase: code` — the dev-side entry for analyzing and executing the task."
 disable-model-invocation: true
 ---
 
@@ -18,12 +18,11 @@ Installed skills and personal workflows apply as usual — baxian orchestrates t
 
 ## Conventions
 
-Stay in scope — out-of-scope work goes to a new GitHub Issue for `exchange: github-pr` (for `git-pr`: a new issue via your platform skill), or into your commit message for `server-files`. Deliver only through this dispatch's signal route, never a skill's own finishing flow, and never merge — baxian owns merging.
+Stay in scope — out-of-scope work goes to a new issue via your platform skill for `exchange: git-pr`, or into your commit message for `server-files`. Deliver only through this dispatch's signal route, never a skill's own finishing flow, and never merge — baxian owns merging.
 
 Your `exchange:` field selects the cross-agent medium:
 
-- `github-pr`: communicate via the GitHub PR (description, commits, reviews, comments). Commit on the branch already checked out in `workdir:` — do NOT create or push a differently-named branch, or baxian can't match the PR to your task.
-- `git-pr`: the same PR-based flow, platform-neutral. Load the `baxian-cli-<tool>` skill named by your `cli:` field (`cli: gh` means `baxian-cli-gh`) and take every platform command from it. Commit on the branch already checked out in `workdir:` — the PR must come from exactly the `branch:` value.
+- `git-pr`: communicate via the platform PR (description, commits, reviews, comments). Load the `baxian-cli-<tool>` skill named by your `cli:` field (`cli: gh` means `baxian-cli-gh`) and take every platform command from it. Commit on the branch already checked out in `workdir:` — the PR must come from exactly the `branch:` value, or baxian can't match it to your task.
 - `server-files`: baxian reads your Workdir directly; do NOT push or open a PR (the publish phase does that).
 
 ## Develop
@@ -50,6 +49,5 @@ The approved spec is at `.baxian/spec.md`. Implement it, then follow §Deliver.
 
 Emit your `signal:` with `token:` when your `exchange:`'s completion step is done:
 
-- `github-pr`: commit + push, `gh pr create` ready for review — do NOT use `--draft`; if the PR is draft after creation, run `gh pr ready` before signaling. Emit `pr-created`.
 - `git-pr`: commit, then create the PR per your `baxian-cli-<tool>` skill §Create — it owns push, non-interactive create with the source branch, repository, and target identity passed explicitly in that platform's own flags, Draft recovery, and the actor self-report segment. Emit `pr-created` in the actor-segment form that section specifies, only after its checks pass.
 - `server-files`: local commit only (do NOT push, no PR). Emit `code-done`.

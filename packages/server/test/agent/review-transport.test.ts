@@ -76,8 +76,14 @@ const FINDINGS_JSON = JSON.stringify({
 
 const RESPONSE_JSON = JSON.stringify({
   round: 1,
+  token: 'abcdef123456',
+  findingsDigest: 'a'.repeat(64),
   responses: [{ findingId: 'f-1', action: 'fix', rationale: 'fixed', commitSha: 'abc123' }],
 });
+const RESPONSE_GENERATION = {
+  token: 'abcdef123456',
+  findingsDigest: 'a'.repeat(64),
+};
 
 describe('readContent (code)', () => {
   it('fetches, detects default branch, captures merge-base, head tree, and binary diff', async () => {
@@ -414,6 +420,38 @@ describe('readFindings / readResponse', () => {
     expect(rm).toContain("[ ! -L '/wt/dev/.baxian/review/response.json' ] && rm -f --");
   });
 
+  it('preserves invalid response bytes and computes their digest before parsing', async () => {
+    const raw = '{\n  "round": 1,\n';
+    const { transport } = makeTransport([
+      { match: c => c.includes('response.json') && c.startsWith('cat'), result: { stdout: raw } },
+    ]);
+    const result = await transport.readResponseWithRaw(task(), DEV);
+    expect(result).toMatchObject({
+      kind: 'invalid',
+      raw,
+    });
+    if (result.kind !== 'invalid') throw new Error('expected invalid response');
+    expect(result.responseDigest).toBe(
+      'e4447dee699b34f682298ce615eaf945665aed197e14776dd0abd58cb9a29df0',
+    );
+    expect(result.schemaViolationCodes).toEqual(['malformed-json']);
+  });
+
+  it.each([
+    ['exit 255', { exitCode: 255, stderr: 'ssh disconnected' }],
+    ['transient stderr', { exitCode: 1, stderr: 'Connection timed out' }],
+    ['transient stdout', { exitCode: 1, stdout: 'Connection reset by peer' }],
+    ['transient stderr with exit zero', { exitCode: 0, stderr: 'Connection timed out' }],
+  ])('classifies an unknown response read from %s without treating it as absent', async (_label, result) => {
+    const { transport } = makeTransport([
+      { match: c => c.includes('response.json') && c.startsWith('cat'), result },
+    ]);
+    await expect(transport.readResponseWithRaw(task(), DEV)).resolves.toMatchObject({
+      kind: 'unknown',
+      error: { reason: 'read-unknown' },
+    });
+  });
+
   it('fails closed instead of deleting when the exchange dir has been swapped for a symlink (real fs)', async () => {
     const worktree = await realpath(await mkdtemp(join(tmpdir(), 'review-exchange-symlink-')));
     const outside = await mkdtemp(join(tmpdir(), 'review-exchange-outside-'));
@@ -485,6 +523,15 @@ describe('clearDispatchOutputs', () => {
       .rejects.toThrow(expect.objectContaining({ reason: 'artifact-cleanup-failed' }));
   });
 
+  it('fails closed when stale output cleanup has an unknown transport outcome with exit zero', async () => {
+    const { transport } = makeTransport([
+      { match: command => command.includes('rm -f --'), result: { exitCode: 0, stderr: 'Connection timed out' } },
+    ]);
+
+    await expect(transport.clearDispatchOutputs(QA, '/wt/qa', 'server-review'))
+      .rejects.toThrow(expect.objectContaining({ reason: 'artifact-cleanup-failed' }));
+  });
+
   it('fails closed when stale Research document cleanup fails before develop', async () => {
     const { transport } = makeTransport([
       {
@@ -498,6 +545,18 @@ describe('clearDispatchOutputs', () => {
         reason: 'artifact-cleanup-failed',
         message: expect.stringContaining('failed to clear stale research docs'),
       }));
+  });
+
+  it('fails closed when Research cleanup has an unknown transport outcome with exit zero', async () => {
+    const { transport } = makeTransport([
+      {
+        match: command => command.includes("rm -rf -- '/wt/dev/.baxian/research'"),
+        result: { exitCode: 0, stderr: 'Connection reset by peer' },
+      },
+    ]);
+
+    await expect(transport.clearDispatchOutputs(DEV, '/wt/dev', 'develop'))
+      .rejects.toThrow(expect.objectContaining({ reason: 'artifact-cleanup-failed' }));
   });
 });
 
@@ -596,11 +655,13 @@ describe('validators', () => {
 
   it('rejects response with unknown action or empty rationale', () => {
     expect(() => validateReviewResponse({
-      round: 1, responses: [{ findingId: 'f-1', action: 'ignore', rationale: 'x' }],
-    })).toThrow(ReviewExchangeError);
+      round: 1, ...RESPONSE_GENERATION,
+      responses: [{ findingId: 'f-1', action: 'ignore', rationale: 'x' }],
+    })).toThrow(expect.objectContaining({ violationCode: 'invalid-action' }));
     expect(() => validateReviewResponse({
-      round: 1, responses: [{ findingId: 'f-1', action: 'reject', rationale: '' }],
-    })).toThrow(ReviewExchangeError);
+      round: 1, ...RESPONSE_GENERATION,
+      responses: [{ findingId: 'f-1', action: 'reject', rationale: '' }],
+    })).toThrow(expect.objectContaining({ violationCode: 'missing-rationale' }));
   });
 });
 
@@ -608,11 +669,23 @@ describe('response validators', () => {
   it('rejects duplicate response findingIds', () => {
     expect(() => validateReviewResponse({
       round: 1,
+      ...RESPONSE_GENERATION,
       responses: [
         { findingId: 'f-1', action: 'fix', rationale: 'a' },
         { findingId: 'f-1', action: 'reject', rationale: 'b' },
       ],
-    })).toThrow(expect.objectContaining({ reason: 'schema' }));
+    })).toThrow(expect.objectContaining({ reason: 'schema', violationCode: 'duplicate-finding-id' }));
+  });
+
+  it.each([
+    ['token', { findingsDigest: 'a'.repeat(64) }, 'missing-or-invalid-token'],
+    ['findings digest', { token: 'abcdef123456' }, 'missing-or-invalid-findings-digest'],
+  ])('requires the response %s generation field', (_label, generation, violationCode) => {
+    expect(() => validateReviewResponse({
+      round: 1,
+      ...generation,
+      responses: [],
+    })).toThrow(expect.objectContaining({ violationCode }));
   });
 });
 

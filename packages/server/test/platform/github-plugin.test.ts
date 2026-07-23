@@ -11,7 +11,7 @@ const BUILTIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../src/pl
 const SHA = 'a'.repeat(40);
 const CTX: RenderContext = {
   scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'owner/repo',
-  binary: 'gh', prNumber: 42, expectedHeadSha: SHA, branch: 'bx/task-1', page: 3,
+  binary: 'gh', prNumber: 42, expectedHeadSha: SHA, remoteProjectId: 'R_repo123', branch: 'bx/task-1', page: 3,
 };
 
 let userRoot = '';
@@ -35,7 +35,7 @@ describe('builtin github plugin: loading', () => {
     expect(plugin.source).toBe('builtin');
     expect(plugin.manifest.name).toBe('github');
     expect(plugin.manifest.tool).toBe('gh');
-    expect(plugin.manifest.minToolVersion).toBe('1.8.0');
+    expect(plugin.manifest.minToolVersion).toBe('1.9.0');
     expect(plugin.skillNames).toEqual(['baxian-cli-gh']);
   });
 
@@ -65,6 +65,14 @@ describe('builtin github plugin: rendered argv equivalence', () => {
     expect(render('projectView')).toBe("GH_HOST='github.com' 'gh' 'api' 'repos/owner/repo'");
   });
 
+  it('branchView queries the bound repository id and qualified ref', () => {
+    expect(render('branchView')).toBe(
+      "GH_HOST='github.com' 'gh' 'api' 'graphql' '-f' 'repositoryId=R_repo123' '-f' " +
+      "'refName=refs/heads/bx/task-1' '-f' " +
+      "'query=query($repositoryId:ID!,$refName:String!){node(id:$repositoryId){... on Repository{id ref(qualifiedName:$refName){target{oid}}}}}'",
+    );
+  });
+
   it('merge carries the squash method and the atomic expected-head sha', () => {
     expect(render('merge')).toBe(
       `GH_HOST='github.com' 'gh' 'api' '-X' 'PUT' 'repos/owner/repo/pulls/42/merge' '-f' 'merge_method=squash' '-f' 'sha=${SHA}'`,
@@ -77,10 +85,14 @@ describe('builtin github plugin: rendered argv equivalence', () => {
     );
   });
 
-  it('deleteBranch expands the ref path with a literal slash, not %2F', () => {
-    expect(render('deleteBranch')).toBe(
-      "GH_HOST='github.com' 'gh' 'api' '-X' 'DELETE' 'repos/owner/repo/git/refs/heads/bx/task-1'",
-    );
+  it('deleteBranch renders updateRefs with the expected tip and repository id', () => {
+    const cmd = render('deleteBranch');
+    expect(cmd).toContain("'repositoryId=R_repo123'");
+    expect(cmd).toContain("'refName=refs/heads/bx/task-1'");
+    expect(cmd).toContain(`'beforeOid=${SHA}'`);
+    expect(cmd).toContain('$refName:GitRefname!');
+    expect(cmd).toContain('updateRefs');
+    expect(cmd).not.toContain("'-X' 'DELETE'");
   });
 
   it('the three comment sources page through their endpoints', () => {
@@ -99,7 +111,7 @@ describe('builtin github plugin: preflight', () => {
 
   it('fixMessages interpolate the executable and pin the supported credential classes', () => {
     const version = renderFixMessage(plugin.spec.preflight[0]!.fixMessage, { ...CTX, minToolVersion: plugin.manifest.minToolVersion });
-    expect(version).toBe('该主机的 gh 需 ≥ 1.8.0，安装/升级见 https://cli.github.com');
+    expect(version).toBe('该主机的 gh 需 ≥ 1.9.0，安装/升级见 https://cli.github.com');
     const auth = renderFixMessage(plugin.spec.preflight[1]!.fixMessage, { ...CTX, minToolVersion: plugin.manifest.minToolVersion });
     expect(auth).toBe(
       '在该主机运行：gh auth login --hostname github.com（受支持凭据：auth login 用户令牌 / fine-grained PAT / GitHub App user token；App installation token 不支持——无法调用 /user 自省身份）',

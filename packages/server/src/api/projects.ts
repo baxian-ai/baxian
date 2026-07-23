@@ -25,8 +25,10 @@ import { withConfigLock } from '../config/mutex.js';
 import { redactProjects } from './config.js';
 import { CleanupFailedError } from '../agent/manager.js';
 import { AGENT_STORE_NOOP } from '../state/agent-store.js';
-import { applyConfigHotReload } from '../config/hot-reload.js';
+import { applyConfigHotReload, prepareConfigHotReload } from '../config/hot-reload.js';
+import { gitBindingBlockerDetails, gitBindingBlockers } from './platform-guard.js';
 import { safeDriverErrorText } from '../platform/git-driver.js';
+import { projectAfterDone, projectNeedsPlatformEntry, projectReviewMode } from '../config/validator.js';
 
 interface CheckRun {
   agentId: string;
@@ -180,13 +182,24 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const entries: CheckEntry[] = [];
       const checks: Promise<CheckRun>[] = [];
       const gitPlatform = app.ctx.agentManager.agentGitPreflightContext(project.id);
+      const reviewMode = projectReviewMode(app.ctx.config, project);
+      const afterDone = projectAfterDone(app.ctx.config, project);
       for (const pair of project.agent) {
         for (const agent of pair) {
           const host = resolveAgentHost(app.ctx.config.host, agent.host);
           const runner = createRunner(agent.mode, host);
+          const agentGitPlatform = agent.role === 'research' && agent.workdir !== undefined
+            ? undefined
+            : gitPlatform;
           entries.push({ agent, hostGroup: hostGroupKey(agent.mode, host), runner });
           checks.push(
-            runPreflight(runner, agent, project.repo, host, project.id, gitPlatform).then(results => ({
+            runPreflight(runner, agent, project.repo, host, project.id, agentGitPlatform, {
+              requireGitHubCli: reviewMode === 'server'
+                && (agent.workdir === undefined
+                  || (agent.role === 'dev' && afterDone === 'pr')),
+              requireGitPush: agent.role === 'dev'
+                && (reviewMode === 'git' || afterDone !== null),
+            }).then(results => ({
               agentId: agent.id,
               mode: agent.mode,
               results,
@@ -197,7 +210,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const agents = await Promise.all(checks);
       // server 执行面手动诊断组：poller 未装配/零 agent 的部署也要能自证 merge/close 通道。
       let server: { results: PreflightResult[] } | undefined;
-      if (gitPlatform !== undefined) {
+      if (projectNeedsPlatformEntry(app.ctx.config, project)) {
         server = { results: await runServerHostChecks(app.ctx.agentManager, project.id) };
       }
       if (request.body?.fix !== true) {
@@ -242,7 +255,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         throw err;
       }
 
-      // 扫描与删除提交经 manager 任务锁同栅栏：并发 createTask 不能在检查后为该项目落新 git 任务
       const guarded = await app.ctx.agentManager.guardGitConfigCommit(
         app.ctx.config,
         validated,
@@ -251,17 +263,19 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           return active.length > 0 ? [{ projectId: id, taskIds: active.map(t => t.id) }] : [];
         },
         async () => {
+          const hotReload = await prepareConfigHotReload(app.ctx, validated);
           await saveConfig(app.ctx.configPath!, validated);
           app.ctx.config = validated;
-          applyConfigHotReload(app.ctx, validated);
+          await applyConfigHotReload(app.ctx, validated, hotReload);
         },
       );
       if (!guarded.ok) {
         return reply.status(409).send({
           error:
-            `Project "${id}" still has ${guarded.blockers[0]!.taskIds.length} active git-mode task(s); ` +
+            `Project "${id}" still has ${guarded.blockers[0]!.taskIds.length} active platform-bound task(s); ` +
             `wait for them to finish or cancel them before deleting the project.`,
           tasks: guarded.blockers[0]!.taskIds,
+          details: gitBindingBlockerDetails(guarded.blockers),
         });
       }
       return reply.status(200).send({ removed: id, restartRequired: false });
@@ -320,9 +334,26 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           });
         }
 
-        await saveConfig(app.ctx.configPath!, validated);
-        app.ctx.config = validated;
-        applyConfigHotReload(app.ctx, validated);
+        const guarded = await app.ctx.agentManager.guardGitConfigCommit(
+          app.ctx.config,
+          validated,
+          (manager, cur, next) => gitBindingBlockers(manager, cur, next),
+          async () => {
+            const hotReload = await prepareConfigHotReload(app.ctx, validated);
+            await saveConfig(app.ctx.configPath!, validated);
+            app.ctx.config = validated;
+            await applyConfigHotReload(app.ctx, validated, hotReload);
+          },
+        );
+        if (!guarded.ok) {
+          return reply.status(409).send({
+            error:
+              `Cannot create project "${id}": its repo is locked by ${guarded.blockers[0]!.taskIds.length} active `
+              + `platform-bound task(s) in another project; wait for them to finish or cancel them first.`,
+            tasks: guarded.blockers[0]!.taskIds,
+            details: gitBindingBlockerDetails(guarded.blockers),
+          });
+        }
         const stored = validated.project.find(p => p.id === id)!;
         return reply.status(201).send({ project: stored, restartRequired: false });
       });

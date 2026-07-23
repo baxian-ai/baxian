@@ -138,7 +138,15 @@ it('surfaces a config load failure instead of silently rendering the github defa
   await waitFor(() => expect(screen.getByText(/Failed to load/)).toBeTruthy());
 });
 
-it('renders the neutral Git (PR/MR) label while submitting the current github mode value', async () => {
+it('preserves line breaks in a multiline create failure', async () => {
+  createMock.mockRejectedValue(new Error('project invalid\nrepo: unreachable'));
+  await renderAndFill('example-owner/example-repo');
+  const banner = await screen.findByText(/project invalid/);
+  expect(banner.textContent).toBe('project invalid\nrepo: unreachable');
+  expect(banner.classList.contains('whitespace-pre-line')).toBe(true);
+});
+
+it('submits the git mode value behind the neutral Git (PR/MR) label', async () => {
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Project ID'), { target: { value: 'gitproj' } });
@@ -152,7 +160,7 @@ it('renders the neutral Git (PR/MR) label while submitting the current github mo
     repo: 'example-owner/example-repo',
     merge: null,
     specApproval: 'human',
-    review: { mode: 'github' },
+    review: { mode: 'git' },
   });
 });
 
@@ -172,11 +180,24 @@ it('offers a tool override for an explicit GitHub URL under git mode', async () 
   expect(screen.queryByLabelText('Git CLI tool')).toBeNull();
 });
 
-it('hides the git CLI inputs under the current github/server defaults', async () => {
+it('hides the git CLI inputs once the effective mode resolves to server', async () => {
+  configGetMock.mockResolvedValue({
+    review: { rounds: 2, mode: 'server' },
+    server: { port: 7080 },
+    host: [],
+    project: [],
+  });
   render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
   await waitFor(() => expect(configGetMock).toHaveBeenCalled());
   fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://gitlab.example.com/group/proj.git' } });
   expect(screen.queryByLabelText('Git CLI tool')).toBeNull();
+});
+
+it('surfaces the git CLI inputs for a non-github repo under the git default', async () => {
+  render(<CreateProjectModal open onClose={() => {}} onCreated={() => {}} />);
+  await waitFor(() => expect(configGetMock).toHaveBeenCalled());
+  fireEvent.change(screen.getByLabelText('Git repository URL'), { target: { value: 'https://gitlab.example.com/group/proj.git' } });
+  expect(await screen.findByLabelText('Git CLI tool')).toBeTruthy();
 });
 
 it('surfaces the git CLI inputs for a non-github repo once the effective mode resolves to git', async () => {

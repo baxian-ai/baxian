@@ -35,7 +35,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
   const [merge, setMerge] = useState<MergeStrategy>(null);
   const [specApproval, setSpecApproval] = useState<SpecApprovalStrategy>('human');
   const [reviewMode, setReviewMode] = useState<ReviewMode | ''>('');
-  const [globalMode, setGlobalMode] = useState<ReviewMode>('github');
+  const [globalMode, setGlobalMode] = useState<ReviewMode>('git');
   const [gitCliTool, setGitCliTool] = useState('');
   const [gitCliNotes, setGitCliNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -55,7 +55,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     setMerge(null);
     setSpecApproval('human');
     setReviewMode('');
-    setGlobalMode('github');
+    setGlobalMode('git');
     setGitCliTool('');
     setGitCliNotes('');
     setError(null);
@@ -66,7 +66,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
       .then(cfg => {
         if (session !== sessionRef.current) return;
         setExistingIds(new Set(cfg.project.map(p => p.id)));
-        setGlobalMode(cfg.review?.mode ?? 'github');
+        setGlobalMode(cfg.review?.mode ?? 'git');
       })
       .catch(err => {
         if (session !== sessionRef.current) return;
@@ -147,7 +147,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
     >
       <form id="create-project-form" onSubmit={handleSubmit} className="space-y-3">
         {error && (
-          <div className="rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
+          <div className="whitespace-pre-line rounded-md border border-accent/25 bg-accent-soft px-3 py-2 text-sm text-accent">
             {error}
           </div>
         )}
@@ -249,8 +249,8 @@ export function CreateProjectModal({ open, onClose, onCreated }: Props) {
             <input
               type="radio"
               name="review-mode"
-              checked={reviewMode === 'github'}
-              onChange={() => setReviewMode('github')}
+              checked={reviewMode === 'git'}
+              onChange={() => setReviewMode('git')}
               disabled={submitting}
               className="h-3.5 w-3.5 accent-accent"
             />

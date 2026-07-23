@@ -1089,6 +1089,7 @@ describe('AgentCard', () => {
       const dialog = await findConfirmDialog();
       expect(within(dialog).getByText('Start a QA re-review?')).toBeTruthy();
       expect(within(dialog).getByText(/task-9/)).toBeTruthy();
+      expect(within(dialog).getByText(/continue only after verifying the QA pane did not receive it/)).toBeTruthy();
       await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Start re-review' })); });
 
       expect(reviewMock).toHaveBeenCalledWith('task-9');

@@ -13,7 +13,7 @@ const ghMock = vi.mocked(api.tasks.prReview);
 function convo(items: number): PrReviewConversation {
   return {
     available: true,
-    items: Array.from({ length: items }, (_, i) => ({ kind: 'commit' as const, id: `c${i}` })),
+    items: Array.from({ length: items }, (_, i) => ({ kind: 'issue-comment' as const, id: `c${i}` })),
   };
 }
 

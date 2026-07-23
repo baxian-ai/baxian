@@ -166,7 +166,6 @@ function normalizeNeedInput(raw: Record<string, unknown>): NeedInputWatermark | 
         w.answeredSeq = o.answeredSeq;
       }
       if (typeof o.at === 'string') w.at = o.at;
-      if (typeof o.cutoverToken === 'string') w.cutoverToken = o.cutoverToken;
       return w;
     }
   }

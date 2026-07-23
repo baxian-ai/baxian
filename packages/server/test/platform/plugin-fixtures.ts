@@ -27,7 +27,16 @@ export const DRIVER = JSON.stringify({
     projectView: {
       argv: ['{binary}', 'api', 'repos/{repoPath}'],
       parse: 'json',
-      map: { defaultBranch: 'default_branch' },
+      map: { defaultBranch: 'default_branch', remoteProjectId: 'node_id' },
+    },
+    branchView: {
+      argv: ['{binary}', 'api', 'graphql', 'branch-ref', '{remoteProjectId}', '{branch}'],
+      parse: 'json',
+      responseEnvelope: 'graphql',
+      map: {
+        remoteProjectId: 'data.node.id',
+        headSha: { sources: ['data.node.ref.target.oid'], optional: true },
+      },
     },
     listComments: {
       argv: ['{binary}', 'api', 'repos/{repoPath}/issues/{prNumber}/comments?page={page}'],
@@ -41,8 +50,8 @@ export const DRIVER = JSON.stringify({
       argv: ['{binary}', 'api', '-X', 'PATCH', 'repos/{repoPath}/pulls/{prNumber}', '-f', 'state=closed'],
     },
     deleteBranch: {
-      argv: ['{binary}', 'api', '-X', 'DELETE', 'repos/{repoPath}/git/refs/heads/{branch}'],
-      treatAsSuccess: ['REF_NOT_FOUND'],
+      argv: ['{binary}', 'api', 'graphql', 'delete-ref', '{branch}', '{expectedHeadSha}', '{remoteProjectId}'],
+      responseEnvelope: 'graphql',
     },
   },
   preflight: [{ argv: ['{binary}', '--version'], fixMessage: 'install it', versionCheck: true }],
@@ -51,6 +60,5 @@ export const DRIVER = JSON.stringify({
     { class: 'ACCESS_DENIED', regex: ['401', '403'] },
     { class: 'NOT_FOUND', regex: ['404'] },
     { class: 'MERGE_BLOCKED', regex: ['405'] },
-    { class: 'REF_NOT_FOUND', regex: ['Reference does not exist'] },
   ],
 });

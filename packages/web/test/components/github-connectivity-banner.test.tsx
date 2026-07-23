@@ -50,7 +50,7 @@ describe('GithubConnectivityBanner', () => {
       snapshot({ repo: 'user/flaky', health: 'degraded', consecutiveFailures: 1 }),
     ];
     render(<GithubConnectivityBanner />);
-    expect(screen.getByText(/GitHub polling degraded/)).not.toBeNull();
+    expect(screen.getByText(/Platform polling degraded/)).not.toBeNull();
     expect(screen.getByText(/user\/flaky/)).not.toBeNull();
   });
 
@@ -60,7 +60,41 @@ describe('GithubConnectivityBanner', () => {
       snapshot({ repo: 'user/down', health: 'failed', consecutiveFailures: 4 }),
     ];
     render(<GithubConnectivityBanner />);
-    expect(screen.getByText(/GitHub unreachable/)).not.toBeNull();
+    expect(screen.getByText(/Platform unreachable/)).not.toBeNull();
+    expect(screen.getByText(/user\/down/)).not.toBeNull();
+  });
+
+  it('shows an active rate limit even while poller health remains healthy', () => {
+    pollersState.data = [snapshot({
+      repo: 'user/throttled',
+      lastErrorClass: 'RATE_LIMIT',
+      rateLimitedUntil: '2099-01-01T00:00:00.000Z',
+    })];
+    render(<GithubConnectivityBanner />);
+    expect(screen.getByText(/Platform polling rate-limited/)).not.toBeNull();
+    expect(screen.getByText(/user\/throttled/)).not.toBeNull();
+  });
+
+  it('ignores an expired rate-limit window', () => {
+    pollersState.data = [snapshot({
+      lastErrorClass: 'RATE_LIMIT',
+      rateLimitedUntil: '2000-01-01T00:00:00.000Z',
+    })];
+    const { container } = render(<GithubConnectivityBanner />);
+    expect(container.innerHTML).toBe('');
+  });
+
+  it('reports a failed poller ahead of a concurrently rate-limited one', () => {
+    pollersState.data = [
+      snapshot({
+        repo: 'user/throttled',
+        lastErrorClass: 'RATE_LIMIT',
+        rateLimitedUntil: '2099-01-01T00:00:00.000Z',
+      }),
+      snapshot({ repo: 'user/down', health: 'failed', consecutiveFailures: 3 }),
+    ];
+    render(<GithubConnectivityBanner />);
+    expect(screen.getByText(/Platform unreachable/)).not.toBeNull();
     expect(screen.getByText(/user\/down/)).not.toBeNull();
   });
 
@@ -73,7 +107,7 @@ describe('GithubConnectivityBanner', () => {
       }),
     ];
     render(<GithubConnectivityBanner />);
-    const banner = screen.getByText(/GitHub unreachable/).closest('div');
+    const banner = screen.getByText(/Platform unreachable/).closest('div');
     expect(banner?.getAttribute('title')).toContain('i/o timeout');
   });
 });

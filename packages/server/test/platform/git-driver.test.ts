@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   GitDriver, DriverOpError, buildDriverRunContext,
   DRIVER_MAX_BUFFER, DRIVER_EXEC_TIMEOUT_MS,
@@ -97,10 +97,81 @@ describe('GitDriver: error classification', () => {
   });
 
   it('treats declared treatAsSuccess classes as idempotent success', async () => {
-    const { driver } = driverWith({
-      'git/refs/heads': { stdout: '', stderr: 'gh: Reference does not exist (HTTP 422)', exitCode: 1 },
+    const spec = JSON.parse(DRIVER) as {
+      ops: { close: { treatAsSuccess?: string[] } };
+      errorClasses: Array<{ class: string; regex: string[] }>;
+    };
+    spec.ops.close.treatAsSuccess = ['ALREADY_CLOSED'];
+    spec.errorClasses.push({ class: 'ALREADY_CLOSED', regex: ['already closed'] });
+    const { driver } = driverWith(
+      { 'pulls/42': { stdout: '', stderr: 'pull request is already closed', exitCode: 1 } },
+      JSON.stringify(spec),
+    );
+    expect(await driver.runOp('close', { prNumber: 42 })).toEqual([]);
+  });
+
+  it('skips error classification for successful REST and GraphQL operations', async () => {
+    const rest = driverWith({ 'pulls/42': ok(PR) }).driver;
+    const restClassify = vi.spyOn(rest, 'classify');
+    await rest.runOp('prView', { prNumber: 42 });
+    expect(restClassify).not.toHaveBeenCalled();
+
+    const graphql = driverWith({
+      'delete-ref': ok({ data: { updateRefs: { clientMutationId: null } } }),
+    }).driver;
+    const graphqlClassify = vi.spyOn(graphql, 'classify');
+    await graphql.runOp('deleteBranch', {
+      branch: 'bx/task-1', expectedHeadSha: SHA, remoteProjectId: 'R_repo',
     });
-    expect(await driver.runOp('deleteBranch', { branch: 'bx/task-1' })).toEqual([]);
+    expect(graphqlClassify).not.toHaveBeenCalled();
+  });
+
+  it('rejects GraphQL errors even when the command exits zero with partial data', async () => {
+    const { driver } = driverWith({
+      'delete-ref': ok({ data: { updateRefs: null }, errors: [{ message: 'ref changed' }] }),
+    });
+    const classify = vi.spyOn(driver, 'classify');
+    await expect(driver.runOp('deleteBranch', {
+      branch: 'bx/task-1', expectedHeadSha: SHA, remoteProjectId: 'R_repo',
+    })).rejects.toThrow(/GraphQL errors/);
+    expect(classify).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces GraphQL request errors when the envelope omits data', async () => {
+    const { driver } = driverWith({
+      'delete-ref': ok({ errors: [{ message: 'repository id is invalid' }] }),
+    });
+    await expect(driver.runOp('deleteBranch', {
+      branch: 'bx/task-1', expectedHeadSha: SHA, remoteProjectId: 'R_repo',
+    })).rejects.toThrow(/repository id is invalid/);
+  });
+
+  it('preserves GraphQL error payloads when the command exits nonzero', async () => {
+    const payload = JSON.stringify({ errors: [{ message: 'beforeOid does not match' }] });
+    const { driver } = driverWith({
+      'delete-ref': { stdout: payload, stderr: 'GraphQL request failed', exitCode: 1 },
+    });
+    const err = await driver.runOp('deleteBranch', {
+      branch: 'bx/task-1', expectedHeadSha: SHA, remoteProjectId: 'R_repo',
+    }).catch((error: unknown) => error as DriverOpError);
+    expect(err).toBeInstanceOf(DriverOpError);
+    expect(err.info.exitCode).toBe(1);
+    expect(err.message).toContain('beforeOid does not match');
+    expect(err.info.stderrTail).toContain('beforeOid does not match');
+  });
+
+  it('maps branchView into present and absent authoritative states', async () => {
+    const absent = driverWith({
+      'branch-ref': ok({ data: { node: { id: 'R_repo', ref: null } } }),
+    }).driver;
+    await expect(absent.runOp('branchView', { branch: 'bx/task-1', remoteProjectId: 'R_repo' }))
+      .resolves.toEqual([{ remoteProjectId: 'R_repo', headSha: undefined }]);
+
+    const present = driverWith({
+      'branch-ref': ok({ data: { node: { id: 'R_repo', ref: { target: { oid: SHA } } } } }),
+    }).driver;
+    await expect(present.runOp('branchView', { branch: 'bx/task-1', remoteProjectId: 'R_repo' }))
+      .resolves.toEqual([{ remoteProjectId: 'R_repo', headSha: SHA }]);
   });
 
   it('unclassified failures carry exit code and stderr tail', async () => {
@@ -190,7 +261,12 @@ describe('GitDriver: single-resource op cardinality', () => {
   });
 
   it('fails closed when a single-object op yields multiple rows', async () => {
-    const { driver } = driverWith({ 'repos/o/r': ok([{ default_branch: 'main' }, { default_branch: 'dev' }]) });
+    const { driver } = driverWith({
+      'repos/o/r': ok([
+        { default_branch: 'main', node_id: 'R_one' },
+        { default_branch: 'dev', node_id: 'R_two' },
+      ]),
+    });
     await expect(driver.runOp('projectView')).rejects.toThrow(/exactly one row/);
   });
 

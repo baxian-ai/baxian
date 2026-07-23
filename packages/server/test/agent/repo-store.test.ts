@@ -8,6 +8,7 @@ import {
   ancestorSymlinkGuard,
   isUnder,
   createRepoStoreCache,
+  ensureBaxianRuntimeDirsSafe,
   moveFileIntoPlace,
   stageFileGuarded,
   sweepStrayFile,
@@ -1032,6 +1033,58 @@ describe('ancestorSymlinkGuard', () => {
     );
     expect(isUnder('/', '/.baxian/x')).toBe(true);
     expect(isUnder('/', '/')).toBe(false);
+  });
+});
+
+describe('ensureBaxianRuntimeDirsSafe outcome classification', () => {
+  function runnerWith(results: Array<ExecResult | Error>): CommandRunner {
+    let index = 0;
+    return {
+      exec: async () => {
+        const result = results[index++]!;
+        if (result instanceof Error) throw result;
+        return result;
+      },
+      writeFile: async () => undefined,
+      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+    };
+  }
+
+  it('accepts an explicit clean probe and directory guard', async () => {
+    await expect(ensureBaxianRuntimeDirsSafe(runnerWith([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 0 },
+    ]), '/wt')).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ['tracked-path exit 255', [
+      { stdout: '', stderr: 'ssh disconnected', exitCode: 255 },
+    ]],
+    ['guard transient failure', [
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'Connection timed out', exitCode: 9 },
+    ]],
+    ['tracked-path transient output with exit zero', [
+      { stdout: '', stderr: 'Connection timed out', exitCode: 0 },
+    ]],
+    ['guard transient output with exit zero', [
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: 'Connection timed out', exitCode: 0 },
+    ]],
+    ['runner rejection', [new Error('runner unavailable')]],
+  ])('maps %s to probe-failed, never unsafe', async (_label, results) => {
+    await expect(ensureBaxianRuntimeDirsSafe(
+      runnerWith(results as Array<ExecResult | Error>),
+      '/wt',
+    )).rejects.toMatchObject({ reason: 'runtime-path-probe-failed' });
+  });
+
+  it('maps only an explicit guard exit to unsafe-runtime-path', async () => {
+    await expect(ensureBaxianRuntimeDirsSafe(runnerWith([
+      { stdout: '', stderr: '', exitCode: 0 },
+      { stdout: '', stderr: '', exitCode: 9 },
+    ]), '/wt')).rejects.toMatchObject({ reason: 'unsafe-runtime-path' });
   });
 });
 

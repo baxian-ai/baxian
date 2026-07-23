@@ -8,8 +8,8 @@ import {
   ConfigValidationError,
 } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
-import { applyConfigHotReload } from '../config/hot-reload.js';
-import { gitBindingBlockers } from './platform-guard.js';
+import { applyConfigHotReload, prepareConfigHotReload } from '../config/hot-reload.js';
+import { activeParticipantBlockers, gitBindingBlockerDetails, gitBindingBlockers } from './platform-guard.js';
 import { agentIsLive } from '../agent/liveness.js';
 
 function hostRefKey(host: unknown): string {
@@ -210,26 +210,27 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const mustRestart = requiresRestart(current.server, validated.server);
-      // 扫描与提交经 manager 任务锁成栅栏：与 createTask 的「读配置快照+落任务」串行，
-      // 关闭「扫描时无任务 → 并发建任务 → 提交换身份」的 TOCTOU（spec §4 活动任务锁）
       const committed = await app.ctx.agentManager.guardGitConfigCommit(
         current,
         validated,
-        (manager, cur, next) => gitBindingBlockers(manager, cur, next),
+        async (manager, cur, next) => [
+          ...(await gitBindingBlockers(manager, cur, next)),
+          ...(await activeParticipantBlockers(manager, cur, next)),
+        ],
         async () => {
+          const hotReload = await prepareConfigHotReload(app.ctx, validated);
           await saveConfig(app.ctx.configPath!, validated);
           app.ctx.config = validated;
-          if (!mustRestart) {
-            applyConfigHotReload(app.ctx, validated);
-          }
+          await applyConfigHotReload(app.ctx, validated, hotReload);
         },
       );
       if (!committed.ok) {
         return reply.status(409).send({
           error:
-            'cannot change the review mode, repo, or gitCli tool of a project with active git-mode tasks; '
-            + 'wait for them to finish or cancel them first',
+            'cannot apply platform configuration while active tasks lock a project identity, repository, or participant agents; '
+            + 'inspect details, then finish or cancel the listed tasks',
           blockers: committed.blockers,
+          details: gitBindingBlockerDetails(committed.blockers),
         });
       }
 
@@ -244,7 +245,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         config: redactConfig(validated),
         restartRequired: mustRestart,
         note: mustRestart
-          ? 'Saved. server.host/port/https changes require a restart to take effect.'
+          ? 'Saved and hot-reloadable fields applied. server.host/port/https changes require a restart to take effect.'
           : 'Saved and applied immediately (no restart required).',
       });
     });

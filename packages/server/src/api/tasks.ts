@@ -7,14 +7,10 @@ import {
   TASK_TERMINAL_STATUS_SET,
   TASK_ACTIVE_STATUS_SET,
   TASK_STATUS_SET,
-  isGitHubRepo,
-  repoSlug,
 } from '../shared/index.js';
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
-import { createRunner } from '../agent/runner.js';
-import { buildGithubReviewConversation } from '../github/pr-conversation.js';
 import { buildDriverReviewTimeline } from '../platform/review-timeline.js';
-import { PrConversationCache, prReviewCacheRevision } from '../github/pr-conversation-cache.js';
+import { PrConversationCache, prReviewCacheRevision } from '../platform/pr-conversation-cache.js';
 import { enrichTaskSnapshot } from '../state/snapshot.js';
 
 const TITLE_MAX_LEN = 200;
@@ -247,7 +243,9 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>('/tasks/:id/review', async (request, reply) => {
-    const updated = await app.ctx.agentManager.dispatchReviewToQa(request.params.id);
+    const updated = await app.ctx.agentManager.dispatchReviewToQa(request.params.id, {
+      confirmUncertainNotDelivered: true,
+    });
     return reply.status(202).send(updated);
   });
 
@@ -292,50 +290,31 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     if (task.prNumber === undefined) {
       return reply.send({ available: false, reason: 'no-pr', items: empty });
     }
-    if (task.reviewMode === 'git') {
-      // 终态任务不受配置锁保护：身份快照失配即按不可用兜底，不拿旧 PR 号查新仓库。
-      const binding = task.platformBinding;
-      const live = app.ctx.agentManager.platformBindingFields(task.projectId).platformBinding;
-      const bindingIntact = binding !== undefined && live !== undefined
-        && binding.mode === live.mode && binding.repoKey === live.repoKey && binding.tool === live.tool;
-      const driver = bindingIntact ? app.ctx.agentManager.platformDriverFor(task.projectId) : undefined;
-      if (!driver || binding === undefined) {
-        return reply.send({ available: false, reason: 'driver-unavailable', items: empty });
-      }
-      const prNumber = task.prNumber;
-      const timeline = await prConversationCache.get(
-        task.id,
-        prReviewCacheRevision(task, binding.repoKey),
-        () => buildDriverReviewTimeline(driver, prNumber),
-      );
-      return reply.send({
-        available: true,
-        prNumber: task.prNumber,
-        ...(task.prUrl ? { prUrl: task.prUrl } : {}),
-        items: timeline.items,
-        ...(timeline.error ? { error: timeline.error } : {}),
-        ...(timeline.rateLimited ? { rateLimited: true } : {}),
-        ...(timeline.truncated ? { truncated: true } : {}),
-      });
+    // 终态任务不受配置锁保护：身份快照失配即按不可用兜底，不拿旧 PR 号查新仓库。
+    const binding = task.platformBinding;
+    const live = app.ctx.agentManager.getProjectConfig(task.projectId) === undefined
+      ? undefined
+      : app.ctx.agentManager.platformBindingFields(task.projectId).platformBinding;
+    const bindingIntact = binding !== undefined && live !== undefined
+      && binding.mode === live.mode && binding.repoKey === live.repoKey && binding.tool === live.tool;
+    const driver = bindingIntact ? app.ctx.agentManager.platformDriverFor(task.projectId) : undefined;
+    if (!driver || binding === undefined) {
+      return reply.send({ available: false, reason: 'driver-unavailable', items: empty });
     }
-    const repo = app.ctx.agentManager.getProjectConfig(task.projectId)?.repo;
-    if (!repo || !isGitHubRepo(repo)) {
-      return reply.send({ available: false, reason: 'not-github', items: empty });
-    }
-    const runner = app.ctx.githubRunner ?? createRunner('local');
-    const slug = repoSlug(repo);
     const prNumber = task.prNumber;
-    const convo = await prConversationCache.get(
+    const timeline = await prConversationCache.get(
       task.id,
-      prReviewCacheRevision(task, slug),
-      () => buildGithubReviewConversation(runner, slug, prNumber),
+      prReviewCacheRevision(task, binding.repoKey),
+      () => buildDriverReviewTimeline(driver, prNumber),
     );
     return reply.send({
       available: true,
       prNumber: task.prNumber,
       ...(task.prUrl ? { prUrl: task.prUrl } : {}),
-      items: convo.items,
-      ...(convo.error ? { error: convo.error } : {}),
+      items: timeline.items,
+      ...(timeline.error ? { error: timeline.error } : {}),
+      ...(timeline.rateLimited ? { rateLimited: true } : {}),
+      ...(timeline.truncated ? { truncated: true } : {}),
     });
   });
 

@@ -8,8 +8,6 @@ export function makeDriverExec(runner: CommandRunner): DriverExec {
   return (command, opts) => runner.exec(command, { timeout: opts.timeout, maxBuffer: opts.maxBuffer });
 }
 
-// Live resolution on every call (spec §4): binary/env follow the current config and
-// plugin set; only the identity trio (mode, repo, tool) is snapshotted per task.
 export function buildProjectDriver(
   project: ProjectConfig,
   registry: PluginRegistry,

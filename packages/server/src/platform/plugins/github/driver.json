@@ -1,4 +1,5 @@
 {
+  "visibilityLagSeconds": 5,
   "ops": {
     "listPrs": {
       "argv": ["{binary}", "api", "repos/{repoPath}/pulls?state=all&sort=updated&direction=desc&per_page=10&page={page}"],
@@ -46,7 +47,18 @@
       "parse": "json",
       "map": {
         "defaultBranch": "default_branch",
+        "remoteProjectId": "node_id",
         "pushPermitted": { "sources": ["permissions.push"], "optional": true }
+      }
+    },
+    "branchView": {
+      "argv": ["{binary}", "api", "graphql", "-f", "repositoryId={remoteProjectId}", "-f", "refName=refs/heads/{branch}", "-f", "query=query($repositoryId:ID!,$refName:String!)\\{node(id:$repositoryId)\\{... on Repository\\{id ref(qualifiedName:$refName)\\{target\\{oid\\}\\}\\}\\}\\}"],
+      "env": { "GH_HOST": "{host}" },
+      "parse": "json",
+      "responseEnvelope": "graphql",
+      "map": {
+        "remoteProjectId": "data.node.id",
+        "headSha": { "sources": ["data.node.ref.target.oid"], "optional": true }
       }
     },
     "listComments": [
@@ -109,9 +121,9 @@
       "env": { "GH_HOST": "{host}" }
     },
     "deleteBranch": {
-      "argv": ["{binary}", "api", "-X", "DELETE", "repos/{repoPath}/git/refs/heads/{branch}"],
+      "argv": ["{binary}", "api", "graphql", "-f", "repositoryId={remoteProjectId}", "-f", "refName=refs/heads/{branch}", "-f", "beforeOid={expectedHeadSha}", "-f", "afterOid=0000000000000000000000000000000000000000", "-f", "query=mutation($repositoryId:ID!,$refName:GitRefname!,$beforeOid:GitObjectID!,$afterOid:GitObjectID!)\\{updateRefs(input:\\{repositoryId:$repositoryId,refUpdates:[\\{name:$refName,beforeOid:$beforeOid,afterOid:$afterOid\\}]\\})\\{clientMutationId\\}\\}"],
       "env": { "GH_HOST": "{host}" },
-      "treatAsSuccess": ["REF_NOT_FOUND"]
+      "responseEnvelope": "graphql"
     }
   },
   "agentCommands": [["openssl"], ["shasum", "sha256sum"]],
@@ -130,7 +142,6 @@
   "errorClasses": [
     { "class": "RATE_LIMIT", "regex": ["HTTP 429", "rate limit exceeded", "secondary rate limit"] },
     { "class": "ACCESS_DENIED", "regex": ["HTTP 401", "HTTP 403", "authentication required"] },
-    { "class": "REF_NOT_FOUND", "regex": ["Reference does not exist"] },
     { "class": "MERGE_BLOCKED", "regex": ["Pull Request is not mergeable", "Head branch was modified", "Base branch was modified"] },
     { "class": "NOT_FOUND", "regex": ["HTTP 404", "Not Found"] }
   ]

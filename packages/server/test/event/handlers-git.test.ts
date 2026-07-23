@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { AgentManager } from '../../src/agent/manager.js';
+import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -12,9 +12,12 @@ import { initStateDir } from '../../src/state/init.js';
 import { recoverGitPostApprovePending, registerEventHandlers } from '../../src/event/handlers.js';
 import type { BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
+import { DirtyWorkdirError } from '../../src/agent/branch.js';
 
 const SHA1 = 'a'.repeat(40);
 const SHA2 = 'b'.repeat(40);
+const POST_APPROVE_GENERATION = 'feedfeedfeed';
+const RECOVERY_READY_AT = '2000-01-01T00:00:00.000Z';
 
 const CONFIG: BaxianConfig = {
   review: { rounds: 3 },
@@ -80,9 +83,83 @@ function prCreated(data: Record<string, unknown>): BaxianEvent {
   };
 }
 
+function asReturned(
+  result: { kind: string } | { kind: string; task: TaskState },
+): TaskState | null {
+  return 'task' in result && result.kind === 'returned' ? result.task : null;
+}
+
+function gitVerdict(data: Record<string, unknown>): Record<string, unknown> {
+  return {
+    source: 'platform-poller',
+    action: 'APPROVE',
+    reviewPassToken: 'ffff00001111',
+    verdictToken: 'abcdef123456',
+    headSha: SHA1,
+    currentHeadSha: SHA1,
+    prNumber: 42,
+    prUrl: 'https://x/pull/42',
+    branch: 'bx/task-1',
+    verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64) },
+    ...data,
+  };
+}
+
+function postApproveEpisode(data: Partial<TaskState> = {}): Partial<TaskState> {
+  return {
+    postApproveGeneration: POST_APPROVE_GENERATION,
+    postApproveHeadSha: SHA1,
+    postApproveToken: 'tok123456789',
+    postApprovePhase: 'installed',
+    updatedAt: RECOVERY_READY_AT,
+    ...data,
+  };
+}
+
+function reviewDispatch(effectiveRound: number) {
+  return {
+    generation: 'decafdecaf12',
+    phase: 'pending' as const,
+    qaPhase: 'recheck' as const,
+    signalToken: 'ffff00001111',
+    headSha: SHA1,
+    passToken: 'abcdef123456',
+    failToken: '123456abcdef',
+    effectiveRound,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 describe('pr.created (git, poller source)', () => {
+  it('fences missing phase and token before creating the initial git review lease', async () => {
+    await taskStore.set(gitTask({ phase: undefined, signalToken: undefined }));
+    const realBegin = manager.beginGitReviewPass.bind(manager);
+    let capturedOptions: Record<string, unknown> | undefined;
+    vi.spyOn(manager, 'beginGitReviewPass').mockImplementation(async (taskId, options) => {
+      capturedOptions = options;
+      const current = await taskStore.get(taskId);
+      await taskStore.set({
+        ...current!, phase: 'code', signalToken: 'created-git-successor', updatedAt: new Date().toISOString(),
+      });
+      return realBegin(taskId, options);
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectPhase')).toBe(true);
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectSignalToken')).toBe(true);
+    expect(capturedOptions).toMatchObject({ fromStatus: ['in_progress'] });
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'in_progress', phase: 'code', signalToken: 'created-git-successor',
+    });
+    expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
   it('adopts with a base snapshot and a provisional reply actor, then no-ops on replay', async () => {
-    await taskStore.set(gitTask());
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
     await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
     let task = await taskStore.get('task-1');
     expect(task).toMatchObject({
@@ -91,8 +168,7 @@ describe('pr.created (git, poller source)', () => {
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
     });
 
-    // 派发完成后（pending 清除）同号重放才是纯 no-op；pending 在场时重放是有意的重试驱动
-    await manager.clearReviewDispatchPending('task-1', (await taskStore.get('task-1'))!.signalToken!);
+    expect(task?.reviewDispatch).toBeUndefined();
     const transitionSpy = vi.spyOn(manager, 'transitionTaskStatus');
     await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
     task = await taskStore.get('task-1');
@@ -107,6 +183,136 @@ describe('pr.created (git, poller source)', () => {
     expect(task?.status).toBe('review');
     expect(task?.replyActorId).toBeUndefined();
     expect(task?.replyActorStatus).toBeUndefined();
+  });
+
+  it('reports when a no-QA adoption cannot park the dev at the review gate', async () => {
+    await taskStore.set(gitTask({ qaAgentId: undefined }));
+    vi.mocked(manager.markAgentWaiting).mockResolvedValueOnce(false);
+
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('review');
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'dev-wait-gate-failed-no-qa',
+    });
+    expect(emitted.some(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-no-qa-partner')).toBe(true);
+  });
+
+  it('keeps fixing-status PR adoption on the initial review QA phase without incrementing the round', async () => {
+    await taskStore.set(gitTask({ status: 'fixing', qaAgentId: 'qa-1', reviewRound: 1 }));
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () =>
+      (await taskStore.get('task-1'))!);
+
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    const task = await taskStore.get('task-1');
+    expect(task?.reviewDispatch).toMatchObject({ qaPhase: 'review', effectiveRound: 1 });
+    expect(task?.reviewRoundPending).toBeUndefined();
+    expect(dispatch).toHaveBeenCalledWith('task-1', {
+      expectedGeneration: task!.reviewDispatch!.generation,
+    });
+  });
+
+  it('falls back to an authoritative PR read when the creation event has no head', async () => {
+    await taskStore.set(gitTask());
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA2, branch: 'bx/task-1', targetBranch: 'main',
+    });
+
+    await eventBus.emit(prCreated({ headSha: undefined, targetBranch: 'main' }));
+
+    expect(verify).toHaveBeenCalledWith('task-1', 42);
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'review', latestHeadSha: SHA2, reviewHeadAnchorSha: SHA2,
+    });
+  });
+
+  it('reports a creation event whose head cannot be recovered authoritatively', async () => {
+    await taskStore.set(gitTask());
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({ ok: false, reason: 'head' });
+
+    await eventBus.emit(prCreated({ headSha: undefined, targetBranch: 'main' }));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-head-unavailable',
+    });
+  });
+});
+
+describe('pr.created (server PR publication)', () => {
+  it('adopts a poller-discovered PR into the server task snapshot', async () => {
+    await taskStore.set(gitTask({
+      reviewMode: 'server', status: 'approved', afterDone: 'pr',
+      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      prNumber: undefined, prUrl: undefined, latestHeadSha: undefined, baseBranch: undefined,
+    }));
+
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      reviewMode: 'server', status: 'approved', prNumber: 42,
+      prUrl: 'https://x/pull/42', latestHeadSha: SHA1, baseBranch: 'main',
+    });
+    expect(emitted.find(event => event.type === 'human.intervention')).toBeUndefined();
+  });
+
+  it('surfaces a server adoption that no longer satisfies the publication predicate', async () => {
+    await taskStore.set(gitTask({
+      reviewMode: 'server', status: 'approved', afterDone: 'branch', platformBinding: undefined,
+    }));
+
+    await eventBus.emit(prCreated({ targetBranch: 'main' }));
+
+    expect((await taskStore.get('task-1'))?.prNumber).toBeUndefined();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'server-pr-adoption-refused', prNumber: 42,
+    });
+  });
+});
+
+describe('pr.merged (git)', () => {
+  it('transitions its tracked PR to merged and runs cleanup', async () => {
+    await taskStore.set(gitTask({ status: 'review', reviewRound: 1, prNumber: 42 }));
+    const cleanup = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
+
+    await eventBus.emit({
+      id: '', type: 'pr.merged', timestamp: new Date().toISOString(),
+      projectId: 'proj', taskId: 'task-1',
+      data: { prNumber: 42, prUrl: 'https://x/pull/42', branch: 'bx/task-1' },
+    });
+
+    expect((await taskStore.get('task-1'))?.status).toBe('merged');
+    expect(cleanup).toHaveBeenCalledWith('task-1');
+  });
+
+  it('dispatches post-merge cleanup to the snapshotted QA', async () => {
+    await taskStore.set(gitTask({ status: 'approved', reviewRound: 1, prNumber: 42, qaAgentId: 'qa-1' }));
+    vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
+    const dispatch = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
+
+    await eventBus.emit({
+      id: '', type: 'pr.merged', timestamp: new Date().toISOString(),
+      projectId: 'proj', taskId: 'task-1',
+      data: { prNumber: 42, branch: 'bx/task-1' },
+    });
+
+    expect(dispatch).toHaveBeenCalledWith('qa-1', { taskId: 'task-1', branch: 'bx/task-1' });
+  });
+
+  it('ignores an unrelated PR merged on a reused custom branch', async () => {
+    await taskStore.set(gitTask({ prNumber: 42, branch: 'feature/reused', branchCreatedByBaxian: false }));
+    const cleanup = vi.spyOn(manager, 'cleanupAfterMerge').mockResolvedValue();
+
+    await eventBus.emit({
+      id: '', type: 'pr.merged', timestamp: new Date().toISOString(),
+      projectId: 'proj', taskId: 'task-1',
+      data: { prNumber: 99, branch: 'feature/reused' },
+    });
+
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+    expect(cleanup).not.toHaveBeenCalled();
   });
 });
 
@@ -147,6 +353,74 @@ describe('pr.created (git, pane signal)', () => {
     const intervention = emitted.find(e => e.type === 'human.intervention');
     expect(intervention?.data).toMatchObject({ phase: 'pane-pr-created-branch-mismatch', reason: 'draft' });
   });
+
+  it('re-arms the develop watcher when platform verification throws', async () => {
+    await taskStore.set(gitTask());
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockRejectedValue(new Error('platform offline'));
+    const rearm = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
+
+    expect(rearm).toHaveBeenCalledWith('task-1', 'dev-1', ['pr-created'], { skipSnapshot: true });
+    expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'pane-pr-created-verify-error',
+      error: 'platform offline',
+    });
+    expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+  });
+
+  it('re-arms on a live transition race but stays silent after the task becomes terminal', async () => {
+    await taskStore.set(gitTask());
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
+    });
+    vi.spyOn(manager, 'beginGitReviewPass').mockResolvedValue(null);
+    const rearm = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
+    expect(rearm).toHaveBeenCalledTimes(1);
+    expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'pane-pr-created-transition-failed',
+    });
+
+    await taskStore.set(gitTask({ status: 'cancelled' }));
+    emitted.length = 0;
+    rearm.mockClear();
+    await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
+    expect(rearm).not.toHaveBeenCalled();
+    expect(emitted.find(e => e.type === 'human.intervention')).toBeUndefined();
+  });
+
+  it('accepts a valid custom branch only when it is already owned by the same task', async () => {
+    await taskStore.set(gitTask({ branch: 'feature/owned' }));
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding')
+      .mockResolvedValueOnce({ ok: false, reason: 'branch', prBranch: 'feature/owned' })
+      .mockResolvedValueOnce({
+        ok: true, headSha: SHA1, branch: 'feature/owned', targetBranch: 'main',
+      });
+
+    await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
+
+    expect(verify).toHaveBeenNthCalledWith(2, 'task-1', 42, { branchOverride: 'feature/owned' });
+    expect((await taskStore.get('task-1'))).toMatchObject({ status: 'review', branch: 'feature/owned' });
+  });
+
+  it.each(['bx/task-foreign', 'invalid..branch'])(
+    'refuses an unowned or invalid branch fallback: %s',
+    async (prBranch) => {
+      await taskStore.set(gitTask());
+      const verify = vi.spyOn(manager, 'platformVerifyPrBinding')
+        .mockResolvedValue({ ok: false, reason: 'branch', prBranch });
+
+      await eventBus.emit(prCreated({ source: 'pane-signal', token: 'aaaa11112222' }));
+
+      expect(verify).toHaveBeenCalledTimes(1);
+      expect((await taskStore.get('task-1'))?.status).toBe('in_progress');
+      expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
+        phase: 'pane-pr-created-branch-mismatch', reason: 'branch',
+      });
+    },
+  );
 });
 
 describe('actor reconciliation on a late publish signal', () => {
@@ -218,6 +492,62 @@ describe('review.submitted (git)', () => {
     expect(emitted.find(e => e.type === 'human.intervention')).toBeUndefined();
   });
 
+  it('rejects an incomplete verdict that bypasses the platform engine', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+
+    await eventBus.emit(reviewSubmitted({
+      action: 'APPROVE', prNumber: 42, reviewPassToken: 'ffff00001111',
+    }));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('review');
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-verdict-payload-invalid',
+      error: expect.stringContaining('invalid source'),
+    });
+  });
+
+  it('auto-redispatches a stale verdict when no QA session owns the current pass', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: undefined,
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+    const dispatch = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(undefined);
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', reviewPassToken: 'eeeeeeeeeeee', verdictToken: '123456abcdef',
+    })));
+
+    expect(dispatch).toHaveBeenCalledWith('task-1', {
+      fromStatus: ['review'], bumpRound: false, expectPhase: 'code', expectSignalToken: 'ffff00001111',
+    });
+    expect(emitted.find(event => event.type === 'human.intervention')).toBeUndefined();
+  });
+
+  it('rejects a verdict submitted before the current review pass freshness window', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+      reviewDispatchedAt: '2026-07-21T12:00:10.000Z',
+    }));
+    vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', verdictToken: '123456abcdef',
+      submittedAt: '2026-07-21T12:00:00.000Z',
+    })));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('review');
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'stale-verdict-superseded-pass',
+    });
+  });
+
   it('trusts the engine payload and persists pass provenance on approval', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
@@ -225,70 +555,170 @@ describe('review.submitted (git)', () => {
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
       replyActorId: '77', replyActorStatus: 'verified',
     }));
-    const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha');
-    await eventBus.emit(reviewSubmitted({
-      action: 'APPROVE', headSha: SHA1, currentHeadSha: SHA1,
-      reviewPassToken: 'ffff00001111', verdictToken: 'abcdef123456',
-      verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64) },
-    }));
+    await eventBus.emit(reviewSubmitted(gitVerdict({})));
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('approved');
     expect(task?.passProvenance).toEqual({
       sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64),
       token: 'abcdef123456', failToken: '123456abcdef', anchorSha: SHA1,
     });
-    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it('APPROVE 原子消费 durable reviewDispatchPending（verdict 即送达证据，#563 R33）', async () => {
+  it('keeps review unchanged when an approval was issued for a stale head', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA2, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+    const approve = vi.spyOn(manager, 'approveGitReviewPass');
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({ currentHeadSha: SHA2 })));
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'review', latestHeadSha: SHA2, reviewHeadAnchorSha: SHA1,
+      signalToken: 'ffff00001111',
+    });
+    expect(approve).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'stale-approval-head-mismatch', reviewedHeadSha: SHA1, currentHeadSha: SHA2,
+    });
+  });
+
+  it('keeps review unchanged when request-changes was issued for a stale head', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA2, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+    const transition = vi.spyOn(manager, 'transitionTaskStatus');
+    const release = vi.spyOn(manager, 'releaseAgentForTask');
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', verdictToken: '123456abcdef', currentHeadSha: SHA2,
+    })));
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'review', reviewRound: 1, signalToken: 'ffff00001111',
+    });
+    expect(transition).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'stale-request-changes-head-mismatch', reviewedHeadSha: SHA1, currentHeadSha: SHA2,
+    });
+  });
+
+  it('APPROVE 原子消费 durable reviewDispatch lease', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
-      reviewDispatchPending: true,
+      reviewDispatch: reviewDispatch(1),
     }));
-    await eventBus.emit(reviewSubmitted({
-      action: 'APPROVE', headSha: SHA1, currentHeadSha: SHA1,
-      reviewPassToken: 'ffff00001111', verdictToken: 'abcdef123456',
-      verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64) },
-    }));
+    await eventBus.emit(reviewSubmitted(gitVerdict({})));
     const task = await taskStore.get('task-1');
-    expect(task?.status).toBe('approved');
-    expect(task?.reviewDispatchPending).toBeUndefined();
+    expect(task).toMatchObject({
+      status: 'approved',
+      reviewRound: 1,
+      postApproveHeadSha: SHA1,
+      postApprovePhase: 'installed',
+      pendingRedispatch: true,
+      redispatchCount: 0,
+    });
+    expect(task?.postApproveGeneration).toMatch(/^[0-9a-f]{12}$/);
+    expect(task?.postApproveToken).toMatch(/^[0-9a-f]{12}$/);
+    expect(task?.postApproveToken).not.toBe(task?.postApproveGeneration);
+    expect(task?.reviewDispatch).toBeUndefined();
   });
 
-  it('REQUEST_CHANGES 原子消费 durable reviewDispatchPending（fixing 态不被 sweep 拽回 review，#563 R33）', async () => {
+  it('REQUEST_CHANGES 原子消费 durable reviewDispatch lease', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
-      reviewDispatchPending: true,
+      passToken: 'abcdef123456', reviewDispatch: reviewDispatch(1),
     }));
-    await eventBus.emit(reviewSubmitted({
-      action: 'REQUEST_CHANGES', headSha: SHA1, currentHeadSha: SHA1,
-      reviewPassToken: 'ffff00001111', verdictToken: '123456abcdef',
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(false);
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'eeee11112222', armed: true });
+    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', verdictToken: '123456abcdef',
       verdictCarrier: { sourceKey: 'reviews', id: 'r2', bodyDigest: 'a'.repeat(64) },
-    }));
+    })));
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('fixing');
-    expect(task?.reviewDispatchPending).toBeUndefined();
+    expect(task?.reviewDispatch).toBeUndefined();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'qa-release-failed-but-dev-dispatched', qaAgentId: 'qa-1',
+    });
   });
 
-  it('max_rounds 原子消费 durable reviewDispatchPending（终局同样不给 sweep 留凭据，#563 R33）', async () => {
+  it('max_rounds 原子消费 durable reviewDispatch lease', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 3,
-      reviewDispatchPending: true,
+      passToken: 'abcdef123456', reviewDispatch: reviewDispatch(3),
     }));
-    await eventBus.emit(reviewSubmitted({
-      action: 'REQUEST_CHANGES', headSha: SHA1, currentHeadSha: SHA1,
-      reviewPassToken: 'ffff00001111', verdictToken: '123456abcdef',
+    vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
+    const release = vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', verdictToken: '123456abcdef',
       verdictCarrier: { sourceKey: 'reviews', id: 'r3', bodyDigest: 'b'.repeat(64) },
-    }));
+    })));
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('max_rounds');
-    expect(task?.reviewDispatchPending).toBeUndefined();
+    expect(task?.reviewDispatch).toBeUndefined();
+    expect(release).toHaveBeenCalledWith('qa-1', 'task-1', 'idle', { allowAwaitingHuman: true });
+    expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'review.max_rounds', data: { reviewRound: 3 },
+    }));
+  });
+
+  it('holds the dev when the pr-fixed watcher cannot be armed', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'eeee11112222', armed: false });
+    const hold = vi.spyOn(manager, 'markAwaitingHuman').mockResolvedValue(true);
+    const dispatch = vi.spyOn(manager, 'continueSession');
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', verdictToken: '123456abcdef',
+    })));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('fixing');
+    expect(hold).toHaveBeenCalledWith(
+      'dev-1', 'signal-arm-failed:pr-fixed', expect.stringContaining('completion signal'),
+      { expectedTaskId: 'task-1' },
+    );
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('registers a durable dev-fix retry when the fix prompt meets a dirty workdir', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    }));
+    vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'eeee11112222', armed: true });
+    vi.spyOn(manager, 'continueSession').mockRejectedValue(new DirtyWorkdirError('/tmp/repo'));
+
+    await eventBus.emit(reviewSubmitted(gitVerdict({
+      action: 'REQUEST_CHANGES', verdictToken: '123456abcdef',
+    })));
+
+    expect(manager.getPendingDispatchRetry('task-1')).toMatchObject({
+      kind: 'dev-fix', agentId: 'dev-1', signalToken: 'eeee11112222',
+    });
+    expect(emitted.find(event => event.type === 'human.intervention'
+      && event.data.phase === 'fix-resume-failed')).toBeUndefined();
   });
 
   it('updates the stored head from the engine-verified current head', async () => {
@@ -297,13 +727,11 @@ describe('review.submitted (git)', () => {
       signalToken: 'ffff00001111', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA2, reviewRound: 1,
     }));
-    const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha');
-    await eventBus.emit(reviewSubmitted({
+    await eventBus.emit(reviewSubmitted(gitVerdict({
       action: 'REQUEST_CHANGES', headSha: SHA2, currentHeadSha: SHA2,
-      reviewPassToken: 'ffff00001111', verdictToken: '123456abcdef',
+      verdictToken: '123456abcdef',
       verdictCarrier: { sourceKey: 'reviews', id: 'r2', bodyDigest: 'a'.repeat(64) },
-    }));
-    expect(fetchSpy).not.toHaveBeenCalled();
+    })));
     expect((await taskStore.get('task-1'))?.latestHeadSha).toBe(SHA2);
   });
 });
@@ -327,10 +755,19 @@ describe('git review dispatch token minting', () => {
       status: 'fixing', prNumber: 42,
       passToken: 'abcdef123456', failToken: '123456abcdef',
     }));
-    await manager.rotateAndSetupPhaseSignal('task-1', 'dev-1', 'pr-fixed');
+    await manager.rotateAndSetupPhaseSignal('task-1', 'dev-1', 'pr-fixed', {
+      expectedStatus: 'fixing', expectedToken: 'aaaa11112222',
+    });
     const task = await taskStore.get('task-1');
     expect(task?.passToken).toBe('abcdef123456');
     expect(task?.failToken).toBe('123456abcdef');
+  });
+
+  it('rejects git signal rotation without a status and token guard', async () => {
+    await taskStore.set(gitTask({ status: 'fixing' }));
+    await expect(manager.rotateAndSetupPhaseSignal('task-1', 'dev-1', 'pr-fixed'))
+      .rejects.toThrow(/requires a status\/token guard/);
+    expect((await taskStore.get('task-1'))?.signalToken).toBe('aaaa11112222');
   });
 
   it('initial git dispatch persists the pr-created expectation token alongside the signal token', async () => {
@@ -338,13 +775,143 @@ describe('git review dispatch token minting', () => {
     expect(manager.dispatchTokenFields(task, 'cccc33334444')).toEqual({
       signalToken: 'cccc33334444', pendingPrSignalToken: 'cccc33334444',
     });
-    expect(manager.dispatchTokenFields({ ...task, reviewMode: 'github' }, 'cccc33334444')).toEqual({
+    expect(manager.dispatchTokenFields({ ...task, reviewMode: 'server' }, 'cccc33334444')).toEqual({
       signalToken: 'cccc33334444',
     });
   });
 });
 
 describe('push replay idempotency (git)', () => {
+  it('warns and defers an in-progress catch-up without any PR identity', async () => {
+    await taskStore.set(gitTask({ prNumber: undefined, latestHeadSha: undefined }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const begin = vi.spyOn(manager, 'beginGitReviewPass');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', branch: 'bx/task-1' },
+    });
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('deferring catch-up'));
+    expect(begin).not.toHaveBeenCalled();
+  });
+
+  it('raises an intervention when a review push has no authoritative head', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: undefined, latestHeadSha: undefined,
+      reviewHeadAnchorSha: undefined,
+    }));
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', branch: 'bx/task-1' },
+    });
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-head-unavailable',
+    });
+  });
+
+  it('uses the event PR number to recover a missing push head authoritatively', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: undefined, latestHeadSha: undefined,
+      reviewHeadAnchorSha: undefined, reviewRound: 1,
+    }));
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA2, branch: 'bx/task-1', targetBranch: 'main',
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockResolvedValue({} as TaskState);
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1' },
+    });
+
+    expect(verify).toHaveBeenCalledWith('task-1', 42);
+    expect(await taskStore.get('task-1')).toMatchObject({
+      prNumber: 42, latestHeadSha: SHA2, reviewHeadAnchorSha: SHA2,
+    });
+    expect(dispatch).toHaveBeenCalledWith('task-1', {
+      expectedGeneration: expect.stringMatching(/^[0-9a-f]{12}$/),
+    });
+  });
+
+  it('reports when authoritative push-head recovery rejects the PR binding', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, latestHeadSha: undefined,
+      reviewHeadAnchorSha: undefined, reviewRound: 1,
+    }));
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({ ok: false, reason: 'state' });
+    const begin = vi.spyOn(manager, 'beginGitReviewPass');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1' },
+    });
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-head-unavailable',
+    });
+  });
+
+  it('does not restart review when a push arrives at the max-rounds human gate', async () => {
+    await taskStore.set(gitTask({
+      status: 'max_rounds', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 3,
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, signalToken: 'ffff00001111',
+    }));
+    const begin = vi.spyOn(manager, 'beginGitReviewPass');
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: SHA2 },
+    });
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'max_rounds', reviewRound: 3, latestHeadSha: SHA1,
+    });
+    expect(begin).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('fences the entry tuple before a push replaces the current git review lease', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', phase: undefined, signalToken: undefined, prNumber: 42, qaAgentId: 'qa-1',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
+    }));
+    const realBegin = manager.beginGitReviewPass.bind(manager);
+    let capturedOptions: Record<string, unknown> | undefined;
+    vi.spyOn(manager, 'beginGitReviewPass').mockImplementation(async (taskId, options) => {
+      capturedOptions = options;
+      const current = await taskStore.get(taskId);
+      await taskStore.set({
+        ...current!, phase: 'code', signalToken: 'updated-git-successor', updatedAt: new Date().toISOString(),
+      });
+      return realBegin(taskId, options);
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: SHA2 },
+    });
+
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectPhase')).toBe(true);
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectSignalToken')).toBe(true);
+    expect(capturedOptions).toMatchObject({ fromStatus: ['review'] });
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'review', phase: 'code', signalToken: 'updated-git-successor',
+    });
+    expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
   it('no-ops a redelivered push whose head already anchors the dispatched review round', async () => {
     await taskStore.set(gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
@@ -385,9 +952,9 @@ describe('push replay idempotency (git)', () => {
 describe('post-approve feedback consumption (git)', () => {
   const approvedTask = () => gitTask({
     status: 'approved', prNumber: 42, qaAgentId: 'qa-1',
-    latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-    postApproveToken: 'tok123456789', signalToken: 'ffff00001111',
+    latestHeadSha: SHA1, signalToken: 'ffff00001111',
     replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+    ...postApproveEpisode(),
   });
 
   function commentEvent(revision: Record<string, unknown>, over: Record<string, unknown> = {}): BaxianEvent {
@@ -414,6 +981,53 @@ describe('post-approve feedback consumption (git)', () => {
     expect(Object.keys(task?.consumedFeedback ?? {})).toHaveLength(1);
   });
 
+  it('revokes the post-approve episode when fresh feedback exceeds the redispatch cap', async () => {
+    await taskStore.set(approvedTask());
+    await manager.updateTask('task-1', { redispatchCount: 10 });
+    vi.spyOn(manager, 'getAgentState').mockResolvedValue(null);
+    const dispatch = vi.spyOn(manager, 'continueSession');
+    const revision = { sourceKey: 'issue-comments', id: 'cap', bodyDigest: 'd'.repeat(64), versionTime: 1750 };
+
+    await eventBus.emit(commentEvent(revision));
+
+    const task = await taskStore.get('task-1');
+    expect(task?.postApproveRevoked).toMatchObject({ reason: 'redispatch-cap' });
+    expect(task?.postApproveToken).toBeUndefined();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-redispatch-cap-exceeded', cap: 10,
+    });
+  });
+
+  it('records but does not redispatch feedback for a revoked post-approve episode', async () => {
+    await taskStore.set(gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1, reviewRound: 1,
+      postApproveRevoked: { generation: POST_APPROVE_GENERATION, reason: 'redispatch-cap', at: new Date().toISOString() },
+    }));
+    const dispatch = vi.spyOn(manager, 'continueSession');
+    const revision = { sourceKey: 'issue-comments', id: 'revoked', bodyDigest: 'e'.repeat(64), versionTime: 1760 };
+
+    await eventBus.emit(commentEvent(revision));
+
+    expect((await taskStore.get('task-1'))?.consumedFeedback).toEqual({
+      [`issue-comments:revoked:${'e'.repeat(64)}`]: 1760,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')).toBeUndefined();
+  });
+
+  it('rejects malformed feedback revisions before mutating the task', async () => {
+    const before = gitTask({ status: 'fixing', prNumber: 42, latestHeadSha: SHA1 });
+    await taskStore.set(before);
+    await eventBus.emit(commentEvent({
+      sourceKey: 'issue-comments', id: 'bad:id', bodyDigest: 'a'.repeat(64), versionTime: 1700,
+    }, { prUrl: 'https://x/pull/42' }));
+    expect(await taskStore.get('task-1')).toEqual(before);
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-feedback-revision-invalid',
+    });
+  });
+
   it('records consumption alongside the feedback timestamp while the task is fixing', async () => {
     await taskStore.set(gitTask({ status: 'fixing', prNumber: 42, latestHeadSha: SHA1 }));
     const revision = { sourceKey: 'inline-comments', id: 'i9', bodyDigest: 'b'.repeat(64), versionTime: 1800 };
@@ -423,15 +1037,33 @@ describe('post-approve feedback consumption (git)', () => {
     expect(task?.prFeedbackReceivedAt).toBeDefined();
   });
 
+  it('ignores an unknown pr.updated kind instead of treating it as feedback or a push', async () => {
+    const before = gitTask({ status: 'fixing', prNumber: 42, latestHeadSha: SHA1 });
+    await taskStore.set(before);
+    const consume = vi.spyOn(manager, 'consumeGitFeedbackRevision');
+    const begin = vi.spyOn(manager, 'beginGitReviewPass');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'future-kind', prNumber: 99, headSha: SHA2 },
+    });
+
+    expect(await taskStore.get('task-1')).toEqual(before);
+    expect(consume).not.toHaveBeenCalled();
+    expect(begin).not.toHaveBeenCalled();
+  });
+
   it('survives a crash between the merge-ready return and the dispatch via the recovery sweep', async () => {
     await taskStore.set(gitTask({
       status: 'merge-ready', prNumber: 42, latestHeadSha: SHA1,
       signalToken: 'ffff00001111', replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
     }));
-    const returned = await manager.returnMergeReadyToApproved('task-1', {
+    const returned = asReturned(await manager.consumeGitFeedbackRevision('task-1', {
       key: 'issue-comments:c7:crash', versionTime: 1900,
-    });
+    }));
     expect(returned?.pendingRedispatch).toBe(true);
+    await taskStore.set({ ...returned!, updatedAt: RECOVERY_READY_AT });
 
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
@@ -447,8 +1079,9 @@ describe('post-approve feedback consumption (git)', () => {
 
   it('recovery redispatches durable pending even when a completion token is installed (delivery unconfirmed)', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      pendingRedispatch: true, postApproveToken: 'tok999888777', signalToken: 'ffff00001111', reviewRound: 1,
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ postApproveToken: 'tok999888777', pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
@@ -457,14 +1090,120 @@ describe('post-approve feedback consumption (git)', () => {
     expect((await taskStore.get('task-1'))?.pendingRedispatch).toBe(false);
   });
 
+  it('does not rotate a freshly installed post-approve episode while its normal dispatch may still be running', async () => {
+    const updatedAt = new Date().toISOString();
+    await taskStore.set(gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true, redispatchCount: 0, updatedAt }),
+    }));
+    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+
+    await recoverGitPostApprovePending(eventBus, manager);
+
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-1')).toMatchObject({
+      postApproveToken: 'tok123456789', pendingRedispatch: true, redispatchCount: 0, updatedAt,
+    });
+  });
+
+  it('does not rotate a successor episode installed after the recovery snapshot was read', async () => {
+    const stale = gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true, redispatchCount: 0 }),
+    });
+    const successor = {
+      ...stale,
+      postApproveToken: 'beefbeefbeef',
+      updatedAt: new Date().toISOString(),
+    };
+    vi.spyOn(manager, 'listActiveGitTasks').mockResolvedValue([stale]);
+    vi.spyOn(manager, 'getTask')
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValueOnce(successor);
+    const rotate = vi.spyOn(manager, 'rotateGitPostApproveEpisode');
+    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+
+    await recoverGitPostApprovePending(eventBus, manager);
+
+    expect(rotate).not.toHaveBeenCalled();
+    expect(continueSpy).not.toHaveBeenCalled();
+  });
+
+  it('warns and skips recovery when the live updatedAt is unparseable', async () => {
+    const stale = gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true, redispatchCount: 0 }),
+    });
+    vi.spyOn(manager, 'listActiveGitTasks').mockResolvedValue([stale]);
+    vi.spyOn(manager, 'getTask').mockResolvedValue({ ...stale, updatedAt: 'not-a-timestamp' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const rotate = vi.spyOn(manager, 'rotateGitPostApproveEpisode');
+    const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+
+    await recoverGitPostApprovePending(eventBus, manager);
+
+    expect(rotate).not.toHaveBeenCalled();
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('updatedAt unparseable'),
+      'not-a-timestamp',
+    );
+  });
+
+  it('warns once per broken updatedAt value across recovery sweeps and again on change', async () => {
+    const stale = gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true, redispatchCount: 0 }),
+    });
+    vi.spyOn(manager, 'listActiveGitTasks').mockResolvedValue([stale]);
+    const live = vi.spyOn(manager, 'getTask');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
+
+    live.mockResolvedValue({ ...stale, updatedAt: 'still-broken' });
+    await recoverGitPostApprovePending(eventBus, manager);
+    await recoverGitPostApprovePending(eventBus, manager);
+    const firstValueWarns = warn.mock.calls.filter(call => call[1] === 'still-broken');
+    expect(firstValueWarns).toHaveLength(1);
+
+    live.mockResolvedValue({ ...stale, updatedAt: 'broken-differently' });
+    await recoverGitPostApprovePending(eventBus, manager);
+    expect(warn.mock.calls.filter(call => call[1] === 'broken-differently')).toHaveLength(1);
+  });
+
+  it('recovery revokes a durable pending episode at the redispatch cap', async () => {
+    await taskStore.set(gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true, redispatchCount: 10 }),
+    }));
+    const continueSpy = vi.spyOn(manager, 'continueSession');
+
+    await recoverGitPostApprovePending(eventBus, manager);
+
+    const task = await taskStore.get('task-1');
+    expect(task?.postApproveRevoked).toMatchObject({ reason: 'redispatch-cap' });
+    expect(task?.postApproveToken).toBeUndefined();
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-redispatch-cap-exceeded', redispatchCount: 10, cap: 10,
+    });
+  });
+
   it('recovery isolates one failing task and still redispatches the next', async () => {
     await taskStore.set(gitTask({
-      id: 'task-1', status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      pendingRedispatch: true, signalToken: 'ffff00001111', reviewRound: 1,
+      id: 'task-1', status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true }),
     }));
     await taskStore.set(gitTask({
-      id: 'task-2', status: 'approved', prNumber: 43, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      pendingRedispatch: true, signalToken: 'ffff00002222', reviewRound: 1,
+      id: 'task-2', status: 'approved', prNumber: 43, latestHeadSha: SHA1,
+      signalToken: 'ffff00002222', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'acquireAgentForTask')
       .mockRejectedValueOnce(new Error('store io error'))
@@ -494,6 +1233,40 @@ describe('post-approve feedback consumption (git)', () => {
       postApproveRedispatchCount: 1,
     }));
   });
+
+  it('reports fresh approved feedback when neither durable head source is usable', async () => {
+    await taskStore.set(approvedTask());
+    const withoutHead = gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: undefined, reviewRound: 1,
+    });
+    vi.spyOn(manager, 'consumeGitFeedbackRevision').mockResolvedValue({
+      kind: 'pending', task: withoutHead,
+    });
+    vi.spyOn(manager, 'getPostApproveCompletion').mockResolvedValue(null);
+    vi.spyOn(manager, 'getAgentState').mockResolvedValue(null);
+    const revision = { sourceKey: 'issue-comments', id: 'no-head', bodyDigest: '8'.repeat(64), versionTime: 2500 };
+
+    await eventBus.emit(commentEvent(revision));
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-approved-head-unavailable',
+    });
+  });
+
+  it('reports a recovery record whose approved head is unavailable', async () => {
+    const malformed = gitTask({
+      status: 'approved', pendingRedispatch: true, latestHeadSha: undefined,
+      updatedAt: RECOVERY_READY_AT,
+    });
+    vi.spyOn(manager, 'listActiveGitTasks').mockResolvedValue([malformed]);
+    vi.spyOn(manager, 'getTask').mockResolvedValue(malformed);
+
+    await recoverGitPostApprovePending(eventBus, manager);
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-approved-head-unavailable',
+    });
+  });
 });
 
 describe('merge-ready receipt recheck (git)', () => {
@@ -506,14 +1279,84 @@ describe('merge-ready receipt recheck (git)', () => {
   }
 
   const approvedWithCompletion = () => gitTask({
-    status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-    postApproveToken: 'tok123456789', signalToken: 'ffff00001111',
+    status: 'approved', prNumber: 42, latestHeadSha: SHA1, signalToken: 'ffff00001111',
     replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+    ...postApproveEpisode(),
+  });
+
+  it('ignores a forged post-approve signal for an approved server task', async () => {
+    await taskStore.set(gitTask({
+      reviewMode: 'server', status: 'approved', afterDone: 'pr',
+      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      prNumber: undefined, signalToken: 'server-token',
+    }));
+    const completion = vi.spyOn(manager, 'getPostApproveCompletion');
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(completion).not.toHaveBeenCalled();
+    expect(manager.markAgentWaiting).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-1')).toMatchObject({
+      reviewMode: 'server', status: 'approved', signalToken: 'server-token',
+    });
+    expect((await taskStore.get('task-1'))?.prNumber).toBeUndefined();
+  });
+
+  it('reports when the dev cannot be parked before merge-ready revalidation', async () => {
+    await taskStore.set(approvedWithCompletion());
+    vi.mocked(manager.markAgentWaiting).mockResolvedValueOnce(false);
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-dev-wait-gate-failed',
+    });
+  });
+
+  it('reports when the approved episode changes after the dev is parked', async () => {
+    await taskStore.set(approvedWithCompletion());
+    vi.mocked(manager.markAgentWaiting).mockImplementationOnce(async () => {
+      await manager.revokePostApproveCompletion('task-1', 'redispatch-cap', {
+        expectedToken: 'tok123456789',
+        expectedGeneration: POST_APPROVE_GENERATION,
+        expectedHeadSha: SHA1,
+      });
+      return true;
+    });
+    const verify = vi.spyOn(manager, 'platformVerifyAcceptedPass');
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
+  });
+
+  it('reports when the refreshed task no longer has a complete approved episode', async () => {
+    const stored = approvedWithCompletion();
+    await taskStore.set(stored);
+    vi.spyOn(manager, 'getTask')
+      .mockResolvedValueOnce(stored)
+      .mockResolvedValueOnce(stored)
+      .mockResolvedValueOnce({
+        ...stored,
+        postApproveGeneration: undefined,
+        postApproveHeadSha: undefined,
+        postApproveToken: undefined,
+        postApprovePhase: undefined,
+      });
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
   });
 
   it('re-runs the pending-feedback set server-side and redispatches instead of migrating', async () => {
     await taskStore.set(approvedWithCompletion());
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ ok: true, pendingCount: 1 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
     await eventBus.emit(mergeReadySignal('tok123456789'));
@@ -522,6 +1365,55 @@ describe('merge-ready receipt recheck (git)', () => {
     expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.objectContaining({
       postApproveRedispatchCount: 1,
     }));
+    expect(manager.markAgentWaiting).toHaveBeenCalledWith('dev-1', 'task-1', {
+      expectedPostApproveEpisode: {
+        generation: POST_APPROVE_GENERATION,
+        token: 'tok123456789',
+        headSha: SHA1,
+      },
+    });
+  });
+
+  it('revokes at the redispatch cap when merge-ready recheck finds pending feedback', async () => {
+    await taskStore.set({ ...approvedWithCompletion(), redispatchCount: 10 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+    const continueSpy = vi.spyOn(manager, 'continueSession');
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    const task = await taskStore.get('task-1');
+    expect(task?.postApproveRevoked).toMatchObject({ reason: 'redispatch-cap' });
+    expect(task?.postApproveToken).toBeUndefined();
+    expect(continueSpy).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-redispatch-cap-exceeded', redispatchCount: 10, cap: 10,
+    });
+  });
+
+  it('reports a stale cap decision when the episode rotates before revocation', async () => {
+    await taskStore.set({ ...approvedWithCompletion(), pendingRedispatch: true, redispatchCount: 10 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+    vi.spyOn(manager, 'revokePostApproveCompletion').mockResolvedValue(false);
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
+  });
+
+  it('reports an unusable completion head before pending-feedback redispatch', async () => {
+    await taskStore.set({ ...approvedWithCompletion(), pendingRedispatch: true });
+    vi.spyOn(manager, 'getPostApproveCompletion').mockResolvedValue({
+      token: 'tok123456789', approvedHeadSha: '', pendingRedispatch: true, redispatchCount: 0,
+    } as never);
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 1 });
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-approved-head-unavailable',
+    });
   });
 
   it('stays fail closed with an intervention when the comment scan cannot complete', async () => {
@@ -541,31 +1433,96 @@ describe('merge-ready receipt recheck (git)', () => {
   it('refuses the migration when the accepted pass no longer verifies', async () => {
     await taskStore.set(approvedWithCompletion());
     vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({
-      ok: false, reason: 'provenance token-dismissed',
+      kind: 'provenance-invalid', reason: 'provenance token-dismissed',
     });
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
     await eventBus.emit(mergeReadySignal('tok123456789'));
-    expect((await taskStore.get('task-1'))?.status).toBe('approved');
+    expect((await taskStore.get('task-1'))?.status).toBe('review');
     expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
-      phase: 'post-approve-merge-skipped-provenance',
+      phase: 'post-approve-provenance-redispatch-failed',
     });
+  });
+
+  it('does not let a provenance recheck replace a successor approved tuple', async () => {
+    await taskStore.set(gitTask({
+      status: 'approved', phase: undefined, signalToken: undefined, prNumber: 42,
+      latestHeadSha: SHA1, replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+      ...postApproveEpisode(),
+    }));
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({
+      kind: 'provenance-invalid', reason: 'provenance token-dismissed',
+    });
+    const realBegin = manager.beginGitReviewPass.bind(manager);
+    let capturedOptions: Record<string, unknown> | undefined;
+    vi.spyOn(manager, 'beginGitReviewPass').mockImplementation(async (taskId, options) => {
+      capturedOptions = options;
+      const current = await taskStore.get(taskId);
+      await taskStore.set({
+        ...current!, phase: 'code', signalToken: 'approved-git-successor', updatedAt: new Date().toISOString(),
+      });
+      return realBegin(taskId, options);
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectPhase')).toBe(true);
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectSignalToken')).toBe(true);
+    expect(capturedOptions).toMatchObject({ fromStatus: ['approved'] });
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'approved', phase: 'code', signalToken: 'approved-git-successor',
+    });
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
+    expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
+  it('fails a provenance recheck when its QA dispatch has a terminal error', async () => {
+    await taskStore.set(approvedWithCompletion());
+    await taskStore.set({
+      ...(await taskStore.get('task-1'))!,
+      qaAgentId: 'qa-1',
+      updatedAt: new Date().toISOString(),
+    });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({
+      kind: 'provenance-invalid', reason: 'provenance token-dismissed',
+    });
+    vi.spyOn(manager, 'dispatchGitReviewLease').mockRejectedValue(
+      new DispatchTerminalError('prompt_too_large', 'review prompt exceeds the limit'),
+    );
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('failed');
   });
 
   it('clears a stale pending flag when the authoritative scan comes back empty', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      postApproveToken: 'tok123456789', pendingRedispatch: true, signalToken: 'ffff00001111',
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1, signalToken: 'ffff00001111',
       replyActorId: '77', replyActorStatus: 'verified', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true }),
     }));
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ ok: true, pendingCount: 0 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
     await eventBus.emit(mergeReadySignal('tok123456789'));
     expect((await taskStore.get('task-1'))?.status).toBe('merge-ready');
   });
 
   it('migrates to merge-ready when the pending set is empty', async () => {
     await taskStore.set(approvedWithCompletion());
-    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ ok: true, pendingCount: 0 });
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
     await eventBus.emit(mergeReadySignal('tok123456789'));
     expect((await taskStore.get('task-1'))?.status).toBe('merge-ready');
+  });
+
+  it('reports a stale merge-ready completion refusal', async () => {
+    await taskStore.set(approvedWithCompletion());
+    vi.spyOn(manager, 'platformVerifyAcceptedPass').mockResolvedValue({ kind: 'valid', pendingCount: 0 });
+    vi.spyOn(manager, 'completeApprovedPassToMergeReady').mockResolvedValue({ refused: 'stale' } as never);
+
+    await eventBus.emit(mergeReadySignal('tok123456789'));
+
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
   });
 });
 
@@ -582,6 +1539,72 @@ describe('pr-fixed no-op gate (git)', () => {
     status: 'fixing', prNumber: 42, latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
     signalToken: 'ffff00001111', qaAgentId: 'qa-1', reviewRound: 1,
     replyActorId: '77', replyActorStatus: 'verified',
+  });
+
+  it('rejects a stale completion token before reading the PR', async () => {
+    await taskStore.set(fixingTask());
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+
+    await eventBus.emit(prFixed('eeeeeeeeeeee'));
+
+    expect(verify).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.status).toBe('fixing');
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'stale-pr-fixed-wrong-pass',
+    });
+  });
+
+  it('re-arms fixing without probing when the task has no PR number', async () => {
+    await taskStore.set({ ...fixingTask(), prNumber: undefined });
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+    const rearm = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await eventBus.emit(prFixed('ffff00001111'));
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(rearm).toHaveBeenCalledWith('task-1', 'dev-1', 'pr-fixed', {
+      skipSnapshot: true, replaceScope: 'agent',
+    });
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'fix-verify-no-anchor',
+    });
+  });
+
+  it('re-arms the same fixing pass when authoritative PR verification throws', async () => {
+    await taskStore.set(fixingTask());
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockRejectedValue(new Error('prView transport failed'));
+    const rearm = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await eventBus.emit(prFixed('ffff00001111'));
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'fixing', signalToken: 'ffff00001111',
+    });
+    expect(rearm).toHaveBeenCalledWith('task-1', 'dev-1', 'pr-fixed', {
+      skipSnapshot: true, replaceScope: 'agent',
+    });
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'fix-verify-head-fetch-failed', error: 'prView transport failed',
+    });
+  });
+
+  it('re-arms fixing when the current review head anchor is missing', async () => {
+    await taskStore.set(fixingTask());
+    await manager.updateTask('task-1', { reviewHeadAnchorSha: undefined });
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
+    });
+    const rearm = vi.spyOn(manager, 'setupPhaseSignal').mockResolvedValue(true);
+
+    await eventBus.emit(prFixed('ffff00001111'));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('fixing');
+    expect(rearm).toHaveBeenCalledWith('task-1', 'dev-1', 'pr-fixed', {
+      skipSnapshot: true, replaceScope: 'agent',
+    });
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'fix-verify-no-anchor', headSha: SHA1,
+    });
   });
 
   it('holds the fixing round while feedback revisions still lack a valid ack', async () => {
@@ -638,6 +1661,21 @@ describe('pr-fixed no-op gate (git)', () => {
       phase: 'fix-verify-replies-fetch-failed',
     });
   });
+
+  it('escalates when the synthetic push cannot advance the fixing task', async () => {
+    await taskStore.set(fixingTask());
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA2, branch: 'bx/task-1', targetBranch: 'main',
+    });
+    vi.spyOn(manager, 'beginGitReviewPass').mockResolvedValue(null);
+
+    await eventBus.emit(prFixed('ffff00001111'));
+
+    expect((await taskStore.get('task-1'))?.status).toBe('fixing');
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'fix-advance-rolled-back',
+    });
+  });
 });
 
 describe('manual git review dispatch (dispatchReviewToQa)', () => {
@@ -650,7 +1688,6 @@ describe('manual git review dispatch (dispatchReviewToQa)', () => {
     }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
-    const fetchLegacy = vi.spyOn(manager, 'fetchPrHeadSha');
     vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true, headSha: SHA2, branch: 'bx/task-1', targetBranch: 'main',
     });
@@ -659,7 +1696,6 @@ describe('manual git review dispatch (dispatchReviewToQa)', () => {
     await manager.dispatchReviewToQa('task-1');
 
     const task = await taskStore.get('task-1');
-    expect(fetchLegacy).not.toHaveBeenCalled();
     expect(task?.reviewHeadAnchorSha).toBe(SHA2);
     expect(task?.passToken).toMatch(/^[0-9a-f]{12}$/);
     expect(task?.passToken).not.toBe('abcdef123456');
@@ -757,55 +1793,158 @@ describe('closed-unmerged / reopen anchor with outbox (git)', () => {
     emitSpy.mockRestore();
     const replayed: BaxianEvent[] = [];
     eventBus.on('human.intervention', (evt) => { replayed.push(evt); });
-    await manager.flushGitOutbox();
+    await manager.flushTaskOutboxes();
     task = await taskStore.get('task-1');
     expect(task?.outbox).toBeUndefined();
     expect(replayed).toHaveLength(1);
     expect(replayed[0]!.data).toMatchObject({ eventKey: 'task-1:42:mr-closed-unmerged:1' });
   });
+
+  it('handles close and reopen for a platform-bound server task that publishes a PR', async () => {
+    await taskStore.set(gitTask({
+      reviewMode: 'server', afterDone: 'pr', status: 'ready',
+      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+    }));
+
+    await eventBus.emit(lifecycleEvent('closed-unmerged'));
+    expect((await taskStore.get('task-1'))?.closedUnmergedAnchor).toEqual({ prNumber: 42, generation: 1 });
+    expect(emitted.filter(event => event.type === 'human.intervention').at(-1)?.data).toMatchObject({
+      phase: 'mr-closed-unmerged', prNumber: 42,
+    });
+
+    await eventBus.emit(lifecycleEvent('reopened'));
+    expect((await taskStore.get('task-1'))?.closedUnmergedAnchor).toEqual({
+      prNumber: 42, generation: 1, cleared: true,
+    });
+  });
+
+  it('replays a platform-bound server task outbox during maintenance', async () => {
+    await taskStore.set(gitTask({
+      reviewMode: 'server', afterDone: 'pr', status: 'ready',
+      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      outbox: [{
+        key: 'task-1:42:mr-closed-unmerged:1',
+        type: 'human.intervention',
+        data: { phase: 'mr-closed-unmerged', prNumber: 42 },
+      }],
+    }));
+
+    await manager.flushTaskOutboxes();
+
+    expect((await taskStore.get('task-1'))?.outbox).toBeUndefined();
+    expect(emitted.filter(event => event.type === 'human.intervention').at(-1)?.data).toMatchObject({
+      phase: 'mr-closed-unmerged', prNumber: 42,
+    });
+  });
+
+  it('handles a platform lifecycle event after the task no longer has an assigned agent', async () => {
+    await taskStore.set(gitTask({
+      agentId: '', reviewMode: 'server', afterDone: 'pr', status: 'ready',
+      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+    }));
+    const event = lifecycleEvent('closed-unmerged');
+    delete event.agentId;
+    await eventBus.emit(event);
+    expect((await taskStore.get('task-1'))?.closedUnmergedAnchor).toEqual({ prNumber: 42, generation: 1 });
+  });
+
+  it('ignores lifecycle events for a server task that only publishes a branch', async () => {
+    await taskStore.set(gitTask({
+      reviewMode: 'server', afterDone: 'branch', status: 'ready', platformBinding: undefined,
+    }));
+    await eventBus.emit(lifecycleEvent('closed-unmerged'));
+    expect((await taskStore.get('task-1'))?.closedUnmergedAnchor).toBeUndefined();
+  });
 });
 
 describe('review round fixes from PR review', () => {
-  it('rejects a git APPROVE whose verdict payload is missing or not the current pass token', async () => {
+  it('rejects malformed git verdicts before any task or agent side effect', async () => {
     const base = {
-      status: 'review' as const, prNumber: 42, qaAgentId: 'qa-1',
+      prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
     };
-    for (const data of [
-      { action: 'APPROVE', headSha: SHA1, currentHeadSha: SHA1, reviewPassToken: 'ffff00001111' },
-      {
-        action: 'APPROVE', headSha: SHA1, currentHeadSha: SHA1, reviewPassToken: 'ffff00001111',
-        verdictToken: 'aaaa00000000', verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64) },
-      },
-    ]) {
-      emitted.length = 0;
-      await taskStore.set(gitTask(base));
-      await eventBus.emit({
-        id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
-        projectId: 'proj', agentId: 'qa-1', taskId: 'task-1', data,
-      });
-      expect((await taskStore.get('task-1'))?.status).toBe('review');
-      expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
-        phase: 'git-verdict-payload-invalid',
-      });
+    const valid = gitVerdict({});
+    const cases = [
+      { ...valid, action: 'DISMISS' },
+      { ...valid, source: 'untrusted-source' },
+      { ...valid, reviewPassToken: undefined },
+      { ...valid, reviewPassToken: 'short' },
+      { ...valid, reviewPassToken: 'eeeeeeeeeeee' },
+      { ...valid, headSha: 'not-a-sha' },
+      { ...valid, verdictCarrier: undefined },
+      { ...valid, verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'bad' } },
+      { ...valid, verdictToken: 'aaaa00000000' },
+    ];
+    for (const status of ['in_progress', 'fixing'] as const) {
+      for (const data of cases) {
+        const before = gitTask({ ...base, status });
+        await taskStore.set(before);
+        const transition = vi.spyOn(manager, 'transitionTaskStatus');
+        const approve = vi.spyOn(manager, 'approveGitReviewPass');
+        const acquire = vi.spyOn(manager, 'acquireAgentForTask');
+        const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+        const wait = vi.mocked(manager.markAgentWaiting);
+        wait.mockClear();
+        emitted.length = 0;
+        await eventBus.emit({
+          id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
+          projectId: 'proj', agentId: 'qa-1', taskId: 'task-1', data,
+        });
+        expect(await taskStore.get('task-1')).toEqual(before);
+        expect(transition).not.toHaveBeenCalled();
+        expect(approve).not.toHaveBeenCalled();
+        expect(acquire).not.toHaveBeenCalled();
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(wait).not.toHaveBeenCalled();
+        expect(emitted.find(event => event.type === 'human.intervention')?.data)
+          .toMatchObject({ phase: 'git-verdict-payload-invalid' });
+        transition.mockRestore();
+        approve.mockRestore();
+        acquire.mockRestore();
+        dispatch.mockRestore();
+      }
     }
   });
 
-  it('rejects a git REQUEST_CHANGES whose verdict payload is missing or not the current fail token', async () => {
-    await taskStore.set(gitTask({
+  it('rejects a git REQUEST_CHANGES whose verdict token is not the current fail token', async () => {
+    const before = gitTask({
       status: 'review', prNumber: 42, qaAgentId: 'qa-1',
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
       latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
-    }));
+    });
+    await taskStore.set(before);
     await eventBus.emit({
       id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
       projectId: 'proj', agentId: 'qa-1', taskId: 'task-1',
-      data: { action: 'REQUEST_CHANGES', headSha: SHA1, currentHeadSha: SHA1, reviewPassToken: 'ffff00001111' },
+      data: gitVerdict({ action: 'REQUEST_CHANGES', verdictToken: 'aaaa00000000' }),
     });
-    expect((await taskStore.get('task-1'))?.status).toBe('review');
-    expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
-      phase: 'git-verdict-payload-invalid', action: 'REQUEST_CHANGES',
+    expect(await taskStore.get('task-1')).toEqual(before);
+    expect(emitted.find(event => event.type === 'human.intervention')?.data)
+      .toMatchObject({ phase: 'git-verdict-payload-invalid' });
+  });
+
+  it('keeps the legal stale-verdict path for a structurally valid old review pass', async () => {
+    const before = gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1',
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1, reviewRound: 1,
+    });
+    await taskStore.set(before);
+    vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
+
+    await eventBus.emit({
+      id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'qa-1', taskId: 'task-1',
+      data: gitVerdict({
+        action: 'REQUEST_CHANGES', reviewPassToken: 'eeeeeeeeeeee',
+        verdictToken: '123456abcdef',
+      }),
+    });
+
+    expect(await taskStore.get('task-1')).toEqual(before);
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'stale-verdict-wrong-pass', verdictPassToken: 'eeeeeeeeeeee',
     });
   });
 
@@ -817,8 +1956,9 @@ describe('review round fixes from PR review', () => {
 
   it('recovery redispatches a durable pending pass even while the waiting dev keeps its binding', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      pendingRedispatch: true, signalToken: 'ffff00001111', reviewRound: 1,
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
@@ -831,10 +1971,10 @@ describe('review round fixes from PR review', () => {
 
   it('consumes a fresh revision even when the pass is already pending (crash-replay stays a no-op)', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      postApproveToken: 'tok123456789', pendingRedispatch: true,
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
       signalToken: 'ffff00001111', reviewRound: 1,
       replyActorId: '77', replyActorStatus: 'verified',
+      ...postApproveEpisode({ pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
     const revision = { sourceKey: 'issue-comments', id: 'c8', bodyDigest: 'd'.repeat(64), versionTime: 2000 };
@@ -886,9 +2026,9 @@ describe('second review round fixes', () => {
       status: 'merge-ready', prNumber: 42, latestHeadSha: shortSha,
       reviewHeadAnchorSha: shortSha, signalToken: 'ffff00001111', reviewRound: 1,
     }));
-    const returned = await manager.returnMergeReadyToApproved('task-1', {
+    const returned = asReturned(await manager.consumeGitFeedbackRevision('task-1', {
       key: 'issue-comments:c1:sha', versionTime: 2200,
-    });
+    }));
     expect(returned?.status).toBe('approved');
     expect(returned?.postApproveHeadSha).toBe(shortSha);
   });
@@ -911,28 +2051,218 @@ describe('second review round fixes', () => {
   });
 });
 
-describe('fourth review round fixes', () => {
-  it('review dispatch pending survives a failed QA dispatch and the sweep retries it', async () => {
-    await taskStore.set(gitTask());
-    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+describe('generation-fenced review dispatch', () => {
+  it('derives the QA phase from the locked lease when the entry snapshot becomes stale', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 0,
+      reviewRoundPending: true, latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
+    }));
+    const realGet = manager.getTask.bind(manager);
+    let reads = 0;
+    vi.spyOn(manager, 'getTask').mockImplementation(async (id: string) => {
+      const task = await realGet(id);
+      reads += 1;
+      if (reads === 2 && task) {
+        await taskStore.set({ ...task, reviewRound: 1, updatedAt: new Date().toISOString() });
+        return task;
+      }
+      return task;
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () => {
+      return (await realGet('task-1'))!;
+    });
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: SHA2 },
+    });
+
     const task = await taskStore.get('task-1');
-    expect(task?.status).toBe('review');
-    expect(task?.reviewDispatchPending).toBe(true);
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(task!);
-    // 直派在 startSession 成功后才计轮：失败后的 sweep 补派带上持久化的未计轮 intent 与首评相位（#563 R16/R17/CX2），
-    // 并把实时代际（expectSignalToken + expectReviewDispatchPending）压进 dispatch 锁内复核（#563 R21）
-    expect(task?.reviewRoundPending).toBe(true);
-    await manager.retryPendingGitReviewDispatches();
-    expect(dispatchSpy).toHaveBeenCalledWith('task-1', {
-      bumpRound: true,
-      qaPhase: 'review',
-      expectSignalToken: task!.signalToken,
-      expectReviewDispatchPending: true,
-      fromStatus: ['review', 'in_progress', 'fixing'],
+    expect(task?.reviewDispatch).toMatchObject({ effectiveRound: 2, qaPhase: 'recheck' });
+    expect(dispatch).toHaveBeenCalledWith('task-1', {
+      expectedGeneration: task!.reviewDispatch!.generation,
     });
   });
 
-  it('初次 git review 成功后按 dispatchToken 清掉持久化 pending，sweep 不再重派健康首评（#563 R27）', async () => {
+  it('pending lease survives a failed QA dispatch and the sweep retries the same generation', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('review');
+    expect(task?.reviewDispatch?.phase).toBe('pending');
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease').mockResolvedValue(task!);
+    expect(task?.reviewRoundPending).toBe(true);
+    await manager.retryPendingGitReviewDispatches();
+    expect(dispatchSpy).toHaveBeenCalledWith('task-1', {
+      expectedGeneration: task!.reviewDispatch!.generation,
+    });
+  });
+
+  it('does not probe or repeatedly claim a pending git review lease with no QA participant', async () => {
+    await taskStore.set(gitTask());
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await manager.retryPendingGitReviewDispatches();
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(emitted.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-no-qa-partner')).toHaveLength(1);
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
+  });
+
+  it('alerts once when the bound QA is missing from config and stops probing the lease', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-gone' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await manager.retryPendingGitReviewDispatches();
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    const alerts = emitted.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-qa-config-missing');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.data).toMatchObject({ qaAgentId: 'qa-gone' });
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
+  });
+
+  it('treats a bound QA whose config role changed as missing and alerts once', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
+    const originalConfig = manager.getAgentConfig.bind(manager);
+    vi.spyOn(manager, 'getAgentConfig').mockImplementation(id => {
+      const config = originalConfig(id);
+      return id === 'qa-1' && config ? { ...config, role: 'dev' } : config;
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await manager.retryPendingGitReviewDispatches();
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(emitted.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-qa-config-missing')).toHaveLength(1);
+  });
+
+  it('treats a bound QA moved to another project as missing and alerts once', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
+    const originalConfig = manager.getAgentConfig.bind(manager);
+    vi.spyOn(manager, 'getAgentConfig').mockImplementation(id => {
+      const config = originalConfig(id);
+      return id === 'qa-1' && config ? { ...config, projectId: 'other' } : config;
+    });
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await manager.retryPendingGitReviewDispatches();
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(verify).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(emitted.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-qa-config-missing')).toHaveLength(1);
+  });
+
+  it('the dispatch entry refuses a QA bound to another project and resets the claim', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
+    const originalConfig = manager.getAgentConfig.bind(manager);
+    vi.spyOn(manager, 'getAgentConfig').mockImplementation(id => {
+      const config = originalConfig(id);
+      return id === 'qa-1' && config ? { ...config, projectId: 'other' } : config;
+    });
+
+    await expect(manager.dispatchGitReviewLease('task-1', {}))
+      .rejects.toThrow('has no available QA participant');
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
+  });
+
+  it('isolates a task read failure in the config alert branch from the rest of the sweep', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-gone' }));
+    await taskStore.set(gitTask({ id: 'task-2', branch: 'bx/task-2', qaAgentId: 'qa-1' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    await eventBus.emit({
+      ...prCreated({ prNumber: 43, prUrl: 'https://x/pull/43', branch: 'bx/task-2', targetBranch: 'main', prAuthorId: '99' }),
+      taskId: 'task-2',
+    });
+    const task2 = await taskStore.get('task-2');
+    expect(task2?.reviewDispatch?.phase).toBe('pending');
+    const originalGet = taskStore.get.bind(taskStore);
+    vi.spyOn(taskStore, 'get').mockImplementation(async id => {
+      if (id === 'task-1') throw new Error('transient read failure');
+      return originalGet(id);
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA1, branch: 'bx/task-2', targetBranch: 'main',
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockResolvedValue(task2!);
+
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(dispatch).toHaveBeenCalledWith('task-2', {
+      expectedGeneration: task2!.reviewDispatch!.generation,
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('qa-config alert check failed'),
+      expect.any(Error),
+    );
+  });
+
+  it('lists participant seats only for active tasks with their expected roles', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    await taskStore.set(gitTask({ id: 'task-2', branch: 'bx/task-2', status: 'merged' }));
+
+    expect(await manager.listActiveParticipantSeats()).toEqual([
+      {
+        taskId: 'task-1',
+        projectId: 'proj',
+        participants: [
+          { agentId: 'dev-1', expectedRole: 'dev' },
+          { agentId: 'qa-1', expectedRole: 'qa' },
+        ],
+      },
+    ]);
+  });
+
+  it('propagates task store read failures out of the participant seat scan', async () => {
+    vi.spyOn(taskStore, 'listStrict').mockRejectedValue(new Error('scan read failed'));
+
+    await expect(manager.listActiveParticipantSeats()).rejects.toThrow('scan read failed');
+  });
+
+  it('does not alert from a stale sweep snapshot once the live lease has rotated', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-gone' }));
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+    const stale = (await taskStore.get('task-1'))!;
+    expect(stale.reviewDispatch?.phase).toBe('pending');
+    await taskStore.set({
+      ...stale,
+      reviewDispatch: { ...stale.reviewDispatch!, generation: 'aaaa11112222' },
+    });
+    vi.spyOn(taskStore, 'list').mockResolvedValue([stale]);
+
+    await manager.retryPendingGitReviewDispatches();
+
+    expect(emitted.filter(event => event.type === 'human.intervention'
+      && event.data.phase === 'git-review-qa-config-missing')).toHaveLength(0);
+  });
+
+  it('successful delivery clears the lease and the sweep does not replay it', async () => {
     await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(manager, 'startSession').mockResolvedValue(true);
@@ -941,37 +2271,32 @@ describe('fourth review round fixes', () => {
 
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('review');
-    expect(task?.reviewDispatchPending).toBeUndefined();
+    expect(task?.reviewDispatch).toBeUndefined();
 
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
     await manager.retryPendingGitReviewDispatches();
     expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
-  it('git 首评 arm 失败回滚保留 transition 写入的未计轮 intent（与 durable pending 同持，#563 CX-5.4）', async () => {
+  it('watcher arm failure resets the claim to pending without rolling back the pass', async () => {
     await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async (taskId) => {
-      const fresh = (await taskStore.get(taskId as string))!;
-      await taskStore.set({ ...fresh, signalToken: 'rot-tok-11111', updatedAt: new Date().toISOString() });
-      return { token: 'rot-tok-11111', armed: false };
-    });
+    const watcher = manager as unknown as { setupPhaseSignalWatcher: () => Promise<boolean> };
+    vi.spyOn(watcher, 'setupPhaseSignalWatcher').mockResolvedValue(false);
     await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
 
     const task = await taskStore.get('task-1');
-    expect(task?.status).toBe('in_progress');
-    expect(task?.reviewDispatchPending).toBe(true);
+    expect(task?.status).toBe('review');
+    expect(task?.reviewDispatch?.phase).toBe('pending');
     expect(task?.reviewRoundPending).toBe(true);
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-dispatch-failed', qaPhase: 'review',
+    });
   });
 
-  it('git 首评 startSession 失败回滚保留未计轮 intent（pr.updated 起点，#563 CX-5.4）', async () => {
+  it('startSession failure resets the claim to pending', async () => {
     await taskStore.set(gitTask({ qaAgentId: 'qa-1', prNumber: 42, latestHeadSha: SHA1 }));
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockImplementation(async (taskId) => {
-      const fresh = (await taskStore.get(taskId as string))!;
-      await taskStore.set({ ...fresh, signalToken: 'rot-tok-22222', updatedAt: new Date().toISOString() });
-      return { token: 'rot-tok-22222', armed: true };
-    });
     vi.spyOn(manager, 'startSession').mockResolvedValue(false);
     await eventBus.emit({
       id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
@@ -980,33 +2305,150 @@ describe('fourth review round fixes', () => {
     });
 
     const task = await taskStore.get('task-1');
-    expect(task?.status).toBe('in_progress');
-    expect(task?.reviewDispatchPending).toBe(true);
+    expect(task?.status).toBe('review');
+    expect(task?.reviewDispatch?.phase).toBe('pending');
     expect(task?.reviewRoundPending).toBe(true);
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-dispatch-failed', qaPhase: 'review',
+    });
   });
 
-  it('sweep 消费谓词按实时值复核：pending 已被清掉的旧快照不再重派（#563 R21）', async () => {
+  it('keeps an ack-unknown delivery as an uncertain lease instead of failing the task', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockRejectedValue(
+      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
+    );
+    const fail = vi.spyOn(manager, 'failTaskForDispatchError');
+
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    const task = await taskStore.get('task-1');
+    expect(task?.status).toBe('review');
+    expect(task?.reviewDispatch?.phase).toBe('uncertain');
+    expect(fail).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-dispatch-uncertain', qaPhase: 'review',
+    });
+  });
+
+  it('keeps a pr.updated push ack-unknown as an uncertain lease without failing the task', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 1,
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+    }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockRejectedValue(
+      new DispatchTerminalError('ack_unknown', 'push delivery outcome unknown'),
+    );
+    const fail = vi.spyOn(manager, 'failTaskForDispatchError');
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: SHA2 },
+    });
+
+    expect(await taskStore.get('task-1')).toMatchObject({
+      status: 'review', latestHeadSha: SHA2,
+      reviewDispatch: { phase: 'uncertain', headSha: SHA2 },
+    });
+    expect(fail).not.toHaveBeenCalled();
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-dispatch-uncertain', qaPhase: 'recheck',
+    });
+  });
+
+  it('surfaces a newer push deferred behind an uncertain review delivery', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 1,
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+    }));
+    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
+    vi.spyOn(manager, 'startSession').mockRejectedValue(
+      new DispatchTerminalError('ack_unknown', 'push delivery outcome unknown'),
+    );
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: SHA2 },
+    });
+    emitted.length = 0;
+    const newestHead = 'c'.repeat(40);
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: newestHead },
+    });
+
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toMatchObject({
+      phase: 'uncertain', headSha: SHA2,
+    });
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'git-review-dispatch-uncertain', qaPhase: 'recheck', headSha: newestHead,
+    });
+  });
+
+  it('routes a terminal review dispatch error through failTaskForDispatchError', async () => {
+    await taskStore.set(gitTask({ qaAgentId: 'qa-1' }));
+    const error = new DispatchTerminalError('prompt_too_large', 'prompt too large');
+    vi.spyOn(manager, 'dispatchGitReviewLease').mockRejectedValue(error);
+    const fail = vi.spyOn(manager, 'failTaskForDispatchError').mockResolvedValue(undefined);
+
+    await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
+
+    expect(fail).toHaveBeenCalledWith(
+      'task-1', 'review', 'qa-1', error,
+      { expectedReviewDispatch: expect.objectContaining({ phase: 'pending' }) },
+    );
+  });
+
+  it('routes a terminal pr.updated dispatch error through failTaskForDispatchError', async () => {
+    await taskStore.set(gitTask({
+      status: 'review', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 1,
+      latestHeadSha: SHA1, reviewHeadAnchorSha: SHA1,
+      signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
+    }));
+    const error = new DispatchTerminalError('required_skills_missing', 'QA skill missing');
+    vi.spyOn(manager, 'dispatchGitReviewLease').mockRejectedValue(error);
+    const fail = vi.spyOn(manager, 'failTaskForDispatchError').mockResolvedValue(undefined);
+
+    await eventBus.emit({
+      id: '', type: 'pr.updated', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { kind: 'push', prNumber: 42, branch: 'bx/task-1', headSha: SHA2 },
+    });
+
+    expect(fail).toHaveBeenCalledWith(
+      'task-1', 'recheck', 'qa-1', error,
+      { expectedReviewDispatch: expect.objectContaining({ phase: 'pending', headSha: SHA2 }) },
+    );
+  });
+
+  it('the sweep ignores a lease removed after its old snapshot was observed', async () => {
     await taskStore.set(gitTask());
     await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
     const stale = await taskStore.get('task-1');
-    expect(stale?.reviewDispatchPending).toBe(true);
-    vi.spyOn(manager, 'listActiveGitTasks').mockResolvedValue([stale!]);
-    await taskStore.set({ ...(stale!), reviewDispatchPending: undefined, updatedAt: new Date().toISOString() } as never);
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+    expect(stale?.reviewDispatch?.phase).toBe('pending');
+    await taskStore.set({ ...(stale!), reviewDispatch: undefined, updatedAt: new Date().toISOString() });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
 
     expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
-  it('sweep 对同代 busy pending 让位（不空转 release/acquire），交对账观测门消费（#563 CX-3.2）', async () => {
+  it('the sweep yields to a matching in-memory busy observation', async () => {
     await taskStore.set(gitTask());
     await eventBus.emit(prCreated({ targetBranch: 'main', prAuthorId: '99' }));
     const live = await taskStore.get('task-1');
     manager.registerPendingDispatchRetry('task-1', {
       kind: 'qa-recheck', agentId: 'qa-1', signalToken: live!.signalToken!,
     });
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease');
 
     await manager.retryPendingGitReviewDispatches();
 
@@ -1016,9 +2458,9 @@ describe('fourth review round fixes', () => {
 
   it('recovery re-arms instead of re-injecting while the delivered prompt is still running', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
-      postApproveToken: 'tok123456789', postApprovePhase: 'delivered',
-      pendingRedispatch: true, signalToken: 'ffff00001111', reviewRound: 1,
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ postApprovePhase: 'delivered', pendingRedispatch: true }),
     }));
     vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
     const rearm = vi.spyOn(manager, 'rearmPostApproveSignal').mockResolvedValue(true);
@@ -1027,10 +2469,34 @@ describe('fourth review round fixes', () => {
     expect(continueSpy).not.toHaveBeenCalled();
     expect(rearm).toHaveBeenCalledWith('task-1');
 
-    await taskStore.set({ ...(await taskStore.get('task-1'))!, postApprovePhase: 'signaled', updatedAt: new Date().toISOString() });
+    await taskStore.set({
+      ...(await taskStore.get('task-1'))!, postApprovePhase: 'signaled', updatedAt: RECOVERY_READY_AT,
+    });
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     await recoverGitPostApprovePending(eventBus, manager);
     expect(continueSpy).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['refuses the active episode', false, 're-arm refused'],
+    ['throws', new Error('watcher unavailable'), 'watcher unavailable'],
+  ])('recovery reports an intervention when post-approve re-arm %s', async (_label, result, message) => {
+    await taskStore.set(gitTask({
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
+      signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode({ postApprovePhase: 'delivered', pendingRedispatch: true }),
+    }));
+    vi.spyOn(manager, 'getAgentState').mockResolvedValue({ taskId: 'task-1' } as never);
+    const rearm = vi.spyOn(manager, 'rearmPostApproveSignal');
+    if (result instanceof Error) rearm.mockRejectedValue(result);
+    else rearm.mockResolvedValue(result);
+
+    await recoverGitPostApprovePending(eventBus, manager);
+
+    expect(emitted).toContainEqual(expect.objectContaining({
+      type: 'human.intervention',
+      data: expect.objectContaining({ phase: 'post-approve-recovery-failed', error: expect.stringContaining(message) }),
+    }));
   });
 
   it('rejects a stale REQUEST_CHANGES once the round rotated during its await window', async () => {
@@ -1048,47 +2514,67 @@ describe('fourth review round fixes', () => {
     await eventBus.emit({
       id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
       projectId: 'proj', agentId: 'qa-1', taskId: 'task-1',
-      data: {
-        action: 'REQUEST_CHANGES', headSha: SHA1, currentHeadSha: SHA1,
-        reviewPassToken: 'ffff00001111', verdictToken: '123456abcdef',
+      data: gitVerdict({
+        action: 'REQUEST_CHANGES', verdictToken: '123456abcdef',
         verdictCarrier: { sourceKey: 'reviews', id: 'r9', bodyDigest: 'a'.repeat(64) },
-      },
+      }),
     });
     expect((await taskStore.get('task-1'))?.status).toBe('review');
+  });
+
+  it('keeps the task merged when post-merge cleanup fails', async () => {
+    await taskStore.set(gitTask({ status: 'review', prNumber: 42, qaAgentId: undefined }));
+    vi.spyOn(manager, 'cleanupAfterMerge').mockRejectedValue(new Error('cleanup unavailable'));
+
+    await expect(eventBus.emit({
+      id: '', type: 'pr.merged', timestamp: new Date().toISOString(),
+      projectId: 'proj', agentId: 'dev-1', taskId: 'task-1',
+      data: { prNumber: 42, branch: 'bx/task-1', prUrl: 'https://x/pull/42' },
+    })).resolves.toBeUndefined();
+
+    expect((await taskStore.get('task-1'))?.status).toBe('merged');
   });
 });
 
 describe('fifth review round fixes', () => {
-  it('sweep re-enters review for a rolled-back fixing task that still owes a dispatch', async () => {
-    await taskStore.set(gitTask({
-      status: 'fixing', prNumber: 42, reviewDispatchPending: true,
-      signalToken: 'ffff00001111', reviewRound: 1,
-    }));
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue(gitTask());
+  it('sweep dispatches a durable pending lease by generation', async () => {
+    await taskStore.set(gitTask({ status: 'fixing', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 1 }));
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['fixing'], headSha: SHA1, bumpRound: false,
+    });
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
+    });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchGitReviewLease').mockResolvedValue(begun!.task);
     await manager.retryPendingGitReviewDispatches();
     expect(dispatchSpy).toHaveBeenCalledWith('task-1', {
-      bumpRound: false,
-      expectSignalToken: 'ffff00001111',
-      expectReviewDispatchPending: true,
-      fromStatus: ['review', 'in_progress', 'fixing'],
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
     });
   });
 
-  it('keeps a sibling generation pending when a stale clear arrives with the old token', async () => {
-    await taskStore.set(gitTask({
-      status: 'review', prNumber: 42, reviewDispatchPending: true,
-      signalToken: 'bbbb22223333', reviewRound: 2,
-    }));
-    await manager.clearReviewDispatchPending('task-1', 'aaaa11112222');
-    expect((await taskStore.get('task-1'))?.reviewDispatchPending).toBe(true);
-    await manager.clearReviewDispatchPending('task-1', 'bbbb22223333');
-    expect((await taskStore.get('task-1'))?.reviewDispatchPending).toBeUndefined();
+  it('a stale generation cannot claim its successor lease', async () => {
+    await taskStore.set(gitTask({ status: 'review', prNumber: 42, reviewRound: 1 }));
+    const first = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    const second = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA2, bumpRound: true,
+      expectSignalToken: first!.task.signalToken,
+    });
+    expect(await manager.claimGitReviewDispatch('task-1', first!.task.reviewDispatch!.generation)).toBeNull();
+    const claimed = await manager.claimGitReviewDispatch('task-1', second!.task.reviewDispatch!.generation);
+    expect(claimed?.lease).toMatchObject({
+      generation: second!.task.reviewDispatch!.generation,
+      phase: 'claimed',
+      headSha: SHA2,
+    });
   });
 
   it('keeps the installed completion for the sweep when the post-approve prompt fails to start', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
       signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode(),
     }));
     vi.spyOn(manager, 'getAgentState').mockResolvedValue(undefined as never);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
@@ -1107,8 +2593,9 @@ describe('fifth review round fixes', () => {
 
   it('leaves a durable retry anchor when the dev cannot be acquired for post-approve', async () => {
     await taskStore.set(gitTask({
-      status: 'approved', prNumber: 42, latestHeadSha: SHA1, postApproveHeadSha: SHA1,
+      status: 'approved', prNumber: 42, latestHeadSha: SHA1,
       signalToken: 'ffff00001111', reviewRound: 1,
+      ...postApproveEpisode(),
     }));
     vi.spyOn(manager, 'getAgentState').mockResolvedValue(undefined as never);
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
@@ -1119,6 +2606,9 @@ describe('fifth review round fixes', () => {
       data: { kind: 'comment', prNumber: 42, commentId: 'cg', revision },
     });
     expect((await taskStore.get('task-1'))?.pendingRedispatch).toBe(true);
+    expect(emitted.find(event => event.type === 'human.intervention')?.data).toMatchObject({
+      phase: 'post-approve-dev-acquire-failed', devAgentId: 'dev-1',
+    });
   });
 
   it('a stale approve after a concurrent round rotation cannot overwrite the successor head', async () => {
@@ -1127,20 +2617,16 @@ describe('fifth review round fixes', () => {
       signalToken: 'ffff00001111', passToken: 'abcdef123456', failToken: '123456abcdef',
       latestHeadSha: SHA2, reviewHeadAnchorSha: SHA1, reviewRound: 1,
     }));
-    const realTransition = manager.transitionTaskStatus.bind(manager);
-    vi.spyOn(manager, 'transitionTaskStatus').mockImplementationOnce(async (id, to, guard, patch) => {
+    const realApprove = manager.approveGitReviewPass.bind(manager);
+    vi.spyOn(manager, 'approveGitReviewPass').mockImplementationOnce(async (id, opts) => {
       const t = await taskStore.get('task-1');
       await taskStore.set({ ...t!, signalToken: 'eeee99990000', updatedAt: new Date().toISOString() });
-      return realTransition(id, to, guard, patch);
+      return realApprove(id, opts);
     });
     await eventBus.emit({
       id: '', type: 'review.submitted', timestamp: new Date().toISOString(),
       projectId: 'proj', agentId: 'qa-1', taskId: 'task-1',
-      data: {
-        action: 'APPROVE', headSha: SHA1, currentHeadSha: SHA1,
-        reviewPassToken: 'ffff00001111', verdictToken: 'abcdef123456',
-        verdictCarrier: { sourceKey: 'reviews', id: 'r1', bodyDigest: 'f'.repeat(64) },
-      },
+      data: gitVerdict({}),
     });
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('review');

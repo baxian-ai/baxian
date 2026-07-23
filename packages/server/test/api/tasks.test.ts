@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { TaskState } from '../../src/shared/index.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { DispatchTerminalError } from '../../src/agent/manager.js';
 import { ApiError } from '../../src/errors.js';
 import {
@@ -37,6 +36,8 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     devAgentId: 'dev-1',
     phase: 'code',
     reviewRound: 0,
+    reviewMode: 'git',
+    platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
     status: 'in_progress',
     branch: 'bx/task-001',
     createdAt: now,
@@ -147,21 +148,6 @@ describe('GET /api/tasks', () => {
     expect(body.tasks[0].projectId).toBe('proj');
   });
 
-  it('does not expose post-approve completion secrets', async () => {
-    await seedTask({ status: 'in_progress' });
-    await app.ctx.agentManager.setPostApproveCompletion('task-001', {
-      token: 'secret-token',
-      approvedHeadSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    });
-
-    const response = await get('/api/tasks?projectId=proj');
-
-    expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body) as { tasks: Array<Record<string, unknown>> };
-    expect(body.tasks[0].signalToken).toBeUndefined();
-    expect(body.tasks[0].approvedHeadSha).toBeUndefined();
-  });
-
   describe('category=active', () => {
     it('只返回 active 任务，按 updatedAt 倒序，分页', async () => {
       await seedTask({ id: 'task-001', status: 'in_progress', updatedAt: '2026-05-16T00:00:00Z' });
@@ -265,18 +251,36 @@ describe('GET /api/tasks/:id', () => {
   it('returns task details for known task', async () => {
     const task = makeTask();
     await app.ctx.taskStore.set(task);
-    await app.ctx.agentManager.setPostApproveCompletion(task.id, {
-      token: 'secret-token',
-      approvedHeadSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-    });
 
     const response = await get('/api/tasks/task-001');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body) as TaskState & Record<string, unknown>;
     expect(body.id).toBe('task-001');
     expect(body.title).toBe('Sample task');
-    expect(body.signalToken).toBeUndefined();
-    expect(body.approvedHeadSha).toBeUndefined();
+  });
+
+  it('exposes the active post-approve episode used by the trusted operator API', async () => {
+    await seedTask({
+      status: 'approved',
+      postApproveGeneration: 'feedfeedfeed',
+      postApproveHeadSha: 'a'.repeat(40),
+      postApproveToken: 'deadbeefcafe',
+      postApprovePhase: 'delivered',
+      pendingRedispatch: true,
+      redispatchCount: 2,
+    });
+
+    const response = await get('/api/tasks/task-001');
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({
+      postApproveGeneration: 'feedfeedfeed',
+      postApproveHeadSha: 'a'.repeat(40),
+      postApproveToken: 'deadbeefcafe',
+      postApprovePhase: 'delivered',
+      pendingRedispatch: true,
+      redispatchCount: 2,
+    });
   });
 
   it('returns 404 for unknown task', async () => {
@@ -438,6 +442,28 @@ describe('POST /api/tasks', () => {
     const response = await post('/api/tasks', createPayload({ preferredAgentId: 'nope' }));
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body).error).toMatch(/Unknown agent/);
+  });
+});
+
+describe('POST /api/tasks/:id/review', () => {
+  it('treats the operator action as explicit confirmation that an uncertain prior dispatch was not delivered', async () => {
+    const updated = makeTask({ id: 'task-001', status: 'review' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa').mockResolvedValue(updated);
+
+    const response = await post('/api/tasks/task-001/review');
+
+    expect(response.statusCode).toBe(202);
+    expect(spy).toHaveBeenCalledWith('task-001', { confirmUncertainNotDelivered: true });
+  });
+
+  it('preserves a manager rejection when the uncertain episode cannot be confirmed safely', async () => {
+    vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa')
+      .mockRejectedValue(new ApiError(409, 'review dispatch generation changed'));
+
+    const response = await post('/api/tasks/task-001/review');
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toContain('generation changed');
   });
 });
 
@@ -1041,19 +1067,6 @@ describe('server review mode API', () => {
 });
 
 describe('GET /api/tasks/:id/pr-review', () => {
-  function fakeRunner(byPath: Record<string, string>): CommandRunner {
-    return {
-      exec: async (cmd: string): Promise<ExecResult> => {
-        for (const [key, stdout] of Object.entries(byPath)) {
-          if (cmd.includes(key)) return { stdout, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      },
-      writeFile: async () => undefined,
-      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    };
-  }
-
   it('404 when the task does not exist', async () => {
     const res = await get('/api/tasks/missing/pr-review');
     expect(res.statusCode).toBe(404);
@@ -1072,24 +1085,10 @@ describe('GET /api/tasks/:id/pr-review', () => {
     expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'no-pr' });
   });
 
-  it('available:false (not-github) when the project repo is unresolvable', async () => {
+  it('available:false (driver-unavailable) when the project is unresolvable', async () => {
     await seedTask({ id: 'gh-other', projectId: 'ghost', prNumber: 3 });
     const res = await get('/api/tasks/gh-other/pr-review');
-    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'not-github' });
-  });
-
-  it('available:true passes through items and PR metadata', async () => {
-    app.ctx.githubRunner = fakeRunner({
-      'pulls/7/reviews': JSON.stringify({ id: 1, state: 'APPROVED', body: 'lgtm', submitted_at: '2026-06-01T10:00:00Z' }),
-    });
-    await seedTask({ id: 'gh-ok', prNumber: 7, prUrl: 'https://github.com/user/repo/pull/7' });
-    const res = await get('/api/tasks/gh-ok/pr-review');
-    const body = JSON.parse(res.body);
-    expect(body.available).toBe(true);
-    expect(body.prNumber).toBe(7);
-    expect(body.prUrl).toBe('https://github.com/user/repo/pull/7');
-    expect(body.items).toHaveLength(1);
-    expect(body.items[0]).toMatchObject({ kind: 'review', verdict: 'approve' });
+    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'driver-unavailable' });
   });
 
   it('the retired github-review path is gone (no alias route)', async () => {
@@ -1146,63 +1145,58 @@ describe('GET /api/tasks/:id/pr-review', () => {
     bindingSpy.mockRestore();
   });
 
-  function countingRunner(): { runner: CommandRunner; commands: string[] } {
-    const commands: string[] = [];
-    const runner: CommandRunner = {
-      exec: async (cmd: string): Promise<ExecResult> => {
-        commands.push(cmd);
-        return { stdout: '', stderr: '', exitCode: 0 };
+  function countingDriver(): { driver: unknown; calls: number[] } {
+    const calls: number[] = [];
+    const driver = {
+      commentSources: [{ key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } }],
+      runCommentSource: async (_src: unknown, vars: { prNumber: number }) => {
+        calls.push(vars.prNumber);
+        return [{ id: 'c1', body: 'hi', createdAt: '2026-07-19T01:00:00Z' }];
       },
-      writeFile: async () => undefined,
-      execWithStdin: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
     };
-    return { runner, commands };
+    return { driver, calls };
   }
 
-  it('serves consecutive same-revision GETs from cache: gh runs once', async () => {
-    const { runner, commands } = countingRunner();
-    app.ctx.githubRunner = runner;
-    await seedTask({ id: 'gh-cache', prNumber: 7 });
-    await get('/api/tasks/gh-cache/pr-review');
-    const afterFirst = commands.length;
-    const res = await get('/api/tasks/gh-cache/pr-review');
-    expect(afterFirst).toBe(4);
-    expect(commands.length).toBe(4);
+  it('serves consecutive same-revision GETs from cache: the driver runs once', async () => {
+    const { driver, calls } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask({ id: 'git-cache', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await get('/api/tasks/git-cache/pr-review');
+    const res = await get('/api/tasks/git-cache/pr-review');
+    expect(calls).toEqual([7]);
     expect(JSON.parse(res.body).available).toBe(true);
+    spy.mockRestore();
+    bindingSpy.mockRestore();
   });
 
   it('rebuilds when a revision field changes (reviewDispatchedAt)', async () => {
-    const { runner, commands } = countingRunner();
-    app.ctx.githubRunner = runner;
-    await seedTask({ id: 'gh-rev', prNumber: 7 });
-    await get('/api/tasks/gh-rev/pr-review');
-    await seedTask({ id: 'gh-rev', prNumber: 7, reviewDispatchedAt: '2026-07-01T00:00:00Z' });
-    await get('/api/tasks/gh-rev/pr-review');
-    expect(commands.length).toBe(8);
+    const { driver, calls } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask({ id: 'git-rev', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await get('/api/tasks/git-rev/pr-review');
+    await seedTask({
+      id: 'git-rev', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING,
+      reviewDispatchedAt: '2026-07-01T00:00:00Z',
+    });
+    await get('/api/tasks/git-rev/pr-review');
+    expect(calls).toEqual([7, 7]);
+    spy.mockRestore();
+    bindingSpy.mockRestore();
   });
 
-  it('rebuilds when only prNumber changes (PR rebind)', async () => {
-    const { runner, commands } = countingRunner();
-    app.ctx.githubRunner = runner;
-    await seedTask({ id: 'gh-rebind', prNumber: 7 });
-    await get('/api/tasks/gh-rebind/pr-review');
-    await seedTask({ id: 'gh-rebind', prNumber: 9 });
-    const res = await get('/api/tasks/gh-rebind/pr-review');
-    expect(commands.length).toBe(8);
-    expect(commands.slice(4).every((c) => c.includes('/9'))).toBe(true);
+  it('rebuilds against the new PR when only prNumber changes (PR rebind)', async () => {
+    const { driver, calls } = countingDriver();
+    const bindingSpy = spyLiveBinding();
+    const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
+    await seedTask({ id: 'git-rebind', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await get('/api/tasks/git-rebind/pr-review');
+    await seedTask({ id: 'git-rebind', reviewMode: 'git', prNumber: 9, platformBinding: GIT_BINDING });
+    const res = await get('/api/tasks/git-rebind/pr-review');
+    expect(calls).toEqual([7, 9]);
     expect(JSON.parse(res.body).prNumber).toBe(9);
-  });
-
-  it('rebuilds when the project repo slug changes', async () => {
-    const { runner, commands } = countingRunner();
-    app.ctx.githubRunner = runner;
-    await seedTask({ id: 'gh-slug', prNumber: 7 });
-    await get('/api/tasks/gh-slug/pr-review');
-    const project = app.ctx.agentManager.getProjectConfig('proj');
-    if (!project) throw new Error('test project missing');
-    project.repo = 'user/moved';
-    await get('/api/tasks/gh-slug/pr-review');
-    expect(commands.length).toBe(8);
-    expect(commands.slice(4).every((c) => c.includes('repos/user/moved/'))).toBe(true);
+    spy.mockRestore();
+    bindingSpy.mockRestore();
   });
 });

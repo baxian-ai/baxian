@@ -61,8 +61,12 @@ function hasPathEndingWith(config: BaxianConfig, suffix: string): boolean {
   return validateConfig(config).some(e => e.path.endsWith(suffix));
 }
 
+// 这些用例考的是 repo URL 形态与凭据，不是 review.mode：显式 server 模式把 git 模式的
+// 结构要求（gitCli.tool 等）隔离在外，避免缺省切换后 URL 断言被 mode 错误淹没。
 function repoErrors(repo: string) {
-  return validateConfig(withProject(devProject({ repo }))).filter(e => e.path.endsWith('.repo'));
+  return validateConfig(withProject(
+    devProject({ repo, review: { mode: 'server' } }),
+  )).filter(e => e.path.endsWith('.repo'));
 }
 
 describe('validateConfig', () => {
@@ -248,17 +252,17 @@ describe('validateConfig', () => {
     expect(validateConfig(cfg)).toEqual([]);
   });
 
-  it('rejects a non-github project whose effective review.mode is github', () => {
+  it("rejects the retired 'github' value at the global scope", () => {
     const errors = validateConfig(withProject(
       devProject({ id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', agent: [] }),
-      { review: { rounds: 10, mode: 'github' } },
+      { review: { rounds: 10, mode: 'github' as never } },
     ));
-    expect(errors.map(e => e.path)).toContain('project[0].review.mode');
+    expect(errors.map(e => e.path)).toContain('review.mode');
   });
 
-  it('rejects a non-github project overriding global server mode back to github', () => {
+  it("rejects the retired 'github' value in a project override", () => {
     const errors = validateConfig(withProject(
-      devProject({ id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', review: { mode: 'github' }, agent: [] }),
+      devProject({ id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', review: { mode: 'github' as never }, agent: [] }),
       { review: { rounds: 10, mode: 'server' } },
     ));
     expect(errors.map(e => e.path)).toContain('project[0].review.mode');
@@ -301,9 +305,9 @@ describe('validateConfig', () => {
     expect(errors.map(e => e.path)).toContain('project[0].review.mode');
   });
 
-  it('allows a github project to override global server mode back to github', () => {
+  it('allows a github project to override global server mode back to git', () => {
     const errors = validateConfig(withProject(
-      devProject({ review: { mode: 'github' }, agent: [[makeAgent({ id: 'd1', role: 'dev' })]] }),
+      devProject({ id: 'gh', repo: 'https://github.com/a/b.git', review: { mode: 'git' }, agent: [] }),
       { review: { rounds: 10, mode: 'server' } },
     ));
     expect(errors).toEqual([]);

@@ -24,10 +24,12 @@ const TASK: TaskState = {
   devAgentId: 'dev-1',
   phase: 'code',
   reviewRound: 0,
+  reviewMode: 'git',
   status: 'pending',
   createdAt: '2026-04-28T10:00:00Z',
   updatedAt: '2026-04-28T10:00:00Z',
 };
+const REVIEW_PAIR = { passToken: 'abc123abc123', failToken: 'def456def456' } as const;
 
 function useServerPhaseRegistry(prefix: string): () => SkillRegistry {
   let tempDir: string;
@@ -126,7 +128,7 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain('phase: develop');
     expect(prompt).not.toContain('role:');
     expect(prompt).not.toContain('task: task-001');
-    expect(prompt).toContain('exchange: github-pr');
+    expect(prompt).toContain('exchange: git-pr');
     expect(prompt).toContain('workdir: /tmp/repo/.baxian-worktrees/task-001_abc');
     expect(prompt).toContain('title: Fix login redirect');
     expect(prompt).not.toContain('cd into the worktree');
@@ -166,7 +168,7 @@ describe('buildPromptInline', () => {
     expect(prompt.startsWith('$baxian-task-check\n')).toBe(true);
     const QA_CODEX: AgentConfig = { ...QA_AGENT, runtime: 'codex' };
     const reviewPrompt = build({
-      task: { ...TASK, status: 'review', prNumber: 42 },
+      task: { ...TASK, status: 'review', prNumber: 42, ...REVIEW_PAIR },
       phase: 'review',
       agent: QA_CODEX,
       signalToken: 'review-token-N',
@@ -376,7 +378,7 @@ describe('buildPromptInline', () => {
   });
 
   it.each([
-    ['github chain', undefined, 'pr-created' as const],
+    ['git chain', 'git' as const, 'pr-created' as const],
     ['server chain', 'server' as const, 'code-done' as const],
   ])('develop drops the spec route when the task has no QA partner (%s)', async (_label, reviewMode, replacementSignal) => {
     await seedAndScan();
@@ -406,7 +408,7 @@ describe('buildPromptInline', () => {
   it('review descriptor carries pr + token; verdict procedure lives in the skill', async () => {
     await seedAndScan();
     const prompt = build({
-      task: { ...TASK, status: 'review', prNumber: 42 },
+      task: { ...TASK, status: 'review', prNumber: 42, ...REVIEW_PAIR },
       phase: 'review',
       agent: QA_AGENT,
       signalToken: 'review-token-N',
@@ -426,7 +428,7 @@ describe('buildPromptInline', () => {
   ])('review descriptor carries anchor-sha only when present (%s)', async (_label, reviewHeadAnchorSha, contains, notContains) => {
     await seedRealSkillsAndScan(['baxian-pr-review']);
     const prompt = build({
-      task: { ...TASK, status: 'review', prNumber: 42, reviewHeadAnchorSha },
+      task: { ...TASK, status: 'review', prNumber: 42, reviewHeadAnchorSha, ...REVIEW_PAIR },
       phase: 'review',
       agent: QA_AGENT,
       signalToken: 'review-token-N',
@@ -439,7 +441,10 @@ describe('buildPromptInline', () => {
   it('recheck descriptor carries pr + anchor-sha; verdict procedure lives in the skill', async () => {
     await seedRealSkillsAndScan(['baxian-pr-recheck']);
     const prompt = build({
-      task: { ...TASK, status: 'review', prNumber: 42, reviewRound: 2, reviewHeadAnchorSha: 'sha-recheck-789' },
+      task: {
+        ...TASK, status: 'review', prNumber: 42, reviewRound: 2,
+        reviewHeadAnchorSha: 'sha-recheck-789', ...REVIEW_PAIR,
+      },
       phase: 'recheck',
       agent: QA_AGENT,
       signalToken: 'recheck-token-N',
@@ -459,7 +464,7 @@ describe('buildPromptInline', () => {
       signalToken: 'code-token-1',
     });
     expect(prompt).toContain('phase: code');
-    expect(prompt).toContain('exchange: github-pr');
+    expect(prompt).toContain('exchange: git-pr');
     expect(prompt).toContain('signal: pr-created');
     expect(prompt).toContain('token: code-token-1');
     expect(prompt).not.toContain('gh pr create');
@@ -596,10 +601,10 @@ describe('buildPromptInline', () => {
       expect(Buffer.byteLength(rendered ?? '', 'utf8')).toBeLessThanOrEqual(512);
     });
 
-    it('legacy tasks render no cli family even when platformCli is passed', async () => {
+    it('a git task without a resolved platform cli keeps the exchange but omits cli fields', async () => {
       await seedAndScan();
-      const prompt = build({ task: TASK, signalToken: 'dev-token-4', platformCli: CLI });
-      expect(prompt).toContain('exchange: github-pr');
+      const prompt = build({ task: TASK, signalToken: 'dev-token-4' });
+      expect(prompt).toContain('exchange: git-pr');
       expect(prompt).not.toContain('cli: gh');
       expect(prompt).not.toContain('cli-host:');
       expect(prompt).not.toMatch(/^base: /m);
@@ -625,6 +630,7 @@ describe('server review mode prompt builders', () => {
       workdir: '/wt/x',
       skillRegistry: getRegistry(),
       signalToken: 'srvtok123456',
+      serverFindingsDigest: 'a'.repeat(64),
       ...extra,
     } as Parameters<typeof buildPromptInline>[0]);
   }
@@ -681,6 +687,28 @@ describe('server review mode prompt builders', () => {
     assertFragments(build(phase, agent, extra), expectations);
   });
 
+  it('publish=pr carries the normalized repo identity and the base snapshot', () => {
+    const prompt = build('server-after-done', DEV_AGENT, {
+      task: {
+        ...TASK, reviewMode: 'server', baseBranch: 'main',
+        platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      },
+      serverAfterDone: { kind: 'pr', branch: 'bx/task-001' },
+    });
+    assertFragments(prompt, { contains: ['publish: pr', 'repo: github.com/owner/repo', 'base: main'] });
+  });
+
+  it('publish=branch carries no PR targeting fields even with both snapshots present', () => {
+    const prompt = build('server-after-done', DEV_AGENT, {
+      task: {
+        ...TASK, reviewMode: 'server', baseBranch: 'main',
+        platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+      },
+      serverAfterDone: { kind: 'branch', branch: 'bx/task-001' },
+    });
+    assertFragments(prompt, { contains: ['publish: branch'], notMatches: [/^repo: /m, /^base: /m] });
+  });
+
   it('server-feedback picks the signal + feedback fields by task phase', () => {
     const codePrompt = build('server-feedback', DEV_AGENT, { serverPriorFindings: CODE_FINDINGS });
     expect(codePrompt).toContain('signal: code-fixed');
@@ -723,6 +751,83 @@ describe('server review mode prompt builders', () => {
       const policy = await readFile(join(skillsRoot, name, 'agents', 'openai.yaml'), 'utf-8');
       expect(policy).toContain('allow_implicit_invocation: false');
     }
+  });
+
+  it('quotes the task-check frontmatter description that contains YAML mapping delimiters', async () => {
+    const skill = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    const description = skill.split('\n').find(line => line.startsWith('description:'));
+    expect(description).toMatch(/^description: ".*"$/);
+  });
+
+  it('keeps the descriptor-selected platform CLI skill model-invocable', async () => {
+    const root = fileURLToPath(new URL('../../src/platform/plugins/github/skills/baxian-cli-gh', import.meta.url));
+    const md = await readFile(join(root, 'SKILL.md'), 'utf-8');
+    const policy = await readFile(join(root, 'agents', 'openai.yaml'), 'utf-8');
+    expect(md).not.toContain('disable-model-invocation: true');
+    expect(md).toContain('Load when the dispatch descriptor carries `cli: gh`');
+    expect(policy).toContain('allow_implicit_invocation: true');
+  });
+
+  it('guards every git CLI Workdir temp write against symlink redirection in one shell invocation', async () => {
+    const root = fileURLToPath(new URL('../../src/platform/plugins/github/skills/baxian-cli-gh', import.meta.url));
+    const md = await readFile(join(root, 'SKILL.md'), 'utf-8');
+    expect(md).toContain('pwd -P');
+    expect(md).toContain('[ ! -e "$target" ] && [ ! -L "$target" ]');
+    expect(md).toContain('quoted heredoc whose delimiter you generated and verified');
+    expect(md).toContain('Never use a file-editing tool for these Workdir temp files');
+    expect(md).toContain('never split the ancestor guards, creation, writes, and final checks across tool calls');
+  });
+
+  it('server PR publication is fully non-interactive and marks the PR as managed', async () => {
+    const skill = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(skill).toContain('--title "$(cat <title-file>)"');
+    expect(skill).toContain('--body-file <body-file>');
+    expect(skill).toContain('<!-- baxian:managed -->');
+    expect(skill).toContain('Strip a leading `Draft:`');
+    expect(skill).toContain('--json isDraft --jq .isDraft');
+    expect(skill).toContain('GH_HOST=<repo-host> gh pr ready <pr_number> -R <repo:>');
+    expect(skill).toContain('Stage the title and body in one shell invocation rooted at the descriptor Workdir');
+    expect(skill).toContain('pwd -P');
+    expect(skill).toContain('[ ! -e "$target" ] && [ ! -L "$target" ]');
+    expect(skill).toContain('quoted heredocs whose delimiters cannot occur as a line in their payloads');
+    expect(skill).toContain('require both targets to be regular files and non-symlinks');
+    expect(skill).toContain('Never split the ancestor guards, creation, writes, and final checks across tool calls');
+    expect(skill).toContain('GH_HOST=<repo-host> gh api repos/<repo-path> --jq .default_branch');
+    expect(skill).toContain('GH_HOST=<repo-host> gh pr create -R <repo:>');
+    expect(skill).toContain('Split the authoritative `repo:` value at its first `/`');
+    expect(skill).not.toContain('with `gh api repos/<owner/repo>');
+    expect(skill).not.toContain('gh repo view <repo:> --json defaultBranchRef');
+  });
+
+  it('requires actor-bound pr-created signals whenever a cli descriptor is present', async () => {
+    const skill = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-signals/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    expect(skill).toContain('allowed only when the dispatch has no `cli:` field');
+    expect(skill).toContain('whenever `cli:` is present, `pr-created` MUST use this form');
+    expect(skill).toContain('omitting the actor prevents feedback acknowledgements from being authorized');
+    expect(skill).toContain("created or published by the current phase's instructions");
+    expect(skill).not.toContain("baxian-cli-<tool>` skill's create command");
+  });
+
+  it('server feedback documents how every correction descriptor changes the replacement response', async () => {
+    const skill = await readFile(
+      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
+      'utf-8',
+    );
+    for (const field of [
+      'correction-reason:', 'missing-finding-ids:', 'unknown-finding-ids:', 'schema-violation-codes:',
+    ]) {
+      expect(skill).toContain(field);
+    }
+    expect(skill).toContain('every current id still appears exactly once');
   });
 
   it('server phases without signalToken throw', () => {
@@ -791,10 +896,40 @@ describe('server review mode prompt builders', () => {
       workdir: '/wt/dev',
       skillRegistry: registry,
       signalToken: 'tok',
+      serverFindingsDigest: 'a'.repeat(64),
       serverPriorFindingsFile: { path: '.baxian/review/inbox/findings-round-5.json', bytes: 20 * 1024 },
     });
     expect(prompt).toContain('findings-file: .baxian/review/inbox/findings-round-5.json (20KB)');
     expect(prompt).not.toContain('\nfindings:\n');
+  });
+
+  it('server-feedback carries the findings generation and stable correction details', () => {
+    const prompt = build('server-feedback', DEV_AGENT, {
+      serverPriorFindings: CODE_FINDINGS,
+      serverFindingsDigest: 'b'.repeat(64),
+      serverFeedbackCorrection: {
+        reason: 'coverage-gap',
+        missingFindingIds: ['f-2'],
+        unknownFindingIds: ['f-old'],
+        schemaViolationCodes: [],
+      },
+    });
+    expect(prompt).toContain(`findings-digest: ${'b'.repeat(64)}`);
+    expect(prompt).toContain('correction-reason: coverage-gap');
+    expect(prompt).toContain('missing-finding-ids: ["f-2"]');
+    expect(prompt).toContain('unknown-finding-ids: ["f-old"]');
+  });
+
+  it('server-feedback rejects a prompt without a findings generation', () => {
+    expect(() => buildPromptInline({
+      task: { ...TASK, reviewMode: 'server' },
+      phase: 'server-feedback',
+      agent: DEV_AGENT,
+      workdir: '/wt/dev',
+      skillRegistry: getRegistry(),
+      signalToken: 'tok',
+      serverPriorFindings: CODE_FINDINGS,
+    })).toThrow(/requires findings digest/);
   });
 
   it('inline server payloads render exactly as before (no truncation markers anywhere)', async () => {
@@ -927,6 +1062,7 @@ describe('server review mode prompt builders', () => {
       workdir: '/wt/dev',
       skillRegistry: registry,
       signalToken: 'tok',
+      serverFindingsDigest: 'a'.repeat(64),
       serverPriorFindings: '{"round":1,"verdict":"request-changes","findings":[]}',
     });
     expect(prompt).toContain('round: 1');

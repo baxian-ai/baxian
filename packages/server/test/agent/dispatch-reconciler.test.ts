@@ -100,6 +100,7 @@ async function seedTask(over: Partial<TaskState> = {}): Promise<TaskState> {
     prNumber: 7,
     status: 'review',
     reviewRound: 2,
+    reviewMode: 'git',
     signalToken: 'tok-current1',
     reviewHeadAnchorSha: SHA,
     latestHeadSha: SHA,
@@ -157,6 +158,7 @@ describe('DispatchReconciler review 侧补派', () => {
     expect(dispatchSpy).toHaveBeenCalledWith(t.id, {
       bumpRound: false,
       fromStatus: ['review'],
+      expectPhase: undefined,
       expectSignalToken: 'tok-current1',
       pendingBudget: expect.objectContaining({ since: expect.any(Number) }),
       onPassArmed: expect.any(Function),
@@ -164,6 +166,24 @@ describe('DispatchReconciler review 侧补派', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
     expect(audits()).toHaveLength(1);
     expect(interventions()).toHaveLength(0);
+  });
+
+  it('reconciler keeps missing phase and token as explicit decision-time fence fields', async () => {
+    const t = await seedTask({ phase: undefined, signalToken: undefined });
+    await seedQa();
+    obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
+    let capturedOptions: Record<string, unknown> | undefined;
+    vi.spyOn(manager, 'dispatchReviewToQa').mockImplementation(async (_taskId, options) => {
+      capturedOptions = options;
+      options.onPassArmed?.('reconciled-pass');
+      return { ...t, signalToken: 'reconciled-pass' };
+    });
+
+    await mkReconciler().pollOnce();
+
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectPhase')).toBe(true);
+    expect(Object.hasOwn(capturedOptions ?? {}, 'expectSignalToken')).toBe(true);
+    expect(capturedOptions).toMatchObject({ fromStatus: ['review'] });
   });
 
   it('pending + 探测忙碌 → 不补派；忙碌超预算发一次性 intervention，不重复', async () => {
@@ -198,38 +218,23 @@ describe('DispatchReconciler review 侧补派', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
   });
 
-  it('可恢复 hold（checkout-preparation-failed）→ 自动补派（事故双 QA 卡死回归）', async () => {
-    const t = await seedTask();
-    await seedQa({
-      status: 'awaiting_human',
-      awaitingPhase: 'checkout-preparation-failed',
-      awaitingReason: 'repl not ready (paneId=%0, runtime=codex) within timeout',
-      awaitingSince: NOW,
-    });
-    obs();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
-      .mockResolvedValue({ ...t, signalToken: 'tok-rotated2' });
+  it.each(['checkout-preparation-failed', 'checkout-cleanup-failed'])(
+    'git QA hold（%s）让位 durable sweep，不由 reconciler 重投',
+    async (awaitingPhase) => {
+      await seedTask();
+      await seedQa({
+        status: 'awaiting_human',
+        awaitingPhase,
+        awaitingSince: NOW,
+      });
+      obs();
+      const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
 
-    await mkReconciler().pollOnce();
+      await mkReconciler().pollOnce();
 
-    expect(dispatchSpy).toHaveBeenCalledWith(t.id, expect.objectContaining({ bumpRound: false }));
-    expect(audits()).toHaveLength(1);
-  });
-
-  it('非可恢复 hold（checkout-cleanup-failed）→ 不动，交人工', async () => {
-    await seedTask();
-    await seedQa({
-      status: 'awaiting_human',
-      awaitingPhase: 'checkout-cleanup-failed',
-      awaitingSince: NOW,
-    });
-    obs();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
-
-    await mkReconciler().pollOnce();
-
-    expect(dispatchSpy).not.toHaveBeenCalled();
-  });
+      expect(dispatchSpy).not.toHaveBeenCalled();
+    },
+  );
 
   it('无 pending 登记（如进程重启后）+ PENDING_IDLE 观察 → 兜底补派；次数达上限后停手并发一次性 intervention', async () => {
     await seedTask();
@@ -430,12 +435,11 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     expect(interventions()).toHaveLength(1);
   });
 
-  it('anchor 缺失 + pending：有界刷新 head 后放行补派（R8）', async () => {
+  it('git pending + anchor 缺失：由标准派发入口重新锚定', async () => {
     const t = await seedTask({ reviewHeadAnchorSha: undefined });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(SHA);
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
       .mockResolvedValue({ ...t, signalToken: 'tok-rotated8' });
 
@@ -444,36 +448,15 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('anchor 缺失且 head 刷新持续失败 → 计次并升级 intervention，不永久静默（R8）', async () => {
-    const t = await seedTask({ reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
-    await seedQa();
-    manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
-    obs();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockRejectedValue(new Error('gh transient'));
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
-    const rec = mkReconciler({ maxAttempts: 2 });
-
-    await rec.pollOnce();
-    await rec.pollOnce();
-    await rec.pollOnce();
-
-    expect(dispatchSpy).not.toHaveBeenCalled();
-    const alerts = interventions();
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0].data).toMatchObject({ phase: 'dispatch-reconcile-attempts-exhausted', action: 'anchor-refresh' });
-  });
-
   it('明确 anchor≠head 仍让位 push 事件路径（R8 边界不回退）', async () => {
     const t = await seedTask({ latestHeadSha: 'b'.repeat(40) });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs();
-    const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha');
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
 
     await mkReconciler().pollOnce();
 
-    expect(fetchSpy).not.toHaveBeenCalled();
     expect(dispatchSpy).not.toHaveBeenCalled();
   });
 });
@@ -575,33 +558,13 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(after.budgetAlerted).toBeUndefined();
   });
 
-  it('R16：可恢复 hold 补派读取持久化的未计轮 intent（首评起点 bumpRound:true + qaPhase:review）', async () => {
-    const t = await seedTask({ reviewRound: 0, reviewRoundPending: true });
-    await seedQa({
-      status: 'awaiting_human',
-      awaitingPhase: 'checkout-preparation-failed',
-      awaitingSince: NOW,
-    });
-    obs();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
-      .mockResolvedValue({ ...t, signalToken: 'tok-hold1' });
-
-    await mkReconciler().pollOnce();
-
-    expect(dispatchSpy).toHaveBeenCalledWith(t.id, expect.objectContaining({
-      bumpRound: true,
-      qaPhase: 'review',
-    }));
-  });
-
-  it('R17：进程重启（无内存登记）+ anchor 缺失 + PENDING_IDLE → 有界刷新后按持久化 intent 补派', async () => {
+  it('R17：进程重启（无内存登记）+ anchor 缺失 + PENDING_IDLE → 按持久化 intent 补派', async () => {
     const t = await seedTask({
       reviewRound: 0, reviewRoundPending: true,
       reviewHeadAnchorSha: undefined, latestHeadSha: undefined,
     });
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(SHA);
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
       .mockResolvedValue({ ...t, signalToken: 'tok-restart1' });
 
@@ -721,11 +684,10 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
   });
 
-  it('CX-3.3：QA 绑定丢失 + anchor 缺失 → 驻留后有界刷新 head 再重建派发', async () => {
+  it('CX-3.3：QA 绑定丢失 + anchor 缺失 → 驻留后由标准入口重建派发', async () => {
     const t = await seedTask({ reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
     await seedQa({ taskId: undefined });
     obs();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(SHA);
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
       .mockResolvedValue({ ...t, signalToken: 'tok-unbound1' });
     const rec = mkReconciler();
@@ -736,7 +698,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('CX-3.5：hold 重放不沿用旧 pass 残留的 pending（先按代清掉，不传 stale 相位）', async () => {
+  it('CX-3.5：git QA hold 不消费 reconciler 内存中的旧 pass 登记', async () => {
     const t = await seedTask({ signalToken: 'new-pass-tok1' });
     await seedQa({
       status: 'awaiting_human',
@@ -747,15 +709,12 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
       kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'old-pass-tok1', qaPhase: 'review',
     });
     obs();
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
-      .mockResolvedValue({ ...t, signalToken: 'tok-hold2' });
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
 
     await mkReconciler().pollOnce();
 
-    expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
-    const opts = dispatchSpy.mock.calls[0][1]!;
-    expect(opts.qaPhase).toBeUndefined();
-    expect(opts.expectSignalToken).toBe('new-pass-tok1');
+    expect(manager.getPendingDispatchRetry(t.id)?.signalToken).toBe('old-pass-tok1');
+    expect(dispatchSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -768,7 +727,9 @@ describe('DispatchReconciler 端到端补派（验收 #1 后半）', () => {
     });
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'tok-current1' });
     obs();
-    vi.spyOn(manager, 'fetchPrHeadSha').mockResolvedValue(SHA);
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
+      ok: true, headSha: SHA, branch: 'bx/task-1', targetBranch: 'main',
+    });
     const armSpy = vi.spyOn(
       manager as unknown as { setupPhaseSignalWatcher: (...a: unknown[]) => Promise<boolean> },
       'setupPhaseSignalWatcher',
@@ -783,7 +744,7 @@ describe('DispatchReconciler 端到端补派（验收 #1 后半）', () => {
     expect(after.reviewRound).toBe(2);
     expect(after.reviewHeadAnchorSha).toBe(SHA);
     expect(armSpy).toHaveBeenCalledWith(
-      t.id, 'qa-1', ['pr-approved', 'pr-changes-requested'], after.signalToken, expect.any(Object),
+      t.id, 'qa-1', [], after.signalToken, expect.any(Object),
     );
     const qa = await agentStore.get('qa-1');
     expect(qa?.taskId).toBe(t.id);
@@ -911,45 +872,16 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
 });
 
 describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
-  it('CX-5.2：补派自轮换 pass 后失败，世系按失败后的实际 pass 延续，预算不被重置', async () => {
-    await seedTask();
-    await seedQa({
-      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed', awaitingSince: NOW,
-    });
-    obs();
-    let gen = 0;
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockImplementation(async (taskId) => {
-      gen += 1;
-      const fresh = (await taskStore.get(taskId))!;
-      await taskStore.set({ ...fresh, signalToken: `tok-armed-${gen}`, updatedAt: new Date().toISOString() });
-      throw new Error('checkout preparation failed again (handled hold)');
-    });
-    const rec = mkReconciler({ maxAttempts: 2 });
-
-    await rec.pollOnce();
-    await rec.pollOnce();
-    await rec.pollOnce();
-    await rec.pollOnce();
-
-    expect(dispatchSpy).toHaveBeenCalledTimes(2);
-    const alerts = interventions();
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0].data).toMatchObject({ phase: 'dispatch-reconcile-attempts-exhausted' });
-  });
-
   it('R29：git 模式 pending + anchor 缺失 → 不经 gh 刷新（平台 driver 在补派内重新锚定）', async () => {
     const t = await seedTask({ reviewMode: 'git', reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs();
-    const fetchSpy = vi.spyOn(manager, 'fetchPrHeadSha')
-      .mockRejectedValue(new Error('gh unavailable for gitCli platform'));
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
       .mockResolvedValue({ ...t, signalToken: 'tok-git-re1' });
 
     await mkReconciler().pollOnce();
 
-    expect(fetchSpy).not.toHaveBeenCalled();
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 

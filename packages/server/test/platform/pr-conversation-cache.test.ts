@@ -4,7 +4,7 @@ import {
   PrConversationCache,
   prReviewCacheRevision,
   type PrConversationPayload,
-} from '../../src/github/pr-conversation-cache.js';
+} from '../../src/platform/pr-conversation-cache.js';
 
 function convo(label: string, error?: string): PrConversationPayload {
   const items: PrReviewItem[] = [{ kind: 'issue-comment', id: label, body: label }];

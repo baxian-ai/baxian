@@ -4,16 +4,33 @@ import type {
   Finding,
   ReviewFindings,
   ReviewRound,
+  ServerResponseFailure,
+  ServerSignalKind,
+  ServerSignalRecoveryReason,
   TaskState,
 } from '../shared/index.js';
 import { isSpecStagePhase } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import type { AgentManager } from '../agent/manager.js';
-import { ReviewExchangeError } from '../agent/review-transport.js';
+import {
+  ReviewExchangeError,
+  type ReadContentResult,
+  type ReviewResponseReadResult,
+} from '../agent/review-transport.js';
 import type { PhaseSignalKind } from '../agent/phase-signal.js';
+import { computeBackoffMs } from '../timing/backoff.js';
+import {
+  reviewFindingsDigest,
+  serverResponseFailureSignature,
+} from '../state/review-store.js';
 
 const LEGACY_DIFF_LARGE_THRESHOLD = 2000;
 const FILE_HEADER_RE = /^diff --git a\/(.+?) b\//;
+const SERVER_HANDLER_ATTEMPTS = 3;
+const SERVER_HANDLER_BACKOFF = { baseMs: 10, maxMs: 20, factor: 2, jitter: 0 } as const;
+const SERVER_SIGNAL_KINDS = new Set<PhaseSignalKind>([
+  'code-done', 'code-reviewed', 'code-fixed', 'code-ready', 'spec-done', 'spec-reviewed', 'spec-fixed',
+]);
 
 interface LegacyDiffFile {
   path: string;
@@ -113,9 +130,14 @@ function aggregateBatchFindings(batches: ReviewFindings[], round: number): Revie
 function coverageGaps(findings: ReviewFindings, responseIds: Set<string>): { missing: string[]; unknown: string[] } {
   const findingIds = new Set(findings.findings.map(f => f.id));
   return {
-    missing: [...findingIds].filter(id => !responseIds.has(id)),
-    unknown: [...responseIds].filter(id => !findingIds.has(id)),
+    missing: [...findingIds].filter(id => !responseIds.has(id)).sort(),
+    unknown: [...responseIds].filter(id => !findingIds.has(id)).sort(),
   };
+}
+
+function waitForHandlerRetry(attempt: number): Promise<void> {
+  const ms = computeBackoffMs(attempt, SERVER_HANDLER_BACKOFF);
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function emitIntervention(
@@ -162,7 +184,8 @@ async function gate(
   const token = event.data?.token as string | undefined;
   const phaseOk = expect.phase === 'any'
     || (expect.phase === 'spec' ? task.phase !== 'code' : !isSpecStagePhase(task.phase));
-  if (task.status !== expect.status || !phaseOk || !token || token !== task.signalToken) {
+  if (token && token !== task.signalToken) return null;
+  if (task.status !== expect.status || !phaseOk || !token) {
     await emitIntervention(bus, task, {
       phase: `${event.type}-stale`,
       taskStatus: task.status,
@@ -210,26 +233,275 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   async function putVerdictRound(
     task: TaskState,
     agentId: string,
-    kind: 'code-reviewed' | 'code-fixed' | 'spec-reviewed' | 'spec-fixed',
+    kind: ServerSignalKind,
     data: ReviewRound,
   ): Promise<boolean> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= SERVER_HANDLER_ATTEMPTS; attempt++) {
+      try {
+        await reviewStore.putRound(task.id, data.phase, data);
+        return true;
+      } catch (err) {
+        lastError = err;
+        try {
+          const stored = await reviewStore.getRound(task.id, data.phase, data.round);
+          if (stored && JSON.stringify(stored) === JSON.stringify(data)) return true;
+        } catch (readBackError) {
+          lastError = readBackError;
+        }
+        if (attempt < SERVER_HANDLER_ATTEMPTS) await waitForHandlerRetry(attempt);
+      }
+    }
+    return holdConsumedSignal(
+      task,
+      agentId,
+      kind,
+      'verdict-store-failed',
+      `server-${data.phase}-verdict-store-failed`,
+      {
+        round: data.round,
+        error: lastError instanceof Error ? lastError.message : String(lastError),
+      },
+    );
+  }
+
+  async function holdConsumedSignal(
+    task: TaskState,
+    agentId: string,
+    kind: PhaseSignalKind,
+    reason: ServerSignalRecoveryReason,
+    failurePhase: string,
+    data: Record<string, unknown> = {},
+  ): Promise<boolean> {
+    if (!SERVER_SIGNAL_KINDS.has(kind)) {
+      throw new Error(`unsupported consumed server signal kind: ${kind}`);
+    }
+    const phase = kind.startsWith('spec-') ? 'spec' : 'code';
+    const round = phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+    const held = await manager.holdConsumedServerSignal(
+      task,
+      agentId,
+      kind as ServerSignalKind,
+      { phase, round, reason, failurePhase },
+    );
+    if (!held) return false;
+    await emitIntervention(bus, held, {
+      phase: failurePhase,
+      ...data,
+      successorToken: held.signalToken,
+    });
+    return false;
+  }
+
+  async function readResponseWithRetry(
+    task: TaskState,
+    dev: AgentConfig,
+  ): Promise<ReviewResponseReadResult> {
+    let result: ReviewResponseReadResult | undefined;
+    for (let attempt = 1; attempt <= SERVER_HANDLER_ATTEMPTS; attempt++) {
+      result = await transport().readResponseWithRaw(task, dev);
+      if (result.kind !== 'unknown' || attempt === SERVER_HANDLER_ATTEMPTS) return result;
+      await waitForHandlerRetry(attempt);
+    }
+    return result!;
+  }
+
+  async function runConsumedSignal(
+    task: TaskState,
+    agentId: string,
+    kind: ServerSignalKind,
+    handler: () => Promise<void>,
+  ): Promise<void> {
     try {
-      await reviewStore.putRound(task.id, data.phase, data);
+      await handler();
+    } catch (err) {
+      await holdConsumedSignal(
+        task,
+        agentId,
+        kind,
+        'handler-failed',
+        `server-${kind.startsWith('spec-') ? 'spec' : 'code'}-handler-failed`,
+        { error: err instanceof Error ? err.message : String(err) },
+      );
+    }
+  }
+
+  async function deleteFindingsOrHold(
+    task: TaskState,
+    qa: AgentConfig,
+    kind: Extract<ServerSignalKind, 'code-reviewed' | 'spec-reviewed'>,
+  ): Promise<boolean> {
+    try {
+      await transport().deleteFindings(qa);
       return true;
     } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: `server-${data.phase}-verdict-store-failed`,
-        round: data.round,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, agentId, kind, { skipSnapshot: true });
+      await holdConsumedSignal(
+        task,
+        qa.id,
+        kind,
+        'handler-failed',
+        `server-${kind.startsWith('spec-') ? 'spec' : 'code'}-findings-cleanup-failed`,
+        { error: err instanceof Error ? err.message : String(err) },
+      );
       return false;
     }
   }
 
-  async function rearmOrHold(task: TaskState, agentId: string, kind: PhaseSignalKind): Promise<void> {
-    const armed = await manager.setupPhaseSignal(task.id, agentId, kind, { skipSnapshot: true });
-    if (!armed) await manager.holdAgentForUnarmedSignal(task.id, agentId, kind);
+  async function rejectServerResponse(
+    task: TaskState,
+    dev: AgentConfig,
+    roundData: ReviewRound & { findings: ReviewFindings },
+    failure: {
+      reason: ServerResponseFailure['reason'];
+      failurePhase: string;
+      rawResponse?: string;
+      responseDigest?: string;
+      missingFindingIds?: string[];
+      unknownFindingIds?: string[];
+      schemaViolationCodes?: string[];
+      details?: Record<string, unknown>;
+    },
+  ): Promise<boolean> {
+    const phase = roundData.phase;
+    const signalKind = `${phase}-fixed` as const;
+    const sourceToken = task.signalToken;
+    if (!sourceToken) return false;
+    const findingsDigest = reviewFindingsDigest(roundData.findings);
+    const missingFindingIds = [...(failure.missingFindingIds ?? [])].sort();
+    const unknownFindingIds = [...(failure.unknownFindingIds ?? [])].sort();
+    const schemaViolationCodes = [...(failure.schemaViolationCodes ?? [])].sort();
+    const failureSignature = serverResponseFailureSignature({
+      phase,
+      round: roundData.round,
+      findingsDigest,
+      reason: failure.reason,
+      missingFindingIds,
+      unknownFindingIds,
+      schemaViolationCodes,
+    });
+    const claimed = await manager.claimServerSignalRecovery(task, dev.id, signalKind, {
+      mode: 'classify-response',
+      phase,
+      round: roundData.round,
+      findingsDigest,
+      failureSignature,
+      reason: failure.reason,
+      failurePhase: failure.failurePhase,
+      missingFindingIds,
+      unknownFindingIds,
+      schemaViolationCodes,
+      ...(failure.responseDigest ? { responseDigest: failure.responseDigest } : {}),
+    });
+    if (!claimed?.signalToken) return false;
+    let recorded: ServerResponseFailure;
+    try {
+      recorded = await reviewStore.recordServerResponseFailure(task.id, phase, roundData.round, {
+        signalKind,
+        sourceToken,
+        successorToken: claimed.signalToken,
+        failureSignature,
+        reason: failure.reason,
+        missingFindingIds,
+        unknownFindingIds,
+        schemaViolationCodes,
+        createdAt: new Date().toISOString(),
+        ...(failure.responseDigest ? { responseDigest: failure.responseDigest } : {}),
+        ...(failure.rawResponse !== undefined ? { rawResponse: failure.rawResponse } : {}),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const held = await manager.holdServerSignalRecovery(
+        task.id,
+        dev.id,
+        claimed.signalToken,
+        `server-${phase}-response-audit-store-failed`,
+        `${message}. The response file was preserved and the old token is retired.`,
+      );
+      if (!held) return false;
+      await emitIntervention(bus, held, {
+        phase: `server-${phase}-response-audit-store-failed`,
+        round: roundData.round,
+        error: message,
+        successorToken: claimed.signalToken,
+      });
+      return false;
+    }
+    const nextMode = recorded.disposition === 'auto-correct' ? 'correct-response' : 'hold';
+    const finalized = await manager.setServerSignalRecoveryMode(task.id, claimed.signalToken, nextMode);
+    if (!finalized) return false;
+    if (recorded.disposition !== 'auto-correct') {
+      const holdPhase = recorded.disposition === 'hold-repeated-signature'
+        ? 'server-feedback-response-repeated'
+        : 'server-feedback-correction-limit';
+      const held = await manager.holdServerSignalRecovery(
+        task.id,
+        dev.id,
+        claimed.signalToken,
+        holdPhase,
+        `The ${phase} response failed with ${failure.reason}; automatic correction stopped `
+        + `(${recorded.disposition}). Rewrite it deliberately, then Restart or Cancel the task.`,
+      );
+      if (!held) return false;
+      await emitIntervention(bus, held, {
+        phase: holdPhase,
+        reviewPhase: phase,
+        round: roundData.round,
+        reason: failure.reason,
+        disposition: recorded.disposition,
+        missingFindingIds,
+        unknownFindingIds,
+        findingsDigest,
+        successorToken: claimed.signalToken,
+      });
+      return false;
+    }
+    const beforeCleanup = await manager.getTask(task.id);
+    const currentRecovery = beforeCleanup?.serverSignalRecovery;
+    const currentRound = phase === 'spec' ? beforeCleanup?.specReviewRound : beforeCleanup?.reviewRound;
+    if (!beforeCleanup
+      || beforeCleanup.status !== task.status
+      || beforeCleanup.phase !== task.phase
+      || beforeCleanup.signalToken !== claimed.signalToken
+      || currentRound !== roundData.round
+      || currentRecovery?.mode !== 'correct-response'
+      || currentRecovery.sourceToken !== sourceToken
+      || currentRecovery.failureSignature !== failureSignature) {
+      return false;
+    }
+    try {
+      await transport().deleteResponse(dev);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const held = await manager.holdServerSignalRecovery(
+        task.id,
+        dev.id,
+        claimed.signalToken,
+        `server-${phase}-response-cleanup-failed`,
+        `${message}. The rejected response is archived, but the live file could not be removed safely.`,
+      );
+      if (!held) return false;
+      await emitIntervention(bus, held, {
+        phase: `server-${phase}-response-cleanup-failed`,
+        round: roundData.round,
+        error: message,
+        successorToken: claimed.signalToken,
+      });
+      return false;
+    }
+    await emitIntervention(bus, finalized, {
+      phase: failure.failurePhase,
+      round: roundData.round,
+      reason: failure.reason,
+      missingFindingIds,
+      unknownFindingIds,
+      schemaViolationCodes,
+      findingsDigest,
+      responseDigest: failure.responseDigest,
+      successorToken: claimed.signalToken,
+      ...failure.details,
+    });
+    await manager.dispatchServerFeedbackCorrection(task.id, JSON.stringify(roundData.findings));
+    return false;
   }
 
   function resolveActiveQa(task: TaskState): AgentConfig | undefined {
@@ -244,24 +516,41 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     phase: string,
   ): Promise<boolean> {
     if (!task.qaAgentId || resolveActiveQa(task)) return false;
-    await emitIntervention(bus, task, { phase, qaAgentId: task.qaAgentId });
-    if (task.agentId) await rearmOrHold(task, task.agentId, entryKind);
+    await holdConsumedSignal(
+      task,
+      task.agentId,
+      entryKind,
+      'handler-failed',
+      phase,
+      { qaAgentId: task.qaAgentId },
+    );
     return true;
   }
 
   async function autoApproveCode(task: TaskState, entryKind: PhaseSignalKind = 'code-done'): Promise<void> {
-    const afterDone = manager.resolveAfterDone(task);
-    if (task.afterDone === undefined) {
-      await manager.updateTask(task.id, { afterDone });
-    }
+    const afterDone = await manager.commitServerAfterDone(task.id);
     if (afterDone === null) {
       const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['in_progress', 'fixing'] });
-      if (!ready) await emitIntervention(bus, task, { phase: 'server-code-auto-approve-transition-failed' });
+      if (!ready) {
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          entryKind,
+          'handler-failed',
+          'server-code-auto-approve-transition-failed',
+        );
+      }
       return;
     }
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
-      await emitIntervention(bus, task, { phase: 'server-code-auto-approve-no-dev-agent' });
+      await holdConsumedSignal(
+        task,
+        task.agentId,
+        entryKind,
+        'fix-no-dev-agent',
+        'server-code-auto-approve-no-dev-agent',
+      );
       return;
     }
     await manager.refreshWorkdirCacheFor(task.agentId);
@@ -269,11 +558,14 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     try {
       reviewHeadAnchorSha = await transport().readHeadSha(dev);
     } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-auto-approve-head-capture-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, task.agentId, entryKind, { skipSnapshot: true });
+      await holdConsumedSignal(
+        task,
+        task.agentId,
+        entryKind,
+        'handler-failed',
+        'server-code-auto-approve-head-capture-failed',
+        { error: err instanceof Error ? err.message : String(err) },
+      );
       return;
     }
     const approved = await manager.transitionTaskStatus(
@@ -281,10 +573,25 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       { reviewHeadAnchorSha },
     );
     if (!approved) {
-      await emitIntervention(bus, task, { phase: 'server-code-auto-approve-transition-failed' });
+      await holdConsumedSignal(
+        task,
+        task.agentId,
+        entryKind,
+        'handler-failed',
+        'server-code-auto-approve-transition-failed',
+      );
       return;
     }
-    await manager.dispatchServerAfterDone(task.id, afterDone);
+    const dispatched = await manager.dispatchServerAfterDone(task.id, afterDone);
+    if (!dispatched) {
+      await holdConsumedSignal(
+        task,
+        task.agentId,
+        entryKind,
+        'handler-failed',
+        'server-code-auto-approve-publish-dispatch-failed',
+      );
+    }
   }
 
   function specApprovalIsHuman(task: TaskState): boolean {
@@ -298,13 +605,17 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         ? await manager.parkTaskAtSpecReady(task.id)
         : await manager.transitionToCodePhase(task.id);
       if (!result) {
-        await emitIntervention(bus, task, { phase: failurePhase });
+        await holdConsumedSignal(task, task.qaAgentId ?? task.agentId, 'spec-reviewed', 'handler-failed', failurePhase);
       }
     } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: failurePhase,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      await holdConsumedSignal(
+        task,
+        task.qaAgentId ?? task.agentId,
+        'spec-reviewed',
+        'handler-failed',
+        failurePhase,
+        { error: err instanceof Error ? err.message : String(err) },
+      );
     }
   }
 
@@ -312,34 +623,51 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     try {
       const result = await manager.transitionToCodePhase(task.id);
       if (!result) {
-        await emitIntervention(bus, task, { phase: 'server-spec-auto-approve-transition-failed' });
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
+          'handler-failed',
+          'server-spec-auto-approve-transition-failed',
+        );
         return false;
       }
       return true;
     } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-auto-approve-transition-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
+      await holdConsumedSignal(
+        task,
+        task.agentId,
+        task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
+        'handler-failed',
+        'server-spec-auto-approve-transition-failed',
+        { error: err instanceof Error ? err.message : String(err) },
+      );
       return false;
     }
   }
 
   async function prepareAndDispatchCodeReview(
     task: TaskState,
-    opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string },
+    opts: {
+      recheck: boolean;
+      bumpRound?: boolean;
+      priorFindingsJson?: string;
+      priorResponseJson?: string;
+    },
   ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
-      await emitIntervention(bus, task, { phase: 'server-code-review-no-dev-agent' });
-      if (task.agentId) {
-        const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
-        await rearmOrHold(task, task.agentId, kind);
-      }
-      return false;
+      const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
+      return holdConsumedSignal(
+        task,
+        task.agentId,
+        kind,
+        'fix-no-dev-agent',
+        'server-code-review-no-dev-agent',
+      );
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
-    const nextRound = task.reviewRound + 1;
+    const nextRound = opts.bumpRound === false ? task.reviewRound : task.reviewRound + 1;
     if (nextRound > cap) {
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
       if (!capResult) return false;
@@ -357,47 +685,60 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return false;
     }
 
-    await manager.refreshWorkdirCacheFor(task.agentId);
-    let content;
+    let content: ReadContentResult;
     let reviewHeadAnchorSha: string;
-    try {
-      content = await transport().readContent(task, dev, 'code');
-      if (!content.headSha) throw new ReviewExchangeError('head-failed', 'review head missing from captured content');
-      reviewHeadAnchorSha = content.headSha;
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-content-read-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
-      await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-      return false;
-    }
-
-    const rearmEntry = async (): Promise<void> => {
-      const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
-      await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-    };
-    try {
-      const violation = await manager.findLineageViolation(task.id, content.baseSha);
-      if (violation) {
-        await emitIntervention(bus, task, {
-          phase: 'server-code-lineage-violation',
-          offendingTaskId: violation.taskId,
-          offendingBranch: violation.branch,
-          offendingSha: violation.sha,
-          note: 'The task branch embeds another active task\'s commits — reviewing it would leak foreign work into this task. Have the dev rebase onto origin/HEAD and re-emit the signal.',
-        });
-        await rearmEntry();
-        return false;
+    if (opts.bumpRound === false) {
+      const stored = await reviewStore.getRound(task.id, 'code', nextRound);
+      if (!stored || stored.phase !== 'code' || !stored.headSha) {
+        throw new Error(`Task ${task.id} has no persisted code review round ${nextRound} to redispatch`);
       }
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-lineage-check-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await rearmEntry();
-      return false;
+      content = {
+        content: stored.content,
+        ...(stored.diffstat ? { diffstat: stored.diffstat } : {}),
+        ...(stored.baseSha ? { baseSha: stored.baseSha } : {}),
+        headSha: stored.headSha,
+        ...(stored.headTree ? { headTree: stored.headTree } : {}),
+      };
+      reviewHeadAnchorSha = stored.headSha;
+    } else {
+      await manager.refreshWorkdirCacheFor(task.agentId);
+      try {
+        content = await transport().readContent(task, dev, 'code');
+        if (!content.headSha) throw new ReviewExchangeError('head-failed', 'review head missing from captured content');
+        reviewHeadAnchorSha = content.headSha;
+      } catch (err) {
+        const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
+        return holdConsumedSignal(
+          task,
+          task.agentId,
+          kind,
+          'handler-failed',
+          'server-code-content-read-failed',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+      try {
+        const violation = await manager.findLineageViolation(task.id, content.baseSha);
+        if (violation) {
+          const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
+          return holdConsumedSignal(task, task.agentId, kind, 'handler-failed', 'server-code-lineage-violation', {
+            offendingTaskId: violation.taskId,
+            offendingBranch: violation.branch,
+            offendingSha: violation.sha,
+            note: 'The task branch embeds another active task\'s commits — reviewing it would leak foreign work into this task. Have the dev rebase onto origin/HEAD and re-emit the signal.',
+          });
+        }
+      } catch (err) {
+        const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
+        return holdConsumedSignal(
+          task,
+          task.agentId,
+          kind,
+          'handler-failed',
+          'server-code-lineage-check-failed',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      }
     }
 
     const round: ReviewRound = {
@@ -411,20 +752,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       startedAt: new Date().toISOString(),
     };
 
-    const putEntryRound = async (data: ReviewRound): Promise<boolean> => {
-      try {
-        await reviewStore.putRound(task.id, 'code', data);
-        return true;
-      } catch (err) {
-        await emitIntervention(bus, task, {
-          phase: 'server-code-round-store-failed',
-          error: err instanceof Error ? err.message : String(err),
-        });
-        const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
-        await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-        return false;
-      }
-    };
+    const putEntryRound = (data: ReviewRound): Promise<boolean> => putVerdictRound(
+      task,
+      task.agentId,
+      task.status === 'fixing' ? 'code-fixed' : 'code-done',
+      data,
+    );
 
     const resolveRecheckInterdiff = async (): Promise<string | undefined> => {
       if (!opts.recheck) return undefined;
@@ -440,11 +773,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
     };
 
-    if (!(await putEntryRound(round))) return false;
+    if (opts.bumpRound !== false && !(await putEntryRound(round))) return false;
     const interdiff = await resolveRecheckInterdiff();
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'code',
       recheck: opts.recheck,
+      ...(opts.bumpRound === false ? { bumpRound: false } : {}),
       content: content.content,
       reviewHeadAnchorSha,
       ...(content.baseSha ? { baseSha: content.baseSha } : {}),
@@ -453,8 +787,17 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(content.diffstat ? { diffstat: content.diffstat } : {}),
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
+      callerOwnsConsumedSignalFailure: true,
     });
-    return dispatched !== null;
+    if (dispatched) return true;
+    const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
+    return holdConsumedSignal(
+      task,
+      task.agentId,
+      kind,
+      'handler-failed',
+      'server-code-review-dispatch-failed',
+    );
   }
 
   async function dispatchLegacyBatch(
@@ -474,6 +817,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       batch: { index, total: batches.length },
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
+      callerOwnsConsumedSignalFailure: true,
     });
     return dispatched !== null;
   }
@@ -486,127 +830,178 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'code', requireServerMode: true });
     if (!gated) return;
     const { task } = gated;
-    if (await pauseForUnavailableQa(task, 'code-done', 'server-code-qa-unavailable')) return;
-    if (!task.qaAgentId) {
-      await autoApproveCode(task);
-      return;
-    }
-    await prepareAndDispatchCodeReview(task, { recheck: false });
+    await runConsumedSignal(task, task.agentId, 'code-done', async () => {
+      if (await pauseForUnavailableQa(task, 'code-done', 'server-code-qa-unavailable')) return;
+      if (!task.qaAgentId) {
+        await autoApproveCode(task);
+        return;
+      }
+      await prepareAndDispatchCodeReview(task, { recheck: false });
+    });
   });
 
   bus.on('server.code.review.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'review', phase: 'code', requireServerMode: true });
     if (!gated) return;
     const { task } = gated;
-    const qa = manager.getAgentConfig(task.qaAgentId ?? '');
-    if (!qa) {
-      await emitIntervention(bus, task, { phase: 'server-code-review-no-qa-agent' });
-      if (task.qaAgentId) {
-        await rearmOrHold(task, task.qaAgentId, 'code-reviewed');
-      }
-      return;
-    }
-    const round = Math.max(task.reviewRound, 1);
-    const roundData = await reviewStore.getRound(task.id, 'code', round);
-    if (!roundData) {
-      await emitIntervention(bus, task, { phase: 'server-code-review-round-missing', round });
-      await manager.setupPhaseSignal(task.id, qa.id, 'code-reviewed', { skipSnapshot: true });
-      return;
-    }
-
-    await manager.refreshWorkdirCacheFor(qa.id);
-    let findings: ReviewFindings | null;
-    try {
-      findings = await transport().readFindings(task, qa);
-    } catch (err) {
-      const reason = err instanceof ReviewExchangeError ? err.reason : 'unknown';
-      await emitIntervention(bus, task, {
-        phase: 'server-code-findings-invalid',
-        reason,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, qa.id, 'code-reviewed', { skipSnapshot: true });
-      return;
-    }
-
-    let current = roundData;
-    if (findings === null) {
-      const alreadyStored = task.batchTotal !== undefined
-        ? (roundData.batchFindings?.length ?? 0) > (task.batchIndex ?? 0)
-        : roundData.findings !== undefined;
-      if (!alreadyStored) {
-        await emitIntervention(bus, task, { phase: 'server-code-findings-missing', round });
-        await manager.setupPhaseSignal(task.id, qa.id, 'code-reviewed', { skipSnapshot: true });
+    await runConsumedSignal(task, task.qaAgentId ?? task.agentId, 'code-reviewed', async () => {
+      const qa = manager.getAgentConfig(task.qaAgentId ?? '');
+      if (!qa) {
+        await holdConsumedSignal(
+          task,
+          task.qaAgentId ?? '',
+          'code-reviewed',
+          'handler-failed',
+          'server-code-review-no-qa-agent',
+        );
         return;
       }
-    } else if (findings.round !== round) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-findings-round-mismatch',
-        round,
-        payloadRound: findings.round,
-      });
-      await transport().deleteFindings(qa);
-      await manager.setupPhaseSignal(task.id, qa.id, 'code-reviewed', { skipSnapshot: true });
-      return;
-    } else if (task.batchTotal !== undefined && task.batchIndex !== undefined) {
-      const batchFindings = [...(roundData.batchFindings ?? [])];
-      batchFindings[task.batchIndex] = findings;
-      current = { ...roundData, batchFindings };
-      if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current))) return;
-      await transport().deleteFindings(qa);
-    } else {
-      current = { ...roundData, findings, completedAt: new Date().toISOString() };
-      if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current))) return;
-      await transport().deleteFindings(qa);
-    }
-
-    const isRecheck = round > 1;
-    if (task.batchTotal !== undefined && task.batchIndex !== undefined) {
-      const nextIndex = task.batchIndex + 1;
-      if (nextIndex < task.batchTotal) {
-        const prev = isRecheck ? await reviewStore.getRound(task.id, 'code', round - 1) : null;
-        await dispatchLegacyBatch(task.id, rebuildLegacyBatches(current), nextIndex, current.diffstat, {
-          recheck: isRecheck,
-          ...(prev?.findings ? { priorFindingsJson: JSON.stringify(prev.findings) } : {}),
-          ...(prev?.response ? { priorResponseJson: JSON.stringify(prev.response) } : {}),
-        });
+      const round = Math.max(task.reviewRound, 1);
+      const roundData = await reviewStore.getRound(task.id, 'code', round);
+      if (!roundData) {
+        await holdConsumedSignal(
+          task,
+          qa.id,
+          'code-reviewed',
+          'handler-failed',
+          'server-code-review-round-missing',
+          { round },
+        );
         return;
       }
-      const aggregated = current.findings
-        ?? aggregateBatchFindings((current.batchFindings ?? []).filter(Boolean), round);
-      if (!current.findings) {
-        const stored = await putVerdictRound(task, qa.id, 'code-reviewed', {
-          ...current,
-          findings: aggregated,
-          completedAt: new Date().toISOString(),
-        });
-        if (!stored) return;
-      }
-      await manager.updateTask(task.id, { batchIndex: undefined, batchTotal: undefined });
-      await routeCodeVerdict({ ...task, batchIndex: undefined, batchTotal: undefined }, aggregated);
-      return;
-    }
 
-    await routeCodeVerdict(task, current.findings!);
+      await manager.refreshWorkdirCacheFor(qa.id);
+      let findings: ReviewFindings | null;
+      try {
+        findings = await transport().readFindings(task, qa);
+      } catch (err) {
+        const reason = err instanceof ReviewExchangeError ? err.reason : 'unknown';
+        await holdConsumedSignal(
+          task,
+          qa.id,
+          'code-reviewed',
+          'handler-failed',
+          'server-code-findings-invalid',
+          { reason, error: err instanceof Error ? err.message : String(err) },
+        );
+        return;
+      }
+
+      let current = roundData;
+      if (findings === null) {
+        const alreadyStored = task.batchTotal !== undefined
+          ? (roundData.batchFindings?.length ?? 0) > (task.batchIndex ?? 0)
+          : roundData.findings !== undefined;
+        if (!alreadyStored) {
+          await holdConsumedSignal(
+            task,
+            qa.id,
+            'code-reviewed',
+            'handler-failed',
+            'server-code-findings-missing',
+            { round },
+          );
+          return;
+        }
+      } else if (findings.round !== round) {
+        await holdConsumedSignal(
+          task,
+          qa.id,
+          'code-reviewed',
+          'handler-failed',
+          'server-code-findings-round-mismatch',
+          { round, payloadRound: findings.round },
+        );
+        return;
+      } else if (task.batchTotal !== undefined && task.batchIndex !== undefined) {
+        const batchFindings = [...(roundData.batchFindings ?? [])];
+        batchFindings[task.batchIndex] = findings;
+        current = { ...roundData, batchFindings };
+        if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current))) return;
+        if (!(await deleteFindingsOrHold(task, qa, 'code-reviewed'))) return;
+      } else {
+        current = { ...roundData, findings, completedAt: new Date().toISOString() };
+        if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current))) return;
+        if (!(await deleteFindingsOrHold(task, qa, 'code-reviewed'))) return;
+      }
+
+      const isRecheck = round > 1;
+      if (task.batchTotal !== undefined && task.batchIndex !== undefined) {
+        const nextIndex = task.batchIndex + 1;
+        if (nextIndex < task.batchTotal) {
+          const prev = isRecheck ? await reviewStore.getRound(task.id, 'code', round - 1) : null;
+          const dispatched = await dispatchLegacyBatch(task.id, rebuildLegacyBatches(current), nextIndex, current.diffstat, {
+            recheck: isRecheck,
+            ...(prev?.findings ? { priorFindingsJson: JSON.stringify(prev.findings) } : {}),
+            ...(prev?.response ? { priorResponseJson: JSON.stringify(prev.response) } : {}),
+          });
+          if (!dispatched) {
+            await holdConsumedSignal(
+              task,
+              qa.id,
+              'code-reviewed',
+              'handler-failed',
+              'server-code-review-continuation-dispatch-failed',
+            );
+          }
+          return;
+        }
+        const aggregated = current.findings
+          ?? aggregateBatchFindings((current.batchFindings ?? []).filter(Boolean), round);
+        if (!current.findings) {
+          const stored = await putVerdictRound(task, qa.id, 'code-reviewed', {
+            ...current,
+            findings: aggregated,
+            completedAt: new Date().toISOString(),
+          });
+          if (!stored) return;
+        }
+        await manager.updateTask(task.id, { batchIndex: undefined, batchTotal: undefined });
+        await routeCodeVerdict({ ...task, batchIndex: undefined, batchTotal: undefined }, aggregated);
+        return;
+      }
+
+      await routeCodeVerdict(task, current.findings!);
+    });
   });
 
   async function routeCodeVerdict(task: TaskState, findings: ReviewFindings): Promise<void> {
     if (findings.verdict === 'approve') {
-      const afterDone = manager.resolveAfterDone(task);
-      if (task.afterDone === undefined) {
-        await manager.updateTask(task.id, { afterDone });
-      }
+      const afterDone = await manager.commitServerAfterDone(task.id);
       if (afterDone === null) {
         const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['review'] });
-        if (!ready) await emitIntervention(bus, task, { phase: 'server-code-ready-transition-failed' });
+        if (!ready) {
+          await holdConsumedSignal(
+            task,
+            task.qaAgentId ?? task.agentId,
+            'code-reviewed',
+            'handler-failed',
+            'server-code-ready-transition-failed',
+          );
+        }
         return;
       }
       const approved = await manager.transitionTaskStatus(task.id, 'approved', { fromStatus: ['review'] });
       if (!approved) {
-        await emitIntervention(bus, task, { phase: 'server-code-approved-transition-failed' });
+        await holdConsumedSignal(
+          task,
+          task.qaAgentId ?? task.agentId,
+          'code-reviewed',
+          'handler-failed',
+          'server-code-approved-transition-failed',
+        );
         return;
       }
-      await manager.dispatchServerAfterDone(task.id, afterDone);
+      const dispatched = await manager.dispatchServerAfterDone(task.id, afterDone);
+      if (!dispatched) {
+        await holdConsumedSignal(
+          task,
+          task.qaAgentId ?? task.agentId,
+          'code-reviewed',
+          'handler-failed',
+          'server-code-publish-dispatch-failed',
+        );
+      }
       return;
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
@@ -628,7 +1023,20 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       });
       return;
     }
-    await manager.dispatchServerFixToDev(task.id, JSON.stringify(findings));
+    const dispatched = await manager.dispatchServerFixToDev(
+      task.id,
+      JSON.stringify(findings),
+      { callerOwnsConsumedSignalFailure: true },
+    );
+    if (!dispatched) {
+      await holdConsumedSignal(
+        task,
+        task.qaAgentId ?? task.agentId,
+        'code-reviewed',
+        'handler-failed',
+        'server-code-fix-dispatch-failed',
+      );
+    }
   }
 
   async function recheckCodeOrAutoApprove(
@@ -649,37 +1057,70 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   async function runCodeFixSubmission(task: TaskState): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
-      await emitIntervention(bus, task, { phase: 'server-code-fix-no-dev-agent' });
-      if (task.agentId) {
-        await rearmOrHold(task, task.agentId, 'code-fixed');
-      }
-      return false;
+      return holdConsumedSignal(
+        task,
+        task.agentId,
+        'code-fixed',
+        'fix-no-dev-agent',
+        'server-code-fix-no-dev-agent',
+      );
     }
     const round = Math.max(task.reviewRound, 1);
     const roundData = await reviewStore.getRound(task.id, 'code', round);
     if (!roundData?.findings) {
-      await emitIntervention(bus, task, { phase: 'server-code-fix-findings-missing', round });
-      await manager.setupPhaseSignal(task.id, task.agentId, 'code-fixed', { skipSnapshot: true });
-      return false;
+      return holdConsumedSignal(
+        task,
+        task.agentId,
+        'code-fixed',
+        'fix-findings-missing',
+        'server-code-fix-findings-missing',
+        { round },
+      );
     }
 
     await manager.refreshWorkdirCacheFor(task.agentId);
-    let response;
+    let readResult: ReviewResponseReadResult;
     try {
-      response = await transport().readResponse(task, dev);
+      readResult = await readResponseWithRetry(task, dev);
     } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-response-invalid',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-      return false;
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        'code-fixed',
+        'response-read-failed',
+        'server-code-response-read-failed',
+        {
+          reason: err instanceof ReviewExchangeError ? err.reason : 'read-failed',
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
     }
-    if (response === null) {
+    if (readResult.kind === 'unknown') {
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        'code-fixed',
+        'response-read-failed',
+        'server-code-response-read-failed',
+        { reason: readResult.error.reason, error: readResult.error.message },
+      );
+    }
+    if (readResult.kind === 'invalid') {
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'response-invalid',
+        failurePhase: 'server-code-response-invalid',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+        schemaViolationCodes: readResult.schemaViolationCodes,
+        details: { error: readResult.error.message },
+      });
+    }
+    if (readResult.kind === 'absent') {
       if (roundData.response === undefined) {
-        await emitIntervention(bus, task, { phase: 'server-code-response-missing', round });
-        await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-        return false;
+        return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+          reason: 'response-missing',
+          failurePhase: 'server-code-response-missing',
+        });
       }
       return recheckCodeOrAutoApprove(
         task,
@@ -687,31 +1128,59 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         JSON.stringify(roundData.response),
       );
     }
+    const { response } = readResult;
     if (response.round !== round) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-response-round-mismatch',
-        round,
-        payloadRound: response.round,
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'round-mismatch',
+        failurePhase: 'server-code-response-round-mismatch',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+        details: { payloadRound: response.round },
       });
-      await transport().deleteResponse(dev);
-      await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-      return false;
+    }
+    if (response.token !== task.signalToken) {
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'token-mismatch',
+        failurePhase: 'server-code-response-token-mismatch',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+      });
+    }
+    const findingsDigest = reviewFindingsDigest(roundData.findings);
+    if (response.findingsDigest !== findingsDigest) {
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'findings-digest-mismatch',
+        failurePhase: 'server-code-response-findings-digest-mismatch',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+      });
     }
 
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
     if (gaps.missing.length > 0 || gaps.unknown.length > 0) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-response-coverage-gap',
-        round,
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'coverage-gap',
+        failurePhase: 'server-code-response-coverage-gap',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
         missingFindingIds: gaps.missing,
         unknownFindingIds: gaps.unknown,
       });
-      await manager.setupPhaseSignal(task.id, dev.id, 'code-fixed', { skipSnapshot: true });
-      return false;
     }
 
     if (!(await putVerdictRound(task, dev.id, 'code-fixed', { ...roundData, response }))) return false;
-    await transport().deleteResponse(dev);
+    try {
+      await transport().deleteResponse(dev);
+    } catch (err) {
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        'code-fixed',
+        'handler-failed',
+        'server-code-response-cleanup-failed',
+        { error: err instanceof Error ? err.message : String(err) },
+      );
+    }
 
     return recheckCodeOrAutoApprove(
       task,
@@ -723,88 +1192,147 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   bus.on('server.code.fix.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'code', requireServerMode: true });
     if (!gated) return;
-    await runCodeFixSubmission(gated.task);
+    await runConsumedSignal(gated.task, gated.task.agentId, 'code-fixed', async () => {
+      await runCodeFixSubmission(gated.task);
+    });
   });
 
   bus.on('server.code.published', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'approved', phase: 'code', requireServerMode: true });
     if (!gated) return;
     const { task } = gated;
-    const prNumber = typeof event.data?.prNumber === 'number' ? event.data.prNumber : undefined;
-    if (prNumber === undefined && manager.resolveAfterDone(task) === 'pr' && task.prNumber === undefined) {
-      await emitIntervention(bus, task, { phase: 'server-code-published-missing-pr-number' });
-      await manager.setupPhaseSignal(task.id, task.agentId, 'code-ready', { skipSnapshot: true });
-      return;
-    }
-    if (prNumber !== undefined) {
-      const verified = await manager.verifyPaneSignalPrNumber(task.id, prNumber);
-      if (!verified) {
-        await emitIntervention(bus, task, {
-          phase: 'server-code-published-pr-number-unverified',
-          prNumber,
-        });
-        await manager.setupPhaseSignal(task.id, task.agentId, 'code-ready', { skipSnapshot: true });
+    await runConsumedSignal(task, task.agentId, 'code-ready', async () => {
+      const prNumber = typeof event.data?.prNumber === 'number' ? event.data.prNumber : task.prNumber;
+      if (prNumber === undefined && manager.resolveAfterDone(task) === 'pr') {
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          'code-ready',
+          'handler-failed',
+          'server-code-published-missing-pr-number',
+        );
         return;
       }
-      await manager.updateTask(task.id, { prNumber });
-    }
-    const dev = manager.getAgentConfig(task.agentId);
-    if (!dev) {
-      await emitIntervention(bus, task, { phase: 'server-code-published-no-dev-agent' });
-      return;
-    }
-    await manager.refreshWorkdirCacheFor(task.agentId);
-    let publishedHead: string;
-    try {
-      publishedHead = await transport().readHeadSha(dev);
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-published-head-capture-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, task.agentId, 'code-ready', { skipSnapshot: true });
-      return;
-    }
-    if (publishedHead !== task.reviewHeadAnchorSha) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-published-head-mismatch',
-        publishedHead,
-        reviewedHead: task.reviewHeadAnchorSha ?? null,
-      });
-      return;
-    }
-    try {
-      await manager.updateTask(task.id, { latestHeadSha: publishedHead });
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-code-published-head-capture-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, task.agentId, 'code-ready', { skipSnapshot: true });
-      return;
-    }
-    const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['approved'] });
-    if (!ready) await emitIntervention(bus, task, { phase: 'server-code-published-transition-failed' });
+      const dev = manager.getAgentConfig(task.agentId);
+      if (!dev) {
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          'code-ready',
+          'fix-no-dev-agent',
+          'server-code-published-no-dev-agent',
+        );
+        return;
+      }
+      await manager.refreshWorkdirCacheFor(task.agentId);
+      let publishedHead: string;
+      try {
+        publishedHead = await transport().readHeadSha(dev);
+      } catch (err) {
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          'code-ready',
+          'handler-failed',
+          'server-code-published-head-capture-failed',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+        return;
+      }
+      if (publishedHead !== task.reviewHeadAnchorSha) {
+        await holdConsumedSignal(task, task.agentId, 'code-ready', 'handler-failed', 'server-code-published-head-mismatch', {
+          publishedHead,
+          reviewedHead: task.reviewHeadAnchorSha ?? null,
+        });
+        return;
+      }
+      if (prNumber !== undefined) {
+        const verified = await manager.verifyPaneSignalPrNumber(task.id, prNumber);
+        if (!verified) {
+          await holdConsumedSignal(
+            task,
+            task.agentId,
+            'code-ready',
+            'handler-failed',
+            'server-code-published-pr-number-unverified',
+            { prNumber },
+          );
+          return;
+        }
+        if (verified.headSha !== publishedHead) {
+          await holdConsumedSignal(
+            task,
+            task.agentId,
+            'code-ready',
+            'handler-failed',
+            'server-code-published-pr-head-mismatch',
+            {
+              prNumber,
+              remoteHead: verified.headSha,
+              publishedHead,
+              reviewedHead: task.reviewHeadAnchorSha,
+            },
+          );
+          return;
+        }
+        await manager.updateTask(task.id, {
+          prNumber,
+          ...(task.baseBranch === undefined ? { baseBranch: verified.targetBranch } : {}),
+        });
+      }
+      try {
+        await manager.updateTask(task.id, { latestHeadSha: publishedHead });
+      } catch (err) {
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          'code-ready',
+          'handler-failed',
+          'server-code-published-head-capture-failed',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+        return;
+      }
+      const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['approved'] });
+      if (!ready) {
+        await holdConsumedSignal(
+          task,
+          task.agentId,
+          'code-ready',
+          'handler-failed',
+          'server-code-published-transition-failed',
+        );
+      }
+    });
   });
 
   bus.on('server.spec.ready', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'spec', requireServerMode: false });
     if (!gated) return;
-    await dispatchSpecReview(gated.task);
+    await runConsumedSignal(gated.task, gated.task.agentId, 'spec-done', async () => {
+      await dispatchSpecReview(gated.task);
+    });
   });
 
-  async function dispatchSpecReview(task: TaskState, prior?: { findingsJson: string; responseJson?: string }): Promise<boolean> {
+  async function dispatchSpecReview(
+    task: TaskState,
+    prior?: { findingsJson: string; responseJson?: string },
+    opts: { bumpRound?: boolean } = {},
+  ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
-      await emitIntervention(bus, task, { phase: 'server-spec-review-no-dev-agent' });
-      if (task.agentId) {
-        const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
-        await rearmOrHold(task, task.agentId, kind);
-      }
-      return false;
+      const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
+      return holdConsumedSignal(
+        task,
+        task.agentId,
+        kind,
+        'fix-no-dev-agent',
+        'server-spec-review-no-dev-agent',
+      );
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
-    const nextRound = (task.specReviewRound ?? 0) + 1;
+    const currentRound = task.specReviewRound ?? 0;
+    const nextRound = opts.bumpRound === false ? currentRound : currentRound + 1;
     if (nextRound > cap) {
       const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
       if (!capResult) return false;
@@ -813,36 +1341,48 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       if (paused.agentId) await releaseAtCap(paused, paused.agentId, 'agentId');
       return false;
     }
-    await manager.refreshWorkdirCacheFor(task.agentId);
-    let content;
-    try {
-      content = await transport().readContent(task, dev, 'spec');
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-content-read-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
-      await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-      return false;
-    }
-    try {
-      if (!content.documents) throw new Error('spec transport returned no documents');
-      await reviewStore.putRound(task.id, 'spec', {
-        round: nextRound,
-        phase: 'spec',
-        content: content.content,
-        documents: content.documents,
-        startedAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-round-store-failed',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
-      await manager.setupPhaseSignal(task.id, task.agentId, kind, { skipSnapshot: true });
-      return false;
+    let content: ReadContentResult;
+    if (opts.bumpRound === false) {
+      const stored = await reviewStore.getRound(task.id, 'spec', nextRound);
+      if (!stored || stored.phase !== 'spec') {
+        throw new Error(`Task ${task.id} has no persisted spec review round ${nextRound} to redispatch`);
+      }
+      content = { content: stored.content, documents: stored.documents };
+    } else {
+      await manager.refreshWorkdirCacheFor(task.agentId);
+      try {
+        content = await transport().readContent(task, dev, 'spec');
+      } catch (err) {
+        const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
+        return holdConsumedSignal(
+          task,
+          task.agentId,
+          kind,
+          'handler-failed',
+          'server-spec-content-read-failed',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+      try {
+        if (!content.documents) throw new Error('spec transport returned no documents');
+        await reviewStore.putRound(task.id, 'spec', {
+          round: nextRound,
+          phase: 'spec',
+          content: content.content,
+          documents: content.documents,
+          startedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
+        return holdConsumedSignal(
+          task,
+          task.agentId,
+          kind,
+          'verdict-store-failed',
+          'server-spec-round-store-failed',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      }
     }
     if (!resolveActiveQa(task)) {
       if (task.qaAgentId) {
@@ -853,156 +1393,268 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       }
       if (specApprovalIsHuman(task) || task.qaAgentId) {
         const parked = await manager.parkTaskAtSpecReady(task.id, { specReviewRound: nextRound });
-        if (!parked) await emitIntervention(bus, task, { phase: 'server-spec-park-transition-failed' });
+        if (!parked) {
+          await holdConsumedSignal(
+            task,
+            task.agentId,
+            task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
+            'handler-failed',
+            'server-spec-park-transition-failed',
+          );
+        }
         return !!parked;
       }
       return autoApproveSpec(task);
     }
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'spec',
+      ...(opts.bumpRound === false ? { bumpRound: false } : {}),
       content: content.content,
       ...(prior ? { priorFindingsJson: prior.findingsJson } : {}),
       ...(prior?.responseJson ? { priorResponseJson: prior.responseJson } : {}),
+      callerOwnsConsumedSignalFailure: true,
     });
-    return dispatched !== null;
+    if (dispatched) return true;
+    return holdConsumedSignal(
+      task,
+      task.agentId,
+      task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
+      'handler-failed',
+      'server-spec-review-dispatch-failed',
+    );
   }
 
   bus.on('server.spec.review.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'review', phase: 'spec', requireServerMode: false });
     if (!gated) return;
     const { task } = gated;
-    const qa = manager.getAgentConfig(task.qaAgentId ?? '');
-    if (!qa) {
-      await emitIntervention(bus, task, { phase: 'server-spec-review-no-qa-agent' });
-      if (task.qaAgentId) {
-        await rearmOrHold(task, task.qaAgentId, 'spec-reviewed');
-      }
-      return;
-    }
-    const round = task.specReviewRound ?? 1;
-    const roundData = await reviewStore.getRound(task.id, 'spec', round);
-    if (!roundData) {
-      await emitIntervention(bus, task, { phase: 'server-spec-review-round-missing', round });
-      await manager.setupPhaseSignal(task.id, qa.id, 'spec-reviewed', { skipSnapshot: true });
-      return;
-    }
-    await manager.refreshWorkdirCacheFor(qa.id);
-    let findings: ReviewFindings | null;
-    try {
-      findings = await transport().readFindings(task, qa);
-    } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-findings-invalid',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, qa.id, 'spec-reviewed', { skipSnapshot: true });
-      return;
-    }
-    let effective = findings;
-    if (effective === null) {
-      if (roundData.findings === undefined) {
-        await emitIntervention(bus, task, { phase: 'server-spec-findings-missing', round });
-        await manager.setupPhaseSignal(task.id, qa.id, 'spec-reviewed', { skipSnapshot: true });
+    await runConsumedSignal(task, task.qaAgentId ?? task.agentId, 'spec-reviewed', async () => {
+      const qa = manager.getAgentConfig(task.qaAgentId ?? '');
+      if (!qa) {
+        await holdConsumedSignal(
+          task,
+          task.qaAgentId ?? '',
+          'spec-reviewed',
+          'handler-failed',
+          'server-spec-review-no-qa-agent',
+        );
         return;
       }
-      effective = roundData.findings;
-    } else if (effective.round !== round) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-findings-round-mismatch',
-        round,
-        payloadRound: effective.round,
-      });
-      await transport().deleteFindings(qa);
-      await manager.setupPhaseSignal(task.id, qa.id, 'spec-reviewed', { skipSnapshot: true });
-      return;
-    } else {
-      const stored = await putVerdictRound(task, qa.id, 'spec-reviewed', {
-        ...roundData,
-        findings: effective,
-        completedAt: new Date().toISOString(),
-      });
-      if (!stored) return;
-      await transport().deleteFindings(qa);
-    }
+      const round = task.specReviewRound ?? 1;
+      const roundData = await reviewStore.getRound(task.id, 'spec', round);
+      if (!roundData) {
+        await holdConsumedSignal(
+          task,
+          qa.id,
+          'spec-reviewed',
+          'handler-failed',
+          'server-spec-review-round-missing',
+          { round },
+        );
+        return;
+      }
+      await manager.refreshWorkdirCacheFor(qa.id);
+      let findings: ReviewFindings | null;
+      try {
+        findings = await transport().readFindings(task, qa);
+      } catch (err) {
+        await holdConsumedSignal(
+          task,
+          qa.id,
+          'spec-reviewed',
+          'handler-failed',
+          'server-spec-findings-invalid',
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+        return;
+      }
+      let effective = findings;
+      if (effective === null) {
+        if (roundData.findings === undefined) {
+          await holdConsumedSignal(
+            task,
+            qa.id,
+            'spec-reviewed',
+            'handler-failed',
+            'server-spec-findings-missing',
+            { round },
+          );
+          return;
+        }
+        effective = roundData.findings;
+      } else if (effective.round !== round) {
+        await holdConsumedSignal(
+          task,
+          qa.id,
+          'spec-reviewed',
+          'handler-failed',
+          'server-spec-findings-round-mismatch',
+          { round, payloadRound: effective.round },
+        );
+        return;
+      } else {
+        const stored = await putVerdictRound(task, qa.id, 'spec-reviewed', {
+          ...roundData,
+          findings: effective,
+          completedAt: new Date().toISOString(),
+        });
+        if (!stored) return;
+        if (!(await deleteFindingsOrHold(task, qa, 'spec-reviewed'))) return;
+      }
 
-    if (effective.verdict === 'approve') {
-      await advanceApprovedSpec(task, 'server-spec-approve-transition-failed');
-      return;
-    }
-    const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
-    if ((task.specReviewRound ?? 0) >= cap) {
-      const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
-      if (!capResult) return;
-      const paused = capResult.task;
-      if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
-      if (paused.agentId) await releaseAtCap(paused, paused.agentId, 'agentId');
-      return;
-    }
-    await manager.dispatchServerFixToDev(task.id, JSON.stringify(effective));
+      if (effective.verdict === 'approve') {
+        await advanceApprovedSpec(task, 'server-spec-approve-transition-failed');
+        return;
+      }
+      const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
+      if ((task.specReviewRound ?? 0) >= cap) {
+        const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
+        if (!capResult) return;
+        const paused = capResult.task;
+        if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
+        if (paused.agentId) await releaseAtCap(paused, paused.agentId, 'agentId');
+        return;
+      }
+      const dispatched = await manager.dispatchServerFixToDev(
+        task.id,
+        JSON.stringify(effective),
+        { callerOwnsConsumedSignalFailure: true },
+      );
+      if (!dispatched) {
+        await holdConsumedSignal(
+          task,
+          task.qaAgentId ?? task.agentId,
+          'spec-reviewed',
+          'handler-failed',
+          'server-spec-fix-dispatch-failed',
+        );
+      }
+    });
   });
 
   async function runSpecFixSubmission(task: TaskState): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
-      await emitIntervention(bus, task, { phase: 'server-spec-fix-no-dev-agent' });
-      if (task.agentId) {
-        await rearmOrHold(task, task.agentId, 'spec-fixed');
-      }
-      return false;
+      return holdConsumedSignal(
+        task,
+        task.agentId,
+        'spec-fixed',
+        'fix-no-dev-agent',
+        'server-spec-fix-no-dev-agent',
+      );
     }
     const round = task.specReviewRound ?? 1;
     const roundData = await reviewStore.getRound(task.id, 'spec', round);
     if (!roundData?.findings) {
-      await emitIntervention(bus, task, { phase: 'server-spec-fix-findings-missing', round });
-      await manager.setupPhaseSignal(task.id, task.agentId, 'spec-fixed', { skipSnapshot: true });
-      return false;
+      return holdConsumedSignal(
+        task,
+        task.agentId,
+        'spec-fixed',
+        'fix-findings-missing',
+        'server-spec-fix-findings-missing',
+        { round },
+      );
     }
     await manager.refreshWorkdirCacheFor(task.agentId);
-    let response;
+    let readResult: ReviewResponseReadResult;
     try {
-      response = await transport().readResponse(task, dev);
+      readResult = await readResponseWithRetry(task, dev);
     } catch (err) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-response-invalid',
-        error: err instanceof Error ? err.message : String(err),
-      });
-      await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-      return false;
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        'spec-fixed',
+        'response-read-failed',
+        'server-spec-response-read-failed',
+        {
+          reason: err instanceof ReviewExchangeError ? err.reason : 'read-failed',
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
     }
-    if (response === null) {
+    if (readResult.kind === 'unknown') {
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        'spec-fixed',
+        'response-read-failed',
+        'server-spec-response-read-failed',
+        { reason: readResult.error.reason, error: readResult.error.message },
+      );
+    }
+    if (readResult.kind === 'invalid') {
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'response-invalid',
+        failurePhase: 'server-spec-response-invalid',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+        schemaViolationCodes: readResult.schemaViolationCodes,
+        details: { error: readResult.error.message },
+      });
+    }
+    if (readResult.kind === 'absent') {
       if (roundData.response === undefined) {
-        await emitIntervention(bus, task, { phase: 'server-spec-response-missing', round });
-        await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-        return false;
+        return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+          reason: 'response-missing',
+          failurePhase: 'server-spec-response-missing',
+        });
       }
       return dispatchSpecReview(task, {
         findingsJson: JSON.stringify(roundData.findings),
         responseJson: JSON.stringify(roundData.response),
       });
     }
+    const { response } = readResult;
     if (response.round !== round) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-response-round-mismatch',
-        round,
-        payloadRound: response.round,
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'round-mismatch',
+        failurePhase: 'server-spec-response-round-mismatch',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+        details: { payloadRound: response.round },
       });
-      await transport().deleteResponse(dev);
-      await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-      return false;
+    }
+    if (response.token !== task.signalToken) {
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'token-mismatch',
+        failurePhase: 'server-spec-response-token-mismatch',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+      });
+    }
+    const findingsDigest = reviewFindingsDigest(roundData.findings);
+    if (response.findingsDigest !== findingsDigest) {
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'findings-digest-mismatch',
+        failurePhase: 'server-spec-response-findings-digest-mismatch',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
+      });
     }
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
     if (gaps.missing.length > 0 || gaps.unknown.length > 0) {
-      await emitIntervention(bus, task, {
-        phase: 'server-spec-response-coverage-gap',
-        round,
+      return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
+        reason: 'coverage-gap',
+        failurePhase: 'server-spec-response-coverage-gap',
+        rawResponse: readResult.raw,
+        responseDigest: readResult.responseDigest,
         missingFindingIds: gaps.missing,
         unknownFindingIds: gaps.unknown,
       });
-      await manager.setupPhaseSignal(task.id, dev.id, 'spec-fixed', { skipSnapshot: true });
-      return false;
     }
     if (!(await putVerdictRound(task, dev.id, 'spec-fixed', { ...roundData, response }))) return false;
-    await transport().deleteResponse(dev);
+    try {
+      await transport().deleteResponse(dev);
+    } catch (err) {
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        'spec-fixed',
+        'handler-failed',
+        'server-spec-response-cleanup-failed',
+        { error: err instanceof Error ? err.message : String(err) },
+      );
+    }
     return dispatchSpecReview(task, {
       findingsJson: JSON.stringify(roundData.findings),
       responseJson: JSON.stringify(response),
@@ -1012,7 +1664,9 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   bus.on('server.spec.fix.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'spec', requireServerMode: false });
     if (!gated) return;
-    await runSpecFixSubmission(gated.task);
+    await runConsumedSignal(gated.task, gated.task.agentId, 'spec-fixed', async () => {
+      await runSpecFixSubmission(gated.task);
+    });
   });
 
   async function latestVerdictRound(taskId: string, phase: 'code' | 'spec', fromRound: number): Promise<ReviewRound | null> {
@@ -1026,24 +1680,26 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   // 手工发起复用自然入口的完整协议：fixing 走 fix-submission（读/校验 dev 的 response 后派 recheck，
   // 缺 response 拒绝）；其余状态按最近结论轮携带 prior 上下文，否则 QA 无从核对上一轮 findings
   manager.setServerReviewDriver({
-    dispatchCodeReview: async (task) => {
+    dispatchCodeReview: async (task, opts = {}) => {
       if (task.status === 'fixing') return runCodeFixSubmission(task);
       const prior = await latestVerdictRound(task.id, 'code', task.reviewRound);
       return prepareAndDispatchCodeReview(task, {
         recheck: prior !== null,
+        ...(opts.bumpRound === false ? { bumpRound: false } : {}),
         ...(prior?.findings ? { priorFindingsJson: JSON.stringify(prior.findings) } : {}),
         ...(prior?.response ? { priorResponseJson: JSON.stringify(prior.response) } : {}),
       });
     },
-    dispatchSpecReview: async (task) => {
+    dispatchSpecReview: async (task, opts = {}) => {
       if (task.status === 'fixing') return runSpecFixSubmission(task);
       const prior = await latestVerdictRound(task.id, 'spec', task.specReviewRound ?? 0);
-      return dispatchSpecReview(task, prior?.findings
+      const priorContext = prior?.findings
         ? {
-          findingsJson: JSON.stringify(prior.findings),
-          ...(prior.response ? { responseJson: JSON.stringify(prior.response) } : {}),
-        }
-        : undefined);
+            findingsJson: JSON.stringify(prior.findings),
+            ...(prior.response ? { responseJson: JSON.stringify(prior.response) } : {}),
+          }
+        : undefined;
+      return dispatchSpecReview(task, priorContext, opts);
     },
   });
 }

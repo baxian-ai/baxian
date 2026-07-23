@@ -106,6 +106,39 @@ describe('GET /api/config', () => {
 });
 
 describe('PATCH /api/config', () => {
+  it('rejects the commit and keeps memory and disk config unchanged when the participant scan fails', async () => {
+    const configPath = await seedConfigPath(app, tempDir);
+    const memoryBefore = app.ctx.config;
+    const diskBefore = await readFile(configPath, 'utf8');
+    vi.spyOn(app.ctx.agentManager, 'listActiveParticipantSeats')
+      .mockRejectedValue(new Error('task scan failed'));
+
+    const response = await patch('/api/config', { review: { rounds: 3 } }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(500);
+    expect(app.ctx.config).toBe(memoryBefore);
+    expect(await readFile(configPath, 'utf8')).toBe(diskBefore);
+  });
+
+  it('returns blocking task ids in validation details for a platform identity conflict', async () => {
+    await seedConfigPath(app, tempDir);
+    vi.spyOn(app.ctx.agentManager, 'guardGitConfigCommit').mockResolvedValue({
+      ok: false,
+      blockers: [{ projectId: 'proj', taskIds: ['task-locked'] }],
+    });
+
+    const response = await patch('/api/config', { review: { rounds: 3 } }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body)).toMatchObject({
+      blockers: [{ projectId: 'proj', taskIds: ['task-locked'] }],
+      details: [{
+        path: 'project.proj',
+        message: 'active platform-bound tasks prevent identity changes: task-locked',
+      }],
+    });
+  });
+
   it('preserves existing server.token when client round-trips the redacted placeholder', async () => {
     const original = 'real-token-value';
     await seedConfigPath(app, tempDir);
@@ -497,10 +530,15 @@ describe('PATCH /api/config', () => {
       const agentReplace = vi.spyOn(app.ctx.agentManager, 'replaceConfig');
       const tmuxReplace = vi.fn();
       const bootstrapReplace = vi.fn();
-      const pollerReplace = vi.fn();
+      const reconcile = vi.fn();
+      const reschedule = vi.fn();
       app.ctx.tmuxProbePoller = { replaceConfig: tmuxReplace, stop: vi.fn() } as never;
       app.ctx.bootstrapPoller = { replaceConfig: bootstrapReplace, stop: vi.fn() } as never;
-      app.ctx.poller = { replaceConfig: pollerReplace, stop: vi.fn() } as never;
+      app.ctx.poller = { reconcile, reschedule, stop: vi.fn() } as never;
+      app.ctx.platformEntryDeps = {
+        driverFor: () => ({ visibilityLagMs: 0, commentSources: [] }),
+        statePathFor: (repoUrl: string) => `/tmp/poller-${encodeURIComponent(repoUrl)}.json`,
+      } as never;
 
       const { statusCode, body } = await patchAndRead({
         review: { rounds: 5 },
@@ -511,20 +549,53 @@ describe('PATCH /api/config', () => {
       expect(agentReplace).toHaveBeenCalledTimes(1);
       expect(tmuxReplace).toHaveBeenCalledTimes(1);
       expect(bootstrapReplace).toHaveBeenCalledTimes(1);
-      expect(pollerReplace).toHaveBeenCalledTimes(1);
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      expect(reschedule).toHaveBeenCalledWith(60000);
     });
 
-    it('requires restart when server.port changes (no replaceConfig calls)', async () => {
+    it('requires a listener restart while still hot-applying the non-listener configuration', async () => {
       const agentReplace = vi.spyOn(app.ctx.agentManager, 'replaceConfig');
-      const pollerReplace = vi.fn();
-      app.ctx.poller = { replaceConfig: pollerReplace, stop: vi.fn() } as never;
+      const reconcile = vi.fn();
+      const reschedule = vi.fn();
+      app.ctx.poller = { reconcile, reschedule, stop: vi.fn() } as never;
+      app.ctx.platformEntryDeps = {
+        driverFor: () => ({ visibilityLagMs: 0, commentSources: [] }),
+        statePathFor: (repoUrl: string) => `/tmp/poller-${encodeURIComponent(repoUrl)}.json`,
+      } as never;
 
-      const { statusCode, body } = await patchAndRead({ server: { port: 4444 } });
+      const { statusCode, body } = await patchAndRead({
+        review: { rounds: 7 },
+        server: { port: 4444, githubPollIntervalMs: 45_000 },
+      });
       expect(statusCode).toBe(200);
       expect(body.restartRequired).toBe(true);
       expect(body.note).toMatch(/restart/);
-      expect(agentReplace).not.toHaveBeenCalled();
-      expect(pollerReplace).not.toHaveBeenCalled();
+      expect(agentReplace).toHaveBeenCalledTimes(1);
+      expect(app.ctx.agentManager.getConfig().review.rounds).toBe(7);
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      expect(reschedule).toHaveBeenCalledWith(45_000);
+    });
+
+    it('fails before saving or swapping config when the retained-task scan fails', async () => {
+      await seedConfigPath(app, tempDir);
+      const before = await readFile(app.ctx.configPath!, 'utf8');
+      const replace = vi.spyOn(app.ctx.agentManager, 'replaceConfig');
+      vi.spyOn(app.ctx.agentManager, 'listActiveGitTasks')
+        .mockRejectedValue(new Error('task schema invalid'));
+      const reconcile = vi.fn();
+      app.ctx.poller = { reconcile, reschedule: vi.fn(), stop: vi.fn() } as never;
+      app.ctx.platformEntryDeps = {
+        driverFor: () => ({ visibilityLagMs: 0, commentSources: [] }),
+        statePathFor: (repoUrl: string) => `/tmp/poller-${encodeURIComponent(repoUrl)}.json`,
+      } as never;
+
+      const response = await patch('/api/config', { review: { rounds: 9 } }, { headers: JSON_HEADERS });
+
+      expect(response.statusCode).toBe(500);
+      expect(app.ctx.config.review.rounds).not.toBe(9);
+      expect(await readFile(app.ctx.configPath!, 'utf8')).toBe(before);
+      expect(replace).not.toHaveBeenCalled();
+      expect(reconcile).not.toHaveBeenCalled();
     });
 
     it('requires restart when server.host changes', async () => {
@@ -552,8 +623,7 @@ describe('PATCH /api/config', () => {
     });
 
     it('does not require restart when allowedHosts changes', async () => {
-      const pollerReplace = vi.fn();
-      app.ctx.poller = { replaceConfig: pollerReplace, stop: vi.fn() } as never;
+      app.ctx.poller = { reschedule: vi.fn(), reconcile: vi.fn(), stop: vi.fn() } as never;
       const { body } = await patchAndRead({
         server: { port: 3000, allowedHosts: ['baxian.dev', 'admin.baxian.dev'] },
       });

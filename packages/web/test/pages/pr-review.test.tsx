@@ -37,7 +37,7 @@ describe('PrReviewPage', () => {
       prUrl: 'https://github.com/user/repo/pull/7',
       items: [
         { kind: 'review-comment', id: '21', author: 'qa', body: 'nit', path: 'a.ts', line: 12, createdAt: '2026-06-01T10:00:00Z' },
-        { kind: 'commit', id: 'sha12345678', author: 'dev', body: 'fix: thing', commitSha: 'sha12345678', createdAt: '2026-06-01T10:05:00Z' },
+        { kind: 'issue-comment', id: 'dev-fix', author: 'dev', body: 'fix: thing', createdAt: '2026-06-01T10:05:00Z' },
         { kind: 'review', id: '11', author: 'qa', body: 'please fix', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
         { kind: 'review', id: '12', author: 'qa', body: 'lgtm', verdict: 'approve', createdAt: '2026-06-01T10:20:00Z' },
       ],
@@ -45,17 +45,32 @@ describe('PrReviewPage', () => {
     ghMock.mockResolvedValue(data);
     renderAt('/tasks/task-1/pr-review');
 
-    expect(await screen.findByText('View PR #7')).toBeTruthy();
+    expect((await screen.findByText('View PR #7')).getAttribute('href'))
+      .toBe('https://github.com/user/repo/pull/7');
     expect(screen.getByText('My Task')).toBeTruthy();
     expect(screen.getByText('Round 1')).toBeTruthy();
     expect(screen.getByText('Round 2')).toBeTruthy();
     expect(screen.getByText('a.ts:12')).toBeTruthy();
     expect(screen.getByText('nit')).toBeTruthy();
     expect(screen.getByText('fix: thing')).toBeTruthy();
-    expect(screen.getByText('sha123456')).toBeTruthy();
     expect(screen.getByText('please fix')).toBeTruthy();
     expect(screen.getByText('request-changes')).toBeTruthy();
     expect(screen.getByText('approve')).toBeTruthy();
+  });
+
+  it('does not create a link for a non-HTTP PR URL supplied by a plugin', async () => {
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      prUrl: 'javascript:alert(1)',
+      items: [
+        { kind: 'issue-comment', id: 'c1', body: 'loaded comment', createdAt: '2026-06-01T10:00:00Z' },
+      ],
+    });
+    renderAt('/tasks/task-1/pr-review');
+
+    await screen.findByText('loaded comment');
+    expect(screen.queryByRole('link', { name: 'View PR #7' })).toBeNull();
   });
 
   it('renders a ghost placeholder for author-less comments, replies, and reviews', async () => {
@@ -79,14 +94,14 @@ describe('PrReviewPage', () => {
       prNumber: 7,
       items: [
         { kind: 'review-comment', id: '21', body: 'nit', path: 'a.ts', line: 12, createdAt: '2026-06-01T10:00:00Z' },
-        { kind: 'commit', id: 'sha12345678', body: 'fix: thing', commitSha: 'sha12345678', createdAt: '2026-06-01T10:05:00Z' },
+        { kind: 'issue-comment', id: 'dev-fix', body: 'fix: thing', createdAt: '2026-06-01T10:05:00Z' },
         { kind: 'review', id: '11', body: 'please fix', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
       ],
     } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
     await screen.findByText('please fix');
     expect(document.getElementById('pr-review-comment-21')).not.toBeNull();
-    expect(document.getElementById('pr-commit-sha12345678')).not.toBeNull();
+    expect(document.getElementById('pr-issue-comment-dev-fix')).not.toBeNull();
     expect(document.getElementById('pr-review-11')).not.toBeNull();
   });
 
@@ -97,7 +112,7 @@ describe('PrReviewPage', () => {
       available: true,
       prNumber: 7,
       items: [
-        { kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
+        { kind: 'issue-comment', id: 'c1', body: 'fix', createdAt: '2026-06-01T10:00:00Z' },
         { kind: 'review', id: '11', body: 'please fix', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
       ],
     } as PrReviewConversation);
@@ -105,7 +120,7 @@ describe('PrReviewPage', () => {
     await screen.findByText('please fix');
     await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
     expect(document.getElementById('pr-review-11')?.className).toContain('ring-2');
-    expect(document.getElementById('pr-commit-c1')?.className).not.toContain('ring-2');
+    expect(document.getElementById('pr-issue-comment-c1')?.className).not.toContain('ring-2');
   });
 
   it('retries the anchor when a same-task refetch adds the target record', async () => {
@@ -115,13 +130,13 @@ describe('PrReviewPage', () => {
       .mockResolvedValueOnce({
         available: true,
         prNumber: 7,
-        items: [{ kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' }],
+        items: [{ kind: 'issue-comment', id: 'c1', body: 'fix', createdAt: '2026-06-01T10:00:00Z' }],
       } as PrReviewConversation)
       .mockResolvedValueOnce({
         available: true,
         prNumber: 7,
         items: [
-          { kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
+          { kind: 'issue-comment', id: 'c1', body: 'fix', createdAt: '2026-06-01T10:00:00Z' },
           { kind: 'review', id: '11', body: 'late review', verdict: 'approve', createdAt: '2026-06-01T10:10:00Z' },
         ],
       } as PrReviewConversation);
@@ -176,12 +191,11 @@ describe('PrReviewPage', () => {
     expect(scrollSpy).not.toHaveBeenCalled();
   });
 
-  it('renders review and comment bodies as basic markdown but keeps commit subjects literal', async () => {
+  it('renders review and comment bodies as basic markdown', async () => {
     ghMock.mockResolvedValue({
       available: true,
       prNumber: 7,
       items: [
-        { kind: 'commit', id: 'c1', body: 'fix: keep **stars**', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' },
         { kind: 'issue-comment', id: 'i1', body: 'see `path/file` please', createdAt: '2026-06-01T10:05:00Z' },
         { kind: 'review', id: '11', body: '# Verdict\n**needs** work', verdict: 'request-changes', createdAt: '2026-06-01T10:10:00Z' },
       ],
@@ -192,8 +206,6 @@ describe('PrReviewPage', () => {
     const h1 = document.querySelector('h1.text-\\[18px\\]');
     expect(h1?.textContent).toBe('# Verdict');
     expect(Array.from(document.querySelectorAll('strong')).some((el) => el.textContent === 'needs')).toBe(true);
-    expect(document.getElementById('pr-commit-c1')?.textContent).toContain('fix: keep **stars**');
-    expect(document.getElementById('pr-commit-c1')?.querySelector('strong')).toBeNull();
   });
 
   it('reports truncation instead of an empty review state when the budget dropped everything', async () => {
@@ -232,7 +244,7 @@ describe('PrReviewPage', () => {
       available: true,
       prNumber: 7,
       error: 'reviews: rate limited',
-      items: [{ kind: 'commit', id: 'c1', body: 'fix', commitSha: 'c1', createdAt: '2026-06-01T10:00:00Z' }],
+      items: [{ kind: 'issue-comment', id: 'c1', body: 'fix', createdAt: '2026-06-01T10:00:00Z' }],
     } as PrReviewConversation);
     renderAt('/tasks/task-1/pr-review');
     expect(await screen.findByText(/Some review records failed to fetch/)).toBeTruthy();

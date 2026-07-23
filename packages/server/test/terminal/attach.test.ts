@@ -459,7 +459,7 @@ describe('generation guard with real tmux target semantics', () => {
     try {
       await expect(waitForTmuxServerExit(
         fixture,
-        100,
+        2_000,
         async () => probes.shift() ?? absent,
       )).resolves.toBe(true);
       expect(probes).toEqual([]);

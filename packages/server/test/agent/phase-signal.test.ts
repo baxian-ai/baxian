@@ -16,8 +16,6 @@ describe('phase signal protocol', () => {
     expect(buildPhaseSignal('spec-done', 'abc123def456')).toBe('[bx:spec-done:abc123def456]');
     expect(buildPhaseSignal('spec-reviewed', 'tok123abc')).toBe('[bx:spec-reviewed:tok123abc]');
     expect(buildPhaseSignal('spec-fixed', 'tok234abc')).toBe('[bx:spec-fixed:tok234abc]');
-    expect(buildPhaseSignal('pr-approved', 'tok333abc')).toBe('[bx:pr-approved:tok333abc]');
-    expect(buildPhaseSignal('pr-changes-requested', 'tok444abc')).toBe('[bx:pr-changes-requested:tok444abc]');
     expect(buildPhaseSignal('pr-merge-ready', 'tok345abc')).toBe('[bx:pr-merge-ready:tok345abc]');
   });
 

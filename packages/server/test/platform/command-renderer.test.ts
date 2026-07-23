@@ -89,12 +89,33 @@ describe('command-renderer', () => {
       ...CTX,
       prNumber: 42,
       expectedHeadSha: 'abc123abc1',
+      remoteProjectId: 'R_repo123',
       branch: 'bx/task-1',
       page: 1,
       minToolVersion: '1.92.0',
     };
     for (const name of new Set([...PLACEHOLDERS_WITH_PAGE, ...PREFLIGHT_FIXMESSAGE_PLACEHOLDERS])) {
       expect(() => renderFixMessage(`{${name}}`, full), name).not.toThrow();
+    }
+  });
+});
+
+describe('command-renderer: GraphQL context', () => {
+  it('renders a bounded remote project id and escaped literal braces', () => {
+    const cmd = renderCommand(
+      { argv: ['{binary}', 'api', 'graphql', '{remoteProjectId}', 'query=query($id:ID!)\\{node(id:$id)\\{id\\}\\}'] },
+      { ...CTX, remoteProjectId: 'R_repo123' },
+    );
+    expect(cmd).toContain("'R_repo123'");
+    expect(cmd).toContain("'query=query($id:ID!){node(id:$id){id}}'");
+  });
+
+  it('rejects missing, control-bearing, and oversized remote project ids', () => {
+    for (const remoteProjectId of [undefined, ' bad', 'bad\nvalue', 'x'.repeat(513)]) {
+      expect(() => renderCommand(
+        { argv: ['{remoteProjectId}'] },
+        { ...CTX, remoteProjectId },
+      )).toThrow(PlaceholderValueError);
     }
   });
 });

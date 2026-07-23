@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadPluginsOrExplainWithRoots, referencedGitTools, scanPluginSkillPools } from '../../src/platform/startup.js';
@@ -37,9 +37,36 @@ afterEach(async () => {
 });
 
 describe('loadPluginsOrExplainWithRoots', () => {
-  it('github-only config loads fine with empty roots', async () => {
+  it('a github project with no plugin root available is fatal (it resolves tool gh like any git project)', async () => {
     const r = await loadPluginsOrExplainWithRoots(cfgWith([
       { id: 'p', repo: 'https://github.com/a/b.git', merge: null, agent: [] },
+    ]), { builtin: '/nonexistent-a', user: '/nonexistent-b' });
+    expect('fatal' in r).toBe(true);
+    expect((r as { fatal: string[] }).fatal.join('\n')).toMatch(/no git-driver plugin provides tool 'gh'/);
+  });
+
+  it('a server + afterDone pr github project is fatal when the gh driver is unavailable (it needs a poller entry)', async () => {
+    const cfg = {
+      review: { rounds: 3, mode: 'server', afterDone: 'pr' }, server: { port: 3000, host: '127.0.0.1' }, host: [],
+      project: [{ id: 'srv', repo: 'https://github.com/a/b.git', merge: null, review: { mode: 'server' }, agent: [] }],
+    } as never;
+    const r = await loadPluginsOrExplainWithRoots(cfg, { builtin: '/nonexistent-a', user: '/nonexistent-b' });
+    expect('fatal' in r).toBe(true);
+    expect((r as { fatal: string[] }).fatal.join('\n')).toMatch(/no git-driver plugin provides tool 'gh'/);
+  });
+
+  it('a server + afterDone branch project still needs no plugin', async () => {
+    const cfg = {
+      review: { rounds: 3, mode: 'server', afterDone: 'branch' }, server: { port: 3000, host: '127.0.0.1' }, host: [],
+      project: [{ id: 'srv', repo: 'https://github.com/a/b.git', merge: null, review: { mode: 'server' }, agent: [] }],
+    } as never;
+    const r = await loadPluginsOrExplainWithRoots(cfg, { builtin: '/nonexistent-a', user: '/nonexistent-b' });
+    expect('registry' in r).toBe(true);
+  });
+
+  it('a server-mode project needs no plugin at all', async () => {
+    const r = await loadPluginsOrExplainWithRoots(cfgWith([
+      { id: 'p', repo: 'https://github.com/a/b.git', merge: null, review: { mode: 'server' }, agent: [] },
     ]), { builtin: '/nonexistent-a', user: '/nonexistent-b' });
     expect('registry' in r).toBe(true);
   });
@@ -206,8 +233,9 @@ describe('loadPluginsOrExplainWithRoots', () => {
     ]), roots);
     expect('fatal' in r).toBe(true);
     const fatal = (r as { fatal: string[] }).fatal;
-    expect(fatal).toHaveLength(2);
+    expect(fatal).toHaveLength(3);
     const joined = fatal.join('\n');
+    expect(joined).toMatch(/'gh'/);
     expect(joined).toMatch(/bad1/);
     expect(joined).toMatch(/forge/);
     expect(joined).toMatch(/bad2/);
@@ -254,5 +282,22 @@ describe('scanPluginSkillPools', () => {
       { id: 'c', repo: 'https://gl.example.com/g/c.git', merge: null, review: { mode: 'server' }, gitCli: { tool: 'forge' }, agent: [] },
     ]);
     expect([...referencedGitTools(cfg)].sort()).toEqual(['gh', 'glab']);
+  });
+});
+
+describe('git recovery wiring', () => {
+  it('runs recovery before event registration and includes both durable sweeps in maintenance', async () => {
+    const source = await readFile(new URL('../../src/index.ts', import.meta.url), 'utf8');
+    expect(source.indexOf('await agentManager.recover()'))
+      .toBeLessThan(source.indexOf('registerEventHandlers(eventBus, agentManager)'));
+    expect(source).toMatch(/name: 'GitMaintenance'[\s\S]*retryPendingGitReviewDispatches\(\)[\s\S]*retryGitRemoteCleanupIntents\(\)/);
+  });
+
+  it('starts durable sweeps directly without legacy migrations', async () => {
+    const source = await readFile(new URL('../../src/agent/manager.ts', import.meta.url), 'utf8');
+    const recover = source.slice(source.indexOf('async recover(): Promise<void>'));
+    expect(recover).not.toContain('migrateLegacyGit');
+    expect(recover).toContain('retryGitRemoteCleanupIntents()');
+    expect(recover).toContain('recoverClaimedGitReviewDispatches()');
   });
 });

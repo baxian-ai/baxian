@@ -28,7 +28,7 @@ baxian 是 **tmux 原生**的。一个 agent 就是 tmux session 里的一个交
 
 - **终端墙** —— 控制台内嵌每个 agent 的实时终端（WebSocket 推流、xterm.js 渲染）。点击任意窗格即可向真实会话输入，无需切换窗口就能看清每个 agent 在做什么。
 - **自动评审循环** —— QA 评审意见结构化（`critical` / `major` / `minor`，附文件与行号），Dev 逐条回应（`fix` / `reject` 并说明理由与提交），一轮轮推进直到结论为 `approve`。
-- **评审发生在真实的 GitHub PR 上** —— 每任务一个分支、自动建 PR、通过 `gh` CLI 轮询评审动态；项目设置 `merge: "auto"` 时，任务通过并经你确认后由 baxian 代为合并 PR。
+- **评审发生在真实的 PR 上** —— 每任务一个分支、自动建 PR、通过平台自己的 CLI（GitHub 用 `gh`，需另行安装并认证）轮询评审动态；项目设置 `merge: "auto"` 时，任务通过并经你确认后由 baxian 代为合并 PR。
 - **内置 server 评审模式（备选）** —— 不便走 PR 的场景可设 `review.mode: "server"`，评审循环走 server 自有协议。
 - **Spec 人审门禁（可选）** —— 项目配置 `specApproval: "human"` 后，走规格稿路线的任务在 QA 通过规格稿时停驻在 `spec-ready`，等你签字确认才开始编码。
 - **本地与远程 agent** —— agent 可以跑在任何 SSH 可达的机器上，远端 tmux 会话由 baxian 代管。
@@ -56,7 +56,7 @@ baxian 是 **tmux 原生**的。一个 agent 就是 tmux session 里的一个交
         │  REST + WebSocket
         ▼
    baxian server（Node + Fastify）
-   任务状态 · 评审轮次 · GitHub poller
+   任务状态 · 评审轮次 · 平台 poller
         │  tmux send-keys / capture-pane
         ├────────────────┐
         ▼                ▼ SSH
@@ -71,7 +71,9 @@ server 持有全部状态（任务、评审轮次、agent 绑定），通过向 
 > - **Node.js ≥ 22.13**
 > - 每台跑 agent 的机器（本地与远程）都装有 **tmux**
 > - **Claude Code**（`claude`）和/或 **Codex**（`codex`）CLI 已安装并登录
-> - **git**；若使用 GitHub 集成，还需已认证的 **GitHub CLI**（`gh`）
+> - **git**，以及 `review.mode: "git"`（默认）所需的平台 CLI —— GitHub 仓库用已认证的 **GitHub CLI**（`gh`）；其它平台需自备 CLI 并在 `~/.baxian/plugins/` 下安装对应的驱动插件
+>
+> 该 CLI 需要在每台跑 agent 的机器上、以及 server 本机都完成认证：server 用它轮询评审、合并与关闭 PR，agent 用它开 PR 与发评论。
 
 ## 快速开始
 
@@ -134,10 +136,11 @@ baxian 优先读取工作目录下的 `./baxian.json`，找不到时回退到 `~
 | --- | --- |
 | `language` | 界面语言，`en-US`（默认）或 `zh-CN` |
 | `review.rounds` | 评审轮数上限，超过后任务标记为 `max_rounds` 暂停 |
-| `review.mode` | `github`（默认）：评审走真实 PR；`server`：无 PR 场景的内置协议；可按项目单独设置 |
+| `review.mode` | `git`（默认）：评审走真实 PR，由平台 CLI 驱动；`server`：无 PR 场景的内置协议；可按项目单独设置 |
 | `server.token` | 保护 API 与 Web 控制台的 Bearer token |
 | `project[].merge` | `"auto"`：任务通过并经你确认后，由 baxian 代为合并 PR；`null`：手动合并 |
 | `project[].specApproval` | `"human"`：QA 通过规格稿后停驻 `spec-ready` 等你确认；`null`（默认）：QA 通过即进入编码 |
+| `project[].gitCli.tool` | `review.mode: "git"` 由哪个平台 CLI 驱动。GitHub 仓库自动解析为 `gh`；其它平台必须声明，并安装对应的驱动插件 |
 | `project[].agent[][].mode` + `host` | `local` 本地运行，或 `remote` 配主机 id 走 SSH 代管 |
 
 ## 许可证

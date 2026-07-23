@@ -1,9 +1,10 @@
-import { createSignalToken, decodeSignalActorId, type PhaseSignalKind } from '../agent/phase-signal.js';
+import { decodeSignalActorId, type PhaseSignalKind } from '../agent/phase-signal.js';
+import { BODY_DIGEST_SOURCE } from '../platform/body-digest.js';
 import { ackRevisionKey } from '../platform/markers.js';
-import { SHA_HEX_SOURCE } from '../platform/types.js';
+import { LINE_SAFE_ID_RE } from '../platform/row-schema.js';
+import { SHA_HEX_SOURCE, SOURCE_KEY_PATTERN } from '../platform/types.js';
 import {
   BRANCH_PREFIX,
-  TASK_TERMINAL_STATUS_SET,
   isRecord,
   isSpecStagePhase,
   isValidBranchName,
@@ -11,16 +12,117 @@ import {
   type TaskState,
 } from '../shared/index.js';
 import type { EventBus } from './bus.js';
-import { type AgentManager, DispatchTerminalError, EnsureSessionError, isRecoverableQaDispatchHold } from '../agent/manager.js';
+import {
+  type AgentManager,
+  type PostApproveEpisodeKey,
+  DispatchTerminalError,
+  isRecoverableQaDispatchHold,
+} from '../agent/manager.js';
 import { ReplNotReadyError } from '../agent/tmux.js';
 import { DirtyWorkdirError } from '../agent/branch.js';
 
 type InterventionData = Record<string, unknown> & { phase: string };
-// 平台 SHA 文法单点（spec §5.3：7-64 位 hex）；legacy github 值恒 40 位，放宽为 additive
 const HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
+const BODY_DIGEST_RE = new RegExp(`^${BODY_DIGEST_SOURCE}$`);
+const PR_UPDATED_REVIEW_FROM_STATUSES: TaskState['status'][] = [
+  'in_progress', 'fixing', 'review', 'approved', 'merge-ready',
+];
 
 function validHeadSha(value: unknown): string | undefined {
   return typeof value === 'string' && HEAD_SHA_RE.test(value) ? value : undefined;
+}
+
+class GitVerdictPayloadError extends Error {
+  constructor(message: string) {
+    super(`malformed git verdict: ${message}`);
+    this.name = 'GitVerdictPayloadError';
+  }
+}
+
+interface GitVerdictPayload {
+  action: 'APPROVE' | 'REQUEST_CHANGES';
+  reviewPassToken: string;
+  verdictToken: string;
+  headSha: string;
+  currentHeadSha: string;
+  prNumber: number;
+  prUrl: string;
+  carrier: { sourceKey: string; id: string; bodyDigest: string };
+}
+
+interface GitFeedbackRevision {
+  sourceKey: string;
+  id: string;
+  bodyDigest: string;
+  versionTime?: number;
+}
+
+function parseGitVerdictPayload(data: Record<string, unknown>): GitVerdictPayload {
+  if (data.action !== 'APPROVE' && data.action !== 'REQUEST_CHANGES') {
+    throw new GitVerdictPayloadError('unknown action');
+  }
+  if (data.source !== 'platform-poller') throw new GitVerdictPayloadError('invalid source');
+  if (typeof data.reviewPassToken !== 'string' || !/^[0-9a-f]{12}$/.test(data.reviewPassToken)) {
+    throw new GitVerdictPayloadError('invalid review pass token');
+  }
+  if (typeof data.verdictToken !== 'string' || !/^[0-9a-f]{12}$/.test(data.verdictToken)) {
+    throw new GitVerdictPayloadError('invalid verdict token');
+  }
+  const headSha = validHeadSha(data.headSha);
+  const currentHeadSha = validHeadSha(data.currentHeadSha);
+  if (!headSha || !currentHeadSha) throw new GitVerdictPayloadError('invalid head sha');
+  if (!Number.isInteger(data.prNumber) || (data.prNumber as number) < 1) {
+    throw new GitVerdictPayloadError('invalid PR number');
+  }
+  if (typeof data.prUrl !== 'string' || data.prUrl.trim() === '' || data.prUrl.length > 4096) {
+    throw new GitVerdictPayloadError('invalid PR URL');
+  }
+  if (typeof data.branch !== 'string' || data.branch.trim() === '' || data.branch.length > 1024) {
+    throw new GitVerdictPayloadError('invalid PR branch');
+  }
+  if (data.submittedAt !== undefined
+    && (typeof data.submittedAt !== 'string' || !Number.isFinite(Date.parse(data.submittedAt)))) {
+    throw new GitVerdictPayloadError('invalid submission time');
+  }
+  if (data.verdictConflict !== undefined && typeof data.verdictConflict !== 'boolean') {
+    throw new GitVerdictPayloadError('invalid conflict flag');
+  }
+  if (!isRecord(data.verdictCarrier)) throw new GitVerdictPayloadError('missing carrier');
+  const carrier = data.verdictCarrier;
+  if (typeof carrier.sourceKey !== 'string' || carrier.sourceKey.trim() === '' || carrier.sourceKey.length > 128
+    || typeof carrier.id !== 'string' || carrier.id.trim() === '' || carrier.id.length > 512
+    || typeof carrier.bodyDigest !== 'string' || !/^[0-9a-f]{64}$/.test(carrier.bodyDigest)) {
+    throw new GitVerdictPayloadError('invalid carrier');
+  }
+  return {
+    action: data.action,
+    reviewPassToken: data.reviewPassToken,
+    verdictToken: data.verdictToken,
+    headSha,
+    currentHeadSha,
+    prNumber: data.prNumber as number,
+    prUrl: data.prUrl,
+    carrier: {
+      sourceKey: carrier.sourceKey,
+      id: carrier.id,
+      bodyDigest: carrier.bodyDigest,
+    },
+  };
+}
+
+function parseGitFeedbackRevision(value: unknown): GitFeedbackRevision | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.sourceKey !== 'string' || !SOURCE_KEY_PATTERN.test(value.sourceKey)) return null;
+  if (typeof value.id !== 'string' || !LINE_SAFE_ID_RE.test(value.id)) return null;
+  if (typeof value.bodyDigest !== 'string' || !BODY_DIGEST_RE.test(value.bodyDigest)) return null;
+  if (value.versionTime !== undefined
+    && (typeof value.versionTime !== 'number' || !Number.isFinite(value.versionTime))) return null;
+  return {
+    sourceKey: value.sourceKey,
+    id: value.id,
+    bodyDigest: value.bodyDigest,
+    ...(value.versionTime !== undefined ? { versionTime: value.versionTime } : {}),
+  };
 }
 
 async function reArmDevelopWatcher(
@@ -60,194 +162,117 @@ async function emitIntervention(
   }
 }
 
-type HeadAnchorSource = 'fetch' | 'task-store' | 'payload-self' | 'completion-approved' | 'unknown';
-interface HeadAnchor {
-  headSha: string | undefined;
-  source: HeadAnchorSource;
-  fetchError?: string;
-}
-
-async function resolveAuthoritativeHead(
-  manager: AgentManager,
-  task: TaskState,
-  opts: {
-    payloadCurrentHeadSha?: string;
-    legacyFallback?: string;
-  } = {},
-): Promise<HeadAnchor> {
-  try {
-    const headSha = await manager.fetchPrHeadSha(task.id);
-    return { headSha, source: 'fetch' };
-  } catch (err) {
-    const fetchError = err instanceof Error ? err.message : String(err);
-    console.warn(
-      `[handlers] fetchPrHeadSha(task=${task.id}) failed; falling back to stored / payload:`,
-      err,
-    );
-    const stored = validHeadSha(task.latestHeadSha);
-    if (stored) return { headSha: stored, source: 'task-store', fetchError };
-    if (opts.payloadCurrentHeadSha) {
-      return { headSha: opts.payloadCurrentHeadSha, source: 'payload-self', fetchError };
-    }
-    if (opts.legacyFallback) {
-      return { headSha: opts.legacyFallback, source: 'completion-approved', fetchError };
-    }
-    return { headSha: undefined, source: 'unknown', fetchError };
-  }
-}
-
-async function fetchVerifiedHeadSha(manager: AgentManager, taskId: string): Promise<string> {
-  let lastErr: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await manager.fetchPrHeadSha(taskId);
-    } catch (err) {
-      lastErr = err;
-      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 300));
-    }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-}
-
 const POST_APPROVE_REDISPATCH_CAP = 10;
+const POST_APPROVE_RECOVERY_MIN_AGE_MS = 60_000;
+// 损坏值不可自愈，每周期 sweep 会重踩同一分支：按 task+值去重，值变化或修复后允许重报
+const unparseableUpdatedAtWarned = new Map<string, string>();
 
 const VERDICT_FRESHNESS_SKEW_MS = 5000;
 
-async function dispatchDevPostApproveCheck(
+function postApproveEpisodeKey(task: TaskState): PostApproveEpisodeKey | null {
+  if (task.postApproveGeneration === undefined
+    || task.postApproveToken === undefined
+    || task.postApproveHeadSha === undefined) return null;
+  return {
+    generation: task.postApproveGeneration,
+    token: task.postApproveToken,
+    headSha: task.postApproveHeadSha,
+  };
+}
+
+async function dispatchGitDevPostApproveCheck(
   bus: EventBus,
   manager: AgentManager,
-  task: TaskState,
+  snapshot: TaskState,
   approvedHeadSha: string,
-  opts: { redispatchCount?: number } = {},
+  opts: { redispatchCount?: number; expectedEpisode?: PostApproveEpisodeKey } = {},
 ): Promise<void> {
   if (!approvedHeadSha) {
-    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+    await emitIntervention(bus, snapshot.projectId, snapshot.agentId, snapshot.id, {
       phase: 'post-approve-approved-head-unavailable',
     });
     return;
   }
+  const live = await manager.getTask(snapshot.id);
+  if (!live || live.status !== 'approved' || live.reviewMode !== 'git') return;
+  let key = postApproveEpisodeKey(live);
+  if (!key || key.headSha !== approvedHeadSha || live.postApprovePhase === undefined) {
+    await emitIntervention(bus, snapshot.projectId, snapshot.agentId, snapshot.id, {
+      phase: 'post-approve-episode-invalid',
+    });
+    return;
+  }
+  if (opts.expectedEpisode
+    && (key.generation !== opts.expectedEpisode.generation
+      || key.token !== opts.expectedEpisode.token
+      || key.headSha !== opts.expectedEpisode.headSha)) return;
+  if (opts.redispatchCount !== undefined) {
+    const rotated = await manager.rotateGitPostApproveEpisode(
+      live.id,
+      opts.expectedEpisode ?? key,
+      opts.redispatchCount,
+    );
+    if (!rotated) return;
+    key = rotated;
+  }
 
-  const acquired = await manager.acquireAgentForTask(task.agentId, task.id, 'post-approve');
+  const acquired = await manager.acquireAgentForTask(live.agentId, live.id, 'post-approve');
   if (!acquired) {
-    if (task.reviewMode === 'git') {
-      // durable retry 锚：acquire 失败发生在 completion 安装前，无 pending 则 sweep 永远看不到
-      await manager.updateTask(task.id, { pendingRedispatch: true }).catch(() => undefined);
-    }
-    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+    await emitIntervention(bus, live.projectId, live.agentId, live.id, {
       phase: 'post-approve-dev-acquire-failed',
-      devAgentId: task.agentId,
+      devAgentId: live.agentId,
+      generation: key.generation,
+    });
+    return;
+  }
+  if (!(await manager.armGitPostApproveEpisode(live.id, key))) {
+    await manager.markAgentWaiting(live.agentId, live.id, {
+      expectedPostApproveEpisode: key,
+    }).catch(err => {
+      console.error(`[EventHandler] post-approve arm refusal release failed for task=${live.id}:`, err);
+    });
+    await emitIntervention(bus, live.projectId, live.agentId, live.id, {
+      phase: 'post-approve-signal-arm-failed',
+      generation: key.generation,
     });
     return;
   }
 
-  // Persisted after acquire and only while still approved: a stale write would forge rebuild evidence.
-  const headPersisted = await manager.updateTaskIfStatus(task.id, 'approved', {
-    postApproveHeadSha: approvedHeadSha,
-  }, { signalToken: task.signalToken, reviewRound: task.reviewRound });
-  if (!headPersisted) {
-    await manager.markAgentWaiting(task.agentId, task.id)
-      .catch(err => {
-        console.error(
-          `[EventHandler] post-approve head persist refused for task=${task.id}; release failed:`,
-          err,
-        );
-      });
-    return;
-  }
-
-  const signalToken = createSignalToken();
-  const installed = await manager.setPostApproveCompletion(
-    task.id,
-    {
-      token: signalToken,
-      approvedHeadSha,
-      ...(typeof opts.redispatchCount === 'number' ? { redispatchCount: opts.redispatchCount } : {}),
-      // 'git' 至少一次投递（spec §6）：pending 随安装保持，continueSession 确认后才清——
-      // 安装与注入之间的崩溃由恢复扫描按 pending 补派
-      ...(task.reviewMode === 'git' ? { pendingRedispatch: true } : {}),
-    },
-    // A fresh human verdict unlocks a standing revocation; automated redispatches never do.
-    { clearRevocation: typeof opts.redispatchCount !== 'number' },
-  );
-  if (!installed) {
-    await manager.markAgentWaiting(task.agentId, task.id)
-      .catch(err => {
-        console.error(
-          `[EventHandler] post-approve install refused by revocation for task=${task.id}; release failed:`,
-          err,
-        );
-      });
-    return;
-  }
-
   let resumed = false;
-  let dispatchErr: unknown = null;
+  let dispatchErr: unknown;
   try {
-    resumed = await manager.continueSession(task.id, task.agentId, 'post-approve', {
-      signalToken,
-      ...(typeof opts.redispatchCount === 'number'
+    resumed = await manager.continueSession(live.id, live.agentId, 'post-approve', {
+      signalToken: key.token,
+      postApproveEpisode: key,
+      ...(opts.redispatchCount !== undefined
         ? { postApproveRedispatchCount: opts.redispatchCount }
         : {}),
     });
   } catch (err) {
     dispatchErr = err;
-    console.error(
-      `[EventHandler] APPROVE continueSession(dev=${task.agentId}, post-approve) failed:`,
-      err,
-    );
+    console.error(`[EventHandler] post-approve dispatch failed for task=${live.id}:`, err);
   }
   if (resumed) {
-    if (task.reviewMode === 'git') await manager.confirmPostApprovePromptDelivered(task.id, signalToken);
+    await manager.confirmPostApprovePromptDelivered(live.id, key);
     return;
   }
-
-  // git：未确认送达的失败保留 installed+pending 交 sweep 补派（DispatchTerminalError 单独终结）；
-  // legacy 维持清除语义
-  if (task.reviewMode !== 'git' || dispatchErr instanceof DispatchTerminalError) {
-    await manager.clearPostApproveCompletionIfMatches(task.id, signalToken);
-  }
-
   if (dispatchErr instanceof DispatchTerminalError) {
-    await manager.failTaskForDispatchError(task.id, 'post-approve', task.agentId, dispatchErr);
+    await manager.failTaskForDispatchError(live.id, 'post-approve', live.agentId, dispatchErr, {
+      expectedPostApproveEpisode: key,
+    });
     return;
   }
-
-  await manager.markAgentWaiting(task.agentId, task.id)
-    .catch(err => {
-      console.error(
-        `[EventHandler] APPROVE markAgentWaiting(dev=${task.agentId}) rollback failed:`,
-        err,
-      );
-      return false;
-    });
-  await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+  await manager.markAgentWaiting(live.agentId, live.id, {
+    expectedPostApproveEpisode: key,
+  }).catch(err => {
+    console.error(`[EventHandler] post-approve rollback failed for task=${live.id}:`, err);
+  });
+  await emitIntervention(bus, live.projectId, live.agentId, live.id, {
     phase: 'post-approve-dispatch-failed',
-    reviewRound: task.reviewRound,
-    ...(dispatchErr instanceof DispatchTerminalError ? { terminalReason: dispatchErr.reason } : {}),
+    reviewRound: live.reviewRound,
+    generation: key.generation,
     ...(dispatchErr ? { error: dispatchErr instanceof Error ? dispatchErr.message : String(dispatchErr) } : {}),
   });
-}
-
-async function gateDevForPostApproveRedispatch(
-  bus: EventBus,
-  manager: AgentManager,
-  task: TaskState,
-): Promise<boolean> {
-  const ready = await manager
-    .releaseAgentForTask(task.agentId, task.id, 'waiting')
-    .catch(err => {
-      console.error(
-        `[EventHandler] post-approve redispatch releaseAgentForTask(dev=${task.agentId}) failed:`,
-        err,
-      );
-      return false;
-    });
-  if (ready) return true;
-  await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-    phase: 'post-approve-dev-wait-gate-failed-before-redispatch',
-    devAgentId: task.agentId,
-  });
-  return false;
 }
 
 async function handlePrMergeReady(
@@ -257,7 +282,7 @@ async function handlePrMergeReady(
 ): Promise<void> {
   const taskId = event.taskId!;
   const taskNow = await manager.getTask(taskId);
-  if (!taskNow) return;
+  if (!taskNow || taskNow.reviewMode !== 'git') return;
   const eventPrNumber = event.data.prNumber as number | undefined;
   const eventPrUrl = event.data.prUrl as string | undefined;
   const needsPatch =
@@ -278,8 +303,12 @@ async function handlePrMergeReady(
     || !signalToken
     || completion?.token !== signalToken
   ) return;
+  const entryGitEpisode = postApproveEpisodeKey(taskNow);
+  if (entryGitEpisode?.token !== signalToken) return;
 
-  const ok = await manager.markAgentWaiting(taskNow.agentId, taskNow.id);
+  const ok = await manager.markAgentWaiting(taskNow.agentId, taskNow.id, {
+    expectedPostApproveEpisode: entryGitEpisode,
+  });
   if (!ok) {
     await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
       phase: 'post-approve-dev-wait-gate-failed',
@@ -294,11 +323,10 @@ async function handlePrMergeReady(
   if (
     !freshTask
     || freshTask.status !== 'approved'
+    || freshTask.reviewMode !== 'git'
     || freshTask.agentId !== taskNow.agentId
     || freshTask.postApproveRevoked !== undefined
     || entryCompletion?.token !== signalToken
-    || freshTask.postApproveHeadSha === undefined
-    || entryCompletion.approvedHeadSha !== freshTask.postApproveHeadSha
   ) {
     await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
       phase: 'post-approve-merge-skipped-stale-task',
@@ -306,57 +334,100 @@ async function handlePrMergeReady(
     return;
   }
 
-  // 'git' merge-ready 接收即 server 权威双复核（spec §6/§10：provenance + ack 完成集，同一次全源扫描）：
-  // agent 自查是尽责而非授权
   let freshCompletion = entryCompletion;
-  if (freshTask.reviewMode === 'git') {
-    // 信号已消费（token 已验证）：durable 记录 signaled——瞬态复核失败时 dev 不会重发信号，
-    // 恢复/sweep 凭此相位重派而不是等一个不会再来的信号
-    await manager.markPostApproveSignalReceived(freshTask.id, signalToken);
-    const scanFailedRetry = async (error: string): Promise<void> => {
-      await manager.updatePostApproveCompletionIfToken(freshTask.id, signalToken, { pendingRedispatch: true });
-      await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
-        phase: 'post-approve-merge-skipped-scan-failed',
-        error,
-      });
-    };
-    let verified: Awaited<ReturnType<AgentManager['platformVerifyAcceptedPass']>>;
-    try {
-      verified = await manager.platformVerifyAcceptedPass(freshTask.id);
-    } catch (err) {
-      await scanFailedRetry(err instanceof Error ? err.message : String(err));
-      return;
+  const gitEpisodeKey = postApproveEpisodeKey(freshTask);
+  if (!gitEpisodeKey || gitEpisodeKey.token !== signalToken) {
+    await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
+      phase: 'post-approve-merge-skipped-stale-task',
+    });
+    return;
+  }
+  await manager.markPostApproveSignalReceived(freshTask.id, gitEpisodeKey);
+  const scanFailedRetry = async (error: string): Promise<void> => {
+    await manager.updatePostApproveCompletionIfToken(
+      freshTask.id,
+      signalToken,
+      { pendingRedispatch: true },
+      { expectedGeneration: gitEpisodeKey.generation, expectedHeadSha: gitEpisodeKey.headSha },
+    );
+    await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
+      phase: 'post-approve-merge-skipped-scan-failed',
+      error,
+    });
+  };
+  let verified: Awaited<ReturnType<AgentManager['platformVerifyAcceptedPass']>>;
+  try {
+    verified = await manager.platformVerifyAcceptedPass(freshTask.id);
+  } catch (err) {
+    await scanFailedRetry(err instanceof Error ? err.message : String(err));
+    return;
+  }
+  if (verified.kind === 'retryable') {
+    await scanFailedRetry(verified.reason);
+    return;
+  }
+  if (verified.kind === 'provenance-invalid') {
+    const begun = await manager.beginGitReviewPass(freshTask.id, {
+      fromStatus: [freshTask.status],
+      headSha: gitEpisodeKey.headSha,
+      bumpRound: true,
+      qaPhase: 'recheck',
+      expectPhase: freshTask.phase,
+      expectSignalToken: freshTask.signalToken,
+      patch: { latestHeadSha: gitEpisodeKey.headSha },
+    });
+    if (begun?.task.reviewDispatch) {
+      try {
+        await manager.dispatchGitReviewLease(freshTask.id, {
+          expectedGeneration: begun.task.reviewDispatch.generation,
+        });
+      } catch (err) {
+        if (err instanceof DispatchTerminalError && begun.task.qaAgentId) {
+          await manager.failTaskForDispatchError(
+            freshTask.id,
+            'recheck',
+            begun.task.qaAgentId,
+            err,
+            { expectedReviewDispatch: begun.task.reviewDispatch },
+          );
+          return;
+        }
+        await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
+          phase: 'post-approve-provenance-redispatch-failed',
+          reason: verified.reason,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
-    if (!verified.ok) {
-      if (verified.reason === 'source scan incomplete') {
-        await scanFailedRetry(verified.reason);
-        return;
-      }
-      // pass 已被撤销/编辑（确定性失效）：拒绝迁移滞留 approved，交人工重派评审（spec §6 merge 条）
-      await emitIntervention(bus, freshTask.projectId, freshTask.agentId, freshTask.id, {
-        phase: 'post-approve-merge-skipped-provenance',
-        reason: verified.reason,
-      });
-      return;
+    return;
+  }
+  if (verified.pendingCount > 0 && !freshCompletion.pendingRedispatch) {
+    if (await manager.updatePostApproveCompletionIfToken(
+      freshTask.id,
+      signalToken,
+      { pendingRedispatch: true },
+      { expectedGeneration: gitEpisodeKey.generation, expectedHeadSha: gitEpisodeKey.headSha },
+    )) {
+      freshCompletion = { ...freshCompletion, pendingRedispatch: true };
     }
-    if (verified.pendingCount > 0 && !freshCompletion.pendingRedispatch) {
-      if (await manager.updatePostApproveCompletionIfToken(freshTask.id, signalToken, { pendingRedispatch: true })) {
-        freshCompletion = { ...freshCompletion, pendingRedispatch: true };
-      }
-    } else if (verified.pendingCount === 0 && freshCompletion.pendingRedispatch) {
-      // 权威扫描为空即清 stale pending：dev 已在本轮内补齐 ack，不再白派一轮
-      if (await manager.updatePostApproveCompletionIfToken(freshTask.id, signalToken, { pendingRedispatch: false })) {
-        freshCompletion = { ...freshCompletion, pendingRedispatch: false };
-      }
+  } else if (verified.pendingCount === 0 && freshCompletion.pendingRedispatch) {
+    if (await manager.updatePostApproveCompletionIfToken(
+      freshTask.id,
+      signalToken,
+      { pendingRedispatch: false },
+      { expectedGeneration: gitEpisodeKey.generation, expectedHeadSha: gitEpisodeKey.headSha },
+    )) {
+      freshCompletion = { ...freshCompletion, pendingRedispatch: false };
     }
   }
-  // A pending flag landing between the check and the transition re-enters here instead of losing the feedback.
   for (;;) {
     if (freshCompletion.pendingRedispatch) {
       const nextCount = (freshCompletion.redispatchCount ?? 0) + 1;
       if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
         const revoked = await manager.revokePostApproveCompletion(freshTask.id, 'redispatch-cap', {
           expectedToken: freshCompletion.token,
+          expectedGeneration: gitEpisodeKey.generation,
+          expectedHeadSha: gitEpisodeKey.headSha,
         });
         if (!revoked) {
           // The pass rotated after the entry re-validation; this merge-ready and its cap decision are stale.
@@ -372,7 +443,7 @@ async function handlePrMergeReady(
         });
         return;
       }
-      await dispatchDevPostApproveCheck(
+      await dispatchGitDevPostApproveCheck(
         bus,
         manager,
         freshTask,
@@ -382,7 +453,10 @@ async function handlePrMergeReady(
       return;
     }
 
-    const completed = await manager.completeApprovedPassToMergeReady(freshTask.id, signalToken);
+    const completed = await manager.completeApprovedPassToMergeReady(
+      freshTask.id,
+      gitEpisodeKey,
+    );
     if ('task' in completed) return;
     if (completed.refused === 'pending') {
       const latest = await manager.getPostApproveCompletion(freshTask.id);
@@ -405,167 +479,60 @@ async function handlePrFeedback(
 ): Promise<void> {
   const taskId = event.taskId!;
   const taskNow = await manager.getTask(taskId);
-  if (!taskNow) return;
-  const eventPrNumber = event.data.prNumber as number | undefined;
-  const eventPrUrl = event.data.prUrl as string | undefined;
-  const eventKind = event.data.kind as string | undefined;
-  const isNewFeedback = eventKind === 'comment' || eventKind === 'review-comment';
-  const revision = taskNow.reviewMode === 'git' && isRecord(event.data.revision)
-    ? event.data.revision as { sourceKey: string; id: string; bodyDigest: string; versionTime?: number }
-    : undefined;
-  const revisionKey = revision ? ackRevisionKey(revision.sourceKey, revision.id, revision.bodyDigest) : undefined;
-  const revisionTime = typeof revision?.versionTime === 'number' ? revision.versionTime : Date.parse(event.timestamp);
-  // 消费幂等（spec §6）：ledger 落盘前崩溃的重投在此收敛，redispatch 计数不重复生效
-  if (revisionKey !== undefined && taskNow.consumedFeedback?.[revisionKey] !== undefined) return;
-  const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
-    ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
-    ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
-  };
-  // 消费与效果由 manager 的单一锁内状态机决定（spec §6）：merge-ready→退回+pending、approved→
-  // pending、其它→仅消费——入口快照与提交之间的并发迁移（completeApprovedPass 等）不再能让
-  // revision 既被 poller 记 delivered 又不产生效果
-  if (taskNow.reviewMode === 'git' && isNewFeedback && revisionKey !== undefined) {
-    const outcome = await manager.consumeGitFeedbackRevision(
-      taskId,
-      { key: revisionKey, versionTime: revisionTime },
-      { feedbackAt: event.timestamp },
-    );
-    if (outcome.kind !== 'pending' && outcome.kind !== 'returned') return;
-    const effected = outcome.task;
-    const completion = await manager.getPostApproveCompletion(effected.id);
-    const devState = await manager.getAgentState(effected.agentId);
-    if (outcome.kind === 'pending' && completion !== null && devState?.taskId === effected.id) {
-      // 在途 pass 会经 merge-ready 循环消化 pending；无 completion 的 durable pending 由下方补派
-      return;
-    }
-    const nextCount = (effected.redispatchCount ?? completion?.redispatchCount ?? 0) + 1;
-    if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-      await manager.revokePostApproveCompletion(effected.id, 'redispatch-cap');
-      await emitIntervention(bus, effected.projectId, effected.agentId, effected.id, {
-        phase: 'post-approve-redispatch-cap-exceeded',
-        redispatchCount: effected.redispatchCount ?? 0,
-        cap: POST_APPROVE_REDISPATCH_CAP,
-      });
-      return;
-    }
-    const approvedHead = effected.postApproveHeadSha ?? validHeadSha(effected.latestHeadSha);
-    if (!approvedHead) {
-      await emitIntervention(bus, effected.projectId, effected.agentId, effected.id, {
-        phase: 'post-approve-approved-head-unavailable',
-      });
-      return;
-    }
-    await dispatchDevPostApproveCheck(bus, manager, effected, approvedHead, { redispatchCount: nextCount });
+  if (!taskNow || taskNow.reviewMode !== 'git') return;
+  const revision = parseGitFeedbackRevision(event.data.revision);
+  if (!revision) {
+    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+      phase: 'git-feedback-revision-invalid',
+    });
     return;
   }
-  const taskPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'prFeedbackReceivedAt'>> = {
-    ...prPatch,
-    ...(isNewFeedback ? { prFeedbackReceivedAt: event.timestamp } : {}),
-  };
-  const needsPatch =
-    (eventPrNumber !== undefined && eventPrNumber !== taskNow.prNumber)
-    || (eventPrUrl !== undefined && eventPrUrl !== taskNow.prUrl)
-    || isNewFeedback;
-  if (needsPatch) {
-    await manager.updateTask(taskId, taskPatch);
+  const revisionKey = ackRevisionKey(revision.sourceKey, revision.id, revision.bodyDigest);
+  if (taskNow.consumedFeedback?.[revisionKey] !== undefined) return;
+  const revisionTime = revision.versionTime ?? Date.parse(event.timestamp);
+  const outcome = await manager.consumeGitFeedbackRevision(
+    taskId,
+    { key: revisionKey, versionTime: revisionTime },
+    { feedbackAt: event.timestamp },
+  );
+  if (outcome.kind !== 'pending' && outcome.kind !== 'returned') return;
+  const effected = outcome.task;
+  const completion = await manager.getPostApproveCompletion(effected.id);
+  const devState = await manager.getAgentState(effected.agentId);
+  if (outcome.kind === 'pending' && completion !== null && devState?.taskId === effected.id) return;
+  const nextCount = (effected.redispatchCount ?? completion?.redispatchCount ?? 0) + 1;
+  if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
+    const key = postApproveEpisodeKey(effected);
+    await manager.revokePostApproveCompletion(effected.id, 'redispatch-cap', key
+      ? {
+          expectedToken: key.token,
+          expectedGeneration: key.generation,
+          expectedHeadSha: key.headSha,
+        }
+      : {});
+    await emitIntervention(bus, effected.projectId, effected.agentId, effected.id, {
+      phase: 'post-approve-redispatch-cap-exceeded',
+      redispatchCount: effected.redispatchCount ?? 0,
+      cap: POST_APPROVE_REDISPATCH_CAP,
+    });
+    return;
   }
-  if (taskNow.status !== 'approved') return;
-  if (!isNewFeedback) return;
-
-  let completion = await manager.getPostApproveCompletion(taskNow.id);
-  if (!completion) {
-    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
+  const approvedHead = effected.postApproveHeadSha ?? validHeadSha(effected.latestHeadSha);
+  if (!approvedHead) {
+    await emitIntervention(bus, effected.projectId, effected.agentId, effected.id, {
       phase: 'post-approve-approved-head-unavailable',
     });
     return;
   }
-  // Rotated successors are installed under a head CAS, so only the entry snapshot needs this proof.
-  if (
-    taskNow.postApproveHeadSha === undefined
-    || completion.approvedHeadSha !== taskNow.postApproveHeadSha
-  ) {
-    await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-      phase: 'post-approve-completion-episode-mismatch',
-    });
-    return;
-  }
-  // Every CAS miss below means the completion rotated mid-flight; re-decide against the live pass so the feedback is never dropped.
-  for (;;) {
-    const devState = await manager.getAgentState(taskNow.agentId);
-    if (devState?.taskId === taskNow.id) {
-      if (completion.pendingRedispatch) {
-        // pending 已立不改效果，但本条 revision 的消费键仍须落盘：崩溃后重投不得再计一轮
-        if (revisionKey !== undefined) {
-          await manager.updatePostApproveCompletionIfToken(taskNow.id, completion.token, {},
-            { consumeRevision: { key: revisionKey, versionTime: revisionTime } });
-        }
-        const fresh = await manager.getPostApproveCompletion(taskNow.id);
-        // Same token: the pending mark is already on the live pass.
-        if (!fresh || fresh.token === completion.token) return;
-        completion = fresh;
-        continue;
-      }
-      if (await manager.updatePostApproveCompletionIfToken(taskNow.id, completion.token, {
-        pendingRedispatch: true,
-      }, revisionKey !== undefined ? { consumeRevision: { key: revisionKey, versionTime: revisionTime } } : {})) return;
-      const fresh = await manager.getPostApproveCompletion(taskNow.id);
-      // Same token: refused in place (revoked marker) — the successor fixing flow owns this feedback.
-      if (!fresh || fresh.token === completion.token) return;
-      completion = fresh;
-      continue;
-    }
-    if (taskNow.reviewMode === 'git' && revisionKey !== undefined) {
-      if (await manager.updatePostApproveCompletionIfToken(taskNow.id, completion.token, {
-        pendingRedispatch: true,
-      }, { consumeRevision: { key: revisionKey, versionTime: revisionTime } })) {
-        completion = { ...completion, pendingRedispatch: true };
-      } else {
-        const fresh = await manager.getPostApproveCompletion(taskNow.id);
-        if (!fresh || fresh.token === completion.token) return;
-        completion = fresh;
-        continue;
-      }
-    }
-    const nextCount = (completion.redispatchCount ?? 0) + 1;
-    if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-      const revoked = await manager.revokePostApproveCompletion(taskNow.id, 'redispatch-cap', {
-        expectedToken: completion.token,
-      });
-      if (!revoked) {
-        const fresh = await manager.getPostApproveCompletion(taskNow.id);
-        if (!fresh || fresh.token === completion.token) return;
-        completion = fresh;
-        continue;
-      }
-      await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
-        phase: 'post-approve-redispatch-cap-exceeded',
-        redispatchCount: completion.redispatchCount ?? 0,
-        cap: POST_APPROVE_REDISPATCH_CAP,
-      });
-      return;
-    }
-    const ready = await gateDevForPostApproveRedispatch(bus, manager, taskNow);
-    if (!ready) return;
-    await dispatchDevPostApproveCheck(
-      bus,
-      manager,
-      { ...taskNow, ...taskPatch },
-      completion.approvedHeadSha,
-      { redispatchCount: nextCount },
-    );
-    return;
-  }
+  await dispatchGitDevPostApproveCheck(bus, manager, effected, approvedHead, { redispatchCount: nextCount });
 }
 
-// 恢复期消费 durable pendingRedispatch（spec §6 至少一次）：merge-ready 退回或 path C 的 CAS
-// 落盘后、派发前崩溃的残局在此补派；dev 仍绑定任务时不派（其在途 pass 的 merge-ready 循环接手）。
 export async function recoverGitPostApprovePending(bus: EventBus, manager: AgentManager): Promise<void> {
   const tasks = await manager.listActiveGitTasks();
   for (const task of tasks) {
     try {
       await recoverOneGitPendingTask(bus, manager, task);
     } catch (err) {
-      // 单任务失败不得饿死其后的 durable pending（至少一次）：报告并继续
       console.warn(`[EventHandler] recoverGitPostApprovePending: task=${task.id} failed, continuing:`, err);
       await emitIntervention(bus, task.projectId, task.agentId, task.id, {
         phase: 'post-approve-recovery-failed',
@@ -577,59 +544,68 @@ export async function recoverGitPostApprovePending(bus: EventBus, manager: Agent
 
 async function recoverOneGitPendingTask(bus: EventBus, manager: AgentManager, task: TaskState): Promise<void> {
   {
-    if (task.status !== 'approved' || task.pendingRedispatch !== true) return;
-    if (task.postApproveRevoked) return;
-    if (task.postApprovePhase === 'delivered') {
-      const devState = await manager.getAgentState(task.agentId);
-      if (devState?.taskId === task.id) {
-        // prompt 已送达且尚未回信号（dev 在跑）：补派会向运行中的会话注入第二个 prompt 并轮换
-        // token——只重臂 watcher 等信号，pending 由 merge-ready 循环消化
-        await manager.rearmPostApproveSignal(task.id).catch(() => false);
+    const live = await manager.getTask(task.id);
+    if (!live || live.reviewMode !== 'git' || live.status !== 'approved' || live.pendingRedispatch !== true) return;
+    if (live.postApproveRevoked) return;
+    const updatedAt = Date.parse(live.updatedAt);
+    if (!Number.isFinite(updatedAt)) {
+      if (unparseableUpdatedAtWarned.get(live.id) !== live.updatedAt) {
+        unparseableUpdatedAtWarned.set(live.id, live.updatedAt);
+        console.warn(
+          `[EventHandler] recoverGitPostApprovePending: task=${live.id} updatedAt unparseable, skipping recovery:`,
+          live.updatedAt,
+        );
+      }
+      return;
+    }
+    unparseableUpdatedAtWarned.delete(live.id);
+    if (Date.now() - updatedAt < POST_APPROVE_RECOVERY_MIN_AGE_MS) return;
+    if (live.postApprovePhase === 'delivered') {
+      const devState = await manager.getAgentState(live.agentId);
+      if (devState?.taskId === live.id) {
+        const rearmed = await manager.rearmPostApproveSignal(live.id);
+        if (!rearmed) {
+          const fresh = await manager.getTask(live.id);
+          if (fresh?.status === 'approved'
+            && fresh.pendingRedispatch === true
+            && fresh.postApprovePhase === 'delivered'
+            && fresh.postApproveGeneration === live.postApproveGeneration
+            && fresh.postApproveToken === live.postApproveToken) {
+            throw new Error(`post-approve signal re-arm refused for active task ${live.id}`);
+          }
+        }
         return;
       }
     }
-    const approvedHead = validHeadSha(task.postApproveHeadSha ?? task.latestHeadSha);
+    const approvedHead = validHeadSha(live.postApproveHeadSha ?? live.latestHeadSha);
     if (!approvedHead) {
-      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      await emitIntervention(bus, live.projectId, live.agentId, live.id, {
         phase: 'post-approve-approved-head-unavailable',
       });
       return;
     }
-    const nextCount = (task.redispatchCount ?? 0) + 1;
+    const nextCount = (live.redispatchCount ?? 0) + 1;
     if (nextCount > POST_APPROVE_REDISPATCH_CAP) {
-      await manager.revokePostApproveCompletion(task.id, 'redispatch-cap');
-      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+      const key = postApproveEpisodeKey(live);
+      await manager.revokePostApproveCompletion(live.id, 'redispatch-cap', key
+        ? {
+            expectedToken: key.token,
+            expectedGeneration: key.generation,
+            expectedHeadSha: key.headSha,
+          }
+        : {});
+      await emitIntervention(bus, live.projectId, live.agentId, live.id, {
         phase: 'post-approve-redispatch-cap-exceeded',
-        redispatchCount: task.redispatchCount ?? 0,
+        redispatchCount: live.redispatchCount ?? 0,
         cap: POST_APPROVE_REDISPATCH_CAP,
       });
       return;
     }
-    await dispatchDevPostApproveCheck(bus, manager, task, approvedHead, { redispatchCount: nextCount });
+    await dispatchGitDevPostApproveCheck(bus, manager, live, approvedHead, {
+      redispatchCount: nextCount,
+      expectedEpisode: postApproveEpisodeKey(live) ?? undefined,
+    });
   }
-}
-
-async function releaseQaAfterSkippedRollback(
-  manager: AgentManager,
-  taskId: string,
-  qaId: string,
-  logPrefix: string,
-  ownAcquire: { expectedLockToken?: string } = {},
-): Promise<void> {
-  const now = await manager.getTask(taskId);
-  if (now && !TASK_TERMINAL_STATUS_SET.has(now.status)) {
-    // pass 被并发接管：QA 已被接管方 re-acquire，释放会误清其绑定；
-    // 但本次派发的 arm 可能已顶掉接管方的 watcher（start 先 stop 同 task 旧 watcher），按当前 pass 重建
-    console.warn(`${logPrefix} rollback skipped for task=${taskId}: pass superseded`);
-    await manager.rearmPhaseSignalForCurrentPass(taskId);
-    return;
-  }
-  // 终态/已删：没有接管方持有这只 QA，而 cancel 清理可能没见到刚写入的 qaAgentId。
-  // 仍钉住本次 acquire 世代——本 handler 的每一条失败释放都只清自己那一代
-  await manager.releaseAgentForTask(qaId, taskId, 'idle', ownAcquire).catch(err => {
-    console.error(`${logPrefix} releaseAgentForTask(QA=${qaId}) after terminal-skip rollback failed:`, err);
-    return false;
-  });
 }
 
 async function handlePrCodePush(
@@ -638,321 +614,91 @@ async function handlePrCodePush(
   event: BaxianEvent,
 ): Promise<void> {
   const taskId = event.taskId!;
-  const agentId = event.agentId!;
   const eventPrNumber = event.data.prNumber as number | undefined;
   const eventPrUrl = event.data.prUrl as string | undefined;
   const eventKind = event.data.kind as string | undefined;
   const eventHeadSha = validHeadSha(event.data.headSha);
-  // 合成 push 的触发信号已被消费但仍留在 pane，失败回滚重建 pr-fixed watcher 时跳过快照，否则立即重放成循环
-  const rearmSkipSnapshot = event.data.source === 'pr-fixed';
-  const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl' | 'latestHeadSha'>> = {
-    ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
-    ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
-    ...(eventKind === 'push' && eventHeadSha ? { latestHeadSha: eventHeadSha } : {}),
-  };
-
-  const taskBeforeTransition = await manager.getTask(taskId);
-  if (!taskBeforeTransition) return;
-  // 'git' push 重投收敛（spec §6 生命周期幂等）：同 head 的评审轮已派发过，重放在任何后继态
-  // 都是有害动作（QA 释放/令牌轮换/计轮/撤销 approval），恰一次由 TaskState 锚判定。
-  // pr-fixed 合成 push 豁免——no-code fix 的 recheck 派发正是靠同 head 重入（spec §7 同 head 复检）。
-  if (taskBeforeTransition.reviewMode === 'git' && eventKind === 'push' && eventHeadSha
+  const task = await manager.getTask(taskId);
+  if (!task || task.reviewMode !== 'git') return;
+  if (eventKind === 'push' && eventHeadSha
     && event.data.source !== 'pr-fixed'
-    && taskBeforeTransition.reviewDispatchPending !== true
-    && taskBeforeTransition.latestHeadSha === eventHeadSha
-    && taskBeforeTransition.reviewHeadAnchorSha === eventHeadSha) {
+    && task.reviewDispatch === undefined
+    && task.latestHeadSha === eventHeadSha
+    && task.reviewHeadAnchorSha === eventHeadSha) {
     return;
   }
-  const willHavePrNumber =
-    taskBeforeTransition.prNumber !== undefined || eventPrNumber !== undefined;
-  if (taskBeforeTransition.status === 'in_progress' && !willHavePrNumber) {
+  if (task.status === 'in_progress' && task.prNumber === undefined && eventPrNumber === undefined) {
     console.warn(
-      `[EventHandler] pr.updated: task ${taskId} in_progress but neither task nor event has prNumber; ` +
-      `deferring catch-up`,
+      `[EventHandler] pr.updated: task ${taskId} in_progress but neither task nor event has prNumber; deferring catch-up`,
     );
     return;
   }
+  if (!PR_UPDATED_REVIEW_FROM_STATUSES.includes(task.status)) return;
+  let reviewHead = eventHeadSha ?? validHeadSha(task.latestHeadSha);
+  const prNumber = eventPrNumber ?? task.prNumber;
+  if (reviewHead === undefined && prNumber !== undefined) {
+    const verified = await manager.platformVerifyPrBinding(taskId, prNumber);
+    if (verified.ok) reviewHead = validHeadSha(verified.headSha);
+  }
+  if (reviewHead === undefined) {
+    await emitIntervention(bus, task.projectId, task.agentId, taskId, {
+      phase: 'git-review-head-unavailable',
+    });
+    return;
+  }
 
-  const anchorAtDispatch = eventHeadSha ?? validHeadSha(taskBeforeTransition.latestHeadSha);
-  const result = await manager.transitionTaskStatus(
-    taskId,
-    'review',
-    { fromStatus: ['in_progress', 'fixing', 'review', 'approved', 'merge-ready'] },
-    {
-      ...prPatch,
-      ...(anchorAtDispatch ? { reviewHeadAnchorSha: anchorAtDispatch } : {}),
-      reviewDispatchedAt: new Date().toISOString(),
-      signalToken: createSignalToken(),
-      // 这些起点的轮次在 prompt 确认送达后才计（consumeReviewRoundIntent）；持久化「未计」意图，
-      // 供 busy pending/可恢复 hold/进程重启后的任何补派方恰好补计一次
-      reviewRoundPending: (taskBeforeTransition.status === 'in_progress'
-        || taskBeforeTransition.status === 'approved'
-        || taskBeforeTransition.status === 'merge-ready') ? true
-        : (taskBeforeTransition.status === 'review' ? taskBeforeTransition.reviewRoundPending : undefined),
-      // pair 与新轮可见性原子（spec §7）：transition 后到 rotate 的窗口内旧 pair 不得授权本轮
-      ...(taskBeforeTransition.reviewMode === 'git'
-        ? { ...manager.mintReviewTokenPair(), reviewDispatchPending: true }
-        : {}),
+  const bumpRound = task.status === 'in_progress'
+    || task.status === 'approved'
+    || task.status === 'merge-ready'
+    || (task.status === 'review' && task.reviewRoundPending === true);
+  const begun = await manager.beginGitReviewPass(taskId, {
+    fromStatus: [task.status],
+    headSha: reviewHead,
+    bumpRound,
+    expectPhase: task.phase,
+    expectSignalToken: task.signalToken,
+    patch: {
+      ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+      ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+      latestHeadSha: reviewHead,
     },
-  );
-  if (!result) return;
-  const { task: transitioned, previousStatus } = result;
-  await manager.clearPostApproveCompletion(transitioned.id);
-
-  let devAlreadyWaiting = false;
-  if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
-    devAlreadyWaiting = await manager
-      .releaseAgentForTask(transitioned.agentId, transitioned.id, 'waiting')
-      .catch(err => {
-        console.error(
-          `[EventHandler] pr.updated releaseAgentForTask(dev=${transitioned.agentId}) before approved→recheck failed:`,
-          err,
-        );
-        return false;
-      });
-    if (!devAlreadyWaiting) {
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'post-approve-dev-wait-gate-failed-before-recheck',
-        devAgentId: transitioned.agentId,
-      });
-      return;
-    }
-  }
-
-  // review 起点且首评从未送达（round=0 + 未计轮 intent 在场）仍是首评：不得换成 recheck prompt/skill
-  const deferredFirstReview = previousStatus === 'review'
-    && taskBeforeTransition.reviewRound === 0
-    && taskBeforeTransition.reviewRoundPending === true;
-  const qaPhase: 'review' | 'recheck' =
-    previousStatus === 'in_progress' || deferredFirstReview ? 'review' : 'recheck';
-
-  if (previousStatus === 'review' && transitioned.qaAgentId) {
-    const released = await manager
-      .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { deferWhenBusy: true })
-      .catch(err => {
-        console.error(
-          `[EventHandler] pr.updated releaseAgentForTask(QA=${transitioned.qaAgentId}) for review→review push failed:`,
-          err,
-        );
-        return false;
-      });
-    if (!released) {
-      // 忙碌拒绝的形状：QA 仍绑定本任务且未落 hold（release 对 REPL 忙碌不再写 hold）。
-      // 这是「欠一次投递」而非故障：登记 pending，由对账在 pane 空闲后按标准入口补派
-      const qaAfter = await manager.getAgentState(transitioned.qaAgentId).catch(() => null);
-      const deferrable = qaAfter?.taskId === transitioned.id && qaAfter.status !== 'awaiting_human';
-      if (deferrable && transitioned.signalToken !== undefined) {
-        manager.registerPendingDispatchRetry(transitioned.id, {
-          kind: 'qa-recheck',
-          agentId: transitioned.qaAgentId,
-          signalToken: transitioned.signalToken,
-          qaPhase,
-        });
-        console.warn(
-          `[EventHandler] pr.updated QA ${qaPhase} deferred for task=${transitioned.id}: QA still busy on the ` +
-          `previous turn; reconciler will redispatch when idle`,
-        );
-        return;
-      }
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-release-failed-cannot-recheck',
-        qaAgentId: transitioned.qaAgentId,
-      });
-      return;
-    }
-  }
-
-  const qaId = transitioned.qaAgentId;
-  if (!qaId) {
-    if (!devAlreadyWaiting && !(await manager.markAgentWaiting(agentId, transitioned.id))) {
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'dev-wait-gate-failed-no-qa',
-      });
-    }
-    return;
-  }
-  const qa = manager.getAgentConfig(qaId);
-  if (!qa || qa.role !== 'qa') {
-    if (!devAlreadyWaiting) await manager.markAgentWaiting(agentId, transitioned.id).catch(() => false);
-    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-      phase: 'qa-config-missing',
-      qaAgentId: qaId,
-    });
-    return;
-  }
-
-  // 锁代由 acquire 原子交出（事后重读只会读到 successor 的代）：派发放弃时只释放自己这一代，
-  // successor 若已重新 acquire 同一 QA（同 task 同 agent，绕过 release 的 taskId 校验）不得被误清
-  let ownLockToken: string | undefined;
-  const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, qaPhase, {
-    onAcquired: (lockToken) => { ownLockToken = lockToken; },
   });
-  if (!acquired) {
-    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-      phase: 'qa-acquire-failed',
-      qaAgentId: qa.id,
-      qaPhase,
-    });
-    return;
-  }
-  const ownAcquire = ownLockToken !== undefined ? { expectedLockToken: ownLockToken } : {};
-
-  const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
-    transitioned.id,
-    qa.id,
-    ['pr-approved', 'pr-changes-requested'] as const,
-  );
-  if (!armed) {
-    console.warn(
-      `[EventHandler] pr.updated verdict watcher failed to arm for task=${transitioned.id} (${qaPhase}); rolling back recheck dispatch`,
-    );
-    if (previousStatus === 'in_progress' || previousStatus === 'fixing'
-      || (previousStatus === 'review' && taskBeforeTransition.reviewMode === 'git')) {
-      const rolledBack = await manager.rollbackVerdictArmFailure(transitioned.id, {
-        status: previousStatus,
-        signalToken: taskBeforeTransition.signalToken,
-        reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
-        reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
-        // git 回滚保留 durable pending 供 sweep 重试：计轮 intent 必须同持（transition 写入值），
-        // 否则最终送达的首评按 stale intent 少计一轮
-        reviewRoundPending: taskBeforeTransition.reviewMode === 'git'
-          ? transitioned.reviewRoundPending
-          : taskBeforeTransition.reviewRoundPending,
-        ...(taskBeforeTransition.reviewMode === 'git'
-          ? { restorePair: true, passToken: taskBeforeTransition.passToken, failToken: taskBeforeTransition.failToken }
-          : {}),
-      }, { expect: { status: 'review', signalToken: dispatchToken }, rearmSkipSnapshot });
-      if (!rolledBack) {
-        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated arm-failure', ownAcquire);
-        return;
-      }
+  if (!begun?.task.reviewDispatch) {
+    const current = await manager.getTask(taskId);
+    if (current?.reviewDispatch?.phase === 'uncertain') {
+      const qaPhase = current.reviewDispatch.qaPhase;
+      await emitIntervention(bus, current.projectId, current.agentId, taskId, {
+        phase: 'git-review-dispatch-uncertain',
+        qaPhase,
+        headSha: reviewHead,
+      });
     }
-    await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire).catch(err => {
-      console.error(`[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
-      return false;
-    });
-    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-      phase: previousStatus === 'approved' || previousStatus === 'merge-ready' ? 'qa-recheck-arm-failed-after-approved-push' : 'qa-recheck-arm-failed',
-      qaAgentId: qa.id,
-      qaPhase,
-    });
     return;
   }
-  let started = false;
-  let dispatchErr: unknown = null;
+  const qaPhase = begun.task.reviewDispatch.qaPhase;
   try {
-    started = await manager.startSession(transitioned.id, qa.id, qaPhase, {
-      dispatchPassToken: dispatchToken,
+    await manager.dispatchGitReviewLease(taskId, {
+      expectedGeneration: begun.task.reviewDispatch.generation,
     });
   } catch (err) {
-    dispatchErr = err;
-    console.error(
-      `[EventHandler] pr.updated startSession(QA=${qa.id}, ${qaPhase}) hard error:`,
-      err,
-    );
-  }
-  if (!started) {
-    console.warn(
-      `[EventHandler] pr.updated QA ${qaPhase} not started; previousStatus=${previousStatus}`,
-    );
-    if (dispatchErr instanceof DispatchTerminalError) {
-      await manager.failTaskForDispatchError(transitioned.id, qaPhase, qa.id, dispatchErr);
-    } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.busyPending) {
-      // 遇忙不是故障：pass 保持 armed、QA 保持绑定，pending 登记已在 startSession 内完成，交对账补派
-      console.warn(
-        `[EventHandler] pr.updated QA ${qaPhase} deferred for task=${transitioned.id}: QA pane busy; ` +
-        `reconciler will redispatch when idle`,
-      );
-    } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
-      // handled 不止代表可恢复派发 hold（checkout-cleanup-failed / dialog 等也走这里），指引须按实际相位分流
-      const qaState = await manager.getAgentState(qa.id).catch((stateErr: unknown) => {
-        console.warn(`[EventHandler] pr.updated could not read held QA state for ${qa.id}:`, stateErr);
-        return null;
-      });
-      const heldPhase = qaState?.status === 'awaiting_human' ? qaState.awaitingPhase : undefined;
-      const note = isRecoverableQaDispatchHold(qaState)
-        ? 'QA dispatch was held awaiting human; the task keeps the rotated review pass. Resume the QA agent or POST /tasks/:id/review to redispatch.'
-        : `QA dispatch was held awaiting human (${heldPhase ?? 'hold not persisted'}); this hold is not auto-redispatchable — inspect the QA agent's awaiting reason, resolve it, then redispatch via POST /tasks/:id/review.`;
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-dispatch-held-awaiting-human',
-        qaAgentId: qa.id,
+    console.error(`[EventHandler] pr.updated git review dispatch failed for task=${taskId}:`, err);
+    if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') {
+      await emitIntervention(bus, begun.task.projectId, begun.task.agentId, taskId, {
+        phase: 'git-review-dispatch-uncertain',
         qaPhase,
-        ...(heldPhase !== undefined ? { awaitingPhase: heldPhase } : {}),
-        note,
+        error: err.message,
       });
-    } else if (previousStatus === 'in_progress' || previousStatus === 'fixing'
-      || (previousStatus === 'review' && taskBeforeTransition.reviewMode === 'git')) {
-      // 仅回滚 status 会留下 transition 轮换后的 token，dev 在途 pass 的完成信号将永久失配；
-      // startSession 窗口内 pass 可能已被并发接管，此时回滚与 QA 释放都要让位于接管方
-      const rolledBack = await manager.rollbackVerdictArmFailure(transitioned.id, {
-        status: previousStatus,
-        signalToken: taskBeforeTransition.signalToken,
-        reviewHeadAnchorSha: taskBeforeTransition.reviewHeadAnchorSha,
-        reviewDispatchedAt: taskBeforeTransition.reviewDispatchedAt,
-        // git 保留 durable pending 即保留计轮 intent（同 arm-failure 站点）
-        reviewRoundPending: taskBeforeTransition.reviewMode === 'git'
-          ? transitioned.reviewRoundPending
-          : taskBeforeTransition.reviewRoundPending,
-        ...(taskBeforeTransition.reviewMode === 'git'
-          ? { restorePair: true, passToken: taskBeforeTransition.passToken, failToken: taskBeforeTransition.failToken }
-          : {}),
-      }, { expect: { status: 'review', signalToken: dispatchToken }, rearmSkipSnapshot });
-      if (rolledBack) {
-        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire)
-          .catch(err => {
-            console.error(
-              `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
-              err,
-            );
-            return false;
-          });
-      } else {
-        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.updated recheck', ownAcquire);
-      }
+    } else if (err instanceof DispatchTerminalError && begun.task.qaAgentId) {
+      await manager.failTaskForDispatchError(taskId, qaPhase, begun.task.qaAgentId, err, {
+        expectedReviewDispatch: begun.task.reviewDispatch,
+      });
     } else {
-      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire)
-        .catch(err => {
-          console.error(
-            `[EventHandler] pr.updated releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
-            err,
-          );
-          return false;
-        });
-      if (previousStatus === 'approved' || previousStatus === 'merge-ready') {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'qa-recheck-failed-after-approved-push',
-          qaAgentId: qa.id,
-        });
-      } else {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'qa-recheck-failed-after-stop',
-          qaAgentId: qa.id,
-        });
-      }
+      await emitIntervention(bus, begun.task.projectId, begun.task.agentId, taskId, {
+        phase: 'git-review-dispatch-failed',
+        qaPhase,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
-    return;
-  }
-
-  if (taskBeforeTransition.reviewMode === 'git') {
-    await manager.clearReviewDispatchPending(transitioned.id, dispatchToken);
-  }
-  // 送达确认后按本次 pass CAS 消费未计轮 intent：flag 本身已编码「哪些起点开新轮」
-  // （review→review 的既计轮 recheck 无 flag 即天然 no-op），successor 换代则留给它自己消费
-  await manager.consumeReviewRoundIntent(transitioned.id, dispatchToken);
-
-  const ok = devAlreadyWaiting || (await manager.markAgentWaiting(agentId, transitioned.id));
-  if (!ok) {
-    await manager.markAwaitingHuman(
-      qa.id,
-      'dev-wait-gate-failed-after-qa-started',
-      `QA review for task ${transitioned.id} started but dev wait-gate failed; QA prompt may still be running, needs operator decision.`,
-      { expectedTaskId: transitioned.id },
-    ).catch(err => {
-      console.error(
-        `[EventHandler] pr.updated markAwaitingHuman(QA=${qa.id}) after dev-wait-gate-fail:`,
-        err,
-      );
-    });
   }
 }
 
@@ -987,6 +733,7 @@ async function redispatchReviewForStaleVerdict(
     await manager.dispatchReviewToQa(task.id, {
       fromStatus: ['review'],
       bumpRound: task.reviewRoundPending === true,
+      expectPhase: task.phase,
       expectSignalToken: task.signalToken,
       ...(qaPhase !== undefined ? { qaPhase } : {}),
     });
@@ -1007,74 +754,40 @@ async function handleReviewApproval(
   bus: EventBus,
   manager: AgentManager,
   task: TaskState,
-  reviewedHeadSha: string | undefined,
-  currentHeadSha: string | undefined,
+  reviewedHeadSha: string,
+  currentHeadSha: string,
   prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>>,
-  gitVerdict?: { token: string; carrier: { sourceKey: string; id: string; bodyDigest: string } },
+  gitVerdict: GitVerdictPayload,
 ): Promise<void> {
-  if (!reviewedHeadSha) {
-    await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-      phase: 'approval-reviewed-head-unavailable',
-    });
-    return;
-  }
-
-  // 'git' 载荷已经 engine 端 fresh prView 复核（spec §7 handler 收紧）：二次解析的缓存回退
-  // 链会重新打开 engine 已关闭的竞态，跳过
-  const anchor = task.reviewMode === 'git'
-    ? { headSha: currentHeadSha ?? reviewedHeadSha, source: 'payload-self' as const }
-    : await resolveAuthoritativeHead(manager, task, { payloadCurrentHeadSha: currentHeadSha });
-  // git 的 head 更新并入下方带 expectSignalToken 的 transition：入口校验后并发 push 换代时，
-  // 旧 verdict 的裸 updateTask 会把 successor 的 latestHeadSha 覆写回旧值
-  if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
-    await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
-  }
-  if (anchor.headSha && reviewedHeadSha !== anchor.headSha) {
+  if (reviewedHeadSha !== currentHeadSha) {
     await emitIntervention(bus, task.projectId, task.agentId, task.id, {
       phase: 'stale-approval-head-mismatch',
       reviewedHeadSha,
-      currentHeadSha: anchor.headSha,
-      source: anchor.source,
-      ...('fetchError' in anchor && anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
+      currentHeadSha,
+      source: 'payload-self',
     });
     return;
   }
 
-  const provenanceFields: Partial<TaskState> =
-    task.reviewMode === 'git' && gitVerdict !== undefined && task.failToken !== undefined
-      ? {
-          passProvenance: {
-            sourceKey: gitVerdict.carrier.sourceKey,
-            id: gitVerdict.carrier.id,
-            bodyDigest: gitVerdict.carrier.bodyDigest,
-            token: gitVerdict.token,
-            failToken: task.failToken,
-            anchorSha: reviewedHeadSha,
-          },
-        }
-      : {};
-  const result = await manager.transitionTaskStatus(
-    task.id,
-    'approved',
-    {
-      fromStatus: ['review'],
-      // 校验后提交前的并发换代（push/重派轮换 token+pair）使旧 APPROVE 失效（spec §7）
-      ...(task.reviewMode === 'git' ? { expectSignalToken: task.signalToken } : {}),
-    },
-    {
-      ...prPatch,
-      ...provenanceFields,
-      ...gitHeadPatch(task, anchor.headSha),
-      // 崩溃在「prompt 已送达、bump 未落盘」窗口时 pending 轮次由 verdict 消费补计
-      reviewRound: Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0)),
-      reviewRoundPending: undefined,
-      // verdict 即送达证据：durable pending 随 transition 原子消费，封死「送达后 verdict 抢先、
-      // startSession 的 clear 因 status/token 已变而拒绝」留下 stale 凭据的竞态
-      reviewDispatchPending: undefined,
-    },
-  );
-  if (!result) return;
-  const { task: transitioned } = result;
+  if (task.failToken === undefined || task.signalToken === undefined) return;
+  const provenance = {
+    sourceKey: gitVerdict.carrier.sourceKey,
+    id: gitVerdict.carrier.id,
+    bodyDigest: gitVerdict.carrier.bodyDigest,
+    token: gitVerdict.verdictToken,
+    failToken: task.failToken,
+    anchorSha: reviewedHeadSha,
+  };
+  const reviewedRound = Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0));
+  const transitioned = await manager.approveGitReviewPass(task.id, {
+    expectedSignalToken: task.signalToken,
+    headSha: reviewedHeadSha,
+    reviewRound: reviewedRound,
+    ...(prPatch.prNumber !== undefined ? { prNumber: prPatch.prNumber } : {}),
+    ...(prPatch.prUrl !== undefined ? { prUrl: prPatch.prUrl } : {}),
+    provenance,
+  });
+  if (!transitioned) return;
 
   manager.stopPhaseSignalWatcher(transitioned.id);
 
@@ -1088,11 +801,11 @@ async function handleReviewApproval(
       );
   }
 
-  await dispatchDevPostApproveCheck(bus, manager, transitioned, reviewedHeadSha);
+  await dispatchGitDevPostApproveCheck(bus, manager, transitioned, reviewedHeadSha);
 }
 
 function gitHeadPatch(task: TaskState, headSha: string | undefined): Partial<Pick<TaskState, 'latestHeadSha'>> {
-  return task.reviewMode === 'git' && headSha !== undefined && task.latestHeadSha !== headSha
+  return headSha !== undefined && task.latestHeadSha !== headSha
     ? { latestHeadSha: headSha }
     : {};
 }
@@ -1101,75 +814,22 @@ async function handleReviewRequestChanges(
   bus: EventBus,
   manager: AgentManager,
   task: TaskState,
-  reviewedHeadSha: string | undefined,
-  currentHeadSha: string | undefined,
+  reviewedHeadSha: string,
+  currentHeadSha: string,
   prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>>,
 ): Promise<void> {
-  const approvedCompletion = task.status === 'approved'
-    ? await manager.getPostApproveCompletion(task.id)
-    : null;
-  const anchor = task.reviewMode === 'git'
-    ? { headSha: currentHeadSha ?? reviewedHeadSha, source: 'payload-self' as const }
-    : await resolveAuthoritativeHead(manager, task, {
-        payloadCurrentHeadSha: currentHeadSha,
-        legacyFallback: approvedCompletion?.approvedHeadSha,
-      });
-  if (anchor.source === 'fetch' && anchor.headSha && task.latestHeadSha !== anchor.headSha) {
-    await manager.updateTask(task.id, { latestHeadSha: anchor.headSha });
-  }
-  if (reviewedHeadSha && anchor.headSha && reviewedHeadSha !== anchor.headSha) {
+  if (reviewedHeadSha !== currentHeadSha) {
     await emitIntervention(bus, task.projectId, task.agentId, task.id, {
       phase: 'stale-request-changes-head-mismatch',
       reviewedHeadSha,
-      currentHeadSha: anchor.headSha,
-      source: anchor.source,
-      ...('fetchError' in anchor && anchor.fetchError ? { fetchError: anchor.fetchError } : {}),
+      currentHeadSha,
+      source: 'payload-self',
     });
     return;
   }
 
   const reviewedRound = Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0));
   const nextRound = reviewedRound + 1;
-  if (task.status === 'approved' && nextRound <= manager.getConfig().review.rounds) {
-    const devState = await manager.getAgentState(task.agentId);
-    const postApproveActive = await manager.getPostApproveCompletion(task.id);
-    if (devState?.taskId === task.id && postApproveActive) {
-      let revoked = await manager.revokePostApproveCompletion(task.id, 'request-changes', {
-        expectedToken: postApproveActive.token,
-      });
-      if (!revoked) {
-        // Token rotation within the episode still gets blocked; a successor approved episode (fresh head) must not.
-        revoked = await manager.revokePostApproveCompletion(task.id, 'request-changes', {
-          expectedHeadSha: postApproveActive.approvedHeadSha,
-        });
-      }
-      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-        phase: 'request-changes-during-post-approve',
-        devAgentId: task.agentId,
-        note: revoked
-          ? 'Dev is still running post-approve check; fix dispatch deferred to avoid prompt collision. PostApproveCompletion cleared to block auto-merge. Operator: wait for post-approve signal to complete, then re-trigger REQUEST_CHANGES manually or cancel the task.'
-          : 'Dev is still running post-approve check and the task moved past the reviewed approved episode before the block could apply; the verdict belongs to a superseded pass. Re-trigger REQUEST_CHANGES if it still applies, or cancel the task.',
-      });
-      return;
-    }
-    const ready = await manager
-      .releaseAgentForTask(task.agentId, task.id, 'waiting')
-      .catch(err => {
-        console.error(
-          `[EventHandler] REQUEST_CHANGES releaseAgentForTask(dev=${task.agentId}) before fix failed:`,
-          err,
-        );
-        return false;
-      });
-    if (!ready) {
-      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-        phase: 'post-approve-dev-wait-gate-failed-before-fix',
-        devAgentId: task.agentId,
-      });
-      return;
-    }
-  }
-
   if (nextRound > manager.getConfig().review.rounds) {
     return handleMaxRounds(bus, manager, task, prPatch, reviewedRound);
   }
@@ -1178,26 +838,24 @@ async function handleReviewRequestChanges(
     task.id,
     'fixing',
     {
-      fromStatus: ['review', 'approved', 'merge-ready'],
-      // fail 方向同样按入口代际 CAS（spec §7）：await 窗口内 push/重派换代后旧 RC 不得推进新轮
-      ...(task.reviewMode === 'git' ? { expectSignalToken: task.signalToken } : {}),
+      fromStatus: ['review'],
+      expectSignalToken: task.signalToken,
     },
     {
       ...prPatch,
-      ...gitHeadPatch(task, anchor.headSha),
+      ...gitHeadPatch(task, currentHeadSha),
       reviewRound: nextRound,
       reviewRoundPending: undefined,
-      // verdict 即送达证据（同 APPROVE）：不消费会让 sweep 在 fixing 态按 stale pending 把任务拽回 review
-      reviewDispatchPending: undefined,
+      reviewDispatch: undefined,
       fixDispatchedAt: new Date().toISOString(),
     },
   );
   if (!result) return;
-  const { task: transitioned, previousStatus } = result;
+  const { task: transitioned } = result;
   await manager.clearPostApproveCompletion(transitioned.id);
   manager.stopPhaseSignalWatcher(transitioned.id);
 
-  if (previousStatus === 'review' && transitioned.qaAgentId) {
+  if (transitioned.qaAgentId) {
     const qaReleased = await manager
       .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
       .catch(err => {
@@ -1224,7 +882,12 @@ async function handleReviewRequestChanges(
     return;
   }
 
-  const { token: fixToken, armed } = await manager.rotateAndSetupPhaseSignal(transitioned.id, transitioned.agentId, 'pr-fixed');
+  const { token: fixToken, armed } = await manager.rotateAndSetupPhaseSignal(
+    transitioned.id,
+    transitioned.agentId,
+    'pr-fixed',
+    { expectedStatus: 'fixing', expectedToken: transitioned.signalToken },
+  );
 
   if (!armed) {
     console.warn(
@@ -1307,10 +970,15 @@ async function handleMaxRounds(
     task.id,
     'max_rounds',
     {
-      fromStatus: ['review', 'approved', 'merge-ready'],
-      ...(task.reviewMode === 'git' ? { expectSignalToken: task.signalToken } : {}),
+      fromStatus: ['review'],
+      expectSignalToken: task.signalToken,
     },
-    { ...prPatch, reviewRound: reviewedRound, reviewRoundPending: undefined, reviewDispatchPending: undefined },
+    {
+      ...prPatch,
+      reviewRound: reviewedRound,
+      reviewRoundPending: undefined,
+      reviewDispatch: undefined,
+    },
   );
   if (!result) return;
   const { task: transitioned } = result;
@@ -1354,21 +1022,30 @@ export function registerEventHandlers(
   bus.on('pr.created', async (event) => {
     if (!event.taskId || !event.agentId) return;
     const taskAtEntry = await manager.getTask(event.taskId);
-    if (taskAtEntry?.reviewMode === 'server') return;
-    if (taskAtEntry && isSpecStagePhase(taskAtEntry.phase)) {
-      console.warn(
-        `[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`,
-      );
+    if (!taskAtEntry) return;
+    if (taskAtEntry.reviewMode === 'server') {
+      const prNumber = event.data.prNumber;
+      if (!Number.isInteger(prNumber) || (prNumber as number) < 1) return;
+      const adopted = await manager.adoptServerPr(event.taskId, {
+        prNumber: prNumber as number,
+        ...(typeof event.data.prUrl === 'string' ? { prUrl: event.data.prUrl } : {}),
+        ...(validHeadSha(event.data.headSha) !== undefined ? { headSha: validHeadSha(event.data.headSha)! } : {}),
+        ...(typeof event.data.targetBranch === 'string' ? { targetBranch: event.data.targetBranch } : {}),
+      });
+      if (!adopted) {
+        await emitIntervention(bus, taskAtEntry.projectId, taskAtEntry.agentId, taskAtEntry.id, {
+          phase: 'server-pr-adoption-refused',
+          prNumber,
+        });
+      }
+      return;
+    }
+    if (isSpecStagePhase(taskAtEntry.phase)) {
+      console.warn(`[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`);
       return;
     }
 
-    const isGit = taskAtEntry?.reviewMode === 'git';
-
-    // 迟到 publish 信号只做 actor reconciliation（spec §5.3 ④）：poller 已抢先收编、任务不在
-    // 可收编态时，同 prNumber + reconciliation token 归位 replyActor，随后拆 dev 侧条目、不动 QA。
-    // fixing 也归 reconciliation：同 prNumber 的迟到信号在 fix 轮重收编会把任务拽回 review、
-    // 孤儿化 dev 的 fix 会话——非 in_progress 的同号信号只承载 actor 归位（spec §5.3 ④）
-    if (isGit && taskAtEntry && event.data.source === 'pane-signal'
+    if (event.data.source === 'pane-signal'
       && taskAtEntry.prNumber !== undefined && taskAtEntry.prNumber === event.data.prNumber
       && taskAtEntry.status !== 'in_progress') {
       if (taskAtEntry.pendingPrSignalToken === undefined
@@ -1380,8 +1057,6 @@ export function registerEventHandlers(
           ? decodeSignalActorId(event.data.actorB64)
           : undefined;
         if (actorId === undefined) {
-          // watcher 单发已被本事件消费：不重臂就永失 reconciliation 入口。skipSnapshot=true
-          // 只等待后续正确的五段信号，避免滚动区里同一条三段残文立即重触发成环
           await manager.rearmGitReconciliationWatcher(taskAtEntry.id, { skipSnapshot: true });
           await emitIntervention(bus, taskAtEntry.projectId, event.agentId, taskAtEntry.id, {
             phase: 'git-pr-created-actor-missing',
@@ -1395,25 +1070,22 @@ export function registerEventHandlers(
           pendingPrSignalToken: undefined,
         });
       }
-      // fixing 态同键 watcher 已是 pr-fixed：拆掉会吞掉本轮完成信号，reconciliation 条目只存在于 review
       if (taskAtEntry.status === 'review') {
         manager.stopPhaseSignalWatcherAgent(taskAtEntry.id, event.agentId);
       }
       return;
     }
 
-    if (isGit && taskAtEntry && event.data.source !== 'pane-signal'
+    if (event.data.source !== 'pane-signal'
       && taskAtEntry.prNumber !== undefined && taskAtEntry.prNumber === event.data.prNumber
-      && taskAtEntry.reviewDispatchPending !== true
       && !['in_progress', 'fixing'].includes(taskAtEntry.status)) {
-      // in_progress/fixing 或派发未完成（pending）的同号重放走完整收编重试（至少一次）
       return;
     }
 
     let paneVerifiedHeadSha: string | undefined;
     let reconciledBranch: string | undefined;
-    let gitVerifiedTargetBranch: string | undefined;
-    if (isGit && event.data.source === 'pane-signal' && event.data.prNumber !== undefined) {
+    let verifiedTargetBranch: string | undefined;
+    if (event.data.source === 'pane-signal' && event.data.prNumber !== undefined) {
       const prNumber = event.data.prNumber as number;
       try {
         let verify = await manager.platformVerifyPrBinding(event.taskId, prNumber);
@@ -1421,11 +1093,11 @@ export function registerEventHandlers(
           const taskNow = await manager.getTask(event.taskId);
           const prBranch = verify.prBranch;
           if (taskNow) {
-            const ownPrefix = BRANCH_PREFIX + event.taskId;
-            const isForeignBxBranch = prBranch.startsWith(BRANCH_PREFIX) && prBranch !== ownPrefix;
+            const ownBranch = BRANCH_PREFIX + event.taskId;
+            const foreignBxBranch = prBranch.startsWith(BRANCH_PREFIX) && prBranch !== ownBranch;
             const bound = await manager.findTaskByBranch(prBranch, taskNow.projectId);
-            if (!isForeignBxBranch && isValidBranchName(prBranch)
-              && (prBranch === ownPrefix || (!!bound && bound.id === taskNow.id))) {
+            if (!foreignBxBranch && isValidBranchName(prBranch)
+              && (prBranch === ownBranch || bound?.id === taskNow.id)) {
               verify = await manager.platformVerifyPrBinding(event.taskId, prNumber, { branchOverride: prBranch });
               if (verify.ok) reconciledBranch = prBranch;
             }
@@ -1448,15 +1120,11 @@ export function registerEventHandlers(
           return;
         }
         paneVerifiedHeadSha = verify.headSha;
-        gitVerifiedTargetBranch = verify.targetBranch;
+        verifiedTargetBranch = verify.targetBranch;
       } catch (err) {
-        console.warn(
-          `[EventHandler] pr.created: platformVerifyPrBinding failed for task ${event.taskId}:`,
-          err,
-        );
+        console.warn(`[EventHandler] pr.created: platformVerifyPrBinding failed for task ${event.taskId}:`, err);
         const taskNow = await manager.getTask(event.taskId);
         if (taskNow) {
-          // skipSnapshot 缺省 true：滚动区里刚消费的信号残文在平台持续失败时会形成无退避热循环
           await reArmDevelopWatcher(manager, taskNow, event.agentId);
           await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
             phase: 'pane-pr-created-verify-error',
@@ -1466,280 +1134,132 @@ export function registerEventHandlers(
         }
         return;
       }
-    } else if (event.data.source === 'pane-signal' && event.data.prNumber !== undefined) {
-      try {
-        const prNumber = event.data.prNumber as number;
-        let verified = await manager.verifyPaneSignalPrNumber(event.taskId, prNumber);
-        if (!verified) {
-          const taskNow = await manager.getTask(event.taskId);
-          if (taskNow) {
-            const prInfo = await manager.fetchPrHeadRef(prNumber, taskNow.projectId);
-            if (prInfo) {
-              const ownPrefix = BRANCH_PREFIX + event.taskId;
-              const isForeignBxBranch = prInfo.headRefName.startsWith(BRANCH_PREFIX)
-                && prInfo.headRefName !== ownPrefix;
-              const bound = await manager.findTaskByBranch(prInfo.headRefName, taskNow.projectId);
-              const isOwnBxBranch = prInfo.headRefName === ownPrefix;
-              const boundToThisTask = !!bound && bound.id === taskNow.id;
-              // Adopt only on deterministic ownership — our own bx/<taskId> namespace or a branch this
-              // task already owns. A dev-chosen branch that is neither is rejected to intervention, not
-              // adopted on an unverifiable claim (a mis-reported PR number must not rebind the task).
-              if (!isForeignBxBranch && isValidBranchName(prInfo.headRefName)
-                && (isOwnBxBranch || boundToThisTask)) {
-                reconciledBranch = prInfo.headRefName;
-                verified = prInfo;
-              }
-            }
-          }
-        }
-        if (!verified) {
-          const taskNow = await manager.getTask(event.taskId);
-          console.warn(
-            `[EventHandler] pr.created REJECT pane prNumber=${event.data.prNumber} for task ${event.taskId} ` +
-            `(branch mismatch: task.branch=${taskNow?.branch})`,
-          );
-          if (taskNow) {
-            await reArmDevelopWatcher(manager, taskNow, event.agentId);
-            await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
-              phase: 'pane-pr-created-branch-mismatch',
-              claimedPrNumber: event.data.prNumber as number,
-              taskBranch: taskNow.branch ?? '',
-            });
-          }
-          return;
-        }
-        paneVerifiedHeadSha = verified.headSha;
-      } catch (err) {
-        console.warn(
-          `[EventHandler] pr.created: verifyPaneSignalPrNumber failed for task ${event.taskId}:`,
-          err,
-        );
-        const taskNow = await manager.getTask(event.taskId);
-        if (taskNow) {
-          await reArmDevelopWatcher(manager, taskNow, event.agentId, { skipSnapshot: false });
-          await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
-            phase: 'pane-pr-created-verify-error',
-            claimedPrNumber: event.data.prNumber as number,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-        return;
-      }
     }
 
-    const createdHeadSha = validHeadSha(event.data.headSha) ?? paneVerifiedHeadSha;
-    const taskBeforeTransition = await manager.getTask(event.taskId);
-    // A poller-sourced pr.created adopts by branch match alone (no pane verify). bx/<taskId> is unique
-    // to this task; a custom branch name can be reused, so for a custom-branch task only accept a PR it
-    // already tracks — a new custom-branch PR must arrive via the deterministic pane signal, not by the
-    // poller matching a stale/foreign open PR that happens to share the branch name.
+    const task = await manager.getTask(event.taskId);
+    if (!task || task.reviewMode !== 'git') return;
     if (event.data.source !== 'pane-signal'
-      && taskBeforeTransition
-      && taskBeforeTransition.branch !== BRANCH_PREFIX + event.taskId
-      && taskBeforeTransition.prNumber !== event.data.prNumber) {
+      && task.branch !== BRANCH_PREFIX + event.taskId
+      && task.prNumber !== event.data.prNumber) {
       console.warn(
         `[EventHandler] pr.created: ignoring poller-sourced PR ${event.data.prNumber} on custom branch ` +
         `for task ${event.taskId} (untracked; custom-branch PRs adopt via the pane signal)`,
       );
       return;
     }
-    const gitAdoptionFields: Partial<TaskState> = {};
-    if (isGit) {
-      const target = event.data.source === 'pane-signal'
-        ? gitVerifiedTargetBranch
-        : (typeof event.data.targetBranch === 'string' ? event.data.targetBranch : undefined);
-      // baseBranch 快照一经写入不可变（spec §6）：默认分支后续改名不影响既有任务
-      if (target !== undefined && taskBeforeTransition?.baseBranch === undefined) {
-        gitAdoptionFields.baseBranch = target;
+
+    const adoption: Partial<Pick<TaskState,
+      'baseBranch' | 'replyActorId' | 'replyActorStatus' | 'pendingPrSignalToken'>> = {};
+    const target = event.data.source === 'pane-signal'
+      ? verifiedTargetBranch
+      : (typeof event.data.targetBranch === 'string' ? event.data.targetBranch : undefined);
+    if (target !== undefined && task.baseBranch === undefined) adoption.baseBranch = target;
+    if (event.data.source === 'pane-signal') {
+      const actorId = typeof event.data.actorB64 === 'string'
+        ? decodeSignalActorId(event.data.actorB64)
+        : undefined;
+      if (actorId !== undefined) {
+        adoption.replyActorId = actorId;
+        adoption.replyActorStatus = 'verified';
+        adoption.pendingPrSignalToken = undefined;
       }
-      if (event.data.source === 'pane-signal') {
-        const actorId = typeof event.data.actorB64 === 'string'
-          ? decodeSignalActorId(event.data.actorB64)
-          : undefined;
-        if (actorId !== undefined) {
-          gitAdoptionFields.replyActorId = actorId;
-          gitAdoptionFields.replyActorStatus = 'verified';
-          gitAdoptionFields.pendingPrSignalToken = undefined;
-        }
-      } else if (typeof event.data.prAuthorId === 'string'
-        && taskBeforeTransition?.replyActorStatus !== 'verified') {
-        // 自动收编只落 provisional：PR 作者可能是对已推送 head 抢建 PR 的第三方（spec §5.3 ④）
-        gitAdoptionFields.replyActorId = event.data.prAuthorId;
-        gitAdoptionFields.replyActorStatus = 'provisional';
-      }
+    } else if (typeof event.data.prAuthorId === 'string' && task.replyActorStatus !== 'verified') {
+      adoption.replyActorId = event.data.prAuthorId;
+      adoption.replyActorStatus = 'provisional';
     }
-    const result = await manager.transitionTaskStatus(
-      event.taskId,
-      'review',
-      { fromStatus: ['in_progress', 'fixing'] },
-      {
+
+    let reviewHead = validHeadSha(event.data.headSha) ?? paneVerifiedHeadSha;
+    if (reviewHead === undefined && typeof event.data.prNumber === 'number') {
+      const verified = await manager.platformVerifyPrBinding(event.taskId, event.data.prNumber);
+      if (verified.ok) reviewHead = validHeadSha(verified.headSha);
+    }
+    if (reviewHead === undefined) {
+      await emitIntervention(bus, task.projectId, task.agentId, event.taskId, {
+        phase: 'git-review-head-unavailable',
+      });
+      return;
+    }
+
+    if (task.status !== 'in_progress' && task.status !== 'fixing') return;
+    const begun = await manager.beginGitReviewPass(event.taskId, {
+      fromStatus: [task.status],
+      headSha: reviewHead,
+      bumpRound: task.status === 'in_progress',
+      qaPhase: 'review',
+      expectPhase: task.phase,
+      expectSignalToken: task.signalToken,
+      patch: {
         ...(event.data.prNumber !== undefined ? { prNumber: event.data.prNumber as number } : {}),
         ...(event.data.prUrl !== undefined ? { prUrl: event.data.prUrl as string } : {}),
-        ...(createdHeadSha ? { latestHeadSha: createdHeadSha, reviewHeadAnchorSha: createdHeadSha } : {}),
+        latestHeadSha: reviewHead,
         ...(reconciledBranch ? { branch: reconciledBranch } : {}),
-        ...gitAdoptionFields,
-        reviewDispatchedAt: new Date().toISOString(),
-        reviewRoundPending: taskBeforeTransition?.status === 'in_progress' ? true : undefined,
-        signalToken: createSignalToken(),
-        ...(isGit ? { ...manager.mintReviewTokenPair(), reviewDispatchPending: true } : {}),
+        ...adoption,
       },
-    );
-    if (!result) {
-      console.warn(
-        `[EventHandler] pr.created: cannot transition task ${event.taskId} (terminal or invalid from-state)`,
-      );
+    });
+    if (!begun?.task.reviewDispatch) {
+      console.warn(`[EventHandler] pr.created: cannot begin git review pass for task ${event.taskId}`);
       if (event.data.source === 'pane-signal') {
-        const taskNow = await manager.getTask(event.taskId);
-        if (taskNow && ['in_progress', 'fixing'].includes(taskNow.status)) {
-          await reArmDevelopWatcher(manager, taskNow, event.agentId);
-          await emitIntervention(bus, taskNow.projectId, event.agentId, event.taskId, {
+        const current = await manager.getTask(event.taskId);
+        if (current && ['in_progress', 'fixing'].includes(current.status)) {
+          await reArmDevelopWatcher(manager, current, event.agentId);
+          await emitIntervention(bus, current.projectId, event.agentId, event.taskId, {
             phase: 'pane-pr-created-transition-failed',
             claimedPrNumber: event.data.prNumber as number,
-            taskBranch: taskNow.branch ?? '',
+            taskBranch: current.branch ?? '',
           });
         }
       }
       return;
     }
-    const { task: transitioned, previousStatus } = result;
     if (reconciledBranch) {
       console.log(
-        `[EventHandler] pr.created reconciled branch for task ${event.taskId}: ` +
-        `${taskBeforeTransition?.branch} → ${reconciledBranch}`,
+        `[EventHandler] pr.created reconciled branch for task ${event.taskId}: ${task.branch} → ${reconciledBranch}`,
       );
     }
-    const qaId = transitioned.qaAgentId;
-    if (!qaId) {
-      const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
-      if (!ok) {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
+    if (!begun.task.qaAgentId) {
+      const parked = await manager.markAgentWaiting(event.agentId, begun.task.id);
+      if (!parked) {
+        await emitIntervention(bus, begun.task.projectId, begun.task.agentId, begun.task.id, {
           phase: 'dev-wait-gate-failed-no-qa',
         });
       }
-      return;
-    }
-    const qa = manager.getAgentConfig(qaId);
-    if (!qa || qa.role !== 'qa') {
-      await manager.markAgentWaiting(event.agentId, transitioned.id).catch(() => false);
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-config-missing',
-        qaAgentId: qaId,
+      await emitIntervention(bus, begun.task.projectId, begun.task.agentId, begun.task.id, {
+        phase: 'git-review-no-qa-partner',
       });
       return;
     }
-
-    let ownLockToken: string | undefined;
-    const acquired = await manager.acquireAgentForTask(qa.id, transitioned.id, 'review', {
-      onAcquired: (lockToken) => { ownLockToken = lockToken; },
-    });
-    if (!acquired) {
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-acquire-failed',
-        qaAgentId: qa.id,
-      });
-      return;
-    }
-    const ownAcquire = ownLockToken !== undefined ? { expectedLockToken: ownLockToken } : {};
-
-    const { token: dispatchToken, armed } = await manager.rotateAndSetupPhaseSignal(
-      transitioned.id,
-      qa.id,
-      ['pr-approved', 'pr-changes-requested'] as const,
-    );
-    if (!armed) {
-      console.warn(
-        `[EventHandler] pr.created verdict watcher failed to arm for task=${transitioned.id}; rolling back review dispatch`,
-      );
-      const rolledBack = await manager.rollbackVerdictArmFailure(transitioned.id, {
-        status: previousStatus,
-        signalToken: taskBeforeTransition?.signalToken,
-        reviewHeadAnchorSha: taskBeforeTransition?.reviewHeadAnchorSha,
-        reviewDispatchedAt: taskBeforeTransition?.reviewDispatchedAt,
-        // git 保留 durable pending 即保留计轮 intent（同 pr.updated 回滚站点）
-        reviewRoundPending: taskBeforeTransition?.reviewMode === 'git'
-          ? transitioned.reviewRoundPending
-          : taskBeforeTransition?.reviewRoundPending,
-        ...(taskBeforeTransition?.reviewMode === 'git'
-          ? { restorePair: true, passToken: taskBeforeTransition.passToken, failToken: taskBeforeTransition.failToken }
-          : {}),
-      }, { expect: { status: 'review', signalToken: dispatchToken } });
-      if (!rolledBack) {
-        await releaseQaAfterSkippedRollback(manager, transitioned.id, qa.id, '[EventHandler] pr.created arm-failure', ownAcquire);
-        return;
-      }
-      await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire).catch(err => {
-        console.error(`[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after arm-failure rollback failed:`, err);
-        return false;
-      });
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-review-arm-failed',
-        qaAgentId: qa.id,
-      });
-      return;
-    }
-    let started = false;
-    let dispatchErr: unknown = null;
     try {
-      started = await manager.startSession(transitioned.id, qa.id, 'review', {
-        dispatchPassToken: dispatchToken,
+      await manager.dispatchGitReviewLease(begun.task.id, {
+        expectedGeneration: begun.task.reviewDispatch.generation,
       });
     } catch (err) {
-      dispatchErr = err;
-      console.error(`[EventHandler] pr.created startSession(QA=${qa.id}) hard error:`, err);
-    }
-    if (!started) {
-      console.warn(
-        `[EventHandler] pr.created QA session not started for task=${transitioned.id}; ` +
-        `task stays in 'review' but no active QA — emitting human.intervention`,
-      );
-      if (dispatchErr instanceof DispatchTerminalError) {
-        await manager.failTaskForDispatchError(transitioned.id, 'review', qa.id, dispatchErr);
-      } else if (dispatchErr instanceof EnsureSessionError && dispatchErr.partial.handled) {
+      console.error(`[EventHandler] pr.created git review dispatch failed for task=${begun.task.id}:`, err);
+      if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') {
+        await emitIntervention(bus, begun.task.projectId, begun.task.agentId, begun.task.id, {
+          phase: 'git-review-dispatch-uncertain',
+          qaPhase: 'review',
+          error: err.message,
+        });
+      } else if (err instanceof DispatchTerminalError) {
+        await manager.failTaskForDispatchError(begun.task.id, 'review', begun.task.qaAgentId, err, {
+          expectedReviewDispatch: begun.task.reviewDispatch,
+        });
       } else {
-        await manager.releaseAgentForTask(qa.id, transitioned.id, 'idle', ownAcquire)
-          .catch(err => {
-            console.error(
-              `[EventHandler] pr.created releaseAgentForTask(QA=${qa.id}) after start-not-true failed:`,
-              err,
-            );
-            return false;
-          });
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'qa-review-start-failed',
-          qaAgentId: qa.id,
+        await emitIntervention(bus, begun.task.projectId, begun.task.agentId, begun.task.id, {
+          phase: 'git-review-dispatch-failed',
+          qaPhase: 'review',
+          error: err instanceof Error ? err.message : String(err),
         });
       }
-      return;
-    }
-
-    if (taskBeforeTransition?.reviewMode === 'git') {
-      await manager.clearReviewDispatchPending(transitioned.id, dispatchToken);
-    }
-    await manager.consumeReviewRoundIntent(transitioned.id, dispatchToken);
-
-    const ok = await manager.markAgentWaiting(event.agentId, transitioned.id);
-    if (!ok) {
-      await manager.markAwaitingHuman(
-        qa.id,
-        'dev-wait-gate-failed-after-qa-started',
-        `QA review for task ${transitioned.id} started but dev wait-gate failed; QA prompt may still be running, needs operator decision.`,
-        { expectedTaskId: transitioned.id },
-      ).catch(err => {
-        console.error(
-          `[EventHandler] pr.created markAwaitingHuman(QA=${qa.id}) after dev-wait-gate-fail:`,
-          err,
-        );
-      });
     }
   });
 
   bus.on('pr.updated', async (event) => {
-    if (!event.taskId || !event.agentId) return;
+    if (!event.taskId) return;
     const taskAtEntry = await manager.getTask(event.taskId);
-    if (taskAtEntry?.reviewMode === 'server') return;
 
     const eventKind = event.data.kind as
-      | 'push' | 'comment' | 'review-comment' | 'pr-edit' | 'pr-merge-ready'
+      | 'push' | 'comment' | 'review-comment' | 'pr-merge-ready'
       | 'closed-unmerged' | 'reopened' | undefined;
 
     if (taskAtEntry && isSpecStagePhase(taskAtEntry.phase)) {
@@ -1750,18 +1270,20 @@ export function registerEventHandlers(
     }
 
     if (eventKind === 'pr-merge-ready') return handlePrMergeReady(bus, manager, event);
-    // closed-unmerged/reopened 只由 PlatformPoller 对 'git' 任务合成（spec §6 outbox 协议）
     if (eventKind === 'closed-unmerged' || eventKind === 'reopened') {
       const prNumber = event.data.prNumber;
       if (typeof prNumber !== 'number') return;
       if (eventKind === 'closed-unmerged') await manager.recordClosedUnmergedAnchor(event.taskId, prNumber);
       else await manager.clearClosedUnmergedAnchor(event.taskId, prNumber);
-      // 无条件投递：滞留的 outbox 条目借重复观察重试，而不是等到重启（spec §6 至少一次）
       await manager.deliverTaskOutbox(event.taskId);
       return;
     }
-    if (eventKind !== 'push' && eventKind !== undefined) return handlePrFeedback(bus, manager, event);
-    return handlePrCodePush(bus, manager, event);
+    if (!event.agentId) return;
+    if (taskAtEntry?.reviewMode === 'server') return;
+    if (eventKind === 'comment' || eventKind === 'review-comment') {
+      return handlePrFeedback(bus, manager, event);
+    }
+    if (eventKind === 'push' || eventKind === undefined) return handlePrCodePush(bus, manager, event);
   });
 
   bus.on('pr.merged', async (event) => {
@@ -1826,42 +1348,53 @@ export function registerEventHandlers(
   bus.on('review.submitted', async (event) => {
     if (!event.taskId) return;
 
-    const action = event.data.action as 'APPROVE' | 'REQUEST_CHANGES' | string;
-    let task = await manager.getTask(event.taskId);
+    const task = await manager.getTask(event.taskId);
     if (!task) return;
     if (task.reviewMode === 'server') return;
-    // 'git' 唯一裁决授权是评论配对令牌（spec §7）：pane verdict 恒拒绝，命中只记日志
-    if (task.reviewMode === 'git' && event.data.source === 'pane-signal') {
+    if (event.data.source === 'pane-signal') {
       console.log(
-        `[EventHandler] review.submitted pane verdict ignored for git task ${task.id} (comment-token protocol is the sole authority)`,
+        `[EventHandler] review.submitted pane verdict ignored for task ${task.id} (comment-token protocol is the sole authority)`,
       );
       return;
     }
-
-    {
-      const terminalQaId = task.qaAgentId;
-      if (terminalQaId && TASK_TERMINAL_STATUS_SET.has(task.status)) {
-        const qaState = await manager.getAgentState(terminalQaId);
-        if (qaState?.taskId === task.id) {
-          const terminalTask = task;
-          await manager
-            .releaseAgentForTask(terminalQaId, terminalTask.id, 'idle')
-            .catch(err =>
-              console.error(
-                `[EventHandler] terminal-task manual review releaseAgentForTask(QA=${terminalQaId}) failed:`,
-                err,
-              ),
-            );
-          await emitIntervention(bus, terminalTask.projectId, terminalTask.agentId, terminalTask.id, {
-            phase: 'manual-review-on-terminal-task-completed',
-            qaAgentId: terminalQaId,
-            taskStatus: terminalTask.status,
-            reviewAction: action,
-            note: 'Manual QA review on a terminal task finished. Task state untouched; QA released. Operator owns any follow-up.',
-          });
-          return;
-        }
+    const verdictTask = task;
+    const rejectGitPayload = async (err: GitVerdictPayloadError): Promise<void> => {
+      await emitIntervention(bus, verdictTask.projectId, verdictTask.agentId, verdictTask.id, {
+        phase: 'git-verdict-payload-invalid',
+        error: err.message,
+        ...(typeof event.data.source === 'string' ? { source: event.data.source } : {}),
+      });
+    };
+    let gitPayload: GitVerdictPayload;
+    try {
+      gitPayload = parseGitVerdictPayload(event.data);
+    } catch (err) {
+      if (!(err instanceof GitVerdictPayloadError)) throw err;
+      await rejectGitPayload(err);
+      return;
+    }
+    const action = gitPayload.action;
+    if (task.signalToken === undefined || gitPayload.reviewPassToken !== task.signalToken) {
+      if (task.status !== 'review') {
+        await rejectGitPayload(new GitVerdictPayloadError('review pass token is not current'));
+        return;
       }
+      if (!(await redispatchReviewForStaleVerdict(manager, task))) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'stale-verdict-wrong-pass',
+          action,
+          verdictPassToken: gitPayload.reviewPassToken,
+          currentToken: task.signalToken,
+          source: 'poller',
+        });
+      }
+      return;
+    }
+    const expectedVerdictToken = action === 'APPROVE' ? task.passToken : task.failToken;
+    if (expectedVerdictToken === undefined || gitPayload.verdictToken !== expectedVerdictToken
+      || task.failToken === undefined) {
+      await rejectGitPayload(new GitVerdictPayloadError('verdict token is not current'));
+      return;
     }
 
     if (isSpecStagePhase(task.phase)) {
@@ -1892,82 +1425,20 @@ export function registerEventHandlers(
       }
     }
 
-    const verdictPassToken =
-      (typeof event.data.reviewPassToken === 'string' ? event.data.reviewPassToken : undefined)
-      ?? (typeof event.data.token === 'string' ? event.data.token : undefined);
-    if (verdictPassToken && task.signalToken && verdictPassToken !== task.signalToken) {
-      if (!(await redispatchReviewForStaleVerdict(manager, task))) {
-        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-          phase: 'stale-verdict-wrong-pass',
-          action,
-          verdictPassToken,
-          currentToken: task.signalToken,
-          source: event.data.source === 'pane-signal' ? 'pane-signal' : 'poller',
-        });
-      }
+    const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
+      ...(gitPayload.prNumber !== task.prNumber ? { prNumber: gitPayload.prNumber } : {}),
+      ...(gitPayload.prUrl !== task.prUrl ? { prUrl: gitPayload.prUrl } : {}),
+    };
+    const reviewedHeadSha = gitPayload.headSha;
+    const currentHeadSha = gitPayload.currentHeadSha;
+
+    if (task.status !== 'review') {
+      await rejectGitPayload(new GitVerdictPayloadError(`task is ${task.status}, not review`));
       return;
     }
 
-    const eventPrNumber = event.data.prNumber as number | undefined;
-    const eventPrUrl = event.data.prUrl as string | undefined;
-    const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
-      ...(eventPrNumber !== undefined && eventPrNumber !== task.prNumber ? { prNumber: eventPrNumber } : {}),
-      ...(eventPrUrl !== undefined && eventPrUrl !== task.prUrl ? { prUrl: eventPrUrl } : {}),
-    };
-    const isPaneSignal = event.data.source === 'pane-signal';
-    const reviewedHeadSha = validHeadSha(event.data.headSha)
-      ?? (isPaneSignal ? validHeadSha(task.reviewHeadAnchorSha) : undefined);
-    const currentHeadSha = validHeadSha(event.data.currentHeadSha)
-      ?? (isPaneSignal ? validHeadSha(task.reviewHeadAnchorSha) : undefined);
-
-    if ((task.status === 'in_progress' || task.status === 'fixing') && eventPrNumber !== undefined) {
-      const catchup = await manager.transitionTaskStatus(
-        event.taskId,
-        'review',
-        { fromStatus: ['in_progress', 'fixing'] },
-        prPatch,
-      );
-      if (catchup) {
-        task = catchup.task;
-        if (task.agentId) {
-          const ok = await manager.markAgentWaiting(task.agentId, task.id);
-          if (!ok) {
-            await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-              phase: 'dev-wait-gate-failed-late-catchup',
-            });
-          }
-        }
-      } else {
-        return;
-      }
-    }
-
-    const carrier = event.data.verdictCarrier as { sourceKey: string; id: string; bodyDigest: string } | undefined;
-    const gitVerdict = task.reviewMode === 'git'
-      && typeof event.data.verdictToken === 'string' && carrier !== undefined
-      ? { token: event.data.verdictToken, carrier }
-      : undefined;
-    // 'git' 的裁决只信任 engine 载荷：reviewPassToken（评审轮绑定）与 verdict 令牌（评论对绑定）
-    // 都必须在场且属当前轮——缺失即绕过 signalToken 门的 malformed 事件，fail closed
-    if (task.reviewMode === 'git' && (action === 'APPROVE' || action === 'REQUEST_CHANGES')) {
-      const expectedToken = action === 'APPROVE' ? task.passToken : task.failToken;
-      const roundToken = typeof event.data.reviewPassToken === 'string' ? event.data.reviewPassToken : undefined;
-      if (gitVerdict === undefined || expectedToken === undefined || task.failToken === undefined
-        || gitVerdict.token !== expectedToken
-        || roundToken === undefined || task.signalToken === undefined || roundToken !== task.signalToken) {
-        console.warn(
-          `[EventHandler] review.submitted ${action} rejected for git task ${task.id}: verdict payload missing or not the current round token`,
-        );
-        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
-          phase: 'git-verdict-payload-invalid',
-          action,
-          hasCarrier: gitVerdict !== undefined,
-        });
-        return;
-      }
-    }
     if (action === 'APPROVE') {
-      return handleReviewApproval(bus, manager, task, reviewedHeadSha, currentHeadSha, prPatch, gitVerdict);
+      return handleReviewApproval(bus, manager, task, reviewedHeadSha, currentHeadSha, prPatch, gitPayload);
     }
     if (action === 'REQUEST_CHANGES') {
       return handleReviewRequestChanges(bus, manager, task, reviewedHeadSha, currentHeadSha, prPatch);
@@ -1982,13 +1453,11 @@ export function registerEventHandlers(
 
     const stayFixing = async (data: { phase: string; [key: string]: unknown }): Promise<void> => {
       await emitIntervention(bus, projectId, agentId, task.id, data);
-      // 同代 fence：平台查询等待期间任务可能已被手动重派进 review——旧失败分支不得覆盖
-      // successor 的 QA/reconciliation watcher
       const fresh = await manager.getTask(task.id);
       if (!fresh || fresh.status !== 'fixing' || fresh.signalToken !== task.signalToken) return;
       await manager.setupPhaseSignal(task.id, agentId, 'pr-fixed', {
         skipSnapshot: true,
-        ...(fresh.reviewMode === 'git' ? { replaceScope: 'agent' as const } : {}),
+        replaceScope: 'agent',
       });
     };
 
@@ -2002,39 +1471,26 @@ export function registerEventHandlers(
       return;
     }
 
-    let headSha: string;
-    if (task.reviewMode === 'git') {
-      if (task.prNumber === undefined) {
-        await stayFixing({ phase: 'fix-verify-no-anchor' });
-        return;
-      }
-      let verify: Awaited<ReturnType<AgentManager['platformVerifyPrBinding']>>;
-      try {
-        verify = await manager.platformVerifyPrBinding(task.id, task.prNumber);
-      } catch (err) {
-        await stayFixing({
-          phase: 'fix-verify-head-fetch-failed',
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return;
-      }
-      if (!verify.ok) {
-        // PR 在修复期间被关闭/转 draft/retarget：推进 recheck 只会造出无裁决入口的评审轮
-        await stayFixing({ phase: 'fix-verify-binding-mismatch', reason: verify.reason });
-        return;
-      }
-      headSha = verify.headSha;
-    } else {
-      try {
-        headSha = await fetchVerifiedHeadSha(manager, task.id);
-      } catch (err) {
-        await stayFixing({
-          phase: 'fix-verify-head-fetch-failed',
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return;
-      }
+    if (task.prNumber === undefined) {
+      await stayFixing({ phase: 'fix-verify-no-anchor' });
+      return;
     }
+    let verify: Awaited<ReturnType<AgentManager['platformVerifyPrBinding']>>;
+    try {
+      verify = await manager.platformVerifyPrBinding(task.id, task.prNumber);
+    } catch (err) {
+      await stayFixing({
+        phase: 'fix-verify-head-fetch-failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (!verify.ok) {
+      // PR 在修复期间被关闭/转 draft/retarget：推进 recheck 只会造出无裁决入口的评审轮
+      await stayFixing({ phase: 'fix-verify-binding-mismatch', reason: verify.reason });
+      return;
+    }
+    const headSha = verify.headSha;
 
     if (!task.reviewHeadAnchorSha) {
       await stayFixing({ phase: 'fix-verify-no-anchor', headSha });
@@ -2042,47 +1498,23 @@ export function registerEventHandlers(
     }
 
     if (headSha === task.reviewHeadAnchorSha) {
-      if (task.reviewMode === 'git') {
-        // no-op fix 通过条件 = 无未 ack 的待处理反馈 revision 且全源拉取成功（spec §6/§8）；
-        // 墙钟比较与「任意评论计回复」在 'git' 均废除
-        let pendingCount: number;
-        try {
-          pendingCount = (await manager.platformPendingFeedback(task.id)).pending.size;
-        } catch (err) {
-          await stayFixing({
-            phase: 'fix-verify-replies-fetch-failed',
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return;
-        }
-        if (pendingCount > 0) {
-          await stayFixing({
-            phase: 'fix-no-op-pending-feedback',
-            pendingCount,
-            note: 'Dev emitted pr-fixed on an unchanged head while feedback revisions still lack a valid ack. Inspect the PR replies.',
-          });
-          return;
-        }
-      } else {
-        const since = task.fixDispatchedAt ?? task.reviewDispatchedAt;
-        let hasReplies: boolean;
-        try {
-          hasReplies = since ? await manager.prHasDevReplySince(task.id, since) : false;
-        } catch (err) {
-          await stayFixing({
-            phase: 'fix-verify-replies-fetch-failed',
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return;
-        }
-
-        if (!hasReplies) {
-          await stayFixing({
-            phase: 'fix-no-op-no-commit-no-reply',
-            note: 'Dev emitted pr-fixed but pushed no commit and left no reply on the PR — the fixing round changed nothing. Inspect the pane.',
-          });
-          return;
-        }
+      let pendingCount: number;
+      try {
+        pendingCount = (await manager.platformPendingFeedback(task.id)).pending.size;
+      } catch (err) {
+        await stayFixing({
+          phase: 'fix-verify-replies-fetch-failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      if (pendingCount > 0) {
+        await stayFixing({
+          phase: 'fix-no-op-pending-feedback',
+          pendingCount,
+          note: 'Dev emitted pr-fixed on an unchanged head while feedback revisions still lack a valid ack. Inspect the PR replies.',
+        });
+        return;
       }
     }
     // head fetch / 回复检查是秒级网络等待，期间真 push / verdict 可能已换代 pass；旧信号不得再驱动派发
