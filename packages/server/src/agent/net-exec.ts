@@ -1,6 +1,13 @@
 import { computeBackoffMs } from '../timing/backoff.js';
 import type { CommandRunner, ExecResult } from './runner.js';
 
+export class ExecOutcomeUnknownError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ExecOutcomeUnknownError';
+  }
+}
+
 // Aborts a stalled HTTP(S) transfer at the git layer (curl low-speed guard);
 // SSH transports ignore it and rely on the exec timeout below.
 export const GIT_NET_ENV = 'GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIME=30';

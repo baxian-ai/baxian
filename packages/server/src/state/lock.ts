@@ -78,6 +78,19 @@ export class LockManager {
     return claim?.taskId === taskId && claim.token === token;
   }
 
+  async runIfOwner<T>(
+    agentId: string,
+    taskId: string,
+    token: string,
+    operation: () => Promise<T>,
+  ): Promise<{ ran: true; value: T } | { ran: false }> {
+    return this.runExclusive(agentId, async () => {
+      const claim = await this.readClaim(agentId);
+      if (!claim || claim.taskId !== taskId || claim.token !== token) return { ran: false };
+      return { ran: true, value: await operation() };
+    });
+  }
+
   async claimOf(agentId: string): Promise<AgentLockClaim | null> {
     return this.runExclusive(agentId, () => this.readClaim(agentId));
   }

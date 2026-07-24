@@ -44,7 +44,6 @@ export interface ReviewHeadOpts {
 
 export interface ReviewCheckoutResult {
   mode: 'head' | 'base';
-  fallbackReason?: string;
 }
 
 export type BranchCleanupResult =

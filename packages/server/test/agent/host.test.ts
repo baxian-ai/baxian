@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { userInfo } from 'node:os';
 import type { HostConfig } from '../../src/shared/index.js';
 import {
   resolveAgentHost,
   hostGroupKey,
+  mayShareHostAccount,
   workdirHostGroupKey,
   sshTarget,
   buildSshOptions,
@@ -11,6 +13,11 @@ import {
 
 const KEY_HOST: HostConfig = { id: 'box', hostname: 'box.example.com', port: 2222, user: 'agent' };
 const PW_HOST: HostConfig = { id: 'pw', hostname: 'pw.example.com', user: 'root', password: 'hunter2' };
+
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, userInfo: vi.fn(actual.userInfo) };
+});
 
 describe('resolveAgentHost', () => {
   it('resolves a string id against the registry', () => {
@@ -28,6 +35,14 @@ describe('resolveAgentHost', () => {
 
   it('returns undefined for an undefined ref (local agent)', () => {
     expect(resolveAgentHost([KEY_HOST], undefined)).toBeUndefined();
+  });
+
+  it('fails closed for malformed inline and registered hosts', () => {
+    expect(resolveAgentHost([], { hostname: '', port: 22 })).toBeUndefined();
+    expect(resolveAgentHost([], { hostname: 'box', port: 70_000 })).toBeUndefined();
+    expect(resolveAgentHost([
+      { id: 'broken', hostname: 'box', port: Number.NaN },
+    ], 'broken')).toBeUndefined();
   });
 });
 
@@ -59,6 +74,124 @@ describe('workdirHostGroupKey', () => {
     expect(workdirHostGroupKey('remote', { hostname: 'h', user: 'u', port: 2222 })).not.toBe(
       workdirHostGroupKey('remote', { hostname: 'h', user: 'u' }),
     );
+  });
+
+  it('groups DNS hostname case variants for Workdir isolation', () => {
+    expect(workdirHostGroupKey('remote', {
+      hostname: 'Host.EXAMPLE.com', user: 'u', port: 22,
+    })).toBe(workdirHostGroupKey('remote', {
+      hostname: 'host.example.com', user: 'u', port: 22,
+    }));
+  });
+});
+
+describe('mayShareHostAccount', () => {
+  it('fails closed when the SSH user is implicit on an otherwise matching host', () => {
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: 'Host.EXAMPLE.com' },
+      'remote',
+      { hostname: 'host.example.com', user: 'runner', port: 22 },
+    )).toBe(true);
+  });
+
+  it('separates accounts only when the SSH user or hostname difference is explicit', () => {
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: 'host.example.com', user: 'root', port: 22 },
+      'remote',
+      { hostname: 'host.example.com', user: 'runner', port: 22 },
+    )).toBe(false);
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: 'host.example.com', user: 'runner', port: 22 },
+      'remote',
+      { hostname: 'host.example.com', user: 'runner', port: 2222 },
+    )).toBe(true);
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: 'root.example.com', user: 'runner' },
+      'remote',
+      { hostname: 'agent.example.com', user: 'runner' },
+    )).toBe(false);
+  });
+
+  it('groups the implicit SSH port with explicit port 22', () => {
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: 'host.example.com', user: 'runner' },
+      'remote',
+      { hostname: 'HOST.EXAMPLE.COM', user: 'runner', port: 22 },
+    )).toBe(true);
+  });
+
+  it('treats every loopback SSH port as local when the SSH account can match', () => {
+    expect(mayShareHostAccount(
+      'local',
+      undefined,
+      'remote',
+      { hostname: '127.8.9.10', user: userInfo().username },
+    )).toBe(true);
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: '[::1]', user: userInfo().username, port: 22 },
+      'local',
+      undefined,
+    )).toBe(true);
+    expect(mayShareHostAccount(
+      'local',
+      undefined,
+      'remote',
+      { hostname: 'localhost', user: `${userInfo().username}-other` },
+    )).toBe(false);
+    expect(mayShareHostAccount(
+      'local',
+      undefined,
+      'remote',
+      { hostname: 'localhost', user: userInfo().username, port: 2222 },
+    )).toBe(true);
+    expect(mayShareHostAccount(
+      'remote',
+      { hostname: 'localhost', user: userInfo().username },
+      'remote',
+      { hostname: '127.0.0.1', user: userInfo().username, port: 22 },
+    )).toBe(true);
+  });
+
+  it.each(['0::1', '::0:1', '::ffff:127.0.0.1'])(
+    'recognizes the IPv6 loopback spelling %s',
+    (hostname) => {
+      expect(mayShareHostAccount(
+        'local',
+        undefined,
+        'remote',
+        { hostname, user: userInfo().username, port: 2222 },
+      )).toBe(true);
+    },
+  );
+
+  it.each(['127.1', '2130706433', '0177.0.0.1', '0x7f000001'])(
+    'recognizes the non-canonical IPv4 loopback spelling %s',
+    (hostname) => {
+      expect(mayShareHostAccount(
+        'local',
+        undefined,
+        'remote',
+        { hostname, user: userInfo().username, port: 2222 },
+      )).toBe(true);
+    },
+  );
+
+  it('fails closed when the current local username cannot be inspected', () => {
+    vi.mocked(userInfo).mockImplementationOnce(() => {
+      throw new Error('user database unavailable');
+    });
+    expect(mayShareHostAccount(
+      'local',
+      undefined,
+      'remote',
+      { hostname: 'localhost', user: 'explicit-user' },
+    )).toBe(true);
   });
 });
 

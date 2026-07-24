@@ -3,6 +3,7 @@ import type {
   StreamClientMsg,
   StreamServerMsg,
   StreamSubMode,
+  TerminalInterventionPhase,
 } from '../shared/index.js';
 import {
   extractTokenFromProtocols,
@@ -479,7 +480,7 @@ function handleConnection(
 async function emitIntervention(
   app: FastifyInstance,
   agentId: string,
-  phase: 'attach' | 'detach' | 'input' | 'close',
+  phase: TerminalInterventionPhase,
 ): Promise<void> {
   const agent = app.ctx.agentManager.getAgentConfig(agentId);
   if (!agent) return;

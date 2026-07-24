@@ -244,9 +244,6 @@ async function dispatchGitDevPostApproveCheck(
     resumed = await manager.continueSession(live.id, live.agentId, 'post-approve', {
       signalToken: key.token,
       postApproveEpisode: key,
-      ...(opts.redispatchCount !== undefined
-        ? { postApproveRedispatchCount: opts.redispatchCount }
-        : {}),
     });
   } catch (err) {
     dispatchErr = err;

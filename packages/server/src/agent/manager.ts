@@ -8,6 +8,7 @@ import type {
   AfterDone,
   BaxianConfig,
   AgentConfig,
+  AgentRuntimeConfig,
   AgentBindingFacts,
   BaxianEvent,
   HostConfig,
@@ -24,6 +25,7 @@ import type {
   ServerSignalRecoveryReason,
   SpecDocument,
   TaskPhase,
+  TaskGenerationGuard,
   TaskState,
   TaskStatus,
 } from '../shared/index.js';
@@ -40,6 +42,8 @@ import {
   parseGitRemote,
   repoIdentityKey,
   repoSlug,
+  taskGenerationGuard,
+  taskMatchesGeneration,
 } from '../shared/index.js';
 import { buildProjectDriver, makeDriverExec } from '../platform/driver-host.js';
 import { DriverOpError, buildDriverRunContext, GitDriver, safeDriverErrorText } from '../platform/git-driver.js';
@@ -117,6 +121,16 @@ import { prepareConfig } from '../config/loader.js';
 import { projectAfterDone, projectReviewMode, resolveProjectTool } from '../config/validator.js';
 import { SHA_HEX_SOURCE } from '../platform/types.js';
 
+// 这两个入口冲突证明当前调用已被并发 pass 接管，应判 stale 而不是派发失败。
+const BENIGN_DISPATCH_CONFLICT_CODES = new Set(['dispatch-superseded', 'dispatch-in-flight']);
+
+export function isBenignDispatchConflict(err: unknown): err is ApiError {
+  return err instanceof ApiError
+    && err.status === 409
+    && err.code !== undefined
+    && BENIGN_DISPATCH_CONFLICT_CODES.has(err.code);
+}
+
 export interface EnsureSessionResult {
   ok: true;
   createdSession: boolean;
@@ -178,6 +192,10 @@ export class DispatchTerminalError extends Error {
 
 export type EnsureSessionMode = 'create' | 'runtime' | 'recover';
 
+export type RedispatchCurrentPhaseGuard = TaskGenerationGuard;
+
+export type RedispatchCurrentPhaseResult = 'dispatched' | 'stale' | 'unsupported';
+
 export type DeletionClaimOutcome =
   | { ok: true }
   | { ok: false; code: 'active'; agentId: string; taskId: string }
@@ -185,7 +203,7 @@ export type DeletionClaimOutcome =
   | { ok: false; code: 'referencing'; taskId: string }
   | { ok: false; code: 'already-deleting'; agentId: string };
 
-export function buildLaunchCommand(agent: AgentConfig): string {
+export function buildLaunchCommand(agent: AgentRuntimeConfig): string {
   const yolo = agent.yolo !== false;
   const segments: string[] = [];
   switch (agent.runtime) {
@@ -223,7 +241,7 @@ export function buildLaunchCommand(agent: AgentConfig): string {
 }
 
 // cd re-resolves by pathname: a reused pane shell may sit on a deleted-and-recreated cwd inode.
-export function launchCommandIn(dir: string, agent: AgentConfig): string {
+export function launchCommandIn(dir: string, agent: AgentRuntimeConfig): string {
   return `cd ${shellQuote(dir)} && ${buildLaunchCommand(agent)}`;
 }
 
@@ -272,7 +290,7 @@ async function sameDirOnHost(
   return await physical(left) === await physical(right);
 }
 
-export function skillSubdirFor(runtime: AgentConfig['runtime']): string {
+export function skillSubdirFor(runtime: AgentRuntimeConfig['runtime']): string {
   switch (runtime) {
     case 'codex':
     case 'opencode':
@@ -382,8 +400,9 @@ interface StartSessionOpts extends SessionDispatchOpts {
 }
 
 export interface ContinueSessionOpts extends SessionDispatchOpts {
-  postApproveRedispatchCount?: number;
   postApproveEpisode?: PostApproveEpisodeKey;
+  // Legacy batch continuation must re-state the base checkout marker so the prompt stays self-contained.
+  serverReviewCheckout?: 'base';
   serverAfterDone?: { kind: 'branch' | 'pr'; branch: string };
   preserveDispatchOutputs?: boolean;
   // In-flight replay: the dirty tree is the holder's own work, so only the branch pointer is asserted.
@@ -420,8 +439,24 @@ export type CodeInterdiffResult =
   | { ok: false; reason: 'released' };
 
 export interface ServerReviewDriver {
-  dispatchCodeReview(task: TaskState, opts?: { bumpRound?: boolean }): Promise<boolean>;
-  dispatchSpecReview(task: TaskState, opts?: { bumpRound?: boolean }): Promise<boolean>;
+  dispatchCodeReview(
+    task: TaskState,
+    opts?: {
+      bumpRound?: boolean;
+      expectedTask?: TaskGenerationGuard;
+      onSideEffect?: () => void;
+      settlePermit?: unknown;
+    },
+  ): Promise<boolean>;
+  dispatchSpecReview(
+    task: TaskState,
+    opts?: {
+      bumpRound?: boolean;
+      expectedTask?: TaskGenerationGuard;
+      onSideEffect?: () => void;
+      settlePermit?: unknown;
+    },
+  ): Promise<boolean>;
 }
 
 const MANUAL_SERVER_REVIEW_STATUSES: readonly TaskStatus[] = ['in_progress', 'review', 'fixing'];
@@ -444,6 +479,17 @@ export function isRecoverableQaDispatchHold(binding: AgentBindingFacts | null | 
   return binding?.status === 'awaiting_human'
     && binding.awaitingPhase != null
     && RECOVERABLE_QA_DISPATCH_HOLD_PHASES.has(binding.awaitingPhase);
+}
+
+function shouldBumpServerReviewRound(
+  requested: boolean | undefined,
+  task: Pick<TaskState, 'id' | 'status'>,
+  qaBinding: AgentBindingFacts | null | undefined,
+): boolean {
+  if (requested !== undefined) return requested;
+  return !(task.status === 'review'
+    && qaBinding?.taskId === task.id
+    && isRecoverableQaDispatchHold(qaBinding));
 }
 
 // REPL 忙碌是常态（QA 回合分钟级、dev 修完即推），遇忙派发不落 hold 而登记待补派；
@@ -673,6 +719,54 @@ export class AgentManager {
     return this.reviewStore;
   }
 
+  async putReviewRoundIfCurrent(
+    taskId: string,
+    data: ReviewRound,
+    expectedTask: TaskGenerationGuard,
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || !taskMatchesGeneration(task, expectedTask)) return false;
+      if (!this.reviewStore) throw new Error('ReviewStore is not configured');
+      await this.reviewStore.putRound(taskId, data.phase, data);
+      return true;
+    });
+  }
+
+  async deleteReviewExchangeIfCurrent(
+    taskId: string,
+    agent: AgentConfig,
+    artifact: 'findings' | 'response',
+    expectedTask: TaskGenerationGuard,
+    expectedRecovery?: Pick<
+      ServerSignalRecovery,
+      'mode' | 'signalKind' | 'phase' | 'round' | 'sourceToken' | 'failureSignature' | 'createdAt'
+    >,
+  ): Promise<boolean> {
+    return this.withTaskLock(async () => {
+      const task = await this.taskStore.get(taskId);
+      if (!task || !taskMatchesGeneration(task, expectedTask)) return false;
+      const recovery = task.serverSignalRecovery;
+      if (expectedRecovery && (
+        !recovery
+        || recovery.mode !== expectedRecovery.mode
+        || recovery.signalKind !== expectedRecovery.signalKind
+        || recovery.phase !== expectedRecovery.phase
+        || recovery.round !== expectedRecovery.round
+        || recovery.sourceToken !== expectedRecovery.sourceToken
+        || recovery.failureSignature !== expectedRecovery.failureSignature
+        || recovery.createdAt !== expectedRecovery.createdAt
+      )) return false;
+      const transport = this.getReviewTransport();
+      if (artifact === 'findings') {
+        await transport.deleteFindings(agent);
+      } else {
+        await transport.deleteResponse(agent);
+      }
+      return true;
+    });
+  }
+
   setServerReviewDriver(driver: ServerReviewDriver): void {
     this.serverReviewDriver = driver;
   }
@@ -692,10 +786,20 @@ export class AgentManager {
     return project ? projectAfterDone(this.config, project) : (this.config.review.afterDone ?? null);
   }
 
-  async commitServerAfterDone(taskId: string): Promise<AfterDone> {
+  async commitServerAfterDone(
+    taskId: string,
+    expectedTask?: TaskGenerationGuard,
+  ): Promise<AfterDone> {
     return this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task) throw new ApiError(404, `Task ${taskId} not found`);
+      if (expectedTask && !taskMatchesGeneration(task, expectedTask)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} review generation changed before afterDone was committed`,
+          'dispatch-superseded',
+        );
+      }
       if (task.afterDone === 'pr' && task.platformBinding === undefined) {
         throw new Error(`platform binding missing for task ${task.id}; refusing to reconstruct it from live config`);
       }
@@ -2345,7 +2449,7 @@ export class AgentManager {
       allowAwaitingHuman?: boolean;
       clearAwaitingHuman?: boolean;
       fromCancelCleanup?: boolean;
-      expectedTask?: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
+      expectedTask?: Partial<TaskGenerationGuard>;
       expectedReviewDispatch?: Pick<ReviewDispatchLease, 'generation' | 'claimId' | 'signalToken'>;
       expectedPostApproveEpisode?: PostApproveEpisodeKey;
       expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
@@ -2404,9 +2508,13 @@ export class AgentManager {
         opts.expectedTask
         && boundTask
         && (
-          boundTask.status !== opts.expectedTask.status
-          || boundTask.phase !== opts.expectedTask.phase
-          || boundTask.signalToken !== opts.expectedTask.signalToken
+          ('status' in opts.expectedTask && boundTask.status !== opts.expectedTask.status)
+          || ('phase' in opts.expectedTask && boundTask.phase !== opts.expectedTask.phase)
+          || ('signalToken' in opts.expectedTask && boundTask.signalToken !== opts.expectedTask.signalToken)
+          || ('agentId' in opts.expectedTask && boundTask.agentId !== opts.expectedTask.agentId)
+          || ('reviewRound' in opts.expectedTask && boundTask.reviewRound !== opts.expectedTask.reviewRound)
+          || ('specReviewRound' in opts.expectedTask
+            && boundTask.specReviewRound !== opts.expectedTask.specReviewRound)
         )
       ) {
         console.warn(
@@ -2752,6 +2860,7 @@ export class AgentManager {
     expectedTaskId: string,
     opts?: {
       allowAwaitingHuman?: boolean;
+      expectedTask?: Partial<TaskGenerationGuard>;
       expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
     },
   ): Promise<boolean> {
@@ -3519,7 +3628,7 @@ export class AgentManager {
       releasedBinding: boolean;
       redispatchCodeTaskId?: string;
       redispatchReviewTaskId?: string;
-      reviewPass?: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
+      reviewPass?: TaskGenerationGuard;
       heldLockToken?: string;
       releaseTaskId?: string;
       releaseHeldQa?: {
@@ -3641,6 +3750,9 @@ export class AgentManager {
               status: boundTask.status,
               phase: boundTask.phase,
               signalToken: boundTask.signalToken,
+              agentId: boundTask.agentId,
+              reviewRound: boundTask.reviewRound,
+              specReviewRound: boundTask.specReviewRound,
             },
             heldLockToken: state.lockToken,
             projectId: state.projectId,
@@ -3837,6 +3949,7 @@ export class AgentManager {
           fromStatus: ['review'],
           expectPhase: reviewPass.phase,
           expectSignalToken: reviewPass.signalToken,
+          expectedTask: reviewPass,
           ...(resumeQaPhase !== undefined ? { qaPhase: resumeQaPhase } : {}),
           onQaAcquired: (lockToken) => { recoveryLockToken = lockToken; },
         });
@@ -3896,9 +4009,7 @@ export class AgentManager {
         let recoveryReadFailed = false;
         try {
           const taskNow = await this.taskStore.get(reviewTaskId);
-          passSuperseded = taskNow?.status !== reviewPass.status
-            || taskNow.phase !== reviewPass.phase
-            || taskNow.signalToken !== reviewPass.signalToken;
+          passSuperseded = !taskNow || !taskMatchesGeneration(taskNow, reviewPass);
         } catch (readErr) {
           recoveryReadFailed = true;
           console.error(`[AgentManager] resumeAgent recovery task read failed for ${agentId}:`, readErr);
@@ -4135,6 +4246,7 @@ export class AgentManager {
     opts: {
       expectedPostApproveEpisode?: PostApproveEpisodeKey;
       expectedReviewDispatch?: ReviewDispatchFence;
+      expectedTask?: TaskGenerationGuard;
       expectedLockToken?: string;
     } = {},
   ): Promise<void> {
@@ -4150,10 +4262,19 @@ export class AgentManager {
         ...(opts.expectedReviewDispatch !== undefined
           ? { expectReviewDispatch: opts.expectedReviewDispatch }
           : {}),
+        ...(opts.expectedTask !== undefined ? { expectTask: opts.expectedTask } : {}),
+        ...(opts.expectedLockToken !== undefined
+          ? { expectAgentLock: { agentId, token: opts.expectedLockToken } }
+          : {}),
       },
     );
     if (!transitioned
-      && (opts.expectedPostApproveEpisode !== undefined || opts.expectedReviewDispatch !== undefined)) {
+      && (
+        opts.expectedPostApproveEpisode !== undefined
+        || opts.expectedReviewDispatch !== undefined
+        || opts.expectedTask !== undefined
+        || opts.expectedLockToken !== undefined
+      )) {
       console.warn(
         `[AgentManager] failTaskForDispatchError: dispatch generation for ${taskId} was superseded; skipping stale failure`,
       );
@@ -4535,10 +4656,19 @@ export class AgentManager {
     }
   }
 
-  async redispatchTaskPromptAfterReplRestart(agentId: string, taskId: string): Promise<boolean> {
+  async redispatchTaskPromptAfterReplRestart(
+    agentId: string,
+    taskId: string,
+    expected?: RedispatchCurrentPhaseGuard,
+  ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     const loadedTask = await this.taskStore.get(taskId);
     if (!agent || !loadedTask || !TASK_OWNER_ROLES.has(agent.role)) return false;
+    if (expected && !taskMatchesGeneration(loadedTask, expected)) return false;
+    const rootGenerationMatches = (
+      fresh: TaskState,
+      signalToken: string | undefined = expected?.signalToken,
+    ): boolean => !expected || taskMatchesGeneration(fresh, { ...expected, signalToken });
     let task: TaskState = loadedTask;
     if (task.agentId !== agentId) return false;
     const participantId = agent.role === 'research' ? task.researchAgentId : task.devAgentId;
@@ -4555,7 +4685,8 @@ export class AgentManager {
       return fresh?.agentId === agentId
         && fresh.status === task.status
         && fresh.phase === task.phase
-        && fresh.signalToken === signalToken;
+        && fresh.signalToken === signalToken
+        && rootGenerationMatches(fresh, signalToken);
     };
     const clearEntryHold = async (): Promise<boolean> => this.withTaskLock(async () => {
       if (!(await taskStillCurrent())) return false;
@@ -4566,12 +4697,22 @@ export class AgentManager {
       return this.clearAwaitingHuman(agentId, { expectedHold: entryHold });
     });
     const holdReplayFailure = (phase: string, reason: string): Promise<boolean> =>
-      this.holdReplayFailureIfCurrent(agentId, task, phase, reason, entryHold);
+      this.holdReplayFailureIfCurrent(
+        agentId,
+        task,
+        phase,
+        reason,
+        entryHold,
+        async fresh => rootGenerationMatches(fresh, task.signalToken),
+      );
 
     try {
       if (task.status === 'approved' && agent.role === 'dev') {
         return await this.replayApprovedHolderAfterReplRestart(
-          agentId, task, entryHold, { clearEntryHold, holdReplayFailure },
+          agentId,
+          task,
+          entryHold,
+          { clearEntryHold, holdReplayFailure, rootGenerationMatches },
         );
       }
 
@@ -4625,6 +4766,7 @@ export class AgentManager {
             || fresh.status !== task.status
             || fresh.phase !== task.phase
             || fresh.signalToken !== signalToken
+            || !rootGenerationMatches(fresh, signalToken)
           ) return false;
           const rotatePendingPr = mapped.expectedKinds.includes('pr-created')
             && fresh.pendingPrSignalToken === signalToken;
@@ -4643,6 +4785,7 @@ export class AgentManager {
           'restart-redispatch-failed',
           reason,
           entryHold,
+          async fresh => rootGenerationMatches(fresh, newToken),
         ),
         continueWith: (newToken, fence) => this.continueSession(taskId, agentId, phase, {
           ...opts,
@@ -4763,6 +4906,47 @@ export class AgentManager {
     }
   }
 
+  async redispatchCurrentTaskPhase(
+    taskId: string,
+    expected: RedispatchCurrentPhaseGuard,
+  ): Promise<RedispatchCurrentPhaseResult> {
+    const current = await this.taskStore.get(taskId);
+    if (!current || !taskMatchesGeneration(current, expected)) return 'stale';
+    if (current.status === 'review') {
+      let changedByRedispatch = false;
+      try {
+        await this.dispatchReviewToQa(taskId, {
+          fromStatus: ['review'],
+          bumpRound: false,
+          expectSignalToken: current.signalToken,
+          expectPhase: current.phase,
+          expectedTask: expected,
+          onSideEffect: () => { changedByRedispatch = true; },
+        });
+        return 'dispatched';
+      } catch (err) {
+        if (!changedByRedispatch && isBenignDispatchConflict(err)) return 'stale';
+        if (!changedByRedispatch
+          && err instanceof ApiError
+          && err.code === 'dispatch-unsupported') {
+          return 'unsupported';
+        }
+        if (changedByRedispatch) throw err;
+        const fresh = await this.taskStore.get(taskId);
+        if (!fresh || !taskMatchesGeneration(fresh, expected)) return 'stale';
+        throw err;
+      }
+    }
+    const redispatched = await this.redispatchTaskPromptAfterReplRestart(
+      current.agentId,
+      taskId,
+      expected,
+    );
+    if (redispatched) return 'dispatched';
+    const fresh = await this.taskStore.get(taskId);
+    return !fresh || !taskMatchesGeneration(fresh, expected) ? 'stale' : 'unsupported';
+  }
+
   // approved hosts two live holder passes — post-approve and server after-done; a parked pre-publish holder stays on the waiting path.
   private async replayApprovedHolderAfterReplRestart(
     agentId: string,
@@ -4771,10 +4955,11 @@ export class AgentManager {
     holdGen: {
       clearEntryHold: () => Promise<boolean>;
       holdReplayFailure: (phase: string, reason: string) => Promise<boolean>;
+      rootGenerationMatches: (fresh: TaskState, signalToken?: string) => boolean;
     },
   ): Promise<boolean> {
     const taskId = task.id;
-    const { clearEntryHold, holdReplayFailure } = holdGen;
+    const { clearEntryHold, holdReplayFailure, rootGenerationMatches } = holdGen;
     if (task.reviewMode === 'server') {
       if (!task.publishDispatchedAt) return false;
       if (!task.signalToken) {
@@ -4813,7 +4998,8 @@ export class AgentManager {
         return fresh?.agentId === agentId
           && fresh.status === task.status
           && fresh.phase === task.phase
-          && fresh.signalToken === signalToken;
+          && fresh.signalToken === signalToken
+          && rootGenerationMatches(fresh, signalToken);
       };
       return this.runRotatedReplay({
         agentId,
@@ -4827,6 +5013,7 @@ export class AgentManager {
             || fresh.status !== task.status
             || fresh.phase !== task.phase
             || fresh.signalToken !== token
+            || !rootGenerationMatches(fresh, token)
           ) return false;
           await this.taskStore.set({ ...fresh, signalToken: newToken, updatedAt: new Date().toISOString() });
           return true;
@@ -4838,6 +5025,7 @@ export class AgentManager {
           'restart-redispatch-failed',
           reason,
           entryHold,
+          async fresh => rootGenerationMatches(fresh, newToken),
         ),
         continueWith: (newToken, fence) => this.continueSession(taskId, agentId, 'server-after-done', {
           signalToken: newToken,
@@ -4886,6 +5074,7 @@ export class AgentManager {
       && fresh.status === task.status
       && fresh.phase === task.phase
       && fresh.signalToken === task.signalToken
+      && rootGenerationMatches(fresh, task.signalToken)
       && fresh.reviewMode === task.reviewMode
       && fresh.postApproveRevoked === undefined
       && fresh.postApproveHeadSha === task.postApproveHeadSha
@@ -5639,6 +5828,7 @@ export class AgentManager {
       qaPhase?: 'review' | 'recheck';
       expectSignalToken?: string;
       expectPhase?: TaskPhase;
+      expectedTask?: TaskGenerationGuard;
       allowDuringComplete?: boolean;
       patch?: Partial<Pick<TaskState,
         | 'prNumber' | 'prUrl' | 'latestHeadSha' | 'branch' | 'baseBranch'
@@ -5652,6 +5842,7 @@ export class AgentManager {
       if (this.markCompleteInFlight.has(taskId) && opts.allowDuringComplete !== true) return null;
       const current = await this.taskStore.get(taskId);
       if (!current || current.reviewMode !== 'git' || TERMINAL_STATUSES.includes(current.status)) return null;
+      if (opts.expectedTask && !taskMatchesGeneration(current, opts.expectedTask)) return null;
       if (!opts.fromStatus.includes(current.status)) return null;
       if (current.reviewDispatch?.phase === 'uncertain') return null;
       if (Object.hasOwn(opts, 'expectSignalToken') && current.signalToken !== opts.expectSignalToken) return null;
@@ -5707,6 +5898,7 @@ export class AgentManager {
   async claimGitReviewDispatch(
     taskId: string,
     expectedGeneration?: string,
+    expectedTask?: TaskGenerationGuard,
   ): Promise<{ task: TaskState; lease: ReviewDispatchLease & {
     phase: 'claimed'; claimId: string; claimedAt: string;
   } } | null> {
@@ -5715,6 +5907,7 @@ export class AgentManager {
       const task = await this.taskStore.get(taskId);
       const lease = task?.reviewDispatch;
       if (!task || !lease || lease.phase !== 'pending') return null;
+      if (expectedTask && !taskMatchesGeneration(task, expectedTask)) return null;
       if (expectedGeneration !== undefined && lease.generation !== expectedGeneration) return null;
       if (!this.gitReviewLeaseMatches(task, lease)) return null;
       const now = new Date().toISOString();
@@ -6361,7 +6554,14 @@ export class AgentManager {
         return;
       }
       try {
-        await this.getReviewTransport().deleteResponse(dev);
+        const deleted = await this.deleteReviewExchangeIfCurrent(
+          task.id,
+          dev,
+          'response',
+          taskGenerationGuard(fresh),
+          current,
+        );
+        if (!deleted) return;
       } catch (err) {
         await hold(
           `server-${recovery.phase}-feedback-recovery-cleanup-failed`,
@@ -6394,10 +6594,16 @@ export class AgentManager {
       const scanSnapshotOnRecover = isServerProtocol
         || (task.phase === undefined && task.status === 'in_progress')
         || (!specStage && (task.status === 'review' || task.status === 'fixing'));
+      // 侧道读 dev workdir，对 head 评审会注入未验证内容——mode 不明时关侧道、发干预交人工。
       const allowRecoveredReadFile = task.status === 'review'
         && (specStage
           || (task.reviewMode === 'server' && task.batchTotal !== undefined)
           || (task.reviewMode === 'server' && task.reviewCheckoutMode === 'base'));
+      const ambiguousCheckout = task.status === 'review'
+        && task.reviewMode === 'server'
+        && !specStage
+        && task.reviewCheckoutMode === undefined
+        && task.batchTotal === undefined;
       try {
         await this.startPhaseSignalWatch({
           taskId: task.id,
@@ -6412,12 +6618,29 @@ export class AgentManager {
             ? { onReadFile: (req: ReadFileSignal) => { void this.handleReadFileRequest(task.id, agentId, req); } }
             : {}),
         });
-        if (interventionKindLabel) {
-          await this.emitIntervention(task.projectId, agentId, task.id, {
-            phase: 'spec-signal-setup-during-recovery',
-            kind: interventionKindLabel,
-            note: 'Task is waiting for a spec signal after server recovery; if no signal arrives, the prompt may not have been fully delivered before the previous crash. Inspect the agent pane and consider manual retry or transition.',
-          });
+        if (interventionKindLabel || ambiguousCheckout) {
+          // snapshot 命中完成信号时不发邀请手工 retry 的干预：结算窗口内的人工重派正是要杜绝的入口；
+          // 结算若推进了任务态（token 轮换/状态离开），该干预已无的放矢。
+          if (this.phaseSignalWatcher?.isSettling(task.id)) {
+            await this.phaseSignalWatcher.awaitSettled(task.id);
+            const fresh = await this.taskStore.get(task.id);
+            if (!fresh || fresh.status !== task.status || fresh.signalToken !== signalToken) {
+              return;
+            }
+          }
+          if (ambiguousCheckout) {
+            await this.emitIntervention(task.projectId, agentId, task.id, {
+              phase: 'server-review-recovery-ambiguous-checkout',
+              note: 'The recovered server code review has no persisted checkout mode (crash before persist, or a pre-rename base task rewritten since). The read-file side-channel stays closed because it reads the dev workdir, not the reviewed head. Inspect the QA pane; redispatch the review to converge on a verified head checkout.',
+            });
+          }
+          if (interventionKindLabel) {
+            await this.emitIntervention(task.projectId, agentId, task.id, {
+              phase: 'spec-signal-setup-during-recovery',
+              kind: interventionKindLabel,
+              note: 'Task is waiting for a spec signal after server recovery; if no signal arrives, the prompt may not have been fully delivered before the previous crash. Inspect the agent pane and consider manual retry or transition.',
+            });
+          }
         }
       } catch (err) {
         console.warn(
@@ -6865,6 +7088,28 @@ export class AgentManager {
       return;
     }
     if (branch!.headSha === undefined) {
+      try {
+        await this.eventBus.emit({
+          id: `outbox:${task.id}:${intent.prNumber}:remote-branch-deleted:${generation}`,
+          type: 'task.updated',
+          timestamp: new Date().toISOString(),
+          projectId: task.projectId,
+          taskId: task.id,
+          data: {
+            status: task.status,
+            operation: 'git-branch-delete',
+            outcome: 'succeeded',
+            generation,
+            prNumber: intent.prNumber,
+            branch: intent.branch,
+            expectedHeadSha: intent.expectedHeadSha,
+            remoteProjectId: intent.remoteProjectId,
+          },
+        });
+      } catch (err) {
+        await this.recordRemoteCleanupFailure(task, generation, 'persist', safeDriverErrorText(err));
+        throw err;
+      }
       await this.mutateRemoteCleanup(taskId, generation, () => undefined);
       return;
     }
@@ -7077,13 +7322,17 @@ export class AgentManager {
     taskId: string,
     expectedStatus: TaskStatus,
     updates: Partial<TaskState>,
-    alsoExpect: Partial<Pick<TaskState, 'signalToken' | 'phase' | 'reviewRound' | 'specReviewRound'>> = {},
+    alsoExpect: Partial<Pick<
+      TaskState,
+      'signalToken' | 'phase' | 'agentId' | 'reviewRound' | 'specReviewRound'
+    >> = {},
   ): Promise<boolean> {
     return this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task || task.status !== expectedStatus) return false;
       if ('signalToken' in alsoExpect && task.signalToken !== alsoExpect.signalToken) return false;
       if ('phase' in alsoExpect && task.phase !== alsoExpect.phase) return false;
+      if ('agentId' in alsoExpect && task.agentId !== alsoExpect.agentId) return false;
       if ('reviewRound' in alsoExpect && task.reviewRound !== alsoExpect.reviewRound) return false;
       if ('specReviewRound' in alsoExpect && task.specReviewRound !== alsoExpect.specReviewRound) return false;
       Object.assign(task, updates, { updatedAt: new Date().toISOString() });
@@ -7340,10 +7589,12 @@ export class AgentManager {
     toStatus: TaskStatus,
     guard: {
       fromStatus: TaskStatus[];
+      expectTask?: TaskGenerationGuard;
       expectSignalToken?: string;
       expectPhase?: TaskPhase;
       expectPostApproveEpisode?: PostApproveEpisodeKey;
       expectReviewDispatch?: ReviewDispatchFence;
+      expectAgentLock?: { agentId: string; token: string };
     },
     patch?: Partial<Pick<
       TaskState,
@@ -7351,6 +7602,7 @@ export class AgentManager {
       | 'agentId'
       | 'prNumber'
       | 'prUrl'
+      | 'baseBranch'
       | 'qaAgentId'
       | 'latestHeadSha'
       | 'reviewHeadAnchorSha'
@@ -7365,34 +7617,53 @@ export class AgentManager {
       | 'phase'
       | 'batchIndex'
       | 'batchTotal'
+      | 'reviewCheckoutMode'
       | 'branch'
       | 'maxRoundsContinues'
     >>,
   ): Promise<TransitionResult | null> {
     return this.withTaskLock(async () => {
-      const task = await this.taskStore.get(taskId);
-      if (!task) return null;
-      const previousStatus = task.status;
-      if (TERMINAL_STATUSES.includes(previousStatus)) return null;
-      if (!guard.fromStatus.includes(previousStatus)) return null;
-      if (Object.hasOwn(guard, 'expectSignalToken') && task.signalToken !== guard.expectSignalToken) return null;
-      if (Object.hasOwn(guard, 'expectPhase') && task.phase !== guard.expectPhase) return null;
-      if (guard.expectPostApproveEpisode !== undefined
-        && !this.postApproveEpisodeMatches(task, guard.expectPostApproveEpisode)) return null;
-      if (guard.expectReviewDispatch !== undefined
-        && !this.gitReviewDispatchMatches(task, guard.expectReviewDispatch)) return null;
-      if (patch?.branch && patch.branch !== task.branch) {
-        const existing = await this.findTaskByBranch(patch.branch, task.projectId);
-        if (existing && existing.id !== taskId) return null;
-      }
-      const next = this.stripGitStatusScopedState(task, toStatus);
-      if (previousStatus !== toStatus) delete next.serverSignalRecovery;
-      Object.assign(next, patch ?? {}, {
-        status: toStatus,
-        updatedAt: new Date().toISOString(),
-      });
-      await this.taskStore.set(next);
-      return { task: next, previousStatus };
+      const transition = async (): Promise<TransitionResult | null> => {
+        if (guard.expectAgentLock) {
+          const binding = await this.agentStore.get(guard.expectAgentLock.agentId);
+          if (
+            binding?.taskId !== taskId
+            || binding.lockToken !== guard.expectAgentLock.token
+          ) return null;
+        }
+        const task = await this.taskStore.get(taskId);
+        if (!task) return null;
+        const previousStatus = task.status;
+        if (TERMINAL_STATUSES.includes(previousStatus)) return null;
+        if (!guard.fromStatus.includes(previousStatus)) return null;
+        if (guard.expectTask && !taskMatchesGeneration(task, guard.expectTask)) return null;
+        if (Object.hasOwn(guard, 'expectSignalToken') && task.signalToken !== guard.expectSignalToken) return null;
+        if (Object.hasOwn(guard, 'expectPhase') && task.phase !== guard.expectPhase) return null;
+        if (guard.expectPostApproveEpisode !== undefined
+          && !this.postApproveEpisodeMatches(task, guard.expectPostApproveEpisode)) return null;
+        if (guard.expectReviewDispatch !== undefined
+          && !this.gitReviewDispatchMatches(task, guard.expectReviewDispatch)) return null;
+        if (patch?.branch && patch.branch !== task.branch) {
+          const existing = await this.findTaskByBranch(patch.branch, task.projectId);
+          if (existing && existing.id !== taskId) return null;
+        }
+        const next = this.stripGitStatusScopedState(task, toStatus);
+        if (previousStatus !== toStatus) delete next.serverSignalRecovery;
+        Object.assign(next, patch ?? {}, {
+          status: toStatus,
+          updatedAt: new Date().toISOString(),
+        });
+        await this.taskStore.set(next);
+        return { task: next, previousStatus };
+      };
+      if (!guard.expectAgentLock) return transition();
+      const guarded = await this.lockManager.runIfOwner(
+        guard.expectAgentLock.agentId,
+        taskId,
+        guard.expectAgentLock.token,
+        transition,
+      );
+      return guarded.ran ? guarded.value : null;
     });
   }
 
@@ -8581,7 +8852,7 @@ export class AgentManager {
 
     const isServerQaPhase = phase === 'server-review' || phase === 'server-recheck' || phase === 'server-spec-review';
     const isServerCodeReviewPhase = phase === 'server-review' || phase === 'server-recheck';
-    let reviewCheckout: { mode: 'head' | 'base'; fallbackReason?: string } | undefined;
+    let reviewCheckout: { mode: 'head' | 'base' } | undefined;
     const dispatchWorkdir = workdir;
     try {
       if (isServerCodeReviewPhase && opts.serverContent !== undefined) {
@@ -8719,11 +8990,6 @@ export class AgentManager {
         ...(promptSignalToken ? { signalToken: promptSignalToken } : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
-        ...(reviewCheckout ? { serverReviewCheckout: reviewCheckout.mode } : {}),
-        ...(reviewCheckout?.fallbackReason ? { serverReviewFallbackReason: reviewCheckout.fallbackReason } : {}),
-        ...(opts.serverBaseSha !== undefined ? { serverBaseSha: opts.serverBaseSha } : {}),
-        ...(opts.serverHeadSha !== undefined ? { serverHeadSha: opts.serverHeadSha } : {}),
-        ...(opts.serverHeadTree !== undefined ? { serverHeadTree: opts.serverHeadTree } : {}),
         ...(opts.serverBatch ? { serverBatch: opts.serverBatch } : {}),
         ...(opts.serverFindingsDigest ? { serverFindingsDigest: opts.serverFindingsDigest } : {}),
         ...(opts.serverFeedbackCorrection ? { serverFeedbackCorrection: opts.serverFeedbackCorrection } : {}),
@@ -9204,7 +9470,7 @@ export class AgentManager {
     opts: {
       allowAwaitingHuman?: boolean;
       clearAwaitingHuman?: boolean;
-      expectedTask?: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
+      expectedTask?: Partial<TaskGenerationGuard>;
       expectedReviewDispatch?: Pick<ReviewDispatchLease, 'generation' | 'claimId' | 'signalToken'>;
       expectedPostApproveEpisode?: PostApproveEpisodeKey;
       expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
@@ -9370,10 +9636,6 @@ export class AgentManager {
           await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
         },
       });
-      const useIncrementalNudge =
-        typeof opts.postApproveRedispatchCount === 'number'
-        && opts.postApproveRedispatchCount > 0
-        && !ensure.freshRuntime;
       const imagePaths = await this.imagePathsForDispatch(runner, task, phase);
       let payloadOpts: ServerPayloadPromptOpts = {};
       if (opts.serverContent !== undefined || opts.serverDiffstat !== undefined || opts.serverInterdiff !== undefined || opts.serverPriorFindings || opts.serverPriorResponse) {
@@ -9401,11 +9663,9 @@ export class AgentManager {
         hasQaPartner: task.qaAgentId !== undefined,
         ...(platformCli ? { platformCli } : {}),
         ...(signalToken ? { signalToken } : {}),
-        ...(useIncrementalNudge
-          ? { postApproveRedispatchCount: opts.postApproveRedispatchCount }
-          : {}),
         ...(promptSpecRound !== undefined ? { currentSpecRound: promptSpecRound } : {}),
         ...(imagePaths.length ? { imagePaths } : {}),
+        ...(opts.serverReviewCheckout ? { serverReviewCheckout: opts.serverReviewCheckout } : {}),
         ...(opts.serverBatch ? { serverBatch: opts.serverBatch } : {}),
         ...(opts.serverAfterDone ? { serverAfterDone: opts.serverAfterDone } : {}),
         ...(opts.serverFindingsDigest ? { serverFindingsDigest: opts.serverFindingsDigest } : {}),
@@ -10284,14 +10544,21 @@ export class AgentManager {
     taskId: string,
     opts: {
       expectedGeneration?: string;
+      expectedTask?: TaskGenerationGuard;
       pendingBudget?: { since: number; budgetAlerted?: boolean };
       onQaAcquired?: (lockToken: string) => void;
+      onSideEffect?: () => void;
     } = {},
   ): Promise<TaskState> {
-    const claimed = await this.claimGitReviewDispatch(taskId, opts.expectedGeneration);
+    const claimed = await this.claimGitReviewDispatch(
+      taskId,
+      opts.expectedGeneration,
+      opts.expectedTask,
+    );
     if (!claimed) {
       throw new ApiError(409, `Git review dispatch for ${taskId} was already claimed or superseded`, 'dispatch-superseded');
     }
+    opts.onSideEffect?.();
     const { task, lease } = claimed;
     const qaId = task.qaAgentId;
     if (!qaId || !this.gitReviewQaConfigUsable(task)) {
@@ -10307,6 +10574,7 @@ export class AgentManager {
         throw new ApiError(
           409,
           `QA agent ${qaId} is awaiting human (${previousQa.awaitingPhase ?? 'unknown phase'})`,
+          'dispatch-unsupported',
         );
       }
       const released = await this.releaseAgentForTask(qaId, taskId, 'idle', {
@@ -10328,12 +10596,14 @@ export class AgentManager {
         await this.resetGitReviewDispatchClaim(taskId, lease);
         throw new ApiError(409, `QA agent ${qaId} could not be released for git review dispatch`);
       }
+      opts.onSideEffect?.();
     }
 
     let acquiredLockToken: string | undefined;
     const acquired = await this.acquireAgentForTask(qaId, taskId, qaPhase, {
       onAcquired: token => {
         acquiredLockToken = token;
+        opts.onSideEffect?.();
         opts.onQaAcquired?.(token);
       },
     });
@@ -10436,15 +10706,20 @@ export class AgentManager {
       bumpRound?: boolean;
       expectSignalToken?: string;
       expectPhase?: TaskPhase;
+      expectedTask?: TaskGenerationGuard;
       qaPhase?: 'review' | 'recheck';
       pendingBudget?: { since: number; budgetAlerted?: boolean };
       onPassArmed?: (armedToken: string) => void;
       onQaAcquired?: (lockToken: string) => void;
+      onSideEffect?: () => void;
       confirmUncertainNotDelivered?: boolean;
     } = {},
   ): Promise<TaskState> {
     let routeTask = await this.taskStore.get(taskId);
     if (routeTask?.reviewMode === 'git' && !isSpecStagePhase(routeTask.phase)) {
+      if (opts.expectedTask && !taskMatchesGeneration(routeTask, opts.expectedTask)) {
+        throw new ApiError(409, `Task ${taskId} review generation changed during redispatch`, 'dispatch-superseded');
+      }
       if (opts.fromStatus && !opts.fromStatus.includes(routeTask.status)) {
         throw new ApiError(
           409,
@@ -10457,6 +10732,13 @@ export class AgentManager {
       }
       if (Object.hasOwn(opts, 'expectPhase') && routeTask.phase !== opts.expectPhase) {
         throw new ApiError(409, `Task ${taskId} review phase changed during redispatch`, 'dispatch-superseded');
+      }
+      if (!routeTask.qaAgentId || this.getAgentConfig(routeTask.qaAgentId)?.role !== 'qa') {
+        throw new ApiError(
+          409,
+          `Task ${taskId} has no available QA participant`,
+          'dispatch-unsupported',
+        );
       }
       let lease = routeTask.reviewDispatch;
       if (lease?.phase === 'uncertain') {
@@ -10487,17 +10769,52 @@ export class AgentManager {
         }
         routeTask = confirmed;
         lease = confirmed.reviewDispatch;
+        opts.onSideEffect?.();
+        if (opts.expectedTask && !taskMatchesGeneration(routeTask, opts.expectedTask)) {
+          throw new ApiError(
+            409,
+            `Task ${taskId} review generation changed during uncertain-delivery confirmation`,
+            'dispatch-superseded',
+          );
+        }
       }
+      const routeQaId = routeTask.qaAgentId;
+      if (!routeQaId || this.getAgentConfig(routeQaId)?.role !== 'qa') {
+        throw new ApiError(
+          409,
+          `Task ${taskId} has no available QA participant`,
+          'dispatch-unsupported',
+        );
+      }
+      const qaBinding = await this.agentStore.get(routeQaId);
+      if (qaBinding?.taskId === taskId
+        && qaBinding.status === 'awaiting_human'
+        && !isRecoverableQaDispatchHold(qaBinding)) {
+        throw new ApiError(
+          409,
+          `QA agent ${routeQaId} is awaiting human (${qaBinding.awaitingPhase ?? 'unknown phase'})`,
+          'dispatch-unsupported',
+        );
+      }
+      let dispatchExpectedTask = opts.expectedTask;
       if (lease === undefined) {
         if (routeTask.prNumber === undefined) {
-          throw new ApiError(400, `Task ${taskId} has no PR yet; cannot dispatch review`);
+          throw new ApiError(400, `Task ${taskId} has no PR yet; cannot dispatch review`, 'dispatch-unsupported');
         }
         const verified = await this.platformVerifyPrBinding(taskId, routeTask.prNumber);
         if (!verified.ok) {
-          throw new ApiError(409, `Cannot dispatch git review for ${taskId}: binding ${verified.reason}`);
+          throw new ApiError(
+            409,
+            `Cannot dispatch git review for ${taskId}: binding ${verified.reason}`,
+            'dispatch-unsupported',
+          );
         }
         if (!PLATFORM_HEAD_SHA_RE.test(verified.headSha)) {
-          throw new ApiError(502, `Cannot dispatch git review for ${taskId}: invalid platform head`);
+          throw new ApiError(
+            502,
+            `Cannot dispatch git review for ${taskId}: invalid platform head`,
+            'dispatch-unsupported',
+          );
         }
         const begun = await this.beginGitReviewPass(taskId, {
           fromStatus: [routeTask.status],
@@ -10506,17 +10823,27 @@ export class AgentManager {
           ...(opts.qaPhase !== undefined ? { qaPhase: opts.qaPhase } : {}),
           expectSignalToken: routeTask.signalToken,
           expectPhase: routeTask.phase,
+          ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
           patch: { latestHeadSha: verified.headSha },
         });
         if (!begun?.task.reviewDispatch) {
           throw new ApiError(409, `Task ${taskId} changed before git review pass creation`, 'dispatch-superseded');
         }
+        opts.onSideEffect?.();
         lease = begun.task.reviewDispatch;
+        if (opts.expectedTask) {
+          dispatchExpectedTask = {
+            ...opts.expectedTask,
+            signalToken: begun.task.signalToken,
+          };
+        }
       }
       const dispatched = await this.dispatchGitReviewLease(taskId, {
         expectedGeneration: lease.generation,
+        ...(dispatchExpectedTask !== undefined ? { expectedTask: dispatchExpectedTask } : {}),
         ...(opts.pendingBudget !== undefined ? { pendingBudget: opts.pendingBudget } : {}),
         ...(opts.onQaAcquired !== undefined ? { onQaAcquired: opts.onQaAcquired } : {}),
+        ...(opts.onSideEffect !== undefined ? { onSideEffect: opts.onSideEffect } : {}),
       });
       opts.onPassArmed?.(lease.signalToken);
       return dispatched;
@@ -10533,10 +10860,21 @@ export class AgentManager {
           'dispatch-in-flight',
         );
       }
+      // 早闸在 claim 前零副作用拒绝：driver 的 putRound/删 response 副作用都在终闸之前。
+      if (this.phaseSignalWatcher?.isSettling(taskId)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} has a review completion settling; retry after it lands`,
+          'review-settling',
+        );
+      }
       const task = await this.taskStore.get(taskId);
       if (!task) throw new ApiError(404, `Task ${taskId} not found`);
       if (task.reviewMode !== 'server' && !isSpecStagePhase(task.phase)) {
         throw new ApiError(409, `Task ${taskId} review mode changed during dispatch; retry`, 'dispatch-superseded');
+      }
+      if (opts.expectedTask && !taskMatchesGeneration(task, opts.expectedTask)) {
+        throw new ApiError(409, `Task ${taskId} review generation changed during redispatch`, 'dispatch-superseded');
       }
       if (opts.fromStatus && !opts.fromStatus.includes(task.status)) {
         throw new ApiError(
@@ -10563,30 +10901,50 @@ export class AgentManager {
         throw new ApiError(
           409,
           `Task ${taskId} status is ${task.status}; manual server-side review requires ${MANUAL_SERVER_REVIEW_STATUSES.join('/')}`,
+          'dispatch-unsupported',
         );
       }
       if (!this.serverReviewDriver) {
-        throw new ApiError(409, `Server review pipeline is not configured; cannot dispatch review for ${taskId}`);
+        throw new ApiError(
+          409,
+          `Server review pipeline is not configured; cannot dispatch review for ${taskId}`,
+          'dispatch-unsupported',
+        );
       }
       if (task.status === 'in_progress' && task.phase === undefined) {
         throw new ApiError(
           409,
           `Task ${taskId} has no phase yet (the dev has not delivered spec-done/code-done); wait for the dev signal or use Cancel/Retry`,
+          'dispatch-unsupported',
         );
       }
       const qaAvailable = task.qaAgentId !== undefined && this.getAgentConfig(task.qaAgentId)?.role === 'qa';
       if (!qaAvailable) {
-        throw new ApiError(400, `Task ${taskId} has no QA partner configured; manual review requires a QA agent`);
+        throw new ApiError(
+          400,
+          `Task ${taskId} has no QA partner configured; manual review requires a QA agent`,
+          'dispatch-unsupported',
+        );
       }
       const isSpec = isSpecStagePhase(task.phase);
+      const qaBinding = await this.agentStore.get(task.qaAgentId!);
+      const bumpRound = shouldBumpServerReviewRound(opts.bumpRound, task, qaBinding);
       const cap = this.config.review.rounds + (task.maxRoundsContinues ?? 0);
       const round = isSpec ? (task.specReviewRound ?? 0) : task.reviewRound;
-      const nextRound = opts.bumpRound === false ? round : round + 1;
+      const nextRound = bumpRound ? round + 1 : round;
       if (nextRound < 1) {
-        throw new ApiError(409, `Task ${taskId} has no current review round to redispatch`);
+        throw new ApiError(
+          409,
+          `Task ${taskId} has no current review round to redispatch`,
+          'dispatch-unsupported',
+        );
       }
       if (nextRound > cap) {
-        throw new ApiError(409, `Task ${taskId} reached the review round cap (${cap}); continue or cancel it instead`);
+        throw new ApiError(
+          409,
+          `Task ${taskId} reached the review round cap (${cap}); continue or cancel it instead`,
+          'dispatch-unsupported',
+        );
       }
       this.manualReviewInFlight.add(taskId);
       return {
@@ -10595,8 +10953,12 @@ export class AgentManager {
           status: task.status,
           phase: task.phase,
           signalToken: task.signalToken,
+          agentId: task.agentId,
+          reviewRound: task.reviewRound,
+          specReviewRound: task.specReviewRound,
         },
-        bumpRound: opts.bumpRound,
+        bumpRound,
+        onSideEffect: opts.onSideEffect,
       };
     });
 
@@ -10607,32 +10969,39 @@ export class AgentManager {
     taskId: string,
     claim: {
       isSpec: boolean;
-      reviewPass: Pick<TaskState, 'status' | 'phase' | 'signalToken'>;
-      bumpRound?: boolean;
+      reviewPass: TaskGenerationGuard;
+      bumpRound: boolean;
+      onSideEffect?: () => void;
     },
   ): Promise<TaskState> {
     try {
-      // 不在此处预释放旧 QA：可失败的准备工作（读 diff/spec、存轮次）失败时旧 pass 必须原样保留；
-      // 同任务的 QA 重新绑定由 dispatchServerReviewToQa 在派发前完成
-      const fresh = await this.taskStore.get(taskId);
-      if (!fresh
-        || fresh.status !== claim.reviewPass.status
-        || fresh.phase !== claim.reviewPass.phase
-        || fresh.signalToken !== claim.reviewPass.signalToken
-        || !MANUAL_SERVER_REVIEW_STATUSES.includes(fresh.status)) {
-        throw new ApiError(409, `Task ${taskId} changed during manual review dispatch; aborting`);
-      }
-      const dispatched = claim.isSpec
-        ? claim.bumpRound === false
-          ? await this.serverReviewDriver!.dispatchSpecReview(fresh, { bumpRound: false })
-          : await this.serverReviewDriver!.dispatchSpecReview(fresh)
-        : claim.bumpRound === false
-          ? await this.serverReviewDriver!.dispatchCodeReview(fresh, { bumpRound: false })
-          : await this.serverReviewDriver!.dispatchCodeReview(fresh);
-      if (!dispatched) {
-        throw new ApiError(500, `Manual review dispatch for ${taskId} did not start; check the event feed for the cause`);
-      }
-      return (await this.taskStore.get(taskId))!;
+      const run = async (ownerPermit?: unknown): Promise<TaskState> => {
+        // 不在此处预释放旧 QA：可失败的准备工作（读 diff/spec、存轮次）失败时旧 pass 必须原样保留；
+        // 同任务的 QA 重新绑定由 dispatchServerReviewToQa 在派发前完成。
+        // 先入的结算持互斥跑完后，下面的任务代 CAS 拒绝本次手工；反向由 owner permit 过终闸。
+        const fresh = await this.taskStore.get(taskId);
+        if (!fresh
+          || !taskMatchesGeneration(fresh, claim.reviewPass)
+          || !MANUAL_SERVER_REVIEW_STATUSES.includes(fresh.status)) {
+          throw new ApiError(409, `Task ${taskId} changed during manual review dispatch; aborting`);
+        }
+        const driverOpts = {
+          bumpRound: claim.bumpRound,
+          expectedTask: claim.reviewPass,
+          ...(claim.onSideEffect !== undefined ? { onSideEffect: claim.onSideEffect } : {}),
+          ...(ownerPermit !== undefined ? { settlePermit: ownerPermit } : {}),
+        };
+        const dispatched = claim.isSpec
+          ? await this.serverReviewDriver!.dispatchSpecReview(fresh, driverOpts)
+          : await this.serverReviewDriver!.dispatchCodeReview(fresh, driverOpts);
+        if (!dispatched) {
+          throw new ApiError(500, `Manual review dispatch for ${taskId} did not start; check the event feed for the cause`);
+        }
+        return (await this.taskStore.get(taskId))!;
+      };
+      return this.phaseSignalWatcher
+        ? await this.phaseSignalWatcher.runExclusive(taskId, run)
+        : await run();
     } finally {
       this.manualReviewInFlight.delete(taskId);
     }
@@ -11638,34 +12007,59 @@ export class AgentManager {
     return { token: result.token, armed: result.armed };
   }
 
-  async parkTaskAtSpecReady(taskId: string, opts: { specReviewRound?: number } = {}): Promise<TaskState | null> {
+  async parkTaskAtSpecReady(
+    taskId: string,
+    opts: { specReviewRound?: number; expectedTask?: TaskGenerationGuard } = {},
+  ): Promise<TaskState | null> {
     const task = await this.taskStore.get(taskId);
     if (!task) return null;
     const transition = await this.transitionTaskStatus(
       taskId,
       'spec-ready',
-      { fromStatus: ['review', 'in_progress', 'fixing'] },
+      {
+        fromStatus: ['review', 'in_progress', 'fixing'],
+        ...(opts.expectedTask !== undefined ? { expectTask: opts.expectedTask } : {}),
+      },
       {
         phase: 'spec',
         ...(opts.specReviewRound !== undefined ? { specReviewRound: opts.specReviewRound } : {}),
       },
     );
     if (!transition) return null;
+    const parked = transition.task;
+    const parkedGeneration: TaskGenerationGuard = {
+      status: parked.status,
+      phase: parked.phase,
+      signalToken: parked.signalToken,
+      agentId: parked.agentId,
+      reviewRound: parked.reviewRound,
+      specReviewRound: parked.specReviewRound,
+    };
     this.stopPhaseSignalWatcher(taskId);
-    if (task.agentId) {
-      const devOk = await this.markAgentWaiting(task.agentId, taskId).catch(() => false);
+    if (parked.agentId) {
+      const devOk = await this.markAgentWaiting(parked.agentId, taskId, {
+        expectedTask: parkedGeneration,
+      }).catch(() => false);
       if (!devOk) {
-        await this.emitIntervention(task.projectId, task.agentId, taskId, { phase: 'spec-ready-dev-park-failed', devAgentId: task.agentId });
+        await this.emitIntervention(parked.projectId, parked.agentId, taskId, {
+          phase: 'spec-ready-dev-park-failed',
+          devAgentId: parked.agentId,
+        });
       }
     }
-    if (task.qaAgentId) {
-      const released = await this.releaseAgentForTask(task.qaAgentId, taskId, 'idle')
+    if (parked.qaAgentId) {
+      const released = await this.releaseAgentForTask(parked.qaAgentId, taskId, 'idle', {
+        expectedTask: parkedGeneration,
+      })
         .catch(() => false);
       if (!released) {
-        await this.emitIntervention(task.projectId, task.qaAgentId, taskId, { phase: 'spec-ready-qa-release-failed', qaAgentId: task.qaAgentId });
+        await this.emitIntervention(parked.projectId, parked.qaAgentId, taskId, {
+          phase: 'spec-ready-qa-release-failed',
+          qaAgentId: parked.qaAgentId,
+        });
       }
     }
-    return transition.task;
+    return parked;
   }
 
   async submitSpecVerdict(
@@ -12075,8 +12469,15 @@ export class AgentManager {
       : this.continueSession(task.id, devAgentId, 'code', dispatchOpts);
   }
 
-  async transitionToCodePhase(taskId: string): Promise<TaskState | null> {
-    const task = await this.taskStore.get(taskId);
+  async transitionToCodePhase(
+    taskId: string,
+    expectedTask?: TaskGenerationGuard,
+  ): Promise<TaskState | null> {
+    const task = await this.withTaskLock(async () => {
+      const current = await this.taskStore.get(taskId);
+      if (expectedTask && current && !taskMatchesGeneration(current, expectedTask)) return null;
+      return current;
+    });
     if (!task) return null;
     const devAgentId = task.devAgentId;
     const dev = devAgentId ? this.getAgentConfig(devAgentId) : undefined;
@@ -12100,7 +12501,10 @@ export class AgentManager {
     const researchHandoff = this.isResearchHandoff(task, devAgentId);
 
     const releaseParticipant = async (agentId: string, failurePhase: string): Promise<boolean> => {
-      const released = await this.releaseAgentIfBound(agentId, taskId, { allowAwaitingHuman: true })
+      const released = await this.releaseAgentIfBound(agentId, taskId, {
+        allowAwaitingHuman: true,
+        ...(expectedTask !== undefined ? { expectedTask } : {}),
+      })
         .catch(() => false);
       if (!released) {
         await this.emitIntervention(task.projectId, agentId, taskId, { phase: failurePhase, agentId });
@@ -12116,7 +12520,10 @@ export class AgentManager {
     }
 
     const devBoundBefore = (await this.agentStore.get(devAgentId))?.taskId === taskId;
-    const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'code');
+    let acquiredLockToken: string | undefined;
+    const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'code', {
+      onAcquired: token => { acquiredLockToken = token; },
+    });
     if (!acquired) {
       await this.emitIntervention(task.projectId, devAgentId, taskId, {
         phase: 'code-dev-acquire-failed',
@@ -12124,19 +12531,33 @@ export class AgentManager {
       });
       return null;
     }
-    const acquiredLockToken = (await this.agentStore.get(devAgentId))?.lockToken;
 
     const newToken = createSignalToken();
     // spec 阶段的扩轮决策不延续到 code 评审：cap 共享字段，进入编码时归零
     const transition = await this.transitionTaskStatus(
       taskId,
       'in_progress',
-      { fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready', 'max_rounds'] },
+      {
+        fromStatus: ['review', 'fixing', 'in_progress', 'spec-ready', 'max_rounds'],
+        ...(expectedTask !== undefined ? { expectTask: expectedTask } : {}),
+      },
       { agentId: devAgentId, phase: 'code', maxRoundsContinues: 0, ...this.dispatchTokenFields({ ...task, phase: 'code' }, newToken) },
     );
     if (!transition) {
-      await this.releaseAgentForTask(devAgentId, taskId, 'idle', { allowAwaitingHuman: true })
-        .catch(() => undefined);
+      if (!devBoundBefore) {
+        try {
+          await this.releaseAgentForTask(devAgentId, taskId, 'idle', {
+            allowAwaitingHuman: true,
+            ...(expectedTask !== undefined ? { expectedTask } : {}),
+            ...(acquiredLockToken !== undefined ? { expectedLockToken: acquiredLockToken } : {}),
+          });
+        } catch (err) {
+          console.warn(
+            `[AgentManager] transitionToCodePhase(${taskId}): stale-generation acquire rollback failed:`,
+            err,
+          );
+        }
+      }
       return null;
     }
     this.stopPhaseSignalWatcher(taskId);
@@ -12238,6 +12659,9 @@ export class AgentManager {
       priorResponseJson?: string;
       reviewHeadAnchorSha?: string;
       callerOwnsConsumedSignalFailure?: boolean;
+      settlePermit?: unknown;
+      expectedTask?: TaskGenerationGuard;
+      onSideEffect?: () => void;
     },
   ): Promise<TaskState | null> {
     const dispatchPhase = opts.phase === 'spec'
@@ -12246,10 +12670,28 @@ export class AgentManager {
     const expectedKind: PhaseSignalKind = opts.phase === 'spec' ? 'spec-reviewed' : 'code-reviewed';
 
     const claim = await this.withTaskLock(async () => {
+      // 终闸与 newToken 铸发同临界区：settling 中仅结算 handler 链（settle permit）
+      // 或当前互斥 FIFO owner（手工先入者）可开新 pass。
+      if (this.phaseSignalWatcher?.isSettling(taskId)
+        && !this.phaseSignalWatcher.settlePermitMatches(taskId, opts.settlePermit)
+        && !this.phaseSignalWatcher.exclusiveOwnerMatches(taskId, opts.settlePermit)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} has a review completion settling; retry after it lands`,
+          'review-settling',
+        );
+      }
       const task = await this.taskStore.get(taskId);
       if (!task) throw new Error(`dispatchServerReviewToQa: task ${taskId} not found`);
       if (task.reviewMode !== 'server' && opts.phase !== 'spec') {
         throw new Error(`dispatchServerReviewToQa: task ${taskId} is not in server review mode`);
+      }
+      if (opts.expectedTask && !taskMatchesGeneration(task, opts.expectedTask)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} review generation changed before server dispatch`,
+          'dispatch-superseded',
+        );
       }
       const qaId = task.qaAgentId;
       if (!qaId) {
@@ -12279,11 +12721,13 @@ export class AgentManager {
         return null;
       }
       const roundField = opts.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+      const qaBinding = await this.agentStore.get(qaId);
+      const bumpRound = shouldBumpServerReviewRound(opts.bumpRound, task, qaBinding);
       const newRound = opts.continuation
         ? Math.max(roundField, 1)
-        : opts.bumpRound === false
-          ? roundField
-          : roundField + 1;
+        : bumpRound
+          ? roundField + 1
+          : roundField;
       if (newRound < 1) {
         throw new Error(`dispatchServerReviewToQa: task ${taskId} has no current ${opts.phase} review round to redispatch`);
       }
@@ -12299,14 +12743,13 @@ export class AgentManager {
         originalBatchIndex: task.batchIndex,
         originalBatchTotal: task.batchTotal,
         originalPhase: task.phase,
+        originalReviewCheckoutMode: task.reviewCheckoutMode,
       };
     });
     if (!claim) return null;
     const { qaId, devAgentId, projectId, newToken, newRound } = claim;
 
-    const rollback = async (
-      installedPass: Pick<TaskState, 'status' | 'phase' | 'signalToken'>,
-    ): Promise<boolean> => {
+    const rollback = async (installedPass: TaskGenerationGuard): Promise<boolean> => {
       try {
         return (await this.transitionTaskStatus(
           taskId,
@@ -12315,12 +12758,15 @@ export class AgentManager {
             fromStatus: [installedPass.status],
             expectPhase: installedPass.phase,
             expectSignalToken: installedPass.signalToken,
+            expectTask: installedPass,
           },
           {
             signalToken: claim.originalToken,
             batchIndex: claim.originalBatchIndex,
             batchTotal: claim.originalBatchTotal,
             phase: claim.originalPhase,
+            // fresh 派发在 install 时清过 mode：不还原会把仍在跑的 base pass 降级成 unknown
+            reviewCheckoutMode: claim.originalReviewCheckoutMode,
             ...(opts.phase === 'spec'
               ? { specReviewRound: claim.originalRound }
               : { reviewRound: claim.originalRound }),
@@ -12367,17 +12813,39 @@ export class AgentManager {
     if (!opts.continuation) {
       const prevQa = await this.agentStore.get(qaId);
       if (prevQa?.taskId === taskId) {
-        // 手工重派：上一 pass 的 QA 仍绑定本任务，先释放再重新 acquire（与 github 手工路径一致）
+        if (prevQa.status === 'awaiting_human' && !isRecoverableQaDispatchHold(prevQa)) {
+          throw new ApiError(
+            409,
+            `QA agent ${qaId} is awaiting human (${prevQa.awaitingPhase ?? 'unknown phase'}); resolve that hold before redispatching server review`,
+            'dispatch-unsupported',
+          );
+        }
+        // 手工重派：上一 pass 的 QA 仍绑定本任务，先释放再重新 acquire
         const released = await this.releaseAgentForTask(qaId, taskId, 'idle', {
+          ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
           ...(prevQa.lockToken !== undefined ? { expectedLockToken: prevQa.lockToken } : {}),
+          ...(prevQa.status === 'awaiting_human'
+            ? {
+                allowAwaitingHuman: true,
+                expectedHold: {
+                  phase: prevQa.awaitingPhase,
+                  since: prevQa.awaitingSince,
+                  nonce: prevQa.awaitingNonce,
+                },
+              }
+            : {}),
         });
         if (!released) {
           await rearmEntrySignal();
           return null;
         }
+        opts.onSideEffect?.();
       }
       const acquired = await this.acquireAgentForTask(qaId, taskId, dispatchPhase, {
-        onAcquired: (lockToken) => { acquiredLockToken = lockToken; },
+        onAcquired: (lockToken) => {
+          acquiredLockToken = lockToken;
+          opts.onSideEffect?.();
+        },
       });
       if (!acquired) {
         await rearmEntrySignal();
@@ -12390,7 +12858,9 @@ export class AgentManager {
         return null;
       }
       if (devAgentId) {
-        const devOk = await this.markAgentWaiting(devAgentId, taskId);
+        const devOk = await this.markAgentWaiting(devAgentId, taskId, {
+          ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
+        });
         if (!devOk) {
           await releaseOwnAcquire('dev park failed');
           await rearmEntrySignal();
@@ -12427,6 +12897,7 @@ export class AgentManager {
         fromStatus: [claim.originalStatus],
         expectPhase: claim.originalPhase,
         expectSignalToken: claim.originalToken,
+        ...(opts.expectedTask !== undefined ? { expectTask: opts.expectedTask } : {}),
       },
       {
         signalToken: newToken,
@@ -12454,16 +12925,19 @@ export class AgentManager {
       }
       return null;
     }
-    const installedPass = {
-      status: transition.task.status,
-      phase: transition.task.phase,
-      signalToken: transition.task.signalToken,
+    opts.onSideEffect?.();
+    const installedPass = taskGenerationGuard(transition.task);
+    const passStillCurrent = async (): Promise<boolean> => {
+      const current = await this.taskStore.get(taskId);
+      return current !== null && taskMatchesGeneration(current, installedPass);
     };
 
     let dispatchedCheckoutMode: 'head' | 'base' | undefined;
     const sessionOpts = {
       bypassTaskStatusGate: true,
       signalToken: newToken,
+      dispatchPassToken: newToken,
+      guardBeforeInject: passStillCurrent,
       serverContent: opts.content,
       ...(opts.interdiff !== undefined ? { serverInterdiff: opts.interdiff } : {}),
       ...(opts.diffstat !== undefined ? { serverDiffstat: opts.diffstat } : {}),
@@ -12474,7 +12948,9 @@ export class AgentManager {
       ...(opts.priorFindingsJson ? { serverPriorFindings: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { serverPriorResponse: opts.priorResponseJson } : {}),
       ...(opts.phase === 'spec' ? { currentSpecRound: newRound } : {}),
-      armBeforeInject: (ctx: DispatchArmContext) => {
+      armBeforeInject: (ctx: DispatchArmContext) => this.withTaskLock(async () => {
+        const current = await this.taskStore.get(taskId);
+        if (!current || !taskMatchesGeneration(current, installedPass)) return false;
         dispatchedCheckoutMode = ctx.serverReviewCheckout;
         const allowReadFile = opts.phase === 'spec' || opts.continuation || ctx.serverReviewCheckout === 'base';
         return this.setupPhaseSignalWatcher(taskId, qaId, expectedKind, newToken, {
@@ -12483,7 +12959,7 @@ export class AgentManager {
             ? { onReadFile: (req: ReadFileSignal) => { void this.handleReadFileRequest(taskId, qaId, req); } }
             : {}),
         });
-      },
+      }),
     };
     const rearmConsumedSignal = async () => {
       if (opts.callerOwnsConsumedSignalFailure) return;
@@ -12496,17 +12972,21 @@ export class AgentManager {
 
     let started = false;
     try {
+      // 批次轮早于 head 物化且其持久化 mode 不可信（改名丢失/尽力而为），续传恒重发 base。
       started = opts.continuation
-        ? await this.continueSession(taskId, qaId, dispatchPhase, sessionOpts)
+        ? await this.continueSession(taskId, qaId, dispatchPhase, { ...sessionOpts, serverReviewCheckout: 'base' })
         : await this.startSession(taskId, qaId, dispatchPhase, sessionOpts);
     } catch (err) {
-      this.stopPhaseSignalWatcher(taskId);
+      this.phaseSignalWatcher?.stopAgentIfToken(taskId, qaId, newToken);
       if (err instanceof DispatchTerminalError) {
-        await this.failTaskForDispatchError(taskId, dispatchPhase, qaId, err, ownAcquire());
+        await this.failTaskForDispatchError(taskId, dispatchPhase, qaId, err, {
+          ...ownAcquire(),
+          expectedTask: installedPass,
+        });
       } else if (err instanceof EnsureSessionError && err.partial.handled) {
       } else {
         const rolledBack = await rollback(installedPass);
-        if (!opts.continuation) {
+        if (rolledBack && !opts.continuation) {
           await releaseOwnAcquire('session dispatch threw');
         }
         if (rolledBack) await rearmConsumedSignal();
@@ -12514,13 +12994,13 @@ export class AgentManager {
       throw err;
     }
     if (!started) {
-      this.stopPhaseSignalWatcher(taskId);
+      this.phaseSignalWatcher?.stopAgentIfToken(taskId, qaId, newToken);
       const rolledBack = await rollback(installedPass);
-      if (!opts.continuation) {
+      if (rolledBack && !opts.continuation) {
         await releaseOwnAcquire('session did not start');
       }
       if (rolledBack) await rearmConsumedSignal();
-      if (!opts.callerOwnsConsumedSignalFailure) {
+      if (rolledBack && !opts.callerOwnsConsumedSignalFailure) {
         await this.emitIntervention(projectId, qaId, taskId, {
           phase: 'server-review-start-failed',
           qaAgentId: qaId,
@@ -12532,7 +13012,18 @@ export class AgentManager {
     // Persist the checkout mode so base-mode recovery can re-arm read-file.
     if (opts.phase !== 'spec' && !opts.continuation) {
       try {
-        await this.updateTask(taskId, { reviewCheckoutMode: dispatchedCheckoutMode });
+        const persisted = await this.updateTaskIfStatus(
+          taskId,
+          installedPass.status,
+          { reviewCheckoutMode: dispatchedCheckoutMode },
+          installedPass,
+        );
+        if (!persisted) {
+          console.warn(
+            `[AgentManager] review checkout mode for ${taskId} was superseded before persistence; skipping stale write`,
+          );
+          return await this.taskStore.get(taskId);
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.warn(`[AgentManager] failed to persist review checkout mode for ${taskId}: ${message}`);
@@ -12549,13 +13040,23 @@ export class AgentManager {
   async dispatchServerFixToDev(
     taskId: string,
     _findingsJson: string,
-    opts: { callerOwnsConsumedSignalFailure?: boolean } = {},
+    opts: {
+      callerOwnsConsumedSignalFailure?: boolean;
+      expectedTask?: TaskGenerationGuard;
+    } = {},
   ): Promise<TaskState | null> {
     const claim = await this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task) throw new Error(`dispatchServerFixToDev: task ${taskId} not found`);
       if (task.reviewMode !== 'server' && !isSpecStagePhase(task.phase)) {
         throw new Error(`dispatchServerFixToDev: task ${taskId} is not in server review mode`);
+      }
+      if (opts.expectedTask && !taskMatchesGeneration(task, opts.expectedTask)) {
+        throw new ApiError(
+          409,
+          `Task ${taskId} review generation changed before server fix dispatch`,
+          'dispatch-superseded',
+        );
       }
       if (!task.agentId) throw new Error(`dispatchServerFixToDev: task ${taskId} has no dev agent`);
       return {
@@ -12568,39 +13069,60 @@ export class AgentManager {
         currentSpecRound: task.specReviewRound,
         originalStatus: task.status as TaskStatus,
         originalToken: task.signalToken,
+        entryGeneration: taskGenerationGuard(task),
       };
     });
     if (!claim) return null;
-    const { devAgentId, qaAgentId, projectId, newToken, taskPhase, currentSpecRound } = claim;
-    const rollbackToEntry = async () => {
-      await this.transitionTaskStatus(
-        taskId,
-        claim.originalStatus,
-        { fromStatus: ['fixing'] },
-        { signalToken: claim.originalToken },
-      ).catch(() => undefined);
-    };
+    const {
+      devAgentId,
+      qaAgentId,
+      projectId,
+      newToken,
+      taskPhase,
+      currentSpecRound,
+      entryGeneration,
+    } = claim;
     const expectedKind: PhaseSignalKind = taskPhase === 'spec' ? 'spec-fixed' : 'code-fixed';
-    const rearmReviewedSignal = async () => {
+    const rearmReviewedSignal = async (expectedTask: TaskGenerationGuard = entryGeneration) => {
       if (opts.callerOwnsConsumedSignalFailure) return;
       if (!qaAgentId) return;
       const reviewedKind: PhaseSignalKind = taskPhase === 'spec' ? 'spec-reviewed' : 'code-reviewed';
-      await this.setupPhaseSignal(taskId, qaAgentId, reviewedKind, { skipSnapshot: true });
+      await this.withTaskLock(async () => {
+        const current = await this.taskStore.get(taskId);
+        if (!current?.signalToken || !taskMatchesGeneration(current, expectedTask)) return;
+        await this.setupPhaseSignal(taskId, qaAgentId, reviewedKind, {
+          skipSnapshot: true,
+        });
+      });
     };
 
     const devBoundBefore = (await this.agentStore.get(devAgentId))?.taskId === taskId;
-    const releaseFreshAcquire = async (): Promise<void> => {
+    let acquiredDevLockToken: string | undefined;
+    const releaseFreshAcquire = async (devLockToken: string): Promise<void> => {
       if (devBoundBefore) return;
-      const released = await this.releaseAgentForTask(devAgentId, taskId, 'idle')
-        .catch(() => false);
-      if (!released) {
+      try {
+        const released = await this.releaseAgentForTask(devAgentId, taskId, 'idle', {
+          expectedTask: entryGeneration,
+          expectedLockToken: devLockToken,
+        });
+        if (!released) {
+          console.error(
+            `[AgentManager] dispatchServerFixToDev: releasing freshly acquired dev `
+            + `${devAgentId} for ${taskId} was refused`,
+          );
+        }
+      } catch (err) {
         console.error(
-          `[AgentManager] dispatchServerFixToDev: releasing freshly acquired dev ${devAgentId} for ${taskId} failed`,
+          `[AgentManager] dispatchServerFixToDev: releasing freshly acquired dev `
+          + `${devAgentId} for ${taskId} failed:`,
+          err,
         );
       }
     };
 
-    const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'server-feedback');
+    const acquired = await this.acquireAgentForTask(devAgentId, taskId, 'server-feedback', {
+      onAcquired: (lockToken) => { acquiredDevLockToken = lockToken; },
+    });
     if (!acquired) {
       await rearmReviewedSignal();
       if (!opts.callerOwnsConsumedSignalFailure) {
@@ -12611,12 +13133,28 @@ export class AgentManager {
       }
       return null;
     }
+    const devLockToken = acquiredDevLockToken;
+    if (!devLockToken) {
+      throw new Error(
+        `dispatchServerFixToDev: acquireAgentForTask did not return the Dev lock token for ${devAgentId}`,
+      );
+    }
 
     if (qaAgentId) {
-      const released = await this.releaseAgentIfBound(qaAgentId, taskId)
-        .catch(() => false);
+      const released = await this.releaseAgentIfBound(
+        qaAgentId,
+        taskId,
+        { expectedTask: entryGeneration },
+      )
+        .catch((err) => {
+          console.error(
+            `[AgentManager] dispatchServerFixToDev: releasing QA ${qaAgentId} for ${taskId} failed:`,
+            err,
+          );
+          return false;
+        });
       if (!released) {
-        await releaseFreshAcquire();
+        await releaseFreshAcquire(devLockToken);
         await rearmReviewedSignal();
         if (!opts.callerOwnsConsumedSignalFailure) {
           await this.emitIntervention(projectId, qaAgentId, taskId, {
@@ -12631,11 +13169,16 @@ export class AgentManager {
     const transition = await this.transitionTaskStatus(
       taskId,
       'fixing',
-      { fromStatus: ['review', 'max_rounds', 'spec-ready', 'ready'] },
+      {
+        fromStatus: ['review', 'max_rounds', 'spec-ready', 'ready'],
+        expectSignalToken: claim.originalToken,
+        expectTask: entryGeneration,
+        expectAgentLock: { agentId: devAgentId, token: devLockToken },
+      },
       { signalToken: newToken, fixDispatchedAt: new Date().toISOString() },
     );
     if (!transition) {
-      await releaseFreshAcquire();
+      await releaseFreshAcquire(devLockToken);
       if (!opts.callerOwnsConsumedSignalFailure) {
         await this.emitIntervention(projectId, devAgentId, taskId, {
           phase: 'server-fix-transition-failed',
@@ -12644,6 +13187,58 @@ export class AgentManager {
       }
       return null;
     }
+
+    const installedFix = taskGenerationGuard(transition.task);
+    const fixingPassStillCurrent = async (): Promise<boolean> => {
+      const current = await this.taskStore.get(taskId);
+      return current !== null && taskMatchesGeneration(current, installedFix);
+    };
+    const rollbackToEntry = async (): Promise<TaskState | null> => {
+      try {
+        const rolledBack = await this.transitionTaskStatus(
+          taskId,
+          claim.originalStatus,
+          {
+            fromStatus: ['fixing'],
+            expectTask: installedFix,
+            expectAgentLock: { agentId: devAgentId, token: devLockToken },
+          },
+          { signalToken: claim.originalToken },
+        );
+        if (!rolledBack) {
+          console.warn(
+            `[AgentManager] dispatchServerFixToDev rollback for ${taskId} was superseded `
+            + `by a newer task or Dev lock generation`,
+          );
+        }
+        return rolledBack?.task ?? null;
+      } catch (err) {
+        console.error(`[AgentManager] dispatchServerFixToDev rollback failed for ${taskId}:`, err);
+        return null;
+      }
+    };
+    const cleanupUndeliveredFix = async (): Promise<boolean> => {
+      const rolledBack = await rollbackToEntry();
+      if (!rolledBack) return false;
+      const rolledBackGeneration = taskGenerationGuard(rolledBack);
+      const released = await this.releaseAgentForTask(devAgentId, taskId, 'idle', {
+        expectedTask: rolledBackGeneration,
+        expectedLockToken: devLockToken,
+      }).catch((err) => {
+        console.error(
+          `[AgentManager] dispatchServerFixToDev: releasing dev ${devAgentId} after rollback failed:`,
+          err,
+        );
+        return false;
+      });
+      if (!released) {
+        console.error(
+          `[AgentManager] dispatchServerFixToDev: releasing dev ${devAgentId} after rollback was refused`,
+        );
+      }
+      await rearmReviewedSignal(rolledBackGeneration);
+      return true;
+    };
 
     let resumed = false;
     try {
@@ -12664,26 +13259,35 @@ export class AgentManager {
         signalToken: newToken,
         serverPriorFindings: findingsJson,
         serverFindingsDigest: findingsDigest,
+        armBeforeInject: () => this.withTaskLock(async () => {
+          const current = await this.taskStore.get(taskId);
+          if (!current || !taskMatchesGeneration(current, installedFix)) return false;
+          return this.setupPhaseSignalWatcher(taskId, devAgentId, expectedKind, newToken, {
+            needInputMode: 'fresh',
+          });
+        }),
+        guardBeforeInject: fixingPassStillCurrent,
         ...(taskPhase === 'spec' && currentSpecRound !== undefined
           ? { currentSpecRound }
           : {}),
       });
     } catch (err) {
+      this.phaseSignalWatcher?.stopAgentIfToken(taskId, devAgentId, newToken);
       if (err instanceof DispatchTerminalError) {
-        await this.failTaskForDispatchError(taskId, 'server-feedback', devAgentId, err);
+        await this.failTaskForDispatchError(taskId, 'server-feedback', devAgentId, err, {
+          expectedTask: installedFix,
+          expectedLockToken: devLockToken,
+        });
       } else if (err instanceof EnsureSessionError && err.partial.handled) {
       } else {
-        await rollbackToEntry();
-        await this.releaseAgentForTask(devAgentId, taskId, 'idle').catch(() => undefined);
-        await rearmReviewedSignal();
+        await cleanupUndeliveredFix();
       }
       throw err;
     }
     if (!resumed) {
-      await rollbackToEntry();
-      await this.releaseAgentForTask(devAgentId, taskId, 'idle').catch(() => undefined);
-      await rearmReviewedSignal();
-      if (!opts.callerOwnsConsumedSignalFailure) {
+      this.phaseSignalWatcher?.stopAgentIfToken(taskId, devAgentId, newToken);
+      const cleaned = await cleanupUndeliveredFix();
+      if (cleaned && !opts.callerOwnsConsumedSignalFailure) {
         await this.emitIntervention(projectId, devAgentId, taskId, {
           phase: 'server-fix-resume-failed',
           devAgentId,
@@ -12692,7 +13296,6 @@ export class AgentManager {
       return null;
     }
 
-    await this.armPostDispatchSignalOrHold(taskId, devAgentId, expectedKind, newToken);
     return await this.taskStore.get(taskId);
   }
 

@@ -1,4 +1,4 @@
-import type { AgentConfig, HostConfig } from '../shared/index.js';
+import type { AgentRuntimeConfig, HostConfig } from '../shared/index.js';
 import type { CommandRunner } from './runner.js';
 import {
   SessionAbsentError,
@@ -17,8 +17,8 @@ import {
 } from './pane-streamer.js';
 
 export interface PaneStreamerManagerOptions {
-  runnerFactory: (agent: AgentConfig) => CommandRunner;
-  hostResolver?: (agent: AgentConfig) => HostConfig | undefined;
+  runnerFactory: (agent: AgentRuntimeConfig) => CommandRunner;
+  hostResolver?: (agent: AgentRuntimeConfig) => HostConfig | undefined;
   streamerDefaults?: PaneStreamerOptions;
   inputBatchMs?: number;
   geometryTimeoutMs?: number;
@@ -58,7 +58,7 @@ interface InputBatch {
 }
 
 interface OwnerState {
-  agent: AgentConfig;
+  agent: AgentRuntimeConfig;
   epoch: number;
   fullHolds: number;
   dirty: boolean;
@@ -96,8 +96,8 @@ export class PaneStreamerManager {
   private pendingGlobal = 0;
   private readonly pendingByAgent = new Map<string, number>();
 
-  private readonly runnerFactory: (agent: AgentConfig) => CommandRunner;
-  private readonly hostResolver?: (agent: AgentConfig) => HostConfig | undefined;
+  private readonly runnerFactory: (agent: AgentRuntimeConfig) => CommandRunner;
+  private readonly hostResolver?: (agent: AgentRuntimeConfig) => HostConfig | undefined;
   private readonly streamerDefaults?: PaneStreamerOptions;
   private readonly inputBatchMs: number;
   private readonly geometryTimeoutMs: number;
@@ -120,7 +120,7 @@ export class PaneStreamerManager {
     return this.geometryTimeoutMs + GEOMETRY_SETTLE_SLACK_MS;
   }
 
-  ensure(agent: AgentConfig): PaneStreamer {
+  ensure(agent: AgentRuntimeConfig): PaneStreamer {
     const existing = this.streamers.get(agent.id);
     if (existing && !existing.isDestroyed()) return existing;
     const runner = this.runnerFactory(agent);
@@ -193,7 +193,7 @@ export class PaneStreamerManager {
   // budget and deterministically starve agents past the cap. scanPending is the
   // retry credential — a transient/backpressured round keeps it, the per-owner
   // timer retries until the round succeeds or the session is provably absent.
-  startupScan(agents: AgentConfig[]): void {
+  startupScan(agents: AgentRuntimeConfig[]): void {
     const queue: OwnerState[] = [];
     for (const agent of agents) {
       const owner = this.ownerOf(agent);
@@ -212,7 +212,7 @@ export class PaneStreamerManager {
     })();
   }
 
-  private ownerOf(agent: AgentConfig): OwnerState {
+  private ownerOf(agent: AgentRuntimeConfig): OwnerState {
     const existing = this.owners.get(agent.id);
     if (existing) {
       existing.agent = agent;

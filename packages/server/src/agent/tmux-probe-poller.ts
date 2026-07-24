@@ -23,6 +23,7 @@ import type { ErrorRecordStore } from '../state/error-record-store.js';
 export interface TmuxSessionObservation {
   tmuxSessionStatus: TmuxSessionStatus;
   observedAt?: string;
+  stateChangedAt?: string;
   lastPresentAt?: string;
   error?: string;
   latestError?: AgentErrorSummary;
@@ -53,19 +54,22 @@ export class TmuxSessionStatusStore {
 
   set(agentId: string, entry: TmuxSessionObservation): void {
     const prev = this.entries.get(agentId);
-    this.entries.set(agentId, entry);
-    if (
-      prev
-      && prev.tmuxSessionStatus === entry.tmuxSessionStatus
-      && prev.error === entry.error
-      && prev.runtimeStatusHint === entry.runtimeStatusHint
-      && prev.reason === entry.reason
-      && prev.message === entry.message
-      && prev.paneState === entry.paneState
-      && prev.latestError?.id === entry.latestError?.id
-    ) {
-      return;
-    }
+    const changed = !prev
+      || prev.tmuxSessionStatus !== entry.tmuxSessionStatus
+      || prev.error !== entry.error
+      || prev.runtimeStatusHint !== entry.runtimeStatusHint
+      || prev.reason !== entry.reason
+      || prev.message !== entry.message
+      || prev.paneState !== entry.paneState
+      || prev.latestError?.id !== entry.latestError?.id;
+    const stateChangedAt = changed
+      ? (entry.observedAt ?? new Date().toISOString())
+      : (prev.stateChangedAt ?? prev.observedAt ?? entry.observedAt);
+    this.entries.set(agentId, {
+      ...entry,
+      ...(stateChangedAt !== undefined ? { stateChangedAt } : {}),
+    });
+    if (!changed) return;
     this.fire('set', agentId);
   }
 

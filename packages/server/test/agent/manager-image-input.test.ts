@@ -155,11 +155,11 @@ describe('persistTaskImages / materializeTaskImages (entry B core)', () => {
       imagePathsForDispatch(r: CommandRunner, t: TaskState, p: string): Promise<string[]>;
     }).imagePathsForDispatch(mockRunner, task, phase);
 
-    for (const phase of ['develop', 'code', 'fix', 'server-feedback']) {
+    for (const phase of ['develop', 'research', 'code', 'fix', 'server-feedback']) {
       expect(await call(phase), phase).toEqual(['/tmp/baxian/upload/task-c/g.png']);
     }
-    for (const phase of ['review', 'recheck', 'post-approve', 'merge', 'server-spec-review']) {
-      expect(await call(phase)).toEqual([]);
+    for (const phase of ['review', 'recheck', 'post-approve', 'merge', 'server-review', 'server-recheck', 'server-spec-review', 'server-after-done']) {
+      expect(await call(phase), phase).toEqual([]);
     }
   });
 });

@@ -1,7 +1,7 @@
 import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
-import { isRecord, mapWithConcurrency, FS_READ_CONCURRENCY } from '../shared/index.js';
+import { isRecord, mapWithConcurrency, FS_READ_CONCURRENCY, TASK_PHASE_SET } from '../shared/index.js';
 
 // a store id becomes a filename; constrain it so a path-like id can't escape the store dir
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
@@ -34,7 +34,6 @@ const TASK_STATUSES = new Set<TaskStatus>([
   'pending', 'in_progress', 'review', 'fixing', 'spec-ready', 'approved', 'merge-ready',
   'ready', 'merged', 'done', 'max_rounds', 'failed', 'cancelled',
 ]);
-const TASK_PHASES = new Set<TaskPhase>(['research', 'spec', 'code']);
 const SERVER_SIGNAL_KINDS = new Set([
   'code-done', 'code-reviewed', 'code-fixed', 'code-ready', 'spec-done', 'spec-reviewed', 'spec-fixed',
 ]);
@@ -227,7 +226,7 @@ function validateTask(raw: Record<string, unknown>): void {
     throw taskSchemaError('reviewRound', 'an integer >= 0');
   }
   if (raw.phase !== undefined && (
-    typeof raw.phase !== 'string' || !TASK_PHASES.has(raw.phase as TaskPhase)
+    typeof raw.phase !== 'string' || !TASK_PHASE_SET.has(raw.phase as TaskPhase)
   )) {
     throw taskSchemaError('phase', 'research, spec, or code when present');
   }
@@ -453,6 +452,11 @@ function sanitizeTask(state: unknown): TaskState {
     if (value !== undefined) {
       (out as Record<string, unknown>)[k] = value;
     }
+  }
+  // 读侧迁移不可删：worktree 时代的 base 任务丢掉这行会被恢复分类误判（undefined ≠ head）。
+  if (out.reviewCheckoutMode === undefined
+    && (raw.reviewWorktreeMode === 'head' || raw.reviewWorktreeMode === 'base')) {
+    out.reviewCheckoutMode = raw.reviewWorktreeMode;
   }
   validateTask(out as Record<string, unknown>);
   return out as TaskState;

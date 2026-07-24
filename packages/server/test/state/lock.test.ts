@@ -59,6 +59,50 @@ describe('LockManager', () => {
     expect(await locks.isOwner('dev-1', 'task-b', newToken)).toBe(true);
   });
 
+  it('runs an owner-scoped operation before a queued release can change the claim', async () => {
+    const token = (await locks.acquire('dev-1', 'task-a'))!;
+    let entered!: () => void;
+    let proceed!: () => void;
+    const operationEntered = new Promise<void>(resolve => { entered = resolve; });
+    const operationMayProceed = new Promise<void>(resolve => { proceed = resolve; });
+
+    const operation = locks.runIfOwner('dev-1', 'task-a', token, async () => {
+      entered();
+      await operationMayProceed;
+      return 'committed';
+    });
+    await operationEntered;
+    let releaseSettled = false;
+    const release = locks.releaseIfOwner('dev-1', 'task-a', token).then(result => {
+      releaseSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(releaseSettled).toBe(false);
+
+    proceed();
+
+    await expect(operation).resolves.toEqual({ ran: true, value: 'committed' });
+    await expect(release).resolves.toBe(true);
+  });
+
+  it('does not run an owner-scoped operation for a stale token', async () => {
+    const token = (await locks.acquire('dev-1', 'task-a'))!;
+    let ran = false;
+    const operation = async () => {
+      ran = true;
+      return 'should-not-run';
+    };
+
+    await expect(locks.runIfOwner(
+      'dev-1',
+      'task-a',
+      `${token}-stale`,
+      operation,
+    )).resolves.toEqual({ ran: false });
+    expect(ran).toBe(false);
+  });
+
   it('lists exact claims so startup recovery can reclaim maintenance locks safely', async () => {
     const devToken = await locks.acquire('dev-1', 'maintenance:branch-reconcile');
     const qaToken = await locks.acquire('qa-1', 'task-42');

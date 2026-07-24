@@ -1,7 +1,7 @@
 import { accessSync, chmodSync, constants, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import type { AgentConfig, HostConfig } from '../shared/index.js';
+import type { AgentRuntimeConfig, HostConfig } from '../shared/index.js';
 import xterm from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import {
@@ -253,7 +253,7 @@ export class PaneStreamer {
   private readonly geometry: StreamerGeometryHooks | undefined;
 
   constructor(
-    private readonly agent: AgentConfig,
+    private readonly agent: AgentRuntimeConfig,
     private readonly tmux: TmuxManager,
     private readonly resolveHost: () => HostConfig | undefined,
     opts: PaneStreamerOptions = {},
@@ -635,48 +635,56 @@ export class PaneStreamer {
 
   async subscribeAtomic(cbs: SubscriberCallbacks): Promise<SubscribeResult> {
     this.cancelIdleTimer();
-    await this.ensureStarted();
-    return new Promise((resolve, reject) => {
-      this.onPtyDataChain = this.onPtyDataChain.then(() => {
-        if (this.destroyed) {
-          reject(new Error('PaneStreamer destroyed before subscribe'));
-          return;
-        }
-        const snapshot: PaneSnapshot = {
-          cols: this.headless.cols,
-          rows: this.headless.rows,
-          data: this.serialize.serialize(),
-        };
-        const snapshotSeq = this.lastBroadcastSeq;
-        this.live.add(cbs.onLive);
-        this.sessionGoneCbs.add(cbs.onSessionGone);
-        if (cbs.onSnapshotRefresh) this.refreshCbs.add(cbs.onSnapshotRefresh);
-        resolve({
-          unsubscribe: () => this.unsubscribeOne(cbs),
-          snapshot,
-          snapshotSeq,
+    try {
+      await this.ensureStarted();
+      return await new Promise((resolve, reject) => {
+        this.onPtyDataChain = this.onPtyDataChain.then(() => {
+          if (this.destroyed) {
+            reject(new Error('PaneStreamer destroyed before subscribe'));
+            return;
+          }
+          const snapshot: PaneSnapshot = {
+            cols: this.headless.cols,
+            rows: this.headless.rows,
+            data: this.serialize.serialize(),
+          };
+          const snapshotSeq = this.lastBroadcastSeq;
+          this.live.add(cbs.onLive);
+          this.sessionGoneCbs.add(cbs.onSessionGone);
+          if (cbs.onSnapshotRefresh) this.refreshCbs.add(cbs.onSnapshotRefresh);
+          resolve({
+            unsubscribe: () => this.unsubscribeOne(cbs),
+            snapshot,
+            snapshotSeq,
+          });
         });
       });
-    });
+    } finally {
+      this.scheduleIdleIfEmpty();
+    }
   }
 
   async getSnapshotAtomic(): Promise<GetSnapshotResult> {
     this.cancelIdleTimer();
-    await this.ensureStarted();
-    return new Promise((resolve, reject) => {
-      this.onPtyDataChain = this.onPtyDataChain.then(() => {
-        if (this.destroyed) {
-          reject(new Error('PaneStreamer destroyed before snapshot'));
-          return;
-        }
-        const snapshot: PaneSnapshot = {
-          cols: this.headless.cols,
-          rows: this.headless.rows,
-          data: this.serialize.serialize(),
-        };
-        resolve({ snapshot, snapshotSeq: this.lastBroadcastSeq });
+    try {
+      await this.ensureStarted();
+      return await new Promise<GetSnapshotResult>((resolve, reject) => {
+        this.onPtyDataChain = this.onPtyDataChain.then(() => {
+          if (this.destroyed) {
+            reject(new Error('PaneStreamer destroyed before snapshot'));
+            return;
+          }
+          const snapshot: PaneSnapshot = {
+            cols: this.headless.cols,
+            rows: this.headless.rows,
+            data: this.serialize.serialize(),
+          };
+          resolve({ snapshot, snapshotSeq: this.lastBroadcastSeq });
+        });
       });
-    });
+    } finally {
+      this.scheduleIdleIfEmpty();
+    }
   }
 
   // Full target lands in owner state before any exec, and the local stream follows

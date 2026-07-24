@@ -243,6 +243,155 @@ describe('PATCH /api/hosts/:id', () => {
     expect(ctx.config.host[0].hostname).toBe('h');
   });
 
+  it('returns 503 and preserves the host when root-agent liveness cannot be determined', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      getRuntimeControlStatus: vi.fn(() => 'active'),
+      isRuntimeLive: vi.fn().mockRejectedValue(new Error('ssh timed out')),
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { app, calls } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box',
+      payload: { hostname: 'moved.example.com' },
+    });
+
+    expect(res.statusCode).toBe(503);
+    expect(JSON.parse(res.body).error).toMatch(/无法确认.*root-agent.*ssh timed out/);
+    expect(ctx.config.host[0].hostname).toBe('h');
+    expect(calls).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('root-agent liveness probe failed'));
+    warn.mockRestore();
+  });
+
+  it.each(['disabled', 'stopping', 'stopped-until-restart'] as const)(
+    'probes a %s root coordinator before structurally editing its host',
+    async (status) => {
+      ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+      ctx.config.root = {
+        runtime: 'codex',
+        mode: 'remote',
+        host: 'box',
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      };
+      const isRuntimeLive = vi.fn(async () => true);
+      ctx.rootRecoveryCoordinator = {
+        usesHost: (hostId: string) => hostId === 'box',
+        getRuntimeControlStatus: vi.fn(() => status),
+        isRuntimeLive,
+      } as unknown as AppContext['rootRecoveryCoordinator'];
+      const { app } = await makeApp(true);
+
+      const res = await app.inject({
+        method: 'PATCH', url: '/api/hosts/box', payload: { hostname: 'moved.example.com' },
+      });
+
+      expect(res.statusCode).toBe(409);
+      expect(JSON.parse(res.body).error).toContain('root-agent');
+      expect(isRuntimeLive).toHaveBeenCalledOnce();
+      expect(ctx.config.host[0].hostname).toBe('h');
+    },
+  );
+
+  it('allows a stopped root host edit only after confirming the session is still absent', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    ctx.config.root = {
+      runtime: 'codex',
+      mode: 'remote',
+      host: 'box',
+      workdir: '/srv/root',
+      responseTimeoutMinutes: 15,
+    };
+    const isRuntimeLive = vi.fn(async () => false);
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      getRuntimeControlStatus: vi.fn(() => 'stopped-until-restart'),
+      isRuntimeLive,
+      invalidateRuntimeStreamer: vi.fn(async () => undefined),
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box', payload: { hostname: 'moved.example.com' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(isRuntimeLive).toHaveBeenCalledTimes(2);
+    expect(ctx.config.host[0].hostname).toBe('moved.example.com');
+  });
+
+  it('allows repairing a root host endpoint while recovery is locally disabled after an uncertain stop', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    const isRuntimeLive = vi.fn().mockRejectedValue(new Error('old endpoint is unreachable'));
+    const invalidateRuntimeStreamer = vi.fn(async () => undefined);
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      getRuntimeControlStatus: vi.fn(() => 'stop-incomplete'),
+      canRepairHostAfterIncompleteStop: vi.fn(() => true),
+      isRuntimeLive,
+      invalidateRuntimeStreamer,
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box',
+      payload: { hostname: 'replacement.example.com' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(isRuntimeLive).not.toHaveBeenCalled();
+    expect(ctx.config.host[0].hostname).toBe('replacement.example.com');
+    expect(invalidateRuntimeStreamer).toHaveBeenCalledOnce();
+  });
+
+  it('allows editing a migrated root host after the old coordinator was explicitly stopped', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    const isRuntimeLive = vi.fn().mockRejectedValue(new Error('old endpoint is unreachable'));
+    const invalidateRuntimeStreamer = vi.fn(async () => undefined);
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      getRuntimeControlStatus: vi.fn(() => 'stopped-until-restart'),
+      isRuntimeLive,
+      invalidateRuntimeStreamer,
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box',
+      payload: { hostname: 'replacement.example.com' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(isRuntimeLive).not.toHaveBeenCalled();
+    expect(ctx.config.host[0].hostname).toBe('replacement.example.com');
+    expect(invalidateRuntimeStreamer).toHaveBeenCalledOnce();
+  });
+
+  it('keeps probing after a stop-incomplete failure that was not a pure endpoint outage', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    const isRuntimeLive = vi.fn(async () => true);
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      getRuntimeControlStatus: vi.fn(() => 'stop-incomplete'),
+      canRepairHostAfterIncompleteStop: vi.fn(() => false),
+      isRuntimeLive,
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box',
+      payload: { hostname: 'replacement.example.com' },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).error).toContain('root-agent');
+    expect(isRuntimeLive).toHaveBeenCalledOnce();
+    expect(ctx.config.host[0].hostname).toBe('h');
+  });
+
   it('allows a non-structural change (alias) even with a live referencing agent', async () => {
     ctx.config.project = [remoteAgentProject()];
     ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' });
@@ -252,6 +401,42 @@ describe('PATCH /api/hosts/:id', () => {
       payload: { alias: 'still-fine' },
     });
     expect(res.statusCode).toBe(200);
+  });
+
+  it('invalidates the root runtime cache after a structural key-auth host change', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    const invalidateRuntimeStreamer = vi.fn(async () => undefined);
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      getRuntimeControlStatus: vi.fn(() => 'active'),
+      isRuntimeLive: vi.fn(async () => false),
+      invalidateRuntimeStreamer,
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box', payload: { hostname: 'moved.example.com' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(invalidateRuntimeStreamer).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the root runtime cache for alias-only host edits', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', port: 22, user: 'u' }];
+    const invalidateRuntimeStreamer = vi.fn(async () => undefined);
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      invalidateRuntimeStreamer,
+    } as unknown as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({
+      method: 'PATCH', url: '/api/hosts/box', payload: { alias: 'renamed' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(invalidateRuntimeStreamer).not.toHaveBeenCalled();
   });
 
   it('treats a port:22 edit of a portless password host as an endpoint change (no secret exfiltration via undefined↔22)', async () => {
@@ -446,6 +631,49 @@ describe('DELETE /api/hosts/:id', () => {
     const res = await app.inject({ method: 'DELETE', url: '/api/hosts/box' });
     expect(res.statusCode).toBe(200);
     expect(ctx.config.host).toHaveLength(0);
+  });
+
+  it('refuses when the root agent still references the host', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    ctx.config.root = {
+      runtime: 'codex',
+      mode: 'remote',
+      host: 'box',
+      workdir: '/srv/root',
+      responseTimeoutMinutes: 15,
+    };
+    const { app } = await makeApp(true);
+    const res = await app.inject({ method: 'DELETE', url: '/api/hosts/box' });
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).error).toContain('root-agent');
+    expect(ctx.config.host).toHaveLength(1);
+  });
+
+  it('keeps the runtime root host protected while a root config change awaits restart', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      isRuntimeExplicitlyStopped: vi.fn(() => false),
+    } as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+    const res = await app.inject({ method: 'DELETE', url: '/api/hosts/box' });
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(res.body).error).toContain('root-agent');
+    expect(ctx.config.host).toHaveLength(1);
+  });
+
+  it('deletes an old root host after the stopped coordinator is removed from current config', async () => {
+    ctx.config.host = [{ id: 'box', hostname: 'h', user: 'u' }];
+    ctx.rootRecoveryCoordinator = {
+      usesHost: (hostId: string) => hostId === 'box',
+      isRuntimeExplicitlyStopped: vi.fn(() => true),
+    } as AppContext['rootRecoveryCoordinator'];
+    const { app } = await makeApp(true);
+
+    const res = await app.inject({ method: 'DELETE', url: '/api/hosts/box' });
+
+    expect(res.statusCode).toBe(200);
+    expect(ctx.config.host).toEqual([]);
   });
 
   it('returns 404 for an unknown host id', async () => {

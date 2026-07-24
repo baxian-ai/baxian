@@ -13,6 +13,7 @@ import {
   stageFileGuarded,
   sweepStrayFile,
 } from '../../src/agent/repo-store.js';
+import { ExecOutcomeUnknownError } from '../../src/agent/net-exec.js';
 import { LocalRunner, shellQuote, type CommandRunner, type ExecOptions, type ExecResult } from '../../src/agent/runner.js';
 
 const PROJECT_REPO = 'https://git.example.com/group/project.git';
@@ -399,8 +400,26 @@ describe('RepoStore per-agent Workdir', () => {
     await store.ensure();
 
     const clone = runner.commands.find(command => command.includes('gh repo clone'));
+    expect(clone).toContain("GH_HOST='github.com' ");
     expect(clone).toContain("gh repo clone 'owner/repo'");
     expect(clone).not.toContain('--bare');
+  });
+
+  it('pins gh auto clone of a self-hosted forge URL to the URL host', async () => {
+    const home = join(tempDir, 'home');
+    await run(`mkdir -p ${shellQuote(home)}`);
+    const ghesRepo = 'https://ghe.example/owner/repo.git';
+    const runner = new TestRunner(home, origin, ghesRepo);
+    const store = new RepoStore(
+      runner, ghesRepo, 'remote', { hostname: 'box-a' },
+      createRepoStoreCache(), 'dev-1', undefined, true,
+    );
+
+    await store.ensure();
+
+    const clone = runner.commands.find(command => command.includes('gh repo clone'));
+    expect(clone).toContain("GH_HOST='ghe.example' ");
+    expect(clone).toContain(`gh repo clone ${shellQuote(ghesRepo)}`);
   });
 
   it('clones a github repo with plain git when the resolved tool is not gh', async () => {
@@ -417,6 +436,7 @@ describe('RepoStore per-agent Workdir', () => {
     await store.ensure();
 
     expect(runner.commands.some(command => command.includes('gh repo clone'))).toBe(false);
+    expect(runner.commands.some(command => command.includes('GH_HOST='))).toBe(false);
     const clone = runner.commands.find(command => command.includes('git clone'));
     expect(clone).toContain("git clone 'https://github.com/owner/repo.git'");
   });
@@ -923,6 +943,36 @@ describe('moveFileIntoPlace (real filesystem)', () => {
     expect(await run(`cat ${shellQuote(`${dir}/final`)}`)).toBe('new');
   });
 
+  it('refuses to publish a staging leaf that was replaced by a symlink', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const external = `${dir}/external`;
+    await write(external, 'foreign');
+    await symlink(external, `${dir}/tmp-link`);
+
+    await expect(moveFileIntoPlace(local, `${dir}/tmp-link`, `${dir}/final-link`))
+      .rejects.toThrow(/atomic replace/);
+
+    expect(await run(`cat ${shellQuote(external)}`)).toBe('foreign');
+    await expect(lstat(`${dir}/final-link`)).rejects.toMatchObject({ code: 'ENOENT' });
+    warn.mockRestore();
+  });
+
+  it('pins non-symlink checks for both staging and published leaves in the atomic command', async () => {
+    const exec = vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 }));
+    const runner = {
+      exec,
+      writeFile: vi.fn(async () => undefined),
+      execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
+    } as CommandRunner;
+
+    await moveFileIntoPlace(runner, '/work/tmp', '/work/final');
+
+    expect(exec).toHaveBeenCalledOnce();
+    const command = exec.mock.calls[0]![0];
+    expect(command).toContain("[ -f '/work/tmp' ] && [ ! -L '/work/tmp' ]");
+    expect(command).toContain("[ -f '/work/final' ] && [ ! -L '/work/final' ]");
+  });
+
   it('fails closed before mv when the target is a directory — no nested tmp ever lands', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await run(`mkdir -p ${shellQuote(`${dir}/final`)}`);
@@ -1143,5 +1193,45 @@ describe('stageFileGuarded parent directories (real filesystem)', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('mailbox mutation outcome classification', () => {
+  function mutationRunner(results: {
+    stage?: ExecResult;
+    move?: ExecResult;
+  }): CommandRunner {
+    return {
+      exec: async command => command.includes('mv -f --')
+        ? results.move ?? ok
+        : { stdout: 'BX_SWEEP_REMOVED', stderr: '', exitCode: 0 },
+      writeFile: async () => undefined,
+      execWithStdin: async () => results.stage ?? ok,
+    };
+  }
+
+  it('preserves an outcome-unknown type for a staged write transport failure', async () => {
+    const runner = mutationRunner({
+      stage: { stdout: '', stderr: 'ssh response lost', exitCode: 255 },
+    });
+
+    await expect(stageFileGuarded(runner, '/wt', '/wt/.tmp-request', 'payload'))
+      .rejects.toBeInstanceOf(ExecOutcomeUnknownError);
+  });
+
+  it('distinguishes an outcome-unknown move from a definite command refusal', async () => {
+    const unknown = mutationRunner({
+      move: { stdout: '', stderr: 'Connection reset by peer', exitCode: 255 },
+    });
+    const refused = mutationRunner({
+      move: { stdout: '', stderr: 'permission denied', exitCode: 9 },
+    });
+
+    await expect(moveFileIntoPlace(unknown, '/wt/.tmp-request', '/wt/request'))
+      .rejects.toBeInstanceOf(ExecOutcomeUnknownError);
+    const refusal = await moveFileIntoPlace(refused, '/wt/.tmp-request', '/wt/request')
+      .then(() => undefined, err => err);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal).not.toBeInstanceOf(ExecOutcomeUnknownError);
   });
 });

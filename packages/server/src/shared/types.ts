@@ -16,16 +16,30 @@ export interface HostConfig {
   password?: string;
 }
 
-export interface AgentConfig {
+export interface AgentRuntimeConfig {
   id: string;
   runtime: AgentRuntime;
-  role: AgentRole;
   mode: AgentMode;
   host?: string | HostConfig;
   workdir?: string;
   yolo?: boolean;
   model?: string;
   addDirs?: string[];
+}
+
+export interface AgentConfig extends AgentRuntimeConfig {
+  role: AgentRole;
+}
+
+export interface RootAgentConfig {
+  runtime: AgentRuntime;
+  mode: AgentMode;
+  host?: string | HostConfig;
+  workdir: string;
+  yolo?: boolean;
+  model?: string;
+  projects?: string[];
+  responseTimeoutMinutes: number;
 }
 
 export interface ProjectConfig {
@@ -81,6 +95,7 @@ export interface BaxianConfig {
   server: ServerConfig;
   host: HostConfig[];
   project: ProjectConfig[];
+  root?: RootAgentConfig;
 }
 
 export type AgentRuntimeStatus =
@@ -331,6 +346,35 @@ export interface TaskState {
   createdAt: string;
   updatedAt: string;
   verdictOverdue?: boolean;
+}
+
+export interface TaskGenerationGuard {
+  status: TaskStatus;
+  phase?: TaskPhase;
+  signalToken?: string;
+  agentId: string;
+  reviewRound: number;
+  specReviewRound?: number;
+}
+
+export function taskGenerationGuard(task: TaskState): TaskGenerationGuard {
+  return {
+    status: task.status,
+    phase: task.phase,
+    signalToken: task.signalToken,
+    agentId: task.agentId,
+    reviewRound: task.reviewRound,
+    specReviewRound: task.specReviewRound,
+  };
+}
+
+export function taskMatchesGeneration(task: TaskState, expected: TaskGenerationGuard): boolean {
+  return task.status === expected.status
+    && task.phase === expected.phase
+    && task.signalToken === expected.signalToken
+    && task.agentId === expected.agentId
+    && task.reviewRound === expected.reviewRound
+    && task.specReviewRound === expected.specReviewRound;
 }
 
 type FindingSeverity = 'critical' | 'major' | 'minor';

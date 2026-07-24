@@ -406,7 +406,7 @@ describe('TaskStore sanitize', () => {
     expect(loaded!).not.toHaveProperty('specMarkerToken');
   });
 
-  it('does not map the removed reviewWorktreeMode field', async () => {
+  it('maps the legacy reviewWorktreeMode field to reviewCheckoutMode on read', async () => {
     await writeUnsanitizedTask('task-review-checkout', {
       title: 'legacy review checkout',
       reviewWorktreeMode: 'base',
@@ -414,8 +414,20 @@ describe('TaskStore sanitize', () => {
 
     const loaded = await store.get('task-review-checkout');
 
-    expect(loaded?.reviewCheckoutMode).toBeUndefined();
+    expect(loaded?.reviewCheckoutMode).toBe('base');
     expect(loaded).not.toHaveProperty('reviewWorktreeMode');
+  });
+
+  it('keeps an explicit reviewCheckoutMode over the legacy reviewWorktreeMode field', async () => {
+    await writeUnsanitizedTask('task-review-checkout-both', {
+      title: 'both checkout fields',
+      reviewCheckoutMode: 'head',
+      reviewWorktreeMode: 'base',
+    });
+
+    const loaded = await store.get('task-review-checkout-both');
+
+    expect(loaded?.reviewCheckoutMode).toBe('head');
   });
 
   it('keeps signalToken when both signalToken and specMarkerToken are on disk', async () => {

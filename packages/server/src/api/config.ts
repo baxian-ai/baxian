@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { normalize } from 'node:path';
-import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig } from '../shared/index.js';
+import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig, RootAgentConfig } from '../shared/index.js';
 import { autoBootstrapAgentIds } from '../agent/bootstrap.js';
 import {
   saveConfig,
@@ -42,12 +42,43 @@ function agentWorkdirRefs(projects: ProjectConfig[] | undefined): Map<string, st
   return refs;
 }
 
+function agentPermissionRefs(projects: ProjectConfig[] | undefined): Map<string, string> {
+  const refs = new Map<string, string>();
+  for (const project of projects ?? []) {
+    for (const pair of project?.agent ?? []) {
+      for (const agent of pair ?? []) {
+        if (!agent || typeof agent.id !== 'string') continue;
+        const addDirs = [...new Set((agent.addDirs ?? []).map(path => normalize(path)))].sort();
+        refs.set(agent.id, JSON.stringify([agent.yolo !== false, addDirs]));
+      }
+    }
+  }
+  return refs;
+}
+
 const REDACTED = '***';
 
-function requiresRestart(prev: BaxianConfig['server'], next: BaxianConfig['server']): boolean {
-  return prev.host !== next.host
-    || prev.port !== next.port
-    || !sameHttps(prev.https, next.https);
+function requiresRestart(prev: BaxianConfig, next: BaxianConfig): boolean {
+  return prev.server.host !== next.server.host
+    || prev.server.port !== next.server.port
+    || !sameHttps(prev.server.https, next.server.https)
+    || JSON.stringify(prev.root ?? null) !== JSON.stringify(next.root ?? null);
+}
+
+function rootRuntimeKey(root: RootAgentConfig | undefined): string {
+  if (!root) return 'none';
+  return JSON.stringify([
+    root.runtime,
+    root.mode,
+    hostRefKey(root.host),
+    normalize(root.workdir),
+    root.yolo ?? true,
+    root.model ?? null,
+  ]);
+}
+
+function rootRuntimeChanged(prev: RootAgentConfig | undefined, next: RootAgentConfig | undefined): boolean {
+  return rootRuntimeKey(prev) !== rootRuntimeKey(next);
 }
 
 function sameHttps(a: HttpsConfig | undefined, b: HttpsConfig | undefined): boolean {
@@ -90,6 +121,14 @@ export function redactConfig(config: BaxianConfig): BaxianConfig {
     },
     host: redactHosts(config.host ?? []),
     project: redactProjects(config.project ?? []),
+    ...(config.root ? { root: redactRoot(config.root) } : {}),
+  };
+}
+
+function redactRoot(root: RootAgentConfig): RootAgentConfig {
+  return {
+    ...root,
+    ...(root.host !== undefined ? { host: redactAgentHostRef(root.host) } : {}),
   };
 }
 
@@ -142,6 +181,9 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         server: mergedServer,
         host: current.host,
         project: incoming.project ?? current.project,
+        ...('root' in incoming
+          ? (incoming.root == null ? {} : { root: incoming.root })
+          : (current.root ? { root: current.root } : {})),
       };
 
       let validated: BaxianConfig;
@@ -160,8 +202,10 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       if (incoming.project !== undefined) {
         const currentHosts = agentHostRefs(current.project);
         const currentWorkdirs = agentWorkdirRefs(current.project);
+        const currentPermissions = agentPermissionRefs(current.project);
         const nextHosts = agentHostRefs(validated.project);
         const nextWorkdirs = agentWorkdirRefs(validated.project);
+        const nextPermissions = agentPermissionRefs(validated.project);
         // A hot reload must not resurrect OR retain an id whose DELETE is in flight/diverged (fail-stop):
         // checking only new ids let a PATCH move an existing deleting id (host/workdir unchanged) to another
         // project and survive the DELETE's hash-mismatch removal. Any deleting id in the next config → 409.
@@ -174,29 +218,58 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         }
         const blockedHosts: string[] = [];
         const blockedWorkdirs: string[] = [];
+        const blockedPermissions: string[] = [];
         const blockedRemovals: string[] = [];
         for (const [agentId, nextHost] of nextHosts) {
           if (!currentHosts.has(agentId)) continue;
           const hostChanged = currentHosts.get(agentId) !== nextHost;
           const workdirChanged = currentWorkdirs.get(agentId) !== nextWorkdirs.get(agentId);
-          if (!hostChanged && !workdirChanged) continue;
+          const permissionsChanged = currentPermissions.get(agentId) !== nextPermissions.get(agentId);
+          if (!hostChanged && !workdirChanged && !permissionsChanged) continue;
           if (!await agentIsLive(app.ctx, agentId)) continue;
           if (hostChanged) blockedHosts.push(agentId);
           if (workdirChanged) blockedWorkdirs.push(agentId);
+          if (permissionsChanged) blockedPermissions.push(agentId);
         }
         for (const agentId of currentHosts.keys()) {
           if (!nextHosts.has(agentId) && await agentIsLive(app.ctx, agentId)) {
             blockedRemovals.push(agentId);
           }
         }
-        if (blockedHosts.length > 0 || blockedWorkdirs.length > 0 || blockedRemovals.length > 0) {
+        if (
+          blockedHosts.length > 0
+          || blockedWorkdirs.length > 0
+          || blockedPermissions.length > 0
+          || blockedRemovals.length > 0
+        ) {
           const changes = [
             ...(blockedHosts.length > 0 ? [`host of ${blockedHosts.join(', ')}`] : []),
             ...(blockedWorkdirs.length > 0 ? [`Workdir of ${blockedWorkdirs.join(', ')}`] : []),
+            ...(blockedPermissions.length > 0 ? [`permissions/addDirs of ${blockedPermissions.join(', ')}`] : []),
             ...(blockedRemovals.length > 0 ? [`configuration entry for ${blockedRemovals.join(', ')}`] : []),
           ].join(' or ');
           return reply.status(409).send({
             error: `cannot change the ${changes} while the agent is live; stop its session first`,
+          });
+        }
+      }
+
+      if (rootRuntimeChanged(current.root, validated.root) && app.ctx.rootRecoveryCoordinator) {
+        const coordinator = app.ctx.rootRecoveryCoordinator;
+        if (!coordinator.isRuntimeExplicitlyStopped()) {
+          return reply.status(409).send({
+            error: 'cannot change or remove root runtime configuration until root-agent is explicitly stopped',
+          });
+        }
+        try {
+          if (await coordinator.isRuntimeLive()) {
+            return reply.status(409).send({
+              error: 'root-agent became live after it was stopped; stop it again before changing root configuration',
+            });
+          }
+        } catch (err) {
+          return reply.status(503).send({
+            error: `cannot verify that root-agent is stopped: ${err instanceof Error ? err.message : String(err)}`,
           });
         }
       }
@@ -209,7 +282,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      const mustRestart = requiresRestart(current.server, validated.server);
+      const mustRestart = requiresRestart(current, validated);
       const committed = await app.ctx.agentManager.guardGitConfigCommit(
         current,
         validated,
@@ -245,7 +318,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         config: redactConfig(validated),
         restartRequired: mustRestart,
         note: mustRestart
-          ? 'Saved and hot-reloadable fields applied. server.host/port/https changes require a restart to take effect.'
+          ? 'Saved and hot-reloadable fields applied. server.host/port/https or root changes require a restart to take effect.'
           : 'Saved and applied immediately (no restart required).',
       });
     });

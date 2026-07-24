@@ -200,7 +200,7 @@ describe('buildPromptInline', () => {
     expect(build()).not.toContain('images:');
   });
 
-  it('fix phase descriptor carries pr/branch/round and the pr-fixed signal field', async () => {
+  it('fix phase descriptor carries pr/branch and the pr-fixed signal field, never round', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
@@ -210,7 +210,8 @@ describe('buildPromptInline', () => {
     expect(prompt.startsWith('/baxian-pr-feedback\n')).toBe(true);
     expect(prompt).toContain('phase: fix');
     expect(prompt).toContain('pr: 42');
-    expect(prompt).toContain('round: 2');
+    expect(prompt).toContain('\nbranch: ');
+    expect(prompt).not.toContain('round:');
     expect(prompt).toContain('signal: pr-fixed');
     expect(prompt).toContain('token: fix-token-42');
   });
@@ -258,23 +259,15 @@ describe('buildPromptInline', () => {
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
-  it.each<[string, number, string[], string[]]>([
-    ['redispatch #3 sets the redispatch field', 3,
-      ['redispatch: 3', 'signal: pr-merge-ready', 'token: post-token-42'],
-      []],
-    ['redispatchCount=0 omits the redispatch field', 0,
-      ['signal: pr-merge-ready'],
-      ['redispatch:']],
-  ])('post-approve %s', async (_label, postApproveRedispatchCount, contains, notContains) => {
+  it('post-approve descriptor never carries a redispatch field (each prompt is the full rerun)', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'approved', prNumber: 42 },
       phase: 'post-approve',
       signalToken: 'post-token-42',
-      postApproveRedispatchCount,
     });
-    for (const f of contains) expect(prompt).toContain(f);
-    for (const f of notContains) expect(prompt).not.toContain(f);
+    expect(prompt).toContain('signal: pr-merge-ready');
+    expect(prompt).not.toContain('redispatch:');
   });
 
   it('every phase force-loads its /command — code reuses baxian-task-check yet still emits it', async () => {
@@ -857,7 +850,7 @@ describe('server review mode prompt builders', () => {
     expect(prompt).not.toContain('\nspec:\n');
   });
 
-  it('server-review renders diff-file and prior-* file fields', async () => {
+  it('server-review renders diff-file and prior-* file fields without checkout metadata mirrors', async () => {
     const registry = getRegistry();
     const prompt = buildPromptInline({
       task: { ...TASK, reviewMode: 'server', reviewRound: 4 },
@@ -866,25 +859,40 @@ describe('server review mode prompt builders', () => {
       workdir: '/wt/qa',
       skillRegistry: registry,
       signalToken: 'tok',
-      serverReviewCheckout: 'head',
-      serverBaseSha: 'base123',
-      serverHeadSha: 'head123',
-      serverHeadTree: 'tree123',
       serverDiffstatFile: { path: '.baxian/review/inbox/diffstat-round-4.txt', bytes: 18 * 1024 },
       serverContentFile: { path: '.baxian/review/inbox/diff-round-4.patch', bytes: 120 * 1024 },
       serverPriorFindingsFile: { path: '.baxian/review/inbox/prior-findings-round-4.json', bytes: 11 * 1024 },
       serverPriorResponse: '{"round":3,"responses":[]}',
     });
-    expect(prompt).toContain('review-checkout: head');
-    expect(prompt).toContain('base-sha: base123');
-    expect(prompt).toContain('head-sha: head123');
-    expect(prompt).toContain('head-tree: tree123');
+    expect(prompt).not.toContain('review-checkout:');
+    expect(prompt).not.toContain('base-sha:');
+    expect(prompt).not.toContain('head-sha:');
+    expect(prompt).not.toContain('head-tree:');
+    expect(prompt).not.toContain('fallback-reason:');
     expect(prompt).toContain('diff-file: .baxian/review/inbox/diff-round-4.patch (120KB)');
     expect(prompt).toContain('diffstat-file: .baxian/review/inbox/diffstat-round-4.txt (18KB)');
     expect(prompt).toContain('prior-findings-file: .baxian/review/inbox/prior-findings-round-4.json (11KB)');
     expect(prompt).toContain('prior-response:');
     expect(prompt).not.toContain('\ndiffstat:\n');
     expect(prompt).not.toContain('\ndiff:\n');
+  });
+
+  it('legacy base continuation re-states review-checkout: base explicitly', async () => {
+    const registry = getRegistry();
+    const prompt = buildPromptInline({
+      task: { ...TASK, reviewMode: 'server', reviewRound: 2, batchIndex: 1, batchTotal: 3 },
+      phase: 'server-review',
+      agent: QA_AGENT,
+      workdir: '/wt/qa',
+      skillRegistry: registry,
+      signalToken: 'tok',
+      serverReviewCheckout: 'base',
+      serverContent: 'diff body',
+      serverBatch: { index: 1, total: 3 },
+    });
+    expect(prompt).toContain('review-checkout: base');
+    expect(prompt).toContain('batch: 2/3');
+    expect(prompt).not.toContain('head-tree:');
   });
 
   it('server-feedback renders findings-file instead of the findings block', async () => {

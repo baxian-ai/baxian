@@ -731,6 +731,45 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(JSON.parse(response.body).error).toMatch(/must not share a directory/);
   });
 
+  it('returns 409 when distinct SSH ports still share a host account and Workdir', async () => {
+    await createProject('shared-port-wd');
+    expect((await addAgent('shared-port-wd', devAgent('shared-port-wd-1', {
+      mode: 'remote',
+      host: { hostname: 'box.example.com', user: 'git', port: 22 },
+      workdir: '/srv/baxian-shared',
+    }))).statusCode).toBe(201);
+
+    const response = await addAgent('shared-port-wd', devAgent('shared-port-wd-2', {
+      mode: 'remote',
+      host: { hostname: 'box.example.com', user: 'git', port: 2222 },
+      workdir: '/srv/baxian-shared',
+    }));
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/must not share a directory/);
+  });
+
+  it('returns semantic 409 when a yolo-disabled agent reuses the root Workdir', async () => {
+    for (const project of app.ctx.config.project) {
+      for (const agent of project.agent.flat()) agent.yolo = false;
+    }
+    app.ctx.config.root = {
+      runtime: 'codex',
+      mode: 'local',
+      workdir: '/tmp/root-shared',
+      responseTimeoutMinutes: 15,
+    };
+    await createProject('shared-root-wd');
+
+    const response = await addAgent('shared-root-wd', devAgent('shared-root-wd-dev', {
+      workdir: '/tmp/root-shared',
+      yolo: false,
+    }));
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/root-agent.*must not share a directory/);
+  });
+
   it('returns 409 when pairWith dev is still being created (creationToken set)', async () => {
     await projectWithDev('qc', 'qc-dev');
     await seedAgent('qc-dev', 'qc', { creationToken: 'tok-mid-bootstrap' });

@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
-import type { HostConfig } from './shared/index.js';
+import { ROOT_AGENT_ID, type HostConfig } from './shared/index.js';
 import { startServer } from './index.js';
 import { shellQuote, wrapRemoteCommand, sshTarget, resolveAgentHost } from './agent/runner.js';
 
@@ -38,6 +38,16 @@ function claimGatedWindowSize(agentId: string): string {
   return `tmux if-shell -t '=${agentId}:' -F '${cond}' '${set}' ''`;
 }
 
+function claimGatedAttachArgs(agentId: string): string[] {
+  const target = `=${agentId}`;
+  const cond = `#{==:#{@baxian-agent-id},${agentId}}`;
+  const attach = `attach-session -t ${shellQuote(target)}`;
+  const refuse =
+    `display-message -p ${shellQuote(`Refusing to attach: tmux session ${agentId} is not owned by Baxian`)}` +
+    `; run-shell ${shellQuote('exit 1')}`;
+  return ['-u', 'if-shell', '-t', `${target}:`, '-F', cond, attach, refuse];
+}
+
 export function buildLocalAttachCommands(
   agentId: string,
   _dims: TtyDimensions | null,
@@ -54,7 +64,13 @@ export function buildLocalAttachCommands(
       file: 'tmux',
       args: ['set-option', '-g', 'focus-events', 'on'],
     },
-    { kind: 'attach', file: 'tmux', args: ['-u', 'attach-session', '-t', `=${agentId}`] },
+    {
+      kind: 'attach',
+      file: 'tmux',
+      args: agentId === ROOT_AGENT_ID
+        ? claimGatedAttachArgs(agentId)
+        : ['-u', 'attach-session', '-t', `=${agentId}`],
+    },
   ];
 }
 
@@ -66,6 +82,9 @@ export function buildRemoteAttachSshArgs(
   const quotedId = shellQuote(`=${agentId}`);
   const autoSizePrefix = `${claimGatedWindowSize(agentId)} 2>/dev/null || true; `;
   const focusEventsPrefix = 'tmux set-option -g focus-events on 2>/dev/null || true; ';
+  const attach = agentId === ROOT_AGENT_ID
+    ? `tmux ${claimGatedAttachArgs(agentId).map(shellQuote).join(' ')}`
+    : `tmux -u attach-session -t ${quotedId}`;
   return [
     '-o', 'ConnectTimeout=10',
     ...(host.port !== undefined ? ['-p', String(host.port)] : []),
@@ -73,7 +92,7 @@ export function buildRemoteAttachSshArgs(
     '--',
     sshTarget(host),
     wrapRemoteCommand(
-      `${autoSizePrefix}${focusEventsPrefix}tmux -u attach-session -t ${quotedId}`,
+      `${autoSizePrefix}${focusEventsPrefix}${attach}`,
       'login-interactive',
     ),
   ];
@@ -94,7 +113,7 @@ function authHeaders(opts: { token?: string }): Record<string, string> {
 async function readResponse<T = unknown>(res: Response, method: string, path: string): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`${method} ${path} failed (${res.status}): ${text || res.statusText}`);
+    throw new Error(`${method} ${path} failed (${res.status}): ${apiErrorDetail(text, res.statusText)}`);
   }
   const text = await res.text();
   if (!text) return null as T;
@@ -103,6 +122,22 @@ async function readResponse<T = unknown>(res: Response, method: string, path: st
   } catch {
     throw new Error(`${method} ${path} returned non-JSON: ${text.slice(0, 200)}`);
   }
+}
+
+function apiErrorDetail(text: string, fallback: string): string {
+  if (!text) return fallback;
+  try {
+    const body = JSON.parse(text) as unknown;
+    if (
+      typeof body === 'object'
+      && body !== null
+      && 'error' in body
+      && typeof body.error === 'string'
+    ) return body.error;
+  } catch {
+    return text;
+  }
+  return text;
 }
 
 async function apiGet<T = unknown>(path: string, opts: { apiUrl?: string; token?: string } = {}): Promise<T> {
@@ -141,16 +176,16 @@ async function apiPatch<T = unknown>(
   return readResponse<T>(res, 'PATCH', path);
 }
 
-async function apiDelete(
+async function apiDelete<T = unknown>(
   path: string,
   opts: { apiUrl?: string; token?: string } = {},
-): Promise<unknown> {
+): Promise<T | null> {
   const res = await fetch(`${resolveApiBase(opts)}${path}`, {
     method: 'DELETE',
     headers: authHeaders(opts),
   });
   if (res.status === 204) return null;
-  return readResponse(res, 'DELETE', path);
+  return readResponse<T>(res, 'DELETE', path);
 }
 
 async function readStdin(): Promise<string> {
@@ -237,8 +272,17 @@ export function buildCli(): Command {
       let resolvedHost: HostConfig | undefined;
       try {
         type CfgAgent = { id: string; mode: 'local' | 'remote'; host?: string | HostConfig };
-        type CfgRes = { host?: HostConfig[]; project?: Array<{ agent?: CfgAgent[][] }> };
+        type CfgRoot = Omit<CfgAgent, 'id'>;
+        type CfgRes = {
+          host?: HostConfig[];
+          project?: Array<{ agent?: CfgAgent[][] }>;
+          root?: CfgRoot;
+        };
         const cfgRes = await apiGet<CfgRes>('/config', ctx);
+        if (agentId === ROOT_AGENT_ID && cfgRes?.root) {
+          agent = cfgRes.root;
+          resolvedHost = resolveAgentHost(cfgRes.host, cfgRes.root.host);
+        }
         for (const proj of cfgRes?.project ?? []) {
           for (const pair of proj.agent ?? []) {
             for (const a of pair) {
@@ -270,13 +314,18 @@ export function buildCli(): Command {
   program
     .command('stop <agent-id>')
     .description('Stop an agent')
-    .action(async (agentId, opts) => {
-      await apiDelete(
-        `/agents/${encodeURIComponent(agentId)}/session`,
-        ctxOf(opts),
-      );
-      console.log(`Agent ${agentId} stopped.`);
-    });
+    .action((agentId, opts) =>
+      withErrors(async () => {
+        const response = await apiDelete<{ message?: unknown }>(
+          `/agents/${encodeURIComponent(agentId)}/session`,
+          ctxOf(opts),
+        );
+        const message = agentId === ROOT_AGENT_ID
+          && typeof response?.message === 'string'
+          ? ` ${response.message}`
+          : '';
+        console.log(`Agent ${agentId} stopped.${message}`);
+      }));
 
   const taskCommand = program.command('task').description('Task management');
 

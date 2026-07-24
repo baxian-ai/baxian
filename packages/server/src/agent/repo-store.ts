@@ -2,9 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import type { CommandRunner, ExecResult } from './runner.js';
 import { shellQuote, hostGroupKey, workdirHostGroupKey } from './runner.js';
-import { CLONE_EXEC_TIMEOUT_MS, GIT_NET_ENV, execNetwork, execOutcomeUnknown } from './net-exec.js';
+import {
+  CLONE_EXEC_TIMEOUT_MS,
+  ExecOutcomeUnknownError,
+  GIT_NET_ENV,
+  execNetwork,
+  execOutcomeUnknown,
+} from './net-exec.js';
 import type { AgentMode, HostConfig } from '../shared/index.js';
-import { isGitHubRepo, normalizeRepoUrl, parseGitRemote, redactGitCredentials, repoSlug } from '../shared/index.js';
+import { isGitHubRepo, normalizeRepoUrl, parseGitRemote, parseRepoUrlParts, redactGitCredentials, repoSlug } from '../shared/index.js';
 
 export interface RepoStoreCache {
   homes: Map<string, string>;
@@ -190,18 +196,29 @@ export async function stageFileGuarded(
   root: string,
   tmp: string,
   content: Buffer | string,
+  opts: { mode?: number } = {},
 ): Promise<void> {
   const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
   const guard = ancestorSymlinkGuard(root, tmp);
   const dir = tmp.slice(0, tmp.lastIndexOf('/'));
-  const cmd = `${guard} && mkdir -p ${shellQuote(dir)} && cat > ${shellQuote(tmp)}`;
+  const privateCreate = opts.mode === undefined ? '' : 'umask 077 && ';
+  const enforceMode = opts.mode === undefined
+    ? ''
+    : ` && chmod ${opts.mode.toString(8)} ${shellQuote(tmp)}`;
+  const cmd = `${guard} && mkdir -p ${shellQuote(dir)} && ${privateCreate}cat > ${shellQuote(tmp)}${enforceMode}`;
   let res: ExecResult;
   try {
     res = await runner.execWithStdin(cmd, buf);
   } catch (err) {
     await sweepStrayFile(runner, tmp, guard);
-    throw new Error(
+    throw new ExecOutcomeUnknownError(
       `staged write of ${tmp} failed (exec layer): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (execOutcomeUnknown(res)) {
+    await sweepStrayFile(runner, tmp, guard);
+    throw new ExecOutcomeUnknownError(
+      `staged write of ${tmp} outcome unknown (exit ${res.exitCode}): ${res.stderr.trim() || 'no stderr'}`,
     );
   }
   if (res.exitCode !== 0) {
@@ -222,9 +239,12 @@ export async function moveFileIntoPlace(
   const tmpBase = tmp.slice(tmp.lastIndexOf('/') + 1);
   const clauses = [
     ...(opts.guardRoot ? [ancestorSymlinkGuard(opts.guardRoot, final)] : []),
+    `[ -f ${shellQuote(tmp)} ]`,
+    `[ ! -L ${shellQuote(tmp)} ]`,
     `[ ! -d ${shellQuote(final)} ]`,
     `mv -f -- ${shellQuote(tmp)} ${shellQuote(final)}`,
     `[ -f ${shellQuote(final)} ]`,
+    `[ ! -L ${shellQuote(final)} ]`,
   ];
   const guardCovers = (p: string): boolean => opts.guardRoot !== undefined && isUnder(opts.guardRoot, p);
   const tmpGuard = guardCovers(tmp) ? ancestorSymlinkGuard(opts.guardRoot!, tmp) : undefined;
@@ -240,8 +260,14 @@ export async function moveFileIntoPlace(
     res = await runner.exec(clauses.join(' && '));
   } catch (err) {
     await sweepBoth();
-    throw new Error(
+    throw new ExecOutcomeUnknownError(
       `atomic replace of ${final} failed (exec layer): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (execOutcomeUnknown(res)) {
+    await sweepBoth();
+    throw new ExecOutcomeUnknownError(
+      `atomic replace of ${final} outcome unknown (exit ${res.exitCode}): ${res.stderr.trim() || 'no stderr'}`,
     );
   }
   if (res.exitCode !== 0) {
@@ -380,7 +406,7 @@ export class RepoStore {
       const mk = await this.runner.exec(`${stagingGuard} && mkdir -p ${shellQuote(parent)}`);
       if (mk.exitCode !== 0) throw new Error(`Failed to mkdir ${parent} (symlink-safe): ${mk.stderr}`);
       const cloneCmd = this.cloneWithGh
-        ? `${stagingGuard} && ${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(staging)} --no-upstream`
+        ? `${stagingGuard} && ${this.ghCloneHostEnv()}${GIT_NET_ENV} gh repo clone ${shellQuote(repoSlug(this.repo))} ${shellQuote(staging)} --no-upstream`
         : `${stagingGuard} && ${GIT_NET_ENV} git clone ${shellQuote(this.repo)} ${shellQuote(staging)}`;
       let clone: ExecResult;
       try {
@@ -435,6 +461,18 @@ export class RepoStore {
     }
 
     return this.syncMatchingOriginUrl(absRepoPath);
+  }
+
+  // gh resolves a two-segment slug against the ambient GH_HOST, so the clone must pin the host from the authoritative repo URL.
+  private ghCloneHostEnv(): string {
+    let host: string | undefined = 'github.com';
+    if (!this.isGitHub) {
+      const parts = parseRepoUrlParts(this.repo);
+      host = parts === null
+        ? undefined
+        : parts.port === '' ? parts.hostname : `${parts.hostname}:${parts.port}`;
+    }
+    return host === undefined ? '' : `GH_HOST=${shellQuote(host)} `;
   }
 
   // Runs a remote probe; an uncertain transport outcome throws instead of masquerading as "no".

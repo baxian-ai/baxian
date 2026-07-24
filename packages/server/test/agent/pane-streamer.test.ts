@@ -709,6 +709,49 @@ describe('PaneStreamer', () => {
   });
 
   describe('idle grace + lazy GC', () => {
+    it('restores idle cleanup when subscription startup fails', async () => {
+      await withFakeTimers(async () => {
+        const { streamer } = makeStreamer({
+          idleGraceMs: 100,
+          ptyFactory: () => { throw new Error('attach spawn failed'); },
+        });
+
+        await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow('attach spawn failed');
+        await vi.advanceTimersByTimeAsync(99);
+        expect(streamer.isDestroyed()).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(streamer.isDestroyed()).toBe(true);
+      });
+    });
+
+    it('destroys a one-shot snapshot streamer after the idle grace', async () => {
+      await withFakeTimers(async () => {
+        const { streamer, fakePty } = makeStreamer({ idleGraceMs: 100 });
+
+        await streamer.getSnapshotAtomic();
+        await vi.advanceTimersByTimeAsync(99);
+        expect(streamer.isDestroyed()).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+
+        expect(streamer.isDestroyed()).toBe(true);
+        expect(fakePty.killCalled).toBe(1);
+      });
+    });
+
+    it('keeps a snapshot streamer alive while a subscriber is active', async () => {
+      await withFakeTimers(async () => {
+        const { streamer } = makeStreamer({ idleGraceMs: 100 });
+        const subscription = await streamer.subscribeAtomic(cbs);
+
+        await streamer.getSnapshotAtomic();
+        await vi.advanceTimersByTimeAsync(200);
+
+        expect(streamer.isDestroyed()).toBe(false);
+        subscription.unsubscribe();
+        streamer.destroy();
+      });
+    });
+
     it('keeps PTY alive when subscribers come and go within graceMs', async () => {
       await withFakeTimers(async () => {
         const { streamer, fakePty } = makeStreamer({ idleGraceMs: 100 });

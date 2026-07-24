@@ -64,6 +64,7 @@ const COMPACT_SIGNAL_RE_CODE_READY = new RegExp(
   `\\[bx:(code-ready)(?::(\\d+))?:(${TOKEN_RANGE})\\]`,
   'g',
 );
+const COMPACT_ROOT_DONE_RE = new RegExp(`\\[bx:root-done:(${TOKEN_RANGE})\\]`, 'g');
 
 export function stripSignalAnsi(text: string): string {
   return text.replace(OSC_PATTERN, '').replace(ANSI_PATTERN, '');
@@ -121,15 +122,22 @@ export function decodeSignalActorId(actorB64: string): string | undefined {
   return text;
 }
 
-export function scanPhaseSignals(text: string): PhaseSignal[] {
-  const stripped = stripSignalAnsi(text);
-  const compact = stripped.replace(/\s+/g, '');
-  const found: Array<{ index: number; signal: PhaseSignal }> = [];
+export interface PhaseSignalMatch {
+  signal: PhaseSignal;
+  raw: string;
+  // compactSignalText coordinates, so callers can region-split against compactBoundaryIndex().
+  index: number;
+}
+
+export function scanPhaseSignalMatches(text: string): PhaseSignalMatch[] {
+  const compact = compactSignalText(text);
+  const found: PhaseSignalMatch[] = [];
   for (const m of compact.matchAll(COMPACT_SIGNAL_RE_PR_CREATED)) {
     const prNumber = Number.parseInt(m[2], 10);
     if (!Number.isFinite(prNumber)) continue;
     found.push({
       index: m.index ?? 0,
+      raw: m[0],
       signal: { kind: 'pr-created', prNumber, ...(m[3] !== undefined ? { actorB64: m[3] } : {}), token: m[4] },
     });
   }
@@ -138,6 +146,7 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
     if (prNumber !== undefined && !Number.isFinite(prNumber)) continue;
     found.push({
       index: m.index ?? 0,
+      raw: m[0],
       signal: { kind: 'code-ready', token: m[3], ...(prNumber !== undefined ? { prNumber } : {}) },
     });
   }
@@ -145,10 +154,19 @@ export function scanPhaseSignals(text: string): PhaseSignal[] {
     const kind = m[1] as PhaseSignalKind;
     if (kind === 'pr-created') continue;
     if (!VALID_KINDS.has(kind)) continue;
-    found.push({ index: m.index ?? 0, signal: { kind, token: m[2] } as PhaseSignal });
+    found.push({ index: m.index ?? 0, raw: m[0], signal: { kind, token: m[2] } as PhaseSignal });
   }
   found.sort((a, b) => a.index - b.index);
-  return found.map(f => f.signal);
+  return found;
+}
+
+export function scanPhaseSignals(text: string): PhaseSignal[] {
+  return scanPhaseSignalMatches(text).map(f => f.signal);
+}
+
+export function scanRootDoneSignals(text: string): string[] {
+  const compact = compactSignalText(text);
+  return [...compact.matchAll(COMPACT_ROOT_DONE_RE)].map(match => match[1]);
 }
 
 export interface NeedInputSignal {

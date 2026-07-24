@@ -51,6 +51,13 @@ export class PaneGoneError extends Error {
   }
 }
 
+export class TmuxOutcomeUnknownError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TmuxOutcomeUnknownError';
+  }
+}
+
 function assertPaneId(paneId: string): void {
   if (!/^%\d+$/.test(paneId)) {
     throw new Error(`tmux: malformed pane id ${JSON.stringify(paneId)}`);
@@ -723,7 +730,7 @@ export class TmuxManager {
     }
     // Transient-network / 255 markers on either stream must NOT be read as "no nonce"; treat as unknown.
     if (tmuxProbeOutcomeUnknown(result)) {
-      throw new Error(`tmux creation-nonce probe for ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+      throw new TmuxOutcomeUnknownError(`tmux creation-nonce probe for ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && (isUnknownTmuxVariable(result.stderr) || isSessionAbsent(result.stderr))) {
       return null;
@@ -752,7 +759,7 @@ export class TmuxManager {
       return { ref, claim: claim === '' ? null : claim };
     }
     if (tmuxProbeOutcomeUnknown(result)) {
-      throw new Error(`tmux getSessionSnapshot ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+      throw new TmuxOutcomeUnknownError(`tmux getSessionSnapshot ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return null;
     throw new Error(`tmux getSessionSnapshot ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
@@ -899,7 +906,7 @@ export class TmuxManager {
     }
     // Transient / 255 must not be read as "absent" — a stuck kill would otherwise let DELETE drop the session.
     if (tmuxProbeOutcomeUnknown(result)) {
-      throw new Error(`tmux killSessionRef ${ref.sessionId} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+      throw new TmuxOutcomeUnknownError(`tmux killSessionRef ${ref.sessionId} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return 'absent';
     throw new Error(`tmux killSessionRef ${ref.sessionId} unexpected exit ${result.exitCode}: ${result.stderr}`);
@@ -974,7 +981,7 @@ export class TmuxManager {
     );
     if (result.exitCode === 0) return parseWindowGeometry(result.stdout);
     if (tmuxProbeOutcomeUnknown(result)) {
-      throw new Error(`tmux getWindowGeometry ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+      throw new TmuxOutcomeUnknownError(`tmux getWindowGeometry ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) {
       throw new SessionAbsentError(name, result.stderr.trim());
@@ -1029,7 +1036,7 @@ export class TmuxManager {
     );
     if (result.exitCode === 0) return true;
     if (tmuxProbeOutcomeUnknown(result)) {
-      throw new Error(`tmux hasSession ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
+      throw new TmuxOutcomeUnknownError(`tmux hasSession ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
     if (result.exitCode === 1 && isSessionAbsent(result.stderr)) return false;
     throw new Error(`tmux hasSession ${name} unexpected exit ${result.exitCode}: ${result.stderr}`);

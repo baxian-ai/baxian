@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { mkdir, writeFile as fsWriteFile, chmod } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
+import { isIP } from 'node:net';
 import { dirname, join } from 'node:path';
 import type { AgentMode, HostConfig } from '../shared/index.js';
 
@@ -209,13 +210,15 @@ export function resolveAgentHost(
   ref: string | HostConfig | undefined,
 ): HostConfig | undefined {
   if (ref === undefined) return undefined;
-  if (typeof ref === 'string') return (hosts ?? []).find(h => h.id === ref);
-  return ref;
+  const host: unknown = typeof ref === 'string'
+    ? (hosts ?? []).find(h => h.id === ref)
+    : ref;
+  return isUsableHostConfig(host) ? host : undefined;
 }
 
 export function hostGroupKey(mode: AgentMode, host: HostConfig | undefined): string {
   if (mode === 'local') return 'local';
-  if (!host) return 'remote:';
+  if (!isUsableHostConfig(host)) return 'remote:';
   const port = host.port === undefined ? 'default' : host.port;
   return host.user
     ? `remote:${host.user}@${host.hostname}:${port}`
@@ -223,8 +226,101 @@ export function hostGroupKey(mode: AgentMode, host: HostConfig | undefined): str
 }
 
 export function workdirHostGroupKey(mode: AgentMode, host: HostConfig | undefined): string {
-  if (mode !== 'remote' || !host || host.port !== undefined) return hostGroupKey(mode, host);
-  return hostGroupKey(mode, { ...host, port: 22 });
+  if (mode !== 'remote' || !isUsableHostConfig(host)) return hostGroupKey(mode, host);
+  return hostGroupKey(mode, {
+    ...host,
+    hostname: host.hostname.toLowerCase(),
+    ...(host.port === undefined ? { port: 22 } : {}),
+  });
+}
+
+export function mayShareHostAccount(
+  leftMode: AgentMode,
+  leftHost: HostConfig | undefined,
+  rightMode: AgentMode,
+  rightHost: HostConfig | undefined,
+): boolean {
+  if (leftMode === 'local' || rightMode === 'local') {
+    if (leftMode === 'local' && rightMode === 'local') return true;
+    const remoteHost = leftMode === 'remote' ? leftHost : rightHost;
+    if (!isUsableHostConfig(remoteHost)) return true;
+    if (!isLoopbackSshHost(remoteHost)) return false;
+    if (remoteHost.user === undefined) return true;
+    const username = currentUsername();
+    return username === undefined || remoteHost.user === username;
+  }
+  if (!isUsableHostConfig(leftHost) || !isUsableHostConfig(rightHost)) return true;
+  if (sshHostKey(leftHost) !== sshHostKey(rightHost)) return false;
+  if (leftHost.user !== undefined && rightHost.user !== undefined) {
+    return leftHost.user === rightHost.user;
+  }
+  return true;
+}
+
+function sshHostKey(host: HostConfig): string {
+  const normalized = normalizeSshHostname(host.hostname);
+  const loopback = isLoopbackHostname(normalized);
+  return JSON.stringify([
+    loopback ? 'loopback' : 'hostname',
+    loopback ? '' : normalized,
+  ]);
+}
+
+function normalizeSshHostname(hostname: string): string {
+  const normalized = hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
+  try {
+    const input = normalized.includes(':') ? `[${normalized}]` : normalized;
+    return new URL(`http://${input}/`).hostname.replace(/^\[(.*)\]$/, '$1');
+  } catch {
+    return normalized;
+  }
+}
+
+function isLoopbackSshHost(host: HostConfig): boolean {
+  return isLoopbackHostname(normalizeSshHostname(host.hostname));
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === 'localhost') return true;
+  const address = hostname.replace(/%.+$/, '');
+  const family = isIP(address);
+  if (family === 4) return hostname.split('.')[0] === '127';
+  if (family !== 6) return false;
+  const canonical = canonicalIpv6(address);
+  if (canonical === '::1') return true;
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  return mapped !== null && (Number.parseInt(mapped[1]!, 16) >>> 8) === 127;
+}
+
+function canonicalIpv6(address: string): string {
+  try {
+    const hostname = new URL(`http://[${address}]/`).hostname;
+    return hostname.slice(1, -1);
+  } catch {
+    return address;
+  }
+}
+
+function currentUsername(): string | undefined {
+  try {
+    const username = userInfo().username;
+    return username.trim() === '' ? undefined : username;
+  } catch {
+    return undefined;
+  }
+}
+
+function isUsableHostConfig(value: unknown): value is HostConfig {
+  if (typeof value !== 'object' || value === null) return false;
+  const host = value as { hostname?: unknown; port?: unknown; user?: unknown };
+  return typeof host.hostname === 'string'
+    && host.hostname.trim() !== ''
+    && (host.port === undefined
+      || (typeof host.port === 'number'
+        && Number.isInteger(host.port)
+        && host.port > 0
+        && host.port <= 65_535))
+    && (host.user === undefined || typeof host.user === 'string');
 }
 
 export function sshTarget(host: HostConfig): string {

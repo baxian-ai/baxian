@@ -35,11 +35,20 @@ describe('password redaction (recursively masks host and server-token secrets)',
         id: 'p', repo: 'u/r', merge: null,
         agent: [[{ id: 'a', runtime: 'claude-code', role: 'dev', mode: 'remote', host: { hostname: 'x', password: 'inlinepw' } }]],
       }],
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'root-host', password: 'root-inlinepw' },
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      },
     };
     const out = redactConfig(config);
     expect(out.host[0].password).toBe('***');
     expect((out.project[0].agent[0][0].host as { password?: string }).password).toBe('***');
+    expect((out.root?.host as { password?: string }).password).toBe('***');
     expect(out.server.token).toBe('***');
     expect(config.host[0].password).toBe('regpw');
+    expect((config.root?.host as { password?: string }).password).toBe('root-inlinepw');
   });
 });

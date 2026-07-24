@@ -2,8 +2,10 @@ import { isAbsolute, normalize } from 'node:path';
 import { isBareRepoSlug,
   CONTROL_CHAR_RE, TOOL_PATTERN,
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
+  ROOT_AGENT_ID,
   type AfterDone, type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
 } from '../shared/index.js';
+import { mayShareHostAccount, resolveAgentHost } from '../agent/runner.js';
 
 const VALID_REVIEW_MODES: ReadonlySet<string> = new Set(['git', 'server']);
 
@@ -20,6 +22,9 @@ const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', n
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const REPO_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
+const ROOT_FIELDS = new Set([
+  'runtime', 'mode', 'host', 'workdir', 'yolo', 'model', 'projects', 'responseTimeoutMinutes',
+]);
 
 function isValidRepo(repo: string): boolean {
   if (isGitHubRepo(repo)) return REPO_SLUG_PATTERN.test(repoSlug(repo));
@@ -49,6 +54,7 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateAgentWorkdirUniqueness(config, errors);
   validateAgentPairs(config, errors);
   validateRemoteHosts(config, errors);
+  validateRootAgent(config, errors);
 
   return errors;
 }
@@ -491,7 +497,30 @@ function validateAgentIds(config: BaxianConfig, errors: ValidationError[]): void
 }
 
 function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
-  const seen = new Map<string, string>();
+  const hosts = Array.isArray(config.host) ? config.host : [];
+  const seen: Array<{
+    id: string;
+    mode: AgentMode;
+    host: ReturnType<typeof resolveAgentHost>;
+    workdir: string;
+  }> = [];
+  const root = config.root;
+  if (
+    root
+    && VALID_MODES.includes(root.mode)
+    && nonEmptyString(root.workdir)
+    && isAbsolute(root.workdir)
+  ) {
+    const host = resolveAgentHost(hosts, root.host);
+    if (root.mode === 'local' || host) {
+      seen.push({
+        id: ROOT_AGENT_ID,
+        mode: root.mode,
+        host,
+        workdir: normalize(root.workdir),
+      });
+    }
+  }
   for (const project of config.project) {
     if (!Array.isArray(project.agent)) continue;
     for (let i = 0; i < project.agent.length; i++) {
@@ -499,40 +528,191 @@ function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: Validation
       if (!Array.isArray(pair)) continue;
       for (let j = 0; j < pair.length; j++) {
         const agent = pair[j];
-        if (!nonEmptyString(agent.workdir) || !isAbsolute(agent.workdir!)) continue;
-        const host = configuredAgentHostKey(config, agent.mode, agent.host);
-        if (!host) continue;
-        const key = `${host}\0${normalize(agent.workdir!)}`;
-        const existing = seen.get(key);
+        if (
+          !VALID_MODES.includes(agent.mode)
+          || !nonEmptyString(agent.workdir)
+          || !isAbsolute(agent.workdir!)
+        ) continue;
+        const host = resolveAgentHost(hosts, agent.host);
+        if (agent.mode === 'remote' && !host) continue;
+        const workdir = normalize(agent.workdir!);
+        const existing = seen.find(entry =>
+          entry.workdir === workdir
+          && mayShareHostAccount(entry.mode, entry.host, agent.mode, host),
+        );
         const path = `project.${project.id}.agent[${i}][${j}].workdir`;
         if (existing) {
           errors.push({
             path,
-            message: `Workdir is already used by agent "${existing}" on the same host; different agents must not share a directory`,
+            message: `Workdir is already used by agent "${existing.id}" on the same host; different agents must not share a directory`,
           });
         } else if (nonEmptyString(agent.id)) {
-          seen.set(key, agent.id);
+          seen.push({ id: agent.id, mode: agent.mode, host, workdir });
         }
       }
     }
   }
 }
 
-function configuredAgentHostKey(
+function validateRootAgent(config: BaxianConfig, errors: ValidationError[]): void {
+  for (const project of config.project) {
+    if (!Array.isArray(project.agent)) continue;
+    for (const group of project.agent) {
+      if (!Array.isArray(group)) continue;
+      if (group.some(agent => isRecord(agent) && agent.id === ROOT_AGENT_ID)) {
+        errors.push({
+          path: `project.${project.id}.agent.${ROOT_AGENT_ID}`,
+          message: `Agent id "${ROOT_AGENT_ID}" is reserved for the root agent`,
+        });
+      }
+    }
+  }
+
+  const root = config.root as unknown;
+  if (root === undefined) return;
+  if (!isRecord(root)) {
+    errors.push({ path: 'root', message: 'root must be an object' });
+    return;
+  }
+  for (const field of Object.keys(root)) {
+    if (!ROOT_FIELDS.has(field)) {
+      errors.push({ path: `root.${field}`, message: `unsupported root field: ${field}` });
+    }
+  }
+  if (!VALID_RUNTIMES.includes(root.runtime as AgentRuntime)) {
+    errors.push({
+      path: 'root.runtime',
+      message: `root.runtime must be one of: ${VALID_RUNTIMES.join(', ')}`,
+    });
+  }
+  if (!VALID_MODES.includes(root.mode as AgentMode)) {
+    errors.push({
+      path: 'root.mode',
+      message: `root.mode must be one of: ${VALID_MODES.join(', ')}`,
+    });
+  }
+  if (!nonEmptyString(root.workdir)) {
+    errors.push({ path: 'root.workdir', message: 'root.workdir must be a non-empty string' });
+  } else if (!isAbsolute(root.workdir as string)) {
+    errors.push({ path: 'root.workdir', message: 'root.workdir must be an absolute path' });
+  } else if (normalize(root.workdir as string) === '/') {
+    errors.push({ path: 'root.workdir', message: 'root.workdir must not be the filesystem root' });
+  }
+  if (root.model !== undefined && !nonEmptyString(root.model)) {
+    errors.push({ path: 'root.model', message: 'root.model, when set, must be a non-empty string' });
+  }
+  if (root.yolo !== undefined && typeof root.yolo !== 'boolean') {
+    errors.push({ path: 'root.yolo', message: 'root.yolo must be a boolean if present' });
+  }
+  if (!Number.isInteger(root.responseTimeoutMinutes)
+    || (root.responseTimeoutMinutes as number) < 1
+    || (root.responseTimeoutMinutes as number) > 1440) {
+    errors.push({
+      path: 'root.responseTimeoutMinutes',
+      message: 'root.responseTimeoutMinutes must be an integer in [1, 1440]',
+    });
+  }
+
+  const projectIds = new Set(config.project.map(project => project.id));
+  if (root.projects !== undefined) {
+    if (!Array.isArray(root.projects)) {
+      errors.push({ path: 'root.projects', message: 'root.projects must be an array of project ids' });
+    } else {
+      if (root.projects.length === 0) {
+        errors.push({ path: 'root.projects', message: 'root.projects must contain at least one project id' });
+      }
+      const seen = new Set<string>();
+      root.projects.forEach((projectId, index) => {
+        if (!nonEmptyString(projectId)) {
+          errors.push({ path: `root.projects[${index}]`, message: 'root.projects[*] must be a non-empty string' });
+          return;
+        }
+        if (!projectIds.has(projectId as string)) {
+          errors.push({
+            path: `root.projects[${index}]`,
+            message: `root.projects references unknown project id "${projectId as string}"`,
+          });
+        }
+        if (seen.has(projectId as string)) {
+          errors.push({ path: `root.projects[${index}]`, message: `Duplicate root project id: ${projectId as string}` });
+        }
+        seen.add(projectId as string);
+      });
+    }
+  }
+
+  validateRootHost(config, root, errors);
+  validateRootAccountIsolation(config, errors);
+}
+
+function validateRootAccountIsolation(config: BaxianConfig, errors: ValidationError[]): void {
+  const root = config.root;
+  if (!root || !VALID_MODES.includes(root.mode)) return;
+  const rootHost = resolveAgentHost(config.host, root.host);
+  if (root.mode === 'remote' && !rootHost) return;
+  for (const project of config.project) {
+    for (const group of project.agent) {
+      for (const agent of group) {
+        if (agent.yolo === false || !VALID_MODES.includes(agent.mode)) continue;
+        const agentHost = resolveAgentHost(config.host, agent.host);
+        if (agent.mode === 'remote' && !agentHost) continue;
+        if (!mayShareHostAccount(root.mode, rootHost, agent.mode, agentHost)) continue;
+        errors.push({
+          path: `project.${project.id}.agent.${agent.id}.yolo`,
+          message:
+            `yolo agent "${agent.id}" may share the root mailbox OS account; ` +
+            'set yolo: false or use a different explicit SSH user or hostname',
+        });
+      }
+    }
+  }
+}
+
+function validateRootHost(
   config: BaxianConfig,
-  mode: unknown,
-  hostRef: unknown,
-): string | null {
-  if (mode === 'local') return 'local';
-  if (mode !== 'remote') return null;
-  const host = typeof hostRef === 'string'
-    ? (Array.isArray(config.host) ? config.host : []).find(item => item.id === hostRef)
-    : hostRef;
-  if (!isRecord(host) || !nonEmptyString(host.hostname)) return null;
-  const port = host.port === undefined ? '22' : String(host.port);
-  return nonEmptyString(host.user)
-    ? `remote:${host.user}@${host.hostname}:${port}`
-    : `remote:${host.hostname}:${port}`;
+  root: Record<string, unknown>,
+  errors: ValidationError[],
+): void {
+  if (root.mode === 'local') {
+    if (root.host !== undefined) {
+      errors.push({ path: 'root.host', message: 'local root agent must not configure root.host' });
+    }
+    return;
+  }
+  if (root.mode !== 'remote') return;
+  if (root.host === undefined || root.host === null) {
+    errors.push({ path: 'root.host', message: 'remote root agent must reference a host' });
+    return;
+  }
+  if (typeof root.host === 'string') {
+    if (!config.host.some(host => host.id === root.host)) {
+      errors.push({
+        path: 'root.host',
+        message: `remote root agent references unknown host id "${root.host}" — add it via Host 管理`,
+      });
+    }
+    return;
+  }
+  if (!isRecord(root.host)) {
+    errors.push({ path: 'root.host', message: 'root.host must be a host id (string) or an inline host object' });
+    return;
+  }
+  if (!nonEmptyString(root.host.hostname)) {
+    errors.push({ path: 'root.host.hostname', message: 'host.hostname must be a non-empty string' });
+  }
+  if (root.host.port !== undefined
+    && (!Number.isInteger(root.host.port) || (root.host.port as number) <= 0 || (root.host.port as number) > 65535)) {
+    errors.push({ path: 'root.host.port', message: 'host.port must be a positive integer ≤ 65535' });
+  }
+  if (root.host.user !== undefined && !nonEmptyString(root.host.user)) {
+    errors.push({ path: 'root.host.user', message: 'host.user, if set, must be a non-empty string' });
+  }
+  if (root.host.password !== undefined) {
+    errors.push({
+      path: 'root.host.password',
+      message: 'inline root.host must not carry a password; define it in the top-level host registry and reference it by id',
+    });
+  }
 }
 
 function validateAgentPairs(config: BaxianConfig, errors: ValidationError[]): void {

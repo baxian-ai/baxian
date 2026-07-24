@@ -4,7 +4,7 @@ description: QA reviews injected server-review content (a code diff or a spec do
 disable-model-invocation: true
 ---
 
-baxian dispatches you with a block of `key: value` dispatch fields. Code review normally arrives with `review-checkout: head`: your fixed `workdir:` is already detached at the reviewed head tree, verified by `head-tree`, so inspect files directly without changing directories or branches. The `diffstat:` / `diffstat-file:` and `diff:` / `diff-file:` payloads identify the changed surface and exact hunks; they are references, not a substitute for reading the local code. A draining legacy task may still arrive with `review-checkout: base`; new fixed-Workdir dispatches fail instead of reviewing an unverified checkout. Spec review still rides as `spec:` or `spec-file:`.
+baxian dispatches you with a block of `key: value` dispatch fields. By default (no `review-checkout:` field) your fixed `workdir:` is already detached at the reviewed head tree — the server verified the checkout when materializing it — so inspect files directly without changing directories or branches. The `diffstat:` / `diffstat-file:` and `diff:` / `diff-file:` payloads identify the changed surface and exact hunks; they are references, not a substitute for reading the local code. A prompt that explicitly carries `review-checkout: base` is a draining legacy shape: the local tree holds the base (or an unknowable older state) — treat local files only as unchanged-content reference, and take every post-change content from the `diff` payloads and the read-file side-channel. Spec review still rides as `spec:` or `spec-file:`.
 
 Payloads may appear in trailing blocks — `diff:` / `diffstat:` / `spec:`, plus `interdiff:` / `prior-findings:` / `prior-response:` on a recheck — or, when large, as file reference fields: `diff-file:` / `diffstat-file:` / `interdiff-file:` / `spec-file:` / `prior-findings-file:` / `prior-response-file:`, each `<path> (<size>)` relative to your Workdir. Read a referenced file with your file tools; it carries the exact content the block otherwise would. If a referenced file cannot be read, state that in a finding and emit your signal as usual — never guess at missing content. Do NOT fetch branches or use `gh` — the checkout and payloads ARE the review input.
 
@@ -12,7 +12,7 @@ Payloads may appear in trailing blocks — `diff:` / `diffstat:` / `spec:`, plus
 
 ## Code Review
 
-Judge the reviewed checkout against the task spec: correctness, tests, edge cases, security, regressions. Use `diff:` / `diff-file:` and `diffstat:` / `diffstat-file:` to focus the review, then read the affected files directly when `review-checkout: head`.
+Judge the reviewed checkout against the task spec: correctness, tests, edge cases, security, regressions. Use `diff:` / `diff-file:` and `diffstat:` / `diffstat-file:` to focus the review, then read the affected files directly in the default head checkout.
 
 - Severity: `critical` = broken/unsafe, `major` = must fix before merge, `minor` = improvement.
 - Reference file + line for every code finding.

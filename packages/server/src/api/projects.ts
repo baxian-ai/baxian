@@ -10,14 +10,19 @@ import type {
   SpecApprovalStrategy,
   AgentConfig,
 } from '../shared/index.js';
-import { TASK_ACTIVE_STATUS_SET, TASK_OWNER_ROLES, TASK_TERMINAL_STATUS_SET } from '../shared/index.js';
+import {
+  ROOT_AGENT_ID,
+  TASK_ACTIVE_STATUS_SET,
+  TASK_OWNER_ROLES,
+  TASK_TERMINAL_STATUS_SET,
+} from '../shared/index.js';
 import { probeTmux, runPreflight, type PreflightResult } from '../agent/preflight.js';
 import { installTmux } from '../agent/tmux-install.js';
 import {
   createRunner,
   hostGroupKey,
+  mayShareHostAccount,
   resolveAgentHost,
-  workdirHostGroupKey,
   type CommandRunner,
 } from '../agent/runner.js';
 import { saveConfig, prepareConfig, ConfigValidationError } from '../config/loader.js';
@@ -1008,21 +1013,43 @@ function findConfiguredWorkdirConflict(config: BaxianConfig, candidate: AgentCon
     candidate.mode === 'remote'
     && (!resolvedCandidateHost || typeof resolvedCandidateHost.hostname !== 'string')
   ) return null;
-  const candidateHost = workdirHostGroupKey(
-    candidate.mode,
-    resolvedCandidateHost,
-  );
   const candidatePath = normalize(candidate.workdir);
+  const configured: Array<{
+    id: string;
+    mode: AgentMode;
+    host: ReturnType<typeof resolveAgentHost>;
+    workdir: string;
+  }> = [];
+  if (config.root) {
+    configured.push({
+      id: ROOT_AGENT_ID,
+      mode: config.root.mode,
+      host: resolveAgentHost(config.host, config.root.host),
+      workdir: config.root.workdir,
+    });
+  }
   for (const project of config.project) {
     for (const existing of project.agent.flat()) {
       if (!existing.workdir) continue;
-      const existingHost = workdirHostGroupKey(
+      configured.push({
+        id: existing.id,
+        mode: existing.mode,
+        host: resolveAgentHost(config.host, existing.host),
+        workdir: existing.workdir,
+      });
+    }
+  }
+  for (const existing of configured) {
+    if (
+      normalize(existing.workdir) === candidatePath
+      && mayShareHostAccount(
         existing.mode,
-        resolveAgentHost(config.host, existing.host),
-      );
-      if (existingHost === candidateHost && normalize(existing.workdir) === candidatePath) {
-        return existing.id;
-      }
+        existing.host,
+        candidate.mode,
+        resolvedCandidateHost,
+      )
+    ) {
+      return existing.id;
     }
   }
   return null;

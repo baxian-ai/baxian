@@ -1072,8 +1072,8 @@ describe('post-approve feedback consumption (git)', () => {
     expect(task?.postApproveToken).toBeDefined();
     // continueSession 确认后 pending 才清（false 表已确认送达）
     expect(task?.pendingRedispatch).toBe(false);
-    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.objectContaining({
-      postApproveRedispatchCount: 1,
+    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.not.objectContaining({
+      postApproveRedispatchCount: expect.anything(),
     }));
   });
 
@@ -1229,8 +1229,8 @@ describe('post-approve feedback consumption (git)', () => {
     expect(task?.status).toBe('approved');
     expect(task?.consumedFeedback).toEqual({ [`issue-comments:c7:${'c'.repeat(64)}`]: 1900 });
     expect(task?.postApproveToken).toBeDefined();
-    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.objectContaining({
-      postApproveRedispatchCount: 1,
+    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.not.objectContaining({
+      postApproveRedispatchCount: expect.anything(),
     }));
   });
 
@@ -1362,8 +1362,8 @@ describe('merge-ready receipt recheck (git)', () => {
     await eventBus.emit(mergeReadySignal('tok123456789'));
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('approved');
-    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.objectContaining({
-      postApproveRedispatchCount: 1,
+    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.not.objectContaining({
+      postApproveRedispatchCount: expect.anything(),
     }));
     expect(manager.markAgentWaiting).toHaveBeenCalledWith('dev-1', 'task-1', {
       expectedPostApproveEpisode: {
@@ -1964,8 +1964,8 @@ describe('review round fixes from PR review', () => {
     vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
     const continueSpy = vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
     await recoverGitPostApprovePending(eventBus, manager);
-    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.objectContaining({
-      postApproveRedispatchCount: 1,
+    expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.not.objectContaining({
+      postApproveRedispatchCount: expect.anything(),
     }));
   });
 

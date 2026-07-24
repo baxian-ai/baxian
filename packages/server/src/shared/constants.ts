@@ -1,4 +1,4 @@
-import type { AgentRole, TaskStatus } from './types.js';
+import type { AgentRole, TaskPhase, TaskStatus } from './types.js';
 
 export const DEFAULT_REVIEW_ROUNDS = 10;
 export const DEFAULT_SERVER_PORT = 3000;
@@ -11,6 +11,11 @@ export const DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS = 60_000;
 export const DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS = 30_000;
 export const DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS = 30 * 60_000;
 export const DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS = 3;
+export const DEFAULT_ROOT_RESPONSE_TIMEOUT_MINUTES = 15;
+export const ROOT_AGENT_ID = 'root-agent';
+export const TERMINAL_INTERVENTION_PHASES = ['attach', 'detach', 'input', 'close'] as const;
+export const TERMINAL_INTERVENTION_PHASE_SET: ReadonlySet<string> = new Set(TERMINAL_INTERVENTION_PHASES);
+export type TerminalInterventionPhase = (typeof TERMINAL_INTERVENTION_PHASES)[number];
 
 export const DEFAULT_SERVER_CONFIG = {
   port: DEFAULT_SERVER_PORT,
@@ -168,6 +173,7 @@ const TASK_STATUSES: readonly TaskStatus[] = [
 ];
 
 export const TASK_STATUS_SET: ReadonlySet<TaskStatus> = new Set(TASK_STATUSES);
+export const TASK_PHASE_SET: ReadonlySet<TaskPhase> = new Set(['research', 'spec', 'code']);
 
 export function isTaskOpen(status: TaskStatus): boolean {
   return !TASK_TERMINAL_STATUS_SET.has(status);

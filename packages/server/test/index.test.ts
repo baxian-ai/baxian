@@ -9,6 +9,7 @@ import {
   startServer,
 } from '../src/index.js';
 import { ProcessLock, ProcessLockError } from '../src/state/process-lock.js';
+import { RootRecoveryCoordinator } from '../src/agent/root-recovery-coordinator.js';
 import { writeFile } from 'node:fs/promises';
 import { initStateDir } from '../src/state/init.js';
 import { TaskStore } from '../src/state/task-store.js';
@@ -77,11 +78,14 @@ describe('startServer', () => {
     });
   }
 
-  async function writeConfig(server: Record<string, unknown>): Promise<{ cfgPath: string; stateDir: string }> {
+  async function writeConfig(
+    server: Record<string, unknown>,
+    extra: Record<string, unknown> = {},
+  ): Promise<{ cfgPath: string; stateDir: string }> {
     const cfgPath = join(tempDir, 'baxian.json');
     await writeFile(
       cfgPath,
-      JSON.stringify({ review: { rounds: 10 }, server, host: [], project: [] }),
+      JSON.stringify({ review: { rounds: 10 }, server, host: [], project: [], ...extra }),
     );
     return { cfgPath, stateDir: join(tempDir, '.baxian') };
   }
@@ -133,6 +137,64 @@ describe('startServer', () => {
       for (const l of process.listeners('SIGINT')) if (!sigintBefore.has(l)) process.removeListener('SIGINT', l);
       for (const l of process.listeners('SIGTERM')) if (!sigtermBefore.has(l)) process.removeListener('SIGTERM', l);
       for (const l of process.listeners('exit')) if (!exitBefore.has(l)) process.removeListener('exit', l);
+      exitSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  }, 30_000);
+
+  it('keeps serving when corrupt optional root-recovery state disables the coordinator', async () => {
+    const port = await getFreePort();
+    const rootWorkdir = join(tempDir, 'root-workdir');
+    await mkdir(rootWorkdir);
+    const { cfgPath, stateDir } = await writeConfig(
+      { port, host: '127.0.0.1', ...QUIET_INTERVALS },
+      {
+        root: {
+          runtime: 'codex',
+          mode: 'local',
+          workdir: rootWorkdir,
+          responseTimeoutMinutes: 15,
+        },
+      },
+    );
+    const recoveryDir = join(stateDir, 'state', 'root-recovery');
+    await mkdir(recoveryDir, { recursive: true });
+    await writeFile(
+      join(recoveryDir, 'root-recovery-00000000-0000-4000-8000-000000000001.json'),
+      '{"version":1,"status":"pending"}\n',
+    );
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const sigintBefore = new Set(process.listeners('SIGINT'));
+    const sigtermBefore = new Set(process.listeners('SIGTERM'));
+    const exitBefore = new Set(process.listeners('exit'));
+
+    try {
+      await startServer(cfgPath);
+      const response = await fetch('http://127.0.0.1:' + port + '/health');
+      expect(response.status).toBe(200);
+      expect(warns.join('\n')).toContain('root recovery is disabled');
+      const rootStatus = await fetch(`http://127.0.0.1:${port}/api/agents/root-agent/session`);
+      expect(rootStatus.status).toBe(200);
+      await expect(rootStatus.json()).resolves.toMatchObject({
+        recoveryStatus: 'disabled',
+        recoveryEnabled: false,
+      });
+
+      const sigintHandler = process.listeners('SIGINT').find(listener => !sigintBefore.has(listener));
+      expect(sigintHandler).toBeDefined();
+      sigintHandler!();
+      await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130), { timeout: 15_000 });
+    } finally {
+      for (const listener of process.listeners('SIGINT')) {
+        if (!sigintBefore.has(listener)) process.removeListener('SIGINT', listener);
+      }
+      for (const listener of process.listeners('SIGTERM')) {
+        if (!sigtermBefore.has(listener)) process.removeListener('SIGTERM', listener);
+      }
+      for (const listener of process.listeners('exit')) {
+        if (!exitBefore.has(listener)) process.removeListener('exit', listener);
+      }
       exitSpy.mockRestore();
       logSpy.mockRestore();
     }
@@ -216,13 +278,23 @@ describe('startServer', () => {
     }
   });
 
-  it('releases the process lock when startup fails mid-way (unreadable https key)', async () => {
+  it('stops root recovery and releases the process lock when startup fails mid-way', async () => {
+    const rootWorkdir = join(tempDir, 'root-workdir');
+    await mkdir(rootWorkdir);
     const { cfgPath, stateDir } = await writeConfig({
       port: 3000,
       host: '127.0.0.1',
       https: { keyFile: join(tempDir, 'missing.key'), certFile: join(tempDir, 'missing.crt') },
       ...QUIET_INTERVALS,
+    }, {
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workdir: rootWorkdir,
+        responseTimeoutMinutes: 15,
+      },
     });
+    const stopRoot = vi.spyOn(RootRecoveryCoordinator.prototype, 'stop');
     const sigintBefore = new Set(process.listeners('SIGINT'));
     const sigtermBefore = new Set(process.listeners('SIGTERM'));
     const exitBefore = new Set(process.listeners('exit'));
@@ -230,6 +302,7 @@ describe('startServer', () => {
 
     try {
       await expect(startServer(cfgPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(stopRoot).toHaveBeenCalledOnce();
 
       const reacquire = new ProcessLock(stateDir);
       await expect(reacquire.acquire()).resolves.not.toThrow();
@@ -238,6 +311,7 @@ describe('startServer', () => {
       for (const l of process.listeners('SIGINT')) if (!sigintBefore.has(l)) process.removeListener('SIGINT', l);
       for (const l of process.listeners('SIGTERM')) if (!sigtermBefore.has(l)) process.removeListener('SIGTERM', l);
       for (const l of process.listeners('exit')) if (!exitBefore.has(l)) process.removeListener('exit', l);
+      stopRoot.mockRestore();
       logSpy.mockRestore();
     }
   }, 30_000);

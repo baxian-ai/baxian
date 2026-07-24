@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { userInfo } from 'node:os';
 import { validateConfig } from '../../src/config/validator.js';
 import type { BaxianConfig, AgentConfig, ProjectConfig, MergeStrategy, SpecApprovalStrategy } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
@@ -11,6 +12,7 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
     role: 'dev',
     mode: 'local',
     workdir: `/tmp/${id}`,
+    yolo: false,
     ...overrides,
   };
 }
@@ -494,7 +496,7 @@ describe('validateConfig', () => {
     expect(error?.message).toContain('must not share a directory');
   });
 
-  it('allows equal Workdir paths on distinct explicit SSH ports', () => {
+  it('rejects equal Workdir paths on the same host and account despite distinct SSH ports', () => {
     const config = withProject(devProject({
       agent: [[
         makeAgent({
@@ -508,7 +510,8 @@ describe('validateConfig', () => {
       ]],
     }));
 
-    expect(validateConfig(config)).toEqual([]);
+    const error = validateConfig(config).find(item => item.path.endsWith('[1].workdir'));
+    expect(error?.message).toContain('must not share a directory');
   });
 
   it('rejects project.repo with shell metacharacters', () => {
@@ -551,6 +554,343 @@ describe('validateConfig', () => {
     for (const repo of cases) {
       expect(repoErrors(repo).length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('root agent config', () => {
+  it('accepts one local root agent scoped to a known project', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workdir: '/tmp/root-agent',
+        projects: ['proj'],
+        responseTimeoutMinutes: 15,
+      },
+    });
+    expect(validateConfig(config)).toEqual([]);
+  });
+
+  it('reserves root-agent even before root recovery is configured', () => {
+    const config = makeConfig({
+      project: [{
+        id: 'proj', repo: 'user/repo', merge: null,
+        agent: [[makeAgent({ id: 'root-agent', role: 'dev' })]],
+      }],
+    });
+    expect(validateConfig(config).some(error => error.message.includes('reserved for the root agent'))).toBe(true);
+  });
+
+  it('rejects reserved ids, shared workdirs, and an empty project scope', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workdir: '/tmp/root-agent',
+        projects: [],
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({ id: 'root-agent', role: 'dev', workdir: '/tmp/root-agent' })]],
+      }],
+    });
+    const errors = validateConfig(config);
+    expect(errors.some(error => error.message.includes('reserved for the root agent'))).toBe(true);
+    expect(errors.some(error => error.message.includes('Workdir is already used by agent "root-agent"'))).toBe(true);
+    expect(errors).toContainEqual({
+      path: 'root.projects',
+      message: 'root.projects must contain at least one project id',
+    });
+  });
+
+  it('normalizes remote hostname case without collapsing distinct users', () => {
+    const configForUser = (user: string) => makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'Host.EXAMPLE.com', user: 'agent' },
+        workdir: '/srv/shared',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-1',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'host.example.com', user },
+          workdir: '/srv/shared',
+        })]],
+      }],
+    });
+
+    expect(validateConfig(configForUser('agent')).some(error =>
+      error.message.includes('Workdir is already used by agent "root-agent"'),
+    )).toBe(true);
+    expect(validateConfig(configForUser('other-user')).some(error =>
+      error.message.includes('Workdir is already used'),
+    )).toBe(false);
+  });
+
+  it('rejects a local root and loopback SSH peer sharing one Workdir', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workdir: '/tmp/shared-root-workdir',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-loopback',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: '127.0.0.1', user: userInfo().username, port: 22 },
+          workdir: '/tmp/shared-root-workdir',
+          yolo: false,
+        })]],
+      }],
+    });
+
+    expect(validateConfig(config).some(error =>
+      error.message.includes('Workdir is already used by agent "root-agent"'),
+    )).toBe(true);
+  });
+
+  it('rejects a same-account yolo agent even when its Workdir is separate', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workdir: '/tmp/root-agent',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({ id: 'dev-yolo', role: 'dev', workdir: '/tmp/dev-yolo', yolo: true })]],
+      }],
+    });
+
+    expect(validateConfig(config)).toContainEqual({
+      path: 'project.proj.agent.dev-yolo.yolo',
+      message: expect.stringContaining('may share the root mailbox OS account'),
+    });
+  });
+
+  it('treats an implicit SSH user as potentially matching an explicit peer user', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'Host.EXAMPLE.com' },
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-yolo',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'host.example.com', user: 'runner' },
+          workdir: '/srv/dev',
+          yolo: true,
+        })]],
+      }],
+    });
+
+    expect(validateConfig(config).some(error =>
+      error.path === 'project.proj.agent.dev-yolo.yolo',
+    )).toBe(true);
+  });
+
+  it('allows a yolo peer when a different remote account is explicit', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'host.example.com', user: 'root', port: 22 },
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-yolo',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'host.example.com', user: 'runner', port: 22 },
+          workdir: '/srv/dev',
+          yolo: true,
+        })]],
+      }],
+    });
+
+    expect(validateConfig(config)).toEqual([]);
+  });
+
+  it('rejects a yolo peer on the same host and account despite a distinct SSH port', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'host.example.com', user: 'runner', port: 22 },
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-yolo',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'host.example.com', user: 'runner', port: 2222 },
+          workdir: '/srv/dev',
+          yolo: true,
+        })]],
+      }],
+    });
+
+    expect(validateConfig(config)).toContainEqual({
+      path: 'project.proj.agent.dev-yolo.yolo',
+      message: expect.stringContaining('may share the root mailbox OS account'),
+    });
+  });
+
+  it('reports malformed inline hosts instead of throwing during account checks', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: '', port: 70_000 } as never,
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-yolo',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'host.example.com', user: 'runner' },
+          workdir: '/srv/dev',
+          yolo: true,
+        })]],
+      }],
+    });
+
+    expect(() => validateConfig(config)).not.toThrow();
+    expect(validateConfig(config)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'root.host.hostname' }),
+      expect.objectContaining({ path: 'root.host.port' }),
+    ]));
+  });
+
+  it('rejects a local-root yolo peer that SSHes back to the same local account', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workdir: '/tmp/root-agent',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-yolo',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'localhost', user: userInfo().username },
+          workdir: '/tmp/dev-yolo',
+          yolo: true,
+        })]],
+      }],
+    });
+
+    expect(validateConfig(config)).toContainEqual({
+      path: 'project.proj.agent.dev-yolo.yolo',
+      message: expect.stringContaining('may share the root mailbox OS account'),
+    });
+  });
+
+  it('applies the same endpoint/account relation to Workdir uniqueness', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'host.example.com', port: 22 },
+        workdir: '/srv/shared',
+        responseTimeoutMinutes: 15,
+      },
+      project: [{
+        id: 'proj',
+        repo: 'user/repo',
+        merge: null,
+        agent: [[makeAgent({
+          id: 'dev-1',
+          role: 'dev',
+          mode: 'remote',
+          host: { hostname: 'HOST.EXAMPLE.COM', user: 'runner' },
+          workdir: '/srv/shared',
+        })]],
+      }],
+    });
+
+    expect(validateConfig(config).some(error =>
+      error.message.includes('Workdir is already used by agent "root-agent"'),
+    )).toBe(true);
+  });
+
+  it('requires a registered host for remote root and rejects inline passwords', () => {
+    const unknown = makeConfig({
+      root: {
+        runtime: 'codex', mode: 'remote', host: 'ghost', workdir: '/srv/root', responseTimeoutMinutes: 15,
+      },
+    });
+    expect(validateConfig(unknown).some(error => /unknown host id/.test(error.message))).toBe(true);
+
+    const inlineSecret = makeConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'remote',
+        host: { hostname: 'host.example', password: 'secret' },
+        workdir: '/srv/root',
+        responseTimeoutMinutes: 15,
+      },
+    });
+    expect(validateConfig(inlineSecret).some(error => /must not carry a password/.test(error.message))).toBe(true);
+  });
+
+  it('rejects the filesystem root as the root agent workdir', () => {
+    const config = makeConfig({
+      root: {
+        runtime: 'codex', mode: 'local', workdir: '/', responseTimeoutMinutes: 15,
+      },
+    });
+    expect(validateConfig(config)).toContainEqual({
+      path: 'root.workdir',
+      message: 'root.workdir must not be the filesystem root',
+    });
   });
 });
 

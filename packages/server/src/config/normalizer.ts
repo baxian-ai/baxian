@@ -11,6 +11,12 @@ const CANONICAL_CASE: Record<string, string> = {
   gitcli: 'gitCli',
 };
 
+const ROOT_CANONICAL_CASE: Record<string, string> = {
+  projects: 'projects',
+  responsetimeoutminutes: 'responseTimeoutMinutes',
+  workdir: 'workdir',
+};
+
 export function normalizeConfig(raw: unknown): Record<string, unknown> {
   if (typeof raw !== 'object' || raw === null) {
     return {};
@@ -28,6 +34,20 @@ export function normalizeConfig(raw: unknown): Record<string, unknown> {
     });
   }
 
+  if (typeof result.root === 'object' && result.root !== null && !Array.isArray(result.root)) {
+    result.root = normalizeRootKeys(result.root as Record<string, unknown>);
+  }
+
+  return result;
+}
+
+function normalizeRootKeys(obj: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    const lower = key.toLowerCase();
+    const canonical = ROOT_CANONICAL_CASE[lower] ?? lower;
+    if (!(canonical in result)) result[canonical] = value;
+  }
   return result;
 }
 

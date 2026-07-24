@@ -1084,6 +1084,10 @@ describe('TmuxSessionStatusStore onChange', () => {
     store.set('dev-1', { tmuxSessionStatus: 'present', observedAt: 't2' });
     store.set('dev-1', { tmuxSessionStatus: 'present', observedAt: 't3' });
     expect(fired).toEqual([['set', 'dev-1']]);
+    expect(store.get('dev-1')).toMatchObject({
+      observedAt: 't3',
+      stateChangedAt: 't1',
+    });
   });
 
   it('fires when tmux status changes', () => {
@@ -1093,6 +1097,29 @@ describe('TmuxSessionStatusStore onChange', () => {
     store.set('dev-1', { tmuxSessionStatus: 'present', observedAt: 't1' });
     store.set('dev-1', { tmuxSessionStatus: 'unreachable', observedAt: 't2', error: 'ssh' });
     expect(fired).toEqual([['set', 'dev-1'], ['set', 'dev-1']]);
+    expect(store.get('dev-1').stateChangedAt).toBe('t2');
+  });
+
+  it('advances stateChangedAt only when the material stall state changes', () => {
+    const store = new TmuxSessionStatusStore();
+    store.set('dev-1', {
+      tmuxSessionStatus: 'present',
+      observedAt: 't1',
+      reason: 'PENDING_IDLE',
+    });
+    store.set('dev-1', {
+      tmuxSessionStatus: 'present',
+      observedAt: 't2',
+      reason: 'PENDING_IDLE',
+    });
+    expect(store.get('dev-1').stateChangedAt).toBe('t1');
+
+    store.set('dev-1', {
+      tmuxSessionStatus: 'present',
+      observedAt: 't3',
+      reason: 'AUTH_REQUIRED',
+    });
+    expect(store.get('dev-1').stateChangedAt).toBe('t3');
   });
 
   it('fires on delete only when an entry existed', () => {

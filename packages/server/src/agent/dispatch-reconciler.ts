@@ -3,12 +3,12 @@ import { isSpecStagePhase } from '../shared/index.js';
 import type { EventBus } from '../event/bus.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { TaskStore } from '../state/task-store.js';
-import { ApiError } from '../errors.js';
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
 import type { TmuxSessionStatusStore, TmuxSessionObservation } from './tmux-probe-poller.js';
 import {
   type AgentManager,
   type PendingDispatchRetry,
+  isBenignDispatchConflict,
 } from './manager.js';
 
 export interface DispatchReconcilerOptions {
@@ -39,10 +39,6 @@ interface AttemptRecord {
 
 // 绑定丢失可能只是一次在途派发的 release→acquire 缝隙，驻留两周期再动手。
 const UNBOUND_DWELL_CYCLES = 2;
-
-// 这些 409 由并发接管/入口互斥产生，会随下一周期自然消解，不消耗重试额度；
-// 其余 409（跨任务占用、不可恢复 hold、release 失败等）是持久门禁，必须计次直至升级人工。
-const NO_COUNT_API_CODES = new Set(['dispatch-superseded', 'dispatch-in-flight']);
 
 // 派发级对账兜底（#558 M2 B3）：消费 TmuxProbePoller 的观察结果 + manager 的 pending 登记，
 // 把「QA 忙碌延后的 recheck / dev 忙碌延后的 fix / 可恢复 hold / 静默失联的 review pass」
@@ -386,12 +382,20 @@ export class DispatchReconciler {
         fromStatus: ['review'],
         expectPhase: task.phase,
         expectSignalToken: tokenAtDecision,
+        expectedTask: {
+          status: task.status,
+          phase: task.phase,
+          signalToken: task.signalToken,
+          agentId: task.agentId,
+          reviewRound: task.reviewRound,
+          specReviewRound: task.specReviewRound,
+        },
         ...(qaPhase !== undefined ? { qaPhase } : {}),
         ...(pendingBudget !== undefined ? { pendingBudget } : {}),
         onPassArmed: (armed) => { armedToken = armed; },
       });
     } catch (err) {
-      if (err instanceof ApiError && err.status === 409 && err.code !== undefined && NO_COUNT_API_CODES.has(err.code)) {
+      if (isBenignDispatchConflict(err)) {
         console.warn(`[dispatch-reconciler] redispatch ${task.id} (${action}) superseded by a concurrent pass: ${err.message}`);
         return;
       }

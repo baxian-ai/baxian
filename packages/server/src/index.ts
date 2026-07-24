@@ -15,6 +15,7 @@ import { TaskStore } from './state/task-store.js';
 import { ErrorRecordStore } from './state/error-record-store.js';
 import { ReviewStore } from './state/review-store.js';
 import { PetStore } from './state/pet-store.js';
+import { RootRecoveryStore } from './state/root-recovery-store.js';
 import { LockManager } from './state/lock.js';
 import { ProcessLock, ProcessLockError } from './state/process-lock.js';
 import { EventBus } from './event/bus.js';
@@ -31,12 +32,14 @@ import { PlatformPoller, platformTaskView, type PlatformPollerOptions } from './
 import { platformPollerStatePath } from './platform/comment-cursor.js';
 import { buildProjectDriver, makeDriverExec } from './platform/driver-host.js';
 import { createRunner, resolveAgentHost } from './agent/runner.js';
-import type { AgentConfig, HostConfig } from './shared/index.js';
+import type { AgentRuntimeConfig, HostConfig } from './shared/index.js';
 import { repoIdentityKey } from './shared/index.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poller.js';
 import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
 import { DispatchReconciler } from './agent/dispatch-reconciler.js';
+import { RootAgentRuntime } from './agent/root-agent-runtime.js';
+import { RootRecoveryCoordinator } from './agent/root-recovery-coordinator.js';
 import { buildApp } from './app.js';
 import { RestartCoordinator } from './lifecycle/restart.js';
 import { consumeRestartSentinel } from './lifecycle/restart-sentinel.js';
@@ -121,6 +124,7 @@ export async function startServer(configPath?: string): Promise<void> {
     }
   };
   let appRef: Awaited<ReturnType<typeof buildApp>> | null = null;
+  let rootRecoveryCoordinatorRef: RootRecoveryCoordinator | undefined;
   let stopBackgroundRunners: () => void = () => undefined;
   let shuttingDown = false;
   const SHUTDOWN_GRACE_MS = 8000;
@@ -162,6 +166,7 @@ export async function startServer(configPath?: string): Promise<void> {
     const taskStore = new TaskStore(`${stateDir}/state/tasks`);
     const errorRecordStore = new ErrorRecordStore(`${stateDir}/state/errors`);
     const petStore = new PetStore(`${stateDir}/state/pets`);
+    const rootRecoveryStore = new RootRecoveryStore(`${stateDir}/state/root-recovery`);
     const lockManager = new LockManager(`${stateDir}/locks`);
     const eventLog = new EventLog(`${stateDir}/events`);
     const eventBus = new EventBus(eventLog);
@@ -173,7 +178,7 @@ export async function startServer(configPath?: string): Promise<void> {
     assertCoreSkillsPresent(registry, skillsDir);
     await scanPluginSkillPools(registry, pluginRegistry.all(), referencedGitTools(config));
 
-    let resolveHostRef: (agent: AgentConfig) => HostConfig | undefined = (agent) =>
+    let resolveHostRef: (agent: AgentRuntimeConfig) => HostConfig | undefined = (agent) =>
       (typeof agent.host === 'object' ? agent.host : undefined);
     const paneStreamerManager = new PaneStreamerManager({
       runnerFactory: (agent) => createRunner(agent.mode, resolveHostRef(agent)),
@@ -239,6 +244,37 @@ export async function startServer(configPath?: string): Promise<void> {
     tmuxSessionStatusStore.onChange((kind, id) => eventPublisher.publishAgentChange(kind, id));
     taskStore.onChange((kind, id) => eventPublisher.publishTaskChange(kind, id));
     petStore.onChange((id) => eventPublisher.publishAgentChange('set', id));
+
+    const rootRecoveryCoordinator = config.root
+      ? new RootRecoveryCoordinator({
+          config: config.root,
+          eventBus,
+          manager: agentManager,
+          taskStore,
+          agentStore,
+          statusStore: tmuxSessionStatusStore,
+          store: rootRecoveryStore,
+          runtime: new RootAgentRuntime({
+            config: config.root,
+            hosts: () => agentManager.getConfig().host,
+            agents: () => agentManager.getConfig().project.flatMap(project => project.agent.flat()),
+            paneStreamerManager,
+          }),
+          capturePane: async (agentId) => {
+            const agent = agentManager.getAgentConfig(agentId);
+            if (!agent) return undefined;
+            return (await paneStreamerManager.ensure(agent).getSnapshotAtomic()).snapshot.data;
+          },
+        })
+      : undefined;
+    rootRecoveryCoordinatorRef = rootRecoveryCoordinator;
+    if (rootRecoveryCoordinator) {
+      try {
+        await rootRecoveryCoordinator.start();
+      } catch (err) {
+        console.warn('[startup] root recovery is disabled because its durable state could not be recovered:', err);
+      }
+    }
 
     const onBootstrapAgentAffected = (ids: string[]) => {
       for (const id of ids) eventPublisher.publishAgentChange('set', id);
@@ -337,6 +373,7 @@ export async function startServer(configPath?: string): Promise<void> {
         eventBroker,
         errorRecordStore,
         petStore,
+        rootRecoveryCoordinator,
       },
       {
         ...(httpsOpts ? { https: httpsOpts } : {}),
@@ -366,6 +403,12 @@ export async function startServer(configPath?: string): Promise<void> {
     dispatchReconciler.start();
     console.log(formatServerRunningMessage(host, config.server.port, Boolean(config.server.https)));
   } catch (err) {
+    stopBackgroundRunners();
+    try {
+      await rootRecoveryCoordinatorRef?.stop();
+    } catch (cleanupErr) {
+      console.warn('[startup] root recovery cleanup after server startup failure failed:', cleanupErr);
+    }
     await releaseLockBestEffort();
     throw err;
   }

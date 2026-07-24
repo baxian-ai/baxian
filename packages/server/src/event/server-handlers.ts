@@ -7,9 +7,10 @@ import type {
   ServerResponseFailure,
   ServerSignalKind,
   ServerSignalRecoveryReason,
+  TaskGenerationGuard,
   TaskState,
 } from '../shared/index.js';
-import { isSpecStagePhase } from '../shared/index.js';
+import { isSpecStagePhase, taskGenerationGuard } from '../shared/index.js';
 import type { EventBus } from './bus.js';
 import type { AgentManager } from '../agent/manager.js';
 import {
@@ -18,6 +19,7 @@ import {
   type ReviewResponseReadResult,
 } from '../agent/review-transport.js';
 import type { PhaseSignalKind } from '../agent/phase-signal.js';
+import { settlePermitOf } from '../agent/phase-signal-watcher.js';
 import { computeBackoffMs } from '../timing/backoff.js';
 import {
   reviewFindingsDigest,
@@ -162,6 +164,13 @@ async function emitIntervention(
 
 interface Gate {
   task: TaskState;
+  expectedTask: TaskGenerationGuard;
+}
+
+interface HandlerDispatchOptions {
+  expectedTask?: TaskGenerationGuard;
+  onSideEffect?: () => void;
+  settlePermit?: unknown;
 }
 
 async function gate(
@@ -193,7 +202,7 @@ async function gate(
     });
     return null;
   }
-  return { task };
+  return { task, expectedTask: taskGenerationGuard(task) };
 }
 
 export function registerServerEventHandlers(bus: EventBus, manager: AgentManager): void {
@@ -235,11 +244,15 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     agentId: string,
     kind: ServerSignalKind,
     data: ReviewRound,
+    opts: HandlerDispatchOptions = {},
   ): Promise<boolean> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= SERVER_HANDLER_ATTEMPTS; attempt++) {
       try {
-        await reviewStore.putRound(task.id, data.phase, data);
+        const stored = opts.expectedTask
+          ? await manager.putReviewRoundIfCurrent(task.id, data, opts.expectedTask)
+          : (await reviewStore.putRound(task.id, data.phase, data), true);
+        if (!stored) return false;
         return true;
       } catch (err) {
         lastError = err;
@@ -262,6 +275,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         round: data.round,
         error: lastError instanceof Error ? lastError.message : String(lastError),
       },
+      opts.onSideEffect,
     );
   }
 
@@ -272,6 +286,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     reason: ServerSignalRecoveryReason,
     failurePhase: string,
     data: Record<string, unknown> = {},
+    onSideEffect?: () => void,
   ): Promise<boolean> {
     if (!SERVER_SIGNAL_KINDS.has(kind)) {
       throw new Error(`unsupported consumed server signal kind: ${kind}`);
@@ -285,6 +300,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       { phase, round, reason, failurePhase },
     );
     if (!held) return false;
+    onSideEffect?.();
     await emitIntervention(bus, held, {
       phase: failurePhase,
       ...data,
@@ -330,10 +346,15 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     task: TaskState,
     qa: AgentConfig,
     kind: Extract<ServerSignalKind, 'code-reviewed' | 'spec-reviewed'>,
+    expectedTask: TaskGenerationGuard,
   ): Promise<boolean> {
     try {
-      await transport().deleteFindings(qa);
-      return true;
+      return await manager.deleteReviewExchangeIfCurrent(
+        task.id,
+        qa,
+        'findings',
+        expectedTask,
+      );
     } catch (err) {
       await holdConsumedSignal(
         task,
@@ -344,6 +365,34 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         { error: err instanceof Error ? err.message : String(err) },
       );
       return false;
+    }
+  }
+
+  async function deleteResponseOrHold(
+    task: TaskState,
+    dev: AgentConfig,
+    kind: Extract<ServerSignalKind, 'code-fixed' | 'spec-fixed'>,
+    opts: HandlerDispatchOptions,
+  ): Promise<boolean> {
+    try {
+      const deleted = await manager.deleteReviewExchangeIfCurrent(
+        task.id,
+        dev,
+        'response',
+        opts.expectedTask ?? taskGenerationGuard(task),
+      );
+      if (deleted) opts.onSideEffect?.();
+      return deleted;
+    } catch (err) {
+      return holdConsumedSignal(
+        task,
+        dev.id,
+        kind,
+        'handler-failed',
+        `server-${kind.startsWith('spec-') ? 'spec' : 'code'}-response-cleanup-failed`,
+        { error: err instanceof Error ? err.message : String(err) },
+        opts.onSideEffect,
+      );
     }
   }
 
@@ -361,6 +410,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       schemaViolationCodes?: string[];
       details?: Record<string, unknown>;
     },
+    onSideEffect?: () => void,
   ): Promise<boolean> {
     const phase = roundData.phase;
     const signalKind = `${phase}-fixed` as const;
@@ -393,6 +443,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(failure.responseDigest ? { responseDigest: failure.responseDigest } : {}),
     });
     if (!claimed?.signalToken) return false;
+    onSideEffect?.();
     let recorded: ServerResponseFailure;
     try {
       recorded = await reviewStore.recordServerResponseFailure(task.id, phase, roundData.round, {
@@ -469,7 +520,14 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       return false;
     }
     try {
-      await transport().deleteResponse(dev);
+      const deleted = await manager.deleteReviewExchangeIfCurrent(
+        task.id,
+        dev,
+        'response',
+        taskGenerationGuard(beforeCleanup),
+        currentRecovery,
+      );
+      if (!deleted) return false;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const held = await manager.holdServerSignalRecovery(
@@ -514,6 +572,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     task: TaskState,
     entryKind: PhaseSignalKind,
     phase: string,
+    onSideEffect?: () => void,
   ): Promise<boolean> {
     if (!task.qaAgentId || resolveActiveQa(task)) return false;
     await holdConsumedSignal(
@@ -523,14 +582,25 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       'handler-failed',
       phase,
       { qaAgentId: task.qaAgentId },
+      onSideEffect,
     );
     return true;
   }
 
-  async function autoApproveCode(task: TaskState, entryKind: PhaseSignalKind = 'code-done'): Promise<void> {
-    const afterDone = await manager.commitServerAfterDone(task.id);
+  async function autoApproveCode(
+    task: TaskState,
+    expectedTask?: TaskGenerationGuard,
+    entryKind: PhaseSignalKind = 'code-done',
+    onSideEffect?: () => void,
+  ): Promise<void> {
+    const afterDone = await manager.commitServerAfterDone(task.id, expectedTask);
+    onSideEffect?.();
     if (afterDone === null) {
-      const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['in_progress', 'fixing'] });
+      const ready = await manager.transitionTaskStatus(task.id, 'ready', {
+        fromStatus: ['in_progress', 'fixing'],
+        ...(expectedTask !== undefined ? { expectTask: expectedTask } : {}),
+      });
+      if (ready) onSideEffect?.();
       if (!ready) {
         await holdConsumedSignal(
           task,
@@ -538,6 +608,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           entryKind,
           'handler-failed',
           'server-code-auto-approve-transition-failed',
+          {},
+          onSideEffect,
         );
       }
       return;
@@ -550,6 +622,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         entryKind,
         'fix-no-dev-agent',
         'server-code-auto-approve-no-dev-agent',
+        {},
+        onSideEffect,
       );
       return;
     }
@@ -565,13 +639,20 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'handler-failed',
         'server-code-auto-approve-head-capture-failed',
         { error: err instanceof Error ? err.message : String(err) },
+        onSideEffect,
       );
       return;
     }
     const approved = await manager.transitionTaskStatus(
-      task.id, 'approved', { fromStatus: ['in_progress', 'fixing'] },
+      task.id,
+      'approved',
+      {
+        fromStatus: ['in_progress', 'fixing'],
+        ...(expectedTask !== undefined ? { expectTask: expectedTask } : {}),
+      },
       { reviewHeadAnchorSha },
     );
+    if (approved) onSideEffect?.();
     if (!approved) {
       await holdConsumedSignal(
         task,
@@ -579,6 +660,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         entryKind,
         'handler-failed',
         'server-code-auto-approve-transition-failed',
+        {},
+        onSideEffect,
       );
       return;
     }
@@ -590,6 +673,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         entryKind,
         'handler-failed',
         'server-code-auto-approve-publish-dispatch-failed',
+        {},
+        onSideEffect,
       );
     }
   }
@@ -599,11 +684,17 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       || manager.getProjectConfig(task.projectId)?.specApproval === 'human';
   }
 
-  async function advanceApprovedSpec(task: TaskState, failurePhase: string): Promise<void> {
+  async function advanceApprovedSpec(
+    task: TaskState,
+    failurePhase: string,
+    expectedTask?: TaskGenerationGuard,
+  ): Promise<void> {
     try {
       const result = specApprovalIsHuman(task)
-        ? await manager.parkTaskAtSpecReady(task.id)
-        : await manager.transitionToCodePhase(task.id);
+        ? await manager.parkTaskAtSpecReady(task.id, {
+            ...(expectedTask !== undefined ? { expectedTask } : {}),
+          })
+        : await manager.transitionToCodePhase(task.id, expectedTask);
       if (!result) {
         await holdConsumedSignal(task, task.qaAgentId ?? task.agentId, 'spec-reviewed', 'handler-failed', failurePhase);
       }
@@ -619,9 +710,14 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
   }
 
-  async function autoApproveSpec(task: TaskState): Promise<boolean> {
+  async function autoApproveSpec(
+    task: TaskState,
+    expectedTask?: TaskGenerationGuard,
+    onSideEffect?: () => void,
+  ): Promise<boolean> {
     try {
-      const result = await manager.transitionToCodePhase(task.id);
+      const result = await manager.transitionToCodePhase(task.id, expectedTask);
+      if (result) onSideEffect?.();
       if (!result) {
         await holdConsumedSignal(
           task,
@@ -629,6 +725,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
           'handler-failed',
           'server-spec-auto-approve-transition-failed',
+          {},
+          onSideEffect,
         );
         return false;
       }
@@ -641,6 +739,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'handler-failed',
         'server-spec-auto-approve-transition-failed',
         { error: err instanceof Error ? err.message : String(err) },
+        onSideEffect,
       );
       return false;
     }
@@ -651,8 +750,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     opts: {
       recheck: boolean;
       bumpRound?: boolean;
+      expectedTask?: TaskGenerationGuard;
+      onSideEffect?: () => void;
       priorFindingsJson?: string;
       priorResponseJson?: string;
+      settlePermit?: unknown;
     },
   ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
@@ -664,13 +766,19 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         kind,
         'fix-no-dev-agent',
         'server-code-review-no-dev-agent',
+        {},
+        opts.onSideEffect,
       );
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     const nextRound = opts.bumpRound === false ? task.reviewRound : task.reviewRound + 1;
     if (nextRound > cap) {
-      const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
+      const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', {
+        fromStatus: ['in_progress', 'fixing'],
+        ...(opts.expectedTask !== undefined ? { expectTask: opts.expectedTask } : {}),
+      });
       if (!capResult) return false;
+      opts.onSideEffect?.();
       const paused = capResult.task;
       if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
       await bus.emit({
@@ -715,6 +823,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           'handler-failed',
           'server-code-content-read-failed',
           { error: err instanceof Error ? err.message : String(err) },
+          opts.onSideEffect,
         );
       }
       try {
@@ -726,7 +835,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
             offendingBranch: violation.branch,
             offendingSha: violation.sha,
             note: 'The task branch embeds another active task\'s commits — reviewing it would leak foreign work into this task. Have the dev rebase onto origin/HEAD and re-emit the signal.',
-          });
+          }, opts.onSideEffect);
         }
       } catch (err) {
         const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
@@ -737,6 +846,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           'handler-failed',
           'server-code-lineage-check-failed',
           { error: err instanceof Error ? err.message : String(err) },
+          opts.onSideEffect,
         );
       }
     }
@@ -757,6 +867,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       task.agentId,
       task.status === 'fixing' ? 'code-fixed' : 'code-done',
       data,
+      opts,
     );
 
     const resolveRecheckInterdiff = async (): Promise<string | undefined> => {
@@ -778,7 +889,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'code',
       recheck: opts.recheck,
-      ...(opts.bumpRound === false ? { bumpRound: false } : {}),
+      ...(opts.bumpRound !== undefined ? { bumpRound: opts.bumpRound } : {}),
       content: content.content,
       reviewHeadAnchorSha,
       ...(content.baseSha ? { baseSha: content.baseSha } : {}),
@@ -788,6 +899,9 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
       callerOwnsConsumedSignalFailure: true,
+      ...(opts.settlePermit !== undefined ? { settlePermit: opts.settlePermit } : {}),
+      ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
+      ...(opts.onSideEffect !== undefined ? { onSideEffect: opts.onSideEffect } : {}),
     });
     if (dispatched) return true;
     const kind = task.status === 'fixing' ? 'code-fixed' : 'code-done';
@@ -797,6 +911,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       kind,
       'handler-failed',
       'server-code-review-dispatch-failed',
+      {},
+      opts.onSideEffect,
     );
   }
 
@@ -805,7 +921,13 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     batches: LegacyDiffFile[][],
     index: number,
     diffstat: string | undefined,
-    opts: { recheck: boolean; priorFindingsJson?: string; priorResponseJson?: string },
+    opts: {
+      recheck: boolean;
+      priorFindingsJson?: string;
+      priorResponseJson?: string;
+      expectedTask?: TaskGenerationGuard;
+      settlePermit?: unknown;
+    },
   ): Promise<boolean> {
     const text = batches[index].map(f => f.text).join('\n');
     const dispatched = await manager.dispatchServerReviewToQa(taskId, {
@@ -818,6 +940,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       ...(opts.priorFindingsJson ? { priorFindingsJson: opts.priorFindingsJson } : {}),
       ...(opts.priorResponseJson ? { priorResponseJson: opts.priorResponseJson } : {}),
       callerOwnsConsumedSignalFailure: true,
+      ...(opts.settlePermit !== undefined ? { settlePermit: opts.settlePermit } : {}),
+      ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
     });
     return dispatched !== null;
   }
@@ -829,21 +953,21 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   bus.on('server.code.ready', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'code', requireServerMode: true });
     if (!gated) return;
-    const { task } = gated;
+    const { task, expectedTask } = gated;
     await runConsumedSignal(task, task.agentId, 'code-done', async () => {
       if (await pauseForUnavailableQa(task, 'code-done', 'server-code-qa-unavailable')) return;
       if (!task.qaAgentId) {
-        await autoApproveCode(task);
+        await autoApproveCode(task, expectedTask);
         return;
       }
-      await prepareAndDispatchCodeReview(task, { recheck: false });
+      await prepareAndDispatchCodeReview(task, { recheck: false, expectedTask, settlePermit: settlePermitOf(event) });
     });
   });
 
   bus.on('server.code.review.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'review', phase: 'code', requireServerMode: true });
     if (!gated) return;
-    const { task } = gated;
+    const { task, expectedTask } = gated;
     await runConsumedSignal(task, task.qaAgentId ?? task.agentId, 'code-reviewed', async () => {
       const qa = manager.getAgentConfig(task.qaAgentId ?? '');
       if (!qa) {
@@ -917,12 +1041,12 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         const batchFindings = [...(roundData.batchFindings ?? [])];
         batchFindings[task.batchIndex] = findings;
         current = { ...roundData, batchFindings };
-        if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current))) return;
-        if (!(await deleteFindingsOrHold(task, qa, 'code-reviewed'))) return;
+        if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current, { expectedTask }))) return;
+        if (!(await deleteFindingsOrHold(task, qa, 'code-reviewed', expectedTask))) return;
       } else {
         current = { ...roundData, findings, completedAt: new Date().toISOString() };
-        if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current))) return;
-        if (!(await deleteFindingsOrHold(task, qa, 'code-reviewed'))) return;
+        if (!(await putVerdictRound(task, qa.id, 'code-reviewed', current, { expectedTask }))) return;
+        if (!(await deleteFindingsOrHold(task, qa, 'code-reviewed', expectedTask))) return;
       }
 
       const isRecheck = round > 1;
@@ -934,6 +1058,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
             recheck: isRecheck,
             ...(prev?.findings ? { priorFindingsJson: JSON.stringify(prev.findings) } : {}),
             ...(prev?.response ? { priorResponseJson: JSON.stringify(prev.response) } : {}),
+            expectedTask,
+            settlePermit: settlePermitOf(event),
           });
           if (!dispatched) {
             await holdConsumedSignal(
@@ -953,23 +1079,41 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
             ...current,
             findings: aggregated,
             completedAt: new Date().toISOString(),
-          });
+          }, { expectedTask });
           if (!stored) return;
         }
-        await manager.updateTask(task.id, { batchIndex: undefined, batchTotal: undefined });
-        await routeCodeVerdict({ ...task, batchIndex: undefined, batchTotal: undefined }, aggregated);
+        const cleared = await manager.updateTaskIfStatus(
+          task.id,
+          expectedTask.status,
+          { batchIndex: undefined, batchTotal: undefined },
+          expectedTask,
+        );
+        if (!cleared) return;
+        await routeCodeVerdict(
+          { ...task, batchIndex: undefined, batchTotal: undefined },
+          aggregated,
+          expectedTask,
+        );
         return;
       }
 
-      await routeCodeVerdict(task, current.findings!);
+      await routeCodeVerdict(task, current.findings!, expectedTask);
     });
   });
 
-  async function routeCodeVerdict(task: TaskState, findings: ReviewFindings): Promise<void> {
+  async function routeCodeVerdict(
+    task: TaskState,
+    findings: ReviewFindings,
+    expectedTask: TaskGenerationGuard,
+  ): Promise<void> {
     if (findings.verdict === 'approve') {
-      const afterDone = await manager.commitServerAfterDone(task.id);
+      const afterDone = await manager.commitServerAfterDone(task.id, expectedTask);
       if (afterDone === null) {
-        const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['review'] });
+        const ready = await manager.transitionTaskStatus(
+          task.id,
+          'ready',
+          { fromStatus: ['review'], expectTask: expectedTask },
+        );
         if (!ready) {
           await holdConsumedSignal(
             task,
@@ -981,7 +1125,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         }
         return;
       }
-      const approved = await manager.transitionTaskStatus(task.id, 'approved', { fromStatus: ['review'] });
+      const approved = await manager.transitionTaskStatus(
+        task.id,
+        'approved',
+        { fromStatus: ['review'], expectTask: expectedTask },
+      );
       if (!approved) {
         await holdConsumedSignal(
           task,
@@ -1006,7 +1154,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     if (task.reviewRound >= cap) {
-      const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
+      const capResult = await manager.transitionTaskStatus(
+        task.id,
+        'max_rounds',
+        { fromStatus: ['review'], expectTask: expectedTask },
+      );
       if (!capResult) return;
       const paused = capResult.task;
       if (paused.qaAgentId) {
@@ -1026,7 +1178,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const dispatched = await manager.dispatchServerFixToDev(
       task.id,
       JSON.stringify(findings),
-      { callerOwnsConsumedSignalFailure: true },
+      { callerOwnsConsumedSignalFailure: true, expectedTask },
     );
     if (!dispatched) {
       await holdConsumedSignal(
@@ -1043,18 +1195,32 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     task: TaskState,
     priorFindingsJson: string,
     priorResponseJson: string,
+    opts: HandlerDispatchOptions = {},
   ): Promise<boolean> {
-    if (await pauseForUnavailableQa(task, 'code-fixed', 'server-code-qa-unavailable-after-fix')) {
+    if (await pauseForUnavailableQa(
+      task,
+      'code-fixed',
+      'server-code-qa-unavailable-after-fix',
+      opts.onSideEffect,
+    )) {
       return false;
     }
     if (!task.qaAgentId) {
-      await autoApproveCode(task, 'code-fixed');
+      await autoApproveCode(task, opts.expectedTask, 'code-fixed', opts.onSideEffect);
       return true;
     }
-    return prepareAndDispatchCodeReview(task, { recheck: true, priorFindingsJson, priorResponseJson });
+    return prepareAndDispatchCodeReview(task, {
+      recheck: true,
+      priorFindingsJson,
+      priorResponseJson,
+      ...opts,
+    });
   }
 
-  async function runCodeFixSubmission(task: TaskState): Promise<boolean> {
+  async function runCodeFixSubmission(
+    task: TaskState,
+    opts: HandlerDispatchOptions = {},
+  ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       return holdConsumedSignal(
@@ -1063,6 +1229,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'code-fixed',
         'fix-no-dev-agent',
         'server-code-fix-no-dev-agent',
+        {},
+        opts.onSideEffect,
       );
     }
     const round = Math.max(task.reviewRound, 1);
@@ -1075,6 +1243,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'fix-findings-missing',
         'server-code-fix-findings-missing',
         { round },
+        opts.onSideEffect,
       );
     }
 
@@ -1093,6 +1262,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           reason: err instanceof ReviewExchangeError ? err.reason : 'read-failed',
           error: err instanceof Error ? err.message : String(err),
         },
+        opts.onSideEffect,
       );
     }
     if (readResult.kind === 'unknown') {
@@ -1103,6 +1273,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'response-read-failed',
         'server-code-response-read-failed',
         { reason: readResult.error.reason, error: readResult.error.message },
+        opts.onSideEffect,
       );
     }
     if (readResult.kind === 'invalid') {
@@ -1113,19 +1284,20 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         responseDigest: readResult.responseDigest,
         schemaViolationCodes: readResult.schemaViolationCodes,
         details: { error: readResult.error.message },
-      });
+      }, opts.onSideEffect);
     }
     if (readResult.kind === 'absent') {
       if (roundData.response === undefined) {
         return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
           reason: 'response-missing',
           failurePhase: 'server-code-response-missing',
-        });
+        }, opts.onSideEffect);
       }
       return recheckCodeOrAutoApprove(
         task,
         JSON.stringify(roundData.findings),
         JSON.stringify(roundData.response),
+        opts,
       );
     }
     const { response } = readResult;
@@ -1136,7 +1308,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         rawResponse: readResult.raw,
         responseDigest: readResult.responseDigest,
         details: { payloadRound: response.round },
-      });
+      }, opts.onSideEffect);
     }
     if (response.token !== task.signalToken) {
       return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
@@ -1144,7 +1316,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         failurePhase: 'server-code-response-token-mismatch',
         rawResponse: readResult.raw,
         responseDigest: readResult.responseDigest,
-      });
+      }, opts.onSideEffect);
     }
     const findingsDigest = reviewFindingsDigest(roundData.findings);
     if (response.findingsDigest !== findingsDigest) {
@@ -1153,7 +1325,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         failurePhase: 'server-code-response-findings-digest-mismatch',
         rawResponse: readResult.raw,
         responseDigest: readResult.responseDigest,
-      });
+      }, opts.onSideEffect);
     }
 
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
@@ -1165,27 +1337,23 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         responseDigest: readResult.responseDigest,
         missingFindingIds: gaps.missing,
         unknownFindingIds: gaps.unknown,
-      });
+      }, opts.onSideEffect);
     }
 
-    if (!(await putVerdictRound(task, dev.id, 'code-fixed', { ...roundData, response }))) return false;
-    try {
-      await transport().deleteResponse(dev);
-    } catch (err) {
-      return holdConsumedSignal(
-        task,
-        dev.id,
-        'code-fixed',
-        'handler-failed',
-        'server-code-response-cleanup-failed',
-        { error: err instanceof Error ? err.message : String(err) },
-      );
-    }
+    if (!(await putVerdictRound(
+      task,
+      dev.id,
+      'code-fixed',
+      { ...roundData, response },
+      opts,
+    ))) return false;
+    if (!(await deleteResponseOrHold(task, dev, 'code-fixed', opts))) return false;
 
     return recheckCodeOrAutoApprove(
       task,
       JSON.stringify(roundData.findings),
       JSON.stringify(response),
+      opts,
     );
   }
 
@@ -1193,7 +1361,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'code', requireServerMode: true });
     if (!gated) return;
     await runConsumedSignal(gated.task, gated.task.agentId, 'code-fixed', async () => {
-      await runCodeFixSubmission(gated.task);
+      await runCodeFixSubmission(gated.task, { expectedTask: gated.expectedTask, settlePermit: settlePermitOf(event) });
     });
   });
 
@@ -1246,6 +1414,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         });
         return;
       }
+      let verifiedBaseBranch: string | undefined;
       if (prNumber !== undefined) {
         const verified = await manager.verifyPaneSignalPrNumber(task.id, prNumber);
         if (!verified) {
@@ -1275,13 +1444,24 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           );
           return;
         }
-        await manager.updateTask(task.id, {
-          prNumber,
-          ...(task.baseBranch === undefined ? { baseBranch: verified.targetBranch } : {}),
-        });
+        verifiedBaseBranch = verified.targetBranch;
       }
+      let ready: Awaited<ReturnType<AgentManager['transitionTaskStatus']>>;
       try {
-        await manager.updateTask(task.id, { latestHeadSha: publishedHead });
+        ready = await manager.transitionTaskStatus(
+          task.id,
+          'ready',
+          { fromStatus: ['approved'], expectTask: gated.expectedTask },
+          {
+            ...(prNumber !== undefined ? { prNumber } : {}),
+            ...(prNumber !== undefined
+              && task.baseBranch === undefined
+              && verifiedBaseBranch !== undefined
+              ? { baseBranch: verifiedBaseBranch }
+              : {}),
+            latestHeadSha: publishedHead,
+          },
+        );
       } catch (err) {
         await holdConsumedSignal(
           task,
@@ -1293,7 +1473,6 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         );
         return;
       }
-      const ready = await manager.transitionTaskStatus(task.id, 'ready', { fromStatus: ['approved'] });
       if (!ready) {
         await holdConsumedSignal(
           task,
@@ -1310,14 +1489,19 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     const gated = await gate(bus, manager, event, { status: 'in_progress', phase: 'spec', requireServerMode: false });
     if (!gated) return;
     await runConsumedSignal(gated.task, gated.task.agentId, 'spec-done', async () => {
-      await dispatchSpecReview(gated.task);
+      await dispatchSpecReview(gated.task, undefined, { expectedTask: gated.expectedTask, settlePermit: settlePermitOf(event) });
     });
   });
 
   async function dispatchSpecReview(
     task: TaskState,
     prior?: { findingsJson: string; responseJson?: string },
-    opts: { bumpRound?: boolean } = {},
+    opts: {
+      bumpRound?: boolean;
+      expectedTask?: TaskGenerationGuard;
+      onSideEffect?: () => void;
+      settlePermit?: unknown;
+    } = {},
   ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
@@ -1328,14 +1512,20 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         kind,
         'fix-no-dev-agent',
         'server-spec-review-no-dev-agent',
+        {},
+        opts.onSideEffect,
       );
     }
     const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
     const currentRound = task.specReviewRound ?? 0;
     const nextRound = opts.bumpRound === false ? currentRound : currentRound + 1;
     if (nextRound > cap) {
-      const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['in_progress', 'fixing'] });
+      const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', {
+        fromStatus: ['in_progress', 'fixing'],
+        ...(opts.expectedTask !== undefined ? { expectTask: opts.expectedTask } : {}),
+      });
       if (!capResult) return false;
+      opts.onSideEffect?.();
       const paused = capResult.task;
       if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
       if (paused.agentId) await releaseAtCap(paused, paused.agentId, 'agentId');
@@ -1361,17 +1551,22 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           'handler-failed',
           'server-spec-content-read-failed',
           { error: err instanceof Error ? err.message : String(err) },
+          opts.onSideEffect,
         );
       }
       try {
         if (!content.documents) throw new Error('spec transport returned no documents');
-        await reviewStore.putRound(task.id, 'spec', {
+        const roundData: ReviewRound = {
           round: nextRound,
           phase: 'spec',
           content: content.content,
           documents: content.documents,
           startedAt: new Date().toISOString(),
-        });
+        };
+        const stored = opts.expectedTask
+          ? await manager.putReviewRoundIfCurrent(task.id, roundData, opts.expectedTask)
+          : (await reviewStore.putRound(task.id, 'spec', roundData), true);
+        if (!stored) return false;
       } catch (err) {
         const kind = task.status === 'fixing' ? 'spec-fixed' : 'spec-done';
         return holdConsumedSignal(
@@ -1381,6 +1576,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           'verdict-store-failed',
           'server-spec-round-store-failed',
           { error: err instanceof Error ? err.message : String(err) },
+          opts.onSideEffect,
         );
       }
     }
@@ -1392,7 +1588,11 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         });
       }
       if (specApprovalIsHuman(task) || task.qaAgentId) {
-        const parked = await manager.parkTaskAtSpecReady(task.id, { specReviewRound: nextRound });
+        const parked = await manager.parkTaskAtSpecReady(task.id, {
+          specReviewRound: nextRound,
+          ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
+        });
+        if (parked) opts.onSideEffect?.();
         if (!parked) {
           await holdConsumedSignal(
             task,
@@ -1400,19 +1600,24 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
             task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
             'handler-failed',
             'server-spec-park-transition-failed',
+            {},
+            opts.onSideEffect,
           );
         }
         return !!parked;
       }
-      return autoApproveSpec(task);
+      return autoApproveSpec(task, opts.expectedTask, opts.onSideEffect);
     }
     const dispatched = await manager.dispatchServerReviewToQa(task.id, {
       phase: 'spec',
-      ...(opts.bumpRound === false ? { bumpRound: false } : {}),
+      ...(opts.bumpRound !== undefined ? { bumpRound: opts.bumpRound } : {}),
       content: content.content,
       ...(prior ? { priorFindingsJson: prior.findingsJson } : {}),
       ...(prior?.responseJson ? { priorResponseJson: prior.responseJson } : {}),
       callerOwnsConsumedSignalFailure: true,
+      ...(opts.settlePermit !== undefined ? { settlePermit: opts.settlePermit } : {}),
+      ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
+      ...(opts.onSideEffect !== undefined ? { onSideEffect: opts.onSideEffect } : {}),
     });
     if (dispatched) return true;
     return holdConsumedSignal(
@@ -1421,13 +1626,15 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       task.status === 'fixing' ? 'spec-fixed' : 'spec-done',
       'handler-failed',
       'server-spec-review-dispatch-failed',
+      {},
+      opts.onSideEffect,
     );
   }
 
   bus.on('server.spec.review.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'review', phase: 'spec', requireServerMode: false });
     if (!gated) return;
-    const { task } = gated;
+    const { task, expectedTask } = gated;
     await runConsumedSignal(task, task.qaAgentId ?? task.agentId, 'spec-reviewed', async () => {
       const qa = manager.getAgentConfig(task.qaAgentId ?? '');
       if (!qa) {
@@ -1497,18 +1704,21 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           ...roundData,
           findings: effective,
           completedAt: new Date().toISOString(),
-        });
+        }, { expectedTask });
         if (!stored) return;
-        if (!(await deleteFindingsOrHold(task, qa, 'spec-reviewed'))) return;
+        if (!(await deleteFindingsOrHold(task, qa, 'spec-reviewed', expectedTask))) return;
       }
 
       if (effective.verdict === 'approve') {
-        await advanceApprovedSpec(task, 'server-spec-approve-transition-failed');
+        await advanceApprovedSpec(task, 'server-spec-approve-transition-failed', expectedTask);
         return;
       }
       const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
       if ((task.specReviewRound ?? 0) >= cap) {
-        const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', { fromStatus: ['review'] });
+        const capResult = await manager.transitionTaskStatus(task.id, 'max_rounds', {
+          fromStatus: ['review'],
+          expectTask: expectedTask,
+        });
         if (!capResult) return;
         const paused = capResult.task;
         if (paused.qaAgentId) await releaseAtCap(paused, paused.qaAgentId, 'qaAgentId');
@@ -1518,7 +1728,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
       const dispatched = await manager.dispatchServerFixToDev(
         task.id,
         JSON.stringify(effective),
-        { callerOwnsConsumedSignalFailure: true },
+        { callerOwnsConsumedSignalFailure: true, expectedTask },
       );
       if (!dispatched) {
         await holdConsumedSignal(
@@ -1532,7 +1742,10 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
     });
   });
 
-  async function runSpecFixSubmission(task: TaskState): Promise<boolean> {
+  async function runSpecFixSubmission(
+    task: TaskState,
+    opts: HandlerDispatchOptions = {},
+  ): Promise<boolean> {
     const dev = manager.getAgentConfig(task.agentId);
     if (!dev) {
       return holdConsumedSignal(
@@ -1541,6 +1754,8 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'spec-fixed',
         'fix-no-dev-agent',
         'server-spec-fix-no-dev-agent',
+        {},
+        opts.onSideEffect,
       );
     }
     const round = task.specReviewRound ?? 1;
@@ -1553,6 +1768,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'fix-findings-missing',
         'server-spec-fix-findings-missing',
         { round },
+        opts.onSideEffect,
       );
     }
     await manager.refreshWorkdirCacheFor(task.agentId);
@@ -1570,6 +1786,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
           reason: err instanceof ReviewExchangeError ? err.reason : 'read-failed',
           error: err instanceof Error ? err.message : String(err),
         },
+        opts.onSideEffect,
       );
     }
     if (readResult.kind === 'unknown') {
@@ -1580,6 +1797,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         'response-read-failed',
         'server-spec-response-read-failed',
         { reason: readResult.error.reason, error: readResult.error.message },
+        opts.onSideEffect,
       );
     }
     if (readResult.kind === 'invalid') {
@@ -1590,19 +1808,19 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         responseDigest: readResult.responseDigest,
         schemaViolationCodes: readResult.schemaViolationCodes,
         details: { error: readResult.error.message },
-      });
+      }, opts.onSideEffect);
     }
     if (readResult.kind === 'absent') {
       if (roundData.response === undefined) {
         return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
           reason: 'response-missing',
           failurePhase: 'server-spec-response-missing',
-        });
+        }, opts.onSideEffect);
       }
       return dispatchSpecReview(task, {
         findingsJson: JSON.stringify(roundData.findings),
         responseJson: JSON.stringify(roundData.response),
-      });
+      }, opts);
     }
     const { response } = readResult;
     if (response.round !== round) {
@@ -1612,7 +1830,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         rawResponse: readResult.raw,
         responseDigest: readResult.responseDigest,
         details: { payloadRound: response.round },
-      });
+      }, opts.onSideEffect);
     }
     if (response.token !== task.signalToken) {
       return rejectServerResponse(task, dev, roundData as ReviewRound & { findings: ReviewFindings }, {
@@ -1620,7 +1838,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         failurePhase: 'server-spec-response-token-mismatch',
         rawResponse: readResult.raw,
         responseDigest: readResult.responseDigest,
-      });
+      }, opts.onSideEffect);
     }
     const findingsDigest = reviewFindingsDigest(roundData.findings);
     if (response.findingsDigest !== findingsDigest) {
@@ -1629,7 +1847,7 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         failurePhase: 'server-spec-response-findings-digest-mismatch',
         rawResponse: readResult.raw,
         responseDigest: readResult.responseDigest,
-      });
+      }, opts.onSideEffect);
     }
     const gaps = coverageGaps(roundData.findings, new Set(response.responses.map(r => r.findingId)));
     if (gaps.missing.length > 0 || gaps.unknown.length > 0) {
@@ -1640,32 +1858,27 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
         responseDigest: readResult.responseDigest,
         missingFindingIds: gaps.missing,
         unknownFindingIds: gaps.unknown,
-      });
+      }, opts.onSideEffect);
     }
-    if (!(await putVerdictRound(task, dev.id, 'spec-fixed', { ...roundData, response }))) return false;
-    try {
-      await transport().deleteResponse(dev);
-    } catch (err) {
-      return holdConsumedSignal(
-        task,
-        dev.id,
-        'spec-fixed',
-        'handler-failed',
-        'server-spec-response-cleanup-failed',
-        { error: err instanceof Error ? err.message : String(err) },
-      );
-    }
+    if (!(await putVerdictRound(
+      task,
+      dev.id,
+      'spec-fixed',
+      { ...roundData, response },
+      opts,
+    ))) return false;
+    if (!(await deleteResponseOrHold(task, dev, 'spec-fixed', opts))) return false;
     return dispatchSpecReview(task, {
       findingsJson: JSON.stringify(roundData.findings),
       responseJson: JSON.stringify(response),
-    });
+    }, opts);
   }
 
   bus.on('server.spec.fix.submitted', async (event) => {
     const gated = await gate(bus, manager, event, { status: 'fixing', phase: 'spec', requireServerMode: false });
     if (!gated) return;
     await runConsumedSignal(gated.task, gated.task.agentId, 'spec-fixed', async () => {
-      await runSpecFixSubmission(gated.task);
+      await runSpecFixSubmission(gated.task, { expectedTask: gated.expectedTask, settlePermit: settlePermitOf(event) });
     });
   });
 
@@ -1681,17 +1894,20 @@ export function registerServerEventHandlers(bus: EventBus, manager: AgentManager
   // 缺 response 拒绝）；其余状态按最近结论轮携带 prior 上下文，否则 QA 无从核对上一轮 findings
   manager.setServerReviewDriver({
     dispatchCodeReview: async (task, opts = {}) => {
-      if (task.status === 'fixing') return runCodeFixSubmission(task);
+      if (task.status === 'fixing') return runCodeFixSubmission(task, opts);
       const prior = await latestVerdictRound(task.id, 'code', task.reviewRound);
       return prepareAndDispatchCodeReview(task, {
         recheck: prior !== null,
-        ...(opts.bumpRound === false ? { bumpRound: false } : {}),
+        ...(opts.bumpRound !== undefined ? { bumpRound: opts.bumpRound } : {}),
+        ...(opts.expectedTask !== undefined ? { expectedTask: opts.expectedTask } : {}),
+        ...(opts.onSideEffect !== undefined ? { onSideEffect: opts.onSideEffect } : {}),
+        ...(opts.settlePermit !== undefined ? { settlePermit: opts.settlePermit } : {}),
         ...(prior?.findings ? { priorFindingsJson: JSON.stringify(prior.findings) } : {}),
         ...(prior?.response ? { priorResponseJson: JSON.stringify(prior.response) } : {}),
       });
     },
     dispatchSpecReview: async (task, opts = {}) => {
-      if (task.status === 'fixing') return runSpecFixSubmission(task);
+      if (task.status === 'fixing') return runSpecFixSubmission(task, opts);
       const prior = await latestVerdictRound(task.id, 'spec', task.specReviewRound ?? 0);
       const priorContext = prior?.findings
         ? {

@@ -565,11 +565,7 @@ export class PlatformPoller {
     return failures;
   }
 
-  // PR 收编后仍可被 retarget/改写：生命周期与裁决事件产出前对 fresh prView 复核绑定三元
-  // （branch/fork/target，spec §7 fresh prView 完整谓词核验），失配转 intervention 并停子轮询。
-  // 期望值缺失即无法核验：预设「无法核验 = 匹配」会给 retarget 后的 PR 继续发 push/merged/裁决
-  // ——task.branch 缺失按失配交人工（任务视图结构异常），base 期望双缺失按不可核验静默停
-  // （projectView 故障已在健康度，恢复即自愈）。
+  // PR 收编后仍可被 retarget/改写：产出生命周期/裁决事件前按 fresh prView 复核绑定，「无法核验」不得视同「匹配」。
   private bindingCheck(
     task: PlatformTaskView,
     prRow: NormalizedRow,

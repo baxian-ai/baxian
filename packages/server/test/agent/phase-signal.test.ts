@@ -8,6 +8,7 @@ import {
   scanNeedInputSignals,
   scanPhaseSignals,
   scanReadFileSignals,
+  scanRootDoneSignals,
   stripSignalAnsi,
 } from '../../src/agent/phase-signal.js';
 
@@ -260,6 +261,20 @@ describe('need-input signal', () => {
   });
 });
 
+describe('root-done signal', () => {
+  it('survives ANSI noise and TUI soft-wrap whitespace', () => {
+    expect(scanRootDoneSignals('\x1b[32m[bx:root-\ndone:0123456789ab\n  cdef0123456789abcdef]\x1b[0m')).toEqual([
+      '0123456789abcdef0123456789abcdef',
+    ]);
+  });
+
+  it('ignores templates, short tokens, and extra segments', () => {
+    expect(scanRootDoneSignals('[bx:root-done:<attemptToken>]')).toEqual([]);
+    expect(scanRootDoneSignals('[bx:root-done:short]')).toEqual([]);
+    expect(scanRootDoneSignals('[bx:root-done:0123456789abcdef:extra]')).toEqual([]);
+  });
+});
+
 describe('read-file signal', () => {
   it('scans read-file requests', () => {
     expect(scanReadFileSignals('see [bx:read-file:src/a/b.ts:80-120] then')).toEqual([
@@ -275,5 +290,16 @@ describe('read-file signal', () => {
   it('ignores malformed ranges', () => {
     expect(scanReadFileSignals('[bx:read-file:a.ts:x-10]')).toEqual([]);
     expect(scanReadFileSignals('[bx:read-file:a.ts:10]')).toEqual([]);
+  });
+});
+
+describe('complete OSC control strings are stripped from signal scans', () => {
+  it('ignores a marker embedded in a finished window-title OSC', () => {
+    expect(scanPhaseSignals('\x1b]0;[bx:spec-fixed:tok123]\x07')).toEqual([]);
+  });
+
+  it('still sees a real marker after a finished OSC', () => {
+    expect(scanPhaseSignals('\x1b]0;title\x07[bx:spec-fixed:tok123]'))
+      .toEqual([{ kind: 'spec-fixed', token: 'tok123' }]);
   });
 });

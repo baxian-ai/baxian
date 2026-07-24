@@ -4,9 +4,12 @@ import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import {
   compactBoundaryIndex,
   scanAskAnswerSignals,
+  scanPhaseSignalMatches,
   scanPhaseSignals,
   scanReadFileSignals,
+  stripSignalAnsi,
   type NeedInputSignal,
+  type PhaseSignal,
   type PhaseSignalKind,
   type ReadFileSignal,
 } from './phase-signal.js';
@@ -21,7 +24,24 @@ export interface NeedInputCommitIntent {
 
 export type NeedInputCommitResult = 'ok' | 'fenced' | 'error';
 
+// symbol 键随事件对象引用传递、不进 JSON 事件日志——手工管道复用同一函数也拿不到它。
+export const SETTLE_PERMIT: unique symbol = Symbol('baxian.settlePermit');
+export type SettlePermit = symbol;
+
+export function settlePermitOf(event: BaxianEvent): SettlePermit | undefined {
+  return (event as unknown as Record<symbol, SettlePermit | undefined>)[SETTLE_PERMIT];
+}
+
+interface SettlingEntry {
+  permit: SettlePermit;
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
 const MATCH_BUFFER_CHARS = 1024;
+
+// Cap so a stuck pane spewing endless distinct tokens can't grow the set or the logs unbounded.
+const STALE_TOKEN_WARN_CAP = 32;
 
 const KIND_TO_EVENT_TYPE: Record<Exclude<PhaseSignalKind, 'greeting'>, EventType> = {
   'spec-fixed': 'server.spec.fix.submitted',
@@ -44,6 +64,8 @@ interface WatchEntry {
   expectedToken: string;
   onReadFile?: (req: ReadFileSignal) => void;
   seenReadFile: Set<string>;
+  seenStaleToken: Set<string>;
+  staleWarnCapped: boolean;
   // Ask/answer watermark: lit ⟺ askSeq > answeredSeq. Monotonic within the entry;
   // replayed literals (redraw/reattach) carry seq ≤ watermark and are swallowed.
   askSeq: number;
@@ -131,8 +153,68 @@ export class PhaseSignalWatcher {
   // current-token pass whose watcher is merely slow to attach.
   private readonly pendingArms = new Map<number, { taskId: string; agentId: string; token: string }>();
   private armCounter = 0;
+  private readonly settlingByTask = new Map<string, SettlingEntry>();
+  private readonly exclusiveByTask = new Map<string, Promise<void>>();
+  private readonly exclusiveOwnerByTask = new Map<string, SettlePermit>();
 
   constructor(private readonly deps: PhaseSignalWatcherDeps) {}
+
+  isSettling(taskId: string): boolean {
+    return this.settlingByTask.has(taskId);
+  }
+
+  settlePermitMatches(taskId: string, permit: unknown): boolean {
+    const settling = this.settlingByTask.get(taskId);
+    return settling !== undefined && permit === settling.permit;
+  }
+
+  async awaitSettled(taskId: string): Promise<void> {
+    const settling = this.settlingByTask.get(taskId);
+    if (settling) await settling.promise;
+  }
+
+  private beginSettling(taskId: string): SettlePermit {
+    const permit = Symbol(`settle:${taskId}`);
+    let resolve!: () => void;
+    const promise = new Promise<void>((res) => { resolve = res; });
+    const prior = this.settlingByTask.get(taskId);
+    this.settlingByTask.set(taskId, { permit, promise, resolve });
+    // 同任务并发结算不应出现（单 watch 单发）；出现即让旧窗口立刻闭合，宁早释放不悬挂。
+    prior?.resolve();
+    return permit;
+  }
+
+  private endSettling(taskId: string, permit: SettlePermit): void {
+    const settling = this.settlingByTask.get(taskId);
+    if (!settling || settling.permit !== permit) return;
+    this.settlingByTask.delete(taskId);
+    settling.resolve();
+  }
+
+  exclusiveOwnerMatches(taskId: string, candidate: unknown): boolean {
+    const owner = this.exclusiveOwnerByTask.get(taskId);
+    return owner !== undefined && candidate === owner;
+  }
+
+  // FIFO owner 拿到不可伪造的 permit：先入者获派发豁免，后入者按任务态 CAS/终闸拒绝。
+  async runExclusive<T>(taskId: string, fn: (owner: SettlePermit) => Promise<T>): Promise<T> {
+    const prior = this.exclusiveByTask.get(taskId);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const tail = prior ? prior.then(() => gate) : gate;
+    this.exclusiveByTask.set(taskId, tail);
+    // 无竞争时同步进入 fn：结算投递时序对快照/live 可见性敏感，不让出微任务。
+    if (prior) await prior;
+    const owner = Symbol(`exclusive:${taskId}`);
+    this.exclusiveOwnerByTask.set(taskId, owner);
+    try {
+      return await fn(owner);
+    } finally {
+      if (this.exclusiveOwnerByTask.get(taskId) === owner) this.exclusiveOwnerByTask.delete(taskId);
+      release();
+      if (this.exclusiveByTask.get(taskId) === tail) this.exclusiveByTask.delete(taskId);
+    }
+  }
 
   private taskEntries(taskId: string): WatchEntry[] {
     return [...this.entries.values()].filter(entry => entry.taskId === taskId);
@@ -206,6 +288,8 @@ export class PhaseSignalWatcher {
       expectedToken: args.token,
       ...(args.onReadFile ? { onReadFile: args.onReadFile } : {}),
       seenReadFile: new Set(),
+      seenStaleToken: new Set(),
+      staleWarnCapped: false,
       askSeq: args.needInput?.askSeq ?? 0,
       answeredSeq: args.needInput?.answeredSeq ?? 0,
       epoch: args.needInput?.epoch ?? 0,
@@ -632,10 +716,22 @@ export class PhaseSignalWatcher {
       }
     }
     this.scanNeedInput(entry, chunk, isSnapshot);
-    const signal = scanPhaseSignals(rawCombined).find(candidate =>
-      entry.expectedKinds.has(candidate.kind) && candidate.token === entry.expectedToken,
+    const oldRegionLen = compactBoundaryIndex(rawCombined, entry.buffer.length);
+    const matches = scanPhaseSignalMatches(rawCombined);
+    // Retain the control-stripped tail so a stripped control string's payload can't resurface as output next chunk.
+    entry.buffer = stripSignalAnsi(rawCombined).slice(-MATCH_BUFFER_CHARS);
+    const armed = matches.find(m =>
+      entry.expectedKinds.has(m.signal.kind) && m.signal.token === entry.expectedToken,
     );
-    entry.buffer = rawCombined.slice(-MATCH_BUFFER_CHARS);
+    // The armed marker ends the dispatch, so a foreign token after it belongs to the next task, not a mis-send here.
+    if (!isSnapshot) {
+      const endsBy = armed ? armed.index : Infinity;
+      this.reportStaleTokens(
+        entry,
+        matches.filter(m => m.index + m.raw.length > oldRegionLen && m.index + m.raw.length <= endsBy).map(m => m.signal),
+      );
+    }
+    const signal = armed?.signal;
     if (!signal) return;
     if (signal.kind === 'greeting') return;
     entry.fired = true;
@@ -662,12 +758,44 @@ export class PhaseSignalWatcher {
           : {}),
       },
     };
-    void this.emitCompletion(event, entry, signal.kind);
+    const permit = this.beginSettling(entry.taskId);
+    Object.defineProperty(event, SETTLE_PERMIT, { value: permit, enumerable: false });
+    void this.emitCompletion(event, entry, signal.kind, permit);
   }
 
-  private async emitCompletion(event: BaxianEvent, entry: WatchEntry, kind: PhaseSignalKind): Promise<void> {
+  // 静默丢弃会把"agent 以为已交付、任务实际停等"变成查无实据的失联；故留痕，但只记日志不发事件（避免重放刷屏）。
+  private reportStaleTokens(entry: WatchEntry, candidates: readonly PhaseSignal[]): void {
+    for (const candidate of candidates) {
+      if (entry.staleWarnCapped) return;
+      if (candidate.kind === 'greeting') continue;
+      if (!entry.expectedKinds.has(candidate.kind)) continue;
+      if (candidate.token === entry.expectedToken) continue;
+      const seenKey = `${candidate.kind}:${candidate.token}`;
+      if (entry.seenStaleToken.has(seenKey)) continue;
+      if (entry.seenStaleToken.size >= STALE_TOKEN_WARN_CAP) {
+        entry.staleWarnCapped = true;
+        console.warn(
+          `[PhaseSignalWatcher] capped foreign-token warnings at ${STALE_TOKEN_WARN_CAP} distinct tokens for `
+          + `task=${entry.taskId} agent=${entry.agentId}; suppressing further (pane emitting token churn?)`,
+        );
+        return;
+      }
+      entry.seenStaleToken.add(seenKey);
+      console.warn(
+        `[PhaseSignalWatcher] discarded ${candidate.kind} signal with a foreign token for task=${entry.taskId} `
+        + `agent=${entry.agentId}: observed=${candidate.token} expected=${entry.expectedToken}`,
+      );
+    }
+  }
+
+  private async emitCompletion(
+    event: BaxianEvent,
+    entry: WatchEntry,
+    kind: PhaseSignalKind,
+    permit: SettlePermit,
+  ): Promise<void> {
     try {
-      await this.deps.eventBus.emit(event);
+      await this.runExclusive(entry.taskId, () => this.deps.eventBus.emit(event));
     } catch (err) {
       console.error(
         `[PhaseSignalWatcher] eventBus.emit failed for task=${entry.taskId} kind=${kind}:`,
@@ -680,6 +808,8 @@ export class PhaseSignalWatcher {
         phase: `signal-emit-failed:${kind}`,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      this.endSettling(entry.taskId, permit);
     }
   }
 

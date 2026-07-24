@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { TmuxManager, PaneGoneError, SessionAbsentError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, detectRuntimePendingPrompt, detectRuntimeOverlay, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, hasOscTitleIdle, runtimeBusyCheck } from '../../src/agent/tmux.js';
+import { TmuxManager, TmuxOutcomeUnknownError, PaneGoneError, SessionAbsentError, tmuxQuote, classifyOwnerWriteCapability, contentArea, desiredTty, parseStatusLines, parseWindowGeometry, detectStartupDialog, detectRuntimeMenu, detectReplActiveBusy, detectRuntimePendingPrompt, detectRuntimeOverlay, hasActiveSpinner, hasActiveSpinnerInTail, hasRuntimeReadyView, hasRuntimeIdleComposerPrompt, hasOscTitleWorking, hasOscTitleIdle, runtimeBusyCheck } from '../../src/agent/tmux.js';
 import type { PaneRef } from '../../src/agent/tmux.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 
@@ -224,7 +224,8 @@ describe('TmuxManager', () => {
 
     it('throws on an ssh-layer failure instead of guessing', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
-      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' })).rejects.toThrow(/outcome unknown/);
+      await expect(tmux.killSessionRef(REF, { kind: 'equals', claim: 'dev-1' }))
+        .rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
     });
 
     it('refuses to run with a malformed ref (defense against credential corruption)', async () => {
@@ -370,7 +371,7 @@ describe('TmuxManager', () => {
 
     it('throws on transport failure instead of reporting absence', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
-      await expect(tmux.getSessionSnapshot('dev')).rejects.toThrow(/getSessionSnapshot/);
+      await expect(tmux.getSessionSnapshot('dev')).rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
     });
   });
 
@@ -459,7 +460,7 @@ describe('TmuxManager', () => {
 
     it('throws on transport failure', async () => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: connect: connection refused', exitCode: 255 });
-      await expect(tmux.hasCreationNonce('dev')).rejects.toThrow(/creation-nonce probe/);
+      await expect(tmux.hasCreationNonce('dev')).rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
     });
   });
 
@@ -491,6 +492,11 @@ describe('TmuxManager', () => {
     ])('throws on %s', async (_label, stderr, exitCode, pattern) => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode });
       await expect(tmux.hasSession('dev')).rejects.toThrow(pattern);
+    });
+
+    it('types a transient has-session result as outcome unknown', async () => {
+      runner.exec.mockResolvedValueOnce({ stdout: '', stderr: 'ssh: timeout', exitCode: 255 });
+      await expect(tmux.hasSession('dev')).rejects.toBeInstanceOf(TmuxOutcomeUnknownError);
     });
   });
 
@@ -2674,7 +2680,7 @@ describe('window geometry read (eleven-field single read)', () => {
     runner.exec.mockResolvedValue({ stdout: '', stderr: 'ssh: connect to host x: Connection timed out', exitCode: 255 });
     const err = await tmux.getWindowGeometry('dev-1').catch((e: unknown) => e);
     expect(err).not.toBeInstanceOf(SessionAbsentError);
-    expect(String(err)).toMatch(/outcome unknown/);
+    expect(err).toBeInstanceOf(TmuxOutcomeUnknownError);
   });
 
   it.each([

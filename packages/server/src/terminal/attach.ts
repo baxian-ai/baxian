@@ -1,4 +1,4 @@
-import type { AgentConfig, HostConfig } from '../shared/index.js';
+import type { AgentRuntimeConfig, HostConfig } from '../shared/index.js';
 import { shellQuote, wrapRemoteCommand, sshAuthArgs, sshTarget } from '../agent/runner.js';
 
 export interface AttachCommand {
@@ -23,7 +23,7 @@ function attachGenerationGuard(expected: AttachExpectedRef): string {
   return `[ "$(${probe})" = ${shellQuote(identity)} ] || { echo BX_ATTACH_GENERATION_MISMATCH >&2; exit 47; }`;
 }
 
-function remoteCommand(agent: AgentConfig, host: HostConfig | undefined, payload: string): AttachCommand {
+function remoteCommand(agent: AgentRuntimeConfig, host: HostConfig | undefined, payload: string): AttachCommand {
   if (!host) throw new Error(`Remote agent ${agent.id} has no resolved host`);
   return {
     file: 'ssh',
@@ -41,7 +41,7 @@ function remoteCommand(agent: AgentConfig, host: HostConfig | undefined, payload
 }
 
 export function buildAttachInteractiveCommand(
-  agent: AgentConfig,
+  agent: AgentRuntimeConfig,
   host?: HostConfig,
   expected?: AttachExpectedRef,
   opts: { ignoreSize?: boolean } = {},
@@ -71,7 +71,7 @@ export function buildAttachInteractiveCommand(
 
 // The probe must resolve tmux in the SAME shell context the interactive attach uses
 // (login-interactive remotely), or PATH skew can gate the flag on a different binary.
-export function buildAttachProbeCommand(agent: AgentConfig, host?: HostConfig): AttachCommand {
+export function buildAttachProbeCommand(agent: AgentRuntimeConfig, host?: HostConfig): AttachCommand {
   if (agent.mode === 'remote') {
     return remoteCommand(agent, host, 'tmux -V');
   }

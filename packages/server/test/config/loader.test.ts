@@ -200,6 +200,53 @@ describe('prepareConfig type guards', () => {
     expect(cfg.project).toEqual([]);
   });
 
+  it('normalizes root agent keys and applies root-only defaults', () => {
+    const cfg = prepareConfig({
+      root: {
+        runtime: 'codex',
+        mode: 'local',
+        workDir: '/tmp/root-agent',
+        ResponseTimeoutMinutes: 9,
+        projects: ['pp'],
+      },
+      project: [{
+        ...PROJECT,
+        agent: PROJECT.agent.map(pair => pair.map(agent => ({ ...agent, yolo: false }))),
+      }],
+    });
+    expect(cfg.root).toEqual({
+      runtime: 'codex',
+      mode: 'local',
+      workdir: '/tmp/root-agent',
+      responseTimeoutMinutes: 9,
+      projects: ['pp'],
+      yolo: true,
+    });
+  });
+
+  it('rejects malformed root config and invalid explicit timeout instead of replacing it', () => {
+    expect(() => prepareConfig({ root: 'codex', project: [PROJECT] })).toThrow(/root must be an object/);
+    expect(() => prepareConfig({
+      root: { runtime: 'codex', mode: 'local', workdir: '/tmp/root-agent', responseTimeoutMinutes: 0 },
+      project: [PROJECT],
+    })).toThrow(/root\.responseTimeoutMinutes/);
+  });
+
+  it('rejects the retired main name and unsupported root authority/id fields explicitly', () => {
+    expect(() => prepareConfig({ main: { runtime: 'codex' }, project: [PROJECT] }))
+      .toThrow(/renamed to root agent/);
+    expect(() => prepareConfig({
+      root: {
+        id: 'root-agent',
+        authority: 'full',
+        runtime: 'codex',
+        mode: 'local',
+        workdir: '/tmp/root-agent',
+      },
+      project: [PROJECT],
+    })).toThrow(/unsupported root field/);
+  });
+
   it('silently drops legacy github field from on-disk config (webhook ingestion was removed)', () => {
     const cfg = prepareConfig({
       github: { secret: 'webhook-secret-from-old-config' },

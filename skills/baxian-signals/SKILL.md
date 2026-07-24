@@ -70,6 +70,12 @@ Server review flow (no PR; exchange via `.baxian/review/*.json`):
 | `code-fixed` | dev handled every code finding |
 | `code-ready` (opt. PR#) | publish phase pushed the branch / opened the PR |
 
+Root recovery runtime:
+
+| Signal | Meaning |
+|---|---|
+| `root-done` | root agent atomically wrote the requested recovery response; the request prompt supplies the attempt token |
+
 ## Context-request side-channel
 
 During server review, request file context only when the prompt says `review-checkout: base`, or during server spec review / legacy batch continuation when the prompt context is insufficient:

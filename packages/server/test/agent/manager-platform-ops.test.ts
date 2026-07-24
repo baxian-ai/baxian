@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig, TaskState } from '../../src/shared/index.js';
+import type { BaxianConfig, TaskGenerationGuard, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import {
   AgentManager, DispatchTerminalError, PlatformMergeRecheckError,
@@ -199,7 +199,13 @@ describe('manual server review dispatch', () => {
 
     const result = await manager.dispatchReviewToQa('task-1');
 
-    expect(review.dispatchCodeReview).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-1' }));
+    expect(review.dispatchCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-1' }),
+      expect.objectContaining({
+        bumpRound: true,
+        expectedTask: expect.objectContaining({ status: 'review', reviewRound: 1 }),
+      }),
+    );
     expect(review.dispatchSpecReview).not.toHaveBeenCalled();
     expect(result.id).toBe('task-1');
   });
@@ -211,8 +217,250 @@ describe('manual server review dispatch', () => {
 
     await manager.dispatchReviewToQa('task-1');
 
-    expect(review.dispatchSpecReview).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-1' }));
+    expect(review.dispatchSpecReview).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-1' }),
+      expect.objectContaining({
+        bumpRound: true,
+        expectedTask: expect.objectContaining({ status: 'review', specReviewRound: 1 }),
+      }),
+    );
     expect(review.dispatchCodeReview).not.toHaveBeenCalled();
+  });
+
+  it('resumes a recoverable held QA in the current server review round at the cap', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', reviewRound: 2,
+      prNumber: undefined, prUrl: undefined, platformBinding: undefined, baseBranch: undefined,
+    });
+    await agentStore.set({
+      id: 'qa-1',
+      projectId: 'proj',
+      taskId: 'task-1',
+      status: 'awaiting_human',
+      awaitingPhase: 'dirty-workdir',
+      awaitingReason: 'checkout is dirty',
+      awaitingSince: TS,
+      awaitingNonce: 'held-generation',
+      updatedAt: TS,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+
+    const result = await manager.dispatchReviewToQa('task-1');
+
+    expect(result.reviewRound).toBe(2);
+    expect(review.dispatchCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-1', reviewRound: 2 }),
+      expect.objectContaining({
+        bumpRound: false,
+        expectedTask: expect.objectContaining({ status: 'review', reviewRound: 2 }),
+      }),
+    );
+  });
+
+  it('preserves an explicit round bump while resuming a recoverable held QA', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', reviewRound: 1,
+      prNumber: undefined, prUrl: undefined, platformBinding: undefined, baseBranch: undefined,
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', status: 'awaiting_human',
+      awaitingPhase: 'dirty-workdir', awaitingSince: TS, awaitingNonce: 'held-generation',
+      updatedAt: TS,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+
+    await manager.dispatchReviewToQa('task-1', { bumpRound: true });
+
+    expect(review.dispatchCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-1', reviewRound: 1 }),
+      expect.objectContaining({
+        bumpRound: true,
+        expectedTask: expect.objectContaining({ status: 'review', reviewRound: 1 }),
+      }),
+    );
+  });
+
+  it.each([
+    ['the task is not in review', 'in_progress', 'task-1', 'dirty-workdir'],
+    ['the held QA belongs to another task', 'review', 'other-task', 'dirty-workdir'],
+    ['the same-task hold is not recoverable', 'review', 'task-1', 'dispatch-failed:ack_unknown'],
+  ] as const)('defaults to a new round when %s', async (_name, status, boundTaskId, awaitingPhase) => {
+    await seed({
+      reviewMode: 'server', status, phase: 'code', reviewRound: 1,
+      prNumber: undefined, prUrl: undefined, platformBinding: undefined, baseBranch: undefined,
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: boundTaskId, status: 'awaiting_human',
+      awaitingPhase, awaitingSince: TS, awaitingNonce: `hold-${awaitingPhase}`,
+      updatedAt: TS,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+
+    await manager.dispatchReviewToQa('task-1');
+
+    expect(review.dispatchCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-1' }),
+      expect.objectContaining({
+        bumpRound: true,
+        expectedTask: expect.objectContaining({ status, reviewRound: 1 }),
+      }),
+    );
+  });
+
+  it('redispatches the current spec pass at the round cap without incrementing it', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', phase: 'spec', specReviewRound: 2,
+      signalToken: 'spec-pass-cap', prNumber: undefined, prUrl: undefined,
+      platformBinding: undefined, baseBranch: undefined,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+
+    await expect(manager.redispatchCurrentTaskPhase('task-1', {
+      status: 'review', phase: 'spec', signalToken: 'spec-pass-cap',
+      agentId: 'dev-1', reviewRound: 1, specReviewRound: 2,
+    })).resolves.toBe('dispatched');
+
+    expect(review.dispatchSpecReview).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'task-1', specReviewRound: 2 }),
+      expect.objectContaining({
+        bumpRound: false,
+        expectedTask: expect.objectContaining({
+          status: 'review',
+          reviewRound: 1,
+          specReviewRound: 2,
+        }),
+        onSideEffect: expect.any(Function),
+      }),
+    );
+    expect((await taskStore.get('task-1'))?.specReviewRound).toBe(2);
+  });
+
+  it('classifies a spec pass beyond the round cap as unsupported', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', phase: 'spec', specReviewRound: 3,
+      signalToken: 'spec-pass-over-cap', prNumber: undefined, prUrl: undefined,
+      platformBinding: undefined, baseBranch: undefined,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+
+    await expect(manager.redispatchCurrentTaskPhase('task-1', {
+      status: 'review', phase: 'spec', signalToken: 'spec-pass-over-cap',
+      agentId: 'dev-1', reviewRound: 1, specReviewRound: 3,
+    })).resolves.toBe('unsupported');
+
+    expect(review.dispatchSpecReview).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the full server review generation after claiming the manual dispatch', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', reviewRound: 1, signalToken: 'server-pass',
+      prNumber: undefined, prUrl: undefined, platformBinding: undefined, baseBranch: undefined,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+    const internal = manager as unknown as {
+      runManualServerReview: (
+        taskId: string,
+        claim: {
+          isSpec: boolean;
+          reviewPass: {
+            status: TaskState['status'];
+            phase: TaskState['phase'];
+            signalToken: TaskState['signalToken'];
+            agentId: string;
+            reviewRound: number;
+            specReviewRound?: number;
+          };
+          bumpRound: boolean;
+        },
+      ) => Promise<TaskState>;
+    };
+    const runManualServerReview = internal.runManualServerReview.bind(internal);
+    vi.spyOn(internal, 'runManualServerReview').mockImplementationOnce(async (taskId, claim) => {
+      const current = await taskStore.get(taskId);
+      await taskStore.set({
+        ...current!,
+        reviewRound: current!.reviewRound + 1,
+        updatedAt: new Date().toISOString(),
+      });
+      return runManualServerReview(taskId, claim);
+    });
+
+    await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({ status: 409 });
+
+    expect(review.dispatchCodeReview).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-1')).toMatchObject({
+      reviewRound: 2,
+      signalToken: 'server-pass',
+    });
+  });
+
+  it('rejects a stale server review generation before claiming the manual dispatch', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', phase: 'code', reviewRound: 2,
+      signalToken: 'server-pass', prNumber: undefined, prUrl: undefined,
+      platformBinding: undefined, baseBranch: undefined,
+    });
+    const review = reviewDriver();
+    manager.setServerReviewDriver(review);
+
+    await expect(manager.dispatchReviewToQa('task-1', {
+      expectedTask: {
+        status: 'review',
+        phase: 'code',
+        signalToken: 'server-pass',
+        agentId: 'dev-1',
+        reviewRound: 1,
+      },
+    })).rejects.toMatchObject({ status: 409, code: 'dispatch-superseded' });
+
+    expect(review.dispatchCodeReview).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the server review generation in the final dispatch lock', async () => {
+    await seed({
+      reviewMode: 'server', status: 'review', phase: 'code', reviewRound: 1,
+      signalToken: 'server-pass', prNumber: undefined, prUrl: undefined,
+      platformBinding: undefined, baseBranch: undefined,
+    });
+    const review = reviewDriver();
+    review.dispatchCodeReview.mockImplementationOnce(async (
+      snapshot: TaskState,
+      opts?: { expectedTask?: TaskGenerationGuard },
+    ) => {
+      await taskStore.set({
+        ...snapshot,
+        reviewRound: 2,
+        updatedAt: new Date().toISOString(),
+      });
+      await manager.dispatchServerReviewToQa(snapshot.id, {
+        phase: 'code',
+        content: 'persisted review round 1',
+        bumpRound: false,
+        expectedTask: opts!.expectedTask!,
+      });
+      return true;
+    });
+    manager.setServerReviewDriver(review);
+    const start = vi.spyOn(manager, 'startSession');
+
+    await expect(manager.dispatchReviewToQa('task-1')).rejects.toMatchObject({
+      status: 409,
+      code: 'dispatch-superseded',
+    });
+
+    expect(review.dispatchCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewRound: 1 }),
+      expect.objectContaining({
+        expectedTask: expect.objectContaining({ reviewRound: 1 }),
+      }),
+    );
+    expect(start).not.toHaveBeenCalled();
   });
 
   it('rejects a manual review when its snapshotted QA is absent', async () => {
@@ -664,6 +912,56 @@ describe('processGitRemoteCleanup', () => {
     expect((await taskStore.get('task-1'))?.remoteCleanup).toBeUndefined();
   });
 
+  it('persists the successful branch-delete audit before retiring the intent', async () => {
+    await seed({
+      status: 'cancelled',
+      remoteCleanup: intent({ stage: 'delete-pending', remoteProjectId: 'R_repo' }),
+    });
+
+    await manager.processGitRemoteCleanup('task-1');
+
+    const date = new Date().toISOString().slice(0, 10);
+    const audit = (await new EventLog(`${tempDir}/events`).readDate(date)).find(event =>
+      event.type === 'task.updated' && event.data.operation === 'git-branch-delete');
+    expect(audit).toMatchObject({
+      projectId: 'proj', taskId: 'task-1',
+      data: {
+        status: 'cancelled', operation: 'git-branch-delete', outcome: 'succeeded',
+        generation: 'abc123abc123', prNumber: 42, branch: 'bx/task-1',
+        expectedHeadSha: SHA1, remoteProjectId: 'R_repo',
+      },
+    });
+    expect((await taskStore.get('task-1'))?.remoteCleanup).toBeUndefined();
+  });
+
+  it('retains the delete intent when the successful-delete audit cannot be persisted', async () => {
+    await seed({
+      status: 'cancelled',
+      remoteCleanup: intent({ stage: 'delete-pending', remoteProjectId: 'R_repo' }),
+    });
+    const auditFailureManager = new AgentManager({
+      config: CONFIG,
+      agentStore,
+      taskStore,
+      lockManager,
+      eventBus: new EventBus({
+        append: async (event: { type: string; data: Record<string, unknown> }) => {
+          if (event.type === 'task.updated' && event.data.operation === 'git-branch-delete') {
+            throw new Error('audit disk full');
+          }
+        },
+      } as unknown as EventLog),
+    });
+    vi.spyOn(auditFailureManager, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
+
+    await expect(auditFailureManager.processGitRemoteCleanup('task-1')).rejects.toThrow('audit disk full');
+
+    expect((await taskStore.get('task-1'))?.remoteCleanup).toMatchObject({
+      stage: 'delete-pending', failure: { kind: 'persist', message: expect.stringContaining('audit disk full') },
+    });
+    expect(driver.ops.map(op => op.op)).toEqual(['deleteBranch', 'branchView']);
+  });
+
   it('classifies a failed mutation plus a different authoritative tip as manual', async () => {
     driver.deleteError = new Error('GraphQL updateRefs rejected');
     driver.branchHead = 'b'.repeat(40);
@@ -698,6 +996,7 @@ describe('processGitRemoteCleanup', () => {
     expect((await taskStore.get('task-1'))?.remoteCleanup?.stage).toBe('delete-pending');
 
     driver.deleteError = new Error('GraphQL ref no longer exists');
+    await mkdir(`${tempDir}/events-restarted`, { recursive: true });
     const restarted = new AgentManager({
       config: CONFIG,
       agentStore: new AgentStore(`${tempDir}/state/agents`),
@@ -711,6 +1010,13 @@ describe('processGitRemoteCleanup', () => {
     await restarted.retryGitRemoteCleanupIntents();
 
     expect((await taskStore.get('task-1'))?.remoteCleanup).toBeUndefined();
+    const date = new Date().toISOString().slice(0, 10);
+    const firstAudit = (await new EventLog(`${tempDir}/events`).readDate(date)).find(event =>
+      event.type === 'task.updated' && event.data.operation === 'git-branch-delete');
+    const replayAudit = (await new EventLog(`${tempDir}/events-restarted`).readDate(date)).find(event =>
+      event.type === 'task.updated' && event.data.operation === 'git-branch-delete');
+    expect(firstAudit?.id).toBeDefined();
+    expect(replayAudit?.id).toBe(firstAudit?.id);
   });
 
   it('repeats the idempotent close after persisting delete-pending failed', async () => {
@@ -1317,6 +1623,62 @@ describe('git review lease outcomes', () => {
     });
   });
 
+  it('reports an uncertain-confirmation write before rejecting a post-confirm generation drift', async () => {
+    await seed({ status: 'in_progress', reviewRound: 0 });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['in_progress'], headSha: SHA1, bumpRound: true,
+    });
+    vi.spyOn(manager, 'startSession').mockRejectedValueOnce(
+      new DispatchTerminalError('ack_unknown', 'delivery outcome unknown'),
+    );
+    await expect(manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    })).rejects.toMatchObject({ reason: 'ack_unknown' });
+    const uncertain = (await taskStore.get('task-1'))!;
+    const internal = manager as unknown as {
+      confirmUncertainGitReviewDispatch: (
+        taskId: string,
+        expectedGeneration: string,
+        verifiedHeadSha: string,
+      ) => Promise<TaskState | null>;
+    };
+    const confirm = internal.confirmUncertainGitReviewDispatch.bind(internal);
+    vi.spyOn(internal, 'confirmUncertainGitReviewDispatch').mockImplementationOnce(async (...args) => {
+      const confirmed = await confirm(...args);
+      const drifted = {
+        ...confirmed!,
+        specReviewRound: 1,
+        updatedAt: new Date().toISOString(),
+      };
+      await taskStore.set(drifted);
+      return drifted;
+    });
+    const onSideEffect = vi.fn();
+
+    await expect(manager.dispatchReviewToQa('task-1', {
+      confirmUncertainNotDelivered: true,
+      expectedTask: {
+        status: uncertain.status,
+        phase: uncertain.phase,
+        signalToken: uncertain.signalToken,
+        agentId: uncertain.agentId,
+        reviewRound: uncertain.reviewRound,
+        specReviewRound: uncertain.specReviewRound,
+      },
+      onSideEffect,
+    })).rejects.toMatchObject({
+      status: 409,
+      code: 'dispatch-superseded',
+      message: 'Task task-1 review generation changed during uncertain-delivery confirmation',
+    });
+
+    expect(onSideEffect).toHaveBeenCalledOnce();
+    expect(await taskStore.get('task-1')).toMatchObject({
+      specReviewRound: 1,
+      reviewDispatch: { phase: 'pending' },
+    });
+  });
+
   it('restores the same uncertain generation when the QA hold changes during confirmation', async () => {
     await seed({ status: 'in_progress', reviewRound: 0 });
     const begun = await manager.beginGitReviewPass('task-1', {
@@ -1634,6 +1996,126 @@ describe('git reconciliation watcher rearm on lease dispatch', () => {
 });
 
 describe('manual dispatch binding recheck', () => {
+  it('preserves the current git review round when redispatch explicitly disables the bump', async () => {
+    await seed({
+      status: 'review',
+      reviewRound: 2,
+      signalToken: 'ffff00001111',
+      reviewDispatch: undefined,
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(async () => {
+      return (await taskStore.get('task-1'))!;
+    });
+
+    const result = await manager.dispatchReviewToQa('task-1', { bumpRound: false });
+
+    expect(result.reviewRound).toBe(2);
+    expect(result.reviewDispatch).toMatchObject({ effectiveRound: 2 });
+    expect(dispatch).toHaveBeenCalledWith('task-1', expect.objectContaining({
+      expectedGeneration: result.reviewDispatch?.generation,
+    }));
+  });
+
+  it('rejects a stale route guard before verifying the PR binding', async () => {
+    await seed({
+      status: 'review',
+      phase: 'code',
+      reviewRound: 2,
+      signalToken: 'current-pass',
+      reviewDispatch: undefined,
+    });
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+
+    await expect(manager.dispatchReviewToQa('task-1', {
+      expectedTask: {
+        status: 'review',
+        phase: 'code',
+        signalToken: 'current-pass',
+        agentId: 'dev-1',
+        reviewRound: 1,
+      },
+    })).rejects.toMatchObject({ status: 409, code: 'dispatch-superseded' });
+
+    expect(verify).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
+  });
+
+  it('dispatches an existing pending lease under a matching full guard and commits its round', async () => {
+    await seed({
+      status: 'review',
+      phase: 'code',
+      reviewRound: 1,
+      specReviewRound: 1,
+      signalToken: 'entry-pass',
+    });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: true,
+    });
+    vi.spyOn(manager, 'startSession').mockResolvedValue(true);
+
+    const result = await manager.dispatchReviewToQa('task-1', {
+      expectedTask: {
+        status: 'review',
+        phase: 'code',
+        signalToken: begun!.task.signalToken,
+        agentId: 'dev-1',
+        reviewRound: 1,
+        specReviewRound: 1,
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: 'review',
+      reviewRound: 2,
+      specReviewRound: 1,
+      signalToken: begun!.task.signalToken,
+    });
+    expect(result.reviewRoundPending).toBeUndefined();
+    expect(result.reviewDispatch).toBeUndefined();
+    expect(await taskStore.get('task-1')).toEqual(result);
+  });
+
+  it('rejects a non-recoverable git QA hold before creating a review lease', async () => {
+    await seed({
+      status: 'review', phase: 'code', signalToken: 'entry-pass', reviewDispatch: undefined,
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', status: 'awaiting_human',
+      awaitingPhase: 'dispatch-failed:ack_unknown', awaitingSince: TS,
+      awaitingNonce: 'uncertain-hold', updatedAt: TS,
+    });
+    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
+
+    await expect(manager.redispatchCurrentTaskPhase('task-1', {
+      status: 'review', phase: 'code', signalToken: 'entry-pass',
+      agentId: 'dev-1', reviewRound: 1,
+    })).resolves.toBe('unsupported');
+
+    expect(verify).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
+  });
+
+  it('restores a claimed git lease and reports unsupported if the QA hold races the route precheck', async () => {
+    await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    await agentStore.set({
+      id: 'qa-1', projectId: 'proj', taskId: 'task-1', status: 'awaiting_human',
+      awaitingPhase: 'dispatch-failed:ack_unknown', awaitingSince: TS,
+      awaitingNonce: 'raced-hold', updatedAt: TS,
+    });
+
+    await expect(manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+    })).rejects.toMatchObject({ status: 409, code: 'dispatch-unsupported' });
+
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toMatchObject({
+      generation: begun!.task.reviewDispatch!.generation,
+      phase: begun!.task.reviewDispatch!.phase,
+    });
+  });
+
   it('fences the route snapshot before creating a missing git review lease', async () => {
     await seed({
       status: 'review', phase: undefined, signalToken: undefined, reviewDispatch: undefined,
@@ -1656,6 +2138,124 @@ describe('manual dispatch binding recheck', () => {
     });
     expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
     expect(dispatchSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not recreate a git pass after concurrent delivery commits the guarded round', async () => {
+    await seed({
+      status: 'review', phase: 'code', reviewRound: 1, signalToken: 'entry-pass',
+    });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: true,
+    });
+    const claimed = await manager.claimGitReviewDispatch(
+      'task-1',
+      begun!.task.reviewDispatch!.generation,
+    );
+    const complete = manager as unknown as {
+      completeGitReviewDispatch: (
+        taskId: string,
+        lease: NonNullable<TaskState['reviewDispatch']>,
+      ) => Promise<boolean>;
+    };
+    const realGet = taskStore.get.bind(taskStore);
+    let routeReads = 0;
+    let completed = false;
+    vi.spyOn(taskStore, 'get').mockImplementation(async taskId => {
+      routeReads++;
+      if (!completed && routeReads === 2) {
+        completed = true;
+        expect(await complete.completeGitReviewDispatch('task-1', claimed!.lease)).toBe(true);
+      }
+      return realGet(taskId);
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(
+      async () => (await realGet('task-1'))!,
+    );
+
+    await expect(manager.redispatchCurrentTaskPhase('task-1', {
+      status: 'review',
+      phase: 'code',
+      signalToken: claimed!.task.signalToken,
+      agentId: 'dev-1',
+      reviewRound: 1,
+    })).resolves.toBe('stale');
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await realGet('task-1')).toMatchObject({
+      status: 'review',
+      reviewRound: 2,
+      signalToken: claimed!.lease.signalToken,
+    });
+    expect((await realGet('task-1'))?.reviewDispatch).toBeUndefined();
+  });
+
+  it('rechecks the guarded round inside git pass creation after PR verification', async () => {
+    await seed({
+      status: 'review', phase: 'code', reviewRound: 1, signalToken: 'entry-pass',
+      reviewDispatch: undefined,
+    });
+    vi.spyOn(manager, 'platformVerifyPrBinding').mockImplementation(async () => {
+      const current = await taskStore.get('task-1');
+      await taskStore.set({
+        ...current!,
+        reviewRound: 2,
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main' };
+    });
+    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
+
+    await expect(manager.redispatchCurrentTaskPhase('task-1', {
+      status: 'review',
+      phase: 'code',
+      signalToken: 'entry-pass',
+      agentId: 'dev-1',
+      reviewRound: 1,
+    })).resolves.toBe('stale');
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await taskStore.get('task-1')).toMatchObject({
+      reviewRound: 2,
+      signalToken: 'entry-pass',
+    });
+    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
+  });
+
+  it('checks the full task generation while claiming an existing git lease', async () => {
+    await seed({
+      status: 'review',
+      phase: 'code',
+      reviewRound: 1,
+      specReviewRound: 1,
+      signalToken: 'entry-pass',
+    });
+    const begun = await manager.beginGitReviewPass('task-1', {
+      fromStatus: ['review'], headSha: SHA1, bumpRound: false,
+    });
+    await taskStore.set({
+      ...begun!.task,
+      specReviewRound: 2,
+      updatedAt: new Date().toISOString(),
+    });
+    const acquire = vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
+    const onSideEffect = vi.fn();
+
+    await expect(manager.dispatchGitReviewLease('task-1', {
+      expectedGeneration: begun!.task.reviewDispatch!.generation,
+      expectedTask: {
+        status: 'review',
+        phase: 'code',
+        signalToken: begun!.task.signalToken,
+        agentId: 'dev-1',
+        reviewRound: 1,
+        specReviewRound: 1,
+      },
+      onSideEffect,
+    })).rejects.toMatchObject({ status: 409, code: 'dispatch-superseded' });
+
+    expect(onSideEffect).not.toHaveBeenCalled();
+    expect(acquire).not.toHaveBeenCalled();
+    expect((await taskStore.get('task-1'))?.reviewDispatch?.phase).toBe('pending');
   });
 
   it('refuses to dispatch a git review onto a PR that fails the binding predicate', async () => {

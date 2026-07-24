@@ -4,7 +4,7 @@ description: Research-side workflow for a baxian dispatch whose phase is researc
 disable-model-invocation: true
 ---
 
-baxian dispatches a block of `key: value` fields followed by the task title and description. `workdir:` is your fixed current directory, checked out detached at the latest default branch; do not create or switch branches. Signal format and emit rules are defined by the baxian-signals skill.
+baxian dispatches a block of `key: value` fields followed by the task title and description. If an `images:` list is present, read each path (the user's uploaded images) and factor them in. `workdir:` is your fixed current directory, checked out detached at the latest default branch; do not create or switch branches. Signal format and emit rules are defined by the baxian-signals skill.
 
 ## Role
 

@@ -160,6 +160,14 @@ describe('DispatchReconciler review 侧补派', () => {
       fromStatus: ['review'],
       expectPhase: undefined,
       expectSignalToken: 'tok-current1',
+      expectedTask: {
+        status: t.status,
+        phase: t.phase,
+        signalToken: t.signalToken,
+        agentId: t.agentId,
+        reviewRound: t.reviewRound,
+        specReviewRound: t.specReviewRound,
+      },
       pendingBudget: expect.objectContaining({ since: expect.any(Number) }),
       onPassArmed: expect.any(Function),
     });
@@ -183,7 +191,17 @@ describe('DispatchReconciler review 侧补派', () => {
 
     expect(Object.hasOwn(capturedOptions ?? {}, 'expectPhase')).toBe(true);
     expect(Object.hasOwn(capturedOptions ?? {}, 'expectSignalToken')).toBe(true);
-    expect(capturedOptions).toMatchObject({ fromStatus: ['review'] });
+    expect(capturedOptions).toMatchObject({
+      fromStatus: ['review'],
+      expectedTask: {
+        status: t.status,
+        phase: undefined,
+        signalToken: undefined,
+        agentId: t.agentId,
+        reviewRound: t.reviewRound,
+        specReviewRound: t.specReviewRound,
+      },
+    });
   });
 
   it('pending + 探测忙碌 → 不补派；忙碌超预算发一次性 intervention，不重复', async () => {
