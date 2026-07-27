@@ -160,16 +160,16 @@ describe('Project header actions', () => {
     expect(trigger.getAttribute('aria-controls')).toBeNull();
   });
 
-  it('moves the project three-dot menu into the topbar and keeps "Add agent" inside it', async () => {
+  it('moves the project three-dot menu into the topbar and keeps "Add agent group" inside it', async () => {
     renderProjectPage();
     await waitFor(() => screen.getByRole('heading', { level: 1, name: 'demo' }));
 
-    expect(screen.queryByRole('button', { name: /Add agent/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Add agent group/ })).toBeNull();
     const topbarActions = screen.getByTestId('topbar-actions');
     expect(within(topbarActions).getByRole('button', { name: /Project demo actions menu/ })).toBeTruthy();
 
     await openProjectMenu();
-    const item = await screen.findByRole('menuitem', { name: 'Add agent' });
+    const item = await screen.findByRole('menuitem', { name: 'Add agent group' });
     expect(item.className).not.toContain('text-danger');
 
     expect(screen.queryByTestId('create-agent-modal')).toBeNull();

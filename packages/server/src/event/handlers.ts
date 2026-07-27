@@ -5,9 +5,11 @@ import { LINE_SAFE_ID_RE } from '../platform/row-schema.js';
 import { SHA_HEX_SOURCE, SOURCE_KEY_PATTERN } from '../platform/types.js';
 import {
   BRANCH_PREFIX,
+  effectiveTaskReviewRound,
   isRecord,
-  isSpecStagePhase,
   isValidBranchName,
+  taskGenerationGuard,
+  taskReviewRound,
   type BaxianEvent,
   type TaskState,
 } from '../shared/index.js';
@@ -18,15 +20,21 @@ import {
   DispatchTerminalError,
   isRecoverableQaDispatchHold,
 } from '../agent/manager.js';
-import { ReplNotReadyError } from '../agent/tmux.js';
-import { DirtyWorkdirError } from '../agent/branch.js';
 
 type InterventionData = Record<string, unknown> & { phase: string };
 const HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 const BODY_DIGEST_RE = new RegExp(`^${BODY_DIGEST_SOURCE}$`);
 const PR_UPDATED_REVIEW_FROM_STATUSES: TaskState['status'][] = [
-  'in_progress', 'fixing', 'review', 'approved', 'merge-ready',
+  'in_progress', 'fixing', 'review', 'spec-ready', 'approved', 'merge-ready',
 ];
+const PREMATURE_MERGE_BLOCKABLE_STATUSES: TaskState['status'][] = [
+  'pending', 'in_progress', 'review', 'fixing', 'spec-ready', 'approved', 'max_rounds',
+];
+
+function requireTaskQaAgentId(task: Pick<TaskState, 'id' | 'qaAgentId'>, operation: string): string {
+  if (!task.qaAgentId) throw new Error(`${operation}: task ${task.id} has no QA participant`);
+  return task.qaAgentId;
+}
 
 function validHeadSha(value: unknown): string | undefined {
   return typeof value === 'string' && HEAD_SHA_RE.test(value) ? value : undefined;
@@ -131,9 +139,7 @@ async function reArmDevelopWatcher(
   agentId: string,
   opts: { skipSnapshot?: boolean } = {},
 ): Promise<void> {
-  const kinds: readonly PhaseSignalKind[] = task.phase === 'research'
-    ? ['spec-done']
-    : task.phase === 'code'
+  const kinds: readonly PhaseSignalKind[] = task.phase === 'code'
       ? ['pr-created']
       : ['spec-done', 'pr-created'];
   await manager.setupPhaseSignal(task.id, agentId, kinds, { skipSnapshot: opts.skipSnapshot ?? true });
@@ -160,6 +166,50 @@ async function emitIntervention(
   } catch (emitErr) {
     console.warn(`[EventHandler] human.intervention emit failed (phase=${data.phase}):`, emitErr);
   }
+}
+
+async function cleanupPrematureMergeParticipants(
+  bus: EventBus,
+  manager: AgentManager,
+  task: Pick<TaskState, 'id' | 'projectId' | 'agentId' | 'qaAgentId'>,
+): Promise<void> {
+  const participantIds = [...new Set(
+    [task.agentId, task.qaAgentId]
+      .filter((id): id is string => typeof id === 'string' && id !== ''),
+  )];
+  const errors: string[] = [];
+  try {
+    await manager.cancelTask(task.id);
+  } catch (err) {
+    errors.push(err instanceof Error ? err.message : String(err));
+  }
+  const remainingParticipants = new Set<string>();
+  for (const participantId of participantIds) {
+    try {
+      if ((await manager.getAgentState(participantId))?.taskId === task.id) {
+        remainingParticipants.add(participantId);
+      }
+    } catch (err) {
+      remainingParticipants.add(participantId);
+      errors.push(`${participantId}: binding probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      if (await manager.getAgentLockOwner(participantId) === task.id) {
+        remainingParticipants.add(participantId);
+        errors.push(`${participantId}: exclusive lock still owned by task ${task.id}`);
+      }
+    } catch (err) {
+      remainingParticipants.add(participantId);
+      errors.push(`${participantId}: lock probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (errors.length === 0 && remainingParticipants.size === 0) return;
+  await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+    phase: 'premature-merge-participant-cleanup-failed',
+    participants: participantIds,
+    remainingParticipants: [...remainingParticipants],
+    ...(errors.length > 0 ? { errors } : {}),
+  });
 }
 
 const POST_APPROVE_REDISPATCH_CAP = 10;
@@ -194,7 +244,7 @@ async function dispatchGitDevPostApproveCheck(
     return;
   }
   const live = await manager.getTask(snapshot.id);
-  if (!live || live.status !== 'approved' || live.reviewMode !== 'git') return;
+  if (!live || live.status !== 'approved') return;
   let key = postApproveEpisodeKey(live);
   if (!key || key.headSha !== approvedHeadSha || live.postApprovePhase === undefined) {
     await emitIntervention(bus, snapshot.projectId, snapshot.agentId, snapshot.id, {
@@ -279,7 +329,7 @@ async function handlePrMergeReady(
 ): Promise<void> {
   const taskId = event.taskId!;
   const taskNow = await manager.getTask(taskId);
-  if (!taskNow || taskNow.reviewMode !== 'git') return;
+  if (!taskNow) return;
   const eventPrNumber = event.data.prNumber as number | undefined;
   const eventPrUrl = event.data.prUrl as string | undefined;
   const needsPatch =
@@ -320,7 +370,6 @@ async function handlePrMergeReady(
   if (
     !freshTask
     || freshTask.status !== 'approved'
-    || freshTask.reviewMode !== 'git'
     || freshTask.agentId !== taskNow.agentId
     || freshTask.postApproveRevoked !== undefined
     || entryCompletion?.token !== signalToken
@@ -374,16 +423,17 @@ async function handlePrMergeReady(
       patch: { latestHeadSha: gitEpisodeKey.headSha },
     });
     if (begun?.task.reviewDispatch) {
+      const qaAgentId = requireTaskQaAgentId(begun.task, 'handlePostApproveMergeReady');
       try {
         await manager.dispatchGitReviewLease(freshTask.id, {
           expectedGeneration: begun.task.reviewDispatch.generation,
         });
       } catch (err) {
-        if (err instanceof DispatchTerminalError && begun.task.qaAgentId) {
+        if (err instanceof DispatchTerminalError) {
           await manager.failTaskForDispatchError(
             freshTask.id,
             'recheck',
-            begun.task.qaAgentId,
+            qaAgentId,
             err,
             { expectedReviewDispatch: begun.task.reviewDispatch },
           );
@@ -476,7 +526,7 @@ async function handlePrFeedback(
 ): Promise<void> {
   const taskId = event.taskId!;
   const taskNow = await manager.getTask(taskId);
-  if (!taskNow || taskNow.reviewMode !== 'git') return;
+  if (!taskNow) return;
   const revision = parseGitFeedbackRevision(event.data.revision);
   if (!revision) {
     await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
@@ -542,7 +592,7 @@ export async function recoverGitPostApprovePending(bus: EventBus, manager: Agent
 async function recoverOneGitPendingTask(bus: EventBus, manager: AgentManager, task: TaskState): Promise<void> {
   {
     const live = await manager.getTask(task.id);
-    if (!live || live.reviewMode !== 'git' || live.status !== 'approved' || live.pendingRedispatch !== true) return;
+    if (!live || live.status !== 'approved' || live.pendingRedispatch !== true) return;
     if (live.postApproveRevoked) return;
     const updatedAt = Date.parse(live.updatedAt);
     if (!Number.isFinite(updatedAt)) {
@@ -616,7 +666,18 @@ async function handlePrCodePush(
   const eventKind = event.data.kind as string | undefined;
   const eventHeadSha = validHeadSha(event.data.headSha);
   const task = await manager.getTask(taskId);
-  if (!task || task.reviewMode !== 'git') return;
+  if (!task) return;
+  if (task.status === 'in_progress'
+    && (task.phase === undefined || task.deliveryConfirmation?.phase !== task.phase)) {
+    if (eventPrNumber !== undefined && eventHeadSha !== undefined) {
+      await manager.recordGitPrObservation(taskId, {
+        prNumber: eventPrNumber,
+        ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+        headSha: eventHeadSha,
+      });
+    }
+    return;
+  }
   if (eventKind === 'push' && eventHeadSha
     && event.data.source !== 'pr-fixed'
     && task.reviewDispatch === undefined
@@ -628,6 +689,16 @@ async function handlePrCodePush(
     console.warn(
       `[EventHandler] pr.updated: task ${taskId} in_progress but neither task nor event has prNumber; deferring catch-up`,
     );
+    return;
+  }
+  if (task.status === 'max_rounds') {
+    if (eventPrNumber !== undefined && eventHeadSha !== undefined) {
+      await manager.recordGitPrObservation(taskId, {
+        prNumber: eventPrNumber,
+        ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
+        headSha: eventHeadSha,
+      });
+    }
     return;
   }
   if (!PR_UPDATED_REVIEW_FROM_STATUSES.includes(task.status)) return;
@@ -645,6 +716,7 @@ async function handlePrCodePush(
   }
 
   const bumpRound = task.status === 'in_progress'
+    || task.status === 'spec-ready'
     || task.status === 'approved'
     || task.status === 'merge-ready'
     || (task.status === 'review' && task.reviewRoundPending === true);
@@ -673,6 +745,7 @@ async function handlePrCodePush(
     return;
   }
   const qaPhase = begun.task.reviewDispatch.qaPhase;
+  const qaAgentId = requireTaskQaAgentId(begun.task, 'handlePrUpdated');
   try {
     await manager.dispatchGitReviewLease(taskId, {
       expectedGeneration: begun.task.reviewDispatch.generation,
@@ -685,8 +758,8 @@ async function handlePrCodePush(
         qaPhase,
         error: err.message,
       });
-    } else if (err instanceof DispatchTerminalError && begun.task.qaAgentId) {
-      await manager.failTaskForDispatchError(taskId, qaPhase, begun.task.qaAgentId, err, {
+    } else if (err instanceof DispatchTerminalError) {
+      await manager.failTaskForDispatchError(taskId, qaPhase, qaAgentId, err, {
         expectedReviewDispatch: begun.task.reviewDispatch,
       });
     } else {
@@ -704,29 +777,28 @@ async function redispatchReviewForStaleVerdict(
   task: TaskState,
 ): Promise<boolean> {
   if (task.status !== 'review') return false;
-  if (task.qaAgentId) {
-    // 当前 pass 的 QA 会话还在跑时，迟到的旧 verdict 只是噪音，不能重派打断；
-    // 派发期 hold（checkout 未备好）意味着从未开工，等同无会话，可安全重派
-    let qaState: Awaited<ReturnType<AgentManager['getAgentState']>>;
-    try {
-      qaState = await manager.getAgentState(task.qaAgentId);
-    } catch (err) {
-      // 无状态证据时 fail closed：不自动重派，让调用方落 stale-verdict 兜底介入
-      console.warn(
-        `[EventHandler] stale-verdict QA state read failed for ${task.qaAgentId}; not redispatching:`,
-        err,
-      );
-      return false;
-    }
-    if (qaState?.taskId === task.id && !isRecoverableQaDispatchHold(qaState)) return false;
+  const qaAgentId = requireTaskQaAgentId(task, 'redispatchReviewForStaleVerdict');
+  // 当前 pass 的 QA 会话还在跑时，迟到的旧 verdict 只是噪音，不能重派打断；
+  // 派发期 hold（checkout 未备好）意味着从未开工，等同无会话，可安全重派
+  let qaState: Awaited<ReturnType<AgentManager['getAgentState']>>;
+  try {
+    qaState = await manager.getAgentState(qaAgentId);
+  } catch (err) {
+    // 无状态证据时 fail closed：不自动重派，让调用方落 stale-verdict 兜底介入
+    console.warn(
+      `[EventHandler] stale-verdict QA state read failed for ${qaAgentId}; not redispatching:`,
+      err,
+    );
+    return false;
   }
+  if (qaState?.taskId === task.id && !isRecoverableQaDispatchHold(qaState)) return false;
   try {
     // fromStatus/expectSignalToken 在 dispatch 锁内复核：本地快照到这里的窗口里任务可能已离开 review
     // 或被并发 dispatcher 换代 pass，不能靠上面的预检
     const entry = manager.getPendingDispatchRetry(task.id);
     const qaPhase = entry?.kind === 'qa-recheck' && entry.signalToken === task.signalToken && entry.qaPhase !== undefined
       ? entry.qaPhase
-      : (task.reviewRound === 0 ? 'review' as const : undefined);
+      : (taskReviewRound(task) === 0 ? 'review' as const : undefined);
     await manager.dispatchReviewToQa(task.id, {
       fromStatus: ['review'],
       bumpRound: task.reviewRoundPending === true,
@@ -767,6 +839,7 @@ async function handleReviewApproval(
   }
 
   if (task.failToken === undefined || task.signalToken === undefined) return;
+  const expectedSignalToken = task.signalToken;
   const provenance = {
     sourceKey: gitVerdict.carrier.sourceKey,
     id: gitVerdict.carrier.id,
@@ -775,9 +848,66 @@ async function handleReviewApproval(
     failToken: task.failToken,
     anchorSha: reviewedHeadSha,
   };
-  const reviewedRound = Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0));
+  const reviewedRound = effectiveTaskReviewRound(task);
+  if (task.phase === 'spec') {
+    const humanApproval = manager.getProjectConfig(task.projectId)?.specApproval === 'human';
+    if (!humanApproval) {
+      let verified: Awaited<ReturnType<AgentManager['platformVerifyPrBinding']>>;
+      try {
+        verified = await manager.platformVerifyPrBinding(task.id, gitVerdict.prNumber);
+      } catch (err) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'git-spec-auto-approve-head-verify-failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
+      if (!verified.ok) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'git-spec-auto-approve-binding-invalid',
+          reason: verified.reason,
+        });
+        throw new Error(`automatic spec approval binding is invalid: ${verified.reason}`);
+      }
+      if (verified.headSha.toLowerCase() !== reviewedHeadSha.toLowerCase()) {
+        await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+          phase: 'git-spec-auto-approve-head-mismatch',
+          reviewedHeadSha,
+          currentHeadSha: verified.headSha,
+          source: 'platform-live-read',
+        });
+        return;
+      }
+    }
+    const expectedTask = taskGenerationGuard(task);
+    const approval = {
+      specReviewRound: reviewedRound,
+      expectedSignalToken,
+      ...(prPatch.prNumber !== undefined ? { prNumber: prPatch.prNumber } : {}),
+      ...(prPatch.prUrl !== undefined ? { prUrl: prPatch.prUrl } : {}),
+      headSha: reviewedHeadSha,
+      passProvenance: provenance,
+    };
+    const transitioned = humanApproval
+      ? await manager.parkTaskAtSpecReady(task.id, {
+          specReviewRound: reviewedRound,
+          expectedTask,
+          expectedSignalToken,
+          ...(prPatch.prNumber !== undefined ? { prNumber: prPatch.prNumber } : {}),
+          ...(prPatch.prUrl !== undefined ? { prUrl: prPatch.prUrl } : {}),
+          headSha: reviewedHeadSha,
+          passProvenance: provenance,
+        })
+      : await manager.transitionToCodePhase(task.id, expectedTask, approval);
+    if (!transitioned) {
+      await emitIntervention(bus, task.projectId, task.agentId, task.id, {
+        phase: 'git-spec-approve-transition-failed',
+      });
+    }
+    return;
+  }
   const transitioned = await manager.approveGitReviewPass(task.id, {
-    expectedSignalToken: task.signalToken,
+    expectedSignalToken,
     headSha: reviewedHeadSha,
     reviewRound: reviewedRound,
     ...(prPatch.prNumber !== undefined ? { prNumber: prPatch.prNumber } : {}),
@@ -788,15 +918,14 @@ async function handleReviewApproval(
 
   manager.stopPhaseSignalWatcher(transitioned.id);
 
-  if (transitioned.qaAgentId) {
-    await manager.releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
-      .catch(err =>
-        console.error(
-          `[EventHandler] APPROVE releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-          err,
-        ),
-      );
-  }
+  const qaAgentId = requireTaskQaAgentId(transitioned, 'handleReviewApproval');
+  await manager.releaseAgentForTask(qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+    .catch(err =>
+      console.error(
+        `[EventHandler] APPROVE releaseAgentForTask(QA=${qaAgentId}) failed:`,
+        err,
+      ),
+    );
 
   await dispatchGitDevPostApproveCheck(bus, manager, transitioned, reviewedHeadSha);
 }
@@ -825,9 +954,10 @@ async function handleReviewRequestChanges(
     return;
   }
 
-  const reviewedRound = Math.max(1, task.reviewRound + (task.reviewRoundPending === true ? 1 : 0));
+  const reviewedRound = effectiveTaskReviewRound(task);
   const nextRound = reviewedRound + 1;
-  if (nextRound > manager.getConfig().review.rounds) {
+  const cap = manager.getConfig().review.rounds + (task.maxRoundsContinues ?? 0);
+  if (nextRound > cap) {
     return handleMaxRounds(bus, manager, task, prPatch, reviewedRound);
   }
 
@@ -841,7 +971,9 @@ async function handleReviewRequestChanges(
     {
       ...prPatch,
       ...gitHeadPatch(task, currentHeadSha),
-      reviewRound: nextRound,
+      ...(task.phase === 'spec'
+        ? { specReviewRound: nextRound }
+        : { reviewRound: nextRound }),
       reviewRoundPending: undefined,
       reviewDispatch: undefined,
       fixDispatchedAt: new Date().toISOString(),
@@ -851,109 +983,7 @@ async function handleReviewRequestChanges(
   const { task: transitioned } = result;
   await manager.clearPostApproveCompletion(transitioned.id);
   manager.stopPhaseSignalWatcher(transitioned.id);
-
-  if (transitioned.qaAgentId) {
-    const qaReleased = await manager
-      .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
-      .catch(err => {
-        console.error(
-          `[EventHandler] REQUEST_CHANGES releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-          err,
-        );
-        return false;
-      });
-    if (!qaReleased) {
-      await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-        phase: 'qa-release-failed-but-dev-dispatched',
-        qaAgentId: transitioned.qaAgentId,
-      });
-    }
-  }
-
-  const acquired = await manager.acquireAgentForTask(transitioned.agentId, transitioned.id, 'fix');
-  if (!acquired) {
-    await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-      phase: 'dev-acquire-failed-fix',
-      devAgentId: transitioned.agentId,
-    });
-    return;
-  }
-
-  const { token: fixToken, armed } = await manager.rotateAndSetupPhaseSignal(
-    transitioned.id,
-    transitioned.agentId,
-    'pr-fixed',
-    { expectedStatus: 'fixing', expectedToken: transitioned.signalToken },
-  );
-
-  if (!armed) {
-    console.warn(
-      `[EventHandler] REQUEST_CHANGES pr-fixed watcher failed to arm for task=${transitioned.id}; holding dev (not dispatching fix)`,
-    );
-    await manager.markAwaitingHuman(
-      transitioned.agentId,
-      'signal-arm-failed:pr-fixed',
-      'pr-fixed watcher failed to arm; the fix was not dispatched (its completion signal would have no consumer). Cancel the task or delete the agent to retry.',
-      { expectedTaskId: transitioned.id },
-    );
-    return;
-  }
-
-  let resumed = false;
-  let dispatchErr: unknown = null;
-  try {
-    resumed = await manager.continueSession(transitioned.id, transitioned.agentId, 'fix', {
-      signalToken: fixToken,
-      guardBeforeInject: async () => {
-        const freshTask = await manager.getTask(transitioned.id);
-        return freshTask?.status === 'fixing' && freshTask.signalToken === fixToken;
-      },
-    });
-  } catch (err) {
-    dispatchErr = err;
-    console.error(
-      `[EventHandler] REQUEST_CHANGES continueSession(dev=${transitioned.agentId}, fix) failed:`,
-      err,
-    );
-  }
-  if (!resumed) {
-    console.warn(
-      `[EventHandler] REQUEST_CHANGES dev=${transitioned.agentId} not resumable for task=${transitioned.id}; ` +
-      `task remains in 'fixing' but no dev session is attached`,
-    );
-    if (dispatchErr instanceof DispatchTerminalError) {
-      await manager.failTaskForDispatchError(
-        transitioned.id, 'fix', transitioned.agentId, dispatchErr,
-      );
-    } else {
-      const parked = await manager.markAgentWaiting(transitioned.agentId, transitioned.id)
-        .catch(err => {
-          console.error(
-            `[EventHandler] REQUEST_CHANGES markAgentWaiting(dev=${transitioned.agentId}) rollback failed:`,
-            err,
-          );
-          return false;
-        });
-      if (parked && (dispatchErr instanceof ReplNotReadyError || dispatchErr instanceof DirtyWorkdirError)) {
-        // dev 回合在途（忙碌/未提交改动）是常态而非故障：登记待补派，回合结束后由对账 re-continue。
-        // 停驻失败说明绑定/锁已不受控，pending 无法证明还有可承接的 session，必须走人工告警
-        manager.registerPendingDispatchRetry(transitioned.id, {
-          kind: 'dev-fix',
-          agentId: transitioned.agentId,
-          signalToken: fixToken,
-        });
-        console.warn(
-          `[EventHandler] REQUEST_CHANGES fix deferred for task=${transitioned.id}: dev pane busy or workdir dirty ` +
-          `(${dispatchErr.name}); reconciler will re-continue when idle`,
-        );
-      } else {
-        await emitIntervention(bus, transitioned.projectId, transitioned.agentId, transitioned.id, {
-          phase: 'fix-resume-failed',
-          reviewRound: transitioned.reviewRound,
-        });
-      }
-    }
-  }
+  await manager.dispatchGitFixToDev(transitioned.id);
 }
 
 async function handleMaxRounds(
@@ -972,7 +1002,9 @@ async function handleMaxRounds(
     },
     {
       ...prPatch,
-      reviewRound: reviewedRound,
+      ...(task.phase === 'spec'
+        ? { specReviewRound: reviewedRound }
+        : { reviewRound: reviewedRound }),
       reviewRoundPending: undefined,
       reviewDispatch: undefined,
     },
@@ -982,19 +1014,18 @@ async function handleMaxRounds(
   await manager.clearPostApproveCompletion(transitioned.id);
   manager.stopPhaseSignalWatcher(transitioned.id);
 
-  if (transitioned.qaAgentId) {
-    const qaState = await manager.getAgentState(transitioned.qaAgentId);
-    if (qaState?.taskId === transitioned.id) {
-      await manager
-        .releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
-        .catch(err => {
-          console.error(
-            `[EventHandler] max_rounds releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-            err,
-          );
-          return false;
-        });
-    }
+  const qaAgentId = requireTaskQaAgentId(transitioned, 'handleMaxRounds');
+  const qaState = await manager.getAgentState(qaAgentId);
+  if (qaState?.taskId === transitioned.id) {
+    await manager
+      .releaseAgentForTask(qaAgentId, transitioned.id, 'idle', { allowAwaitingHuman: true })
+      .catch(err => {
+        console.error(
+          `[EventHandler] max_rounds releaseAgentForTask(QA=${qaAgentId}) failed:`,
+          err,
+        );
+        return false;
+      });
   }
 
   try {
@@ -1005,7 +1036,10 @@ async function handleMaxRounds(
       projectId: transitioned.projectId,
       agentId: transitioned.agentId,
       taskId: transitioned.id,
-      data: { reviewRound: transitioned.reviewRound },
+      data: {
+        phase: transitioned.phase,
+        reviewRound: taskReviewRound(transitioned),
+      },
     });
   } catch (emitErr) {
     console.warn(`[EventHandler] max_rounds emit failed:`, emitErr);
@@ -1016,35 +1050,17 @@ export function registerEventHandlers(
   bus: EventBus,
   manager: AgentManager,
 ): void {
-  bus.on('pr.created', async (event) => {
+  const handleGitPrDelivery = async (
+    event: BaxianEvent,
+    deliveryPhase: TaskState['phase'] | undefined,
+  ): Promise<void> => {
     if (!event.taskId || !event.agentId) return;
     const taskAtEntry = await manager.getTask(event.taskId);
     if (!taskAtEntry) return;
-    if (taskAtEntry.reviewMode === 'server') {
-      const prNumber = event.data.prNumber;
-      if (!Number.isInteger(prNumber) || (prNumber as number) < 1) return;
-      const adopted = await manager.adoptServerPr(event.taskId, {
-        prNumber: prNumber as number,
-        ...(typeof event.data.prUrl === 'string' ? { prUrl: event.data.prUrl } : {}),
-        ...(validHeadSha(event.data.headSha) !== undefined ? { headSha: validHeadSha(event.data.headSha)! } : {}),
-        ...(typeof event.data.targetBranch === 'string' ? { targetBranch: event.data.targetBranch } : {}),
-      });
-      if (!adopted) {
-        await emitIntervention(bus, taskAtEntry.projectId, taskAtEntry.agentId, taskAtEntry.id, {
-          phase: 'server-pr-adoption-refused',
-          prNumber,
-        });
-      }
-      return;
-    }
-    if (isSpecStagePhase(taskAtEntry.phase)) {
-      console.warn(`[EventHandler] pr.created ignored for task ${event.taskId}: task in spec phase`);
-      return;
-    }
-
     if (event.data.source === 'pane-signal'
       && taskAtEntry.prNumber !== undefined && taskAtEntry.prNumber === event.data.prNumber
       && taskAtEntry.status !== 'in_progress') {
+      if (taskAtEntry.phase !== deliveryPhase) return;
       if (taskAtEntry.pendingPrSignalToken === undefined
         || event.data.token !== taskAtEntry.pendingPrSignalToken) {
         return;
@@ -1133,8 +1149,8 @@ export function registerEventHandlers(
       }
     }
 
-    const task = await manager.getTask(event.taskId);
-    if (!task || task.reviewMode !== 'git') return;
+    let task = await manager.getTask(event.taskId);
+    if (!task) return;
     if (event.data.source !== 'pane-signal'
       && task.branch !== BRANCH_PREFIX + event.taskId
       && task.prNumber !== event.data.prNumber) {
@@ -1145,25 +1161,9 @@ export function registerEventHandlers(
       return;
     }
 
-    const adoption: Partial<Pick<TaskState,
-      'baseBranch' | 'replyActorId' | 'replyActorStatus' | 'pendingPrSignalToken'>> = {};
     const target = event.data.source === 'pane-signal'
       ? verifiedTargetBranch
       : (typeof event.data.targetBranch === 'string' ? event.data.targetBranch : undefined);
-    if (target !== undefined && task.baseBranch === undefined) adoption.baseBranch = target;
-    if (event.data.source === 'pane-signal') {
-      const actorId = typeof event.data.actorB64 === 'string'
-        ? decodeSignalActorId(event.data.actorB64)
-        : undefined;
-      if (actorId !== undefined) {
-        adoption.replyActorId = actorId;
-        adoption.replyActorStatus = 'verified';
-        adoption.pendingPrSignalToken = undefined;
-      }
-    } else if (typeof event.data.prAuthorId === 'string' && task.replyActorStatus !== 'verified') {
-      adoption.replyActorId = event.data.prAuthorId;
-      adoption.replyActorStatus = 'provisional';
-    }
 
     let reviewHead = validHeadSha(event.data.headSha) ?? paneVerifiedHeadSha;
     if (reviewHead === undefined && typeof event.data.prNumber === 'number') {
@@ -1177,6 +1177,55 @@ export function registerEventHandlers(
       return;
     }
 
+    if (deliveryPhase === undefined) {
+      if (typeof event.data.prNumber !== 'number') return;
+      await manager.recordGitPrObservation(event.taskId, {
+        prNumber: event.data.prNumber,
+        ...(typeof event.data.prUrl === 'string' ? { prUrl: event.data.prUrl } : {}),
+        headSha: reviewHead,
+        ...(target !== undefined ? { targetBranch: target } : {}),
+        ...(typeof event.data.prAuthorId === 'string' ? { prAuthorId: event.data.prAuthorId } : {}),
+      });
+      return;
+    }
+
+    const actorId = typeof event.data.actorB64 === 'string'
+      ? decodeSignalActorId(event.data.actorB64)
+      : undefined;
+    if (actorId === undefined || typeof event.data.prNumber !== 'number') {
+      await reArmDevelopWatcher(manager, task, event.agentId);
+      await emitIntervention(bus, task.projectId, event.agentId, event.taskId, {
+        phase: 'git-pr-delivery-actor-missing',
+        deliveryPhase,
+        claimedPrNumber: event.data.prNumber,
+      });
+      return;
+    }
+    const confirmed = await manager.confirmGitDelivery(event.taskId, {
+      phase: deliveryPhase,
+      source: 'signal',
+      prNumber: event.data.prNumber,
+      ...(typeof event.data.prUrl === 'string' ? { prUrl: event.data.prUrl } : {}),
+      headSha: reviewHead,
+      ...(target !== undefined ? { targetBranch: target } : {}),
+      ...(reconciledBranch !== undefined ? { branch: reconciledBranch } : {}),
+      actorId,
+      expectedSignalToken: typeof event.data.token === 'string' ? event.data.token : undefined,
+    });
+    if (!confirmed) {
+      const current = await manager.getTask(event.taskId);
+      if (current?.status === 'in_progress') {
+        await reArmDevelopWatcher(manager, current, event.agentId);
+        await emitIntervention(bus, current.projectId, event.agentId, event.taskId, {
+          phase: 'pane-pr-delivery-transition-failed',
+          deliveryPhase,
+          claimedPrNumber: event.data.prNumber,
+        });
+      }
+      return;
+    }
+    task = confirmed;
+
     if (task.status !== 'in_progress' && task.status !== 'fixing') return;
     const begun = await manager.beginGitReviewPass(event.taskId, {
       fromStatus: [task.status],
@@ -1186,11 +1235,7 @@ export function registerEventHandlers(
       expectPhase: task.phase,
       expectSignalToken: task.signalToken,
       patch: {
-        ...(event.data.prNumber !== undefined ? { prNumber: event.data.prNumber as number } : {}),
-        ...(event.data.prUrl !== undefined ? { prUrl: event.data.prUrl as string } : {}),
         latestHeadSha: reviewHead,
-        ...(reconciledBranch ? { branch: reconciledBranch } : {}),
-        ...adoption,
       },
     });
     if (!begun?.task.reviewDispatch) {
@@ -1213,18 +1258,7 @@ export function registerEventHandlers(
         `[EventHandler] pr.created reconciled branch for task ${event.taskId}: ${task.branch} → ${reconciledBranch}`,
       );
     }
-    if (!begun.task.qaAgentId) {
-      const parked = await manager.markAgentWaiting(event.agentId, begun.task.id);
-      if (!parked) {
-        await emitIntervention(bus, begun.task.projectId, begun.task.agentId, begun.task.id, {
-          phase: 'dev-wait-gate-failed-no-qa',
-        });
-      }
-      await emitIntervention(bus, begun.task.projectId, begun.task.agentId, begun.task.id, {
-        phase: 'git-review-no-qa-partner',
-      });
-      return;
-    }
+    const qaAgentId = requireTaskQaAgentId(begun.task, 'pr.created');
     try {
       await manager.dispatchGitReviewLease(begun.task.id, {
         expectedGeneration: begun.task.reviewDispatch.generation,
@@ -1238,7 +1272,7 @@ export function registerEventHandlers(
           error: err.message,
         });
       } else if (err instanceof DispatchTerminalError) {
-        await manager.failTaskForDispatchError(begun.task.id, 'review', begun.task.qaAgentId, err, {
+        await manager.failTaskForDispatchError(begun.task.id, 'review', qaAgentId, err, {
           expectedReviewDispatch: begun.task.reviewDispatch,
         });
       } else {
@@ -1249,22 +1283,26 @@ export function registerEventHandlers(
         });
       }
     }
+  };
+
+  bus.on('pr.created', async (event) => {
+    await handleGitPrDelivery(
+      event,
+      event.data.source === 'pane-signal' ? 'code' : undefined,
+    );
+  });
+
+  bus.on('spec.ready', async (event) => {
+    const task = event.taskId ? await manager.getTask(event.taskId) : null;
+    if (!task) return;
+    await handleGitPrDelivery(event, 'spec');
   });
 
   bus.on('pr.updated', async (event) => {
     if (!event.taskId) return;
-    const taskAtEntry = await manager.getTask(event.taskId);
-
     const eventKind = event.data.kind as
       | 'push' | 'comment' | 'review-comment' | 'pr-merge-ready'
       | 'closed-unmerged' | 'reopened' | undefined;
-
-    if (taskAtEntry && isSpecStagePhase(taskAtEntry.phase)) {
-      console.warn(
-        `[EventHandler] pr.updated (kind=${eventKind ?? 'push'}) ignored for task ${event.taskId}: task in spec phase`,
-      );
-      return;
-    }
 
     if (eventKind === 'pr-merge-ready') return handlePrMergeReady(bus, manager, event);
     if (eventKind === 'closed-unmerged' || eventKind === 'reopened') {
@@ -1276,7 +1314,6 @@ export function registerEventHandlers(
       return;
     }
     if (!event.agentId) return;
-    if (taskAtEntry?.reviewMode === 'server') return;
     if (eventKind === 'comment' || eventKind === 'review-comment') {
       return handlePrFeedback(bus, manager, event);
     }
@@ -1285,53 +1322,138 @@ export function registerEventHandlers(
 
   bus.on('pr.merged', async (event) => {
     if (!event.taskId) return;
+    const taskId = event.taskId;
 
     const eventPrNumber = event.data.prNumber as number | undefined;
     const eventPrUrl = event.data.prUrl as string | undefined;
 
-    // The poller surfaces every merged PR on a managed branch — including a stale one whose number
-    // this task never tracked (e.g. a reused custom branch name). bx/<taskId> is unique to this task,
-    // so its merge is definitively ours even if pr.created was missed and prNumber was never recorded;
-    // for any other branch require the tracked PR number to match, else a foreign/stale merge on a
-    // reused custom branch name could prematurely finish an active task.
-    const taskBefore = await manager.getTask(event.taskId);
+    const taskBefore = await manager.getTask(taskId);
     if (!taskBefore) return;
-    if (isSpecStagePhase(taskBefore.phase)) return;
-    const mergedOwnBxBranch = (event.data.branch as string | undefined) === BRANCH_PREFIX + event.taskId;
-    if (!mergedOwnBxBranch && typeof eventPrNumber === 'number' && taskBefore.prNumber !== eventPrNumber) return;
-
+    const mergedOwnBxBranch = (event.data.branch as string | undefined) === BRANCH_PREFIX + taskId;
+    const sameBoundPr = eventPrNumber !== undefined
+      && (taskBefore.prNumber === eventPrNumber || (taskBefore.prNumber === undefined && mergedOwnBxBranch));
+    if (eventPrNumber !== undefined && !sameBoundPr) {
+      await emitIntervention(bus, taskBefore.projectId, taskBefore.agentId, taskBefore.id, {
+        phase: 'pr-merged-status-race',
+        status: taskBefore.status,
+        reason: taskBefore.prNumber === undefined ? 'pr-binding-unconfirmed' : 'pr-binding-changed',
+        boundPrNumber: taskBefore.prNumber,
+        prNumber: eventPrNumber,
+      });
+      return;
+    }
+    if ((taskBefore.status === 'merged' || taskBefore.status === 'done') && sameBoundPr) return;
+    let mergeExpectedPrNumber = taskBefore.prNumber;
+    let mergeBindingConfirmed = sameBoundPr;
     const prPatch: Partial<Pick<TaskState, 'prNumber' | 'prUrl'>> = {
       ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
       ...(eventPrUrl !== undefined ? { prUrl: eventPrUrl } : {}),
     };
+    if (taskBefore.status !== 'merge-ready') {
+      if (!sameBoundPr || !PREMATURE_MERGE_BLOCKABLE_STATUSES.includes(taskBefore.status)) {
+        await emitIntervention(bus, taskBefore.projectId, taskBefore.agentId, taskBefore.id, {
+          phase: 'pr-merged-outside-merge-ready',
+          status: taskBefore.status,
+          taskPhase: taskBefore.phase,
+          ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+        });
+        return;
+      }
+      const blocked = await manager.transitionTaskStatus(
+        taskId,
+        'failed',
+        {
+          fromStatus: PREMATURE_MERGE_BLOCKABLE_STATUSES,
+          expectPrNumber: taskBefore.prNumber,
+        },
+        prPatch,
+      );
+      if (blocked) {
+        manager.stopPhaseSignalWatcher(taskId);
+        await emitIntervention(bus, blocked.task.projectId, blocked.task.agentId, blocked.task.id, {
+          phase: 'pr-merged-outside-merge-ready',
+          status: blocked.previousStatus,
+          taskPhase: blocked.task.phase,
+          ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+        });
+        await cleanupPrematureMergeParticipants(bus, manager, blocked.task);
+        return;
+      }
+      const current = await manager.getTask(taskId);
+      if (!current) return;
+      const currentSameBoundPr = eventPrNumber !== undefined
+        && (current.prNumber === eventPrNumber || (current.prNumber === undefined && mergedOwnBxBranch));
+      if ((current.status === 'merged' || current.status === 'done') && currentSameBoundPr) return;
+      if (!currentSameBoundPr) {
+        await emitIntervention(bus, current.projectId, current.agentId, current.id, {
+          phase: 'pr-merged-status-race',
+          status: current.status,
+          reason: 'pr-binding-changed',
+          boundPrNumber: current.prNumber,
+          ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+        });
+        return;
+      }
+      if (current.status !== 'merge-ready') {
+        await emitIntervention(bus, current.projectId, current.agentId, current.id, {
+          phase: 'pr-merged-status-race',
+          status: current.status,
+          ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+        });
+        return;
+      }
+      mergeExpectedPrNumber = current.prNumber;
+      mergeBindingConfirmed = true;
+    }
+    if (!mergeBindingConfirmed) {
+      await emitIntervention(bus, taskBefore.projectId, taskBefore.agentId, taskBefore.id, {
+        phase: 'pr-merged-status-race',
+        status: taskBefore.status,
+        reason: 'pr-binding-unconfirmed',
+        boundPrNumber: taskBefore.prNumber,
+        ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+      });
+      return;
+    }
 
     const result = await manager.transitionTaskStatus(
-      event.taskId,
+      taskId,
       'merged',
-      { fromStatus: ['in_progress', 'fixing', 'review', 'approved', 'merge-ready', 'ready', 'max_rounds'] },
+      { fromStatus: ['merge-ready'], expectPrNumber: mergeExpectedPrNumber },
       prPatch,
     );
-    if (!result) return;
+    if (!result) {
+      const current = await manager.getTask(event.taskId);
+      if (current && (current.status === 'merged' || current.status === 'done')
+        && eventPrNumber !== undefined && current.prNumber === eventPrNumber) return;
+      if (current) {
+        await emitIntervention(bus, current.projectId, current.agentId, current.id, {
+          phase: 'pr-merged-status-race',
+          status: current.status,
+          ...(eventPrNumber !== undefined ? { prNumber: eventPrNumber } : {}),
+        });
+      }
+      return;
+    }
     const { task: transitioned } = result;
 
-    if (transitioned.qaAgentId) {
-      if (transitioned.prNumber && transitioned.branch) {
-        await manager.dispatchPostMergeCleanup(transitioned.qaAgentId, {
-          taskId: transitioned.id,
-          branch: transitioned.branch,
-        }).catch(err => console.warn(
-          `[EventHandler] pr.merged dispatchPostMergeCleanup(QA=${transitioned.qaAgentId}) failed:`,
+    const qaAgentId = requireTaskQaAgentId(transitioned, 'pr.merged');
+    if (transitioned.prNumber && transitioned.branch) {
+      await manager.dispatchPostMergeCleanup(qaAgentId, {
+        taskId: transitioned.id,
+        branch: transitioned.branch,
+      }).catch(err => console.warn(
+        `[EventHandler] pr.merged dispatchPostMergeCleanup(QA=${qaAgentId}) failed:`,
+        err,
+      ));
+    } else {
+      try {
+        await manager.releaseAgentForTask(qaAgentId, transitioned.id, 'idle');
+      } catch (err) {
+        console.error(
+          `[EventHandler] pr.merged releaseAgentForTask(QA=${qaAgentId}) failed:`,
           err,
-        ));
-      } else {
-        try {
-          await manager.releaseAgentForTask(transitioned.qaAgentId, transitioned.id, 'idle');
-        } catch (err) {
-          console.error(
-            `[EventHandler] pr.merged releaseAgentForTask(QA=${transitioned.qaAgentId}) failed:`,
-            err,
-          );
-        }
+        );
       }
     }
 
@@ -1347,7 +1469,6 @@ export function registerEventHandlers(
 
     const task = await manager.getTask(event.taskId);
     if (!task) return;
-    if (task.reviewMode === 'server') return;
     if (event.data.source === 'pane-signal') {
       console.log(
         `[EventHandler] review.submitted pane verdict ignored for task ${task.id} (comment-token protocol is the sole authority)`,
@@ -1391,13 +1512,6 @@ export function registerEventHandlers(
     if (expectedVerdictToken === undefined || gitPayload.verdictToken !== expectedVerdictToken
       || task.failToken === undefined) {
       await rejectGitPayload(new GitVerdictPayloadError('verdict token is not current'));
-      return;
-    }
-
-    if (isSpecStagePhase(task.phase)) {
-      console.warn(
-        `[EventHandler] review.submitted (action=${action}) ignored for task ${task.id}: task in spec phase`,
-      );
       return;
     }
 
@@ -1445,7 +1559,7 @@ export function registerEventHandlers(
   bus.on('pr.fix.submitted', async (event) => {
     if (!event.taskId || !event.agentId) return;
     const task = await manager.getTask(event.taskId);
-    if (!task || task.reviewMode === 'server' || task.status !== 'fixing' || isSpecStagePhase(task.phase)) return;
+    if (!task || task.status !== 'fixing') return;
     const { projectId, agentId } = task;
 
     const stayFixing = async (data: { phase: string; [key: string]: unknown }): Promise<void> => {

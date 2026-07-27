@@ -1,10 +1,8 @@
 export type AgentRuntime = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
-export type AgentRole = 'dev' | 'qa' | 'research';
+export type AgentRole = 'dev' | 'qa';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
-export type ReviewMode = 'git' | 'server';
-export type AfterDone = 'pr' | 'branch' | null;
 type SupportedLanguage = 'zh-CN' | 'en-US';
 
 export interface HostConfig {
@@ -47,13 +45,8 @@ export interface ProjectConfig {
   repo: string;
   merge: MergeStrategy;
   specApproval?: SpecApprovalStrategy;
-  review?: ProjectReviewConfig;
   gitCli?: GitCliConfig;
   agent: AgentConfig[][];
-}
-
-interface ProjectReviewConfig {
-  mode?: ReviewMode;
 }
 
 export interface GitCliConfig {
@@ -64,8 +57,6 @@ export interface GitCliConfig {
 
 interface ReviewConfig {
   rounds: number;
-  mode?: ReviewMode;
-  afterDone?: AfterDone;
 }
 
 export interface HttpsConfig {
@@ -120,18 +111,27 @@ export type TaskStatus =
   | 'spec-ready'
   | 'approved'
   | 'merge-ready'
-  | 'ready'
   | 'merged'
   | 'done'
   | 'max_rounds'
   | 'failed'
   | 'cancelled';
 
-export type TaskPhase = 'research' | 'spec' | 'code';
-export type ReviewPhase = 'spec' | 'code';
-
+export type TaskPhase = 'spec' | 'code';
 export function isSpecStagePhase(phase: TaskPhase | undefined): boolean {
-  return phase === 'research' || phase === 'spec';
+  return phase === 'spec';
+}
+
+export function taskReviewRound(
+  task: Pick<TaskState, 'phase' | 'reviewRound' | 'specReviewRound'>,
+): number {
+  return task.phase === 'spec' ? (task.specReviewRound ?? 0) : task.reviewRound;
+}
+
+export function effectiveTaskReviewRound(
+  task: Pick<TaskState, 'phase' | 'reviewRound' | 'reviewRoundPending' | 'specReviewRound'>,
+): number {
+  return Math.max(1, taskReviewRound(task) + (task.reviewRoundPending === true ? 1 : 0));
 }
 
 type AgentLifecycleStatus = 'ok' | 'awaiting_human';
@@ -190,45 +190,6 @@ export interface AgentSnapshot {
   petId?: string;
 }
 
-export type ServerSignalKind =
-  | 'code-done'
-  | 'code-reviewed'
-  | 'code-fixed'
-  | 'code-ready'
-  | 'spec-done'
-  | 'spec-reviewed'
-  | 'spec-fixed';
-
-export type ServerSignalRecoveryReason =
-  | 'response-missing'
-  | 'response-invalid'
-  | 'round-mismatch'
-  | 'token-mismatch'
-  | 'findings-digest-mismatch'
-  | 'coverage-gap'
-  | 'fix-no-dev-agent'
-  | 'fix-findings-missing'
-  | 'response-read-failed'
-  | 'verdict-store-failed'
-  | 'handler-failed';
-
-export interface ServerSignalRecovery {
-  mode: 'classify-response' | 'correct-response' | 'hold';
-  signalKind: ServerSignalKind;
-  phase: 'spec' | 'code';
-  round: number;
-  sourceToken: string;
-  findingsDigest?: string;
-  failureSignature?: string;
-  responseDigest?: string;
-  reason: ServerSignalRecoveryReason;
-  failurePhase?: string;
-  missingFindingIds?: string[];
-  unknownFindingIds?: string[];
-  schemaViolationCodes?: string[];
-  createdAt: string;
-}
-
 export type PetSpritesheetExt = 'png' | 'webp';
 
 export interface PetMeta {
@@ -268,6 +229,16 @@ export interface ReviewDispatchLease {
   updatedAt: string;
 }
 
+export type TaskOutboxEntry =
+  | { key: string; type: 'human.intervention'; data: Record<string, unknown> }
+  | {
+      key: string;
+      type: 'git.spec-verdict';
+      data: { prNumber: number; comments: string; writeAttemptedAt?: string };
+  };
+
+export type SpecVerdictOutboxEntry = Extract<TaskOutboxEntry, { type: 'git.spec-verdict' }>;
+
 export interface TaskState {
   id: string;
   projectId: string;
@@ -277,7 +248,6 @@ export interface TaskState {
   agentId: string;
   devAgentId: string;
   qaAgentId?: string;
-  researchAgentId?: string;
   prNumber?: number;
   prUrl?: string;
   branch?: string;
@@ -309,18 +279,10 @@ export interface TaskState {
   reviewRoundPending?: boolean;
   specReviewRound?: number;
   phase?: TaskPhase;
+  deliveryConfirmation?: { phase: TaskPhase; source: 'signal' | 'human'; at: string };
   images?: string[];
   signalToken?: string;
-  serverSignalRecovery?: ServerSignalRecovery;
-  reviewMode: ReviewMode;
-  batchIndex?: number;
-  batchTotal?: number;
-  // Persisted so recovery can re-arm read-file for a base fallback without
-  // re-enabling it for a head checkout, which would bypass the tree proof.
-  reviewCheckoutMode?: 'head' | 'base';
   maxRoundsContinues?: number;
-  afterDone?: AfterDone;
-  publishDispatchedAt?: string;
   // Deliberately cleared post-approve completion; a restart replay must not rebuild it while this stands.
   postApproveRevoked?: { generation: string; reason: 'request-changes' | 'redispatch-cap'; at: string };
   // Approved head persisted at post-approve dispatch; the only SHA a completion rebuild may trust.
@@ -339,7 +301,7 @@ export interface TaskState {
   closedUnmergedAnchor?: { prNumber: number; generation: number; cleared?: boolean };
   passProvenance?: { sourceKey: string; id: string; bodyDigest: string; token: string; failToken: string; anchorSha: string };
   consumedFeedback?: Record<string, number>;
-  outbox?: Array<{ key: string; type: 'human.intervention'; data: Record<string, unknown> }>;
+  outbox?: TaskOutboxEntry[];
   pendingRedispatch?: boolean;
   redispatchCount?: number;
   status: TaskStatus;
@@ -377,114 +339,6 @@ export function taskMatchesGeneration(task: TaskState, expected: TaskGenerationG
     && task.specReviewRound === expected.specReviewRound;
 }
 
-type FindingSeverity = 'critical' | 'major' | 'minor';
-
-export interface Finding {
-  id: string;
-  severity: FindingSeverity;
-  message: string;
-  file?: string;
-  line?: number;
-  location?: string;
-}
-
-export interface ReviewFindings {
-  round: number;
-  verdict: 'approve' | 'request-changes';
-  findings: Finding[];
-}
-
-type FindingAction = 'fix' | 'reject' | 'out-of-scope';
-
-interface FindingResponse {
-  findingId: string;
-  action: FindingAction;
-  rationale: string;
-  commitSha?: string;
-}
-
-export interface ReviewResponse {
-  round: number;
-  token?: string;
-  findingsDigest?: string;
-  responses: FindingResponse[];
-}
-
-export type ServerResponseFailureDisposition =
-  | 'auto-correct'
-  | 'hold-repeated-signature'
-  | 'hold-correction-limit';
-
-export interface ServerResponseFailure {
-  signalKind: Extract<ServerSignalKind, 'code-fixed' | 'spec-fixed'>;
-  sourceToken: string;
-  successorToken: string;
-  failureSignature: string;
-  responseDigest?: string;
-  rawResponse?: string;
-  reason: Extract<ServerSignalRecoveryReason,
-    | 'response-missing'
-    | 'response-invalid'
-    | 'round-mismatch'
-    | 'token-mismatch'
-    | 'findings-digest-mismatch'
-    | 'coverage-gap'>;
-  missingFindingIds: string[];
-  unknownFindingIds: string[];
-  schemaViolationCodes: string[];
-  disposition: ServerResponseFailureDisposition;
-  createdAt: string;
-}
-
-export interface ReviewContentFileRef {
-  path: string;
-  bytes: number;
-}
-
-export interface SpecDocument {
-  relPath: string;
-  content: string;
-}
-
-export function renderSpecDocuments(documents: readonly SpecDocument[]): string {
-  if (documents.length === 1) return documents[0]!.content;
-  return documents.map(document => `=== ${document.relPath} ===\n${document.content}`).join('\n');
-}
-
-interface SpecUserDecision {
-  verdict: 'approve' | 'request-changes' | 'archive';
-  comments?: string;
-  at: string;
-}
-
-interface ReviewRoundBase {
-  round: number;
-  content: string;
-  contentTruncated?: boolean;
-  diffstat?: string;
-  baseSha?: string;
-  headSha?: string;
-  headTree?: string;
-  findings?: ReviewFindings;
-  response?: ReviewResponse;
-  serverResponseFailures?: ServerResponseFailure[];
-  batchFindings?: ReviewFindings[];
-  userDecision?: SpecUserDecision;
-  startedAt: string;
-  completedAt?: string;
-}
-
-export interface SpecReviewRound extends ReviewRoundBase {
-  phase: 'spec';
-  documents: SpecDocument[];
-}
-
-export interface CodeReviewRound extends ReviewRoundBase {
-  phase: 'code';
-}
-
-export type ReviewRound = SpecReviewRound | CodeReviewRound;
-
 export type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';
 
 export type PrReviewVerdict = 'approve' | 'request-changes' | 'comment';
@@ -519,13 +373,7 @@ export type EventType =
   | 'pr.merged'
   | 'review.submitted'
   | 'review.max_rounds'
-  | 'server.spec.ready'
-  | 'server.spec.review.submitted'
-  | 'server.spec.fix.submitted'
-  | 'server.code.ready'
-  | 'server.code.review.submitted'
-  | 'server.code.fix.submitted'
-  | 'server.code.published'
+  | 'spec.ready'
   | 'pr.fix.submitted'
   | 'agent.bootstrap_failed'
   | 'agent.bootstrap_succeeded'

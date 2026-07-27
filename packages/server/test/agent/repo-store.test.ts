@@ -162,7 +162,7 @@ describe('RepoStore per-agent Workdir', () => {
     await expect(store.ensure()).resolves.toBe(await run(`cd ${shellQuote(path)} && pwd -P`));
   });
 
-  it('creates real directories for every baxian runtime path', async () => {
+  it('creates the baxian runtime directory', async () => {
     const path = join(tempDir, 'custom-runtime-dirs');
     await cloneAt(path);
     const store = new RepoStore(
@@ -172,14 +172,13 @@ describe('RepoStore per-agent Workdir', () => {
 
     await store.ensure();
 
-    for (const relative of ['.baxian', '.baxian/review', '.baxian/review/inbox', '.baxian/review-inbox']) {
-      const stat = await lstat(join(path, relative));
-      expect(stat.isDirectory()).toBe(true);
-      expect(stat.isSymbolicLink()).toBe(false);
-    }
+    const stat = await lstat(join(path, '.baxian'));
+    expect(stat.isDirectory()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
   });
 
-  it.each(['.baxian', '.baxian/review'])('rejects a symbolic-link runtime directory at %s', async (relative) => {
+  it('rejects a symbolic-link runtime directory', async () => {
+    const relative = '.baxian';
     const path = join(tempDir, `custom-symlink-${relative.replaceAll('/', '-')}`);
     const outside = join(tempDir, `outside-${relative.replaceAll('/', '-')}`);
     await cloneAt(path);
@@ -1024,17 +1023,17 @@ describe('moveFileIntoPlace (real filesystem)', () => {
 
   it('refuses when the guard root itself is a symlink — external files stay intact', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    await run(`mkdir -p ${shellQuote(`${dir}/outside/.baxian/research`)}`);
-    await write(`${dir}/outside/.baxian/research/evidence`, 'precious');
+    await run(`mkdir -p ${shellQuote(`${dir}/outside/.baxian/review`)}`);
+    await write(`${dir}/outside/.baxian/review/evidence`, 'precious');
     const rootLink = `${dir}/work`;
     await symlink(`${dir}/outside`, rootLink);
     await write(`${dir}/tmp6`, 'payload');
 
     await expect(
-      moveFileIntoPlace(local, `${dir}/tmp6`, `${rootLink}/.baxian/research/evidence`, { guardRoot: rootLink }),
+      moveFileIntoPlace(local, `${dir}/tmp6`, `${rootLink}/.baxian/review/evidence`, { guardRoot: rootLink }),
     ).rejects.toThrow(/atomic replace/);
 
-    expect(await run(`cat ${shellQuote(`${dir}/outside/.baxian/research/evidence`)}`)).toBe('precious');
+    expect(await run(`cat ${shellQuote(`${dir}/outside/.baxian/review/evidence`)}`)).toBe('precious');
   });
 
   it('never sweeps a nested tmp through a symlinked final — foreign same-name files survive', async () => {

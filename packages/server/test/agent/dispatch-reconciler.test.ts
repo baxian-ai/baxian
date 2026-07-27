@@ -87,7 +87,7 @@ function mkReconciler(over: { busyWaitBudgetMs?: number; maxAttempts?: number } 
 }
 
 async function seedTask(over: Partial<TaskState> = {}): Promise<TaskState> {
-  const t: TaskState = {
+  const t = {
     id: 'task-1',
     projectId: 'proj',
     title: 'T',
@@ -99,8 +99,11 @@ async function seedTask(over: Partial<TaskState> = {}): Promise<TaskState> {
     branch: 'bx/task-1',
     prNumber: 7,
     status: 'review',
+    phase: 'code',
     reviewRound: 2,
-    reviewMode: 'git',
+    deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+    replyActorId: '77',
+    replyActorStatus: 'verified',
     signalToken: 'tok-current1',
     reviewHeadAnchorSha: SHA,
     latestHeadSha: SHA,
@@ -110,6 +113,10 @@ async function seedTask(over: Partial<TaskState> = {}): Promise<TaskState> {
     updatedAt: NOW,
     ...over,
   } as TaskState;
+  if (t.phase === undefined) delete t.deliveryConfirmation;
+  else if (!Object.hasOwn(over, 'deliveryConfirmation')) {
+    t.deliveryConfirmation = { phase: t.phase, source: 'signal', at: NOW };
+  }
   await taskStore.set(t);
   return t;
 }
@@ -145,6 +152,19 @@ function audits(): BaxianEvent[] {
 }
 
 describe('DispatchReconciler review 侧补派', () => {
+  it('review 任务缺少 QA 时明确报告不变量破坏', async () => {
+    const task = await seedTask();
+    vi.spyOn(taskStore, 'list').mockResolvedValue([{ ...task, qaAgentId: undefined }]);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await mkReconciler().pollOnce();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      `[dispatch-reconciler] task ${task.id} reconcile failed:`,
+      expect.objectContaining({ message: `review task ${task.id} has no QA participant` }),
+    );
+  });
+
   it('pending qa-recheck + 探测非忙 → 按当前 pass 令牌补派（bumpRound:false）并留审计', async () => {
     const t = await seedTask();
     await seedQa();
@@ -158,7 +178,7 @@ describe('DispatchReconciler review 侧补派', () => {
     expect(dispatchSpy).toHaveBeenCalledWith(t.id, {
       bumpRound: false,
       fromStatus: ['review'],
-      expectPhase: undefined,
+      expectPhase: 'code',
       expectSignalToken: 'tok-current1',
       expectedTask: {
         status: t.status,
@@ -342,18 +362,21 @@ describe('DispatchReconciler review 侧补派', () => {
     expect(alerts[0].data).toMatchObject({ phase: 'dispatch-reconcile-attempts-exhausted' });
   });
 
-  it('server 评审模式与 spec 阶段任务不在对账范围', async () => {
-    await seedTask({ id: 'task-srv', reviewMode: 'server' });
-    await seedTask({ id: 'task-spec', phase: 'spec' });
-    await seedQa({ taskId: 'task-srv' });
+  it('spec 阶段复用同一对账入口', async () => {
+    await seedTask({ id: 'task-spec', phase: 'spec', specReviewRound: 0 });
+    await seedQa({ taskId: 'task-spec' });
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
-    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa');
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
+      .mockImplementation(async (taskId) => (await taskStore.get(taskId))!);
 
     const rec = mkReconciler();
     await rec.pollOnce();
     await rec.pollOnce();
 
-    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(dispatchSpy).toHaveBeenCalledWith('task-spec', expect.objectContaining({
+      expectPhase: 'spec',
+      expectedTask: expect.objectContaining({ specReviewRound: 0 }),
+    }));
   });
 });
 
@@ -651,8 +674,8 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('CX1：git 模式 fixing 任务的 dev-fix pending 不被清掉且由对账补投', async () => {
-    const t = await seedTask({ status: 'fixing', reviewMode: 'git' });
+  it('CX1：fixing 任务的 dev-fix pending 不被清掉且由对账补投', async () => {
+    const t = await seedTask({ status: 'fixing' });
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, workdir: '/tmp/repo',
       paneId: '%1', startedAt: NOW, updatedAt: NOW,
@@ -668,8 +691,8 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     }));
   });
 
-  it('git 模式 busy pending 由对账的观测门消费（sweep 让位），hold/绑定丢失仍归 git 机制（R21/CX-3.2）', async () => {
-    const t = await seedTask({ reviewMode: 'git' });
+  it('busy pending 由对账的观测门消费（sweep 让位），hold/绑定丢失仍归平台机制（R21/CX-3.2）', async () => {
+    const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs();
@@ -680,7 +703,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
 
     dispatchSpy.mockClear();
-    const t2 = await seedTask({ id: 'task-git-hold', reviewMode: 'git' });
+    const t2 = await seedTask({ id: 'task-git-hold' });
     await agentStore.set({
       id: 'qa-1', projectId: 'proj', taskId: t2.id, workdir: '/tmp/repo-qa', paneId: '%0',
       status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed', awaitingSince: NOW,
@@ -890,8 +913,8 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
 });
 
 describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
-  it('R29：git 模式 pending + anchor 缺失 → 不经 gh 刷新（平台 driver 在补派内重新锚定）', async () => {
-    const t = await seedTask({ reviewMode: 'git', reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
+  it('R29：pending + anchor 缺失 → 不经 gh 刷新（平台 driver 在补派内重新锚定）', async () => {
+    const t = await seedTask({ reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs();
@@ -903,8 +926,8 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('R30：git 模式 QA 绑定丢失（durable pending 已清、sweep 无凭据）→ 驻留两周期后由对账补派', async () => {
-    const t = await seedTask({ reviewMode: 'git' });
+  it('R30：QA 绑定丢失（durable pending 已清、sweep 无凭据）→ 驻留两周期后由对账补派', async () => {
+    const t = await seedTask();
     await seedQa({ taskId: undefined });
     obs();
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
@@ -917,8 +940,8 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('R30：git 模式送达后静默失联（PENDING_IDLE 无 verdict）→ 无登记兜底补派', async () => {
-    const t = await seedTask({ reviewMode: 'git' });
+  it('R30：送达后静默失联（PENDING_IDLE 无 verdict）→ 无登记兜底补派', async () => {
+    const t = await seedTask();
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa')
@@ -930,7 +953,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
   });
 
   it('CX-5.1：git pending 登记 + QA 解绑 → 不再双让位（对账驻留后补派并消费登记）', async () => {
-    const t = await seedTask({ reviewMode: 'git' });
+    const t = await seedTask();
     await seedQa({ taskId: undefined });
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     obs();

@@ -32,6 +32,13 @@ const DEV: AgentConfig = {
   mode: 'local',
   workdir: '/tmp/dev-1',
 };
+const QA: AgentConfig = {
+  id: 'qa-1',
+  role: 'qa',
+  runtime: 'codex',
+  mode: 'local',
+  workdir: '/tmp/qa-1',
+};
 
 class FakeRootRuntime implements RootAgentRuntimePort {
   readonly requests = new Map<string, string>();
@@ -124,10 +131,10 @@ beforeEach(async () => {
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     reviewRound: 1,
     phase: 'code',
     signalToken: 'abcdef123456',
-    reviewMode: 'git',
     status: 'in_progress',
     createdAt: AT,
     updatedAt: AT,
@@ -150,10 +157,10 @@ afterEach(async () => {
 
 function config(): BaxianConfig {
   return {
-    review: { rounds: 10, mode: 'github' },
+    review: { rounds: 10 },
     server: { ...DEFAULT_SERVER_CONFIG, token: SERVER_TOKEN },
     host: [{ id: 'configured-host', hostname: 'host.example.test', password: HOST_PASSWORD }],
-    project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[DEV]] }],
+    project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[DEV, QA]] }],
   };
 }
 
@@ -183,7 +190,7 @@ function createCoordinator(options: {
     runtime,
     store: recoveryStore,
     capturePane: options.capturePane ?? (async () =>
-      'working\ntoken: abcdef123456\nlock-must-not-leak\n[bx:code-done:abcdef123456]'),
+      'working\ntoken: abcdef123456\nlock-must-not-leak\n[bx:pr-created:7:Nzc:abcdef123456]'),
     now: () => now,
     pollIntervalMs: 60_000,
   });
@@ -274,7 +281,7 @@ describe('RootRecoveryCoordinator', () => {
     expect(request).not.toContain('password-must-not-leak');
     expect(request).not.toContain('nonce-must-not-leak');
     expect(request).not.toContain('abcdef123456');
-    expect(request).not.toContain('[bx:code-done:');
+    expect(request).not.toContain('[bx:pr-created:');
 
     runtime.responses.set(record.id, responseFor(record));
     await coordinator!.pollOnce();
@@ -435,6 +442,137 @@ describe('RootRecoveryCoordinator', () => {
     const request = runtime.requests.get(record.id)!;
     expect(request).not.toContain(SERVER_TOKEN);
     expect(request).not.toContain(HOST_PASSWORD);
+  });
+
+  // Structured fields are not a terminal stream: parsing them with the VT state machine let a
+  // single unterminated OSC swallow the rest of the operator's evidence.
+  it('keeps context after an unterminated control string while still stripping complete ones', async () => {
+    await createCoordinator({
+      capturePane: async () => 'pane ok',
+    }).start();
+    await eventBus.emit({
+      id: 'evt-unterminated-osc',
+      type: 'task.updated',
+      timestamp: AT,
+      projectId: 'proj',
+      taskId: task.id,
+      data: {
+        message: `crash tail: \x1b]0;${'T'.repeat(4000)}\x07 LONG-OSC-STRIPPED `
+          + `\x1b[${'1'.repeat(600)}m LONG-CSI-STRIPPED `
+          + '\x1b]0;never-closed EVIDENCE-AFTER-OSC and \x1b[31mcoloured\x1b[0m text',
+      },
+    });
+
+    const record = await emitIntervention();
+    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    const request = runtime.requests.get(record.id)!;
+    expect(request).toContain('LONG-OSC-STRIPPED');
+    expect(request).not.toContain('TTTTTTTTTT'); // a long but properly terminated OSC is still stripped
+    expect(request).toContain('LONG-CSI-STRIPPED');
+    expect(request).not.toContain('1111111111'); // and so is a long but properly terminated CSI
+    expect(request).toContain('EVIDENCE-AFTER-OSC');
+    expect(request).toContain('coloured');
+    expect(request).not.toContain('\x1b');
+    expect(request).not.toContain('[31m');
+  });
+
+  // A value that is mostly control bytes normalises down to a common fragment; replacing that
+  // globally rewrites the diagnostics themselves, and the second pass then eats its own markers.
+  it('does not globally replace a credential that normalises below the threshold', async () => {
+    const mostlyControl = `e${'\x07'.repeat(7)}`;
+    await createCoordinator({
+      baxianConfig: {
+        ...config(),
+        server: { ...DEFAULT_SERVER_CONFIG, token: mostlyControl },
+        host: [{ id: 'configured-host', hostname: 'host.example.test', password: HOST_PASSWORD }],
+      },
+      capturePane: async () => 'ensureWorkdir failed: git fetch timed out',
+    }).start();
+
+    const record = await emitIntervention();
+    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    const pane = runtime.requests.get(record.id)!;
+    expect(pane).toContain('ensureWorkdir failed: git fetch timed out');
+    expect(pane).not.toContain('[r[redacted]');
+  });
+
+  // A later OSC's terminator must not close an earlier unterminated one: pairing across the
+  // gap deletes exactly the evidence the operator needs.
+  it('keeps the evidence between an unterminated OSC and a later complete one', async () => {
+    await createCoordinator({ capturePane: async () => 'pane ok' }).start();
+    await eventBus.emit({
+      id: 'evt-nested-osc',
+      type: 'task.updated',
+      timestamp: AT,
+      projectId: 'proj',
+      taskId: task.id,
+      data: { message: '\x1b]broken KEEP-THIS-EVIDENCE \x1b]0;window-title\x07 TAIL-EVIDENCE' },
+    });
+
+    const record = await emitIntervention();
+    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    const request = runtime.requests.get(record.id)!;
+    expect(request).toContain('KEEP-THIS-EVIDENCE');
+    expect(request).toContain('TAIL-EVIDENCE');
+    expect(request).not.toContain('window-title'); // the complete one is still stripped
+  });
+
+  // Redaction runs before the 12 KiB truncation, so an unbounded pane reaches it whole. Rescanning
+  // the tail from every unterminated OSC start is quadratic and blocks the event loop for seconds.
+  it('stays linear when the pane is full of unterminated OSC starts', async () => {
+    await createCoordinator({
+      capturePane: async () => 'PANE-EVIDENCE-SURVIVES ' + '\x1b]x'.repeat(40_000),
+    }).start();
+
+    const started = Date.now();
+    const record = await emitIntervention();
+    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    const elapsed = Date.now() - started;
+    expect(runtime.requests.get(record.id)!).toContain('PANE-EVIDENCE-SURVIVES');
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  // Stripping first rewrites the credential, and the exact-match pass then walks straight past it.
+  it('redacts a credential that carries control bytes, and one an escape interrupts', async () => {
+    const withControl = 'abcd\x07efgh-token-must-not-leak';
+    const interrupted = 'configured-password-must-not-leak';
+    await createCoordinator({
+      baxianConfig: {
+        ...config(),
+        server: { ...DEFAULT_SERVER_CONFIG, token: withControl },
+        host: [{ id: 'configured-host', hostname: 'host.example.test', password: interrupted }],
+      },
+      capturePane: async () =>
+        `pane echoed ${withControl} and ${interrupted.slice(0, 6)}\x1b[0m${interrupted.slice(6)}`
+        + ` and ${withControl.slice(0, 5)}\x1b[31m${withControl.slice(5)}`,
+    }).start();
+
+    const record = await emitIntervention();
+    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    const request = runtime.requests.get(record.id)!;
+    expect(request).not.toContain(withControl);
+    // Both halves rewritten at once: the raw secret misses because of the SGR, the stripped
+    // context misses because the secret still carries the BEL.
+    expect(request).not.toContain('abcdefgh-token-must-not-leak');
+    expect(request).not.toContain(interrupted);
+  });
+
+  // A complete sequence the stripper fails to match leaves its params behind as ordinary text,
+  // and those digits eat the 512-byte context-error quota the real failure needs.
+  it('keeps the reason of a context error that an over-long complete CSI precedes', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await createCoordinator({
+      capturePane: async () => {
+        throw new Error(`\x1b[${'1'.repeat(600)}mensureWorkdir failed: git fetch timed out`);
+      },
+    }).start();
+
+    const record = await emitIntervention();
+    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    const request = runtime.requests.get(record.id)!;
+    expect(request).toContain('git fetch timed out');
+    expect(request).not.toContain('1111111111');
+    warn.mockRestore();
   });
 
   it('redacts short credentials only in labeled context without corrupting ordinary diagnostics', async () => {
@@ -803,9 +941,9 @@ describe('RootRecoveryCoordinator', () => {
 
   it.each([
     'post-approve-merge-skipped-provenance',
-    'server-code-published-head-capture-failed',
-    'server-code-published-missing-pr-number',
-    'server-code-published-round-mismatch',
+    'platform-binding-mismatch',
+    'post-approve-recovery-incomplete-episode',
+    'phase-signal-setup-during-recovery',
     'dispatch-failed:ack_unknown',
     'dispatch-reconcile-attempts-exhausted',
     'code-dispatch-failed',
@@ -821,7 +959,12 @@ describe('RootRecoveryCoordinator', () => {
       awaitingNonce: `hold-${phase}`,
     });
     const record = await emitIntervention(phase);
-    await vi.waitFor(() => expect(runtime.requests.has(record.id)).toBe(true));
+    // The fake mailbox is written before markDispatched settles; waiting on it alone lets the
+    // pollOnce() below land in the window where the record is not yet durably inflight.
+    await vi.waitFor(async () => {
+      expect(runtime.requests.has(record.id)).toBe(true);
+      expect((await recoveryStore.get(record.id))?.status).toBe('inflight');
+    });
     const request = JSON.parse(runtime.requests.get(record.id)!) as {
       allowedDecisions: Array<{ action: string }>;
     };

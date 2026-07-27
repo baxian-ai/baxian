@@ -20,8 +20,8 @@ function makeTask(id: string, overrides: Partial<TaskState> = {}): TaskState {
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     reviewRound: 0,
-    reviewMode: 'git',
     status: 'pending',
     createdAt: NOW,
     updatedAt: NOW,
@@ -42,8 +42,8 @@ async function writeUnsanitizedTask(id: string, overrides: Record<string, unknow
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     reviewRound: 0,
-    reviewMode: 'git',
     status: 'pending',
     createdAt: NOW,
     updatedAt: NOW,
@@ -86,48 +86,27 @@ describe('TaskStore', () => {
     expect(loaded?.images).toEqual(['a.png', 'b.webp']);
   });
 
-  it('preserves server review mode fields across persistence round-trip', async () => {
-    const task = makeTask('task-srv', {
+  it('strips retired task fields instead of migrating them', async () => {
+    const task = {
+      ...makeTask('task-retired-fields'),
       reviewMode: 'server',
+      afterDone: 'pr',
       reviewCheckoutMode: 'base',
+      reviewWorktreeMode: 'head',
       batchIndex: 1,
       batchTotal: 3,
       maxRoundsContinues: 2,
-    });
+      serverSignalRecovery: { signalKind: 'code-done' },
+    } as TaskState & Record<string, unknown>;
     await store.set(task);
-    const loaded = await store.get('task-srv');
-    expect(loaded?.reviewMode).toBe('server');
-    expect(loaded?.reviewCheckoutMode).toBe('base');
-    expect(loaded?.batchIndex).toBe(1);
-    expect(loaded?.batchTotal).toBe(3);
+    const loaded = await store.get(task.id);
+    for (const field of [
+      'reviewMode', 'afterDone', 'reviewCheckoutMode', 'reviewWorktreeMode',
+      'batchIndex', 'batchTotal', 'serverSignalRecovery',
+    ]) {
+      expect(loaded).not.toHaveProperty(field);
+    }
     expect(loaded?.maxRoundsContinues).toBe(2);
-  });
-
-  it('round-trips a generation-fenced server signal recovery intent', async () => {
-    const task = makeTask('task-recovery', {
-      phase: 'code',
-      status: 'fixing',
-      reviewRound: 2,
-      signalToken: '222222222222',
-      serverSignalRecovery: {
-        mode: 'correct-response',
-        signalKind: 'code-fixed',
-        phase: 'code',
-        round: 2,
-        sourceToken: '111111111111',
-        findingsDigest: 'a'.repeat(64),
-        failureSignature: 'b'.repeat(64),
-        responseDigest: 'c'.repeat(64),
-        reason: 'coverage-gap',
-        missingFindingIds: ['f-1'],
-        unknownFindingIds: ['old-1'],
-        schemaViolationCodes: [],
-        createdAt: NOW,
-      },
-    });
-
-    await store.set(task);
-    expect(await store.get(task.id)).toEqual(task);
   });
 
   it('returns null for nonexistent task', async () => {
@@ -220,98 +199,6 @@ describe('TaskStore', () => {
 });
 
 describe('TaskStore sanitize', () => {
-  it.each([
-    ['source token is not superseded', {
-      signalToken: '111111111111',
-    }],
-    ['task round drifted', {
-      reviewRound: 3,
-    }],
-    ['task phase drifted', {
-      phase: 'spec', specReviewRound: 2,
-    }],
-    ['failure ids are not sorted', {
-      missingFindingIds: ['f-2', 'f-1'],
-    }],
-    ['response recovery has no digest', {
-      findingsDigest: undefined,
-    }],
-  ])('rejects malformed server recovery intent when %s', async (_label, mutation) => {
-    const recovery = {
-      mode: 'classify-response',
-      signalKind: 'code-fixed',
-      phase: 'code',
-      round: 2,
-      sourceToken: '111111111111',
-      findingsDigest: 'a'.repeat(64),
-      failureSignature: 'b'.repeat(64),
-      responseDigest: 'c'.repeat(64),
-      reason: 'coverage-gap',
-      missingFindingIds: ['f-1'],
-      unknownFindingIds: [],
-      schemaViolationCodes: [],
-      createdAt: NOW,
-      ...(Object.hasOwn(mutation, 'missingFindingIds') ? mutation : {}),
-      ...(Object.hasOwn(mutation, 'findingsDigest') ? mutation : {}),
-    };
-    await writeUnsanitizedTask(`task-bad-recovery-${_label.length}`, {
-      phase: 'code',
-      status: 'fixing',
-      reviewRound: 2,
-      signalToken: '222222222222',
-      serverSignalRecovery: recovery,
-      ...(!Object.hasOwn(mutation, 'missingFindingIds') && !Object.hasOwn(mutation, 'findingsDigest')
-        ? mutation
-        : {}),
-    });
-    await expect(store.get(`task-bad-recovery-${_label.length}`)).rejects.toThrow(/serverSignalRecovery/);
-  });
-
-  it('accepts code recovery for a legacy direct task whose phase is undefined', async () => {
-    await writeUnsanitizedTask('task-direct-recovery', {
-      phase: undefined,
-      status: 'in_progress',
-      reviewRound: 0,
-      signalToken: '222222222222',
-      serverSignalRecovery: {
-        mode: 'hold',
-        signalKind: 'code-done',
-        phase: 'code',
-        round: 0,
-        sourceToken: '111111111111',
-        reason: 'handler-failed',
-        failurePhase: 'server-code-content-read-failed',
-        createdAt: NOW,
-      },
-    });
-    const loaded = await store.get('task-direct-recovery');
-    expect(loaded?.phase).toBeUndefined();
-    expect(loaded?.serverSignalRecovery).toMatchObject({ phase: 'code', round: 0 });
-  });
-
-  it('accepts spec-entry recovery before a legacy task has materialized its phase and round', async () => {
-    await writeUnsanitizedTask('task-direct-spec-recovery', {
-      phase: undefined,
-      status: 'in_progress',
-      reviewRound: 0,
-      specReviewRound: undefined,
-      signalToken: '222222222222',
-      serverSignalRecovery: {
-        mode: 'hold',
-        signalKind: 'spec-done',
-        phase: 'spec',
-        round: 0,
-        sourceToken: '111111111111',
-        reason: 'handler-failed',
-        failurePhase: 'server-spec-content-read-failed',
-        createdAt: NOW,
-      },
-    });
-    const loaded = await store.get('task-direct-spec-recovery');
-    expect(loaded?.phase).toBeUndefined();
-    expect(loaded?.serverSignalRecovery).toMatchObject({ phase: 'spec', round: 0 });
-  });
-
   it('reviewRoundPending 持久化并校验类型：boolean 通过、字符串 "true" 抛错（#563 R24）', async () => {
     await store.set({ ...makeTask('task-rrp'), reviewRoundPending: true });
     const loaded = await store.get('task-rrp');
@@ -406,30 +293,6 @@ describe('TaskStore sanitize', () => {
     expect(loaded!).not.toHaveProperty('specMarkerToken');
   });
 
-  it('maps the legacy reviewWorktreeMode field to reviewCheckoutMode on read', async () => {
-    await writeUnsanitizedTask('task-review-checkout', {
-      title: 'legacy review checkout',
-      reviewWorktreeMode: 'base',
-    });
-
-    const loaded = await store.get('task-review-checkout');
-
-    expect(loaded?.reviewCheckoutMode).toBe('base');
-    expect(loaded).not.toHaveProperty('reviewWorktreeMode');
-  });
-
-  it('keeps an explicit reviewCheckoutMode over the legacy reviewWorktreeMode field', async () => {
-    await writeUnsanitizedTask('task-review-checkout-both', {
-      title: 'both checkout fields',
-      reviewCheckoutMode: 'head',
-      reviewWorktreeMode: 'base',
-    });
-
-    const loaded = await store.get('task-review-checkout-both');
-
-    expect(loaded?.reviewCheckoutMode).toBe('head');
-  });
-
   it('keeps signalToken when both signalToken and specMarkerToken are on disk', async () => {
     await writeUnsanitizedTask('task-smt2', {
       title: 'dormant pre-rename task',
@@ -503,13 +366,33 @@ describe('TaskStore sanitize', () => {
 
   it.each([
     ['unknown phase', { phase: 'analysis' }, 'phase'],
+    ['research phase', { phase: 'research' }, 'phase'],
     ['missing devAgentId', { devAgentId: undefined }, 'devAgentId'],
     ['duplicate participants', { qaAgentId: 'dev-1' }, 'participants'],
+    ['assigned Dev without QA', { qaAgentId: undefined }, 'participants'],
+    ['unassigned Dev with QA', { agentId: '', devAgentId: '' }, 'participants'],
     ['non-participant agentId', { agentId: 'qa-1' }, 'agentId'],
-    ['research phase without Research', { phase: 'research', researchAgentId: undefined }, 'researchAgentId'],
   ])('rejects strict task schema violation: %s', async (_case, overrides, field) => {
     await writeUnsanitizedTask(`task-strict-${field}`, overrides);
     await expect(store.get(`task-strict-${field}`)).rejects.toThrow(field);
+  });
+
+  it('accepts an unassigned task only when both participant slots are empty', async () => {
+    await writeUnsanitizedTask('task-unassigned', {
+      preferredAgentId: '',
+      agentId: '',
+      devAgentId: '',
+      qaAgentId: undefined,
+      status: 'pending',
+    });
+
+    await expect(store.get('task-unassigned')).resolves.toMatchObject({
+      preferredAgentId: '',
+      agentId: '',
+      devAgentId: '',
+      status: 'pending',
+    });
+    expect((await store.get('task-unassigned'))?.qaAgentId).toBeUndefined();
   });
 
   it('accepts an unphased Dev task as the initial Dev-SDD state', async () => {
@@ -526,38 +409,6 @@ describe('TaskStore sanitize', () => {
       status: 'in_progress',
     });
     expect((await store.get('task-dev-sdd'))?.phase).toBeUndefined();
-  });
-
-  it('rejects an unphased task that records a Research participant', async () => {
-    await writeUnsanitizedTask('task-research-no-phase', {
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      researchAgentId: 'research-1',
-      phase: undefined,
-      status: 'in_progress',
-    });
-
-    await expect(store.get('task-research-no-phase')).rejects.toThrow('phase');
-  });
-
-  it('accepts a Research task with distinct stable participants', async () => {
-    await writeUnsanitizedTask('task-research', {
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-      status: 'in_progress',
-    });
-
-    await expect(store.get('task-research')).resolves.toMatchObject({
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-    });
   });
 
   it('preserves all schema fields on set for a fresh task', async () => {
@@ -579,7 +430,6 @@ describe('TaskStore sanitize', () => {
       prFeedbackReceivedAt: '2026-04-28T10:02:00Z',
       fixDispatchedAt: '2026-04-28T10:03:00Z',
       reviewRound: 1,
-      reviewMode: 'git',
       phase: 'code',
       status: 'in_progress',
       createdAt: NOW,
@@ -593,7 +443,6 @@ describe('TaskStore sanitize', () => {
 
 describe('TaskStore git review fields', () => {
   const gitFields: Partial<TaskState> = {
-    reviewMode: 'git',
     passToken: 'abcdef123456',
     failToken: '123456abcdef',
     baseBranch: 'main',
@@ -615,50 +464,22 @@ describe('TaskStore git review fields', () => {
     expect(loaded).toMatchObject(gitFields);
   });
 
-  it("fails loud on an unsupported 'github' reviewMode", async () => {
-    await writeUnsanitizedTask('task-invalid-mode', { reviewMode: 'github' });
-    await expect(store.get('task-invalid-mode')).rejects.toThrow(/reviewMode/);
-  });
-
-  it("list() propagates an unsupported 'github' reviewMode", async () => {
-    await writeUnsanitizedTask('task-invalid-mode-list', { reviewMode: 'github' });
-    await expect(store.list()).rejects.toThrow(/reviewMode/);
-  });
-
-  it('fails loud when reviewMode is missing', async () => {
-    await writeUnsanitizedTask('task-missing-mode', { reviewMode: undefined });
-    await expect(store.get('task-missing-mode')).rejects.toThrow(/reviewMode/);
-  });
-
-  it('round-trips a server PR task with its immutable platform binding', async () => {
-    const task = makeTask('task-server-pr', {
-      reviewMode: 'server',
-      afterDone: 'pr',
-      platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
+  it('round-trips a task with its immutable platform binding', async () => {
+    const task = makeTask('task-platform-bound', {
+      platformBinding: { mode: 'git', repoKey: 'github.com/owner/repo', tool: 'gh' },
     });
     await store.set(task);
     expect(await store.get(task.id)).toEqual(task);
   });
 
-  it('rejects afterDone pr without a platform binding instead of accepting a live-config backfill', async () => {
-    await writeUnsanitizedTask('task-server-pr-unbound', {
-      reviewMode: 'server',
-      afterDone: 'pr',
-    });
-    await expect(store.get('task-server-pr-unbound')).rejects.toThrow(/platformBinding/);
-    await expect(store.set(makeTask('task-server-pr-set', {
-      reviewMode: 'server',
-      afterDone: 'pr',
-    }))).rejects.toThrow(/platformBinding/);
-  });
-
-  it('list() propagates a missing reviewMode', async () => {
-    await writeUnsanitizedTask('task-missing-mode-list', { reviewMode: undefined });
-    await expect(store.list()).rejects.toThrow(/reviewMode/);
+  it("rejects the retired 'ready' status on get and list", async () => {
+    await writeUnsanitizedTask('task-ready', { status: 'ready' });
+    await expect(store.get('task-ready')).rejects.toThrow(/status/);
+    await expect(store.listStrict()).rejects.toThrow(/status/);
   });
 
   it('list() still skips a genuinely corrupt file rather than failing the whole store', async () => {
-    await writeUnsanitizedTask('task-ok', { reviewMode: 'git' });
+    await writeUnsanitizedTask('task-ok');
     await writeFile(join(tasksDir, 'task-corrupt.json'), '{ not json', 'utf-8');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const loaded = await store.list();
@@ -668,7 +489,7 @@ describe('TaskStore git review fields', () => {
   });
 
   it('listStrict() returns valid tasks but fails closed when any task file is corrupt', async () => {
-    await writeUnsanitizedTask('task-ok', { reviewMode: 'git' });
+    await writeUnsanitizedTask('task-ok');
     expect((await store.listStrict()).map(task => task.id)).toEqual(['task-ok']);
 
     await writeFile(join(tasksDir, 'task-corrupt.json'), '{ not json', 'utf-8');
@@ -683,15 +504,15 @@ describe('TaskStore git review fields', () => {
     });
 
     await rm(join(tasksDir, 'task-broken-json.json'));
-    await writeUnsanitizedTask('task-broken-schema', { reviewMode: 'github' });
+    await writeUnsanitizedTask('task-broken-schema', { status: 'ready' });
     await expect(store.listStrict()).rejects.toSatisfy((error: unknown) =>
       error instanceof TaskSchemaError
       && error.message.includes('task-broken-schema.json')
-      && error.message.includes('reviewMode'));
+      && error.message.includes('status'));
   });
 
   it('listStrict() skips an entry that disappears after the directory scan', async () => {
-    await writeUnsanitizedTask('task-ok', { reviewMode: 'git' });
+    await writeUnsanitizedTask('task-ok');
     await symlink(join(tasksDir, 'already-gone.json'), join(tasksDir, 'vanished.json'));
 
     await expect(store.listStrict()).resolves.toEqual([
@@ -705,15 +526,8 @@ describe('TaskStore git review fields', () => {
     await expect(missingStore.list()).resolves.toEqual([]);
   });
 
-  it('accepts reviewMode git on load', async () => {
-    await writeUnsanitizedTask('task-401', { reviewMode: 'git' });
-    const loaded = await store.get('task-401');
-    expect(loaded?.reviewMode).toBe('git');
-  });
-
   it('round-trips a complete active post-approve episode', async () => {
     const episode: Partial<TaskState> = {
-      reviewMode: 'git',
       status: 'approved',
       postApproveGeneration: 'feedfeedfeed',
       postApproveHeadSha: 'a'.repeat(40),
@@ -726,24 +540,8 @@ describe('TaskStore git review fields', () => {
     expect(await store.get('task-episode')).toMatchObject(episode);
   });
 
-  it('rejects post-approve state on a server review task', async () => {
-    await writeUnsanitizedTask('task-server-episode', {
-      reviewMode: 'server',
-      status: 'approved',
-      postApproveGeneration: 'feedfeedfeed',
-      postApproveHeadSha: 'a'.repeat(40),
-      postApproveToken: 'abcdef123456',
-      postApprovePhase: 'installed',
-      pendingRedispatch: true,
-      redispatchCount: 0,
-    });
-
-    await expect(store.get('task-server-episode')).rejects.toThrow('postApproveGeneration');
-  });
-
-  it('rejects generationless legacy approved episodes', async () => {
+  it('rejects generationless approved episodes', async () => {
     await writeUnsanitizedTask('task-legacy-active-episode', {
-      reviewMode: 'git',
       status: 'approved',
       postApproveHeadSha: 'a'.repeat(40),
       postApproveToken: 'abcdef123456',
@@ -751,7 +549,6 @@ describe('TaskStore git review fields', () => {
       pendingRedispatch: true,
     });
     await writeUnsanitizedTask('task-legacy-revoked-episode', {
-      reviewMode: 'git',
       status: 'approved',
       postApproveHeadSha: 'a'.repeat(40),
       postApproveRevoked: { reason: 'request-changes', at: NOW },
@@ -763,7 +560,6 @@ describe('TaskStore git review fields', () => {
 
   it('rejects post-approve effects outside approved even with a complete episode', async () => {
     await writeUnsanitizedTask('task-effects-outside-approved', {
-      reviewMode: 'git',
       status: 'max_rounds',
       postApproveGeneration: 'feedfeedfeed',
       postApproveHeadSha: 'a'.repeat(40),
@@ -787,14 +583,14 @@ describe('TaskStore git review fields', () => {
       updatedAt: NOW,
     };
     await store.set(makeTask('task-remote', {
-      reviewMode: 'git', status: 'cancelled', remoteCleanup,
+      status: 'cancelled', remoteCleanup,
     }));
     expect((await store.get('task-remote'))?.remoteCleanup).toEqual(remoteCleanup);
   });
 
   it('rejects remote cleanup intents with an invalid stage contract', async () => {
     await writeUnsanitizedTask('task-remote-delete-incomplete', {
-      reviewMode: 'git', status: 'cancelled',
+      status: 'cancelled',
       remoteCleanup: {
         generation: 'abc123abc123', stage: 'delete-pending', prNumber: 42,
         branch: 'bx/task-remote-delete-incomplete', updatedAt: NOW,
@@ -803,7 +599,7 @@ describe('TaskStore git review fields', () => {
     await expect(store.get('task-remote-delete-incomplete')).rejects.toThrow('remoteCleanup');
 
     await writeUnsanitizedTask('task-remote-manual-incomplete', {
-      reviewMode: 'git', status: 'cancelled',
+      status: 'cancelled',
       remoteCleanup: {
         generation: 'abc123abc123', stage: 'manual', prNumber: 42,
         branch: 'bx/task-remote-manual-incomplete', updatedAt: NOW,
@@ -811,14 +607,6 @@ describe('TaskStore git review fields', () => {
     });
     await expect(store.get('task-remote-manual-incomplete')).rejects.toThrow('remoteCleanup.failure');
 
-    await writeUnsanitizedTask('task-remote-non-git', {
-      reviewMode: 'server', status: 'cancelled',
-      remoteCleanup: {
-        generation: 'abc123abc123', stage: 'close-pending', prNumber: 42,
-        branch: 'bx/task-remote-non-git', updatedAt: NOW,
-      },
-    });
-    await expect(store.get('task-remote-non-git')).rejects.toThrow('remoteCleanup');
   });
 
   it('round-trips a pending review lease bound to the current pass tuple', async () => {
@@ -834,7 +622,7 @@ describe('TaskStore git review fields', () => {
       updatedAt: NOW,
     };
     await store.set(makeTask('task-lease', {
-      reviewMode: 'git', status: 'review', reviewRound: 1, reviewRoundPending: true,
+      status: 'review', reviewRound: 1, reviewRoundPending: true,
       signalToken: lease.signalToken, reviewHeadAnchorSha: lease.headSha,
       passToken: lease.passToken, failToken: lease.failToken, reviewDispatch: lease,
     }));
@@ -843,19 +631,19 @@ describe('TaskStore git review fields', () => {
 
   it('rejects the retired legacy boolean pending marker', async () => {
     await writeUnsanitizedTask('task-legacy-lease', {
-      reviewMode: 'git', status: 'review', reviewDispatchPending: true,
+      status: 'review', reviewDispatchPending: true,
     });
     await expect(store.get('task-legacy-lease')).rejects.toThrow('reviewDispatchPending');
   });
 
   it('rejects incomplete episodes and leases detached from the current tuple', async () => {
     await writeUnsanitizedTask('task-incomplete-episode', {
-      reviewMode: 'git', status: 'approved', postApproveGeneration: 'feedfeedfeed',
+      status: 'approved', postApproveGeneration: 'feedfeedfeed',
     });
     await expect(store.get('task-incomplete-episode')).rejects.toThrow('postApproveGeneration');
 
     await writeUnsanitizedTask('task-detached-lease', {
-      reviewMode: 'git', status: 'review', reviewRound: 1,
+      status: 'review', reviewRound: 1,
       signalToken: 'abcdef123456', reviewHeadAnchorSha: 'a'.repeat(40),
       passToken: '111111111111', failToken: '222222222222',
       reviewDispatch: {
@@ -867,7 +655,7 @@ describe('TaskStore git review fields', () => {
     await expect(store.get('task-detached-lease')).rejects.toThrow('reviewDispatch');
 
     await writeUnsanitizedTask('task-invalid-lease-phase', {
-      reviewMode: 'git', status: 'review', reviewRound: 1,
+      status: 'review', reviewRound: 1,
       signalToken: 'abcdef123456', reviewHeadAnchorSha: 'a'.repeat(40),
       passToken: '111111111111', failToken: '222222222222',
       reviewDispatch: {
@@ -894,6 +682,8 @@ describe('TaskStore git review fields', () => {
       ['outbox', { outbox: [{ key: '', type: 'human.intervention', data: {} }] }],
       ['outbox', { outbox: [{ key: 'k', type: 'other', data: {} }] }],
       ['outbox', { outbox: { key: 'k' } }],
+      ['outbox', { outbox: [{ key: 'abc123abc123', type: 'git.spec-verdict', data: { prNumber: 42, comments: 'change' } }] }],
+      ['outbox', { outbox: [{ key: 'k', type: 'human.intervention', data: {} }, { key: 'k', type: 'human.intervention', data: {} }] }],
       ['pendingRedispatch', { pendingRedispatch: 'yes' }],
       ['redispatchCount', { redispatchCount: -1 }],
     ];

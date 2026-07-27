@@ -501,7 +501,7 @@ describe('compactAgent', () => {
     expect(guardSet().has('dev-1')).toBe(false);
   });
 
-  it('read-file text injection waits for the guard, then pastes once it is released', async () => {
+  it('guarded text injection waits for the guard, then pastes once it is released', async () => {
     await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
     expect(await lockManager.acquire('qa-1', 't1')).toBeTruthy();
     setPollMs(1);
@@ -521,7 +521,7 @@ describe('compactAgent', () => {
     expect(guardSet().has('qa-1')).toBe(false);
   });
 
-  it('drops stale read-file injection when the agent was rebound during the guard wait', async () => {
+  it('drops stale text injection when the agent was rebound during the guard wait', async () => {
     await seedAgent({ id: 'qa-1', paneId: '%3', taskId: 't1' });
     expect(await lockManager.acquire('qa-1', 't1')).toBeTruthy();
     setPollMs(1);

@@ -27,9 +27,8 @@ baxian 是 **tmux 原生**的。一个 agent 就是 tmux session 里的一个交
 ## 功能特性
 
 - **终端墙** —— 控制台内嵌每个 agent 的实时终端（WebSocket 推流、xterm.js 渲染）。点击任意窗格即可向真实会话输入，无需切换窗口就能看清每个 agent 在做什么。
-- **自动评审循环** —— QA 评审意见结构化（`critical` / `major` / `minor`，附文件与行号），Dev 逐条回应（`fix` / `reject` 并说明理由与提交），一轮轮推进直到结论为 `approve`。
+- **自动评审循环** —— QA 在 pull request 上发布评审意见，Dev 逐条修复并给出提交，或说明拒绝理由，再由 QA 复审，循环直到结论为 `approve`。
 - **评审发生在真实的 PR 上** —— 每任务一个分支、自动建 PR、通过平台自己的 CLI（GitHub 用 `gh`，需另行安装并认证）轮询评审动态；项目设置 `merge: "auto"` 时，任务通过并经你确认后由 baxian 代为合并 PR。
-- **内置 server 评审模式（备选）** —— 不便走 PR 的场景可设 `review.mode: "server"`，评审循环走 server 自有协议。
 - **Spec 人审门禁（可选）** —— 项目配置 `specApproval: "human"` 后，走规格稿路线的任务在 QA 通过规格稿时停驻在 `spec-ready`，等你签字确认才开始编码。
 - **本地与远程 agent** —— agent 可以跑在任何 SSH 可达的机器上，远端 tmux 会话由 baxian 代管。
 - **不需要 API key** —— agent 运行的是交互式 Claude Code / Codex CLI，凭证只有你已有的订阅账号。
@@ -56,7 +55,7 @@ baxian 是 **tmux 原生**的。一个 agent 就是 tmux session 里的一个交
         │  REST + WebSocket
         ▼
    baxian server（Node + Fastify）
-   任务状态 · 评审轮次 · 平台 poller
+   任务状态 · PR 时间线 · 平台 poller
         │  tmux send-keys / capture-pane
         ├────────────────┐
         ▼                ▼ SSH
@@ -64,14 +63,14 @@ baxian 是 **tmux 原生**的。一个 agent 就是 tmux session 里的一个交
    dev-1 · qa-1      dev-2 · qa-2
 ```
 
-server 持有全部状态（任务、评审轮次、agent 绑定），通过向 tmux pane 注入 prompt、观察输出来驱动 agent。agent 之间从不直接通信——Dev 与 QA 之间的评审请求和反馈都由 server 中转。
+server 持有任务和 agent 绑定状态，通过 tmux pane 驱动 agent，并从平台 PR 跟进评审反馈。
 
 ## 环境要求
 
 > - **Node.js ≥ 22.13**
 > - 每台跑 agent 的机器（本地与远程）都装有 **tmux**
 > - **Claude Code**（`claude`）和/或 **Codex**（`codex`）CLI 已安装并登录
-> - **git**，以及 `review.mode: "git"`（默认）所需的平台 CLI —— GitHub 仓库用已认证的 **GitHub CLI**（`gh`）；其它平台需自备 CLI 并在 `~/.baxian/plugins/` 下安装对应的驱动插件
+> - **git**，以及仓库平台所需的 CLI —— GitHub 仓库用已认证的 **GitHub CLI**（`gh`）；其它平台需自备 CLI 并在 `~/.baxian/plugins/` 下安装对应的驱动插件
 >
 > 该 CLI 需要在每台跑 agent 的机器上、以及 server 本机都完成认证：server 用它轮询评审、合并与关闭 PR，agent 用它开 PR 与发评论。
 
@@ -136,11 +135,10 @@ baxian 优先读取工作目录下的 `./baxian.json`，找不到时回退到 `~
 | --- | --- |
 | `language` | 界面语言，`en-US`（默认）或 `zh-CN` |
 | `review.rounds` | 评审轮数上限，超过后任务标记为 `max_rounds` 暂停 |
-| `review.mode` | `git`（默认）：评审走真实 PR，由平台 CLI 驱动；`server`：无 PR 场景的内置协议；可按项目单独设置 |
 | `server.token` | 保护 API 与 Web 控制台的 Bearer token |
 | `project[].merge` | `"auto"`：任务通过并经你确认后，由 baxian 代为合并 PR；`null`：手动合并 |
 | `project[].specApproval` | `"human"`：QA 通过规格稿后停驻 `spec-ready` 等你确认；`null`（默认）：QA 通过即进入编码 |
-| `project[].gitCli.tool` | `review.mode: "git"` 由哪个平台 CLI 驱动。GitHub 仓库自动解析为 `gh`；其它平台必须声明，并安装对应的驱动插件 |
+| `project[].gitCli.tool` | 由哪个平台 CLI 驱动 PR 评审。GitHub 仓库自动解析为 `gh`；其它平台必须声明，并安装对应的驱动插件 |
 | `project[].agent[][].mode` + `host` | `local` 本地运行，或 `remote` 配主机 id 走 SSH 代管 |
 
 ## 许可证

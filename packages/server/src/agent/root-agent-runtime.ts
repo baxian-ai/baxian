@@ -5,6 +5,7 @@ import type { AgentRuntimeConfig, HostConfig, RootAgentConfig } from '../shared/
 import { ROOT_AGENT_ID } from '../shared/index.js';
 import type { PaneStreamerManager } from './pane-streamer-manager.js';
 import { scanRootDoneSignals } from './phase-signal.js';
+import { visibleText } from './vt-visible-text.js';
 import {
   ancestorSymlinkGuard,
   canonicalSelfGuard,
@@ -123,14 +124,14 @@ export class RootAgentRuntime implements RootAgentRuntimePort {
     if (this.unsubscribe) return;
     const streamer = this.paneStreamerManager.ensure(this.runtimeConfig());
     const subscription = await streamer.subscribeAtomic({
-      onLive: data => this.consumePaneData(data),
+      onVisible: visible => this.consumePaneData(visible),
       onSessionGone: () => {
         this.unsubscribe = undefined;
         this.signalBuffer = '';
       },
     });
     this.unsubscribe = subscription.unsubscribe;
-    this.consumePaneData(subscription.snapshot.data);
+    this.consumePaneData(visibleText(subscription.snapshot.data));
   }
 
   async writeRequest(record: RootRecoveryRecord, body: string): Promise<void> {
@@ -743,6 +744,7 @@ export class RootAgentRuntime implements RootAgentRuntimePort {
     ].join('\n');
   }
 
+  // `data` is visible text — decoded by PaneStreamer (live) or at the call site (snapshot).
   private consumePaneData(data: string): void {
     const combined = this.signalBuffer + data;
     for (const token of scanRootDoneSignals(combined)) {

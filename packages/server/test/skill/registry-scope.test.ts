@@ -174,14 +174,20 @@ describe('AgentManager skill scope', () => {
         id: 'proj-git',
         repo: 'git@github.com:owner/repo.git',
         merge: null,
-        agent: [[{ id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' }]],
+        agent: [[
+          { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+        ]],
       },
       {
-        id: 'proj-server',
+        id: 'proj-forge',
         repo: 'https://git.corp.example.com/g/p.git',
         merge: null,
-        review: { mode: 'server' },
-        agent: [[{ id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo2' }]],
+        gitCli: { tool: 'forge' },
+        agent: [[
+          { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo2' },
+          { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo2' },
+        ]],
       },
     ],
   };
@@ -210,33 +216,22 @@ describe('AgentManager skill scope', () => {
     (manager as unknown as { agentSkillScope: (id: string) => { pluginTools: string[] } })
       .agentSkillScope(agentId);
 
-  it('scopes a git-mode project agent to its resolved tool and leaves others empty', async () => {
+  it('scopes each project agent to its resolved tool and leaves unknown agents empty', async () => {
     await seedPlugin('gh');
-    vi.spyOn(manager, 'effectiveReviewMode').mockImplementation(
-      (projectId: string) => (projectId === 'proj-git' ? 'git' : 'server'),
-    );
+    await seedPlugin('forge');
     expect(scopeOf('dev-1')).toEqual({ pluginTools: ['gh'] });
-    expect(scopeOf('dev-2')).toEqual({ pluginTools: [] });
+    expect(scopeOf('dev-2')).toEqual({ pluginTools: ['forge'] });
     expect(scopeOf('ghost-agent')).toEqual({ pluginTools: [] });
   });
 
-  it('server-mode agents resolve to the bare core scope', async () => {
-    await seedPlugin('gh');
-    vi.spyOn(manager, 'effectiveReviewMode').mockReturnValue('server');
-    expect(scopeOf('dev-1')).toEqual({ pluginTools: [] });
-    expect(scopeOf('dev-2')).toEqual({ pluginTools: [] });
-  });
-
-  it('git-mode agents pick up the plugin pool without any mode override (the default is git)', async () => {
+  it('agents pick up the plugin pool without any mode override', async () => {
     await seedPlugin('gh');
     expect(scopeOf('dev-1')).toEqual({ pluginTools: ['gh'] });
   });
 
-  it('provisioning writes the scoped plugin skill and keeps it off legacy agents', async () => {
+  it('provisioning writes only the project-scoped plugin skill', async () => {
     await seedPlugin('gh');
-    vi.spyOn(manager, 'effectiveReviewMode').mockImplementation(
-      (projectId: string) => (projectId === 'proj-git' ? 'git' : 'server'),
-    );
+    await seedPlugin('forge');
     const staged: string[] = [];
     const runner = {
       exec: vi.fn(async (cmd: string) => ({
@@ -262,8 +257,9 @@ describe('AgentManager skill scope', () => {
     expect(cleanup).toContain("! -name '\\''baxian-cli-gh'\\''");
 
     staged.length = 0;
-    const serverAgent = CONFIG.project[1].agent[0][0];
-    await provision(runner, serverAgent, '/tmp/repo2');
+    const forgeAgent = CONFIG.project[1].agent[0][0];
+    await provision(runner, forgeAgent, '/tmp/repo2');
+    expect(staged.some(p => p.includes('baxian-cli-forge/SKILL.md'))).toBe(true);
     expect(staged.some(p => p.includes('baxian-cli-gh'))).toBe(false);
   });
 });

@@ -12,6 +12,7 @@ import {
 import { sshEnv } from './runner.js';
 import { TmuxManager, desiredTty, type TmuxSessionRef, type TtySize, type WindowGeometry } from './tmux.js';
 import { computeBackoffMs } from '../timing/backoff.js';
+import { VisibleTextExtractor } from './vt-visible-text.js';
 
 export interface PaneStreamerOptions {
   scrollbackLines?: number;
@@ -66,8 +67,10 @@ export interface GetSnapshotResult {
 }
 
 export interface SubscriberCallbacks {
-  onLive: (data: string, seq: number) => void;
+  onLive?: (data: string, seq: number) => void;
   onSessionGone: () => void;
+  // Decoded off the same stream headless sees — a subscription can start mid control string.
+  onVisible?: (visible: string, seq: number) => void;
   onSnapshotRefresh?: (snapshot: { cols: number; rows: number; data: string }, seq: number) => void;
 }
 
@@ -212,7 +215,10 @@ export class PaneStreamer {
   private onPtyDataChain: Promise<void> = Promise.resolve();
   private nextSeq = 0;
   private lastBroadcastSeq = -1;
-  private live = new Set<SubscriberCallbacks['onLive']>();
+  private live = new Set<NonNullable<SubscriberCallbacks['onLive']>>();
+  private visibleCbs = new Set<NonNullable<SubscriberCallbacks['onVisible']>>();
+  // Bound to the WHOLE PTY stream, never to one subscription's arbitrary starting chunk.
+  private readonly visible = new VisibleTextExtractor();
   private sessionGoneCbs = new Set<SubscriberCallbacks['onSessionGone']>();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private reattachTimer: ReturnType<typeof setTimeout> | null = null;
@@ -625,10 +631,15 @@ export class PaneStreamer {
     this.onPtyDataChain = this.onPtyDataChain.then(async () => {
       if (this.destroyed) return;
       const seq = this.nextSeq++;
+      // Same bytes, same order as headless: that adjacency is what keeps scan and render in step.
+      const visible = this.visible.write(data);
       await new Promise<void>((resolve) => this.headless.write(data, () => resolve()));
       this.lastBroadcastSeq = seq;
       for (const cb of [...this.live]) {
         try { cb(data, seq); } catch {}
+      }
+      for (const cb of [...this.visibleCbs]) {
+        try { cb(visible, seq); } catch {}
       }
     });
   }
@@ -649,7 +660,8 @@ export class PaneStreamer {
             data: this.serialize.serialize(),
           };
           const snapshotSeq = this.lastBroadcastSeq;
-          this.live.add(cbs.onLive);
+          if (cbs.onLive) this.live.add(cbs.onLive);
+          if (cbs.onVisible) this.visibleCbs.add(cbs.onVisible);
           this.sessionGoneCbs.add(cbs.onSessionGone);
           if (cbs.onSnapshotRefresh) this.refreshCbs.add(cbs.onSnapshotRefresh);
           resolve({
@@ -732,6 +744,7 @@ export class PaneStreamer {
     const goneCbs = [...this.sessionGoneCbs];
     this.sessionGoneCbs.clear();
     this.live.clear();
+    this.visibleCbs.clear();
     this.refreshCbs.clear();
     if (!opts.silent) {
       for (const cb of goneCbs) {
@@ -756,7 +769,7 @@ export class PaneStreamer {
 
   private async handleAttachExit(): Promise<void> {
     if (this.destroyed) return;
-    if (this.live.size === 0 && this.sessionGoneCbs.size === 0) {
+    if (this.live.size === 0 && this.visibleCbs.size === 0 && this.sessionGoneCbs.size === 0) {
       this.scheduleIdleIfEmpty();
       return;
     }
@@ -818,6 +831,7 @@ export class PaneStreamer {
     const cbs = [...this.sessionGoneCbs];
     this.sessionGoneCbs.clear();
     this.live.clear();
+    this.visibleCbs.clear();
     this.refreshCbs.clear();
     this.killAttachPty();
     for (const cb of cbs) {
@@ -826,7 +840,8 @@ export class PaneStreamer {
   }
 
   private unsubscribeOne(cbs: SubscriberCallbacks): void {
-    this.live.delete(cbs.onLive);
+    if (cbs.onLive) this.live.delete(cbs.onLive);
+    if (cbs.onVisible) this.visibleCbs.delete(cbs.onVisible);
     this.sessionGoneCbs.delete(cbs.onSessionGone);
     if (cbs.onSnapshotRefresh) this.refreshCbs.delete(cbs.onSnapshotRefresh);
     this.scheduleIdleIfEmpty();
@@ -834,12 +849,12 @@ export class PaneStreamer {
 
   private scheduleIdleIfEmpty(): void {
     if (this.destroyed) return;
-    if (this.live.size > 0 || this.sessionGoneCbs.size > 0) return;
+    if (this.live.size > 0 || this.visibleCbs.size > 0 || this.sessionGoneCbs.size > 0) return;
     if (this.idleTimer) return;
     if (this.idleGraceMs <= 0) return;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
-      if (this.live.size === 0 && this.sessionGoneCbs.size === 0 && !this.destroyed) {
+      if (this.live.size === 0 && this.visibleCbs.size === 0 && this.sessionGoneCbs.size === 0 && !this.destroyed) {
         this.destroy();
       }
     }, this.idleGraceMs);

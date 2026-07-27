@@ -21,10 +21,13 @@ const NOW = '2026-04-28T10:00:00Z';
 const devAgent: AgentConfig = {
   id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local',
 };
+const qaAgent: AgentConfig = {
+  id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local',
+};
 const config: BaxianConfig = {
   review: { rounds: 10 },
   server: DEFAULT_SERVER_CONFIG,
-  project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent]] }],
+  project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent, qaAgent]] }],
 };
 const noopRunner: CommandRunner = {
   exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),

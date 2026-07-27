@@ -6,7 +6,6 @@ import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import { initStateDir } from '../../src/state/init.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
-import { ReviewStore } from '../../src/state/review-store.js';
 import { PetStore } from '../../src/state/pet-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
@@ -75,7 +74,6 @@ export async function createTestContext(tempDir: string): Promise<AppContext> {
     skillRegistry: registry,
     runnerFactory: () => mockRunner,
     platformRunner: mockRunner,
-    reviewStore: new ReviewStore(join(tempDir, 'state', 'reviews')),
     imageStagingRoot: join(tempDir, 'state', 'task-images'),
   });
 

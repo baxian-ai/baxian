@@ -112,6 +112,11 @@
         }
       }
     ],
+    "comment": {
+      "argv": ["{binary}", "api", "-X", "POST", "repos/{repoPath}/issues/{prNumber}/comments", "-F", "body=@-"],
+      "stdin": "{body}",
+      "env": { "GH_HOST": "{host}" }
+    },
     "merge": {
       "argv": ["{binary}", "api", "-X", "PUT", "repos/{repoPath}/pulls/{prNumber}/merge", "-f", "merge_method=squash", "-f", "sha={expectedHeadSha}"],
       "env": { "GH_HOST": "{host}" }

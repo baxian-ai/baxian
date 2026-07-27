@@ -155,10 +155,10 @@ describe('persistTaskImages / materializeTaskImages (entry B core)', () => {
       imagePathsForDispatch(r: CommandRunner, t: TaskState, p: string): Promise<string[]>;
     }).imagePathsForDispatch(mockRunner, task, phase);
 
-    for (const phase of ['develop', 'research', 'code', 'fix', 'server-feedback']) {
+    for (const phase of ['develop', 'code', 'fix']) {
       expect(await call(phase), phase).toEqual(['/tmp/baxian/upload/task-c/g.png']);
     }
-    for (const phase of ['review', 'recheck', 'post-approve', 'merge', 'server-review', 'server-recheck', 'server-spec-review', 'server-after-done']) {
+    for (const phase of ['review', 'recheck', 'post-approve', 'merge']) {
       expect(await call(phase), phase).toEqual([]);
     }
   });
@@ -234,9 +234,9 @@ describe('retryTask image preservation', () => {
     const now = new Date().toISOString();
     await taskStore.set({
       id, projectId: 'proj', title: `Task ${id}`, description: 'd',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', reviewRound: 0,
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1',
+      phase: 'code', reviewRound: 0,
       status: 'failed', branch: `bx/${id}`, createdAt: now, updatedAt: now,
-      reviewMode: 'git',
       platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
       images: [filename],
     });

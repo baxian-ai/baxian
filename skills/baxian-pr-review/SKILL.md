@@ -16,6 +16,10 @@ If you need a factual clarification from your human partner, ask in your reply a
 
 Read the diff first and form your own judgement; only then read the description and comments, checking claims against the implementation. Every command comes from your `baxian-cli-<tool>` skill §Inspect, which also fixes the pagination discipline.
 
+## Review Baseline
+
+When the descriptor carries `stage: spec`, review the proposed design and repository spec as a spec: judge requirements, invariants, failure handling, and whether the plan is implementable and testable. Do not require the implementation to exist yet. When `stage:` is absent, review the code implementation.
+
 ## Scope
 
 Prioritize:

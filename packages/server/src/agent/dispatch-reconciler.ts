@@ -1,5 +1,5 @@
 import type { BaxianConfig, TaskState } from '../shared/index.js';
-import { isSpecStagePhase } from '../shared/index.js';
+import { taskReviewRound } from '../shared/index.js';
 import type { EventBus } from '../event/bus.js';
 import type { AgentStore } from '../state/agent-store.js';
 import type { TaskStore } from '../state/task-store.js';
@@ -85,19 +85,17 @@ export class DispatchReconciler {
 
   private async reconcile(): Promise<void> {
     const tasks = await this.opts.taskStore.list({});
-    // 保护集只按状态划定：git/server 模式的登记不归本 poller 消费（git dev-fix 归本 poller、
-    // git QA 归 retryPendingGitReviewDispatches），但都不得被当成孤儿清掉
+    // QA 归 retryPendingGitReviewDispatches，dev fix 归本 poller；两类登记都不能被当作孤儿清掉。
     const protectedIds = new Set<string>();
     for (const task of tasks) {
       if (task.status === 'review' || task.status === 'fixing') protectedIds.add(task.id);
     }
     await this.pruneTrackers(protectedIds);
     for (const task of tasks) {
-      if (isSpecStagePhase(task.phase)) continue;
       try {
-        if (task.status === 'review' && task.reviewMode === 'git') {
+        if (task.status === 'review') {
           await this.reconcileReview(task);
-        } else if (task.status === 'fixing' && task.reviewMode === 'git') {
+        } else if (task.status === 'fixing') {
           await this.reconcileFix(task);
         }
       } catch (err) {
@@ -137,8 +135,11 @@ export class DispatchReconciler {
   }
 
   private async reconcileReview(task: TaskState): Promise<void> {
+    if (!task.qaAgentId) {
+      throw new Error(`review task ${task.id} has no QA participant`);
+    }
     const qaId = task.qaAgentId;
-    if (!qaId || !task.prNumber) return;
+    if (!task.prNumber) return;
     const anchor = task.reviewHeadAnchorSha?.toLowerCase();
     const head = task.latestHeadSha?.toLowerCase();
     // 明确的 anchor≠head 才让位 push 事件路径；任一缺失时 push 路径可能永不触发（poller 的
@@ -373,7 +374,7 @@ export class DispatchReconciler {
     const tokenAtDecision = task.signalToken;
     // 相位：登记时记录的原始相位优先；无登记时首轮（round=0）意味着初次 review 从未完成，按 review 重放。
     // 计轮：读持久化的 reviewRoundPending（该轮尚未入账），补派恰好补计一次，重启后依然成立
-    const qaPhase = entryAtDecision?.qaPhase ?? (task.reviewRound === 0 ? 'review' : undefined);
+    const qaPhase = entryAtDecision?.qaPhase ?? (taskReviewRound(task) === 0 ? 'review' : undefined);
     let result: TaskState;
     let armedToken: string | undefined;
     try {

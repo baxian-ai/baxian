@@ -242,9 +242,25 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(201).send(fresh);
   });
 
-  app.post<{ Params: { id: string } }>('/tasks/:id/review', async (request, reply) => {
+  app.post<{
+    Params: { id: string };
+    Body: { stage?: string; actorId?: string; prNumber?: number };
+  }>('/tasks/:id/review', async (request, reply) => {
+    const { stage, actorId, prNumber } = request.body ?? {};
+    if (stage !== undefined && stage !== 'spec' && stage !== 'code') {
+      return reply.status(400).send({ error: 'stage must be "spec" or "code" when provided' });
+    }
+    if (actorId !== undefined && (typeof actorId !== 'string' || actorId.trim() === '')) {
+      return reply.status(400).send({ error: 'actorId must be a non-empty string when provided' });
+    }
+    if (prNumber !== undefined && (!Number.isSafeInteger(prNumber) || prNumber < 1)) {
+      return reply.status(400).send({ error: 'prNumber must be a positive safe integer when provided' });
+    }
     const updated = await app.ctx.agentManager.dispatchReviewToQa(request.params.id, {
       confirmUncertainNotDelivered: true,
+      ...(stage !== undefined ? { stage } : {}),
+      ...(typeof actorId === 'string' ? { actorId: actorId.trim() } : {}),
+      ...(prNumber !== undefined ? { prNumber } : {}),
     });
     return reply.status(202).send(updated);
   });
@@ -254,39 +270,10 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     return reply.status(202).send(updated);
   });
 
-  app.get<{ Params: { id: string } }>('/tasks/:id/reviews', async (request, reply) => {
-    const store = app.ctx.agentManager.getReviewStore();
-    if (!store) return reply.send([]);
-    const rounds = await store.listRounds(request.params.id);
-    return reply.send(rounds);
-  });
-
-  app.get<{ Params: { id: string; round: string } }>(
-    '/tasks/:id/reviews/code/:round/interdiff',
-    async (request, reply) => {
-      try {
-        const result = await app.ctx.agentManager.computeCodeInterdiff(
-          request.params.id,
-          Number(request.params.round),
-        );
-        if (result.ok) return reply.send({ diff: result.diff });
-        if (result.reason === 'no-anchor') {
-          return reply.status(404).send({ error: '该轮次缺少 headSha 锚点（历史轮次），增量视图不可用' });
-        }
-        return reply.status(409).send({ error: 'dev 工作区已释放，增量不可用' });
-      } catch (err) {
-        return reply.status(500).send({ error: err instanceof Error ? err.message : String(err) });
-      }
-    },
-  );
-
   app.get<{ Params: { id: string } }>('/tasks/:id/pr-review', async (request, reply) => {
     const task = await app.ctx.taskStore.get(request.params.id);
     if (!task) return reply.status(404).send({ error: 'task not found' });
     const empty: PrReviewItem[] = [];
-    if (task.reviewMode === 'server') {
-      return reply.send({ available: false, reason: 'server-mode', items: empty });
-    }
     if (task.prNumber === undefined) {
       return reply.send({ available: false, reason: 'no-pr', items: empty });
     }
@@ -327,30 +314,13 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     '/tasks/:id/spec',
     async (request, reply) => {
       const { verdict, comments } = request.body ?? {};
-      if (verdict !== 'approve' && verdict !== 'request-changes' && verdict !== 'archive') {
-        return reply.status(400).send({ error: 'verdict must be "approve", "request-changes", or "archive"' });
+      if (verdict !== 'approve' && verdict !== 'request-changes') {
+        return reply.status(400).send({ error: 'verdict must be "approve" or "request-changes"' });
       }
       if (comments !== undefined && typeof comments !== 'string') {
         return reply.status(400).send({ error: 'comments must be a string' });
       }
       const updated = await app.ctx.agentManager.submitSpecVerdict(request.params.id, verdict, comments);
-      return reply.status(202).send(updated);
-    },
-  );
-
-  app.post<{ Params: { id: string }; Body: { verdict?: string; comments?: string } }>(
-    '/tasks/:id/code',
-    async (request, reply) => {
-      const { verdict, comments } = request.body ?? {};
-      if (verdict !== 'request-changes') {
-        return reply
-          .status(400)
-          .send({ error: 'verdict must be "request-changes"; to approve, POST /tasks/:id/complete' });
-      }
-      if (typeof comments !== 'string' || comments.trim() === '') {
-        return reply.status(400).send({ error: 'comments must be a non-empty string' });
-      }
-      const updated = await app.ctx.agentManager.submitCodeVerdict(request.params.id, comments);
       return reply.status(202).send(updated);
     },
   );

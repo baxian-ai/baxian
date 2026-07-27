@@ -106,6 +106,32 @@ describe('makeDriverExec', () => {
     await makeDriverExec(runner)('gh api y', { timeout: 1234, maxBuffer: 4096 });
     expect(seen).toEqual({ timeout: 1234, maxBuffer: 4096 });
   });
+
+  it('uses execWithStdin whenever stdin is present, including an empty buffer', async () => {
+    let seen: { command: string; stdin: Buffer; options?: ExecOptions } | undefined;
+    const runner: CommandRunner = {
+      exec: async () => {
+        throw new Error('plain exec must not receive stdin-backed driver operations');
+      },
+      writeFile: async () => undefined,
+      execWithStdin: async (command, stdin, options) => {
+        seen = { command, stdin, options };
+        return { stdout: '', stderr: '', exitCode: 0 };
+      },
+    };
+
+    await makeDriverExec(runner)('gh api comment', {
+      timeout: 1234,
+      maxBuffer: 4096,
+      stdin: Buffer.alloc(0),
+    });
+
+    expect(seen).toEqual({
+      command: 'gh api comment',
+      stdin: Buffer.alloc(0),
+      options: { timeout: 1234, maxBuffer: 4096 },
+    });
+  });
 });
 
 describe('GitDriver.runPreflightSteps', () => {

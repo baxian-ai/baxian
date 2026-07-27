@@ -58,6 +58,31 @@ describe('PrReviewPage', () => {
     expect(screen.getByText('approve')).toBeTruthy();
   });
 
+  it('labels the full PR timeline from the current spec phase', async () => {
+    useTaskMock.mockReturnValue({
+      data: {
+        id: 'task-1',
+        title: 'My Task',
+        reviewRound: 0,
+        specReviewRound: 1,
+        phase: 'spec',
+        status: 'review',
+      },
+      loaded: true,
+      error: null,
+    });
+    ghMock.mockResolvedValue({
+      available: true,
+      prNumber: 7,
+      items: [{ kind: 'review', id: '11', body: 'spec approved', verdict: 'approve' }],
+    });
+
+    renderAt('/tasks/task-1/pr-review');
+
+    expect(await screen.findByText('Spec review')).toBeTruthy();
+    expect(screen.queryByText('Code review')).toBeNull();
+  });
+
   it('does not create a link for a non-HTTP PR URL supplied by a plugin', async () => {
     ghMock.mockResolvedValue({
       available: true,

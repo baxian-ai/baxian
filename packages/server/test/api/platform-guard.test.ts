@@ -4,13 +4,13 @@ import type { AgentManager } from '../../src/agent/manager.js';
 import type { BaxianConfig, TaskState } from '../../src/shared/index.js';
 import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 
-function config(over: Partial<BaxianConfig['project'][number]> = {}, review: BaxianConfig['review'] = { rounds: 2 }): BaxianConfig {
+function config(over: Partial<BaxianConfig['project'][number]> = {}): BaxianConfig {
   return {
-    review,
+    review: { rounds: 2 },
     server: DEFAULT_SERVER_CONFIG,
     project: [{
       id: 'proj', repo: 'git@github.com:owner/repo.git', merge: null, agent: [],
-      review: { mode: 'git' }, ...over,
+      ...over,
     }],
   } as BaxianConfig;
 }
@@ -40,31 +40,23 @@ function managerWithBound(tasks: Array<{
   } as unknown as AgentManager;
 }
 
-const twoProjectCfg = (projects: Array<{ id: string; repo: string; mode?: 'git' | 'server' }>, review: BaxianConfig['review'] = { rounds: 2 }): BaxianConfig => ({
-  review, server: DEFAULT_SERVER_CONFIG,
-  project: projects.map(p => ({ id: p.id, repo: p.repo, merge: null, agent: [], review: { mode: p.mode ?? 'git' } })),
+const twoProjectCfg = (projects: Array<{ id: string; repo: string }>): BaxianConfig => ({
+  review: { rounds: 2 }, server: DEFAULT_SERVER_CONFIG,
+  project: projects.map(p => ({ id: p.id, repo: p.repo, merge: null, agent: [] })),
 } as BaxianConfig);
 
 describe('gitBindingBlockers', () => {
-  it('blocks repo, tool, and effective-mode changes while git tasks are active', async () => {
+  it('blocks repo and tool changes while platform tasks are active', async () => {
     const manager = managerWith(['task-1']);
     const current = config();
     for (const next of [
       config({ repo: 'git@github.com:owner/other.git' }),
       config({ gitCli: { tool: 'forge' } }),
-      config({ review: { mode: 'server' } }),
     ]) {
       expect(await gitBindingBlockers(manager, current, next)).toEqual([
         { projectId: 'proj', taskIds: ['task-1'] },
       ]);
     }
-  });
-
-  it('blocks a global review-mode flip that changes the project effective mode', async () => {
-    const manager = managerWith(['task-2']);
-    const current = config({ review: undefined }, { rounds: 2, mode: 'git' });
-    const next = config({ review: undefined }, { rounds: 2, mode: 'server' });
-    expect(await gitBindingBlockers(manager, current, next)).toHaveLength(1);
   });
 
   it('blocks removing a project that still has active git tasks', async () => {
@@ -81,10 +73,10 @@ describe('gitBindingBlockers', () => {
       .toEqual([]);
   });
 
-  it('protects identity changes even after the live mode drifted away from git', async () => {
+  it('protects identity changes even after the live repo drifted', async () => {
     const manager = managerWith(['task-5']);
-    const current = config({ review: { mode: 'server' } });
-    const next = config({ review: { mode: 'server' }, repo: 'git@github.com:owner/other.git' });
+    const current = config({ repo: 'git@github.com:owner/drifted.git' });
+    const next = config({ repo: 'git@github.com:owner/other.git' });
     expect(await gitBindingBlockers(manager, current, next)).toEqual([
       { projectId: 'proj', taskIds: ['task-5'] },
     ]);
@@ -97,7 +89,6 @@ describe('gitBindingBlockers', () => {
     }]);
     const current = config({
       repo: 'git@github.com:owner/drifted.git',
-      review: { mode: 'server' },
       gitCli: { tool: 'forge' },
     });
 
@@ -113,7 +104,7 @@ describe('gitBindingBlockers', () => {
       'legacy-task': { id: 'legacy-task', projectId: 'legacy', repoKey: 'github.com/owner/repo' },
     } as const;
     const manager = managerWithBound(order.map(id => tasks[id as keyof typeof tasks]));
-    const current = config({ review: { mode: 'server' } }, { rounds: 2, mode: 'server', afterDone: 'branch' });
+    const current = config({ repo: 'git@github.com:owner/drifted.git' });
 
     expect(await gitBindingBlockers(manager, current, config())).toEqual([]);
   });
@@ -140,20 +131,6 @@ describe('gitBindingBlockers', () => {
     expect(await gitBindingBlockers(manager, current, next)).toEqual([
       { projectId: 'b', taskIds: ['task-a'], lockedByProjectId: 'a' },
     ]);
-  });
-
-  it('allows a new server+branch project to share a repo because it creates no platform entry', async () => {
-    const manager = managerWithBound([{ id: 'task-a', projectId: 'a', repoKey: 'github.com/owner/repo' }]);
-    const review: BaxianConfig['review'] = { rounds: 2, mode: 'server', afterDone: 'branch' };
-    const current = twoProjectCfg([
-      { id: 'a', repo: 'git@github.com:owner/repo.git', mode: 'git' },
-    ], review);
-    const next = twoProjectCfg([
-      { id: 'a', repo: 'git@github.com:owner/repo.git', mode: 'git' },
-      { id: 'b', repo: 'https://github.com/owner/repo.git', mode: 'server' },
-    ], review);
-
-    expect(await gitBindingBlockers(manager, current, next)).toEqual([]);
   });
 
   it('blocks repointing an existing project onto a repo locked by another', async () => {
@@ -191,28 +168,6 @@ describe('gitBindingBlockers', () => {
     ]);
   });
 
-  it('blocks a no-entry project switching to a mode that occupies a locked shared repo', async () => {
-    // A/B 都是 server+branch 共享 R(都不建 entry),A 有绑定 R 的 retained task;在线只把 B 切到 git。
-    // B 自己无活动任务(①不拦),repo 字符串没变但 B 从「不占 entry」变成「占 entry」——②必须拦。
-    const manager = managerWithBound([{ id: 'a', projectId: 'a', repoKey: 'github.com/owner/repo' }]);
-    const server = (id: string): { id: string; repo: string; mode: 'server' } =>
-      ({ id, repo: 'https://github.com/owner/repo.git', mode: 'server' });
-    const current: BaxianConfig = {
-      review: { rounds: 2, mode: 'server', afterDone: 'branch' }, server: DEFAULT_SERVER_CONFIG,
-      project: [server('a'), server('b')].map(p => ({ id: p.id, repo: p.repo, merge: null, agent: [], review: { mode: p.mode } })),
-    } as BaxianConfig;
-    const next: BaxianConfig = {
-      review: { rounds: 2, mode: 'server', afterDone: 'branch' }, server: DEFAULT_SERVER_CONFIG,
-      project: [
-        { id: 'a', repo: 'https://github.com/owner/repo.git', merge: null, agent: [], review: { mode: 'server' } },
-        { id: 'b', repo: 'https://github.com/owner/repo.git', merge: null, agent: [], review: { mode: 'git' } },
-      ],
-    } as BaxianConfig;
-    expect(await gitBindingBlockers(manager, current, next)).toEqual([
-      { projectId: 'b', taskIds: ['a'], lockedByProjectId: 'a' },
-    ]);
-  });
-
   it('attributes cross-project repo-lock diagnostics to the changed project and names the lock owner', () => {
     expect(gitBindingBlockerDetails([{
       projectId: 'b', taskIds: ['task-a'], lockedByProjectId: 'a',
@@ -234,15 +189,15 @@ describe('gitBindingBlockers', () => {
 });
 
 describe('activeParticipantBlockers', () => {
-  type Seats = Array<{ taskId: string; projectId: string; participants: Array<{ agentId: string; expectedRole?: 'dev' | 'qa' | 'research' }> }>;
+  type Seats = Array<{ taskId: string; projectId: string; participants: Array<{ agentId: string; expectedRole?: 'dev' | 'qa' }> }>;
   const seatedManager = (seats: Seats): AgentManager =>
     ({ listActiveParticipantSeats: async () => seats } as unknown as AgentManager);
 
-  const agentCfg = (projects: Array<{ id: string; agents: Array<{ id: string; role: 'dev' | 'qa' | 'research' }> }>): BaxianConfig => ({
+  const agentCfg = (projects: Array<{ id: string; agents: Array<{ id: string; role: 'dev' | 'qa' }> }>): BaxianConfig => ({
     review: { rounds: 2 },
     server: DEFAULT_SERVER_CONFIG,
     project: projects.map(p => ({
-      id: p.id, repo: `git@github.com:owner/${p.id}.git`, merge: null, review: { mode: 'git' as const },
+      id: p.id, repo: `git@github.com:owner/${p.id}.git`, merge: null,
       agent: [p.agents.map(a => ({ id: a.id, runtime: 'claude-code', role: a.role, mode: 'local', workdir: `/tmp/${a.id}` }))],
     })),
   } as BaxianConfig);

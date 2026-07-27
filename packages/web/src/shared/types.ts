@@ -1,10 +1,8 @@
 export type AgentRuntime = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
-export type AgentRole = 'dev' | 'qa' | 'research';
+export type AgentRole = 'dev' | 'qa';
 export type AgentMode = 'local' | 'remote';
 export type MergeStrategy = 'auto' | null;
 export type SpecApprovalStrategy = 'human' | null;
-export type ReviewMode = 'git' | 'server';
-type AfterDone = 'pr' | 'branch' | null;
 export type SupportedLanguage = 'zh-CN' | 'en-US';
 
 export interface HostConfig {
@@ -33,7 +31,6 @@ export interface ProjectConfig {
   repo: string;
   merge: MergeStrategy;
   specApproval?: SpecApprovalStrategy;
-  review?: ProjectReviewConfig;
   gitCli?: GitCliConfig;
   agent: AgentConfig[][];
 }
@@ -44,14 +41,8 @@ export interface GitCliConfig {
   notes?: string;
 }
 
-export interface ProjectReviewConfig {
-  mode?: ReviewMode;
-}
-
 interface ReviewConfig {
   rounds: number;
-  mode?: ReviewMode;
-  afterDone?: AfterDone;
 }
 
 interface HttpsConfig {
@@ -102,18 +93,16 @@ export type TaskStatus =
   | 'spec-ready'
   | 'approved'
   | 'merge-ready'
-  | 'ready'
   | 'merged'
   | 'done'
   | 'max_rounds'
   | 'failed'
   | 'cancelled';
 
-export type TaskPhase = 'research' | 'spec' | 'code';
-export type ReviewPhase = 'spec' | 'code';
+export type TaskPhase = 'spec' | 'code';
 
 export function isSpecStagePhase(phase: TaskPhase | undefined): boolean {
-  return phase === 'research' || phase === 'spec';
+  return phase === 'spec';
 }
 
 type AgentLifecycleStatus = 'ok' | 'awaiting_human';
@@ -182,7 +171,6 @@ export interface TaskState {
   agentId: string;
   devAgentId: string;
   qaAgentId?: string;
-  researchAgentId?: string;
   prNumber?: number;
   prUrl?: string;
   branch?: string;
@@ -205,90 +193,25 @@ export interface TaskState {
   reviewRound: number;
   specReviewRound?: number;
   phase?: TaskPhase;
+  deliveryConfirmation?: { phase: TaskPhase; source: 'signal' | 'human'; at: string };
   signalToken?: string;
-  reviewMode: ReviewMode;
-  batchIndex?: number;
-  batchTotal?: number;
   maxRoundsContinues?: number;
-  afterDone?: AfterDone;
-  publishDispatchedAt?: string;
+  replyActorId?: string;
+  replyActorStatus?: 'verified' | 'provisional';
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
   verdictOverdue?: boolean;
 }
 
-export type FindingSeverity = 'critical' | 'major' | 'minor';
-
-export interface Finding {
-  id: string;
-  severity: FindingSeverity;
-  message: string;
-  file?: string;
-  line?: number;
-  location?: string;
+export function needsGitReviewRecovery(
+  task: Pick<TaskState, 'phase' | 'deliveryConfirmation' | 'replyActorStatus' | 'prNumber'>,
+): boolean {
+  return task.prNumber === undefined
+    || task.phase === undefined
+    || task.deliveryConfirmation?.phase !== task.phase
+    || task.replyActorStatus !== 'verified';
 }
-
-export interface ReviewFindings {
-  round: number;
-  verdict: 'approve' | 'request-changes';
-  findings: Finding[];
-}
-
-export interface FindingResponse {
-  findingId: string;
-  action: 'fix' | 'reject' | 'out-of-scope';
-  rationale: string;
-  commitSha?: string;
-}
-
-export interface ReviewResponse {
-  round: number;
-  responses: FindingResponse[];
-}
-
-interface SpecUserDecision {
-  verdict: 'approve' | 'request-changes' | 'archive';
-  comments?: string;
-  at: string;
-}
-
-export interface SpecDocument {
-  relPath: string;
-  content: string;
-}
-
-export function renderSpecDocuments(documents: readonly SpecDocument[]): string {
-  if (documents.length === 1) return documents[0]!.content;
-  return documents.map(document => `=== ${document.relPath} ===\n${document.content}`).join('\n');
-}
-
-interface ReviewRoundBase {
-  round: number;
-  content: string;
-  contentTruncated?: boolean;
-  diffstat?: string;
-  baseSha?: string;
-  headSha?: string;
-  headTree?: string;
-  findings?: ReviewFindings;
-  response?: ReviewResponse;
-  batchFindings?: ReviewFindings[];
-  userDecision?: SpecUserDecision;
-  startedAt: string;
-  completedAt?: string;
-}
-
-export interface SpecReviewRound extends ReviewRoundBase {
-  phase: 'spec';
-  documents: SpecDocument[];
-}
-
-export interface CodeReviewRound extends ReviewRoundBase {
-  phase: 'code';
-}
-
-export type ReviewRound = SpecReviewRound | CodeReviewRound;
 
 type PrReviewItemKind = 'review' | 'review-comment' | 'issue-comment';
 
@@ -315,7 +238,7 @@ export interface PrReviewItem {
 
 export interface PrReviewConversation {
   available: boolean;
-  reason?: 'server-mode' | 'no-pr' | 'driver-unavailable';
+  reason?: 'no-pr' | 'driver-unavailable';
   prNumber?: number;
   prUrl?: string;
   items: PrReviewItem[];

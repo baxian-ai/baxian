@@ -14,6 +14,10 @@ If you need a factual clarification from your human partner, ask in your reply a
 
 Read the diff first and form your own judgement; only then read the replies and comments, checking claims against the implementation. Every command comes from your `baxian-cli-<tool>` skill §Inspect: closure decisions need its fully paginated reads, since a single-shot view of a conversation truncates silently.
 
+## Review Baseline
+
+When the descriptor carries `stage: spec`, recheck the design/spec changes and prior spec findings; implementation is not required yet. When `stage:` is absent, recheck the code implementation.
+
 ## Decision Path
 
 - Head changed: review the increment since your prior review; verify all prior findings closed and new behavior has tests.

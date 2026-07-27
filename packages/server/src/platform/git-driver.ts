@@ -1,5 +1,5 @@
 import { SINGLE_RESOURCE_OPS, type CommentSourceOp, type DriverOp, type DriverSpec } from './types.js';
-import { renderCommand, type RenderContext } from './command-renderer.js';
+import { renderCommand, renderCommandStdin, type RenderContext } from './command-renderer.js';
 import { runDriverPreflightSteps, type DriverPreflightStepResult } from './preflight-exec.js';
 import { parseJsonResponse, parseJsonPagedPage } from './response-parser.js';
 import { mapResponse } from './field-mapper.js';
@@ -22,7 +22,10 @@ export interface DriverExecResult {
   exitCode: number;
 }
 
-export type DriverExec = (command: string, opts: { timeout: number; maxBuffer: number }) => Promise<DriverExecResult>;
+export type DriverExec = (
+  command: string,
+  opts: { timeout: number; maxBuffer: number; stdin?: Buffer },
+) => Promise<DriverExecResult>;
 
 export class DriverOpError extends Error {
   constructor(
@@ -57,6 +60,7 @@ export interface OpVars {
   expectedHeadSha?: string;
   remoteProjectId?: string;
   branch?: string;
+  body?: string;
 }
 
 export function buildDriverRunContext(repoUrl: string, binary: string): RenderContext {
@@ -206,8 +210,14 @@ export class GitDriver {
     op: DriverOp,
     vars: OpVars & { page?: number },
   ): Promise<DriverExecResult | 'treated-success'> {
-    const cmd = renderCommand(op, { ...this.ctx, ...vars });
-    const result = await this.exec(cmd, { timeout: DRIVER_EXEC_TIMEOUT_MS, maxBuffer: DRIVER_MAX_BUFFER });
+    const context = { ...this.ctx, ...vars };
+    const cmd = renderCommand(op, context);
+    const stdin = renderCommandStdin(op, context);
+    const result = await this.exec(cmd, {
+      timeout: DRIVER_EXEC_TIMEOUT_MS,
+      maxBuffer: DRIVER_MAX_BUFFER,
+      ...(stdin !== undefined ? { stdin } : {}),
+    });
     if (result.exitCode === 0) {
       if (op.responseEnvelope === 'graphql') this.assertGraphqlEnvelope(opName, result);
       return result;

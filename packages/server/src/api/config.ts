@@ -4,7 +4,7 @@ import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig, RootAgentCon
 import { autoBootstrapAgentIds } from '../agent/bootstrap.js';
 import {
   saveConfig,
-  prepareConfig,
+  prepareConfigWithWarnings,
   ConfigValidationError,
 } from '../config/loader.js';
 import { withConfigLock } from '../config/mutex.js';
@@ -175,7 +175,13 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         delete (mergedServer as Partial<BaxianConfig['server']>).token;
       }
 
-      const merged: BaxianConfig = {
+      const unknownIncoming = Object.fromEntries(
+        Object.entries(incoming).filter(
+          ([key]) => !['language', 'review', 'server', 'project', 'root'].includes(key),
+        ),
+      );
+      const merged: BaxianConfig & Record<string, unknown> = {
+        ...unknownIncoming,
         language: ('language' in incoming ? incoming.language : current.language) as BaxianConfig['language'],
         review: { ...current.review, ...(incoming.review ?? {}) },
         server: mergedServer,
@@ -187,8 +193,9 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       };
 
       let validated: BaxianConfig;
+      let warnings: Array<{ path: string; message: string }>;
       try {
-        validated = prepareConfig(merged);
+        ({ config: validated, warnings } = prepareConfigWithWarnings(merged));
       } catch (err) {
         if (err instanceof ConfigValidationError) {
           return reply.status(400).send({
@@ -317,6 +324,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
       return reply.send({
         config: redactConfig(validated),
         restartRequired: mustRestart,
+        ...(warnings.length > 0 ? { warnings } : {}),
         note: mustRestart
           ? 'Saved and hot-reloadable fields applied. server.host/port/https or root changes require a restart to take effect.'
           : 'Saved and applied immediately (no restart required).',

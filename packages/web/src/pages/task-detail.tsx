@@ -4,6 +4,7 @@ import { api } from '../api.ts';
 import { AgentCard } from '../components/agent-card.tsx';
 import { inputCls } from '../components/form-styles.ts';
 import { CreateTaskModal } from '../components/create-task-modal.tsx';
+import { Modal } from '../components/modal.tsx';
 import { ReviewConversation } from '../components/review-conversation.tsx';
 import { useToast } from '../components/toast.tsx';
 import { useConfirm } from '../components/confirm-dialog.tsx';
@@ -14,12 +15,13 @@ import { useProjects } from '../hooks/use-projects.ts';
 import { useT } from '../i18n/index.tsx';
 import {
   isSpecStagePhase,
+  needsGitReviewRecovery,
   REVIEW_VERDICT_TIMEOUT_MS,
   TASK_TERMINAL_STATUS_SET,
   safeExternalHref,
   type AgentConfig,
   type AgentSnapshot,
-  type ReviewRound,
+  type TaskPhase,
   type TaskState,
 } from '../shared/index.js';
 
@@ -51,6 +53,12 @@ function branchTreeUrl(prUrl: string | undefined, branch: string): string | null
   return `${base[1]}/tree/${path}`;
 }
 
+function positivePrNumber(value: string): number | undefined {
+  if (!/^[1-9]\d*$/.test(value.trim())) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
 export function TaskDetail() {
   const { taskId = '' } = useParams<{ id: string; taskId: string }>();
   // key on taskId so switching tasks on this shared route remounts with fresh
@@ -67,12 +75,14 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   const [cancelling, setCancelling] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [reviewing, setReviewing] = useState(false);
+  const [reviewRecoveryOpen, setReviewRecoveryOpen] = useState(false);
+  const [reviewRecoveryStage, setReviewRecoveryStage] = useState<TaskPhase>('spec');
+  const [reviewRecoveryActorId, setReviewRecoveryActorId] = useState('');
+  const [reviewRecoveryPrNumber, setReviewRecoveryPrNumber] = useState('');
   const [completing, setCompleting] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [specSubmitting, setSpecSubmitting] = useState(false);
   const [specComments, setSpecComments] = useState('');
-  const [codeSubmitting, setCodeSubmitting] = useState(false);
-  const [codeComments, setCodeComments] = useState('');
   const [override, setOverride] = useState<TaskState | null>(null);
   const { data: streamed, loaded, error: errorPayload } = useTask(taskId);
   const { projects } = useProjects();
@@ -121,25 +131,17 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     }
   };
 
-  const handleReview = async () => {
-    if (!task) return;
-    const isTerminal = TASK_TERMINAL_STATUS_SET.has(task.status);
-    const ok = await (isTerminal
-      ? confirmDialog({
-          title: t.taskDetail.reReviewTerminalConfirmTitle,
-          body: t.taskDetail.reReviewTerminalConfirmBody(task.id, t.status[task.status] ?? task.status),
-          confirmLabel: t.agents.confirmReReviewLabel,
-        })
-      : confirmDialog({
-          title: t.agents.confirmReReviewTitle,
-          body: t.agents.confirmReReviewBody(task.id),
-          confirmLabel: t.agents.confirmReReviewLabel,
-        }));
-    if (!ok) return;
+  const dispatchReview = async (
+    reviewTask: TaskState,
+    body?: { stage?: TaskPhase; actorId?: string; prNumber?: number },
+  ) => {
     setReviewing(true);
     try {
-      const updated = await api.tasks.review(task.id);
+      const updated = body === undefined
+        ? await api.tasks.review(reviewTask.id)
+        : await api.tasks.review(reviewTask.id, body);
       commitTaskExternal(updated);
+      setReviewRecoveryOpen(false);
       const round = isSpecStagePhase(updated.phase) ? (updated.specReviewRound ?? 0) : updated.reviewRound;
       show({ kind: 'success', title: t.agents.reReviewStarted(round) });
     } catch (err) {
@@ -147,6 +149,24 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     } finally {
       setReviewing(false);
     }
+  };
+
+  const handleReview = async () => {
+    if (!task) return;
+    if (needsGitReviewRecovery(task)) {
+      setReviewRecoveryStage(task.phase ?? 'spec');
+      setReviewRecoveryActorId(task.replyActorId ?? '');
+      setReviewRecoveryPrNumber(task.prNumber?.toString() ?? '');
+      setReviewRecoveryOpen(true);
+      return;
+    }
+    const ok = await confirmDialog({
+      title: t.agents.confirmReReviewTitle,
+      body: t.agents.confirmReReviewBody(task.id),
+      confirmLabel: t.agents.confirmReReviewLabel,
+    });
+    if (!ok) return;
+    await dispatchReview(task);
   };
 
   const handleRetry = async () => {
@@ -202,7 +222,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
   };
 
   const submitSpecVerdict = async (
-    body: { verdict: 'approve' | 'request-changes' | 'archive'; comments?: string },
+    body: { verdict: 'approve' | 'request-changes'; comments?: string },
     toast: { success: string; failure: string },
   ) => {
     if (!task) return;
@@ -234,43 +254,10 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     await submitSpecVerdict(
       { verdict: 'request-changes', comments },
       {
-        success: task?.researchAgentId
-          ? t.taskDetail.specRejectedToastTitleResearch
-          : t.taskDetail.specRejectedToastTitle,
+        success: t.taskDetail.specRejectedToastTitle,
         failure: t.taskDetail.specRejectFailedTitle,
       },
     );
-  };
-
-  const handleSpecArchive = async () => {
-    if (!task) return;
-    const confirmed = await confirmDialog({
-      title: t.taskDetail.specArchiveConfirmTitle,
-      body: t.taskDetail.specArchiveConfirmBody(task.id),
-      confirmLabel: t.taskDetail.specArchive,
-    });
-    if (!confirmed) return;
-    await submitSpecVerdict(
-      { verdict: 'archive' },
-      { success: t.taskDetail.specArchivedToastTitle, failure: t.taskDetail.specArchiveFailedTitle },
-    );
-  };
-
-  const handleCodeReject = async () => {
-    if (!task) return;
-    const comments = codeComments.trim();
-    if (!comments) return;
-    setCodeSubmitting(true);
-    try {
-      const updated = await api.tasks.code(task.id, { verdict: 'request-changes', comments });
-      commitTaskExternal(updated);
-      setCodeComments('');
-      show({ kind: 'success', title: t.taskDetail.codeRejectedToastTitle });
-    } catch (err) {
-      show({ kind: 'error', title: t.taskDetail.codeRejectFailedTitle, body: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setCodeSubmitting(false);
-    }
   };
 
   const handleConfirmGate = async () => {
@@ -323,6 +310,109 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           onUpdated={commitTaskExternal}
         />
       )}
+      {reviewRecoveryOpen && task && (
+        <Modal
+          open
+          title={t.taskDetail.reviewRecoveryTitle}
+          onClose={() => {
+            if (!reviewing) setReviewRecoveryOpen(false);
+          }}
+          size="sm"
+          dismissOnBackdrop={!reviewing}
+          footer={
+            <>
+              <button
+                type="button"
+                disabled={reviewing}
+                onClick={() => setReviewRecoveryOpen(false)}
+                className="btn-secondary"
+              >
+                {t.common.cancel}
+              </button>
+              <button
+                type="submit"
+                form="review-recovery-form"
+                disabled={reviewing
+                  || reviewRecoveryActorId.trim() === ''
+                  || (task.prNumber === undefined
+                    && positivePrNumber(reviewRecoveryPrNumber) === undefined)}
+                className="btn-primary"
+              >
+                {reviewing ? t.agents.callingReview : t.taskDetail.reviewRecoverySubmit}
+              </button>
+            </>
+          }
+        >
+          <form
+            id="review-recovery-form"
+            className="space-y-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const actorId = reviewRecoveryActorId.trim();
+              const prNumber = task.prNumber ?? positivePrNumber(reviewRecoveryPrNumber);
+              if (!actorId || prNumber === undefined || reviewing) return;
+              void dispatchReview(task, {
+                stage: reviewRecoveryStage,
+                actorId,
+                ...(task.prNumber === undefined ? { prNumber } : {}),
+              });
+            }}
+          >
+            <p className="text-sm text-og-700">{t.taskDetail.reviewRecoveryBody}</p>
+            {task.prNumber === undefined && (
+              <div>
+                <label htmlFor="review-recovery-pr-number" className="mb-1 block text-sm text-og-700">
+                  {t.taskDetail.reviewRecoveryPrNumberLabel}
+                </label>
+                <input
+                  id="review-recovery-pr-number"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={reviewRecoveryPrNumber}
+                  required
+                  disabled={reviewing}
+                  onChange={(event) => setReviewRecoveryPrNumber(event.target.value)}
+                  placeholder={t.taskDetail.reviewRecoveryPrNumberPlaceholder}
+                  className={inputCls}
+                />
+              </div>
+            )}
+            <div>
+              <label htmlFor="review-recovery-stage" className="mb-1 block text-sm text-og-700">
+                {t.taskDetail.reviewRecoveryStageLabel}
+              </label>
+              <select
+                id="review-recovery-stage"
+                value={reviewRecoveryStage}
+                required
+                disabled={reviewing || task.phase !== undefined}
+                onChange={(event) => setReviewRecoveryStage(event.target.value as TaskPhase)}
+                className={inputCls}
+              >
+                <option value="spec">{t.review.phaseLabel.spec}</option>
+                <option value="code">{t.review.phaseLabel.code}</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor="review-recovery-actor" className="mb-1 block text-sm text-og-700">
+                {t.taskDetail.reviewRecoveryActorLabel}
+              </label>
+              <input
+                id="review-recovery-actor"
+                value={reviewRecoveryActorId}
+                required
+                disabled={reviewing || (
+                  task.replyActorStatus === 'verified' && task.replyActorId !== undefined
+                )}
+                onChange={(event) => setReviewRecoveryActorId(event.target.value)}
+                placeholder={t.taskDetail.reviewRecoveryActorPlaceholder}
+                className={inputCls}
+              />
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 
@@ -331,7 +421,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const showApprovedAction = task.status === 'approved' && task.prNumber !== undefined;
     const showMergeReadyAction = task.status === 'merge-ready' && task.prNumber !== undefined;
     const showSpecReadyAction = task.status === 'spec-ready';
-    const showReadyGate = task.status === 'ready';
     const showCodeMaxRounds = task.status === 'max_rounds' && !isSpecStagePhase(task.phase);
     const showSpecMaxRounds = task.status === 'max_rounds' && isSpecStagePhase(task.phase);
     const prHref = safeExternalHref(task.prUrl);
@@ -398,50 +487,6 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           </div>
         )}
 
-        {showReadyGate && (
-          <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
-            <div className="font-semibold">{t.taskDetail.readyGateBannerTitle}</div>
-            <div className="mt-1 text-og-700">
-              {t.taskDetail.readyGateBannerBody(task.reviewRound)}
-            </div>
-            <ReviewSummary taskId={task.id} />
-            {prHref && (
-              <a
-                href={prHref}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="btn-secondary mt-3"
-              >
-                {t.taskDetail.viewPr(task.prNumber ?? 0)}
-              </a>
-            )}
-            {task.reviewMode === 'server' && !isSpecStagePhase(task.phase) && (
-              <div className="mt-3 flex flex-col gap-2">
-                <div className="text-og-700">{t.taskDetail.readyGateRejectHint}</div>
-                <textarea
-                  value={codeComments}
-                  onChange={e => setCodeComments(e.target.value)}
-                  placeholder={t.taskDetail.codeRejectCommentsPlaceholder}
-                  rows={3}
-                  disabled={codeSubmitting}
-                  className={inputCls}
-                />
-                <div>
-                  <button
-                    type="button"
-                    disabled={codeSubmitting || completing || codeComments.trim() === ''}
-                    onClick={handleCodeReject}
-                    title={codeComments.trim() === '' ? t.taskDetail.codeRejectTitleEmpty : t.taskDetail.codeRejectTitleReady}
-                    className="btn-secondary"
-                  >
-                    {codeSubmitting ? t.taskDetail.submitting : t.taskDetail.codeReject}
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
         {showMergeReadyAction && (
           <div className="mb-4 rounded-lg border border-accent/25 bg-accent-soft p-4 text-sm text-accent">
             <div className="font-semibold">{t.taskDetail.mergeReadyBannerTitle}</div>
@@ -465,11 +510,9 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           <div className="mb-4 rounded-lg border border-accent-soft bg-accent-soft/40 p-4 text-sm text-accent">
             <div className="font-semibold">{t.taskDetail.specReadyBannerTitle}</div>
             <div className="mt-1 text-og-700">
-              {task.researchAgentId
-                ? t.taskDetail.specReadyNoticeResearch(task.specReviewRound ?? 0)
-                : t.taskDetail.specReadyNotice(task.specReviewRound ?? 0)}
+              {t.taskDetail.specReadyNotice(task.specReviewRound ?? 0)}
             </div>
-            {renderSpecVerdictControls(task)}
+            {renderSpecVerdictControls()}
           </div>
         )}
 
@@ -488,8 +531,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             <div className="mt-1 text-og-700">
               {t.taskDetail.specMaxRoundsBody}
             </div>
-            <ReviewSummary taskId={task.id} />
-            {renderSpecVerdictControls(task)}
+            {renderSpecVerdictControls()}
           </div>
         )}
 
@@ -529,7 +571,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     );
   }
 
-  function renderSpecVerdictControls(task: TaskState) {
+  function renderSpecVerdictControls() {
     return (
       <div className="mt-3 flex flex-col gap-2">
         <textarea
@@ -555,21 +597,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
             onClick={handleSpecReject}
             title={specComments.trim() === ''
               ? t.taskDetail.specRejectTitleEmpty
-              : t.taskDetail.specRejectTitleReady(task.researchAgentId ? 'Research' : 'Dev')}
+              : t.taskDetail.specRejectTitleReady('Dev')}
             className="btn-secondary"
           >
             {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specReject}
           </button>
-          {task.researchAgentId && (
-            <button
-              type="button"
-              disabled={specSubmitting}
-              onClick={handleSpecArchive}
-              className="btn-secondary"
-            >
-              {specSubmitting ? t.taskDetail.submitting : t.taskDetail.specArchiveButton}
-            </button>
-          )}
         </div>
       </div>
     );
@@ -581,23 +613,18 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     }
     const project = projects.find((p) => p.id === task.projectId);
     const group = project?.agent.find((g) => g.some((a) => a.id === task.devAgentId))
-      ?? (task.qaAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.qaAgentId)) : undefined)
-      ?? (task.researchAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.researchAgentId)) : undefined);
+      ?? (task.qaAgentId ? project?.agent.find((g) => g.some((a) => a.id === task.qaAgentId)) : undefined);
     const devConfig = group?.find((a) => a.role === 'dev' && a.id === task.devAgentId);
     const qaConfig = task.qaAgentId
       ? group?.find((a) => a.role === 'qa' && a.id === task.qaAgentId)
       : undefined;
-    const researchConfig = task.researchAgentId
-      ? group?.find((a) => a.role === 'research' && a.id === task.researchAgentId)
-      : undefined;
 
-    if (!devConfig && !qaConfig && !researchConfig) {
+    if (!devConfig && !qaConfig) {
       return <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">{t.taskDetail.noLinkedAgent}</div>;
     }
 
     return (
       <>
-        {researchConfig ? renderAgentCard(task, researchConfig) : null}
         {devConfig ? renderAgentCard(task, devConfig) : <AgentSlotPlaceholder role="dev" />}
         {qaConfig ? renderAgentCard(task, qaConfig) : <AgentSlotPlaceholder role="qa" />}
       </>
@@ -627,6 +654,7 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         terminalMode="embedded-full"
         active={activeAgentId === cfg.id}
         onActivate={() => activateAgentCard(cfg.id)}
+        task={task}
       />
     );
   }
@@ -635,19 +663,17 @@ function TaskDetailView({ taskId }: { taskId: string }) {
     const isMaxRounds = task.status === 'max_rounds';
     const isCodeMaxRounds = isMaxRounds && !isSpecStagePhase(task.phase);
     const isSpecMaxRounds = isMaxRounds && isSpecStagePhase(task.phase);
-    const isGate = task.status === 'ready' || task.status === 'merge-ready';
+    const isGate = task.status === 'merge-ready';
     const editEnabled = task.status === 'pending';
     const retryEnabled =
       (RETRYABLE_STATUSES.has(task.status) || isSpecMaxRounds) && !!task.preferredAgentId;
-    const isServerMode = task.reviewMode === 'server';
-    const serverStyleReview = isServerMode || isSpecStagePhase(task.phase);
-    const serverReviewUnphased = task.status === 'in_progress' && task.phase === undefined;
-    const serverReviewableNow = !serverReviewUnphased && (task.status === 'in_progress'
-      || task.status === 'review' || task.status === 'fixing');
-    const reviewEnabled = serverStyleReview ? serverReviewableNow : !!task.prNumber;
-    const completeEnabled = isCodeMaxRounds && (!!task.prNumber || isServerMode);
-    const continueEnabled = isCodeMaxRounds && (!!task.prNumber || isServerMode) && !!task.agentId;
-    const serverPublishRetry = isServerMode && task.status === 'approved';
+    const reviewEnabled = (
+      task.prNumber !== undefined
+      || (task.branch !== undefined && needsGitReviewRecovery(task))
+    ) && task.status !== 'pending'
+      && !TASK_TERMINAL_STATUS_SET.has(task.status);
+    const completeEnabled = isCodeMaxRounds && task.prNumber !== undefined;
+    const continueEnabled = completeEnabled && !!task.agentId;
     const isLegacy = task.preferredAgentId === '';
 
     return (
@@ -686,11 +712,11 @@ function TaskDetailView({ taskId }: { taskId: string }) {
           disabled={!reviewEnabled || reviewing}
           onClick={handleReview}
           title={
-            serverStyleReview
-              ? (reviewEnabled
+            TASK_TERMINAL_STATUS_SET.has(task.status)
+              ? t.taskDetail.reviewTerminalTitle
+              : reviewEnabled
                 ? t.taskDetail.reviewButtonTitle
-                : serverReviewUnphased ? t.taskDetail.reviewUnphasedTitle : t.taskDetail.reviewServerStatusTitle)
-              : (task.prNumber ? t.taskDetail.reviewButtonTitle : t.taskDetail.reviewNoPrTitle)
+                : t.taskDetail.reviewNoPrTitle
           }
           className="btn-secondary"
         >
@@ -721,23 +747,12 @@ function TaskDetailView({ taskId }: { taskId: string }) {
         {isGate && (
           <button
             type="button"
-            disabled={completing || codeSubmitting}
+            disabled={completing}
             onClick={handleConfirmGate}
             title={t.taskDetail.confirmButtonTitle}
             className="btn-primary"
           >
             {completing ? t.taskDetail.confirming : t.common.confirm}
-          </button>
-        )}
-        {serverPublishRetry && (
-          <button
-            type="button"
-            disabled={completing}
-            onClick={handleConfirmGate}
-            title={t.taskDetail.retryPublishButtonTitle}
-            className="btn-primary"
-          >
-            {completing ? t.common.retrying : t.taskDetail.retryPublish}
           </button>
         )}
       </>
@@ -750,27 +765,6 @@ function AgentSlotPlaceholder({ role }: { role: 'dev' | 'qa' }) {
   return (
     <div className="rounded-lg border border-hairline bg-surface px-3 py-6 text-center text-sm text-og-400">
       {t.taskDetail.noAgentSlot(role === 'dev' ? 'Dev' : 'QA')}
-    </div>
-  );
-}
-
-function ReviewSummary({ taskId }: { taskId: string }) {
-  const t = useT();
-  const [rounds, setRounds] = useState<ReviewRound[] | null>(null);
-  useEffect(() => {
-    let alive = true;
-    api.tasks.reviews(taskId)
-      .then(data => { if (alive) setRounds(data); })
-      .catch(() => { if (alive) setRounds([]); });
-    return () => { alive = false; };
-  }, [taskId]);
-  if (!rounds || rounds.length === 0) return null;
-  const last = rounds[rounds.length - 1];
-  const findingsCount = rounds.reduce((n, r) => n + (r.findings?.findings.length ?? 0), 0);
-  return (
-    <div className="mt-2 text-xs text-og-700">
-      {t.taskDetail.reviewSummaryPrefix}{rounds.length}{t.taskDetail.reviewSummaryMid}<span className="font-mono">{last.findings?.verdict ?? '—'}</span>
-      {t.taskDetail.reviewSummaryFindingsPrefix}{findingsCount}{t.taskDetail.reviewSummaryFindingsSuffix}
     </div>
   );
 }

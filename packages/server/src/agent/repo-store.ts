@@ -26,10 +26,6 @@ export function createRepoStoreCache(): RepoStoreCache {
 const FETCH_THROTTLE_MS = 30_000;
 const BAXIAN_RUNTIME_DIRS = [
   '.baxian',
-  '.baxian/review',
-  '.baxian/review/inbox',
-  '.baxian/review-inbox',
-  '.baxian/research',
 ] as const;
 
 export class BaxianRuntimeDirsError extends Error {

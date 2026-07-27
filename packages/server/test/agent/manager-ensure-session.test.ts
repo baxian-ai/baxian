@@ -28,6 +28,7 @@ const CONFIG: BaxianConfig = {
     merge: null,
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', yolo: true },
+      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo', yolo: true },
     ]],
   }],
 };
@@ -123,9 +124,10 @@ describe('AgentManager.ensureSession', () => {
       project: [{
         ...CONFIG.project[0],
         agent: [
+          ...CONFIG.project[0].agent,
           [
-            { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', yolo: true },
-            { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo', yolo: true },
+            { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo-2', yolo: true },
+            { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo-2', yolo: true },
           ],
         ],
       }],
@@ -147,9 +149,9 @@ describe('AgentManager.ensureSession', () => {
       preferredAgentId: 'dev-1',
       agentId: 'dev-1',
       devAgentId: 'dev-1',
+      qaAgentId: 'qa-1',
       phase: 'code',
       branch: `bx/${id}`,
-      reviewMode: 'server',
       reviewRound: 0,
       status: 'in_progress',
       createdAt: now,
@@ -738,10 +740,10 @@ describe('AgentManager.ensureSession', () => {
     expect(killCalled).toBe(true);
   });
 
-  it('prepareRemoveTargets: dev includes paired qa; qa returns only itself', async () => {
+  it('prepareRemoveTargets returns the whole group for either member', async () => {
     manager.replaceConfig(expandedConfig());
     expect(manager.prepareRemoveTargets('dev-1').targets).toEqual(['dev-1', 'qa-1']);
-    expect(manager.prepareRemoveTargets('qa-1').targets).toEqual(['qa-1']);
+    expect(manager.prepareRemoveTargets('qa-1').targets).toEqual(['dev-1', 'qa-1']);
   });
 
   it('previewPromptBytesForTaskInput: returns finite byte count without IO', () => {
@@ -776,9 +778,9 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('replaceConfig: rebuilds agentIndex so newly added agents are visible', async () => {
-    expect(manager.getAgentConfig('qa-1')).toBeUndefined();
+    expect(manager.getAgentConfig('qa-2')).toBeUndefined();
     manager.replaceConfig(expandedConfig());
-    expect(manager.getAgentConfig('qa-1')).toBeDefined();
+    expect(manager.getAgentConfig('qa-2')).toBeDefined();
   });
 
   it('replaceConfig preserves canonical ownership and rejects a newly configured alias', async () => {
@@ -813,6 +815,9 @@ describe('AgentManager.ensureSession', () => {
     ['idle Workdir change', [[{
       id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local',
       workdir: '/tmp/repo-new', yolo: true,
+    }, {
+      id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local',
+      workdir: '/tmp/qa-repo', yolo: true,
     }]]],
   ] as const)('replaceConfig releases the old canonical owner on %s', (_label, agent) => {
     manager.getRepoCache().owners.set('local:/tmp/repo', 'dev-1');

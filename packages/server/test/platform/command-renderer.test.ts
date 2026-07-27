@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { renderCommand, renderFixMessage, PlaceholderValueError } from '../../src/platform/command-renderer.js';
+import {
+  renderCommand,
+  renderCommandStdin,
+  renderFixMessage,
+  PlaceholderValueError,
+} from '../../src/platform/command-renderer.js';
 import { PLACEHOLDERS_WITH_PAGE, PREFLIGHT_FIXMESSAGE_PLACEHOLDERS } from '../../src/platform/types.js';
 
 const CTX = {
@@ -91,6 +96,7 @@ describe('command-renderer', () => {
       expectedHeadSha: 'abc123abc1',
       remoteProjectId: 'R_repo123',
       branch: 'bx/task-1',
+      body: 'comment body',
       page: 1,
       minToolVersion: '1.92.0',
     };
@@ -139,5 +145,43 @@ describe('command-renderer: {branch} placeholder', () => {
 
   it('requires a branch value in context', () => {
     expect(() => renderCommand({ argv: ['{branch}'] }, CTX)).toThrow(PlaceholderValueError);
+  });
+});
+
+describe('command-renderer: {body} placeholder', () => {
+  it('keeps multiline shell metacharacters inside one quoted argument', () => {
+    const body = 'fix `$HOME`\n$(touch /tmp/nope)\nline 3';
+    const cmd = renderCommand(
+      { argv: ['{binary}', 'api', '-f', 'body={body}'] },
+      { ...CTX, body },
+    );
+    expect(cmd).toContain("'body=fix `$HOME`\n$(touch /tmp/nope)\nline 3'");
+  });
+
+  it('rejects blank and oversized comment bodies', () => {
+    expect(() => renderCommand({ argv: ['{body}'] }, { ...CTX, body: '  \n' }))
+      .toThrow(PlaceholderValueError);
+    expect(() => renderCommand({ argv: ['{body}'] }, { ...CTX, body: 'x'.repeat(65_537) }))
+      .toThrow(/exceeds 65536 bytes/);
+  });
+
+  it('rejects NUL before the command reaches the process runner', () => {
+    expect(() => renderCommand({ argv: ['{body}'] }, { ...CTX, body: 'before\0after' }))
+      .toThrow(/must not contain NUL/);
+  });
+
+  it('keeps a quote-heavy legal comment out of the bash -c argument and preserves it on stdin', () => {
+    const body = "'".repeat(40 * 1024);
+    const op = {
+      argv: ['{binary}', 'api', '-F', 'body=@-'],
+      stdin: '{body}',
+    };
+
+    const cmd = renderCommand(op, { ...CTX, body });
+    const stdin = renderCommandStdin(op, { ...CTX, body });
+
+    expect(cmd).toBe("'/opt/glab' 'api' '-F' 'body=@-'");
+    expect(cmd).not.toContain(body);
+    expect(stdin).toEqual(Buffer.from(body));
   });
 });

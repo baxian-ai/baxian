@@ -156,10 +156,7 @@ describe('runPreflight', () => {
 
   it('detects gh auth failure', async () => {
     const runner = mockRunner({ 'gh auth status': FAIL });
-    const results = await runPreflight(
-      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
-      { requireGitHubCli: true },
-    );
+    const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     expect(results.find(r => r.step === 'gh')).toMatchObject({
       ok: false,
       message: 'Run "gh auth login" or set GITHUB_TOKEN',
@@ -173,10 +170,7 @@ describe('runPreflight', () => {
       if (cmd === 'gh auth status') throw new Error('Command timed out after 30000ms');
       return fallbackExec(cmd, options);
     });
-    const results = await runPreflight(
-      fallback, makeAgent(), 'user/repo', undefined, undefined, undefined,
-      { requireGitHubCli: true },
-    );
+    const results = await runPreflight(fallback, makeAutoAgent(), 'user/repo');
     expect(results.find(r => r.step === 'gh')).toMatchObject({ ok: false });
     expect(results.find(r => r.step === 'gh')?.message).toContain('outcome is unknown');
     const call = (fallback.exec as ReturnType<typeof vi.fn>).mock.calls.find(c => c[0] === 'gh auth status');
@@ -187,10 +181,7 @@ describe('runPreflight', () => {
     const runner = mockRunner({
       'gh auth status': { stdout: '', stderr: 'connection reset by peer', exitCode: 255 },
     });
-    const results = await runPreflight(
-      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
-      { requireGitHubCli: true },
-    );
+    const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     const gh = results.find(r => r.step === 'gh');
     expect(gh).toMatchObject({ ok: false });
     expect(gh?.message).toContain('outcome is unknown');
@@ -199,10 +190,7 @@ describe('runPreflight', () => {
 
   it('detects repo access failure via gh api', async () => {
     const runner = mockRunner({ 'gh api repos/': FAIL });
-    const results = await runPreflight(
-      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
-      { requireGitHubCli: true },
-    );
+    const results = await runPreflight(runner, makeAutoAgent(), 'user/repo');
     expect(results.find(r => r.step === 'gh-repo')?.ok).toBe(false);
   });
 
@@ -486,7 +474,7 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
 
     const results = await runPreflight(
       runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
-      { requireGitHubCli: false, requireGitPush: false },
+      { requireGitPush: false },
     );
 
     expect(results.find(r => r.step === 'workdir')?.ok).toBe(true);
@@ -494,16 +482,6 @@ describe('runPreflight — non-GitHub (generic git) repos', () => {
     expect(results.find(r => r.step === 'git')?.message).toContain('fetch/checkout would fail');
     expect(execCmds(runner).some(c => c.includes('git remote get-url origin'))).toBe(true);
     expect(execCmds(runner).some(c => c.includes('git ls-remote'))).toBe(false);
-  });
-
-  it('a manual github server project runs gh checks when PR publication is required', async () => {
-    const runner = mockRunner({});
-    const results = await runPreflight(
-      runner, makeAgent(), 'user/repo', undefined, undefined, undefined,
-      { requireGitHubCli: true },
-    );
-    expect(results.find(r => r.step === 'gh')).toBeDefined();
-    expect(results.find(r => r.step === 'gh-repo')).toBeDefined();
   });
 
   it('a non-github server project never touches gh', async () => {
@@ -577,17 +555,6 @@ describe('runPreflight — git platform track', () => {
     );
     const repoStep = badResults.find(r => r.step === 'platform-repo');
     expect(repoStep?.ok).toBe(false);
-  });
-
-  it('keeps a research host green on missing push permission (non-publishing role)', async () => {
-    const runner = mockRunner({});
-    const results = await runPreflight(
-      runner, makeAgent({ role: 'research' }), 'git@github.com:user/repo.git', undefined, 'p1',
-      gitPlatform({}, { defaultBranch: 'main', pushPermitted: false }),
-    );
-    const push = results.find(r => r.step === 'platform-push');
-    expect(push?.ok).toBe(true);
-    expect(push?.message).toContain('research');
   });
 
   it('warns without failing when the plugin does not map pushPermitted', async () => {
@@ -750,14 +717,12 @@ describe('runPreflight — git platform track', () => {
   });
 
   it('skips the platform-skill dependency probe for roles that never run those commands', async () => {
-    for (const role of ['qa', 'research'] as const) {
-      const runner = mockRunner({ 'command -v openssl': FAIL, 'command -v shasum': FAIL, 'command -v sha256sum': FAIL });
-      const results = await runPreflight(
-        runner, makeAgent({ role }), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform(),
-      );
-      expect(results.some(r => r.step === 'platform-skill-deps'), role).toBe(false);
-      expect(execCmds(runner).every(c => !c.includes('command -v openssl')), role).toBe(true);
-    }
+    const runner = mockRunner({ 'command -v openssl': FAIL, 'command -v shasum': FAIL, 'command -v sha256sum': FAIL });
+    const results = await runPreflight(
+      runner, makeAgent({ role: 'qa' }), 'git@github.com:user/repo.git', undefined, 'p1', gitPlatform(),
+    );
+    expect(results.some(r => r.step === 'platform-skill-deps')).toBe(false);
+    expect(execCmds(runner).every(c => !c.includes('command -v openssl'))).toBe(true);
   });
 
   it('probes nothing for a plugin that declares no agent-side commands', async () => {

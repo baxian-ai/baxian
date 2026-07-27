@@ -34,7 +34,6 @@ const CONFIG: BaxianConfig = {
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
       { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-      { id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: '/tmp/research-repo' },
     ]],
   }],
 };
@@ -84,22 +83,26 @@ async function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string })
 }
 
 function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void> {
-  return taskStore.set({
+  const task = {
     projectId: 'proj',
     title: 'T',
     description: 'D',
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     branch: `bx/${overrides.id}`,
     reviewRound: 0,
-    reviewMode: 'git',
     platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
     status: 'in_progress',
     createdAt: NOW,
     updatedAt: NOW,
     ...overrides,
-  });
+  } as TaskState;
+  if (task.phase !== undefined && !Object.hasOwn(overrides, 'deliveryConfirmation')) {
+    task.deliveryConfirmation = { phase: task.phase, source: 'signal', at: NOW };
+  }
+  return taskStore.set(task);
 }
 
 function postApproveEpisode(token: string, headSha: string): Partial<TaskState> {
@@ -273,7 +276,7 @@ describe('recover()', () => {
 
   it('redrives context compaction for a recovered done-task binding (terminal without pr)', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0' });
-    await seedTask({ id: 'task-done', reviewMode: 'server', status: 'done' });
+    await seedTask({ id: 'task-done', status: 'done' });
     mockEnsureSessionOk();
     let paneIdSeenByCompaction: string | undefined;
     const compactSpy = vi.spyOn(
@@ -298,7 +301,7 @@ describe('recover()', () => {
   it('redrives context compaction for a recovered merged binding without a PR (branch merge)', async () => {
     await seedAgent({ id: 'qa-1', taskId: 'task-branch-merged', paneId: '%0' });
     await seedTask({
-      id: 'task-branch-merged', reviewMode: 'server', status: 'merged',
+      id: 'task-branch-merged', status: 'merged',
       preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1',
     });
     mockEnsureSessionOk();
@@ -450,28 +453,7 @@ describe('recover()', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('rolls back an undelivered Research bootstrap without changing its stable participants', async () => {
-    await runRecovery({
-      agents: [{ id: 'research-1', taskId: 'task-research', bootstrappingTaskId: 'task-research' }],
-      tasks: [{
-        id: 'task-research',
-        preferredAgentId: 'research-1',
-        agentId: 'research-1',
-        devAgentId: 'dev-1',
-        researchAgentId: 'research-1',
-        phase: 'research',
-      }],
-    });
-
-    await expectRolledBack('task-research', 'research-1');
-    expect(await taskStore.get('task-research')).toMatchObject({
-      devAgentId: 'dev-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-    });
-  });
-
-  it('releases a Dev bootstrap marker left behind before a spec-ready code transition', async () => {
+  it('clears a Dev bootstrap marker left behind at the spec-ready gate', async () => {
     await runRecovery({
       agents: [{
         id: 'dev-1',
@@ -481,10 +463,9 @@ describe('recover()', () => {
       }],
       tasks: [{
         id: 'task-spec-ready',
-        preferredAgentId: 'research-1',
-        agentId: 'research-1',
+        preferredAgentId: 'dev-1',
+        agentId: 'dev-1',
         devAgentId: 'dev-1',
-        researchAgentId: 'research-1',
         phase: 'spec',
         status: 'spec-ready',
       }],
@@ -492,14 +473,37 @@ describe('recover()', () => {
 
     expect(await taskStore.get('task-spec-ready')).toMatchObject({
       status: 'spec-ready',
-      agentId: 'research-1',
+      agentId: 'dev-1',
       devAgentId: 'dev-1',
     });
-    expect(await agentStore.get('dev-1')).toMatchObject({ workdir: '/tmp/repo' });
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
+    expect(await agentStore.get('dev-1')).toMatchObject({ workdir: '/tmp/repo', taskId: 'task-spec-ready' });
     expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
+    expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
+
+  it.each(['spec-ready', 'max_rounds'] as const)(
+    'releases a QA binding stranded after the %s verdict gate was persisted',
+    async (status) => {
+      await runRecovery({
+        agents: [{
+          id: 'qa-1',
+          taskId: 'task-verdict-gate',
+        }],
+        tasks: [{
+          id: 'task-verdict-gate',
+          phase: 'spec',
+          status,
+        }],
+      });
+
+      expect(await taskStore.get('task-verdict-gate')).toMatchObject({
+        status,
+        qaAgentId: 'qa-1',
+      });
+      expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
+      expect(await lockManager.isLocked('qa-1')).toBe(false);
+    },
+  );
 
   it('rolls back a mid-bootstrap task without deleting the fixed Workdir', async () => {
     const { cleanupSpy } = await runRecovery({
@@ -732,8 +736,10 @@ describe('redispatchCurrentTaskPhase()', () => {
       signalToken: 'abcdef123456',
       reviewRound: 2,
       qaAgentId: 'qa-1',
-      reviewMode: 'git',
       prNumber: 42,
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+      replyActorId: '77',
+      replyActorStatus: 'verified',
     });
     vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
       ok: true,
@@ -754,39 +760,6 @@ describe('redispatchCurrentTaskPhase()', () => {
     expect((await taskStore.get('task-review'))?.signalToken).not.toBe('abcdef123456');
   });
 
-  it('does not classify a server-review failure after its own dispatch mutation as stale', async () => {
-    await seedTask({
-      id: 'task-review',
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 2,
-      qaAgentId: 'qa-1',
-      reviewMode: 'server',
-    });
-    manager.setServerReviewDriver({
-      dispatchCodeReview: vi.fn(async (_task, opts) => {
-        opts?.onSideEffect?.();
-        const current = await taskStore.get('task-review');
-        await taskStore.set({
-          ...current!,
-          signalToken: 'fedcba654321',
-          updatedAt: new Date().toISOString(),
-        });
-        throw new ApiError(409, 'server review pass changed after QA release', 'dispatch-superseded');
-      }),
-      dispatchSpecReview: vi.fn(async () => true),
-    });
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    })).rejects.toMatchObject({ status: 409, code: 'dispatch-superseded' });
-  });
-
   it('does not classify a git re-acquire failure as stale after releasing the prior QA', async () => {
     await seedTask({
       id: 'task-review',
@@ -795,8 +768,10 @@ describe('redispatchCurrentTaskPhase()', () => {
       signalToken: 'abcdef123456',
       reviewRound: 2,
       qaAgentId: 'qa-1',
-      reviewMode: 'git',
       prNumber: 42,
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+      replyActorId: '77',
+      replyActorStatus: 'verified',
     });
     await seedAgent({ id: 'qa-1', taskId: 'task-review' });
     vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
@@ -818,13 +793,10 @@ describe('redispatchCurrentTaskPhase()', () => {
     expect((await taskStore.get('task-review'))?.signalToken).not.toBe('abcdef123456');
   });
 
-  it.each([
-    ['a git review without a PR', { reviewMode: 'git' as const, prNumber: undefined }],
-    ['a git review without a QA participant', { reviewMode: 'git' as const, prNumber: 42, qaAgentId: undefined }],
-  ])('classifies %s as unsupported without consuming recovery budget', async (_name, overrides) => {
+  it('classifies a git review without a PR as unsupported without consuming recovery budget', async () => {
     await seedTask({
       id: 'task-review', status: 'review', phase: 'code', signalToken: 'entry-pass', reviewRound: 2,
-      qaAgentId: 'qa-1', ...overrides,
+      qaAgentId: 'qa-1', prNumber: undefined,
     });
     const guard = {
       status: 'review' as const,
@@ -849,25 +821,9 @@ describe('redispatchCurrentTaskPhase()', () => {
   ])('classifies %s as unsupported before creating a git review pass', async (_name, verification) => {
     await seedTask({
       id: 'task-review', status: 'review', phase: 'code', signalToken: 'entry-pass', reviewRound: 2,
-      qaAgentId: 'qa-1', reviewMode: 'git', prNumber: 42,
+      qaAgentId: 'qa-1', prNumber: 42,
     });
     vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue(verification);
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review', phase: 'code', signalToken: 'entry-pass', agentId: 'dev-1', reviewRound: 2,
-    })).resolves.toBe('unsupported');
-    expect((await taskStore.get('task-review'))?.signalToken).toBe('entry-pass');
-  });
-
-  it('classifies a missing server-review QA partner as unsupported', async () => {
-    await seedTask({
-      id: 'task-review', status: 'review', phase: 'code', signalToken: 'entry-pass', reviewRound: 2,
-      qaAgentId: undefined, reviewMode: 'server', prNumber: undefined,
-    });
-    manager.setServerReviewDriver({
-      dispatchCodeReview: vi.fn(async () => true),
-      dispatchSpecReview: vi.fn(async () => true),
-    });
 
     await expect(manager.redispatchCurrentTaskPhase('task-review', {
       status: 'review', phase: 'code', signalToken: 'entry-pass', agentId: 'dev-1', reviewRound: 2,
@@ -1034,31 +990,6 @@ describe('setupRecoveredPostApproveSignals()', () => {
     });
   });
 
-  it('does not install a post-approve watcher for an approved server publish task', async () => {
-    await seedTask({
-      id: 'task-server-approved', reviewMode: 'server', reviewRound: 1, status: 'approved',
-      afterDone: 'pr', publishDispatchedAt: NOW,
-    });
-    const watcher = {
-      start: vi.fn(async () => true),
-      stop: vi.fn(),
-    };
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: new EventBus(new EventLog(join(tempDir, 'events-merge-ready'))),
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
-      phaseSignalWatcher: watcher as never,
-    });
-
-    await manager.setupRecoveredPostApproveSignals();
-
-    expect(watcher.start).not.toHaveBeenCalled();
-  });
-
   it('reports an approved git task whose persisted post-approve episode is incomplete', async () => {
     await seedTask({
       id: 'task-approved-incomplete', reviewRound: 1, status: 'approved',
@@ -1117,7 +1048,10 @@ describe('setupRecoveredPostApproveSignals()', () => {
 describe('git review dispatch recovery', () => {
   it('resets an unbound claimed lease to pending after restart', async () => {
     await seedTask({
-      id: 'task-unbound-claim', reviewMode: 'git', status: 'in_progress', qaAgentId: 'qa-1',
+      id: 'task-unbound-claim', status: 'in_progress', phase: 'code',
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+      replyActorId: '77', replyActorStatus: 'verified', prNumber: 42,
+      signalToken: 'delivery-pass-1', qaAgentId: 'qa-1',
     });
     const begun = await manager.beginGitReviewPass('task-unbound-claim', {
       fromStatus: ['in_progress'], headSha: 'a'.repeat(40), bumpRound: true,
@@ -1131,7 +1065,10 @@ describe('git review dispatch recovery', () => {
 
   it('marks a claimed lease uncertain when the QA binding may have received it', async () => {
     await seedTask({
-      id: 'task-bound-claim', reviewMode: 'git', status: 'in_progress', qaAgentId: 'qa-1',
+      id: 'task-bound-claim', status: 'in_progress', phase: 'code',
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+      replyActorId: '77', replyActorStatus: 'verified', prNumber: 42,
+      signalToken: 'delivery-pass-2', qaAgentId: 'qa-1',
     });
     const begun = await manager.beginGitReviewPass('task-bound-claim', {
       fromStatus: ['in_progress'], headSha: 'b'.repeat(40), bumpRound: true,
@@ -1159,12 +1096,9 @@ describe('setupRecoveredSpecSignals()', () => {
     const watcher = {
       start: vi.fn(async () => true),
       stop: vi.fn(),
-      has: vi.fn(() => false),
+      has: vi.fn(() => true),
       isSettling: vi.fn(() => false),
-      settlePermitMatches: vi.fn(() => false),
-      exclusiveOwnerMatches: vi.fn(() => false),
       awaitSettled: vi.fn(async () => undefined),
-      runExclusive: vi.fn(async (_taskId: string, fn: (owner: symbol) => Promise<unknown>) => fn(Symbol('owner-test'))),
     };
     const eventsDir = join(tempDir, 'events-spec');
     await mkdir(eventsDir, { recursive: true });
@@ -1184,77 +1118,34 @@ describe('setupRecoveredSpecSignals()', () => {
     return { watcher, events: localEvents };
   }
 
-  it.each<[string, Partial<TaskState> & { id: string }, unknown]>([
-    ['sets up spec-done|pr-created when Dev-SDD has not chosen a path yet',
-      { id: 'task-1', signalToken: 'tok-ready' },
+  it.each<[string, Partial<TaskState> & { id: string }, Record<string, unknown>]>([
+    ['sets up spec-done|pr-created before the development path is known',
+      { id: 'task-initial', signalToken: 'tok-ready' },
       {
-        taskId: 'task-1', projectId: 'proj', agentId: 'dev-1',
+        taskId: 'task-initial', projectId: 'proj', agentId: 'dev-1',
         expectedKinds: ['spec-done', 'pr-created'], token: 'tok-ready',
-        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
-    ['sets up spec-done for an in-progress Research task',
-      {
-        id: 'task-research',
-        preferredAgentId: 'research-1',
-        agentId: 'research-1',
-        researchAgentId: 'research-1',
-        phase: 'research',
-        signalToken: 'tok-research',
-      },
-      {
-        taskId: 'task-research', projectId: 'proj', agentId: 'research-1',
-        expectedKinds: ['spec-done'], token: 'tok-research',
-        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
-    ['sets up pr-created for code-phase tasks (dispatched after spec approval)',
+        skipSnapshot: false, recovered: true, needInputInherit: true,
+      }],
+    ['sets up pr-created for code-phase development',
       { id: 'task-code', phase: 'code', signalToken: 'tok-code' },
       {
         taskId: 'task-code', projectId: 'proj', agentId: 'dev-1',
-        expectedKinds: ['pr-created'], token: 'tok-code', skipSnapshot: true, recovered: true,
-        needInputInherit: true,
+        expectedKinds: ['pr-created'], token: 'tok-code',
+        skipSnapshot: false, recovered: true, needInputInherit: true,
       }],
-    ['sets up spec-reviewed for spec-phase review tasks',
-      { id: 'task-2', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec', signalToken: 'tok-review', status: 'review' },
-      expect.objectContaining({
-        taskId: 'task-2', projectId: 'proj', agentId: 'qa-1',
-        expectedKinds: ['spec-reviewed'], token: 'tok-review',
-        skipSnapshot: false, onReadFile: expect.any(Function), recovered: true,
-      })],
-    ['sets up spec-fixed for spec-phase fixing tasks',
-      { id: 'task-3', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec', signalToken: 'tok-fix', status: 'fixing' },
+    ['sets up pr-fixed for spec fixes',
+      { id: 'task-spec-fix', phase: 'spec', status: 'fixing', signalToken: 'tok-spec-fix' },
       {
-        taskId: 'task-3', projectId: 'proj', agentId: 'dev-1',
-        expectedKinds: ['spec-fixed'], token: 'tok-fix',
-        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
-    ['sets up pr-fixed for code-phase fixing tasks',
-      { id: 'task-code-fix', qaAgentId: 'qa-1', reviewRound: 1, phase: 'code', signalToken: 'tok-prfix', status: 'fixing', prNumber: 60 },
+        taskId: 'task-spec-fix', projectId: 'proj', agentId: 'dev-1',
+        expectedKinds: ['pr-fixed'], token: 'tok-spec-fix',
+        skipSnapshot: false, recovered: true, needInputInherit: true,
+      }],
+    ['sets up pr-fixed for code fixes',
+      { id: 'task-code-fix', phase: 'code', status: 'fixing', signalToken: 'tok-code-fix' },
       {
         taskId: 'task-code-fix', projectId: 'proj', agentId: 'dev-1',
-        expectedKinds: ['pr-fixed'], token: 'tok-prfix',
-        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
-    ['recovers the server code-review watcher for review-phase tasks with qaAgentId',
-      {
-        id: 'task-pr-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review',
-        signalToken: 'tok-verdict', prNumber: 50, reviewMode: 'server', platformBinding: undefined,
-      },
-      // mode undefined 不开侧道（读 dev workdir 会污染 head 评审），另发 ambiguous-checkout 干预
-      {
-        taskId: 'task-pr-review', projectId: 'proj', agentId: 'qa-1',
-        expectedKinds: ['code-reviewed'], token: 'tok-verdict',
-        skipSnapshot: false, recovered: true, needInputInherit: true,       }],
-    ['sets up snapshot scan and read-file for github spec-review tasks',
-      { id: 'task-gh-spec', qaAgentId: 'qa-1', specReviewRound: 1, status: 'review', phase: 'spec', reviewMode: 'git', signalToken: 'tok-spec' },
-      expect.objectContaining({
-        taskId: 'task-gh-spec', agentId: 'qa-1', expectedKinds: ['spec-reviewed'],
-        skipSnapshot: false, onReadFile: expect.any(Function),
-      })],
-    ['restores the passive watcher for git code-review tasks',
-      {
-        id: 'task-git-review', qaAgentId: 'qa-1', reviewRound: 1, status: 'review',
-        phase: 'code', reviewMode: 'git', signalToken: 'tok-git-review',
-      },
-      {
-        taskId: 'task-git-review', projectId: 'proj', agentId: 'qa-1',
-        expectedKinds: [], token: 'tok-git-review', skipSnapshot: false,
-        recovered: true, needInputInherit: true,
+        expectedKinds: ['pr-fixed'], token: 'tok-code-fix',
+        skipSnapshot: false, recovered: true, needInputInherit: true,
       }],
   ])('%s', async (_label, task, expectedArg) => {
     await seedTask(task);
@@ -1265,24 +1156,38 @@ describe('setupRecoveredSpecSignals()', () => {
     expect(watcher.start).toHaveBeenCalledWith(expectedArg);
   });
 
-  it('restores a passive git review watcher without a signal-waiting intervention', async () => {
+  it.each([
+    ['spec', 'task-spec-review'],
+    ['code', 'task-code-review'],
+  ] as const)('restores the passive platform watcher for %s review', async (phase, id) => {
     await seedTask({
-      id: 'task-git-passive', qaAgentId: 'qa-1', reviewRound: 1, status: 'review',
-      phase: 'code', reviewMode: 'git', signalToken: 'tok-git-passive',
+      id,
+      phase,
+      status: 'review',
+      signalToken: `tok-${phase}-review`,
     });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
 
-    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({ expectedKinds: [] }));
+    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: id,
+      agentId: 'qa-1',
+      expectedKinds: [],
+      token: `tok-${phase}-review`,
+      skipSnapshot: false,
+      recovered: true,
+    }));
     expect(localEvents.some(event =>
       event.type === 'human.intervention'
-      && event.data.phase === 'spec-signal-setup-during-recovery')).toBe(false);
+      && event.data.phase === 'phase-signal-setup-during-recovery')).toBe(false);
   });
 
   it.each<[string, Partial<TaskState> & { id: string }]>([
-    ['skips tasks without signalToken', { id: 'task-4' }],
-    ['skips terminal tasks even when signalToken is set', { id: 'task-5', signalToken: 'tok-stale', status: 'merged' }],
+    ['skips tasks without signalToken', { id: 'task-no-token' }],
+    ['skips terminal tasks even when signalToken is set', {
+      id: 'task-terminal', signalToken: 'tok-stale', status: 'merged',
+    }],
   ])('%s', async (_label, task) => {
     await seedTask(task);
     const { watcher } = await buildManagerWithSpecWatcher();
@@ -1292,226 +1197,88 @@ describe('setupRecoveredSpecSignals()', () => {
     expect(watcher.start).not.toHaveBeenCalled();
   });
 
-  it('emits info intervention for each recovered spec-phase task', async () => {
+  it('reports a recovered fix signal without restoring the retired read-file side channel', async () => {
     await seedTask({
-      id: 'task-armed-1', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec',
-      signalToken: 'tok-armed-review', status: 'review',
-    });
-    await seedTask({
-      id: 'task-armed-2', qaAgentId: 'qa-1', specReviewRound: 2, phase: 'spec',
-      signalToken: 'tok-armed-fix', status: 'fixing',
+      id: 'task-fixing',
+      phase: 'code',
+      status: 'fixing',
+      signalToken: 'tok-fixing',
     });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
 
-    expect(watcher.start).toHaveBeenCalledTimes(2);
-    const setupInterventions = localEvents.filter(e =>
-      e.type === 'human.intervention'
-      && (e.data.phase as string) === 'spec-signal-setup-during-recovery',
-    );
-    expect(setupInterventions).toHaveLength(2);
-    const taskIds = setupInterventions.map(e => e.taskId).sort();
-    expect(taskIds).toEqual(['task-armed-1', 'task-armed-2']);
-    const kinds = setupInterventions.map(e => e.data.kind as string).sort();
-    expect(kinds).toEqual(['spec-fixed', 'spec-reviewed']);
-  });
-
-  it('skips snapshot and read-file for github code-phase tasks', async () => {
-    await seedTask({
-      id: 'task-gh-code', phase: 'code', reviewMode: 'git', signalToken: 'tok-code',
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
-    expect(args.expectedKinds).toEqual(['pr-created']);
-    expect(args.skipSnapshot).toBe(true);
+    const args = watcher.start.mock.calls[0]![0] as Record<string, unknown>;
+    expect(args.expectedKinds).toEqual(['pr-fixed']);
+    expect(args.skipSnapshot).toBe(false);
     expect('onReadFile' in args).toBe(false);
+    expect(localEvents).toContainEqual(expect.objectContaining({
+      type: 'human.intervention',
+      taskId: 'task-fixing',
+      data: expect.objectContaining({
+        phase: 'phase-signal-setup-during-recovery',
+        kind: 'pr-fixed',
+      }),
+    }));
   });
 
-  it('skips the manual-retry intervention when a snapshot completion is settling and advances the task', async () => {
+  it('does not report a stale recovery intervention after the snapshot advances the task generation', async () => {
     await seedTask({
-      id: 'task-settling', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec',
-      signalToken: 'tok-settling', status: 'review',
+      id: 'task-fixing-snapshot',
+      phase: 'code',
+      status: 'fixing',
+      signalToken: 'tok-fixing-snapshot',
     });
     const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
     watcher.isSettling.mockReturnValue(true);
     watcher.awaitSettled.mockImplementation(async () => {
-      const current = await taskStore.get('task-settling');
-      await taskStore.set({ ...current!, signalToken: 'tok-rotated', updatedAt: new Date().toISOString() });
+      const task = (await taskStore.get('task-fixing-snapshot'))!;
+      await taskStore.set({
+        ...task,
+        status: 'review',
+        signalToken: 'tok-review-successor',
+        updatedAt: new Date().toISOString(),
+      });
+      watcher.has.mockReturnValue(false);
     });
 
     await manager.setupRecoveredSpecSignals();
 
-    expect(watcher.start).toHaveBeenCalled();
+    expect(watcher.awaitSettled).toHaveBeenCalledWith('task-fixing-snapshot');
     expect(localEvents.some(event =>
       event.type === 'human.intervention'
-      && event.data.phase === 'spec-signal-setup-during-recovery')).toBe(false);
+      && event.data.phase === 'phase-signal-setup-during-recovery')).toBe(false);
   });
 
-  it('still emits the manual-retry intervention when settling released without advancing the task', async () => {
+  it('restores both the passive review watcher and an unverified PR delivery watcher', async () => {
     await seedTask({
-      id: 'task-settled-noop', qaAgentId: 'qa-1', specReviewRound: 1, phase: 'spec',
-      signalToken: 'tok-noop', status: 'review',
-    });
-    const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
-    watcher.isSettling.mockReturnValue(true);
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(localEvents.some(event =>
-      event.type === 'human.intervention'
-      && event.data.phase === 'spec-signal-setup-during-recovery')).toBe(true);
-  });
-
-  it('keeps read-file closed for an unknown checkout mode and escalates ambiguous-checkout (crash before mode persisted)', async () => {
-    await seedTask({
-      id: 'task-server-code-review',
-      qaAgentId: 'qa-1',
+      id: 'task-pending-pr',
       phase: 'code',
-      reviewMode: 'server',
       status: 'review',
-      reviewRound: 1,
-      signalToken: 'tok-code-review',
-    });
-    const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
-    expect(args.expectedKinds).toEqual(['code-reviewed']);
-    expect(args.skipSnapshot).toBe(false);
-    expect('onReadFile' in args).toBe(false);
-    expect(localEvents.some(event =>
-      event.type === 'human.intervention'
-      && event.data.phase === 'server-review-recovery-ambiguous-checkout')).toBe(true);
-  });
-
-  it('recovers read-file for a server code review persisted as base mode without the ambiguity escalation', async () => {
-    await seedTask({
-      id: 'task-server-code-base',
-      qaAgentId: 'qa-1',
-      phase: 'code',
-      reviewMode: 'server',
-      status: 'review',
-      reviewRound: 1,
-      signalToken: 'tok-code-base',
-      reviewCheckoutMode: 'base',
-    });
-    const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
-    expect('onReadFile' in args).toBe(true);
-    expect(localEvents.some(event =>
-      event.type === 'human.intervention'
-      && event.data.phase === 'server-review-recovery-ambiguous-checkout')).toBe(false);
-  });
-
-  it('does not recover read-file for a server code review persisted as head mode', async () => {
-    await seedTask({
-      id: 'task-server-code-head',
-      qaAgentId: 'qa-1',
-      phase: 'code',
-      reviewMode: 'server',
-      status: 'review',
-      reviewRound: 1,
-      signalToken: 'tok-code-head',
-      reviewCheckoutMode: 'head',
+      signalToken: 'tok-review',
+      pendingPrSignalToken: 'tok-pending-pr',
+      replyActorStatus: 'provisional',
+      prNumber: 42,
     });
     const { watcher } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
 
-    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
-    expect(args.expectedKinds).toEqual(['code-reviewed']);
-    expect('onReadFile' in args).toBe(false);
-  });
-
-
-  it('recovers read-file for server batch continuations', async () => {
-    await seedTask({
-      id: 'task-server-code-batch',
-      qaAgentId: 'qa-1',
-      phase: 'code',
-      reviewMode: 'server',
-      status: 'review',
-      reviewRound: 1,
-      batchIndex: 1,
-      batchTotal: 2,
-      signalToken: 'tok-code-batch',
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
+    expect(watcher.start).toHaveBeenCalledTimes(2);
     expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
-      expectedKinds: ['code-reviewed'],
-      onReadFile: expect.any(Function),
-      skipSnapshot: false,
+      taskId: 'task-pending-pr',
+      agentId: 'qa-1',
+      expectedKinds: [],
+      token: 'tok-review',
+      replaceScope: 'agent',
     }));
-  });
-
-  it('recovers read-file for a base-fallback server code review', async () => {
-    await seedTask({
-      id: 'task-server-code-base',
-      qaAgentId: 'qa-1',
-      phase: 'code',
-      reviewMode: 'server',
-      status: 'review',
-      reviewRound: 1,
-      reviewCheckoutMode: 'base',
-      signalToken: 'tok-code-base',
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
     expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({
-      expectedKinds: ['code-reviewed'],
-      onReadFile: expect.any(Function),
-      skipSnapshot: false,
+      taskId: 'task-pending-pr',
+      agentId: 'dev-1',
+      expectedKinds: ['pr-created'],
+      token: 'tok-pending-pr',
+      replaceScope: 'agent',
     }));
-  });
-
-  it('does NOT recover read-file for a head-mode server code review', async () => {
-    await seedTask({
-      id: 'task-server-code-head',
-      qaAgentId: 'qa-1',
-      phase: 'code',
-      reviewMode: 'server',
-      status: 'review',
-      reviewRound: 1,
-      reviewCheckoutMode: 'head',
-      signalToken: 'tok-code-head',
-    });
-    const { watcher } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    const args = watcher.start.mock.calls[0][0] as Record<string, unknown>;
-    expect('onReadFile' in args).toBe(false);
-  });
-
-  it('does NOT emit intervention for recovered pre-spec Dev-SDD tasks', async () => {
-    await seedTask({ id: 'task-pre-spec', signalToken: 'tok-pre-spec' });
-    const { watcher, events: localEvents } = await buildManagerWithSpecWatcher();
-
-    await manager.setupRecoveredSpecSignals();
-
-    expect(watcher.start).toHaveBeenCalledTimes(1);
-    expect(watcher.start.mock.calls[0]![0]).toMatchObject({
-      expectedKinds: ['spec-done', 'pr-created'],
-      token: 'tok-pre-spec',
-    });
-    const setupInterventions = localEvents.filter(e =>
-      e.type === 'human.intervention'
-      && (e.data.phase as string) === 'spec-signal-setup-during-recovery',
-    );
-    expect(setupInterventions).toHaveLength(0);
   });
 });
 

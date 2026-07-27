@@ -59,7 +59,7 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
   let clockNow = T0;
   let poller: PlatformPoller;
   const tasks: PlatformTaskView[] = [{
-    taskId: 'task-1', terminal: false, reviewMode: 'git', branch: 'bx/task-1',
+    taskId: 'task-1', terminal: false, branch: 'bx/task-1',
   }];
 
   beforeAll(async () => {
@@ -544,9 +544,10 @@ describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (
     await h.poller.poll();
     let task = (await h.taskStore.get(created.id))!;
     expect(task).toMatchObject({
-      status: 'review', prNumber: 42, latestHeadSha: SHA, reviewHeadAnchorSha: SHA,
+      status: 'in_progress', prNumber: 42, latestHeadSha: SHA,
       replyActorId: '77', replyActorStatus: 'provisional',
     });
+    expect(task.reviewHeadAnchorSha).toBeUndefined();
 
     await h.eventBus.emit({
       id: '', type: 'pr.created', timestamp: new Date().toISOString(),
@@ -556,7 +557,11 @@ describe.each(['github', 'forge'] as const)('%s driver lifecycle integration', (
         actorB64: Buffer.from('77', 'utf8').toString('base64url'),
       },
     });
-    expect((await h.taskStore.get(created.id))?.replyActorStatus).toBe('verified');
+    task = (await h.taskStore.get(created.id))!;
+    expect(task).toMatchObject({
+      status: 'review', phase: 'code', prNumber: 42, latestHeadSha: SHA,
+      reviewHeadAnchorSha: SHA, replyActorId: '77', replyActorStatus: 'verified',
+    });
 
     const humanBody = 'please handle the edge case';
     const failBody = `same-account request changes\n${buildReviewTokenLine({

@@ -2,7 +2,7 @@ import { readFile, writeFile, access, mkdir, stat, open, rename, rm, realpath } 
 import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { isRecord, type AfterDone, type BaxianConfig, type HostConfig, type ProjectConfig, type ReviewMode, type RootAgentConfig, type ServerConfig } from '../shared/index.js';
+import { isRecord, type AgentConfig, type BaxianConfig, type HostConfig, type ProjectConfig, type RootAgentConfig, type ServerConfig } from '../shared/index.js';
 import {
   CONFIG_FILE,
   DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
@@ -20,10 +20,14 @@ import {
   STATE_DIR,
   USER_CONFIG_REL,
   USER_STATE_REL,
-  isGitHubRepo,
 } from '../shared/index.js';
 import { normalizeConfig } from './normalizer.js';
-import { validateConfig, type ValidationError } from './validator.js';
+import {
+  collectUnknownConfigWarnings,
+  validateConfig,
+  type ValidationError,
+  type ValidationWarning,
+} from './validator.js';
 import { backupConfig } from './backup.js';
 
 export class ConfigValidationError extends Error {
@@ -34,7 +38,9 @@ export class ConfigValidationError extends Error {
   }
 }
 
-export function prepareConfig(raw: unknown): BaxianConfig {
+export function prepareConfigWithWarnings(
+  raw: unknown,
+): { config: BaxianConfig; warnings: ValidationWarning[] } {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     const got = Array.isArray(raw) ? 'array' : raw === null ? 'null' : typeof raw;
     throw new ConfigValidationError([
@@ -42,6 +48,7 @@ export function prepareConfig(raw: unknown): BaxianConfig {
     ]);
   }
   const normalized = normalizeConfig(raw);
+  const warnings = collectUnknownConfigWarnings(normalized);
   if ('main' in normalized) {
     throw new ConfigValidationError([
       { path: 'main', message: 'main agent was renamed to root agent; configure the top-level root object instead' },
@@ -79,12 +86,20 @@ export function prepareConfig(raw: unknown): BaxianConfig {
   if (errors.length > 0) {
     throw new ConfigValidationError(errors);
   }
-  return config;
+  return { config, warnings };
+}
+
+export function prepareConfig(raw: unknown): BaxianConfig {
+  return prepareConfigWithWarnings(raw).config;
 }
 
 export async function loadConfig(configPath: string): Promise<BaxianConfig> {
   const raw = await readFile(configPath, 'utf-8');
-  return prepareConfig(JSON.parse(raw));
+  const result = prepareConfigWithWarnings(JSON.parse(raw));
+  for (const warning of result.warnings) {
+    console.warn(`[config] ${warning.path}: ${warning.message}`);
+  }
+  return result.config;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -219,16 +234,12 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const hasHttps = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'https');
   const hasAllowedHosts = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'allowedHosts');
 
-  const reviewMode = (rv.mode === undefined ? 'git' : rv.mode) as ReviewMode;
-
   return {
     ...(normalized.language !== undefined
       ? { language: normalized.language as BaxianConfig['language'] }
       : {}),
     review: {
       rounds: isFiniteNumber(rv.rounds) ? rv.rounds : DEFAULT_REVIEW_ROUNDS,
-      mode: reviewMode,
-      afterDone: rv.afterDone as AfterDone | undefined,
     },
     server: {
       port: isFiniteNumber(sv.port) ? sv.port : DEFAULT_SERVER_PORT,
@@ -246,7 +257,7 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
       dispatchReconcileMaxAttempts: isFiniteNumber(sv.dispatchReconcileMaxAttempts) ? sv.dispatchReconcileMaxAttempts : DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS,
     },
     host: hosts,
-    project: projects.map(p => applyProjectDefaults(p, reviewMode)),
+    project: projects.map(applyProjectDefaults),
     ...(root ? { root: applyRootDefaults(root) } : {}),
   };
 }
@@ -261,21 +272,32 @@ function applyRootDefaults(root: Record<string, unknown>): RootAgentConfig {
   };
 }
 
-function applyProjectDefaults(p: Record<string, unknown>, globalReviewMode: ReviewMode): ProjectConfig {
+function applyProjectDefaults(p: Record<string, unknown>): ProjectConfig {
   const project: ProjectConfig = {
-    ...(p as unknown as ProjectConfig),
+    id: p.id as string,
+    repo: p.repo as string,
     merge: (p.merge as ProjectConfig['merge'] | undefined) ?? null,
+    ...(p.specApproval !== undefined
+      ? { specApproval: p.specApproval as ProjectConfig['specApproval'] }
+      : {}),
+    ...(p.gitCli !== undefined ? { gitCli: p.gitCli as ProjectConfig['gitCli'] } : {}),
     agent: Array.isArray(p.agent)
-      ? (p.agent as unknown as Record<string, unknown>[][]).map(pair => pair.map(a => ({
-        ...a,
-        yolo: a.yolo === undefined ? true : a.yolo,
-      }))) as unknown as ProjectConfig['agent']
+      ? (p.agent as Record<string, unknown>[][]).map(pair => pair.map(applyAgentDefaults))
       : [],
   };
-  const review = project.review as unknown;
-  if (review !== undefined && !isRecord(review)) return project;
-  if (isRecord(review) && review.mode !== undefined) return project;
-  if (typeof project.repo === 'string' && isGitHubRepo(project.repo)) return project;
-  const mode = globalReviewMode;
-  return { ...project, review: { ...(isRecord(review) ? project.review : {}), mode } };
+  return project;
+}
+
+function applyAgentDefaults(agent: Record<string, unknown>): AgentConfig {
+  return {
+    id: agent.id as string,
+    runtime: agent.runtime as AgentConfig['runtime'],
+    mode: agent.mode as AgentConfig['mode'],
+    role: agent.role as AgentConfig['role'],
+    ...(agent.host !== undefined ? { host: agent.host as AgentConfig['host'] } : {}),
+    ...(agent.workdir !== undefined ? { workdir: agent.workdir as string } : {}),
+    yolo: agent.yolo === undefined ? true : agent.yolo as boolean,
+    ...(agent.model !== undefined ? { model: agent.model as string } : {}),
+    ...(agent.addDirs !== undefined ? { addDirs: agent.addDirs as string[] } : {}),
+  };
 }

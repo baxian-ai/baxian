@@ -1,4 +1,10 @@
-import type { AgentRole, AgentRuntime, AgentSnapshot } from '../shared/index.js';
+import {
+  needsGitReviewRecovery,
+  type AgentRole,
+  type AgentRuntime,
+  type AgentSnapshot,
+  type TaskState,
+} from '../shared/index.js';
 import { type KeyboardEvent as ReactKeyboardEvent, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { KebabMenu, MenuItem } from './kebab-menu.tsx';
@@ -103,6 +109,7 @@ interface AgentCardProps {
   terminalMode?: TerminalMode;
   active?: boolean;
   onActivate?: () => void;
+  task?: TaskState;
 }
 
 export function AgentCard({
@@ -118,6 +125,7 @@ export function AgentCard({
   terminalMode = 'activity-preview',
   active,
   onActivate,
+  task,
 }: AgentCardProps) {
   const t = useT();
   const [stopping, setStopping] = useState(false);
@@ -135,6 +143,9 @@ export function AgentCard({
   const [petModalOpen, setPetModalOpen] = useState(false);
 
   const taskId = agent.binding?.taskId;
+  const reviewNeedsRecovery = task !== undefined
+    && task.id === taskId
+    && needsGitReviewRecovery(task);
   const isAwaitingHuman = agent.binding?.status === 'awaiting_human';
   const needInputAt = agent.binding?.needInput?.at;
   const needsRegreet = isAwaitingHuman && agent.binding?.awaitingPhase === 'greeting_failed';
@@ -281,12 +292,18 @@ export function AgentCard({
       const result = await api.projects.deleteAgent(projectId, agent.id);
       if (result?.restartRequired) flagDirty();
       const removed = result?.removed ?? [agent.id];
+      const warningLines = [...(result?.warnings ?? [])];
       if (removed.length > 1) {
         const others = removed.filter(id => id !== agent.id).join(', ');
+        warningLines.unshift(t.agents.deletedWithPairBody(others));
+      }
+      if (warningLines.length > 0) {
         show({
           kind: 'warn',
-          title: t.agents.deletedWithPairTitle(agent.id),
-          body: t.agents.deletedWithPairBody(others),
+          title: removed.length > 1
+            ? t.agents.deletedWithPairTitle(agent.id)
+            : t.agents.deletedTitle(agent.id),
+          body: warningLines.join('\n'),
         });
       } else {
         show({
@@ -342,7 +359,7 @@ export function AgentCard({
       <div className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 font-mono text-xs font-medium tracking-[0.05em] text-og-500">
-            {role === 'qa' ? 'QA' : role === 'research' ? 'Research' : 'Dev'}
+            {role === 'qa' ? 'QA' : 'Dev'}
           </span>
           <span
             className="min-w-0 truncate whitespace-nowrap font-display text-sm font-semibold text-og-1000"
@@ -525,11 +542,13 @@ export function AgentCard({
               >
                 {clearing ? t.agents.clearing : t.agents.clear}
               </MenuItem>
-              {!pendingRestart && taskId && (role === 'dev' || role === 'research') && (
+              {!pendingRestart && taskId && role === 'dev' && (
                 <MenuItem
                   onClick={() => { close(); void handleRequestReview(); }}
-                  disabled={reviewing || deleting}
-                  title={t.agents.callReviewMenuItemTitle(taskId)}
+                  disabled={reviewing || deleting || reviewNeedsRecovery}
+                  title={reviewNeedsRecovery
+                    ? t.agents.callReviewRecoveryTaskTitle(taskId)
+                    : t.agents.callReviewMenuItemTitle(taskId)}
                 >
                   {reviewing ? t.agents.callingReview : t.agents.callReview}
                 </MenuItem>

@@ -27,6 +27,7 @@ const CONFIG: BaxianConfig = {
     merge: null,
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', yolo: true },
+      { id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo', yolo: true },
     ]],
   }],
 };

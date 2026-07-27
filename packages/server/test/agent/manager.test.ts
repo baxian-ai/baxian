@@ -12,7 +12,6 @@ import {
   canDispatchWithBinding,
   type ContinueSessionOpts,
 } from '../../src/agent/manager.js';
-import { prepareConfig } from '../../src/config/loader.js';
 import { ApiError } from '../../src/errors.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { PromptSizeError, RequiredSkillsMissingError } from '../../src/agent/prompt.js';
@@ -23,9 +22,9 @@ import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
+import { VisibleTextExtractor } from '../../src/agent/vt-visible-text.js';
 import { EventLog } from '../../src/event/log.js';
 import { SkillRegistry } from '../../src/skill/registry.js';
-import { ReviewStore } from '../../src/state/review-store.js';
 import { initStateDir } from '../../src/state/init.js';
 import { DriverOpError } from '../../src/platform/git-driver.js';
 
@@ -43,17 +42,6 @@ const CONFIG: BaxianConfig = {
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
       { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-    ]],
-  }],
-};
-
-const RESEARCH_CONFIG: BaxianConfig = {
-  ...CONFIG,
-  project: [{
-    ...CONFIG.project[0]!,
-    agent: [[
-      ...CONFIG.project[0]!.agent[0]!,
-      { id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: '/tmp/research-repo' },
     ]],
   }],
 };
@@ -210,10 +198,10 @@ function task(overrides: Partial<TaskState> = {}): TaskState {
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     branch,
     branchCreatedByBaxian: overrides.branchCreatedByBaxian ?? branch === `bx/${id}`,
     reviewRound: 0,
-    reviewMode: 'git',
     platformBinding: GIT_BINDING,
     status: 'in_progress',
     createdAt: NOW,
@@ -232,6 +220,48 @@ function makeManager(overrides: Partial<AgentManagerDeps> = {}): AgentManager {
     runnerFactory: () => readyRunner(),
     ...overrides,
   });
+}
+
+type InjectAckFn = (
+  tmux: TmuxManager,
+  paneId: string,
+  prompt: string,
+  agentId: string,
+  runtime: 'claude-code' | 'codex',
+) => Promise<{ acked: boolean; composerDelivered: boolean }>;
+
+function stubInject(mgr: AgentManager, impl: InjectAckFn): void {
+  vi.spyOn(mgr as unknown as { injectAndAwaitAck: InjectAckFn }, 'injectAndAwaitAck').mockImplementation(impl);
+}
+
+function stubEnsureSession(mgr: AgentManager, over: Record<string, unknown> = {}): void {
+  vi.spyOn(mgr, 'ensureSession').mockImplementation(async (agentId) => ({
+    ok: true,
+    createdSession: false,
+    freshRuntime: false,
+    paneId: '%0',
+    workdir: (await agentStore.get(agentId))?.workdir ?? '/tmp/repo',
+    ...over,
+  }));
+  vi.spyOn(
+    mgr as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
+    'waitForReplPromptReady',
+  ).mockResolvedValue(undefined);
+  vi.spyOn(
+    mgr as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+    'clearRuntimeForDispatchBoundary',
+  ).mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
+  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+}
+
+function stubImagePathsThrow(mgr: AgentManager, err: Error): void {
+  vi.spyOn(
+    mgr as unknown as { imagePathsForDispatch: () => Promise<string[]> },
+    'imagePathsForDispatch',
+  ).mockRejectedValue(err);
 }
 
 function mockPlatformReviewBinding(
@@ -359,11 +389,6 @@ async function acquireBoundLock(agentId: string, taskId?: string): Promise<strin
   return lockManager.acquire(agentId, owner);
 }
 
-function spyOnRealAcquire(target: AgentManager): void {
-  const acquire = target.acquireAgentForTask.bind(target);
-  vi.spyOn(target, 'acquireAgentForTask').mockImplementation((...args) => acquire(...args));
-}
-
 function capturePaneRunner(
   execs: string[],
   capture: () => string | Promise<string>,
@@ -400,7 +425,6 @@ async function seedPhaseSkillsAtDir(skillsDir: string): Promise<void> {
     'baxian-pr-feedback',
     'baxian-pr-review',
     'baxian-pr-recheck',
-    'baxian-research',
     'baxian-server-feedback',
     'baxian-signals',
   ]) {
@@ -577,12 +601,12 @@ describe('AgentManager task binding flow', () => {
     expect(await lockManager.isLocked('dev-1')).toBe(false);
   });
 
-  it('scanActiveThenClaimDeletion serializes with createTask: a racing delete-claim cannot orphan the in_progress write', async () => {
+  it('scanOpenThenClaimDeletion serializes with createTask: a racing delete-claim cannot orphan the in_progress write', async () => {
     await seedAgent({ id: 'dev-1' });
     // createTask is invoked first so it wins the task lock; the delete-claim queues behind it and its active
     // scan runs only AFTER the in_progress commit — the owner-check→commit window is never interleaved.
     const create = manager.createTask('proj', { title: 't', description: 'd', preferredAgentId: 'dev-1' });
-    const claim = manager.scanActiveThenClaimDeletion(['dev-1']);
+    const claim = manager.scanOpenThenClaimDeletion(['dev-1']);
     const [created, claimResult] = await Promise.all([create, claim]);
 
     expect(created.status).toBe('in_progress');
@@ -594,7 +618,7 @@ describe('AgentManager task binding flow', () => {
     await seedAgent({ id: 'dev-1' });
     // Reverse order: the delete-claim wins the lock and tombstones dev-1; createTask (queued behind it) then
     // sees the tombstone at its gate/participant check and rejects instead of committing an active task.
-    const claim = manager.scanActiveThenClaimDeletion(['dev-1']);
+    const claim = manager.scanOpenThenClaimDeletion(['dev-1']);
     const create = manager.createTask('proj', { title: 't', description: 'd', preferredAgentId: 'dev-1' });
 
     await expect(create).rejects.toThrow(/being deleted or recreated/);
@@ -793,35 +817,6 @@ describe('AgentManager task binding flow', () => {
       preferredAgentId: 'dev-1',
       branch: 'feat/unique',
     })).rejects.toThrow(/already bound to task/);
-  });
-
-  it('createTask rejects a duplicate custom branch across projects sharing one repo', async () => {
-    manager = makeManager({
-      config: {
-        ...CONFIG,
-        // 同 repo 双项目只在都不进 platform entry 时合法（spec §4）
-        review: { rounds: 2, mode: 'server' as const, afterDone: 'branch' as const },
-        project: [
-          { id: 'proj-a', repo: 'https://github.com/User/Repo.git', merge: null, agent: [] },
-          { id: 'proj-b', repo: 'git@github.com:user/repo.git', merge: null, agent: [] },
-        ],
-      },
-    });
-    await taskStore.set(task({
-      id: 'task-shared',
-      projectId: 'proj-a',
-      preferredAgentId: '',
-      agentId: '',
-      branch: 'feat/shared',
-      branchCreatedByBaxian: false,
-    }));
-
-    await expect(manager.createTask('proj-b', {
-      title: 'duplicate in the same repo',
-      description: 'details',
-      preferredAgentId: '',
-      branch: 'feat/shared',
-    })).rejects.toThrow(/already bound to task task-shared/);
   });
 
   it('createTask allows the same custom branch name in different repos', async () => {
@@ -1065,64 +1060,6 @@ describe('AgentManager task binding flow', () => {
     expect(await lockManager.isOwner('dev-1', t.id, newToken!)).toBe(true);
   });
 
-  it('runs Dev-SDD and Research tasks side by side with isolated owners and initial watchers', async () => {
-    const m = makeManager({ config: RESEARCH_CONFIG, skillRegistry: freshRegistry() });
-    const startSpy = vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    const armSpy = vi.spyOn(
-      m as unknown as { armPostDispatchSignalOrHold: (...args: unknown[]) => Promise<void> },
-      'armPostDispatchSignalOrHold',
-    ).mockResolvedValue(undefined);
-
-    const devTask = await m.createAndStartTask('proj', {
-      title: 'Implement the accepted change',
-      description: 'Use Dev-SDD when design work is needed.',
-      preferredAgentId: 'dev-1',
-    });
-    const researchTask = await m.createAndStartTask('proj', {
-      title: 'Compare storage engines',
-      description: 'Research trade-offs before implementation.',
-      preferredAgentId: 'research-1',
-    });
-
-    expect(devTask).toMatchObject({
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      status: 'in_progress',
-    });
-    expect(devTask.phase).toBeUndefined();
-    expect(researchTask).toMatchObject({
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-      status: 'in_progress',
-    });
-    expect((await agentStore.get('dev-1'))?.taskId).toBe(devTask.id);
-    expect((await agentStore.get('research-1'))?.taskId).toBe(researchTask.id);
-    expect(startSpy).toHaveBeenCalledWith(devTask.id, 'dev-1', 'develop');
-    expect(startSpy).toHaveBeenCalledWith(researchTask.id, 'research-1', 'research');
-    const storedDev = await taskStore.get(devTask.id);
-    const storedResearch = await taskStore.get(researchTask.id);
-    expect(storedDev?.signalToken).toEqual(expect.any(String));
-    expect(storedResearch?.signalToken).toEqual(expect.any(String));
-    expect(armSpy).toHaveBeenCalledWith(
-      devTask.id,
-      'dev-1',
-      ['spec-done', 'pr-created'],
-      storedDev?.signalToken,
-    );
-    expect(armSpy).toHaveBeenCalledWith(
-      researchTask.id,
-      'research-1',
-      ['spec-done'],
-      storedResearch?.signalToken,
-    );
-  });
-
   it('createAndStartTask surfaces a non-terminal dispatch error as a dispatch-rollback intervention', async () => {
     vi.spyOn(manager, 'startSession').mockRejectedValue(
       new Error('ensureWorkdir failed: git fetch failed at /repo: Connection timed out'),
@@ -1310,18 +1247,18 @@ describe('AgentManager task binding flow', () => {
       } as never,
     });
 
-    const armed = await m.setupPhaseSignal(t.id, 'ghost', 'code-done', { skipSnapshot: true });
+    const armed = await m.setupPhaseSignal(t.id, 'ghost', 'pr-created', { skipSnapshot: true });
 
     expect(armed).toBe(false);
     expect(events.some(
       e => e.type === 'human.intervention'
-        && (e.data as { phase?: string }).phase === 'signal-setup-no-agent:code-done',
+        && (e.data as { phase?: string }).phase === 'signal-setup-no-agent:pr-created',
     )).toBe(true);
 
-    await m.holdAgentForUnarmedSignal(t.id, 'ghost', 'code-done');
+    await m.holdAgentForUnarmedSignal(t.id, 'ghost', 'pr-created');
     const held = await agentStore.get('ghost');
     expect(held?.status).toBe('awaiting_human');
-    expect(held?.awaitingPhase).toBe('signal-arm-failed:code-done');
+    expect(held?.awaitingPhase).toBe('signal-arm-failed:pr-created');
   });
 
   it('setupPhaseSignal through the REAL watcher arms and reports true for a configured agent', async () => {
@@ -1337,7 +1274,7 @@ describe('AgentManager task binding flow', () => {
       } as never,
     });
 
-    const armed = await m.setupPhaseSignal(t.id, 'dev-1', 'code-done', { skipSnapshot: true });
+    const armed = await m.setupPhaseSignal(t.id, 'dev-1', 'pr-created', { skipSnapshot: true });
 
     expect(armed).toBe(true);
   });
@@ -1582,7 +1519,13 @@ describe('AgentManager task binding flow', () => {
     expect(stateAfter?.status).toBe('awaiting_human');
     expect(stateAfter?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
     expect(await lockManager.isLocked('dev-1')).toBe(true);
-    expect(releaseSpy).not.toHaveBeenCalled();
+    expect(releaseSpy).toHaveBeenCalledWith(
+      'qa-1',
+      t.id,
+      'idle',
+      { allowAwaitingHuman: true },
+    );
+    expect(releaseSpy.mock.calls.some(([agentId]) => agentId === 'dev-1')).toBe(false);
 
     const interventions = events.filter(
       e => e.type === 'human.intervention' &&
@@ -1686,14 +1629,13 @@ describe('AgentManager transitionTaskStatus', () => {
       signalToken: 'token-1',
       agentId: 'dev-1',
       reviewRound: 2,
-      batchIndex: 1,
-      batchTotal: 2,
+      pendingPrSignalToken: 'pending-token-1',
     });
 
     await expect(manager.updateTaskIfStatus(
       'task-update-guard',
       'review',
-      { batchIndex: undefined, batchTotal: undefined },
+      { pendingPrSignalToken: undefined },
       {
         phase: 'code',
         signalToken: 'token-1',
@@ -1703,14 +1645,13 @@ describe('AgentManager transitionTaskStatus', () => {
     )).resolves.toBe(false);
     expect(await taskStore.get('task-update-guard')).toMatchObject({
       agentId: 'dev-1',
-      batchIndex: 1,
-      batchTotal: 2,
+      pendingPrSignalToken: 'pending-token-1',
     });
 
     await expect(manager.updateTaskIfStatus(
       'task-update-guard',
       'review',
-      { batchIndex: undefined, batchTotal: undefined },
+      { pendingPrSignalToken: undefined },
       {
         phase: 'code',
         signalToken: 'token-1',
@@ -1719,346 +1660,13 @@ describe('AgentManager transitionTaskStatus', () => {
       },
     )).resolves.toBe(true);
     const updated = await taskStore.get('task-update-guard');
-    expect(updated?.batchIndex).toBeUndefined();
-    expect(updated?.batchTotal).toBeUndefined();
-  });
-});
-
-describe('AgentManager.transitionToCodePhase', () => {
-  const documents = [{ relPath: '.baxian/spec.md', content: '# Spec' }];
-
-  async function putSpecRound(store: ReviewStore): Promise<void> {
-    await store.putRound('task-spec-1', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Spec',
-      documents,
-      startedAt: NOW,
-    });
-  }
-
-  it('flips task review→in_progress, phase=code, rotates signalToken, and dispatches the exact Spec documents', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await putSpecRound(store);
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-      qaAgentId: 'qa-1',
-    });
-    await seedAgent({
-      id: 'dev-1', taskId: 'task-spec-1',
-      paneId: '%0',
-    });
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const result = await m.transitionToCodePhase('task-spec-1');
-    expect(result?.status).toBe('in_progress');
-    expect(result?.phase).toBe('code');
-    expect(result?.signalToken).toMatch(/^[0-9a-f]{12}$/);
-    expect(result?.signalToken).not.toBe('old-token');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-spec-1',
-      'dev-1',
-      'code',
-      expect.objectContaining({ specDocuments: documents }),
-    );
-    const dispatchOptions = continueSpy.mock.calls[0]?.[3];
-    expect(dispatchOptions).not.toHaveProperty('currentSpecRound');
-    expect(dispatchOptions).not.toHaveProperty('bypassTaskStatusGate');
-  });
-
-  it('rejects a stale captured generation before releasing or acquiring participants', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await putSpecRound(store);
-    const original = await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-      qaAgentId: 'qa-1',
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask');
-    const acquireSpy = vi.spyOn(m, 'acquireAgentForTask');
-    await seedTask({ ...original, signalToken: 'successor-token' });
-
-    const result = await m.transitionToCodePhase('task-spec-1', {
-      status: original.status,
-      phase: original.phase,
-      signalToken: original.signalToken,
-      agentId: original.agentId,
-      reviewRound: original.reviewRound,
-      specReviewRound: original.specReviewRound,
-    });
-
-    expect(result).toBeNull();
-    expect(releaseSpy).not.toHaveBeenCalled();
-    expect(acquireSpy).not.toHaveBeenCalled();
-    expect(await taskStore.get('task-spec-1')).toMatchObject({
-      status: 'review',
-      phase: 'spec',
-      signalToken: 'successor-token',
-    });
-  });
-
-  it('keeps a newly acquired dev bound when a successor generation takes over before transition', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await putSpecRound(store);
-    const original = await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-      qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1' });
-    const acquireAgentForTask = m.acquireAgentForTask.bind(m);
-    vi.spyOn(m, 'acquireAgentForTask').mockImplementation(async (...args) => {
-      const acquired = await acquireAgentForTask(...args);
-      if (acquired) {
-        await taskStore.set({
-          ...original,
-          signalToken: 'successor-token',
-          updatedAt: new Date().toISOString(),
-        });
-      }
-      return acquired;
-    });
-
-    const result = await m.transitionToCodePhase('task-spec-1', {
-      status: original.status,
-      phase: original.phase,
-      signalToken: original.signalToken,
-      agentId: original.agentId,
-      reviewRound: original.reviewRound,
-      specReviewRound: original.specReviewRound,
-    });
-
-    expect(result).toBeNull();
-    expect(await taskStore.get('task-spec-1')).toMatchObject({
-      status: 'review',
-      signalToken: 'successor-token',
-    });
-    expect(await agentStore.get('dev-1')).toMatchObject({
-      taskId: 'task-spec-1',
-    });
-  });
-
-  it('keeps an already-bound dev when an unguarded transition is refused', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await putSpecRound(store);
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-      qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'transitionTaskStatus').mockResolvedValueOnce(null);
-    const release = vi.spyOn(m, 'releaseAgentForTask');
-
-    const result = await m.transitionToCodePhase('task-spec-1');
-
-    expect(result).toBeNull();
-    expect(release.mock.calls.some(([agentId]) => agentId === 'dev-1')).toBe(false);
-    expect(await agentStore.get('dev-1')).toMatchObject({ taskId: 'task-spec-1' });
-  });
-
-  it('starts a fresh Dev session when a Research participant hands off the accepted Spec', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ config: RESEARCH_CONFIG, reviewStore: store });
-    await putSpecRound(store);
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      status: 'spec-ready',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-    });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    const startSpy = vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const result = await m.transitionToCodePhase('task-spec-1');
-
-    expect(result).toMatchObject({
-      agentId: 'dev-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'code',
-    });
-    expect(startSpy).toHaveBeenCalledWith(
-      'task-spec-1',
-      'dev-1',
-      'code',
-      expect.objectContaining({
-        specDocuments: documents,
-        preserveBindingOnFailure: true,
-      }),
-    );
-    const dispatchOptions = startSpy.mock.calls[0]?.[3];
-    expect(dispatchOptions).not.toHaveProperty('currentSpecRound');
-    expect(dispatchOptions).not.toHaveProperty('bypassTaskStatusGate');
-    expect(continueSpy).not.toHaveBeenCalled();
-  });
-
-  it('stops spec signal watcher so a late spec-* signal on dev pane is not consumed', async () => {
-    const watcher = {
-      start: vi.fn(async () => true),
-      stop: vi.fn(),
-      has: vi.fn(() => false),
-    };
-    const store = new ReviewStore();
-    const m2 = makeManager({
-      skillRegistry: freshRegistry(),
-      phaseSignalWatcher: watcher as never,
-      reviewStore: store,
-    });
-    await putSpecRound(store);
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-      qaAgentId: 'qa-1',
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
-    vi.spyOn(m2, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m2, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m2, 'acquireAgentForTask').mockResolvedValue(true);
-
-    await m2.transitionToCodePhase('task-spec-1');
-    expect(watcher.stop).toHaveBeenCalledWith('task-spec-1');
-  });
-
-  it('holds the dev when the code prompt cannot be delivered', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await putSpecRound(store);
-    await seedTask({
-      id: 'task-spec-1', branch: 'bx/task-spec-1',
-      status: 'review', phase: 'spec', specReviewRound: 1, signalToken: 'old-token', qaAgentId: 'qa-1',
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-    const holdSpy = vi.spyOn(m, 'markAwaitingHuman');
-
-    const result = await m.transitionToCodePhase('task-spec-1');
-
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'code-dispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-spec-1' }),
-    );
-    expect(result).toBeNull();
-  });
-
-  it('atomically writes status + phase + signalToken in single transitionTaskStatus call', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await putSpecRound(store);
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      signalToken: 'old-token',
-      qaAgentId: 'qa-1',
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    const transitionSpy = vi.spyOn(m, 'transitionTaskStatus');
-    const updateTaskSpy = vi.spyOn(m, 'updateTask');
-
-    await m.transitionToCodePhase('task-spec-1');
-
-    const codeTransitionCalls = transitionSpy.mock.calls.filter(
-      c => c[0] === 'task-spec-1' && c[1] === 'in_progress',
-    );
-    expect(codeTransitionCalls).toHaveLength(1);
-    expect(codeTransitionCalls[0]![3]).toMatchObject({
-      phase: 'code',
-      signalToken: expect.stringMatching(/^[0-9a-f]{12}$/),
-    });
-    expect(updateTaskSpy).not.toHaveBeenCalled();
-  });
-});
-
-describe('transitionToCodePhase qa release fail-loud', () => {
-  it('emits intervention when releaseAgentForTask(qa) returns false', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
-      startedAt: NOW,
-    });
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'review',
-      phase: 'spec',
-      specReviewRound: 1,
-      qaAgentId: 'qa-1',
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockImplementation(async (agentId: string) => {
-      return agentId !== 'qa-1';
-    });
-
-    await m.transitionToCodePhase('task-spec-1');
-    expect(events.some(e =>
-      e.type === 'human.intervention'
-      && (e.data.phase as string) === 'code-phase-qa-release-failed',
-    )).toBe(true);
+    expect(updated?.pendingPrSignalToken).toBeUndefined();
   });
 });
 
 describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
-  function restartManager(reviewStore = new ReviewStore()): AgentManager {
-    return makeManager({ config: RESEARCH_CONFIG, skillRegistry: freshRegistry(), reviewStore });
+  function restartManager(): AgentManager {
+    return makeManager({ config: CONFIG, skillRegistry: freshRegistry() });
   }
 
   function spyDispatch(m: AgentManager): {
@@ -2111,113 +1719,11 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     ]]);
   }
 
-  it('resumes an active Research pass with a rotated token and spec-done watcher', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-research-restart',
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-      status: 'in_progress',
-      signalToken: 'research-token-1',
-    });
-    const { continueSpy, armedWith } = spyDispatch(m);
-
-    const resumed = await m.redispatchTaskPromptAfterReplRestart(
-      'research-1',
-      'task-research-restart',
-    );
-
-    expect(resumed).toBe(true);
-    const newToken = await rotatedTaskToken('task-research-restart', 'research-token-1');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-research-restart',
-      'research-1',
-      'research',
-      expect.objectContaining({
-        signalToken: newToken,
-        preserveDispatchOutputs: true,
-        armBeforeInject: expect.any(Function),
-      }),
-    );
-    const researchOpts = continueSpy.mock.calls[0]![3] as {
-      allowDirtyWorkdir?: boolean;
-      bypassTaskStatusGate?: boolean;
-    };
-    expect(researchOpts.allowDirtyWorkdir).toBeUndefined();
-    expect(researchOpts.bypassTaskStatusGate).toBeUndefined();
-    expectReplayArm(await armedWith(), 'task-research-restart', 'research-1', ['spec-done'], 'research-token-1', newToken);
-  });
-
-  it('holds a fixing-pass restart until persisted findings exist, then resumes exact feedback', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    await seedTask({
-      id: 'task-research-fix-restart',
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'spec',
-      status: 'fixing',
-      specReviewRound: 2,
-      signalToken: 'research-token-2',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart(
-      'research-1',
-      'task-research-fix-restart',
-    )).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'research-1',
-      'restart-redispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-research-fix-restart' }),
-    );
-
-    await reviewStore.putRound('task-research-fix-restart', 'spec', {
-      round: 2,
-      phase: 'spec',
-      content: '# Spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
-      findings: {
-        round: 2,
-        verdict: 'request-changes',
-        findings: [{ id: 'f-1', severity: 'major', message: '补充失败回滚方案' }],
-      },
-      startedAt: NOW,
-    });
-
-    expect(await m.redispatchTaskPromptAfterReplRestart(
-      'research-1',
-      'task-research-fix-restart',
-    )).toBe(true);
-    const researchFixToken = await rotatedTaskToken('task-research-fix-restart', 'research-token-2');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-research-fix-restart',
-      'research-1',
-      'server-feedback',
-      expect.objectContaining({
-        currentSpecRound: 2,
-        signalToken: researchFixToken,
-        serverPriorFindings: expect.stringContaining('补充失败回滚方案'),
-        armBeforeInject: expect.any(Function),
-      }),
-    );
-  });
-
   it('replays the initial develop prompt for a dev holder with in-flight-safe options', async () => {
     const m = restartManager();
     await seedTask({
       id: 'task-dev-restart',
       status: 'in_progress',
-      reviewMode: 'git',
       signalToken: 'dev-token-1',
       pendingPrSignalToken: 'dev-token-1',
     });
@@ -2232,7 +1738,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       'develop',
       expect.objectContaining({
         signalToken: newToken,
-        preserveDispatchOutputs: true,
         allowDirtyWorkdir: true,
         armBeforeInject: expect.any(Function),
       }),
@@ -2242,154 +1747,92 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expectReplayArm(await armedWith(), 'task-dev-restart', 'dev-1', ['spec-done', 'pr-created'], 'dev-token-1', newToken);
   });
 
-  it('arms server-mode initial kinds for a develop replay', async () => {
+  it('replays a git code phase without server Spec documents', async () => {
     const m = restartManager();
     await seedTask({
-      id: 'task-dev-server-restart',
-      status: 'in_progress',
-      reviewMode: 'server',
-      signalToken: 'dev-token-2',
-    });
-    const { armedWith } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-server-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-dev-server-restart', 'dev-token-2');
-    expectReplayArm(await armedWith(), 'task-dev-server-restart', 'dev-1', ['spec-done', 'code-done'], 'dev-token-2', newToken);
-  });
-
-  it('replays the code prompt with the persisted Spec documents for an approved pass', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    const documents = [{ relPath: '.baxian/spec.md', content: '# Approved spec' }];
-    await reviewStore.putRound('task-code-restart', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Approved spec',
-      documents,
-      startedAt: NOW,
-    });
-    await seedTask({
-      id: 'task-code-restart',
+      id: 'task-git-code-restart',
       status: 'in_progress',
       phase: 'code',
-      specReviewRound: 1,
-      signalToken: 'code-token-1',
+      specReviewRound: 2,
+      signalToken: 'git-code-token',
     });
-    await seedAgent({ id: 'dev-1', taskId: 'task-code-restart' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-git-code-restart' });
     const { continueSpy, holdSpy, armedWith } = spyDispatch(m);
 
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-code-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-code-restart', 'code-token-1');
+    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-git-code-restart')).toBe(true);
+    const newToken = await rotatedTaskToken('task-git-code-restart', 'git-code-token');
     expect(holdSpy).not.toHaveBeenCalled();
     expect(continueSpy).toHaveBeenCalledWith(
-      'task-code-restart',
+      'task-git-code-restart',
       'dev-1',
       'code',
       expect.objectContaining({
         signalToken: newToken,
-        specDocuments: documents,
-        currentSpecRound: 1,
-        preserveDispatchOutputs: true,
         allowDirtyWorkdir: true,
       }),
     );
-    expectReplayArm(await armedWith(), 'task-code-restart', 'dev-1', ['pr-created'], 'code-token-1', newToken);
+    expect(continueSpy.mock.calls[0]?.[3]).not.toHaveProperty('specDocuments');
+    expectReplayArm(
+      await armedWith(),
+      'task-git-code-restart',
+      'dev-1',
+      ['pr-created'],
+      'git-code-token',
+      newToken,
+    );
   });
 
-  it('holds a code-phase holder for Resume replay when the handoff bootstrap never delivered', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    await reviewStore.putRound('task-code-boot-restart', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Approved spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Approved spec' }],
-      startedAt: NOW,
-    });
+  it('finalizes an interrupted git code bootstrap after replay', async () => {
+    const m = restartManager();
     await seedTask({
-      id: 'task-code-boot-restart',
+      id: 'task-git-code-boot-restart',
       status: 'in_progress',
       phase: 'code',
       specReviewRound: 1,
-      signalToken: 'code-token-2',
+      signalToken: 'git-code-boot-token',
     });
     await seedAgent({
       id: 'dev-1',
-      taskId: 'task-code-boot-restart',
-      bootstrappingTaskId: 'task-code-boot-restart',
+      taskId: 'task-git-code-boot-restart',
+      bootstrappingTaskId: 'task-git-code-boot-restart',
     });
     const { continueSpy, holdSpy } = spyDispatch(m);
 
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-code-boot-restart')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
+    expect(await m.redispatchTaskPromptAfterReplRestart(
       'dev-1',
-      'code-dispatch-failed',
-      expect.stringContaining('Resume'),
-      expect.objectContaining({ expectedTaskId: 'task-code-boot-restart' }),
-    );
+      'task-git-code-boot-restart',
+    )).toBe(true);
+    expect(continueSpy).toHaveBeenCalledOnce();
+    expect(holdSpy).not.toHaveBeenCalled();
+    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
   });
 
-  it('holds a code-phase holder for Resume when the persisted Spec round is missing', async () => {
+  it('replays spec fixing from PR feedback', async () => {
     const m = restartManager();
     await seedTask({
-      id: 'task-code-lost-restart',
-      status: 'in_progress',
-      phase: 'code',
-      specReviewRound: 1,
-      signalToken: 'code-token-3',
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-code-lost-restart' });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-code-lost-restart')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'code-dispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-code-lost-restart' }),
-    );
-  });
-
-  it('replays exact spec feedback for a dev-SDD fixing pass', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    await reviewStore.putRound('task-dev-spec-fix-restart', 'spec', {
-      round: 3,
-      phase: 'spec',
-      content: '# Spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
-      findings: {
-        round: 3,
-        verdict: 'request-changes',
-        findings: [{ id: 'f-2', severity: 'major', message: '边界条件缺失' }],
-      },
-      startedAt: NOW,
-    });
-    await seedTask({
-      id: 'task-dev-spec-fix-restart',
+      id: 'task-git-spec-fix-restart',
       status: 'fixing',
       phase: 'spec',
-      specReviewRound: 3,
-      signalToken: 'dev-spec-token',
+      specReviewRound: 2,
+      signalToken: 'git-spec-fix-token',
     });
-    const { continueSpy, armedWith } = spyDispatch(m);
+    await seedAgent({ id: 'dev-1', taskId: 'task-git-spec-fix-restart' });
+    const { continueSpy, holdSpy } = spyDispatch(m);
 
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-spec-fix-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-dev-spec-fix-restart', 'dev-spec-token');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-dev-spec-fix-restart',
+    expect(await m.redispatchTaskPromptAfterReplRestart(
       'dev-1',
-      'server-feedback',
+      'task-git-spec-fix-restart',
+    )).toBe(true);
+    expect(holdSpy).not.toHaveBeenCalled();
+    expect(continueSpy).toHaveBeenCalledWith(
+      'task-git-spec-fix-restart',
+      'dev-1',
+      'fix',
       expect.objectContaining({
-        currentSpecRound: 3,
-        signalToken: newToken,
-        serverPriorFindings: expect.stringContaining('边界条件缺失'),
         allowDirtyWorkdir: true,
       }),
     );
-    expectReplayArm(await armedWith(), 'task-dev-spec-fix-restart', 'dev-1', ['spec-fixed'], 'dev-spec-token', newToken);
+    expect(continueSpy.mock.calls[0]?.[3]).not.toHaveProperty('serverPriorFindings');
   });
 
   it('replays the PR-feedback fix prompt for a github fixing pass', async () => {
@@ -2398,7 +1841,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       id: 'task-dev-fix-restart',
       status: 'fixing',
       phase: 'code',
-      reviewMode: 'git',
       reviewRound: 1,
       signalToken: 'dev-fix-token',
       pendingPrSignalToken: 'initial-pr-token',
@@ -2414,7 +1856,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       'fix',
       expect.objectContaining({
         signalToken: newToken,
-        preserveDispatchOutputs: true,
         allowDirtyWorkdir: true,
       }),
     );
@@ -2441,60 +1882,10 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       'fix',
       expect.objectContaining({
         signalToken: newToken,
-        preserveDispatchOutputs: true,
         allowDirtyWorkdir: true,
       }),
     );
     expectReplayArm(await armedWith(), 'task-dev-fix-nophase-restart', 'dev-1', ['pr-fixed'], 'dev-fix-nophase-token', newToken);
-  });
-
-  it('replays persisted code findings for a server-mode fixing pass and holds without them', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    await seedTask({
-      id: 'task-dev-server-fix-restart',
-      status: 'fixing',
-      phase: 'code',
-      reviewMode: 'server',
-      reviewRound: 2,
-      signalToken: 'dev-server-fix-token',
-    });
-    const { continueSpy, holdSpy, armedWith } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-server-fix-restart')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-dev-server-fix-restart' }),
-    );
-
-    await reviewStore.putRound('task-dev-server-fix-restart', 'code', {
-      round: 2,
-      phase: 'code',
-      content: 'diff --git a b',
-      findings: {
-        round: 2,
-        verdict: 'request-changes',
-        findings: [{ id: 'f-3', severity: 'critical', message: '空指针回归' }],
-      },
-      startedAt: NOW,
-    });
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-server-fix-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-dev-server-fix-restart', 'dev-server-fix-token');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-dev-server-fix-restart',
-      'dev-1',
-      'server-feedback',
-      expect.objectContaining({
-        signalToken: newToken,
-        serverPriorFindings: expect.stringContaining('空指针回归'),
-        allowDirtyWorkdir: true,
-      }),
-    );
-    expectReplayArm(await armedWith(), 'task-dev-server-fix-restart', 'dev-1', ['code-fixed'], 'dev-server-fix-token', newToken);
   });
 
   it('arms replay watchers without consuming the stale pane snapshot', async () => {
@@ -2707,32 +2098,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect(state?.awaitingReason).toMatch(/already delivered/);
   });
 
-  it('finalizes the bootstrap marker after replaying an interrupted initial research pass', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-boot-research',
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-      status: 'in_progress',
-      signalToken: 'boot-token-3',
-    });
-    await seedAgent({
-      id: 'research-1', taskId: 'task-boot-research', paneId: '%0',
-      workdir: '/tmp/research-repo', bootstrappingTaskId: 'task-boot-research',
-    });
-    vi.spyOn(m, 'clearAwaitingHuman').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('research-1', 'task-boot-research')).toBe(true);
-    expect((await agentStore.get('research-1'))?.bootstrappingTaskId).toBeUndefined();
-    expect(events.some(e =>
-      e.type === 'session.started' && e.taskId === 'task-boot-research' && e.data.phase === 'research',
-    )).toBe(true);
-  });
-
   it('aborts the replay before arming when the pass moved on mid-dispatch', async () => {
     const m = manager;
     await seedTask({
@@ -2774,7 +2139,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     await seedTask({
       id: 'task-postapprove-git-restart',
       status: 'approved',
-      reviewMode: 'git',
       signalToken: 'task-token-git',
       postApproveGeneration: 'feedfeedfeed',
       postApproveHeadSha: 'a'.repeat(40),
@@ -2852,67 +2216,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     );
   });
 
-  it('replays a first-round code pass whose specReviewRound was never persisted', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    const documents = [{ relPath: '.baxian/spec.md', content: '# Auto spec' }];
-    await reviewStore.putRound('task-code-r1', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Auto spec',
-      documents,
-      startedAt: NOW,
-    });
-    await seedTask({
-      id: 'task-code-r1',
-      status: 'in_progress',
-      phase: 'code',
-      signalToken: 'code-r1-tok',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-code-r1')).toBe(true);
-    const newToken = await rotatedTaskToken('task-code-r1', 'code-r1-tok');
-    expect(holdSpy).not.toHaveBeenCalled();
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-code-r1',
-      'dev-1',
-      'code',
-      expect.objectContaining({ specDocuments: documents, signalToken: newToken }),
-    );
-  });
-
-  it('reinstates the failure hold when Resume cleared the entry hold mid-probe', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    await seedTask({
-      id: 'task-hold-reinstate',
-      status: 'fixing',
-      phase: 'spec',
-      specReviewRound: 2,
-      signalToken: 'ri-T1',
-    });
-    await seedAgent({
-      id: 'dev-1', taskId: 'task-hold-reinstate', paneId: '%0',
-      status: 'awaiting_human',
-      awaitingPhase: 'restart-redispatch-failed',
-      awaitingReason: 'pre-restart hold',
-      awaitingSince: NOW,
-    });
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(reviewStore, 'getRound').mockImplementation(async () => {
-      await m.clearAwaitingHuman('dev-1');
-      return null;
-    });
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-hold-reinstate')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    const binding = await agentStore.get('dev-1');
-    expect(binding?.status).toBe('awaiting_human');
-    expect(binding?.awaitingPhase).toBe('restart-redispatch-failed');
-    expect(binding?.awaitingReason).toContain('findings are not persisted');
-  });
-
   it('markAwaitingHuman reports whether the hold generation write landed', async () => {
     const m = restartManager();
     await seedTask({ id: 'task-mark-cas', status: 'in_progress', signalToken: 'mc-T1' });
@@ -2932,28 +2235,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
       expectedHold: { phase: 'phase-a', since: NOW },
     })).toBe(true);
     expect((await agentStore.get('dev-1'))?.awaitingPhase).toBe('phase-b');
-  });
-
-  it('a failure hold is skipped when the pass rotated during the branch probe', async () => {
-    const reviewStore = new ReviewStore();
-    const m = restartManager(reviewStore);
-    await seedTask({
-      id: 'task-hold-tuple',
-      status: 'fixing',
-      phase: 'spec',
-      specReviewRound: 2,
-      signalToken: 'tuple-T1',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-    vi.spyOn(reviewStore, 'getRound').mockImplementation(async () => {
-      const fresh = await taskStore.get('task-hold-tuple');
-      await taskStore.set({ ...fresh!, status: 'review', phase: 'code', signalToken: 'tuple-T2' });
-      return null;
-    });
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-hold-tuple')).toBe(false);
-    expect(holdSpy).not.toHaveBeenCalled();
-    expect(continueSpy).not.toHaveBeenCalled();
   });
 
   it('aborts the replay when the entry hold vanished before the clear', async () => {
@@ -2980,58 +2261,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
 
     await expect(m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-entry-clear')).resolves.toBe(false);
     expect(continueSpy).not.toHaveBeenCalled();
-  });
-
-  it('holds the publish replay when the branch lineage re-check finds a violation', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-lineage-violation',
-      status: 'approved',
-      reviewMode: 'server',
-      afterDone: 'branch',
-      signalToken: 'publish-lv',
-      publishDispatchedAt: NOW,
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-    vi.spyOn(
-      m as unknown as { findLineageViolation: (taskId: string) => Promise<unknown> },
-      'findLineageViolation',
-    ).mockResolvedValue({ taskId: 'task-other', branch: 'bx/task-other', sha: 'deadbeef' });
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-lineage-violation')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.stringContaining('bx/task-other'),
-      expect.objectContaining({ expectedTaskId: 'task-lineage-violation' }),
-    );
-  });
-
-  it('holds the publish replay when the lineage re-check itself fails', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-lineage-probe',
-      status: 'approved',
-      reviewMode: 'server',
-      afterDone: 'branch',
-      signalToken: 'publish-lp',
-      publishDispatchedAt: NOW,
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-    vi.spyOn(
-      m as unknown as { findLineageViolation: (taskId: string) => Promise<unknown> },
-      'findLineageViolation',
-    ).mockRejectedValue(new Error('fetch origin timed out'));
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-lineage-probe')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.stringContaining('fetch origin timed out'),
-      expect.objectContaining({ expectedTaskId: 'task-lineage-probe' }),
-    );
   });
 
   it('a successor hold landing after the currentness read still survives the clear', async () => {
@@ -3253,106 +2482,6 @@ describe('AgentManager.redispatchTaskPromptAfterReplRestart', () => {
     expect(stepsSpy).not.toHaveBeenCalled();
   });
 
-  it('holds a server publish replay when the rotated task token is missing', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-afterdone-lost-token',
-      status: 'approved',
-      reviewMode: 'server',
-      afterDone: 'branch',
-      publishDispatchedAt: NOW,
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-afterdone-lost-token')).toBe(true);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'restart-redispatch-failed',
-      expect.any(String),
-      expect.objectContaining({ expectedTaskId: 'task-afterdone-lost-token' }),
-    );
-  });
-
-  it('replays the server publish pass for an approved holder mid after-done', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-afterdone-restart',
-      status: 'approved',
-      reviewMode: 'server',
-      afterDone: 'branch',
-      signalToken: 'publish-token-1',
-      publishDispatchedAt: NOW,
-    });
-    const { continueSpy, armedWith } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-afterdone-restart')).toBe(true);
-    const newToken = await rotatedTaskToken('task-afterdone-restart', 'publish-token-1');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-afterdone-restart',
-      'dev-1',
-      'server-after-done',
-      expect.objectContaining({
-        signalToken: newToken,
-        preserveDispatchOutputs: true,
-        allowDirtyWorkdir: true,
-        serverAfterDone: { kind: 'branch', branch: 'bx/task-afterdone-restart' },
-        armBeforeInject: expect.any(Function),
-      }),
-    );
-    expectReplayArm(await armedWith(), 'task-afterdone-restart', 'dev-1', ['code-ready'], 'publish-token-1', newToken);
-  });
-
-  it('leaves an approved server holder parked before the publish is dispatched', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-afterdone-parked',
-      status: 'approved',
-      reviewMode: 'server',
-      signalToken: 'tok-y',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-afterdone-parked')).toBe(false);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).not.toHaveBeenCalled();
-  });
-
-  it('refuses when the agent is not the persisted holder of the pass', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-handed-off',
-      status: 'in_progress',
-      phase: 'code',
-      agentId: 'dev-1',
-      devAgentId: 'dev-1',
-      researchAgentId: 'research-1',
-      specReviewRound: 1,
-      signalToken: 'handoff-token',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('research-1', 'task-handed-off')).toBe(false);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).not.toHaveBeenCalled();
-  });
-
-  it('refuses a role/phase mismatch instead of guessing a pass', async () => {
-    const m = restartManager();
-    await seedTask({
-      id: 'task-dev-research-phase',
-      status: 'in_progress',
-      phase: 'research',
-      researchAgentId: 'research-1',
-      signalToken: 'tok-a',
-    });
-    const { continueSpy, holdSpy } = spyDispatch(m);
-
-    expect(await m.redispatchTaskPromptAfterReplRestart('dev-1', 'task-dev-research-phase')).toBe(false);
-    expect(continueSpy).not.toHaveBeenCalled();
-    expect(holdSpy).not.toHaveBeenCalled();
-  });
-
   it('holds an in-flight holder whose signal token is missing', async () => {
     const m = restartManager();
     await seedTask({
@@ -3402,45 +2531,31 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     stopAgentIfToken: vi.fn(),
     has: vi.fn(() => false),
   });
-  const specDocuments = [{ relPath: '.baxian/spec.md', content: '# Spec' }];
-
-  function specManager(reviewStore: ReviewStore): AgentManager {
+  function specManager(): AgentManager {
     return makeManager({
-      config: RESEARCH_CONFIG,
+      config: CONFIG,
       skillRegistry: freshRegistry(),
-      reviewStore,
       phaseSignalWatcher: watcherStub() as never,
     });
   }
 
-  async function seedResearchSpecTask(overrides: Partial<TaskState> = {}): Promise<TaskState> {
+  async function seedSpecTask(overrides: Partial<TaskState> = {}): Promise<TaskState> {
     return seedTask({
       id: 'task-spec-1',
       branch: 'bx/task-spec-1',
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
+      preferredAgentId: 'dev-1',
+      agentId: 'dev-1',
       devAgentId: 'dev-1',
       qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
       phase: 'spec',
       ...overrides,
     });
   }
 
-  async function seedSpecReady(store: ReviewStore, roundOverrides: Record<string, unknown> = {}): Promise<void> {
-    await seedResearchSpecTask({ status: 'spec-ready', specReviewRound: 1 });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 1, phase: 'spec', content: '# Spec', documents: specDocuments, startedAt: NOW,
-      findings: { round: 1, verdict: 'approve', findings: [{ id: 'f-1', severity: 'minor', message: 'nit' }] },
-      ...roundOverrides,
-    });
-  }
-
-  it('parks a review task at spec-ready, retains qaAgentId, marks Research waiting, and releases QA', async () => {
-    const m = specManager(new ReviewStore());
-    await seedResearchSpecTask({ status: 'review', specReviewRound: 1 });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
+  it('parks a review task at spec-ready, retains qaAgentId, marks Dev waiting, and releases QA', async () => {
+    const m = specManager();
+    await seedSpecTask({ status: 'review', specReviewRound: 1 });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
     const releaseSpy = vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
     const waitingSpy = vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
@@ -3454,12 +2569,12 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
       status: 'spec-ready',
       phase: 'spec',
       signalToken: undefined,
-      agentId: 'research-1',
+      agentId: 'dev-1',
       reviewRound: 0,
       specReviewRound: 1,
     };
     expect(waitingSpy).toHaveBeenCalledWith(
-      'research-1',
+      'dev-1',
       'task-spec-1',
       { expectedTask: parkedGeneration },
     );
@@ -3471,10 +2586,10 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
     );
   });
 
-  it('parks from fixing with an explicit specReviewRound patch (no-QA revision loop)', async () => {
-    const m = specManager(new ReviewStore());
-    await seedResearchSpecTask({ status: 'fixing', specReviewRound: 1, qaAgentId: undefined });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
+  it('parks from fixing with an explicit specReviewRound patch', async () => {
+    const m = specManager();
+    await seedSpecTask({ status: 'fixing', specReviewRound: 1 });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
 
     const result = await m.parkTaskAtSpecReady('task-spec-1', { specReviewRound: 2 });
@@ -3483,17 +2598,17 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
   });
 
   it('does not park or release participants for a stale captured generation', async () => {
-    const m = specManager(new ReviewStore());
-    const original = await seedResearchSpecTask({
+    const m = specManager();
+    const original = await seedSpecTask({
       status: 'review',
       specReviewRound: 1,
       signalToken: 'old-token',
     });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
     const releaseSpy = vi.spyOn(m, 'releaseAgentForTask');
     const waitingSpy = vi.spyOn(m, 'markAgentWaiting');
-    await seedResearchSpecTask({
+    await seedSpecTask({
       status: 'review',
       specReviewRound: 2,
       signalToken: 'successor-token',
@@ -3521,13 +2636,13 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
   });
 
   it('does not park or release participants when the parked generation is superseded', async () => {
-    const m = specManager(new ReviewStore());
-    await seedResearchSpecTask({
+    const m = specManager();
+    await seedSpecTask({
       status: 'review',
       specReviewRound: 1,
       signalToken: 'same-token',
     });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
+    await seedAgent({ id: 'dev-1', taskId: 'task-spec-1' });
     await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
     const transitionTaskStatus = m.transitionTaskStatus.bind(m);
     vi.spyOn(m, 'transitionTaskStatus').mockImplementation(async (...args) => {
@@ -3547,7 +2662,7 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
         status: 'review',
         phase: 'spec',
         signalToken: 'same-token',
-        agentId: 'research-1',
+        agentId: 'dev-1',
         reviewRound: 0,
         specReviewRound: 1,
       },
@@ -3559,1119 +2674,10 @@ describe('AgentManager.parkTaskAtSpecReady / submitSpecVerdict', () => {
       signalToken: 'same-token',
       specReviewRound: 2,
     });
-    expect((await agentStore.get('research-1'))?.status).not.toBe('waiting');
+    expect((await agentStore.get('dev-1'))?.status).not.toBe('waiting');
     expect((await agentStore.get('qa-1'))?.taskId).toBe('task-spec-1');
   });
 
-  it('request-changes works end-to-end on a task parked by parkTaskAtSpecReady (QA already released)', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'review', specReviewRound: 1 });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 1, phase: 'spec', content: '# Spec', documents: specDocuments, startedAt: NOW,
-      findings: { round: 1, verdict: 'approve', findings: [] },
-    });
-    vi.spyOn(m, 'markAgentWaiting').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const parked = await m.parkTaskAtSpecReady('task-spec-1');
-    expect(parked?.status).toBe('spec-ready');
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '补充回滚方案');
-    expect(result.status).toBe('fixing');
-    expect(result.agentId).toBe('research-1');
-    expect(result.qaAgentId).toBe('qa-1');
-    expect(m.continueSession).toHaveBeenCalledWith(
-      'task-spec-1',
-      'research-1',
-      'server-feedback',
-      expect.objectContaining({ currentSpecRound: 1 }),
-    );
-  });
-
-  it('rejects a verdict when the task is not spec-ready', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'review' });
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({ status: 409 });
-  });
-
-  it('approve records userDecision and dispatches the code phase', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecReady(store);
-    vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
-    expect(result.status).toBe('in_progress');
-    expect(result.phase).toBe('code');
-    expect(result.agentId).toBe('dev-1');
-    expect(result.qaAgentId).toBe('qa-1');
-    expect(result.researchAgentId).toBe('research-1');
-    const round = await store.getRound('task-spec-1', 'spec', 1);
-    expect(round?.userDecision?.verdict).toBe('approve');
-  });
-
-  it('request-changes without comments is a 400', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecReady(store);
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '  '))
-      .rejects.toMatchObject({ status: 400 });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('spec-ready');
-  });
-
-  it('request-changes merges a user finding, flips the verdict, and dispatches the fix', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecReady(store);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '边界场景没有覆盖');
-    expect(result.status).toBe('fixing');
-    const round = await store.getRound('task-spec-1', 'spec', 1);
-    expect(round?.findings?.verdict).toBe('request-changes');
-    expect(round?.findings?.findings).toContainEqual(
-      { id: 'u-1', severity: 'major', message: '边界场景没有覆盖' },
-    );
-    expect(round?.findings?.findings.some(f => f.id === 'f-1')).toBe(true);
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes', comments: '边界场景没有覆盖' });
-  });
-
-  it('approve refuses a parked task without a persisted Spec round', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'spec-ready', specReviewRound: 1 });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('no persisted spec review round'),
-    });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('spec-ready');
-  });
-
-  it('request-changes at the spec round cap extends the cap instead of refusing', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'spec-ready', specReviewRound: 2 });
-    await seedAgent({ id: 'research-1', taskId: 'task-spec-1' });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 2, phase: 'spec', content: '# Spec v2',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
-      startedAt: NOW,
-      findings: { round: 2, verdict: 'approve', findings: [] },
-    });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '还差回滚方案');
-    expect(result.status).toBe('fixing');
-    expect(result.maxRoundsContinues).toBe(1);
-    expect((await store.getRound('task-spec-1', 'spec', 2))?.userDecision)
-      .toMatchObject({ verdict: 'request-changes' });
-  });
-
-  it('concurrent verdicts on the same spec-ready task: exactly one wins, the other gets 409', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecReady(store);
-    vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const results = await Promise.allSettled([
-      m.submitSpecVerdict('task-spec-1', 'approve'),
-      m.submitSpecVerdict('task-spec-1', 'approve'),
-    ]);
-    const fulfilled = results.filter(r => r.status === 'fulfilled');
-    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
-    expect(fulfilled).toHaveLength(1);
-    expect(rejected).toHaveLength(1);
-    expect(rejected[0].reason).toMatchObject({ status: 409 });
-  });
-
-  it('request-changes refuses a parked task without a persisted Spec round', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'spec-ready', specReviewRound: 1 });
-
-    await expect(
-      m.submitSpecVerdict('task-spec-1', 'request-changes', '先补充回滚方案'),
-    ).rejects.toMatchObject({ status: 409 });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('spec-ready');
-  });
-
-  it('archive records the decision, finishes the task, and releases bound runtimes', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecReady(store);
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'archive', '暂不实施');
-
-    expect(result.status).toBe('done');
-    expect(result.qaAgentId).toBe('qa-1');
-    expect(result.researchAgentId).toBe('research-1');
-    expect((await store.getRound('task-spec-1', 'spec', 1))?.userDecision).toMatchObject({
-      verdict: 'archive',
-      comments: '暂不实施',
-    });
-    expect(releaseSpy).toHaveBeenCalledWith(
-      'research-1', 'task-spec-1', 'idle', { allowAwaitingHuman: true },
-    );
-    expect(releaseSpy).toHaveBeenCalledWith(
-      'qa-1', 'task-spec-1', 'idle', { allowAwaitingHuman: true },
-    );
-  });
-
-  it('refuses to archive a spec that was not produced by Research', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'spec-ready',
-      phase: 'spec',
-      specReviewRound: 1,
-    });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Spec',
-      documents: specDocuments,
-      startedAt: NOW,
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'archive'))
-      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('not a Research task') });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('spec-ready');
-  });
-
-  async function seedSpecMaxRounds(store: ReviewStore, overrides: Partial<TaskState> = {}): Promise<void> {
-    await seedResearchSpecTask({ status: 'max_rounds', specReviewRound: 2, agentId: '', ...overrides });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 2, phase: 'spec', content: '# Spec v2',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
-      startedAt: NOW,
-      findings: { round: 2, verdict: 'request-changes', findings: [{ id: 'f-1', severity: 'major', message: '仍有分歧' }] },
-    });
-  }
-
-  it('approve on a spec-phase max_rounds task transitions to the code phase', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
-    expect(result.status).toBe('in_progress');
-    expect(result.phase).toBe('code');
-    expect(result.agentId).toBe('dev-1');
-    expect((await store.getRound('task-spec-1', 'spec', 2))?.userDecision?.verdict).toBe('approve');
-  });
-
-  it('approve at max_rounds on a dev-authored spec dispatches the code prompt via continueSession', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: 'dev-1',
-      researchAgentId: undefined,
-      qaAgentId: undefined,
-    });
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
-    expect(result.status).toBe('in_progress');
-    expect(result.phase).toBe('code');
-    expect(continueSpy).toHaveBeenCalledWith(
-      'task-spec-1',
-      'dev-1',
-      'code',
-      expect.objectContaining({ specDocuments: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }] }),
-    );
-  });
-
-  it('request-changes on a spec-phase max_rounds task extends the cap, restores the holder, and dispatches the fix', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '按 f-1 再收敛一轮');
-    expect(result.status).toBe('fixing');
-    expect(result.maxRoundsContinues).toBe(1);
-    expect(result.agentId).toBe('research-1');
-    const round = await store.getRound('task-spec-1', 'spec', 2);
-    expect(round?.findings?.findings).toContainEqual(
-      { id: 'u-1', severity: 'major', message: '按 f-1 再收敛一轮' },
-    );
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes' });
-    expect(m.continueSession).toHaveBeenCalledWith(
-      'task-spec-1',
-      'research-1',
-      'server-feedback',
-      expect.objectContaining({ currentSpecRound: 2 }),
-    );
-  });
-
-  it('request-changes at the cap can repeat: the next round hits the extended cap and pauses again', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, { maxRoundsContinues: 1, specReviewRound: 3 });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 3, phase: 'spec', content: '# Spec v3',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v3' }],
-      startedAt: NOW,
-      findings: { round: 3, verdict: 'request-changes', findings: [] },
-    });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '再来一轮');
-    expect(result.status).toBe('fixing');
-    expect(result.maxRoundsContinues).toBe(2);
-  });
-
-  it('request-changes rolls back the cap extension and the restored holder when the fix dispatch fails', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮'))
-      .rejects.toMatchObject({ status: 500 });
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('max_rounds');
-    expect(after?.maxRoundsContinues ?? 0).toBe(0);
-    expect(after?.agentId).toBe('');
-  });
-
-  it('the rollback leaves the task alone when its generation moved past the extension', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    vi.spyOn(m, 'continueSession').mockImplementation(async () => {
-      const fresh = (await taskStore.get('task-spec-1'))!;
-      fresh.status = 'cancelled';
-      fresh.agentId = 'dev-1';
-      await taskStore.set(fresh);
-      return false;
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮'))
-      .rejects.toMatchObject({ status: 500 });
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('cancelled');
-    expect(after?.agentId).toBe('dev-1');
-    expect(after?.maxRoundsContinues).toBe(1);
-  });
-
-  it('approve at max_rounds clears the bootstrap marker written by the dev re-acquisition', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: 'dev-1',
-      researchAgentId: undefined,
-      qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
-
-    expect(result.status).toBe('in_progress');
-    const dev = await agentStore.get('dev-1');
-    expect(dev?.taskId).toBe('task-spec-1');
-    expect(dev?.bootstrappingTaskId).toBeUndefined();
-    expect(events.some(e =>
-      e.type === 'session.started' && e.taskId === 'task-spec-1' && e.data.phase === 'code',
-    )).toBe(true);
-  });
-
-  it('an undelivered code prompt keeps the bootstrap marker and tells the user to Resume, not retry', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: 'dev-1',
-      researchAgentId: undefined,
-      qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringContaining('Resume the dev agent'),
-    });
-    expect(await taskStore.get('task-spec-1')).toMatchObject({ status: 'in_progress', phase: 'code' });
-    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBe('task-spec-1');
-  });
-
-  it('a max_rounds rejection with cap headroom restores the holder without extending the cap', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, { maxRoundsContinues: 1 });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '仍需收敛');
-    expect(result.status).toBe('fixing');
-    expect(result.maxRoundsContinues).toBe(1);
-    expect(result.agentId).toBe('research-1');
-  });
-
-  it('extending the cap after review.rounds was lowered still fits the next round', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, { specReviewRound: 4 });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 4, phase: 'spec', content: '# Spec v4',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v4' }],
-      startedAt: NOW,
-      findings: { round: 4, verdict: 'request-changes', findings: [] },
-    });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '再来一轮');
-    expect(result.status).toBe('fixing');
-    expect(result.maxRoundsContinues).toBe(3);
-  });
-
-  it('a failed dispatch after a multi-step cap extension restores the exact original counter', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, { specReviewRound: 4 });
-    await store.putRound('task-spec-1', 'spec', {
-      round: 4, phase: 'spec', content: '# Spec v4',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v4' }],
-      startedAt: NOW,
-      findings: { round: 4, verdict: 'request-changes', findings: [] },
-    });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再来一轮'))
-      .rejects.toMatchObject({ status: 500 });
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('max_rounds');
-    expect(after?.maxRoundsContinues ?? 0).toBe(0);
-    expect(after?.agentId).toBe('');
-  });
-
-  it('a handled dialog crash that failed the task during request-changes answers with Retry guidance', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    vi.spyOn(m, 'continueSession').mockImplementation(async () => {
-      const fresh = (await taskStore.get('task-spec-1'))!;
-      fresh.status = 'failed';
-      await taskStore.set(fresh);
-      throw new EnsureSessionError(
-        { createdSession: false, agentId: 'research-1', handled: true },
-        'runtime dialog handled; task failed',
-      );
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringMatching(/terminally[\s\S]*kept on record[\s\S]*Retry/),
-    });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('failed');
-    const round = await store.getRound('task-spec-1', 'spec', 2);
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes' });
-  });
-
-  it('a terminal fix dispatch failure marks the task failed, keeps the rejection, and says Retry', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    vi.spyOn(m, 'continueSession').mockRejectedValue(
-      new DispatchTerminalError('prompt_too_large', 'prompt exceeds the runtime composer limit'),
-    );
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringMatching(/terminally .*prompt_too_large[\s\S]*marked failed[\s\S]*Retry/),
-    });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('failed');
-    const round = await store.getRound('task-spec-1', 'spec', 2);
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes' });
-    expect(round?.findings?.findings).toContainEqual(
-      { id: 'u-1', severity: 'major', message: '再收敛一轮' },
-    );
-  });
-
-  it('keeps the rejection round when the dispatch left the task held in fixing', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    vi.spyOn(m, 'continueSession').mockRejectedValue(
-      new EnsureSessionError({ createdSession: false, agentId: 'research-1', handled: true }, 'dirty workdir hold taken'),
-    );
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringContaining('resume the holder agent'),
-    });
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('fixing');
-    expect(after?.maxRoundsContinues).toBe(1);
-    const round = await store.getRound('task-spec-1', 'spec', 2);
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes' });
-    expect(round?.findings?.findings).toContainEqual(
-      { id: 'u-1', severity: 'major', message: '再收敛一轮' },
-    );
-  });
-
-  it('approve maps a terminal dispatch failure to the marked-failed guidance', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: 'dev-1',
-      researchAgentId: undefined,
-      qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockRejectedValue(
-      new DispatchTerminalError('prompt_too_large', 'prompt exceeds the runtime composer limit'),
-    );
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringMatching(/terminally .*prompt_too_large[\s\S]*marked failed[\s\S]*Retry/),
-    });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('failed');
-  });
-
-  it('a handled dialog crash that failed the task during approve also answers with Retry guidance', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: 'dev-1',
-      researchAgentId: undefined,
-      qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockImplementation(async () => {
-      const fresh = (await taskStore.get('task-spec-1'))!;
-      fresh.status = 'failed';
-      await taskStore.set(fresh);
-      throw new EnsureSessionError(
-        { createdSession: false, agentId: 'dev-1', handled: true },
-        'runtime dialog handled; task failed',
-      );
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringMatching(/terminally[\s\S]*marked failed[\s\S]*Retry/),
-    });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('failed');
-  });
-
-  it('a handled checkout failure during approve rolls the task back to max_rounds for a fresh verdict', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: 'dev-1',
-      researchAgentId: undefined,
-      qaAgentId: undefined,
-      maxRoundsContinues: 2,
-    });
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'continueSession').mockRejectedValue(
-      new EnsureSessionError(
-        { createdSession: false, agentId: 'dev-1', handled: true },
-        'checkout preparation failed for task task-spec-1: dirty workdir',
-      ),
-    );
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringMatching(/rolled back to await the verdict[\s\S]*Resume[\s\S]*retry the verdict/),
-    });
-    const after = await taskStore.get('task-spec-1');
-    expect(after).toMatchObject({ status: 'max_rounds', phase: 'spec', agentId: '' });
-    expect(after?.maxRoundsContinues).toBe(2);
-  });
-
-  it('a handled checkout failure on a research handoff releases the freshly acquired dev', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'startSession').mockImplementation(async () => {
-      await agentStore.update('dev-1', existing => ({
-        ...existing!,
-        status: 'awaiting_human',
-        awaitingPhase: 'dirty-workdir',
-        awaitingReason: 'Workdir /tmp/repo has staged changes',
-        awaitingSince: NOW,
-        updatedAt: NOW,
-      }));
-      throw new EnsureSessionError(
-        { createdSession: false, agentId: 'dev-1', handled: true },
-        'checkout preparation failed for task task-spec-1: dirty workdir',
-      );
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({ status: 500 });
-    expect(await taskStore.get('task-spec-1')).toMatchObject({
-      status: 'max_rounds',
-      phase: 'spec',
-      agentId: '',
-    });
-    const dev = await agentStore.get('dev-1');
-    expect(dev?.taskId).toBeUndefined();
-    expect(dev?.awaitingPhase).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
-  });
-
-  it('after a rolled-back research handoff, request-changes binds Research without leaking the dev', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    await seedAgent({ id: 'dev-1' });
-    vi.spyOn(m, 'startSession').mockRejectedValue(
-      new EnsureSessionError(
-        { createdSession: false, agentId: 'dev-1', handled: true },
-        'checkout preparation failed for task task-spec-1: dirty workdir',
-      ),
-    );
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({ status: 500 });
-
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮');
-
-    expect(result.status).toBe('fixing');
-    expect(result.agentId).toBe('research-1');
-    expect((await agentStore.get('research-1'))?.taskId).toBe('task-spec-1');
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
-
-  it('a Resume code redispatch finalizes the bootstrap marker after delivery', async () => {
-    const m = specManager(new ReviewStore());
-    const reviewStore = m.getReviewStore()!;
-    await seedTask({
-      id: 'task-spec-1',
-      branch: 'bx/task-spec-1',
-      status: 'in_progress',
-      phase: 'code',
-      specReviewRound: 2,
-      signalToken: 'tok123456789',
-    });
-    await reviewStore.putRound('task-spec-1', 'spec', {
-      round: 2, phase: 'spec', content: '# Spec v2',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
-      startedAt: NOW,
-    });
-    await seedAgent({
-      id: 'dev-1', taskId: 'task-spec-1', paneId: '%0', workdir: '/tmp/repo',
-      bootstrappingTaskId: 'task-spec-1',
-      status: 'awaiting_human', awaitingPhase: 'code-dispatch-failed',
-      awaitingReason: 'prompt not delivered', awaitingSince: NOW,
-    });
-    await acquireBoundLock('dev-1', 'task-spec-1');
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-
-    const result = await m.resumeAgent('dev-1');
-
-    expect(result).toMatchObject({ resumed: true });
-    expect((await agentStore.get('dev-1'))?.bootstrappingTaskId).toBeUndefined();
-    expect(events.some(e =>
-      e.type === 'session.started' && e.taskId === 'task-spec-1' && e.data.phase === 'code',
-    )).toBe(true);
-  });
-
-  it('Resume releases a stale code-handoff binding once the task is back at the verdict gate', async () => {
-    const m = specManager(new ReviewStore());
-    await seedResearchSpecTask({ status: 'max_rounds', specReviewRound: 2, agentId: '' });
-    await seedAgent({
-      id: 'dev-1', taskId: 'task-spec-1', paneId: '%0', workdir: '/tmp/repo',
-      status: 'awaiting_human', awaitingPhase: 'dirty-workdir',
-      awaitingReason: 'Workdir /tmp/repo has staged changes', awaitingSince: NOW,
-    });
-    await acquireBoundLock('dev-1', 'task-spec-1');
-
-    const result = await m.resumeAgent('dev-1');
-
-    expect(result).toMatchObject({ resumed: true, releasedBinding: true });
-    const dev = await agentStore.get('dev-1');
-    expect(dev?.status).not.toBe('awaiting_human');
-    expect(dev?.awaitingPhase).toBeUndefined();
-    expect(dev?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
-  });
-
-  it('Resume keeps the binding when the held dev is still the task holder (reentry stays possible)', async () => {
-    const m = specManager(new ReviewStore());
-    await seedResearchSpecTask({
-      status: 'spec-ready', specReviewRound: 1,
-      preferredAgentId: 'dev-1', agentId: 'dev-1', researchAgentId: undefined,
-    });
-    await seedAgent({
-      id: 'dev-1', taskId: 'task-spec-1', paneId: '%0', workdir: '/tmp/repo',
-      status: 'awaiting_human', awaitingPhase: 'dirty-workdir',
-      awaitingReason: 'Workdir /tmp/repo has staged changes', awaitingSince: NOW,
-    });
-    await acquireBoundLock('dev-1', 'task-spec-1');
-
-    const result = await m.resumeAgent('dev-1');
-
-    expect(result).toMatchObject({ resumed: true, releasedBinding: false });
-    expect((await agentStore.get('dev-1'))?.taskId).toBe('task-spec-1');
-  });
-
-  it('a failed fix dispatch restores the round record; the retry keeps exactly one user finding', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(false);
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮'))
-      .rejects.toMatchObject({ status: 500 });
-    const afterFailure = await store.getRound('task-spec-1', 'spec', 2);
-    expect(afterFailure?.userDecision).toBeUndefined();
-    expect(afterFailure?.findings?.findings.filter(f => f.id.startsWith('u-'))).toHaveLength(0);
-
-    continueSpy.mockResolvedValue(true);
-    const result = await m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮');
-    expect(result.status).toBe('fixing');
-    const afterRetry = await store.getRound('task-spec-1', 'spec', 2);
-    expect(afterRetry?.findings?.findings.filter(f => f.id.startsWith('u-'))).toEqual([
-      { id: 'u-1', severity: 'major', message: '再收敛一轮' },
-    ]);
-  });
-
-  it('request-changes refuses a holder that was removed from the config, with no round write', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      researchAgentId: undefined,
-      preferredAgentId: 'dev-gone',
-      devAgentId: 'dev-gone',
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再来一轮'))
-      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('not in the current config') });
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('max_rounds');
-    expect(after?.maxRoundsContinues ?? 0).toBe(0);
-    expect((await store.getRound('task-spec-1', 'spec', 2))?.userDecision).toBeUndefined();
-  });
-
-  it('releases the freshly acquired holder when the QA release aborts the fix dispatch', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      researchAgentId: undefined,
-      preferredAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-    });
-    await seedAgent({ id: 'qa-1', taskId: 'task-spec-1' });
-    spyOnRealAcquire(m);
-    vi.spyOn(m, 'setupPhaseSignal').mockResolvedValue(undefined as never);
-    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask')
-      .mockImplementation(async (agentId) => agentId !== 'qa-1');
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再收敛一轮'))
-      .rejects.toMatchObject({ status: 500 });
-    expect(releaseSpy).toHaveBeenCalledWith(
-      'dev-1',
-      'task-spec-1',
-      'idle',
-      expect.objectContaining({ expectedTask: expect.any(Object) }),
-    );
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('max_rounds');
-    expect(after?.maxRoundsContinues ?? 0).toBe(0);
-  });
-
-  it('approving into the code phase resets the spec-only cap extensions', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, { maxRoundsContinues: 2, specReviewRound: 2 });
-    vi.spyOn(m, 'startSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'approve');
-    expect(result.status).toBe('in_progress');
-    expect(result.phase).toBe('code');
-    expect(result.maxRoundsContinues).toBe(0);
-  });
-
-  it('request-changes at max_rounds without any holder agent is a 409', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, {
-      preferredAgentId: '',
-      devAgentId: '',
-      researchAgentId: undefined,
-    });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'request-changes', '再来一轮'))
-      .rejects.toMatchObject({ status: 409 });
-    const after = await taskStore.get('task-spec-1');
-    expect(after?.status).toBe('max_rounds');
-    expect(after?.maxRoundsContinues ?? 0).toBe(0);
-  });
-
-  it('archive on a spec-phase max_rounds research task finishes it', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitSpecVerdict('task-spec-1', 'archive', '分歧太大，暂不实施');
-    expect(result.status).toBe('done');
-    expect((await store.getRound('task-spec-1', 'spec', 2))?.userDecision?.verdict).toBe('archive');
-  });
-
-  it('still rejects a verdict on a code-phase max_rounds task', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'max_rounds', phase: 'code', reviewRound: 2 });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve'))
-      .rejects.toMatchObject({ status: 409 });
-  });
-
-  it('approve at max_rounds is a 409 when the dev agent was removed from the config', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store, { devAgentId: 'dev-gone' });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve'))
-      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('Dev is unavailable') });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('max_rounds');
-  });
-
-  it('approve at max_rounds is a 409 when the dev cannot be re-acquired (held by another task)', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(false);
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve'))
-      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('Dev is unavailable') });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('max_rounds');
-  });
-
-  it('a verdict at max_rounds without the persisted spec round is a 409', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedResearchSpecTask({ status: 'max_rounds', specReviewRound: 2, agentId: '' });
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve'))
-      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('no persisted spec review round') });
-    expect((await taskStore.get('task-spec-1'))?.status).toBe('max_rounds');
-  });
-
-  it('approve wraps a code-phase dispatch crash into an actionable ApiError instead of a bare 500', async () => {
-    const store = new ReviewStore();
-    const m = specManager(store);
-    await seedSpecMaxRounds(store);
-    vi.spyOn(m, 'transitionToCodePhase').mockRejectedValue(
-      new Error('Agent dev-1 checkout mismatch for task task-spec-1: expected refs/heads/bx/task-spec-1, got detached HEAD'),
-    );
-
-    await expect(m.submitSpecVerdict('task-spec-1', 'approve')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringContaining('checkout mismatch'),
-    });
-  });
-});
-
-describe('AgentManager.submitCodeVerdict', () => {
-  const watcherStub = () => ({ start: vi.fn(async () => true), stop: vi.fn(), has: vi.fn(() => false) });
-
-  function codeManager(reviewStore: ReviewStore): AgentManager {
-    return makeManager({
-      skillRegistry: freshRegistry(),
-      reviewStore,
-      phaseSignalWatcher: watcherStub() as never,
-    });
-  }
-
-  async function seedCodeReady(
-    store: ReviewStore,
-    taskOverrides: Partial<TaskState> = {},
-    roundOverrides: Record<string, unknown> = {},
-  ): Promise<void> {
-    await seedTask({
-      id: 'task-code-1', branch: 'bx/task-code-1',
-      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 1, qaAgentId: undefined,
-      ...taskOverrides,
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
-    await store.putRound('task-code-1', 'code', {
-      round: 1, phase: 'code', content: 'diff --git a/a.ts b/a.ts', startedAt: NOW,
-      findings: { round: 1, verdict: 'approve', findings: [{ id: 'f-1', severity: 'minor', message: 'nit' }] },
-      ...roundOverrides,
-    });
-  }
-
-  function mockDispatchDeps(m: AgentManager): void {
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-  }
-
-  it('request-changes merges a u- finding, flips the verdict, records userDecision, and dispatches the fix', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store);
-    mockDispatchDeps(m);
-
-    const result = await m.submitCodeVerdict('task-code-1', '这里漏了空态处理');
-    expect(result.status).toBe('fixing');
-    const round = await store.getRound('task-code-1', 'code', 1);
-    expect(round?.findings?.verdict).toBe('request-changes');
-    expect(round?.findings?.findings).toContainEqual(
-      { id: 'u-1', severity: 'major', message: '这里漏了空态处理' },
-    );
-    expect(round?.findings?.findings.some(f => f.id === 'f-1')).toBe(true);
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes', comments: '这里漏了空态处理' });
-    // u- 前缀不与批次聚合前缀 b\d+- 冲突（防回归）
-    expect(/^b\d+-/.test('u-1')).toBe(false);
-  });
-
-  it('with a bound QA at ready: releases the QA and dispatches the fix to fixing', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store, { qaAgentId: 'qa-1' });
-    await seedAgent({ id: 'qa-1', taskId: 'task-code-1' });
-    vi.spyOn(m, 'continueSession').mockResolvedValue(true);
-    spyOnRealAcquire(m);
-    const releaseSpy = vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-
-    const result = await m.submitCodeVerdict('task-code-1', 'QA 也得再看看');
-    expect(result.status).toBe('fixing');
-    expect(releaseSpy).toHaveBeenCalledWith(
-      'qa-1',
-      'task-code-1',
-      'idle',
-      expect.objectContaining({ expectedTask: expect.any(Object) }),
-    );
-    const round = await store.getRound('task-code-1', 'code', 1);
-    expect(round?.findings?.findings.some(f => f.id === 'u-1')).toBe(true);
-  });
-
-  it('request-changes without comments is a 400 and leaves the task ready', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store);
-    await expect(m.submitCodeVerdict('task-code-1', '   '))
-      .rejects.toMatchObject({ status: 400 });
-    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
-  });
-
-  it('rejects when the task is not ready (409)', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store, { status: 'review' });
-    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
-  });
-
-  it('rejects a spec-phase task (409)', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store, { phase: 'spec' });
-    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
-  });
-
-  it('rejects a non-server (github) task (409)', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store, { reviewMode: 'git' });
-    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
-  });
-
-  it('rejects a task with no dev agent (400)', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store, { agentId: '' });
-    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 400 });
-  });
-
-  it('refuses request-changes at the round cap with 409 (task stays ready, no userDecision)', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    // CONFIG.review.rounds = 2：reviewRound 已到上限
-    await seedTask({
-      id: 'task-code-1', branch: 'bx/task-code-1',
-      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 2, qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
-    await store.putRound('task-code-1', 'code', {
-      round: 2, phase: 'code', content: 'd', startedAt: NOW,
-      findings: { round: 2, verdict: 'approve', findings: [] },
-    });
-    mockDispatchDeps(m);
-    await expect(m.submitCodeVerdict('task-code-1', '还差点'))
-      .rejects.toMatchObject({ status: 409, message: expect.stringContaining('round cap') });
-    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
-    expect((await store.getRound('task-code-1', 'code', 2))?.userDecision).toBeUndefined();
-  });
-
-  it('synthesizes a round from the dev worktree when none is stored, persists reviewRound=1, and dispatches u-1', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedTask({
-      id: 'task-code-1', branch: 'bx/task-code-1',
-      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 0, qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
-    mockDispatchDeps(m);
-    vi.spyOn(m, 'refreshWorkdirCacheFor').mockResolvedValue(undefined);
-    vi.spyOn(m, 'getReviewTransport').mockReturnValue({
-      readContent: vi.fn(async () => ({ content: 'diff synth', diffstat: 'stat', baseSha: 'sha1' })),
-    } as never);
-
-    const result = await m.submitCodeVerdict('task-code-1', '补一下测试');
-    expect(result.status).toBe('fixing');
-    expect((await taskStore.get('task-code-1'))?.reviewRound).toBe(1);
-    const round = await store.getRound('task-code-1', 'code', 1);
-    expect(round?.content).toBe('diff synth');
-    expect(round?.findings?.findings).toEqual([{ id: 'u-1', severity: 'major', message: '补一下测试' }]);
-    expect(round?.userDecision?.verdict).toBe('request-changes');
-  });
-
-  it('degrades to an empty round when the worktree read fails, still dispatching u-1', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedTask({
-      id: 'task-code-1', branch: 'bx/task-code-1',
-      status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 0, qaAgentId: undefined,
-    });
-    await seedAgent({ id: 'dev-1', taskId: 'task-code-1' });
-    mockDispatchDeps(m);
-    vi.spyOn(m, 'refreshWorkdirCacheFor').mockResolvedValue(undefined);
-    vi.spyOn(m, 'getReviewTransport').mockReturnValue({
-      readContent: vi.fn(async () => { throw new Error('git unavailable'); }),
-    } as never);
-
-    const result = await m.submitCodeVerdict('task-code-1', '这块得改');
-    expect(result.status).toBe('fixing');
-    const round = await store.getRound('task-code-1', 'code', 1);
-    expect(round?.content).toBe('');
-    expect(round?.findings?.findings).toEqual([{ id: 'u-1', severity: 'major', message: '这块得改' }]);
-  });
-
-  it('appends u-2 on a subsequent request-changes', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store, {}, {
-      findings: { round: 1, verdict: 'request-changes', findings: [
-        { id: 'f-1', severity: 'minor', message: 'nit' },
-        { id: 'u-1', severity: 'major', message: '第一次意见' },
-      ] },
-    });
-    mockDispatchDeps(m);
-    const result = await m.submitCodeVerdict('task-code-1', '第二次意见');
-    expect(result.status).toBe('fixing');
-    const round = await store.getRound('task-code-1', 'code', 1);
-    expect(round?.findings?.findings.map(f => f.id)).toEqual(['f-1', 'u-1', 'u-2']);
-  });
-
-  it('serializes concurrent verdicts: exactly one wins, the other gets 409', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store);
-    mockDispatchDeps(m);
-    const results = await Promise.allSettled([
-      m.submitCodeVerdict('task-code-1', '意见 A'),
-      m.submitCodeVerdict('task-code-1', '意见 B'),
-    ]);
-    const fulfilled = results.filter(r => r.status === 'fulfilled');
-    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
-    expect(fulfilled).toHaveLength(1);
-    expect(rejected).toHaveLength(1);
-    expect(rejected[0].reason).toMatchObject({ status: 409 });
-  });
-
-  it('returns 409 while a merge is in flight', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store);
-    (m as unknown as { markCompleteInFlight: Set<string> }).markCompleteInFlight.add('task-code-1');
-    await expect(m.submitCodeVerdict('task-code-1', 'x')).rejects.toMatchObject({ status: 409 });
-    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
-  });
-
-  it('confirmHumanGate returns 409 while a code verdict is in flight', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store);
-    const gates = m as unknown as {
-      codeVerdictInFlight: Set<string>;
-      markCompleteInFlight: Set<string>;
-    };
-    gates.codeVerdictInFlight.add('task-code-1');
-    await expect(m.confirmHumanGate('task-code-1')).rejects.toMatchObject({ status: 409 });
-    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
-    expect(gates.markCompleteInFlight.has('task-code-1')).toBe(false);
-  });
-
-  it('returns 500 when the dev cannot be acquired; the task stays ready with the decision on record', async () => {
-    const store = new ReviewStore();
-    const m = codeManager(store);
-    await seedCodeReady(store);
-    vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(false);
-    vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
-    await expect(m.submitCodeVerdict('task-code-1', '打回但派发失败'))
-      .rejects.toMatchObject({ status: 500 });
-    expect((await taskStore.get('task-code-1'))?.status).toBe('ready');
-    // 留档不回滚：意见已记录，重复发起会追加 u-2
-    const round = await store.getRound('task-code-1', 'code', 1);
-    expect(round?.userDecision?.comments).toBe('打回但派发失败');
-    expect(round?.findings?.findings.some(f => f.id === 'u-1')).toBe(true);
-  });
 });
 
 describe('AgentManager.startSession status gate', () => {
@@ -4679,7 +2685,7 @@ describe('AgentManager.startSession status gate', () => {
     await seedTask({ status: 'cancelled' });
     await seedAgent({ id: 'qa-1' });
 
-    const result = await manager.startSession('task-1', 'qa-1', 'server-spec-review', {
+    const result = await manager.startSession('task-1', 'qa-1', 'review', {
       bypassTaskStatusGate: true,
     });
     expect(result).toBe(false);
@@ -4730,8 +2736,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
       'waitForReplPromptReady',
     ).mockResolvedValue(undefined);
     vi.spyOn(
-      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForTaskBoundary',
+      manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForDispatchBoundary',
     ).mockResolvedValue(undefined);
   }
 
@@ -4747,8 +2753,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
     return { projectId: 'proj', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', ...over } as unknown as AgentConfig;
   }
 
-  it('startSession develop prompt drops the spec route when the task snapshot has no QA', async () => {
-    const t = await seedTask({ id: 'task-noqa-1', branch: 'bx/task-noqa-1', signalToken: 'devtok1234ab' });
+  it('startSession develop prompt delegates completion kinds to skills', async () => {
+    const t = await seedTask({ id: 'task-spec-route-1', branch: 'bx/task-spec-route-1', signalToken: 'devtok1234ab' });
     await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
     await acquireBoundLock('dev-1');
 
@@ -4758,8 +2764,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
-    expect(prompts[0]).toContain('signal: pr-created');
-    expect(prompts[0]).not.toContain('spec-signal:');
+    expect(prompts[0]).toContain('token: devtok1234ab');
+    expect(prompts[0]).not.toMatch(/^(?:spec-)?signal:/m);
   });
 
   it('startSession assertOwner gates on generation: a DELETE→recreate during ensureSession aborts before checkout', async () => {
@@ -4779,7 +2785,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(switchSpy).not.toHaveBeenCalled();
   });
 
-  it('startSession develop prompt keeps the Dev-SDD spec route when the task snapshot has QA', async () => {
+  it('startSession develop prompt stays kind-free when the task snapshot has QA', async () => {
     const t = await seedTask({
       id: 'task-hasqa-1',
       branch: 'bx/task-hasqa-1',
@@ -4795,8 +2801,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
 
     const ok = await manager.startSession(t.id, 'dev-1', 'develop');
     expect(ok).toBe(true);
-    expect(prompts[0]).toContain('spec-signal: spec-done');
-    expect(prompts[0]).toContain('signal: pr-created');
+    expect(prompts[0]).toContain('token: devtok5678cd');
+    expect(prompts[0]).not.toMatch(/^(?:spec-)?signal:/m);
   });
 
   it('startSession marks bootstrappingTaskId during dispatch and clears it once the prompt is ack\'d', async () => {
@@ -5125,7 +3131,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-busyq', branch: 'bx/task-busyq', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 7, qaAgentId: 'qa-1', signalToken: 'tokA12345678',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 7, qaAgentId: 'qa-1', signalToken: 'tokA12345678',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5156,7 +3162,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-busysup', branch: 'bx/task-busysup', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 9, qaAgentId: 'qa-1', signalToken: 'successor-tk',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 9, qaAgentId: 'qa-1', signalToken: 'successor-tk',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5177,7 +3183,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-busynof', branch: 'bx/task-busynof', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 10, qaAgentId: 'qa-1', signalToken: 'tokNF1234567',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 10, qaAgentId: 'qa-1', signalToken: 'tokNF1234567',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5210,7 +3216,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-busyb', branch: 'bx/task-busyb', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 8, qaAgentId: 'qa-1', signalToken: 'tokB12345678',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 8, qaAgentId: 'qa-1', signalToken: 'tokB12345678',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5221,8 +3227,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
       'switchToVerifiedReviewHead',
     ).mockResolvedValue(undefined);
     vi.spyOn(
-      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForTaskBoundary',
+      manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForDispatchBoundary',
     ).mockRejectedValue(new ReplNotReadyError('%0', 'codex', '', 'stable idle not confirmed within 5000ms'));
 
     await expect(manager.startSession(t.id, 'qa-1', 'recheck', {
@@ -5243,8 +3249,8 @@ describe('AgentManager dispatch & skill provisioning', () => {
     mockEnsureSession();
     vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue();
     vi.spyOn(
-      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForTaskBoundary',
+      manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForDispatchBoundary',
     ).mockRejectedValue(new ReplNotReadyError('%0', 'claude-code', '', 'stable idle not confirmed within 5000ms'));
 
     await expect(manager.startSession(t.id, 'dev-1', 'develop')).rejects.toMatchObject({
@@ -5261,7 +3267,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-busyinj', branch: 'bx/task-busyinj', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 12, qaAgentId: 'qa-1', signalToken: 'tokINJ123456',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 12, qaAgentId: 'qa-1', signalToken: 'tokINJ123456',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5309,46 +3315,11 @@ describe('AgentManager dispatch & skill provisioning', () => {
     expect(nextGen.budgetAlerted).toBeUndefined();
   });
 
-  it('startSession 注入前 pass 已被接管（token 轮换、锁未换）→ 放弃 paste 返回 false（#563 R25）', async () => {
-    manager = await makeManagedCloneManager();
-    const t = await seedTask({
-      id: 'task-fence', branch: 'bx/task-fence', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 13, qaAgentId: 'qa-1', signalToken: 'old-pass-tok9',
-    });
-    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
-    await acquireBoundLock('qa-1', t.id);
-
-    mockEnsureSession();
-    vi.spyOn(
-      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
-      'switchToVerifiedReviewHead',
-    ).mockResolvedValue(undefined);
-    // 在 artifacts 制备窗口里 push 轮换了 token（不动锁）——旧派发不得把旧 prompt 注入 successor pass
-    vi.spyOn(
-      manager as unknown as { prepareDispatchArtifacts: (...args: unknown[]) => Promise<void> },
-      'prepareDispatchArtifacts',
-    ).mockImplementation(async () => {
-      const fresh = (await taskStore.get(t.id))!;
-      await taskStore.set({ ...fresh, signalToken: 'successor-tok9', updatedAt: new Date().toISOString() });
-    });
-    const injectSpy = vi.spyOn(
-      manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
-      'injectAndAwaitAck',
-    );
-
-    const started = await manager.startSession(t.id, 'qa-1', 'recheck', {
-      dispatchPassToken: 'old-pass-tok9',
-    });
-
-    expect(started).toBe(false);
-    expect(injectSpy).not.toHaveBeenCalled();
-  });
-
   it('startSession 携带 pass guard 到 injectAndAwaitAck 的 paste fence（#563 R25）', async () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-fence2', branch: 'bx/task-fence2', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 14, qaAgentId: 'qa-1', signalToken: 'tokF212345678'.slice(0, 12),
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 14, qaAgentId: 'qa-1', signalToken: 'tokF212345678'.slice(0, 12),
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5379,45 +3350,11 @@ describe('AgentManager dispatch & skill provisioning', () => {
     await expect((guardArg as () => Promise<boolean>)()).resolves.toBe(false);
   });
 
-  it('cancel 不轮换 token：注入前 fence 复核可投递状态，cancelled 任务放弃 paste（#563 R31）', async () => {
-    manager = await makeManagedCloneManager();
-    const t = await seedTask({
-      id: 'task-fence3', branch: 'bx/task-fence3', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 15, qaAgentId: 'qa-1', signalToken: 'cancel-tok99',
-    });
-    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
-    await acquireBoundLock('qa-1', t.id);
-
-    mockEnsureSession();
-    vi.spyOn(
-      manager as unknown as { switchToVerifiedReviewHead: (...args: unknown[]) => Promise<void> },
-      'switchToVerifiedReviewHead',
-    ).mockResolvedValue(undefined);
-    vi.spyOn(
-      manager as unknown as { prepareDispatchArtifacts: (...args: unknown[]) => Promise<void> },
-      'prepareDispatchArtifacts',
-    ).mockImplementation(async () => {
-      const fresh = (await taskStore.get(t.id))!;
-      await taskStore.set({ ...fresh, status: 'cancelled', updatedAt: new Date().toISOString() });
-    });
-    const injectSpy = vi.spyOn(
-      manager as unknown as { injectAndAwaitAck: (...args: unknown[]) => Promise<unknown> },
-      'injectAndAwaitAck',
-    );
-
-    const started = await manager.startSession(t.id, 'qa-1', 'recheck', {
-      dispatchPassToken: 'cancel-tok99',
-    });
-
-    expect(started).toBe(false);
-    expect(injectSpy).not.toHaveBeenCalled();
-  });
-
   it('paste fence 的 guard 同时复核任务状态：cancelled（token 未变）判 false（#563 R31）', async () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-fence4', branch: 'bx/task-fence4', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 16, qaAgentId: 'qa-1', signalToken: 'cancel-tok88',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 16, qaAgentId: 'qa-1', signalToken: 'cancel-tok88',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5451,7 +3388,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-clearp', branch: 'bx/task-clearp', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 11, qaAgentId: 'qa-1', signalToken: 'tokCL1234567',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 11, qaAgentId: 'qa-1', signalToken: 'tokCL1234567',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo-qa' });
     await acquireBoundLock('qa-1', t.id);
@@ -5495,7 +3432,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     manager = await makeManagedCloneManager();
     const t = await seedTask({
       id: 'task-ghrev', branch: 'bx/task-ghrev', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 7, signalToken: 'revtok1234ab',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb', prNumber: 7, signalToken: 'revtok1234ab',
       latestHeadSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
@@ -5516,7 +3453,7 @@ describe('AgentManager dispatch & skill provisioning', () => {
     const NEW = 'c'.repeat(40);
     const t = await seedTask({
       id: 'task-moved', branch: 'bx/task-moved', status: 'review',
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
       prNumber: 7, signalToken: 'movtok123456', latestHeadSha: OLD,
     });
     await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%0', workdir: '/tmp/repo' });
@@ -6407,7 +4344,7 @@ describe('interruptPaneAndWaitReady composer recovery', () => {
     expect(timeouts.filter(t => t !== undefined).every(t => t === 15_000)).toBe(true);
   });
 
-  it('injectTextToAgent (read-file responder) refuses to inject into a pane held by cancel cleanup', async () => {
+  it('injectTextToAgent refuses to inject into a pane held by cancel cleanup', async () => {
     await seedTask({ id: 'task-rf-hold', status: 'in_progress' });
     await seedAgent({ id: 'qa-1', taskId: 'task-rf-hold', paneId: '%0', status: 'awaiting_human', awaitingPhase: 'cancel-clearing' });
     await expect(
@@ -6822,18 +4759,15 @@ describe('AgentManager dispatchPostMergeCleanup', () => {
     expect((await taskStore.get('pend-task'))?.status).toBe('pending');
   });
 
-  it('a delete-claim that wins the task lock forces a racing dispatchPendingTask to refuse (task stays pending)', async () => {
+  it('a pending task reference prevents deletion from tombstoning its participant', async () => {
     await seedAgent({ id: 'dev-1' });
     await seedTask({ id: 'pend-ser', status: 'pending', agentId: 'dev-1', preferredAgentId: 'dev-1' });
-    // The claim is invoked first, tombstones dev-1 under the task lock; the dispatch queued behind it sees the
-    // tombstone and refuses — the claim and the dispatch's active commit share one critical section.
-    const claim = manager.scanActiveThenClaimDeletion(['dev-1']);
-    const dispatched = await manager.dispatchPendingTask('pend-ser', 'dev-1');
 
-    expect(await claim).toEqual({ ok: true });
-    expect(dispatched.errorCode).toBe(409);
+    const claim = await manager.scanOpenThenClaimDeletion(['dev-1']);
+
+    expect(claim).toEqual({ ok: false, code: 'referencing', taskId: 'pend-ser' });
     expect((await taskStore.get('pend-ser'))?.status).toBe('pending');
-    expect(manager.isDeletionInFlight('dev-1')).toBe(true);
+    expect(manager.isDeletionInFlight('dev-1')).toBe(false);
   });
 
   it('dispatchPendingTask rejects when a non-dispatched participant (QA) is deleted+recreated before the active write', async () => {
@@ -8514,15 +6448,24 @@ describe('injectAndAwaitAck busy-baseline is non-ackable', () => {
 
 describe('AgentManager max_rounds manual actions', () => {
   function maxRoundsTask(overrides: Partial<TaskState> = {}): TaskState {
-    return task({
+    const value = task({
       id: 'task-mr',
       status: 'max_rounds',
       reviewRound: 2,
       prNumber: 42,
       prUrl: 'https://github.com/user/repo/pull/42',
       branch: 'bx/task-mr',
+      phase: 'code',
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+      replyActorId: '77',
+      replyActorStatus: 'verified',
       ...overrides,
     });
+    if (value.phase === undefined) delete value.deliveryConfirmation;
+    else if (!Object.hasOwn(overrides, 'deliveryConfirmation')) {
+      value.deliveryConfirmation = { phase: value.phase, source: 'signal', at: NOW };
+    }
+    return value;
   }
 
   describe('markTaskComplete', () => {
@@ -8660,8 +6603,10 @@ describe('AgentManager max_rounds manual actions', () => {
       await taskStore.set(maxRoundsTask());
       await bindReservedDev();
       vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-      vi.spyOn(manager as unknown as { rotateAndSetupPhaseSignal: () => Promise<{ armed: boolean }> },
-        'rotateAndSetupPhaseSignal').mockResolvedValue({ armed });
+      vi.spyOn(manager as unknown as {
+        rotateAndSetupPhaseSignal: () => Promise<{ token: string; armed: boolean }>;
+      },
+        'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'fix-token', armed });
     }
 
     it('transitions max_rounds → fixing, bumps the round, and dispatches the fix', async () => {
@@ -8672,7 +6617,12 @@ describe('AgentManager max_rounds manual actions', () => {
 
       expect(result.status).toBe('fixing');
       expect(result.reviewRound).toBe(3);
-      expect(continueSpy).toHaveBeenCalledWith('task-mr', 'dev-1', 'fix');
+      expect(continueSpy).toHaveBeenCalledWith(
+        'task-mr',
+        'dev-1',
+        'fix',
+        expect.objectContaining({ signalToken: 'fix-token' }),
+      );
     });
 
     it.each([
@@ -8739,16 +6689,9 @@ describe('AgentManager max_rounds manual actions', () => {
     expect((await taskStore.get('task-mr'))?.status).toBe('failed');
   });
 
-  it('failTasksForAgent does NOT fail a max_rounds task whose qaAgentId was cleared on release', async () => {
-    await taskStore.set(maxRoundsTask({ qaAgentId: undefined }));
-    const { failedTaskIds } = await manager.failTasksForAgent('qa-1', 'tmux-absent');
-    expect(failedTaskIds).not.toContain('task-mr');
-    expect((await taskStore.get('task-mr'))?.status).toBe('max_rounds');
-  });
-
   it('failTasksForAgent fails a spec-ready task when its dev dies (approve/reject both need the dev worktree)', async () => {
     await taskStore.set(task({
-      id: 'task-sr', status: 'spec-ready', phase: 'spec', agentId: 'dev-1', qaAgentId: undefined,
+      id: 'task-sr', status: 'spec-ready', phase: 'spec', agentId: 'dev-1',
     }));
     await seedAgent({ id: 'dev-1', status: 'waiting', taskId: 'task-sr' });
     const { failedTaskIds } = await manager.failTasksForAgent('dev-1', 'tmux-absent');
@@ -8774,6 +6717,32 @@ describe('AgentManager max_rounds manual actions', () => {
       expect(createSpy).toHaveBeenCalled();
       expect(fresh.id).toBe('task-mr-retry');
       expect((await taskStore.get('task-mr'))?.status).toBe('cancelled');
+    });
+
+    it('resolves the current Dev through the surviving QA group when the historical Dev was replaced', async () => {
+      await taskStore.set(task({ id: 'task-retry-replaced', status: 'failed' }));
+      manager.replaceConfig({
+        ...CONFIG,
+        project: [{
+          ...CONFIG.project[0]!,
+          agent: [[
+            { ...CONFIG.project[0]!.agent[0]![0]!, id: 'dev-next' },
+            CONFIG.project[0]!.agent[0]![1]!,
+          ]],
+        }],
+      });
+      const validate = vi.spyOn(manager, 'validateTaskDispatch').mockResolvedValue();
+      const create = vi.spyOn(manager, 'createAndStartTask')
+        .mockResolvedValue(task({ id: 'task-retry-created', status: 'in_progress' }));
+
+      await manager.retryTask('task-retry-replaced');
+
+      expect(validate).toHaveBeenCalledWith('proj', expect.objectContaining({
+        preferredAgentId: 'dev-next',
+      }));
+      expect(create).toHaveBeenCalledWith('proj', expect.objectContaining({
+        preferredAgentId: 'dev-next',
+      }));
     });
   });
 
@@ -8809,182 +6778,6 @@ async function waitUntilAsync(predicate: () => Promise<boolean>, timeoutMs = 100
     await new Promise(resolve => setTimeout(resolve, 5));
   }
   throw new Error('waitUntilAsync: predicate never became true');
-}
-
-describe('AgentManager — non-GitHub platform derivation', () => {
-  const GL = 'https://gitlab.example.com/group/proj.git';
-
-  function makeMgr(config: BaxianConfig): AgentManager {
-    return makeManager({ config, skillRegistry: freshRegistry() });
-  }
-
-  function cfg(opts: {
-    mode?: 'github' | 'server';
-    afterDone?: 'pr' | 'branch' | null;
-    ghReviewMode?: 'github' | 'server';
-    glReviewMode?: 'github' | 'server';
-    glHasQa?: boolean;
-  }): BaxianConfig {
-    const dev = { id: 'gldev', runtime: 'claude-code' as const, role: 'dev' as const, mode: 'local' as const, workdir: '/tmp/repo' };
-    const qa = { id: 'glqa', runtime: 'codex' as const, role: 'qa' as const, mode: 'local' as const, workdir: '/tmp/qa-repo' };
-    return {
-      review: {
-        rounds: 2,
-        ...(opts.mode !== undefined ? { mode: opts.mode } : {}),
-        ...(opts.afterDone !== undefined ? { afterDone: opts.afterDone } : {}),
-      },
-      server: DEFAULT_SERVER_CONFIG,
-      project: [
-        {
-          id: 'gh', repo: 'user/repo', merge: null,
-          ...(opts.ghReviewMode !== undefined ? { review: { mode: opts.ghReviewMode } } : {}),
-          agent: [],
-        },
-        {
-          id: 'gl', repo: GL, merge: null,
-          review: { mode: opts.glReviewMode ?? 'server' },
-          agent: [opts.glHasQa === false ? [dev] : [dev, qa]],
-        },
-      ],
-    };
-  }
-
-  it('effectiveReviewMode: project override wins for github repos; non-github stays server', () => {
-    const mGh = makeMgr(cfg({ mode: 'git' }));
-    expect(mGh.effectiveReviewMode('gh')).toBe('git');
-    expect(mGh.effectiveReviewMode('gl')).toBe('server');
-
-    const mSrv = makeMgr(cfg({ mode: 'server' }));
-    expect(mSrv.effectiveReviewMode('gh')).toBe('server');
-    expect(mSrv.effectiveReviewMode('gl')).toBe('server');
-
-    const mDef = makeMgr(cfg({}));
-    expect(mDef.effectiveReviewMode('gh')).toBe('git');
-    expect(mDef.effectiveReviewMode('gl')).toBe('server');
-
-    const mMixed = makeMgr(cfg({ mode: 'server', ghReviewMode: 'git', glReviewMode: 'server' }));
-    expect(mMixed.effectiveReviewMode('gh')).toBe('git');
-    expect(mMixed.effectiveReviewMode('gl')).toBe('server');
-
-    const mProjectServer = makeMgr(cfg({ mode: 'git', ghReviewMode: 'server' }));
-    expect(mProjectServer.effectiveReviewMode('gh')).toBe('server');
-  });
-
-  it('effectiveReviewMode: github projects without overrides follow global mode changes', () => {
-    const m = makeMgr(cfg({ mode: 'server' }));
-    expect(m.effectiveReviewMode('gh')).toBe('server');
-
-    m.replaceConfig(cfg({ mode: 'git' }));
-    expect(m.effectiveReviewMode('gh')).toBe('git');
-  });
-
-  it('createTask snapshots the project review mode override', async () => {
-    const gitOverride = makeMgr(cfg({ mode: 'server', ghReviewMode: 'git' }));
-    const gitTask = await gitOverride.createTask('gh', {
-      title: 'T',
-      description: 'D',
-      preferredAgentId: '',
-    });
-    expect(gitTask.reviewMode).toBe('git');
-
-    const serverOverride = makeMgr(cfg({ mode: 'git', ghReviewMode: 'server' }));
-    const serverTask = await serverOverride.createTask('gh', {
-      title: 'T',
-      description: 'D',
-      preferredAgentId: '',
-    });
-    expect(serverTask.reviewMode).toBe('server');
-  });
-
-  it('resolveAfterDone: non-github coerces pr/unset → branch; explicit null honored; github unchanged', () => {
-    const t = (projectId: string, afterDone?: 'pr' | 'branch' | null) =>
-      task({ projectId, ...(afterDone !== undefined ? { afterDone } : {}) });
-
-    let m = makeMgr(cfg({ mode: 'git' }));
-    expect(m.resolveAfterDone(t('gl'))).toBe('branch');
-    expect(m.resolveAfterDone(t('gh'))).toBe(null);
-
-    m = makeMgr(cfg({ mode: 'git', afterDone: 'pr' }));
-    expect(m.resolveAfterDone(t('gl'))).toBe('branch');
-    expect(m.resolveAfterDone(t('gh'))).toBe('pr');
-
-    m = makeMgr(cfg({ mode: 'git', afterDone: null }));
-    expect(m.resolveAfterDone(t('gl'))).toBe(null);
-
-    m = makeMgr(cfg({ mode: 'git', afterDone: 'branch' }));
-    expect(m.resolveAfterDone(t('gl'))).toBe('branch');
-  });
-
-  it('resolveAfterDone: an explicit task.afterDone snapshot wins over coercion', () => {
-    const m = makeMgr(cfg({ mode: 'git', afterDone: 'pr' }));
-    expect(m.resolveAfterDone(task({ projectId: 'gl', afterDone: null }))).toBe(null);
-  });
-
-  it('createTask allows a server-mode (non-github) dev without QA partner', async () => {
-    await agentStore.set({ id: 'gldev', projectId: 'gl', updatedAt: NOW });
-    const m = makeMgr(cfg({ glHasQa: false }));
-    const created = await m.createTask('gl', { title: 'T', description: 'D', preferredAgentId: 'gldev' });
-    expect(created.reviewMode).toBe('server');
-    expect(created.qaAgentId).toBeUndefined();
-  });
-
-  it('createTask allows a non-github dev that DOES have a QA partner (snapshots server mode)', async () => {
-    await agentStore.set({ id: 'gldev', projectId: 'gl', updatedAt: NOW });
-    const m = makeMgr(cfg({ glHasQa: true }));
-    const created = await m.createTask('gl', { title: 'T', description: 'D', preferredAgentId: 'gldev' });
-    expect(created.reviewMode).toBe('server');
-    expect(created.qaAgentId).toBe('glqa');
-  });
-
-  it('resolveAfterDone through prepareConfig: non-github with omitted afterDone delivers (branch)', () => {
-    const prepared = prepareConfig({
-      review: { rounds: 2, mode: 'server' },
-      project: [{ id: 'gl', repo: GL, merge: null, agent: [[
-        { id: 'gldev', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-        { id: 'glqa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-      ]] }],
-    });
-    const m = makeMgr(prepared);
-    expect(m.resolveAfterDone(task({ projectId: 'gl' }))).toBe('branch');
-  });
-});
-
-type InjectAckFn = (
-  tmux: TmuxManager, paneId: string, prompt: string, agentId: string, runtime: 'claude-code' | 'codex',
-) => Promise<{ acked: boolean; composerDelivered: boolean }>;
-
-function stubInject(mgr: AgentManager, impl: InjectAckFn): void {
-  vi.spyOn(mgr as unknown as { injectAndAwaitAck: InjectAckFn }, 'injectAndAwaitAck').mockImplementation(impl);
-}
-
-function stubEnsureSession(mgr: AgentManager, over: Record<string, unknown> = {}): void {
-  vi.spyOn(mgr, 'ensureSession').mockImplementation(async (agentId) => ({
-    ok: true,
-    createdSession: false,
-    freshRuntime: false,
-    paneId: '%0',
-    workdir: (await agentStore.get(agentId))?.workdir ?? '/tmp/repo',
-    ...over,
-  }));
-  vi.spyOn(
-    mgr as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
-    'waitForReplPromptReady',
-  ).mockResolvedValue(undefined);
-  vi.spyOn(
-    mgr as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
-    'clearRuntimeForTaskBoundary',
-  ).mockResolvedValue(undefined);
-  vi.spyOn(BranchManager.prototype, 'switchToTaskBranch').mockResolvedValue(undefined);
-  vi.spyOn(BranchManager.prototype, 'switchToRemoteBranchDetached').mockResolvedValue(undefined);
-  vi.spyOn(BranchManager.prototype, 'switchToDefaultDetached').mockResolvedValue(undefined);
-  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
-}
-
-function stubImagePathsThrow(mgr: AgentManager, err: Error): void {
-  vi.spyOn(
-    mgr as unknown as { imagePathsForDispatch: () => Promise<string[]> },
-    'imagePathsForDispatch',
-  ).mockRejectedValue(err);
 }
 
 describe('AgentManager.startSession pre/mid-dispatch gates', () => {
@@ -9199,7 +6992,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     const newHeadSha = 'b'.repeat(40);
     const t = await seedTask({
       status: 'review', qaAgentId: 'qa-1', prNumber: 17,
-      reviewMode: 'git', platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
+      platformBinding: GIT_BINDING, passToken: 'aaaaaaaaaaaa', failToken: 'bbbbbbbbbbbb',
       signalToken: 'tok123456789', latestHeadSha: oldHeadSha,
     });
     await seedAgent({ id: 'qa-1', taskId: t.id });
@@ -9236,7 +7029,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
     const revalidate = vi.fn(async () => undefined);
     const clearBoundary = (
       manager as unknown as {
-        clearRuntimeForTaskBoundary: (
+        clearRuntimeForDispatchBoundary: (
           tmuxManager: TmuxManager,
           paneId: string,
           agentId: string,
@@ -9244,7 +7037,7 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
           revalidateOwner: () => Promise<void>,
         ) => Promise<void>;
       }
-    ).clearRuntimeForTaskBoundary.bind(manager);
+    ).clearRuntimeForDispatchBoundary.bind(manager);
 
     await expect(clearBoundary(tmux, '%0', 'dev-1', 'claude-code', revalidate))
       .rejects.toThrow('Runtime rejected /clear');
@@ -9269,8 +7062,8 @@ describe('AgentManager.startSession pre/mid-dispatch gates', () => {
       'waitForReplPromptReady',
     ).mockResolvedValue(undefined);
     vi.spyOn(
-      manager as unknown as { clearRuntimeForTaskBoundary: (...args: unknown[]) => Promise<void> },
-      'clearRuntimeForTaskBoundary',
+      manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForDispatchBoundary',
     ).mockRejectedValue(new Error('Runtime rejected /clear'));
     const tagSpy = vi.spyOn(
       manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
@@ -9390,25 +7183,6 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     return t;
   }
 
-  async function seedResearchContinuation(): Promise<TaskState> {
-    manager.replaceConfig(prepareConfig(RESEARCH_CONFIG));
-    const t = await seedTask({
-      status: 'fixing',
-      phase: 'spec',
-      preferredAgentId: 'research-1',
-      agentId: 'research-1',
-      devAgentId: 'dev-1',
-      researchAgentId: 'research-1',
-      signalToken: 'tok123456789',
-    });
-    await seedAgent({
-      id: 'research-1', taskId: t.id, paneId: '%0',
-      workdir: '/tmp/research-repo',
-    });
-    await acquireBoundLock('research-1', t.id);
-    return t;
-  }
-
   it('post-approve without a completion token is skipped', async () => {
     const t = await seedTask({ status: 'approved' });
     await seedAgent({
@@ -9446,35 +7220,6 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     await expect(manager.continueSession(t.id, 'qa-1', 'recheck')).resolves.toBe(false);
   });
 
-  it('resets a Research continuation to the latest detached default branch before dispatch', async () => {
-    const t = await seedResearchContinuation();
-    stubEnsureSession(manager);
-    stubInject(manager, async () => ({ acked: true, composerDelivered: true }));
-    const resetSpy = vi.mocked(BranchManager.prototype.switchToDefaultDetached);
-
-    await expect(manager.continueSession(t.id, 'research-1', 'server-feedback', {
-      serverPriorFindings: '{}',
-      serverFindingsDigest: 'a'.repeat(64),
-    }))
-      .resolves.toBe(true);
-    expect(resetSpy).toHaveBeenCalledWith('/tmp/research-repo');
-  });
-
-  it('does not dispatch Research feedback when the default detached checkout cannot be restored', async () => {
-    const t = await seedResearchContinuation();
-    stubEnsureSession(manager);
-    const injectSpy = vi.spyOn(
-      manager as unknown as { injectAndAwaitAck: InjectAckFn },
-      'injectAndAwaitAck',
-    ).mockResolvedValue({ acked: true, composerDelivered: true });
-    vi.mocked(BranchManager.prototype.switchToDefaultDetached)
-      .mockRejectedValueOnce(new DirtyWorkdirError('/tmp/research-repo'));
-
-    await expect(manager.continueSession(t.id, 'research-1', 'server-feedback'))
-      .rejects.toBeInstanceOf(DirtyWorkdirError);
-    expect(injectSpy).not.toHaveBeenCalled();
-  });
-
   it('a dirty checkout blocks a dev continuation unless allowDirtyWorkdir marks it as in-flight resume', async () => {
     const t = await seedContinueFix();
     stubEnsureSession(manager);
@@ -9485,6 +7230,64 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     await expect(manager.continueSession(t.id, 'dev-1', 'fix')).rejects.toBeInstanceOf(DirtyWorkdirError);
     await expect(manager.continueSession(t.id, 'dev-1', 'fix', { allowDirtyWorkdir: true }))
       .resolves.toBe(true);
+  });
+
+  it('clears and retags stale skill context before continuation injection', async () => {
+    const t = await seedContinueFix();
+    const order: string[] = [];
+    stubEnsureSession(manager, {
+      skillsStale: true,
+      pane: paneRefOf('%0', 'dev-1'),
+      sessionRef: SESSION_REF,
+    });
+    const clearSpy = vi.spyOn(
+      manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForDispatchBoundary',
+    ).mockImplementation(async (...args) => {
+      order.push('clear');
+      await (args[4] as () => Promise<void>)();
+    });
+    const tagSpy = vi.spyOn(
+      manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
+      'tagSessionSkillsVersion',
+    ).mockImplementation(async () => {
+      order.push('tag');
+    });
+    stubInject(manager, async () => {
+      order.push('inject');
+      return { acked: true, composerDelivered: true };
+    });
+
+    await expect(manager.continueSession(t.id, 'dev-1', 'fix')).resolves.toBe(true);
+    expect(order).toEqual(['clear', 'tag', 'inject']);
+    expect(clearSpy).toHaveBeenCalledOnce();
+    expect(tagSpy).toHaveBeenCalledWith(expect.any(TmuxManager), 'dev-1', SESSION_REF);
+  });
+
+  it('does not retag or inject when stale continuation context cannot be cleared', async () => {
+    const t = await seedContinueFix();
+    stubEnsureSession(manager, {
+      skillsStale: true,
+      pane: paneRefOf('%0', 'dev-1'),
+      sessionRef: SESSION_REF,
+    });
+    vi.spyOn(
+      manager as unknown as { clearRuntimeForDispatchBoundary: (...args: unknown[]) => Promise<void> },
+      'clearRuntimeForDispatchBoundary',
+    ).mockRejectedValue(new Error('skill refresh clear failed'));
+    const tagSpy = vi.spyOn(
+      manager as unknown as { tagSessionSkillsVersion: (...args: unknown[]) => Promise<void> },
+      'tagSessionSkillsVersion',
+    ).mockResolvedValue(undefined);
+    const injectSpy = vi.spyOn(
+      manager as unknown as { injectAndAwaitAck: InjectAckFn },
+      'injectAndAwaitAck',
+    ).mockResolvedValue({ acked: true, composerDelivered: true });
+
+    await expect(manager.continueSession(t.id, 'dev-1', 'fix'))
+      .rejects.toThrow('skill refresh clear failed');
+    expect(tagSpy).not.toHaveBeenCalled();
+    expect(injectSpy).not.toHaveBeenCalled();
   });
 
   it('restores the task branch checkout when a dev continuation left it and the tree is clean', async () => {
@@ -9573,18 +7376,11 @@ describe('AgentManager.continueSession pre/mid-dispatch gates', () => {
     return prompts[0]!;
   }
 
-  it('a develop continuation without a QA partner replays the QA-less prompt (no spec-signal)', async () => {
+  it('a develop continuation carries only the rotating token', async () => {
     const prompt = await pasteDevelopContinuation({});
 
-    expect(prompt).not.toContain('spec-signal:');
-    expect(prompt).toContain('signal: pr-created');
-  });
-
-  it('a develop continuation with a QA partner keeps the spec-signal exit', async () => {
-    const prompt = await pasteDevelopContinuation({ qaAgentId: 'qa-1' });
-
-    expect(prompt).toContain('spec-signal: spec-done');
-    expect(prompt).toContain('signal: pr-created');
+    expect(prompt).toContain('token: tok123456789');
+    expect(prompt).not.toMatch(/^(?:spec-)?signal:/m);
   });
 
   it('rethrows without killSession when the dialog handler claims the ensureSession failure', async () => {
@@ -9871,7 +7667,7 @@ describe('AgentManager need-input watermark persistence', () => {
 
 describe('AgentManager need-input cross-layer (real watcher)', () => {
   interface CrossStreamer {
-    subscribeAtomic: (cbs: { onLive: (data: string) => void; onSessionGone: () => void }) => Promise<{
+    subscribeAtomic: (cbs: { onVisible: (data: string) => void; onSessionGone: () => void }) => Promise<{
       snapshot: { data: string };
       unsubscribe: () => void;
     }>;
@@ -9885,6 +7681,8 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
   function makeCrossLayer(): { m: AgentManager; streamer: CrossStreamer; captured: BaxianEvent[] } {
     const lives: Array<(data: string) => void> = [];
     const gones: Array<() => void> = [];
+    // Mirrors PaneStreamer: one decoder bound to the whole stream, shared by every subscription.
+    const decoder = new VisibleTextExtractor();
     let failNext = false;
     const holdQueue: Promise<void>[] = [];
     let snapshotData = '';
@@ -9896,11 +7694,14 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
         }
         const gate = holdQueue.shift();
         if (gate) await gate;
-        lives.push(cbs.onLive);
+        lives.push(cbs.onVisible);
         gones.push(cbs.onSessionGone);
         return { snapshot: { data: snapshotData }, unsubscribe: () => undefined };
       },
-      triggerLive: (data) => { for (const fn of [...lives]) fn(data); },
+      triggerLive: (data) => {
+        const visible = decoder.write(data);
+        for (const fn of [...lives]) fn(visible);
+      },
       triggerSessionGone: () => { for (const fn of [...gones]) fn(); },
       failNextSubscribe: () => { failNext = true; },
       holdNextSubscribe: () => {
@@ -10617,7 +8418,7 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
     const wm = (await agentStore.get('dev-1'))?.needInput;
     expect(wm).toMatchObject({ epoch: 2, askSeq: 1, answeredSeq: 0 });
     expect(wm?.at).toBeDefined();
-    streamer.triggerLive('[bx:pr-created:7:tokNEW1234567]\n');
+    streamer.triggerLive('[bx:pr-created:7:Nzc:tokNEW1234567]\n');
     await flush();
     expect(captured.some(e => e.type === 'pr.created')).toBe(true);
   });
@@ -10706,7 +8507,7 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
     expect(await armVia(m, 'tokNEW1234567', { needInputMode: 'fresh', skipSnapshot: true })).toBe(true);
     expect((await agentStore.get('dev-1'))?.needInput?.epoch).toBe(2);
     // The successor consumes its phase signal and exits the watcher map entirely.
-    streamer.triggerLive('[bx:pr-created:7:tokNEW1234567]\n');
+    streamer.triggerLive('[bx:pr-created:7:Nzc:tokNEW1234567]\n');
     await flush();
     expect(m['phaseSignalWatcher']!.has('t-xl', 'dev-1')).toBe(false);
 
@@ -10742,32 +8543,25 @@ describe('AgentManager need-input cross-layer (real watcher)', () => {
     expect((await agentStore.get('dev-1'))?.needInput).toMatchObject({ epoch: 3, askSeq: 1, answeredSeq: 0 });
   });
 
-  it('armPostDispatchSignalOrHold strips a superseded watermark (server fix/publish continuations)', async () => {
+  it('armPostDispatchSignalOrHold strips a superseded watermark for a continuation', async () => {
     const { m } = makeCrossLayer();
     await seedCross({ epoch: 2, askSeq: 1, answeredSeq: 0, at: NOW });
     await (m as never as {
       armPostDispatchSignalOrHold: (
         taskId: string, agentId: string, kinds: readonly string[], token: string,
       ) => Promise<void>;
-    }).armPostDispatchSignalOrHold('t-xl', 'dev-1', ['code-fixed'], 'tokXL12345678');
+    }).armPostDispatchSignalOrHold('t-xl', 'dev-1', ['pr-fixed'], 'tokXL12345678');
     expect((await agentStore.get('dev-1'))?.needInput).toEqual({ epoch: 3, askSeq: 0, answeredSeq: 0 });
   });
 });
 
 describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', () => {
-  async function seedFailedCodeRedispatch(reviewStore: ReviewStore): Promise<TaskState> {
+  async function seedFailedCodeRedispatch(): Promise<TaskState> {
     const t = await seedTask({
       status: 'in_progress',
       phase: 'code',
       specReviewRound: 1,
       signalToken: 'code-redispatch-token',
-    });
-    await reviewStore.putRound(t.id, 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Accepted spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Accepted spec' }],
-      startedAt: NOW,
     });
     await seedAgent({
       id: 'dev-1', taskId: t.id, paneId: '%0',
@@ -10881,6 +8675,34 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
     },
   );
 
+  it('Resume treats a later spec review round as recheck even when code reviewRound is zero', async () => {
+    const t = await seedTask({
+      status: 'review',
+      phase: 'spec',
+      specReviewRound: 2,
+      reviewRound: 0,
+      qaAgentId: 'qa-1',
+      prNumber: 12,
+      signalToken: 'spec-pass-r2',
+    });
+    await seedAgent({
+      id: 'qa-1',
+      taskId: t.id,
+      paneId: '%1',
+      status: 'awaiting_human',
+      awaitingPhase: 'checkout-preparation-failed',
+      awaitingReason: 'repl not ready',
+      awaitingSince: NOW,
+    });
+    await acquireBoundLock('qa-1', t.id);
+    const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue({} as never);
+
+    await manager.resumeAgent('qa-1');
+
+    const options = dispatchSpy.mock.calls[0]?.[1];
+    expect(options).not.toHaveProperty('qaPhase');
+  });
+
   it('Resume 首评 hold 携带持久化未计轮 intent：bumpRound=true + qaPhase=review（#563 R23）', async () => {
     const t = await seedTask({
       status: 'review', qaAgentId: 'qa-1', prNumber: 12,
@@ -10901,40 +8723,6 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
       qaPhase: 'review',
       expectSignalToken: 'pass-t2',
     }));
-  });
-
-  it('Resume replays a held spec review at the cap without creating round cap + 1', async () => {
-    const t = await seedTask({
-      status: 'review', phase: 'spec', specReviewRound: 2,
-      qaAgentId: 'qa-1', signalToken: 'spec-pass-t2',
-    });
-    await seedAgent({
-      id: 'qa-1', taskId: t.id,
-      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
-      awaitingReason: 'repl not ready', awaitingSince: NOW,
-    });
-    await acquireBoundLock('qa-1', t.id);
-    const driver = {
-      dispatchCodeReview: vi.fn(async () => true),
-      dispatchSpecReview: vi.fn(async () => true),
-    };
-    manager.setServerReviewDriver(driver);
-
-    const result = await manager.resumeAgent('qa-1');
-
-    expect(result).toEqual({ resumed: true, releasedBinding: false });
-    expect(driver.dispatchSpecReview).toHaveBeenCalledWith(
-      expect.objectContaining({ id: t.id, specReviewRound: 2 }),
-      expect.objectContaining({
-        bumpRound: false,
-        expectedTask: expect.objectContaining({
-          status: 'review',
-          specReviewRound: 2,
-          signalToken: 'spec-pass-t2',
-        }),
-      }),
-    );
-    expect((await taskStore.get(t.id))?.specReviewRound).toBe(2);
   });
 
   it('releases the held QA binding instead of redispatching when the task has left review', async () => {
@@ -11189,7 +8977,9 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
   it('Resume git 路由把 onQaAcquired 转发到 lease 派发，并用 L2 恢复 handled hold', async () => {
     const headSha = 'a'.repeat(40);
     const t = await seedTask({
-      status: 'review', reviewMode: 'git', qaAgentId: 'qa-1', prNumber: 12,
+      status: 'review', phase: 'code', qaAgentId: 'qa-1', prNumber: 12,
+      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
+      replyActorId: '77', replyActorStatus: 'verified',
       reviewRound: 1, signalToken: '111111111111', reviewHeadAnchorSha: headSha,
       passToken: '222222222222', failToken: '333333333333',
       reviewDispatch: {
@@ -11282,24 +9072,20 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
     expect(await lockManager.isLocked('dev-1')).toBe(true);
   });
 
-  it('resumes a first-round code redispatch whose specReviewRound was never persisted', async () => {
-    const reviewStore = new ReviewStore();
-    const m = makeManager({ reviewStore });
+  it('resumes a code redispatch without a server Spec handoff', async () => {
+    const m = makeManager();
     const t = await seedTask({
       status: 'in_progress',
       phase: 'code',
-      signalToken: 'code-r1-resume-token',
-    });
-    await reviewStore.putRound(t.id, 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Auto spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Auto spec' }],
-      startedAt: NOW,
+      specReviewRound: 2,
+      signalToken: 'git-code-resume-token',
     });
     await seedAgent({
-      id: 'dev-1', taskId: t.id, paneId: '%0',
-      status: 'awaiting_human', awaitingPhase: 'code-dispatch-failed',
+      id: 'dev-1',
+      taskId: t.id,
+      paneId: '%0',
+      status: 'awaiting_human',
+      awaitingPhase: 'code-dispatch-failed',
     });
     await acquireBoundLock('dev-1');
     const continueSpy = vi.spyOn(m, 'continueSession').mockResolvedValue(true);
@@ -11307,13 +9093,18 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
     const result = await m.resumeAgent('dev-1');
 
     expect(result).toMatchObject({ resumed: true, releasedBinding: false });
-    expect(continueSpy).toHaveBeenCalled();
+    expect(continueSpy).toHaveBeenCalledWith(
+      t.id,
+      'dev-1',
+      'code',
+      expect.objectContaining({ signalToken: 'git-code-resume-token' }),
+    );
+    expect(continueSpy.mock.calls[0]?.[3]).not.toHaveProperty('specDocuments');
   });
 
   it('re-holds the agent when the code redispatch is not delivered', async () => {
-    const reviewStore = new ReviewStore();
-    const m = makeManager({ reviewStore });
-    const t = await seedFailedCodeRedispatch(reviewStore);
+    const m = makeManager();
+    const t = await seedFailedCodeRedispatch();
     vi.spyOn(m, 'continueSession').mockResolvedValue(false);
     const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
 
@@ -11330,9 +9121,8 @@ describe('AgentManager.resumeAgent binding cleanup & code redispatch failures', 
   });
 
   it('re-holds the agent when the code redispatch throws', async () => {
-    const reviewStore = new ReviewStore();
-    const m = makeManager({ reviewStore });
-    const t = await seedFailedCodeRedispatch(reviewStore);
+    const m = makeManager();
+    const t = await seedFailedCodeRedispatch();
     vi.spyOn(m, 'continueSession').mockRejectedValue(new Error('redispatch boom'));
     const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -11363,32 +9153,6 @@ describe('AgentManager.createTask queue reasons', () => {
     expect(created).toMatchObject({ status: 'pending', agentId: '', devAgentId: '' });
     const queuedEvent = events.find(e => e.type === 'task.created' && e.taskId === created.id);
     expect(queuedEvent?.data).toEqual({ queued: true, queueReason: 'unassigned' });
-  });
-
-  it('keeps the Research group snapshot when the preferred owner is busy', async () => {
-    manager = makeManager({ config: RESEARCH_CONFIG });
-    await seedAgent({ id: 'research-1', creationToken: 'creating' });
-
-    const created = await manager.createTask('proj', {
-      title: 'research later',
-      description: 'details',
-      preferredAgentId: 'research-1',
-    });
-
-    expect(created).toMatchObject({
-      status: 'pending',
-      agentId: '',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-    });
-    const queuedEvent = events.find(e => e.type === 'task.created' && e.taskId === created.id);
-    expect(queuedEvent?.data).toEqual({
-      queued: true,
-      queueReason: 'preferred_agent_busy',
-      agentId: 'research-1',
-    });
   });
 
   it('queues with agent_locked when the dev binding is free but its lock is already held', async () => {
@@ -11429,19 +9193,16 @@ describe('AgentManager.editTask', () => {
   it('clearing preferredAgentId also drops the snapshotted participants and initial phase', async () => {
     await seedTask({
       status: 'pending',
-      preferredAgentId: 'research-1',
+      preferredAgentId: 'dev-1',
       agentId: '',
       devAgentId: 'dev-1',
       qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
     });
     const updated = await manager.editTask('task-1', { preferredAgentId: '' });
     expect(updated.preferredAgentId).toBe('');
     expect(updated).toMatchObject({ agentId: '', devAgentId: '' });
     expect(updated.phase).toBeUndefined();
     expect(updated.qaAgentId).toBeUndefined();
-    expect(updated.researchAgentId).toBeUndefined();
   });
 
   it('rejects an unknown preferred agent with 400', async () => {
@@ -11459,10 +9220,9 @@ describe('AgentManager.editTask', () => {
   it('switching the preferred owner to Dev re-derives QA and leaves the initial phase undecided', async () => {
     await seedTask({
       status: 'pending',
-      preferredAgentId: 'research-1',
+      preferredAgentId: '',
       agentId: '',
-      researchAgentId: 'research-1',
-      phase: 'research',
+      devAgentId: '',
       qaAgentId: undefined,
     });
     const updated = await manager.editTask('task-1', { preferredAgentId: 'dev-1' });
@@ -11470,22 +9230,6 @@ describe('AgentManager.editTask', () => {
     expect(updated.devAgentId).toBe('dev-1');
     expect(updated.qaAgentId).toBe('qa-1');
     expect(updated.phase).toBeUndefined();
-    expect(updated.researchAgentId).toBeUndefined();
-  });
-
-  it('switching the preferred owner to Research snapshots all participants and the research phase', async () => {
-    manager = makeManager({ config: RESEARCH_CONFIG });
-    await seedTask({ status: 'pending', preferredAgentId: '', agentId: '', qaAgentId: undefined });
-
-    const updated = await manager.editTask('task-1', { preferredAgentId: 'research-1' });
-
-    expect(updated).toMatchObject({
-      preferredAgentId: 'research-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
-      researchAgentId: 'research-1',
-      phase: 'research',
-    });
   });
 });
 
@@ -11563,122 +9307,6 @@ describe('AgentManager.verifyPaneSignalPrNumber', () => {
   });
 });
 
-describe('AgentManager read-file relay', () => {
-  type ReadFileReq = { file: string; startLine: number; endLine: number };
-  function relay(mgr: AgentManager, taskId: string, qaId: string, req: ReadFileReq): Promise<void> {
-    return (mgr as unknown as {
-      handleReadFileRequest: (t: string, q: string, r: ReadFileReq) => Promise<void>;
-    }).handleReadFileRequest(taskId, qaId, req);
-  }
-
-  function stubTransport(mgr: AgentManager, impl: () => Promise<string>): void {
-    vi.spyOn(mgr, 'getReviewTransport').mockReturnValue({
-      readFileRange: vi.fn(impl),
-    } as unknown as ReturnType<AgentManager['getReviewTransport']>);
-  }
-
-  it('getReviewTransport memoizes the transport instance', () => {
-    expect(manager.getReviewTransport()).toBe(manager.getReviewTransport());
-  });
-
-  it('refreshWorkdirCacheFor caches the bound worktree and clears it when absent', async () => {
-    await seedAgent({ id: 'dev-1', workdir: '/tmp/repo/.baxian-worktrees/wt' });
-    await expect(manager.refreshWorkdirCacheFor('dev-1')).resolves.toBe('/tmp/repo/.baxian-worktrees/wt');
-    await seedAgent({ id: 'dev-1' });
-    await expect(manager.refreshWorkdirCacheFor('dev-1')).resolves.toBeUndefined();
-  });
-
-  it('injects the file range back to the still-bound QA', async () => {
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id, workdir: '/tmp/repo/.baxian-worktrees/wt' });
-    await seedAgent({ id: 'qa-1', taskId: t.id });
-    stubTransport(manager, async () => 'line one\nline two');
-    const injectSpy = vi.spyOn(manager, 'injectTextToAgent').mockResolvedValue();
-
-    await relay(manager, t.id, 'qa-1', { file: 'src/a.ts', startLine: 1, endLine: 2 });
-
-    expect(injectSpy).toHaveBeenCalledWith(
-      'qa-1',
-      expect.stringContaining('=== baxian read-file src/a.ts:1-2 ==='),
-      { expectedTaskId: t.id },
-    );
-    expect(injectSpy.mock.calls[0][1]).toContain('line one\nline two');
-  });
-
-  it('injects a REFUSED marker when the transport rejects the read', async () => {
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id });
-    await seedAgent({ id: 'qa-1', taskId: t.id });
-    stubTransport(manager, async () => { throw new Error('path escapes worktree'); });
-    const injectSpy = vi.spyOn(manager, 'injectTextToAgent').mockResolvedValue();
-
-    await relay(manager, t.id, 'qa-1', { file: '../../etc/passwd', startLine: 1, endLine: 5 });
-
-    expect(injectSpy).toHaveBeenCalledWith(
-      'qa-1',
-      expect.stringContaining('REFUSED: path escapes worktree'),
-      { expectedTaskId: t.id },
-    );
-  });
-
-  it('drops the response when the QA is no longer bound to the task', async () => {
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id });
-    await seedAgent({ id: 'qa-1', taskId: 'other-task' });
-    stubTransport(manager, async () => 'text');
-    const injectSpy = vi.spyOn(manager, 'injectTextToAgent').mockResolvedValue();
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    await relay(manager, t.id, 'qa-1', { file: 'src/a.ts', startLine: 1, endLine: 2 });
-
-    expect(injectSpy).not.toHaveBeenCalled();
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('read-file response dropped'))).toBe(true);
-    warnSpy.mockRestore();
-  });
-
-  it('swallows injection failures with a warning', async () => {
-    const t = await seedTask();
-    await seedAgent({ id: 'dev-1', taskId: t.id });
-    await seedAgent({ id: 'qa-1', taskId: t.id });
-    stubTransport(manager, async () => 'text');
-    vi.spyOn(manager, 'injectTextToAgent').mockRejectedValue(new Error('pane gone'));
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
-    await expect(relay(manager, t.id, 'qa-1', { file: 'src/a.ts', startLine: 1, endLine: 2 }))
-      .resolves.toBeUndefined();
-    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('read-file injection'))).toBe(true);
-    warnSpy.mockRestore();
-  });
-
-  it('does nothing when the task is gone', async () => {
-    const transportSpy = vi.spyOn(manager, 'getReviewTransport');
-    await relay(manager, 'gone-task', 'qa-1', { file: 'src/a.ts', startLine: 1, endLine: 2 });
-    expect(transportSpy).not.toHaveBeenCalled();
-  });
-});
-
-describe('AgentManager.mapServerTaskToExpectedWatcher', () => {
-  function mapServer(t: TaskState): { expectedKinds: readonly string[]; agentId: string } | undefined {
-    return (manager as unknown as {
-      mapServerTaskToExpectedWatcher: (t: TaskState) => { expectedKinds: readonly string[]; agentId: string } | undefined;
-    }).mapServerTaskToExpectedWatcher(t);
-  }
-
-  it.each([
-    { name: 'spec review → spec-reviewed on QA', overrides: { status: 'review' as const, phase: 'spec' as const, qaAgentId: 'qa-1' }, expected: { expectedKinds: ['spec-reviewed'], agentId: 'qa-1' } },
-    { name: 'code review → code-reviewed on QA', overrides: { status: 'review' as const, qaAgentId: 'qa-1' }, expected: { expectedKinds: ['code-reviewed'], agentId: 'qa-1' } },
-    { name: 'spec fixing → spec-fixed on dev', overrides: { status: 'fixing' as const, phase: 'spec' as const }, expected: { expectedKinds: ['spec-fixed'], agentId: 'dev-1' } },
-    { name: 'code fixing → code-fixed on dev', overrides: { status: 'fixing' as const }, expected: { expectedKinds: ['code-fixed'], agentId: 'dev-1' } },
-    { name: 'code in_progress → code-done on dev', overrides: { status: 'in_progress' as const, phase: 'code' as const }, expected: { expectedKinds: ['code-done'], agentId: 'dev-1' } },
-    { name: 'fresh Dev-SDD in_progress → spec-done|code-done on dev', overrides: { status: 'in_progress' as const }, expected: { expectedKinds: ['spec-done', 'code-done'], agentId: 'dev-1' } },
-    { name: 'approved → code-ready on dev', overrides: { status: 'approved' as const }, expected: { expectedKinds: ['code-ready'], agentId: 'dev-1' } },
-    { name: 'ready gate has no watcher', overrides: { status: 'ready' as const }, expected: undefined },
-    { name: 'review without QA has no watcher', overrides: { status: 'review' as const, qaAgentId: undefined }, expected: undefined },
-  ])('$name', ({ overrides, expected }) => {
-    expect(mapServer(task({ reviewMode: 'server', ...overrides }))).toEqual(expected);
-  });
-});
-
 describe('AgentManager.failTaskForDispatchError edge paths', () => {
   it('warns (does not transition) when the task is outside the expected fromStatus and still emits the intervention', async () => {
     await seedTask({ status: 'done' });
@@ -11727,146 +9355,8 @@ describe('AgentManager.cancelTask release failure tolerance', () => {
   });
 });
 
-describe('AgentManager.continueDevRound guards & server-mode rounds', () => {
-  function serverMaxRounds(overrides: Partial<TaskState> = {}): TaskState {
-    return task({
-      id: 'task-smr',
-      status: 'max_rounds',
-      reviewMode: 'server',
-      reviewRound: 2,
-      branch: 'bx/task-smr',
-      ...overrides,
-    });
-  }
-
-  function gitMaxRounds(overrides: Partial<TaskState> = {}): TaskState {
-    return task({
-      id: 'task-gmr',
-      status: 'max_rounds',
-      reviewRound: 2,
-      prNumber: 42,
-      branch: 'bx/task-gmr',
-      ...overrides,
-    });
-  }
-
-  async function bindDev(taskId: string): Promise<void> {
-    await seedAgent({
-      id: 'dev-1', status: 'waiting', taskId,
-      workdir: '/tmp/repo/.baxian-worktrees/wt', paneId: '%1',
-    });
-  }
-
-  function stubReviewStore(findings: unknown): void {
-    Object.assign(manager, {
-      reviewStore: { getRound: vi.fn(async () => (findings === null ? null : { findings })) },
-    });
-  }
-
-  it('server task without a dev agent → 400', async () => {
-    await taskStore.set(serverMaxRounds({ agentId: '' }));
-    await expect(manager.continueDevRound('task-smr')).rejects.toMatchObject({ status: 400 });
-  });
-
-  it('server task without stored findings → 409 pointing at cancel', async () => {
-    await taskStore.set(serverMaxRounds());
-    stubReviewStore(null);
-    await expect(manager.continueDevRound('task-smr')).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('no stored findings'),
-    });
-  });
-
-  it('server task redispatches the stored findings and bumps maxRoundsContinues', async () => {
-    await taskStore.set(serverMaxRounds());
-    stubReviewStore([{ file: 'a.ts', note: 'bug' }]);
-    const dispatchSpy = vi.spyOn(manager, 'dispatchServerFixToDev').mockImplementation(
-      async () => (await taskStore.get('task-smr'))!,
-    );
-
-    const result = await manager.continueDevRound('task-smr');
-
-    expect(dispatchSpy).toHaveBeenCalledWith('task-smr', JSON.stringify([{ file: 'a.ts', note: 'bug' }]));
-    expect(result.maxRoundsContinues).toBe(1);
-  });
-
-  it('server task rolls maxRoundsContinues back when the fix dispatch returns null', async () => {
-    await taskStore.set(serverMaxRounds());
-    stubReviewStore([{ file: 'a.ts' }]);
-    vi.spyOn(manager, 'dispatchServerFixToDev').mockResolvedValue(null);
-
-    await expect(manager.continueDevRound('task-smr')).rejects.toMatchObject({ status: 500 });
-    expect((await taskStore.get('task-smr'))?.maxRoundsContinues).toBe(0);
-  });
-
-  it.each([
-    { name: 'git task without PR/branch', overrides: { prNumber: undefined } },
-    { name: 'git task without dev agent', overrides: { agentId: '' } },
-  ])('$name → 400', async ({ overrides }) => {
-    await taskStore.set(gitMaxRounds(overrides));
-    await expect(manager.continueDevRound('task-gmr')).rejects.toMatchObject({ status: 400 });
-  });
-
-  it('409s when a concurrent transition steals the max_rounds → fixing edge', async () => {
-    await taskStore.set(gitMaxRounds());
-    await bindDev('task-gmr');
-    vi.spyOn(manager, 'transitionTaskStatus').mockResolvedValue(undefined);
-
-    await expect(manager.continueDevRound('task-gmr')).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('changed status during continue'),
-    });
-  });
-
-  it('rolls back to max_rounds when the dev can no longer be acquired', async () => {
-    await taskStore.set(gitMaxRounds());
-    await bindDev('task-gmr');
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
-
-    await expect(manager.continueDevRound('task-gmr')).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('no longer available'),
-    });
-    const t = await taskStore.get('task-gmr');
-    expect(t?.status).toBe('max_rounds');
-    expect(t?.reviewRound).toBe(2);
-  });
-
-  it('fails the task via failTaskForDispatchError on a DispatchTerminalError', async () => {
-    await taskStore.set(gitMaxRounds());
-    await bindDev('task-gmr');
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: true });
-    vi.spyOn(manager, 'continueSession').mockRejectedValue(
-      new DispatchTerminalError('prompt_too_large', 'too big'),
-    );
-    const failSpy = vi.spyOn(manager, 'failTaskForDispatchError').mockResolvedValue();
-
-    await expect(manager.continueDevRound('task-gmr')).rejects.toMatchObject({
-      status: 500,
-      message: expect.stringContaining('Continue dispatch failed'),
-    });
-    expect(failSpy).toHaveBeenCalledWith('task-gmr', 'fix', 'dev-1', expect.objectContaining({ reason: 'prompt_too_large' }));
-  });
-
-  it('rolls back and re-parks the dev on a non-terminal dispatch error', async () => {
-    await taskStore.set(gitMaxRounds());
-    await bindDev('task-gmr');
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
-    vi.spyOn(manager, 'rotateAndSetupPhaseSignal').mockResolvedValue({ token: 'tok', armed: true });
-    vi.spyOn(manager, 'continueSession').mockRejectedValue(new Error('tmux hiccup'));
-    const waitSpy = vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
-
-    await expect(manager.continueDevRound('task-gmr')).rejects.toThrow('tmux hiccup');
-    const t = await taskStore.get('task-gmr');
-    expect(t?.status).toBe('max_rounds');
-    expect(t?.reviewRound).toBe(2);
-    expect(waitSpy).toHaveBeenCalledWith('dev-1', 'task-gmr');
-  });
-});
-
 describe('AgentManager.transitionToCodePhase failure paths', () => {
-  async function seedSpecApproved(store: ReviewStore, overrides: Partial<TaskState> = {}): Promise<void> {
+  async function seedSpecApproved(overrides: Partial<TaskState> = {}): Promise<void> {
     await seedTask({
       id: 'task-code-1',
       branch: 'bx/task-code-1',
@@ -11878,22 +9368,14 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
       ...overrides,
     });
     await seedAgent({ id: 'dev-1', taskId: 'task-code-1', paneId: '%0' });
-    await store.putRound('task-code-1', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
-      startedAt: NOW,
-    });
   }
 
-  it('server-mode holds the dev when the code-done watcher prevents delivery', async () => {
+  it('holds the dev when the pr-created watcher prevents code-phase delivery', async () => {
     const watcher = { start: vi.fn(async () => false), stop: vi.fn(), has: vi.fn(() => false) };
-    const store = new ReviewStore();
     const m2 = makeManager({
-      skillRegistry: freshRegistry(), phaseSignalWatcher: watcher as never, reviewStore: store,
+      skillRegistry: freshRegistry(), phaseSignalWatcher: watcher as never,
     });
-    await seedSpecApproved(store, { reviewMode: 'server' });
+    await seedSpecApproved();
     vi.spyOn(m2, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m2, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(m2, 'continueSession').mockImplementation(async (_taskId, _agentId, _phase, opts) => {
@@ -11905,16 +9387,15 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
     const result = await m2.transitionToCodePhase('task-code-1');
 
     expect(result).toBeNull();
-    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({ expectedKinds: 'code-done' }));
+    expect(watcher.start).toHaveBeenCalledWith(expect.objectContaining({ expectedKinds: 'pr-created' }));
     expect(holdSpy).toHaveBeenCalledWith(
       'dev-1', 'code-dispatch-failed', expect.any(String), { expectedTaskId: 'task-code-1' },
     );
   });
 
   it('stays at the spec gate and emits code-dev-acquire-failed when the dev is unavailable', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await seedSpecApproved(store);
+    const m = makeManager();
+    await seedSpecApproved();
     vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(false);
     const holdSpy = vi.spyOn(m, 'markAwaitingHuman').mockResolvedValue(true);
@@ -11929,9 +9410,8 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
   });
 
   it('fails the task on a DispatchTerminalError from the code dispatch', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await seedSpecApproved(store);
+    const m = makeManager();
+    await seedSpecApproved();
     vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'continueSession').mockRejectedValue(new DispatchTerminalError('prompt_too_large', 'too big'));
@@ -11944,9 +9424,8 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
   });
 
   it('holds the dev on a generic code dispatch error', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await seedSpecApproved(store);
+    const m = makeManager();
+    await seedSpecApproved();
     vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'continueSession').mockRejectedValue(new Error('pane vanished'));
@@ -11958,10 +9437,9 @@ describe('AgentManager.transitionToCodePhase failure paths', () => {
     errSpy.mockRestore();
   });
 
-  it('holds the dev and emits code-resume-failed when the Dev-SDD code prompt is not delivered', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await seedSpecApproved(store);
+  it('holds the dev and emits code-resume-failed when the code prompt is not delivered', async () => {
+    const m = makeManager();
+    await seedSpecApproved();
     vi.spyOn(m, 'releaseAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'acquireAgentForTask').mockResolvedValue(true);
     vi.spyOn(m, 'continueSession').mockResolvedValue(false);
@@ -12311,89 +9789,5 @@ describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
     expect(await agentStore.get('qa-1')).toMatchObject({
       status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
     });
-  });
-});
-
-describe('AgentManager.computeCodeInterdiff', () => {
-  const PREV = 'a'.repeat(40);
-  const CUR = 'b'.repeat(40);
-
-  function interdiffRunner(execs: string[], diff: string): CommandRunner {
-    return {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        execs.push(cmd);
-        if (cmd.includes('git') && cmd.includes('diff')) {
-          return { stdout: diff, stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-      execWithStdin: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    } as unknown as CommandRunner;
-  }
-
-  async function seedRounds(store: ReviewStore, opts: { prevHead?: string; curHead?: string }): Promise<void> {
-    await store.putRound('task-inter-1', 'code', {
-      round: 1, phase: 'code', content: 'd1', startedAt: NOW,
-      ...(opts.prevHead !== undefined ? { headSha: opts.prevHead } : {}),
-    });
-    await store.putRound('task-inter-1', 'code', {
-      round: 2, phase: 'code', content: 'd2', startedAt: NOW,
-      ...(opts.curHead !== undefined ? { headSha: opts.curHead } : {}),
-    });
-  }
-
-  it('returns the two-round diff, executed via the dev agent runner in its worktree', async () => {
-    const execs: string[] = [];
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'INTERDIFF-BODY') });
-    await seedRounds(store, { prevHead: PREV, curHead: CUR });
-    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', workdir: '/wt/task-inter-1' });
-
-    const result = await m.computeCodeInterdiff('task-inter-1', 2);
-    expect(result).toEqual({ ok: true, diff: 'INTERDIFF-BODY' });
-    const gitDiff = execs.find(c => c.includes('git -c core.quotepath=false diff'));
-    expect(gitDiff).toBeDefined();
-    // direct two-arg tree diff, not three-dot (#515)
-    expect(gitDiff).toContain(`diff '${PREV}' '${CUR}'`);
-    expect(gitDiff).not.toContain(`${PREV}...${CUR}`);
-    expect(gitDiff).toContain('/wt/task-inter-1');
-  });
-
-  it('no-anchor when the current round has no headSha (historical round)', async () => {
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store });
-    await seedRounds(store, { prevHead: PREV });
-    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', workdir: '/wt/task-inter-1' });
-    expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'no-anchor' });
-  });
-
-  it('no-anchor for round < 2 (no predecessor to diff against)', async () => {
-    const m = makeManager({ reviewStore: new ReviewStore() });
-    expect(await m.computeCodeInterdiff('task-inter-1', 1)).toEqual({ ok: false, reason: 'no-anchor' });
-  });
-
-  it('released when the dev agent is rebound to another task; runner is never invoked', async () => {
-    const execs: string[] = [];
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'x') });
-    await seedRounds(store, { prevHead: PREV, curHead: CUR });
-    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'other-task', workdir: '/wt/other' });
-    expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'released' });
-    expect(execs.some(c => c.includes('git') && c.includes('diff'))).toBe(false);
-  });
-
-  it('released when the worktree is gone; runner is never invoked', async () => {
-    const execs: string[] = [];
-    const store = new ReviewStore();
-    const m = makeManager({ reviewStore: store, runnerFactory: () => interdiffRunner(execs, 'x') });
-    await seedRounds(store, { prevHead: PREV, curHead: CUR });
-    await seedTask({ id: 'task-inter-1', agentId: 'dev-1' });
-    await seedAgent({ id: 'dev-1', taskId: 'task-inter-1', workdir: '' });
-    expect(await m.computeCodeInterdiff('task-inter-1', 2)).toEqual({ ok: false, reason: 'released' });
-    expect(execs.some(c => c.includes('git') && c.includes('diff'))).toBe(false);
   });
 });

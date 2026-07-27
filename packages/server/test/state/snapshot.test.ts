@@ -406,9 +406,9 @@ describe('enrichTaskSnapshot', () => {
     expect(result.verdictOverdue).toBeUndefined();
   });
 
-  it('does not set verdictOverdue when qaAgentId is missing', () => {
-    const result = enrichTaskSnapshot(reviewTask({ qaAgentId: undefined }));
-    expect(result.verdictOverdue).toBeUndefined();
+  it('rejects a dispatched review snapshot with no QA participant', () => {
+    expect(() => enrichTaskSnapshot(reviewTask({ qaAgentId: undefined })))
+      .toThrow('review task task-1 has no QA participant');
   });
 
   it('does not set verdictOverdue when signalToken is missing', () => {

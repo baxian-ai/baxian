@@ -18,36 +18,35 @@ Installed skills and personal workflows apply as usual — baxian orchestrates t
 
 ## Conventions
 
-Stay in scope — out-of-scope work goes to a new issue via your platform skill for `exchange: git-pr`, or into your commit message for `server-files`. Deliver only through this dispatch's signal route, never a skill's own finishing flow, and never merge — baxian owns merging.
+Stay in scope — out-of-scope work goes to a new issue via your platform skill. Deliver only through this dispatch's signal route, never a skill's own finishing flow, and never merge — baxian owns merging.
 
-Your `exchange:` field selects the cross-agent medium:
-
-- `git-pr`: communicate via the platform PR (description, commits, reviews, comments). Load the `baxian-cli-<tool>` skill named by your `cli:` field (`cli: gh` means `baxian-cli-gh`) and take every platform command from it. Commit on the branch already checked out in `workdir:` — the PR must come from exactly the `branch:` value, or baxian can't match it to your task.
-- `server-files`: baxian reads your Workdir directly; do NOT push or open a PR (the publish phase does that).
+Communicate through the platform PR (description, commits, reviews, comments). Load the `baxian-cli-<tool>` skill named by your `cli:` field (`cli: gh` means `baxian-cli-gh`) and take every platform command from it. Commit on the branch already checked out in `workdir:` — the PR must come from exactly the `branch:` value, or baxian can't match it to your task.
 
 ## Develop
 
 How you develop is yours — your installed skills and workflows decide how you analyze, design, and implement. baxian defines only the exits, and you emit exactly one exit signal per dispatch:
 
-- Deliver the implementation: follow §Deliver (`signal:`).
-- Get a design reviewed before you code: follow §SDD (`spec-signal:`) — available only when the dispatch carries a `spec-signal:` field; without it, delivering is your only exit.
+- Deliver the implementation: follow §Deliver.
+- Get a design reviewed before you code: follow §SDD.
 
 ## SDD
 
 The companion for spec-first development: baxian routes your spec through review before you code.
 
-1. Write the spec to `.baxian/spec.md` in your Workdir. Do NOT commit or push it — baxian reads the file directly for review.
-2. Emit `spec-signal:` (`spec-done`) with `token:` — NOT the default `signal:`, which would skip spec review and push an unimplemented task forward.
+The spec is a permanent repository document on the task branch.
+
+1. Verify `git symbolic-ref --quiet --short HEAD` is byte-for-byte equal to the descriptor's original, case-sensitive `branch:` value. Derive the flat path with this single command: `branch="$(git symbolic-ref --quiet --short HEAD)" && slug="$(printf %s "$branch" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-48)" && hash16="$(printf %s "$branch" | openssl dgst -sha256 -r | cut -c1-16)" && spec_path="docs/specs/${slug}-${hash16}.md"`. Do not invent a fallback slug or a nested directory.
+2. Start the file with YAML front matter whose `branch:` value is the JSON-quoted exact original branch, then write the design. Before any write, use one shell invocation rooted at the absolute logical `workdir:` to enforce all three guards: every existing component from Workdir through the target is a non-symlink and its canonical path stays under the canonical Workdir; the first target creation uses `set -o noclobber` so it is atomic and no-clobber; if the target already exists, compare its front-matter `branch:` value with the current branch byte-for-byte and continue only when they match. Re-check newly created directories and the target as non-symlinks before writing content. A collision, malformed front matter, canonical-prefix failure, or any ambiguous probe stops the task without overwriting the file.
+3. Commit the spec and follow your `baxian-cli-<tool>` skill §Create. It pushes and adopts or creates the PR. After every common check passes, complete the `develop` / `§SDD` route from baxian-signals in its actor form, carrying the selected PR number.
+
+Complete only the `§SDD` route: `§Deliver` selects direct code delivery instead.
 
 After the spec is approved, baxian dispatches the code phase back to you.
 
 ## Code
 
-The approved spec is at `.baxian/spec.md`. Implement it, then follow §Deliver.
+Derive the approved repository spec path from `branch:` with §SDD's exact mapping and read it from the current branch; the descriptor also carries the already-bound `pr:` that §Create must adopt or reopen, never replace. Implement it, then follow §Deliver.
 
 ## Deliver
 
-Emit your `signal:` with `token:` when your `exchange:`'s completion step is done:
-
-- `git-pr`: commit, then create the PR per your `baxian-cli-<tool>` skill §Create — it owns push, non-interactive create with the source branch, repository, and target identity passed explicitly in that platform's own flags, Draft recovery, and the actor self-report segment. Emit `pr-created` in the actor-segment form that section specifies, only after its checks pass.
-- `server-files`: local commit only (do NOT push, no PR). Emit `code-done`.
+Commit, then create the PR per your `baxian-cli-<tool>` skill §Create — it owns push, non-interactive create with the source branch, repository, and target identity passed explicitly in that platform's own flags, Draft recovery, and the actor self-report segment. Complete the current phase's `§Deliver` route from baxian-signals in the actor-segment form that section specifies, only after its checks pass.

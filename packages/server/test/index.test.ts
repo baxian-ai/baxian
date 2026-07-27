@@ -200,28 +200,25 @@ describe('startServer', () => {
     }
   }, 30_000);
 
-  it('emits a repo-conflict intervention when a retained startup entry owns the live project repo', async () => {
+  it('emits a platform-binding intervention when an active task binding differs from live config', async () => {
     const port = await getFreePort();
     const cfgPath = join(tempDir, 'baxian.json');
     const stateDir = join(tempDir, '.baxian');
     await writeFile(cfgPath, JSON.stringify({
-      review: { rounds: 3, afterDone: 'branch' },
+      review: { rounds: 3 },
       server: { port, host: '127.0.0.1', ...QUIET_INTERVALS },
       host: [],
       project: [
         { id: 'b-live', repo: 'https://github.com/owner/repo.git', merge: null, agent: [] },
-        {
-          id: 'a-retained', repo: 'git@github.com:owner/repo.git', merge: null,
-          review: { mode: 'server' }, agent: [],
-        },
       ],
     }));
     await initStateDir(stateDir);
     const now = new Date().toISOString();
     await new TaskStore(join(stateDir, 'state', 'tasks')).set({
-      id: 'task-retained', projectId: 'a-retained', title: 'retained', description: 'retained entry',
+      id: 'task-binding-mismatch', projectId: 'b-live', title: 'binding mismatch', description: 'binding audit',
       preferredAgentId: 'dev-retained', agentId: 'dev-retained', devAgentId: 'dev-retained',
-      reviewRound: 0, reviewMode: 'server', status: 'pending', afterDone: 'pr',
+      qaAgentId: 'qa-retained',
+      reviewRound: 0, status: 'pending',
       platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
       createdAt: now, updatedAt: now,
     });
@@ -239,11 +236,12 @@ describe('startServer', () => {
       expect(events).toContainEqual(expect.objectContaining({
         type: 'human.intervention',
         projectId: 'b-live',
-        data: {
-          phase: 'repo-conflict',
-          repoKey: 'github.com/owner/repo',
-          claimedBy: 'a-retained',
-        },
+        taskId: 'task-binding-mismatch',
+        data: expect.objectContaining({
+          phase: 'platform-binding-mismatch',
+          reason: 'identity-mismatch',
+          differences: ['mode'],
+        }),
       }));
 
       const sigintHandler = process.listeners('SIGINT').find(listener => !sigintBefore.has(listener));

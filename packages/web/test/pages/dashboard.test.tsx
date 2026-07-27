@@ -384,10 +384,10 @@ describe('Dashboard "Project created" follow-up modal', () => {
     return screen.findByRole('dialog', { name: 'Project created' });
   }
 
-  it('pins both follow-up buttons in the footer region and "Continue adding an agent" enters the add-agent flow', async () => {
+  it('pins both follow-up buttons in the footer region and "Continue adding an agent group" enters the add-agent flow', async () => {
     const dialog = await reachContinueDialog();
 
-    const continueBtn = within(dialog).getByRole('button', { name: 'Continue adding an agent' });
+    const continueBtn = within(dialog).getByRole('button', { name: 'Continue adding an agent group' });
     const laterBtn = within(dialog).getByRole('button', { name: 'Later' });
     const footer = continueBtn.parentElement!;
     expect(footer.className).toContain('border-t');

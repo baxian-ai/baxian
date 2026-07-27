@@ -12,6 +12,7 @@ export interface RenderContext {
   expectedHeadSha?: string;
   remoteProjectId?: string;
   branch?: string;
+  body?: string;
   page?: number;
 }
 
@@ -23,8 +24,18 @@ export class PlaceholderValueError extends Error {
 }
 
 const SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
+export const COMMENT_BODY_MAX_BYTES = 64 * 1024;
 // String.replace 对全局正则自重置 lastIndex，模块级复用安全。
 const PLACEHOLDER_RE = /\{([a-zA-Z]+)\}/g;
+
+export function validateCommentBody(body: string): void {
+  if (body.trim() === '') throw new PlaceholderValueError('body must be non-empty for {body}');
+  if (body.includes('\0')) throw new PlaceholderValueError('body must not contain NUL');
+  const bytes = Buffer.byteLength(body, 'utf8');
+  if (bytes > COMMENT_BODY_MAX_BYTES) {
+    throw new PlaceholderValueError(`body exceeds ${COMMENT_BODY_MAX_BYTES} bytes`);
+  }
+}
 
 function placeholderValue(name: string, ctx: RenderContext & { minToolVersion?: string }): string {
   switch (name) {
@@ -70,6 +81,11 @@ function placeholderValue(name: string, ctx: RenderContext & { minToolVersion?: 
       if (ctx.branch === undefined) throw new PlaceholderValueError('branch required for {branchEncoded}');
       return encodeURIComponent(ctx.branch);
     }
+    case 'body': {
+      if (ctx.body === undefined) throw new PlaceholderValueError('body required for {body}');
+      validateCommentBody(ctx.body);
+      return ctx.body;
+    }
     case 'page': {
       if (ctx.page === undefined || !Number.isInteger(ctx.page) || ctx.page <= 0) {
         throw new PlaceholderValueError(`page must be a positive integer (got ${ctx.page})`);
@@ -107,6 +123,13 @@ export function renderCommand(
     .join(' ');
   const argv = op.argv.map(a => shellQuote(substitute(a, ctx))).join(' ');
   return envPrefix === '' ? argv : `${envPrefix} ${argv}`;
+}
+
+export function renderCommandStdin(
+  op: { stdin?: string },
+  ctx: RenderContext,
+): Buffer | undefined {
+  return op.stdin === undefined ? undefined : Buffer.from(substitute(op.stdin, ctx), 'utf8');
 }
 
 export function renderFixMessage(

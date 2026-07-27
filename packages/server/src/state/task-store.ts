@@ -1,7 +1,13 @@
 import { readFile, writeFile, readdir, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { TaskPhase, TaskState, TaskStatus } from '../shared/index.js';
-import { isRecord, mapWithConcurrency, FS_READ_CONCURRENCY, TASK_PHASE_SET } from '../shared/index.js';
+import {
+  effectiveTaskReviewRound,
+  isRecord,
+  mapWithConcurrency,
+  FS_READ_CONCURRENCY,
+  TASK_PHASE_SET,
+} from '../shared/index.js';
 
 // a store id becomes a filename; constrain it so a path-like id can't escape the store dir
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
@@ -18,11 +24,10 @@ function withTaskFileContext(file: string, error: unknown): unknown {
 
 const TASK_FIELDS = [
   'id', 'projectId', 'title', 'description', 'preferredAgentId',
-  'agentId', 'devAgentId', 'qaAgentId', 'researchAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'remoteCleanup', 'branchLocalCleaned', 'latestHeadSha', 'reviewHeadAnchorSha',
-  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'signalToken',
-  'serverSignalRecovery',
+  'agentId', 'devAgentId', 'qaAgentId', 'prNumber', 'prUrl', 'branch', 'branchCreatedByBaxian', 'branchCleanupPending', 'branchCleanupSkipped', 'remoteCleanup', 'branchLocalCleaned', 'latestHeadSha', 'reviewHeadAnchorSha',
+  'reviewDispatchedAt', 'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'reviewRound', 'reviewRoundPending', 'specReviewRound', 'phase', 'deliveryConfirmation', 'signalToken',
   'status', 'createdAt', 'updatedAt', 'images',
-  'reviewMode', 'batchIndex', 'batchTotal', 'reviewCheckoutMode', 'maxRoundsContinues', 'afterDone', 'publishDispatchedAt',
+  'maxRoundsContinues',
   'postApproveRevoked', 'postApproveHeadSha', 'verdictOverdue',
   'passToken', 'failToken', 'pendingPrSignalToken', 'postApproveToken', 'postApproveGeneration', 'postApprovePhase', 'reviewDispatch', 'platformBinding', 'baseBranch', 'replyActorId', 'replyActorStatus',
   'closedUnmergedAnchor', 'passProvenance', 'consumedFeedback', 'outbox', 'pendingRedispatch', 'redispatchCount',
@@ -32,22 +37,8 @@ const REVIEW_TOKEN_RE = /^[0-9a-f]{12}$/;
 
 const TASK_STATUSES = new Set<TaskStatus>([
   'pending', 'in_progress', 'review', 'fixing', 'spec-ready', 'approved', 'merge-ready',
-  'ready', 'merged', 'done', 'max_rounds', 'failed', 'cancelled',
+  'merged', 'done', 'max_rounds', 'failed', 'cancelled',
 ]);
-const SERVER_SIGNAL_KINDS = new Set([
-  'code-done', 'code-reviewed', 'code-fixed', 'code-ready', 'spec-done', 'spec-reviewed', 'spec-fixed',
-]);
-const SERVER_RECOVERY_MODES = new Set(['classify-response', 'correct-response', 'hold']);
-const SERVER_RECOVERY_REASONS = new Set([
-  'response-missing', 'response-invalid', 'round-mismatch', 'token-mismatch',
-  'findings-digest-mismatch', 'coverage-gap', 'fix-no-dev-agent', 'fix-findings-missing',
-  'response-read-failed', 'verdict-store-failed', 'handler-failed',
-]);
-const SERVER_RESPONSE_REASONS = new Set([
-  'response-missing', 'response-invalid', 'round-mismatch', 'token-mismatch',
-  'findings-digest-mismatch', 'coverage-gap',
-]);
-const SHA256_RE = /^[0-9a-f]{64}$/;
 const HEAD_SHA_RE = /^[0-9a-f]{7,64}$/i;
 const REMOTE_FAILURE_KINDS = new Set([
   'config', 'binding', 'close', 'persist', 'delete', 'probe', 'tip-changed',
@@ -102,7 +93,6 @@ function validateCleanupPending(raw: Record<string, unknown>, field: string): vo
 function validateRemoteCleanup(raw: Record<string, unknown>): void {
   const value = raw.remoteCleanup;
   if (value === undefined) return;
-  if (raw.reviewMode !== 'git') throw taskSchemaError('remoteCleanup', 'present only for git review tasks');
   if (!isRecord(value)) throw taskSchemaError('remoteCleanup', 'an object when present');
   if (typeof value.generation !== 'string' || !REVIEW_TOKEN_RE.test(value.generation)) {
     throw taskSchemaError('remoteCleanup.generation', 'a 12-hex token');
@@ -135,76 +125,6 @@ function validateRemoteCleanup(raw: Record<string, unknown>): void {
   }
 }
 
-function validateSortedStringArray(value: unknown, field: string): void {
-  if (value === undefined) return;
-  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item.trim() === '')) {
-    throw taskSchemaError(field, 'an array of non-empty strings when present');
-  }
-  const sorted = [...value].sort();
-  if (new Set(value).size !== value.length || value.some((item, index) => item !== sorted[index])) {
-    throw taskSchemaError(field, 'a sorted array of unique strings when present');
-  }
-}
-
-function validateServerSignalRecovery(raw: Record<string, unknown>): void {
-  const value = raw.serverSignalRecovery;
-  if (value === undefined) return;
-  if (!isRecord(value)) throw taskSchemaError('serverSignalRecovery', 'an object when present');
-  if (typeof value.mode !== 'string' || !SERVER_RECOVERY_MODES.has(value.mode)) {
-    throw taskSchemaError('serverSignalRecovery.mode', 'classify-response, correct-response, or hold');
-  }
-  if (typeof value.signalKind !== 'string' || !SERVER_SIGNAL_KINDS.has(value.signalKind)) {
-    throw taskSchemaError('serverSignalRecovery.signalKind', 'a server review signal kind');
-  }
-  if (value.phase !== 'spec' && value.phase !== 'code') {
-    throw taskSchemaError('serverSignalRecovery.phase', 'spec or code');
-  }
-  if (!Number.isInteger(value.round) || (value.round as number) < 0) {
-    throw taskSchemaError('serverSignalRecovery.round', 'an integer >= 0');
-  }
-  for (const field of ['sourceToken', 'createdAt']) requireString(value, field);
-  if (typeof value.reason !== 'string' || !SERVER_RECOVERY_REASONS.has(value.reason)) {
-    throw taskSchemaError('serverSignalRecovery.reason', 'a known recovery reason');
-  }
-  for (const field of ['findingsDigest', 'failureSignature', 'responseDigest']) {
-    const digest = value[field];
-    if (digest !== undefined && (typeof digest !== 'string' || !SHA256_RE.test(digest))) {
-      throw taskSchemaError(`serverSignalRecovery.${field}`, 'a lowercase SHA-256 digest when present');
-    }
-  }
-  optionalString(value, 'failurePhase');
-  for (const field of ['missingFindingIds', 'unknownFindingIds', 'schemaViolationCodes']) {
-    validateSortedStringArray(value[field], `serverSignalRecovery.${field}`);
-  }
-  const responseMode = value.mode === 'classify-response' || value.mode === 'correct-response';
-  if (responseMode && (
-    !SERVER_RESPONSE_REASONS.has(value.reason as string)
-    || (value.signalKind !== 'code-fixed' && value.signalKind !== 'spec-fixed')
-    || typeof value.findingsDigest !== 'string'
-    || typeof value.failureSignature !== 'string'
-    || (value.reason !== 'response-missing' && typeof value.responseDigest !== 'string')
-  )) {
-    throw taskSchemaError('serverSignalRecovery', 'response recovery fields for classify/correct mode');
-  }
-  const expectedPhase = String(value.signalKind).startsWith('spec-') ? 'spec' : 'code';
-  if (value.phase !== expectedPhase) {
-    throw taskSchemaError('serverSignalRecovery.signalKind', `a ${value.phase} signal kind`);
-  }
-  const taskPhaseMatches = value.phase === 'spec'
-    ? raw.phase !== 'code'
-    : raw.phase === 'code' || raw.phase === undefined;
-  if (!taskPhaseMatches) {
-    throw taskSchemaError('serverSignalRecovery.phase', 'the current task phase');
-  }
-  const currentRound = value.phase === 'spec' ? (raw.specReviewRound ?? 0) : raw.reviewRound;
-  if (value.round !== currentRound) {
-    throw taskSchemaError('serverSignalRecovery.round', 'the current task review round');
-  }
-  if (typeof raw.signalToken !== 'string' || raw.signalToken === value.sourceToken) {
-    throw taskSchemaError('serverSignalRecovery.sourceToken', 'a token superseded by task.signalToken');
-  }
-}
-
 function validateTask(raw: Record<string, unknown>): void {
   requireString(raw, 'id');
   requireString(raw, 'projectId');
@@ -216,11 +136,10 @@ function validateTask(raw: Record<string, unknown>): void {
   requireString(raw, 'createdAt');
   requireString(raw, 'updatedAt');
   optionalString(raw, 'qaAgentId');
-  optionalString(raw, 'researchAgentId');
   for (const field of [
     'prUrl', 'branch', 'latestHeadSha', 'reviewHeadAnchorSha', 'reviewDispatchedAt',
     'prFeedbackReceivedAt', 'reviewConversationUpdatedAt', 'fixDispatchedAt', 'signalToken',
-    'publishDispatchedAt', 'postApproveHeadSha',
+    'postApproveHeadSha',
   ]) optionalString(raw, field);
   if (!Number.isInteger(raw.reviewRound) || (raw.reviewRound as number) < 0) {
     throw taskSchemaError('reviewRound', 'an integer >= 0');
@@ -228,15 +147,25 @@ function validateTask(raw: Record<string, unknown>): void {
   if (raw.phase !== undefined && (
     typeof raw.phase !== 'string' || !TASK_PHASE_SET.has(raw.phase as TaskPhase)
   )) {
-    throw taskSchemaError('phase', 'research, spec, or code when present');
+    throw taskSchemaError('phase', 'spec or code when present');
+  }
+  if (raw.deliveryConfirmation !== undefined) {
+    const confirmation = raw.deliveryConfirmation;
+    if (!isRecord(confirmation)
+      || (confirmation.phase !== 'spec' && confirmation.phase !== 'code')
+      || (confirmation.source !== 'signal' && confirmation.source !== 'human')
+      || typeof confirmation.at !== 'string' || !Number.isFinite(Date.parse(confirmation.at))) {
+      throw taskSchemaError('deliveryConfirmation', 'a { phase, source, at } record');
+    }
+    if (confirmation.phase !== raw.phase) {
+      throw taskSchemaError('deliveryConfirmation.phase', 'the current task phase');
+    }
   }
   if (typeof raw.status !== 'string' || !TASK_STATUSES.has(raw.status as TaskStatus)) {
     throw taskSchemaError('status', 'a known task status');
   }
   optionalInteger(raw, 'prNumber', 1);
   optionalInteger(raw, 'specReviewRound', 0);
-  optionalInteger(raw, 'batchIndex', 0);
-  optionalInteger(raw, 'batchTotal', 1);
   optionalInteger(raw, 'maxRoundsContinues', 0);
   for (const field of ['branchCreatedByBaxian', 'verdictOverdue', 'reviewRoundPending']) optionalBoolean(raw, field);
   if (raw.images !== undefined && (
@@ -244,17 +173,6 @@ function validateTask(raw: Record<string, unknown>): void {
     || raw.images.some(image => typeof image !== 'string' || image.trim() === '')
   )) {
     throw taskSchemaError('images', 'an array of non-empty strings when present');
-  }
-  if (raw.reviewMode !== 'git' && raw.reviewMode !== 'server') {
-    throw taskSchemaError('reviewMode', 'git or server');
-  }
-  if (raw.reviewCheckoutMode !== undefined
-    && raw.reviewCheckoutMode !== 'head' && raw.reviewCheckoutMode !== 'base') {
-    throw taskSchemaError('reviewCheckoutMode', 'head or base when present');
-  }
-  if (raw.afterDone !== undefined && raw.afterDone !== null
-    && raw.afterDone !== 'pr' && raw.afterDone !== 'branch') {
-    throw taskSchemaError('afterDone', 'pr, branch, or null when present');
   }
   validateCleanupPending(raw, 'branchCleanupPending');
   validateCleanupPending(raw, 'branchCleanupSkipped');
@@ -268,21 +186,17 @@ function validateTask(raw: Record<string, unknown>): void {
     }
     requireString(cleaned, 'updatedAt');
   }
-  validateServerSignalRecovery(raw);
   validateGitReviewFields(raw);
-  const participantIds = [raw.devAgentId, raw.qaAgentId, raw.researchAgentId]
+  const participantIds = [raw.devAgentId, raw.qaAgentId]
     .filter((value): value is string => typeof value === 'string' && value !== '');
   if (new Set(participantIds).size !== participantIds.length) {
-    throw taskSchemaError('participants', 'distinct dev, qa, and research agent ids');
+    throw taskSchemaError('participants', 'distinct dev and qa agent ids');
   }
-  if (raw.agentId !== '' && raw.agentId !== raw.devAgentId && raw.agentId !== raw.researchAgentId) {
-    throw taskSchemaError('agentId', 'the task dev or research agent id');
+  if ((raw.devAgentId === '') !== (raw.qaAgentId === undefined)) {
+    throw taskSchemaError('participants', 'a complete dev and qa pair, or neither when unassigned');
   }
-  if (raw.phase === 'research' && raw.researchAgentId === undefined) {
-    throw taskSchemaError('researchAgentId', 'a non-empty string during research phase');
-  }
-  if (raw.phase === undefined && raw.researchAgentId !== undefined) {
-    throw taskSchemaError('phase', 'research when a research participant is present');
+  if (raw.agentId !== '' && raw.agentId !== raw.devAgentId) {
+    throw taskSchemaError('agentId', 'the task dev agent id');
   }
 }
 
@@ -324,11 +238,6 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
     throw taskSchemaError('postApproveGeneration', 'a complete post-approve episode');
   }
   const activeEpisode = activeCount === activeFields.length;
-  const hasPostApproveState = activeEpisode || revoked !== undefined
-    || raw.pendingRedispatch !== undefined || raw.redispatchCount !== undefined;
-  if (hasPostApproveState && raw.reviewMode !== 'git') {
-    throw taskSchemaError('postApproveGeneration', 'post-approve state only for git review tasks');
-  }
   if (activeEpisode) {
     if (raw.status !== 'approved' || revoked !== undefined) {
       throw taskSchemaError('postApproveGeneration', 'an active episode only while approved and not revoked');
@@ -378,9 +287,8 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
       }
       requireString(lease, 'claimedAt');
     }
-    const effectiveRound = Math.max(1, Number(raw.reviewRound) + (raw.reviewRoundPending === true ? 1 : 0));
-    if (raw.reviewMode !== 'git' || raw.status !== 'review'
-      || raw.signalToken !== lease.signalToken
+    const effectiveRound = effectiveTaskReviewRound(raw as unknown as TaskState);
+    if (raw.status !== 'review' || raw.signalToken !== lease.signalToken
       || raw.reviewHeadAnchorSha !== lease.headSha
       || raw.passToken !== lease.passToken
       || raw.failToken !== lease.failToken
@@ -394,9 +302,6 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
     if (!isRecord(binding) || keys.some(key => typeof binding[key] !== 'string' || (binding[key] as string).trim() === '')) {
       throw taskSchemaError('platformBinding', 'a { mode, repoKey, tool } identity record when present');
     }
-  }
-  if (raw.afterDone === 'pr' && raw.platformBinding === undefined) {
-    throw taskSchemaError('platformBinding', "present when afterDone is 'pr'");
   }
   optionalString(raw, 'baseBranch');
   optionalString(raw, 'replyActorId');
@@ -429,13 +334,32 @@ function validateGitReviewFields(raw: Record<string, unknown>): void {
   }
   if (raw.outbox !== undefined) {
     const outbox = raw.outbox;
-    const validEntry = (entry: unknown): boolean =>
-      isRecord(entry)
-      && typeof entry.key === 'string' && entry.key.trim() !== ''
-      && entry.type === 'human.intervention'
-      && isRecord(entry.data);
-    if (!Array.isArray(outbox) || !outbox.every(validEntry)) {
-      throw taskSchemaError('outbox', 'an array of pending notification entries when present');
+    if (!Array.isArray(outbox)) throw taskSchemaError('outbox', 'an array of pending operation entries when present');
+    const keys = new Set<string>();
+    let hasSpecVerdict = false;
+    for (const entry of outbox) {
+      if (!isRecord(entry) || typeof entry.key !== 'string' || entry.key.trim() === ''
+        || keys.has(entry.key) || !isRecord(entry.data)) {
+        throw taskSchemaError('outbox', 'entries with unique non-empty keys and object data');
+      }
+      keys.add(entry.key);
+      if (entry.type === 'human.intervention') continue;
+      if (entry.type !== 'git.spec-verdict') {
+        throw taskSchemaError('outbox.type', 'human.intervention or git.spec-verdict');
+      }
+      if (hasSpecVerdict) throw taskSchemaError('outbox', 'at most one git.spec-verdict entry');
+      hasSpecVerdict = true;
+      const data = entry.data;
+      if (!REVIEW_TOKEN_RE.test(entry.key)
+        || !Number.isInteger(data.prNumber) || (data.prNumber as number) < 1
+        || typeof data.comments !== 'string' || data.comments.trim() === ''
+        || (data.writeAttemptedAt !== undefined
+          && (typeof data.writeAttemptedAt !== 'string' || data.writeAttemptedAt.trim() === ''))
+        || raw.phase !== 'spec' || raw.prNumber !== data.prNumber
+        || (raw.status !== 'spec-ready' && raw.status !== 'max_rounds')
+        || !Number.isInteger(raw.specReviewRound) || (raw.specReviewRound as number) < 1) {
+        throw taskSchemaError('outbox', 'a valid current spec-phase git verdict operation');
+      }
     }
   }
 }
@@ -452,11 +376,6 @@ function sanitizeTask(state: unknown): TaskState {
     if (value !== undefined) {
       (out as Record<string, unknown>)[k] = value;
     }
-  }
-  // 读侧迁移不可删：worktree 时代的 base 任务丢掉这行会被恢复分类误判（undefined ≠ head）。
-  if (out.reviewCheckoutMode === undefined
-    && (raw.reviewWorktreeMode === 'head' || raw.reviewWorktreeMode === 'base')) {
-    out.reviewCheckoutMode = raw.reviewWorktreeMode;
   }
   validateTask(out as Record<string, unknown>);
   return out as TaskState;

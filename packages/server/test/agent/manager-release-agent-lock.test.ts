@@ -26,6 +26,7 @@ const CONFIG: BaxianConfig = {
     merge: null,
     agent: [[
       { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
+      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
     ]],
   }],
 };
@@ -107,10 +108,10 @@ async function seedActiveBinding(): Promise<void> {
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     phase: 'code',
     branch: 'bx/task-001',
     branchCreatedByBaxian: true,
-    reviewMode: 'server',
     reviewRound: 0,
     status: 'in_progress',
     createdAt: NOW,

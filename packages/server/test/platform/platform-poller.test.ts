@@ -104,15 +104,14 @@ class FakeDriver implements PlatformDriver {
 
 let dir = '';
 let driver: FakeDriver;
-type PlatformTaskFixture = Omit<PlatformTaskView, 'reviewMode'>
-  & Partial<Pick<PlatformTaskView, 'reviewMode'>>;
+type PlatformTaskFixture = PlatformTaskView;
 let tasks: PlatformTaskFixture[];
 let events: MappedEvent[];
 let failEventMatch: ((e: MappedEvent) => boolean) | undefined;
 let clockNow = T0;
 
 function makePoller(extra: Partial<ConstructorParameters<typeof PlatformPoller>[0]> = {}) {
-  const materialize = (task: PlatformTaskFixture): PlatformTaskView => ({ reviewMode: 'git', ...task });
+  const materialize = (task: PlatformTaskFixture): PlatformTaskView => task;
   const poller = new PlatformPoller({
     onEvent: (_projectId, event) => {
       if (failEventMatch?.(event)) throw new Error('delivery rejected');
@@ -510,7 +509,7 @@ describe('PlatformPoller: reopen and generations', () => {
 
     await makePoller({
       task: async taskId => taskId === 'task-hidden'
-        ? { taskId, terminal: false, reviewMode: 'git', branch: 'bx/task-hidden' }
+        ? { taskId, terminal: false, branch: 'bx/task-hidden' }
         : null,
     }).poll();
 
@@ -552,26 +551,6 @@ describe('PlatformPoller: pr lifecycle sub-poll', () => {
     expect(events.some(e => e.data.kind === 'comment')).toBe(false);
   });
 
-  it('limits server+PR tasks to lifecycle reads while preserving merge observation', async () => {
-    tasks = [{
-      taskId: 'task-1', terminal: false, reviewMode: 'server', branch: 'bx/task-1',
-      prNumber: 42, latestHeadSha: SHA1,
-    }];
-    driver.prViews.set(42, prRow({ headSha: SHA2 }));
-    driver.comments['issue-comments'] = [comment('1', 'not consumed by server review')];
-    const poller = makePoller();
-
-    await poller.poll();
-
-    expect(driver.calls).toContain('prView');
-    expect(driver.calls.filter(call => call.startsWith('listComments'))).toEqual([]);
-    expect(ofType('pr.updated')).toHaveLength(0);
-
-    events = [];
-    driver.prViews.set(42, prRow({ state: 'closed', mergedAt: OLD_TS }));
-    await poller.poll();
-    expect(ofType('pr.merged')).toHaveLength(1);
-  });
 });
 
 describe('PlatformPoller: comment flow', () => {

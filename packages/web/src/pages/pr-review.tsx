@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { safeExternalHref, type PrReviewItem, type PrReviewVerdict } from '../shared/index.js';
+import {
+  isSpecStagePhase,
+  safeExternalHref,
+  type PrReviewItem,
+  type PrReviewVerdict,
+} from '../shared/index.js';
 import {
   PR_REVIEW_VERDICT_CLASS,
   groupPrReviewRounds,
@@ -21,15 +26,14 @@ const VERDICT_LABEL: Record<PrReviewVerdict, string> = {
   comment: 'comment',
 };
 
-function reasonOf(reason?: string): 'server-mode' | 'no-pr' | 'driver-unavailable' | undefined {
-  return reason === 'server-mode' || reason === 'no-pr' || reason === 'driver-unavailable'
+function reasonOf(reason?: string): 'no-pr' | 'driver-unavailable' | undefined {
+  return reason === 'no-pr' || reason === 'driver-unavailable'
     ? reason
     : undefined;
 }
 
 function reasonText(t: Messages): Record<NonNullable<ReturnType<typeof reasonOf>>, string> {
   return {
-    'server-mode': t.prReview.reasonServerMode,
     'no-pr': t.prReview.reasonNoPr,
     'driver-unavailable': t.prReview.reasonDriverUnavailable,
   };
@@ -56,6 +60,9 @@ export function PrReviewPage() {
   const prHref = safeExternalHref(prUrl);
   const rounds = data ? groupPrReviewRounds(data.items) : [];
   const itemsReady = loaded && !error && data?.available === true && data.items.length > 0;
+  const heading = isSpecStagePhase(task?.phase)
+    ? t.prReview.specReviewHeading
+    : t.prReview.codeReviewHeading;
 
   const landedRef = useRef<string | null>(null);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -99,7 +106,7 @@ export function PrReviewPage() {
         <span className="text-sm font-semibold text-og-1000">{task?.title ?? ''}</span>
       </div>
       <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-og-500">
-        <span className="pill">{t.prReview.codeReviewHeading}</span>
+        <span className="pill">{heading}</span>
         {prHref && prNumber !== undefined && (
           <a href={prHref} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent-hover">
             {t.taskDetail.viewPr(prNumber)}

@@ -17,6 +17,16 @@ function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
   };
 }
 
+function makeAgentGroup(
+  devOverrides: Partial<AgentConfig> = {},
+  qaOverrides: Partial<AgentConfig> = {},
+): [AgentConfig, AgentConfig] {
+  return [
+    makeAgent({ id: 'dd', role: 'dev', ...devOverrides }),
+    makeAgent({ id: 'qq', role: 'qa', runtime: 'codex', ...qaOverrides }),
+  ];
+}
+
 function makeConfig(overrides: Partial<BaxianConfig> = {}): BaxianConfig {
   return {
     review: { rounds: 10 },
@@ -46,7 +56,7 @@ function withProject(project: ProjectConfig, rest: Partial<BaxianConfig> = {}): 
 function devProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
   return {
     id: 'pp', repo: 'u/r', merge: null,
-    agent: [[makeAgent({ id: 'dd', role: 'dev' })]],
+    agent: [makeAgentGroup()],
     ...overrides,
   };
 }
@@ -63,11 +73,14 @@ function hasPathEndingWith(config: BaxianConfig, suffix: string): boolean {
   return validateConfig(config).some(e => e.path.endsWith(suffix));
 }
 
-// 这些用例考的是 repo URL 形态与凭据，不是 review.mode：显式 server 模式把 git 模式的
-// 结构要求（gitCli.tool 等）隔离在外，避免缺省切换后 URL 断言被 mode 错误淹没。
 function repoErrors(repo: string) {
   return validateConfig(withProject(
-    devProject({ repo, review: { mode: 'server' } }),
+    devProject({
+      repo,
+      ...(repo.includes('github.com') || /^[^/:]+\/[^/]+$/.test(repo)
+        ? {}
+        : { gitCli: { tool: 'glab' } }),
+    }),
   )).filter(e => e.path.endsWith('.repo'));
 }
 
@@ -76,16 +89,19 @@ describe('validateConfig', () => {
     expect(validateConfig(makeConfig())).toEqual([]);
   });
 
-  it('accepts dev-only pair (no QA)', () => {
+  it('rejects an incomplete group without QA', () => {
     const config = withProject(devProject({ id: 'pp', agent: [[makeAgent({ id: 'd1', role: 'dev' })]] }));
-    expect(validateConfig(config)).toEqual([]);
+    expect(validateConfig(config)).toContainEqual({
+      path: 'project.pp.agent[0]',
+      message: 'Agent group must contain exactly one qa agent',
+    });
   });
 
   it('detects duplicate agent ids across projects', () => {
     const config = makeConfig({
       project: [
-        { id: 'p1', repo: 'u/r1', merge: null, agent: [[makeAgent({ id: 'dup', role: 'dev' })]] },
-        { id: 'p2', repo: 'u/r2', merge: null, agent: [[makeAgent({ id: 'dup', role: 'dev' })]] },
+        { id: 'p1', repo: 'u/r1', merge: null, agent: [makeAgentGroup({ id: 'dup' }, { id: 'q1' })] },
+        { id: 'p2', repo: 'u/r2', merge: null, agent: [makeAgentGroup({ id: 'dup' }, { id: 'q2' })] },
       ],
     });
     const errors = validateConfig(config);
@@ -95,21 +111,32 @@ describe('validateConfig', () => {
   it('detects duplicate agent ids within same project', () => {
     const config = withProject(devProject({
       agent: [
-        [makeAgent({ id: 'dup', role: 'dev' })],
-        [makeAgent({ id: 'dup', role: 'dev' })],
+        makeAgentGroup({ id: 'dup' }, { id: 'q1' }),
+        makeAgentGroup({ id: 'dup' }, { id: 'q2' }),
       ],
     }));
     const errors = validateConfig(config);
     expect(errors.some(e => e.message.includes('Duplicate'))).toBe(true);
   });
 
-  it('accepts a three-role group in any order', () => {
+  it('accepts a dev and qa group in any order', () => {
     const config = withProject(devProject({ agent: [[
       makeAgent({ id: 'q1', role: 'qa' }),
-      makeAgent({ id: 'r1', role: 'research' }),
       makeAgent({ id: 'd1', role: 'dev' }),
     ]] }));
     expect(validateConfig(config)).toEqual([]);
+  });
+
+  it('rejects the research role and lists the current role enum', () => {
+    const research = makeAgent({ id: 'r1' });
+    (research as { role: string }).role = 'research';
+    const errors = validateConfig(withProject(devProject({ agent: [[
+      makeAgent({ id: 'd1', role: 'dev' }),
+      research,
+    ]] })));
+    expect(errors).toContainEqual(expect.objectContaining({
+      message: expect.stringMatching(/dev.*qa/),
+    }));
   });
 
   it.each<[string, AgentConfig[][], string]>([
@@ -118,22 +145,16 @@ describe('validateConfig', () => {
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'd2', role: 'dev' }),
     ]], 'exactly one dev'],
-    ['detects more than 3 agents in a group', [[
+    ['detects more than 2 agents in a group', [[
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'q1', role: 'qa' }),
-      makeAgent({ id: 'r1', role: 'research' }),
       makeAgent({ id: 'q2', role: 'qa' }),
-    ]], 'at most 3'],
+    ]], 'at most 2'],
     ['detects duplicate qa agents', [[
       makeAgent({ id: 'd1', role: 'dev' }),
       makeAgent({ id: 'q1', role: 'qa' }),
       makeAgent({ id: 'q2', role: 'qa' }),
-    ]], 'at most one qa'],
-    ['detects duplicate research agents', [[
-      makeAgent({ id: 'd1', role: 'dev' }),
-      makeAgent({ id: 'r1', role: 'research' }),
-      makeAgent({ id: 'r2', role: 'research' }),
-    ]], 'at most one research'],
+    ]], 'exactly one qa'],
     ['detects empty agent group', [[]], 'empty'],
   ])('%s', (_label, agent, messagePart) => {
     const config = withProject(devProject({ agent }));
@@ -147,7 +168,11 @@ describe('validateConfig', () => {
 
   it('accepts remote agent with host config', () => {
     const config = withProject(devProject({
-      agent: [[makeAgent({ id: 'd1', role: 'dev', mode: 'remote', host: { hostname: 'server', user: 'rock' } })]],
+      agent: [makeAgentGroup({
+        id: 'd1',
+        mode: 'remote',
+        host: { hostname: 'server', user: 'rock' },
+      })],
     }));
     expect(validateConfig(config)).toEqual([]);
   });
@@ -155,8 +180,8 @@ describe('validateConfig', () => {
   it('detects duplicate project ids', () => {
     const config = makeConfig({
       project: [
-        { id: 'same', repo: 'u/r1', merge: null, agent: [[makeAgent({ id: 'd1', role: 'dev' })]] },
-        { id: 'same', repo: 'u/r2', merge: null, agent: [[makeAgent({ id: 'd2', role: 'dev' })]] },
+        { id: 'same', repo: 'u/r1', merge: null, agent: [makeAgentGroup({ id: 'd1' }, { id: 'q1' })] },
+        { id: 'same', repo: 'u/r2', merge: null, agent: [makeAgentGroup({ id: 'd2' }, { id: 'q2' })] },
       ],
     });
     expect(validateConfig(config).some(e => e.message.includes('Duplicate project id'))).toBe(true);
@@ -179,11 +204,9 @@ describe('validateConfig', () => {
     }
   });
 
-  it('accepts non-github git URLs (https / ssh / scp, including multi-segment subgroup paths)', () => {
+  it('accepts non-github http(s) git URLs, including multi-segment subgroup paths', () => {
     const ok = [
       'https://gitlab.example.com/group/proj.git',
-      'git@gitlab.com:group/proj.git',
-      'ssh://git@gitlab.example.com:2222/group/sub/proj.git',
       'https://gitlab.example.com/group/sub/deep/proj',
       'https://gitea.internal/team/repo.git',
     ];
@@ -202,7 +225,7 @@ describe('validateConfig', () => {
       'https://gitlab.example.com/',
     ];
     for (const repo of bad) {
-      expect.soft(repoErrors(repo), repo).toHaveLength(1);
+      expect.soft(repoErrors(repo).length, repo).toBeGreaterThan(0);
     }
   });
 
@@ -215,7 +238,7 @@ describe('validateConfig', () => {
       'https://gitlab.example.com|x/group/proj.git',
     ];
     for (const repo of bad) {
-      expect.soft(repoErrors(repo), repo).toHaveLength(1);
+      expect.soft(repoErrors(repo).length, repo).toBeGreaterThan(0);
     }
   });
 
@@ -226,48 +249,38 @@ describe('validateConfig', () => {
       'ssh://git:TOKEN@gitlab.example.com/group/proj.git',
     ]) {
       const errs = repoErrors(repo);
-      expect.soft(errs, repo).toHaveLength(1);
-      expect.soft(errs[0]?.message, repo).toMatch(/must not embed credentials/);
+      expect.soft(errs.some(error => /must not embed credentials/.test(error.message)), repo).toBe(true);
     }
   });
 
-  it('allows plain SSH logins (git@), which are not secrets', () => {
+  it('rejects non-github SSH and scp URLs because the platform driver needs an HTTP API endpoint', () => {
     for (const repo of ['ssh://git@gitlab.example.com/group/proj.git', 'git@gitlab.example.com:group/proj.git']) {
-      expect.soft(repoErrors(repo), repo).toEqual([]);
+      expect.soft(
+        repoErrors(repo).some(error => /require an http\(s\):\/\//.test(error.message)),
+        repo,
+      ).toBe(true);
     }
   });
 
-  it('accepts a non-github project with a lone dev (no qa) — incremental agent creation not blocked at config time', () => {
+  it('accepts a non-github project with a complete agent group', () => {
     const cfg = withProject(devProject({
       id: 'gl', repo: 'https://gitlab.example.com/group/proj.git',
-      review: { mode: 'server' },
-      agent: [[makeAgent({ id: 'gldev', role: 'dev' })]],
+      gitCli: { tool: 'glab' },
+      agent: [makeAgentGroup({ id: 'gldev' }, { id: 'glqa' })],
     }));
     expect(validateConfig(cfg)).toEqual([]);
   });
 
-  it('accepts a non-github project that falls back to global server review mode', () => {
-    const cfg = withProject(
-      devProject({ id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', agent: [[makeAgent({ id: 'gldev', role: 'dev' })]] }),
-      { review: { rounds: 10, mode: 'server' } },
-    );
-    expect(validateConfig(cfg)).toEqual([]);
-  });
-
-  it("rejects the retired 'github' value at the global scope", () => {
-    const errors = validateConfig(withProject(
-      devProject({ id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', agent: [] }),
-      { review: { rounds: 10, mode: 'github' as never } },
-    ));
-    expect(errors.map(e => e.path)).toContain('review.mode');
-  });
-
-  it("rejects the retired 'github' value in a project override", () => {
-    const errors = validateConfig(withProject(
-      devProject({ id: 'gl', repo: 'https://gitlab.example.com/group/proj.git', review: { mode: 'github' as never }, agent: [] }),
-      { review: { rounds: 10, mode: 'server' } },
-    ));
-    expect(errors.map(e => e.path)).toContain('project[0].review.mode');
+  it('requires an explicit gitCli driver for a non-github project', () => {
+    const errors = validateConfig(withProject(devProject({
+      id: 'gl',
+      repo: 'https://gitlab.example.com/group/proj.git',
+      agent: [makeAgentGroup({ id: 'gldev' }, { id: 'glqa' })],
+    })));
+    expect(errors).toContainEqual(expect.objectContaining({
+      path: 'project[0].gitCli',
+      message: expect.stringContaining('require gitCli.tool'),
+    }));
   });
 
   it('rejects unknown agent.runtime / role / mode', () => {
@@ -295,34 +308,6 @@ describe('validateConfig', () => {
     });
     expect(paths(cfg)).toContain('server.port');
     expect(paths(cfg)).toContain('review.rounds');
-  });
-
-  it('rejects invalid review.mode', () => {
-    const errors = validateConfig(makeConfig({ review: { rounds: 10, mode: 'gitlab' as never } }));
-    expect(errors.map(e => e.path)).toContain('review.mode');
-  });
-
-  it('rejects invalid project.review.mode', () => {
-    const errors = validateConfig(withProject(devProject({ review: { mode: 'gitlab' as never }, agent: [] })));
-    expect(errors.map(e => e.path)).toContain('project[0].review.mode');
-  });
-
-  it('allows a github project to override global server mode back to git', () => {
-    const errors = validateConfig(withProject(
-      devProject({ id: 'gh', repo: 'https://github.com/a/b.git', review: { mode: 'git' }, agent: [] }),
-      { review: { rounds: 10, mode: 'server' } },
-    ));
-    expect(errors).toEqual([]);
-  });
-
-  it('rejects invalid review.afterDone', () => {
-    const errors = validateConfig(makeConfig({ review: { rounds: 10, mode: 'server', afterDone: 'tag' as never } }));
-    expect(errors.map(e => e.path)).toContain('review.afterDone');
-  });
-
-  it('accepts review.mode=server with afterDone=branch', () => {
-    const errors = validateConfig(makeConfig({ review: { rounds: 10, mode: 'server', afterDone: 'branch' } }));
-    expect(errors.filter(e => e.path.startsWith('review.'))).toEqual([]);
   });
 
   describe('server.https', () => {
@@ -431,7 +416,9 @@ describe('validateConfig', () => {
     ['accepts remote agent with hostname only (user omitted)', { hostname: 'box' }, null],
     ['rejects host.user when set to an empty string', { hostname: 'box', user: '   ' }, 'host.user'],
   ])('%s', (_label, host, suffix) => {
-    const cfg = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', mode: 'remote', host })]] }));
+    const cfg = withProject(devProject({
+      agent: [makeAgentGroup({ id: 'dd', mode: 'remote', host })],
+    }));
     if (suffix === null) {
       expect(validateConfig(cfg)).toEqual([]);
     } else {
@@ -440,7 +427,9 @@ describe('validateConfig', () => {
   });
 
   it('accepts agent without workdir (auto mode)', () => {
-    const config = withProject(devProject({ agent: [[makeAgent({ id: 'd1', role: 'dev', workdir: undefined })]] }));
+    const config = withProject(devProject({
+      agent: [makeAgentGroup({ id: 'd1', workdir: undefined })],
+    }));
     expect(validateConfig(config)).toEqual([]);
   });
 
@@ -729,14 +718,13 @@ describe('root agent config', () => {
         id: 'proj',
         repo: 'user/repo',
         merge: null,
-        agent: [[makeAgent({
+        agent: [makeAgentGroup({
           id: 'dev-yolo',
-          role: 'dev',
           mode: 'remote',
           host: { hostname: 'host.example.com', user: 'runner', port: 22 },
           workdir: '/srv/dev',
           yolo: true,
-        })]],
+        })],
       }],
     });
 
@@ -896,12 +884,12 @@ describe('root agent config', () => {
 
 describe('agent.yolo field', () => {
   it('accepts yolo: true', () => {
-    const config = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', yolo: true })]] }));
+    const config = withProject(devProject({ agent: [makeAgentGroup({ yolo: true })] }));
     expect(validateConfig(config)).toEqual([]);
   });
 
   it('accepts yolo: false (issue #475: runtime launches in its default permission mode)', () => {
-    const config = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', yolo: false })]] }));
+    const config = withProject(devProject({ agent: [makeAgentGroup({ yolo: false })] }));
     expect(validateConfig(config)).toEqual([]);
   });
 
@@ -919,7 +907,7 @@ describe('agent.model field', () => {
     ['rejects empty-string model', '   ', false],
     ['rejects non-string model', 42 as unknown as string, false],
   ] as const)('%s', (_label, model, valid) => {
-    const config = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', model })]] }));
+    const config = withProject(devProject({ agent: [makeAgentGroup({ model })] }));
     if (valid) {
       expect(validateConfig(config)).toEqual([]);
     } else {
@@ -942,7 +930,7 @@ describe('agent.addDirs field', () => {
       expect(hasPathEndingWith(config, '.addDirs')).toBe(true);
     }],
   ])('%s', (_label, addDirs, check) => {
-    check(withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', addDirs })]] })));
+    check(withProject(devProject({ agent: [makeAgentGroup({ addDirs })] })));
   });
 });
 
@@ -953,12 +941,14 @@ describe('opencode/qodercli runtime', () => {
   });
 
   it('accepts an opencode agent without addDirs', () => {
-    const cfg = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', runtime: 'opencode' })]] }));
+    const cfg = withProject(devProject({ agent: [makeAgentGroup({ runtime: 'opencode' })] }));
     expect(validateConfig(cfg)).toEqual([]);
   });
 
   it('accepts a qodercli agent with addDirs', () => {
-    const cfg = withProject(devProject({ agent: [[makeAgent({ id: 'dd', role: 'dev', runtime: 'qodercli', addDirs: ['/a'] })]] }));
+    const cfg = withProject(devProject({
+      agent: [makeAgentGroup({ runtime: 'qodercli', addDirs: ['/a'] })],
+    }));
     expect(validateConfig(cfg)).toEqual([]);
   });
 });
@@ -1050,7 +1040,12 @@ describe('remote agent host references', () => {
 
   function remoteHostConfig(host: AgentConfig['host'], rest: Partial<BaxianConfig> = {}): BaxianConfig {
     return withProject(
-      { id: 'proj', repo: 'u/r', merge: null, agent: [[makeAgent({ id: 'rdev', role: 'dev', mode: 'remote', host, workdir: undefined })]] },
+      {
+        id: 'proj',
+        repo: 'u/r',
+        merge: null,
+        agent: [makeAgentGroup({ id: 'rdev', mode: 'remote', host, workdir: undefined })],
+      },
       rest,
     );
   }

@@ -13,7 +13,6 @@ import { initStateDir } from './state/init.js';
 import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
 import { ErrorRecordStore } from './state/error-record-store.js';
-import { ReviewStore } from './state/review-store.js';
 import { PetStore } from './state/pet-store.js';
 import { RootRecoveryStore } from './state/root-recovery-store.js';
 import { LockManager } from './state/lock.js';
@@ -27,7 +26,6 @@ import { EventBroker } from './event/broker.js';
 import { EventPublisher } from './event/publish.js';
 import { autoBootstrapAgentIds, bootstrapAutoRepos } from './agent/bootstrap.js';
 import { registerEventHandlers, recoverGitPostApprovePending } from './event/handlers.js';
-import { registerServerEventHandlers } from './event/server-handlers.js';
 import { PlatformPoller, platformTaskView, type PlatformPollerOptions } from './platform/platform-poller.js';
 import { platformPollerStatePath } from './platform/comment-cursor.js';
 import { buildProjectDriver, makeDriverExec } from './platform/driver-host.js';
@@ -185,7 +183,6 @@ export async function startServer(configPath?: string): Promise<void> {
       hostResolver: (agent) => resolveHostRef(agent),
     });
 
-    const reviewStore = new ReviewStore(`${stateDir}/state/reviews`);
     const driverExec = makeDriverExec(createRunner('local'));
     const platformEntryDeps: PlatformEntryDeps = {
       driverFor: (project) => buildProjectDriver(project, pluginRegistry, driverExec),
@@ -202,7 +199,6 @@ export async function startServer(configPath?: string): Promise<void> {
       paneStreamerManager,
       pluginRegistry,
       errorRecordStore,
-      reviewStore,
       imageStagingRoot: `${stateDir}/state/task-images`,
       platformDefaultBranchOf: (projectId) => defaultBranchOf(projectId),
     });
@@ -233,7 +229,6 @@ export async function startServer(configPath?: string): Promise<void> {
     });
     gitOutboxFlusher.start();
     stopBackgroundRunners = () => gitOutboxFlusher.stop();
-    registerServerEventHandlers(eventBus, agentManager);
     await agentManager.setupRecoveredPostApproveSignals();
     await agentManager.setupRecoveredSpecSignals();
     paneStreamerManager.startupScan((config.project ?? []).flatMap((p) => (p.agent ?? []).flat()));

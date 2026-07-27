@@ -27,9 +27,8 @@ baxian is **tmux-native**. An agent is just an interactive Claude Code or Codex 
 ## Features
 
 - **Terminal wall** — the dashboard embeds every agent's live terminal (streamed over WebSocket, rendered with xterm.js). Click a pane to type into the real session; no context switching to find out what an agent is doing.
-- **Automated review loop** — QA findings are structured (`critical` / `major` / `minor`, file and line), Dev responses are per-finding (`fix` / `reject` with rationale and commit), and rounds repeat until the verdict is `approve`.
+- **Automated review loop** — QA publishes findings on the pull request, Dev resolves each with a fix and commit or a concrete rejection rationale, and QA rechecks until the verdict is `approve`.
 - **Reviews happen on real pull requests** — branch-per-task, automatic PR creation, and review polling through the platform's own CLI (`gh` for GitHub; install and authenticate it separately); with `merge: "auto"`, baxian merges the PR itself once you confirm the approved task.
-- **Built-in server review mode (fallback)** — set `review.mode: "server"` to run the review loop through the server's own protocol when a PR is not an option.
 - **Human spec gate (optional)** — with `specApproval: "human"` on a project, a task that starts with a spec parks at `spec-ready` once QA approves the spec, and coding waits for your sign-off.
 - **Local & remote agents** — run agents on any machine reachable over SSH; baxian manages the remote tmux sessions for you.
 - **No API keys** — agents run the interactive Claude Code / Codex CLIs, so your existing subscriptions are the only credentials involved.
@@ -56,7 +55,7 @@ Every round is recorded and browsable — the QA review with its findings, and t
         │  REST + WebSocket
         ▼
    baxian server (Node + Fastify)
-   task state · review rounds · platform poller
+   task state · PR timeline · platform poller
         │  tmux send-keys / capture-pane
         ├────────────────┐
         ▼                ▼ SSH
@@ -64,14 +63,14 @@ Every round is recorded and browsable — the QA review with its findings, and t
    dev-1 · qa-1      dev-2 · qa-2
 ```
 
-The server owns all state (tasks, review rounds, agent bindings) and drives agents by injecting prompts into their tmux panes and watching the output. Agents never talk to each other directly — the server relays review requests and feedback between the Dev and QA sides.
+The server owns task and agent-binding state, drives agents through their tmux panes, and follows review feedback through the platform pull request.
 
 ## Requirements
 
 > - **Node.js ≥ 22.13**
 > - **tmux** on every machine that runs agents (local and remote)
 > - **Claude Code** (`claude`) and/or **Codex** (`codex`) CLI installed and logged in
-> - **git**, plus the platform CLI your repo needs for `review.mode: "git"` (the default) — **GitHub CLI** (`gh`, authenticated) for GitHub repos; another host needs its own CLI and a matching driver plugin under `~/.baxian/plugins/`
+> - **git**, plus the platform CLI your repo needs — **GitHub CLI** (`gh`, authenticated) for GitHub repos; another host needs its own CLI and a matching driver plugin under `~/.baxian/plugins/`
 >
 > The CLI must be authenticated on every machine that runs agents, and on the server itself: the server calls it to poll reviews, merge, and close PRs, while agents call it to open PRs and post comments.
 
@@ -136,11 +135,10 @@ Useful options:
 | --- | --- |
 | `language` | UI language, `en-US` (default) or `zh-CN` |
 | `review.rounds` | Cap on review rounds before a task is parked as `max_rounds` |
-| `review.mode` | `git` (default): reviews on real pull requests, driven by the platform CLI; `server`: built-in protocol for PR-less setups; can be set per project |
 | `server.token` | Bearer token protecting the API and web console |
 | `project[].merge` | `"auto"`: baxian merges the PR itself once you confirm the approved task; `null`: merge by hand |
 | `project[].specApproval` | `"human"`: after QA approves a spec, park at `spec-ready` for your sign-off; `null` (default): QA approval moves straight to coding |
-| `project[].gitCli.tool` | Which platform CLI drives `review.mode: "git"`. GitHub repos resolve `gh` automatically; any other host must name its tool (and have a matching driver plugin installed) |
+| `project[].gitCli.tool` | Which platform CLI drives pull-request reviews. GitHub repos resolve `gh` automatically; any other host must name its tool (and have a matching driver plugin installed) |
 | `project[].agent[][].mode` + `host` | `local`, or `remote` with a host id for SSH-managed agents |
 
 ## License

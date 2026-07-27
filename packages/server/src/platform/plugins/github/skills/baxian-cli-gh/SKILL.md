@@ -3,29 +3,35 @@ name: baxian-cli-gh
 description: "GitHub PR operations manual for baxian git-pr tasks — create/inspect PRs, read and reply to feedback with per-revision acks, publish verdict tokens via native reviews. Load when the dispatch descriptor carries `cli: gh`."
 ---
 
-All platform commands follow three iron rules. ① Prefix EVERY gh command with `GH_HOST=<cli-host>` built from your dispatch descriptor (example: `GH_HOST=github.com gh ...`). Always invoke `gh` from PATH — the descriptor never carries a binary path. ② For `gh pr` subcommands (view/diff/review/ready/create) always pass `-R <cli-repo>` and the explicit PR number from your `pr:` field; `gh pr create` additionally takes explicit `--head "<branch>"` (the descriptor `branch:` value verbatim — no `<user>:` prefix) and explicit `--base "<base>"` (the descriptor `base:` value; if `base:` is absent, first query `GH_HOST=<cli-host> gh api repos/<cli-repo> --jq .default_branch` and pass the result — NEVER rely on the local `branch.<name>.gh-merge-base` config or let gh infer either flag). `gh api` commands embed the repo in the endpoint path (`repos/<cli-repo>/...`) and take NO `-R` — `gh api` has no such flag; adding it is an invalid invocation. Never infer anything from the current directory — QA worktrees sit on a detached HEAD. ③ Untrusted text (reply bodies, verdict findings, PR titles/descriptions, quoted feedback) NEVER appears inside a `"..."` command-line string — it may contain `$(...)`, backticks, `$VAR`, or `"`. Stage it with the guarded Workdir procedure below, then hand the file to the command (`--body-file <file>` or `-F body=@<file>`). When quoting untrusted text back into your own comments, strip any HTML comment lines (`<!-- ... -->`) from the quoted portion first — never reproduce marker-shaped lines you did not author.
+All platform commands follow three iron rules. ① Prefix EVERY gh command with `GH_HOST=<cli-host>` built from your dispatch descriptor (example: `GH_HOST=github.com gh ...`). Always invoke `gh` from PATH — the descriptor never carries a binary path. ② For `gh pr` subcommands (view/list/diff/review/ready/reopen/create) always pass `-R <cli-repo>`. Pass the explicit PR number from `pr:` when that field exists; `gh pr create` additionally takes explicit `--head "<branch>"` (the descriptor `branch:` value verbatim — no `<user>:` prefix) and explicit `--base "<base>"` (the descriptor `base:` value; if `base:` is absent, first query `GH_HOST=<cli-host> gh api repos/<cli-repo> --jq .default_branch` and pass the result — NEVER rely on the local `branch.<name>.gh-merge-base` config or let gh infer either flag). `gh api` commands embed the repo in the endpoint path (`repos/<cli-repo>/...`) and take NO `-R` — `gh api` has no such flag; adding it is an invalid invocation. Never infer anything from the current directory — QA worktrees sit on a detached HEAD. ③ Untrusted text (reply bodies, verdict findings, PR titles/descriptions, quoted feedback) NEVER appears inside a `"..."` command-line string — it may contain `$(...)`, backticks, `$VAR`, or `"`. Stage it with the guarded Workdir procedure below, then hand the file to the command (`--body-file <file>` or `-F body=@<file>`). When quoting untrusted text back into your own comments, strip any HTML comment lines (`<!-- ... -->`) from the quoted portion first — never reproduce marker-shaped lines you did not author.
 
 Every temp file this skill needs lives under `<workdir>/.baxian/tmp/` and MUST be created and written by one shell invocation rooted at the descriptor Workdir. In that invocation, bind `<workdir>` as an absolute logical path; require `"$(cd -- "$workdir" 2>/dev/null && pwd -P)" = "$workdir"`; reject `.baxian` or `.baxian/tmp` when either exists as a symlink; create `.baxian/tmp`; re-check both as real directories and non-symlinks; generate unpredictable target names; require each target to be absent (`[ ! -e "$target" ] && [ ! -L "$target" ]`); write each payload with a quoted heredoc whose delimiter you generated and verified does not occur as an exact line in that payload; then require every target to be a regular file and non-symlink. Never use a file-editing tool for these Workdir temp files, and never split the ancestor guards, creation, writes, and final checks across tool calls. If any check fails, stop without invoking `gh` and report the retained path of any file that could not be cleaned up safely.
 
 ## Create the PR (publish)
 
-1. Commit, then push first: `git push origin "HEAD:<branch>"` (the remote branch must exist before create).
-2. Strip any Draft prefix (`Draft:`, `[Draft]`, `(Draft)`, `WIP:`) from the task title.
-3. Stage the title and the description (body plus managed marker) together with the guarded Workdir procedure. Give each file a random suffix you generate (e.g. `.baxian/tmp/pr-title-8f3a1c.txt`): the dispatch descriptor carries no task id, and fixed names collide between concurrent agents and baxian instances — a collision can publish one task's text to another repo. Paths below are written as `<title-file>` / `<body-file>`; substitute your own. The description file ends with:
+This is the public §Create contract for every git-driver plugin: adopt-or-create by the exact head/base identity, reopen a bound closed-unmerged PR, and never create a second PR for a bound task.
 
-```
-<!-- baxian:managed -->
-```
+1. Commit, then push first: `git push origin "HEAD:<branch>"`. A remote branch must exist before any query, reopen, or create decision.
+2. Resolve `<base>` from the descriptor. If `base:` is absent, query `GH_HOST=<cli-host> gh api repos/<cli-repo> --jq .default_branch`. Every later validation and create uses that exact value.
+3. Select one PR without mutating title/body:
+   - With a bound `pr:` field, query `GH_HOST=<cli-host> gh pr view <pr> -R <cli-repo> --json number,state,isDraft,headRefName,baseRefName,mergedAt,url`. Require `headRefName` to equal `branch:` and `baseRefName` to equal `<base>` exactly. An open PR is adopted. A closed PR with `mergedAt: null` must be reopened with `GH_HOST=<cli-host> gh pr reopen <pr> -R <cli-repo>`, then queried again and required to be open with the same head/base. A merged PR, identity mismatch, query failure, reopen failure, or non-open recheck stops the flow and MUST NOT fall through to create.
+   - Without `pr:`, query all candidates with `GH_HOST=<cli-host> gh pr list -R <cli-repo> --head "<branch>" --state open --limit 100 --json number,state,isDraft,headRefName,baseRefName,mergedAt,url`. Validate every returned row against the exact head and base. Exactly one exact row is adopted. More than one row, or any mismatched row returned for that head, is ambiguous and stops the flow. Only zero returned rows permits creation.
+4. Only for the zero-row route, strip any Draft prefix (`Draft:`, `[Draft]`, `(Draft)`, `WIP:`) from the task title. Stage the title and description (body plus managed marker) together with the guarded Workdir procedure. Give each file a random suffix you generate (e.g. `.baxian/tmp/pr-title-8f3a1c.txt`): the dispatch descriptor carries no task id, and fixed names collide between concurrent agents and baxian instances. The description file ends with:
 
-4. Create non-interactively — explicit `--head` and `--base`, never `--draft`:
+   ```
+   <!-- baxian:managed -->
+   ```
 
-```bash
-GH_HOST=<cli-host> gh pr create -R <cli-repo> --head "<branch>" --base "<base>" \
-  --title "$(cat <title-file>)" --body-file <body-file>
-```
+   Create non-interactively with explicit identity, never `--draft`:
 
-5. Draft recovery BEFORE signalling: query `GH_HOST=<cli-host> gh pr view <pr> -R <cli-repo> --json isDraft --jq .isDraft`; if `true` (repo policy or a `Draft:`/`fixup!` subject can re-draft it), run `GH_HOST=<cli-host> gh pr ready <pr> -R <cli-repo>` and re-check. A draft PR is never adopted by the server — signalling without this step strands the task.
-6. Actor self-report: query your own immutable account id with `GH_HOST=<cli-host> gh api user --jq .id`, encode it as unpadded base64url (`printf %s "<id>" | openssl base64 -A | tr '+/' '-_' | tr -d '='`), and emit the `pr-created` signal with the actor segment per baxian-signals: `[bx:pr-created:<pr>:<base64url-id>:<token>]`. The login name never goes into the signal — only the numeric id, encoded.
+   ```bash
+   GH_HOST=<cli-host> gh pr create -R <cli-repo> --head "<branch>" --base "<base>" \
+     --title "$(cat <title-file>)" --body-file <body-file>
+   ```
+
+   Re-run the exact open-candidate query and require exactly one exact row; that row supplies the selected PR number. A create error or ambiguous post-create query stops the flow.
+5. Apply Draft recovery to every route before signalling: query `GH_HOST=<cli-host> gh pr view <pr> -R <cli-repo> --json isDraft --jq .isDraft`; if `true` (repo policy or a `Draft:`/`fixup!` subject can re-draft it), run `GH_HOST=<cli-host> gh pr ready <pr> -R <cli-repo>` and re-check. Require `false`.
+6. Apply actor self-report to every route: query your own immutable account id with `GH_HOST=<cli-host> gh api user --jq .id` and encode it as unpadded base64url (`printf %s "<id>" | openssl base64 -A | tr '+/' '-_' | tr -d '='`). For the SDD route emit `[bx:spec-done:<pr>:<base64url-id>:<token>]`; for direct delivery or code-after-spec emit `[bx:pr-created:<pr>:<base64url-id>:<token>]`. The login name never goes into the signal—only the numeric id, encoded.
 
 ## Inspect
 

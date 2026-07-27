@@ -19,16 +19,16 @@ const driver = (): PlatformDriver => ({
   runCommentSource: async () => [],
 });
 
-const cfg = (projects: Array<Partial<ProjectConfig>>, review: Partial<BaxianConfig['review']> = {}): BaxianConfig => ({
+const cfg = (projects: Array<Partial<ProjectConfig>>): BaxianConfig => ({
   server: { port: 3000 },
-  review: { rounds: 3, ...review },
+  review: { rounds: 3 },
   project: projects.map(p => ({ id: 'p', repo: 'https://github.com/a/b.git', merge: null, agent: [], ...p })),
 } as BaxianConfig);
 
 const deps = { driverFor: driver, statePathFor: (repoUrl: string) => `/state/${repoUrl}.json` };
 
 const task = (over: Partial<TaskState> = {}): TaskState => ({
-  id: 't1', projectId: 'p', title: 't', reviewMode: 'server', status: 'in_progress', createdAt: '', updatedAt: '', ...over,
+  id: 't1', projectId: 'p', title: 't', status: 'in_progress', createdAt: '', updatedAt: '', ...over,
 } as TaskState);
 
 describe('createPlatformPollerOptions', () => {
@@ -66,28 +66,18 @@ describe('createPlatformPollerOptions', () => {
 });
 
 describe('planPlatformEntries', () => {
-  it('builds an entry for an effective git project', () => {
+  it('builds an entry for a GitHub project', () => {
     const { entries } = planPlatformEntries(cfg([{}]), deps);
     expect(entries).toHaveLength(1);
     expect(entries[0]).toMatchObject({ projectId: 'p', repoUrl: 'https://github.com/a/b.git' });
   });
 
-  it('builds an entry for a server-mode project that opens PRs after done', () => {
-    const config = cfg([{ review: { mode: 'server' } }], { mode: 'server', afterDone: 'pr' });
+  it('builds an entry for a non-GitHub project with an explicit tool', () => {
+    const config = cfg([{
+      repo: 'https://gl.example.com/g/x.git',
+      gitCli: { tool: 'glab' },
+    }]);
     expect(planPlatformEntries(config, deps).entries).toHaveLength(1);
-  });
-
-  it('builds no entry for a server-mode project that only pushes a branch', () => {
-    const config = cfg([{ review: { mode: 'server' } }], { mode: 'server', afterDone: 'branch' });
-    expect(planPlatformEntries(config, deps).entries).toEqual([]);
-  });
-
-  it('builds no entry when afterDone pr is coerced away on a non-github repo', () => {
-    const config = cfg(
-      [{ repo: 'https://gl.example.com/g/x.git', review: { mode: 'server' }, gitCli: { tool: 'glab' } }],
-      { mode: 'server', afterDone: 'pr' },
-    );
-    expect(planPlatformEntries(config, deps).entries).toEqual([]);
   });
 
   it('skips the project with a diagnostic when no driver resolves', () => {
@@ -110,45 +100,31 @@ describe('planPlatformEntries', () => {
   });
 
   it('lets a retained project claim its repo first, exposing the colliding live project as a conflict', () => {
-    // A retained(server+branch,有活动任务) 与 B(git,needsEntry) 同 repo:受保护的 A 保留 entry,
-    // B 落为 conflict 交调用方发 repo-conflict intervention(spec §5.5)
     const config = cfg([
       { id: 'b-live', repo: 'https://github.com/a/b.git' },
-      { id: 'a-retained', repo: 'git@github.com:a/b.git', review: { mode: 'server' } },
-    ], { afterDone: 'branch' });
+      { id: 'a-retained', repo: 'git@github.com:a/b.git' },
+    ]);
     const { entries, conflicts } = planPlatformEntries(config, { ...deps, retainedProjectIds: new Set(['a-retained']) });
     expect(entries.map(e => e.projectId)).toEqual(['a-retained']);
     expect(conflicts).toEqual([{ projectId: 'b-live', repoKey: 'github.com/a/b', claimedBy: 'a-retained' }]);
   });
-
-  it('keeps a retained project even when its config no longer qualifies', () => {
-    const config = cfg([{ review: { mode: 'server' } }], { mode: 'server', afterDone: 'branch' });
-    expect(planPlatformEntries(config, { ...deps, retainedProjectIds: new Set(['p']) }).entries).toHaveLength(1);
-  });
 });
 
 describe('retainedPlatformProjectIds', () => {
-  const serverBranchCfg = cfg([{ review: { mode: 'server' } }], { mode: 'server', afterDone: 'branch' });
+  const platformCfg = cfg([{}]);
 
-  it('retains a project whose non-terminal task still carries a platform binding', async () => {
-    const retained = await retainedPlatformProjectIds(serverBranchCfg, async () => [
-      task({ platformBinding: { mode: 'server', repoKey: 'github.com/a/b', tool: 'gh' } }),
+  it('does not retain an active project that already has a live entry', async () => {
+    const retained = await retainedPlatformProjectIds(platformCfg, async () => [
+      task({ platformBinding: { mode: 'git', repoKey: 'github.com/a/b', tool: 'gh' } }),
     ]);
-    expect(retained).toEqual(new Set(['p']));
-  });
-
-  it('retains a project whose non-terminal task resolved afterDone to pr', async () => {
-    const retained = await retainedPlatformProjectIds(serverBranchCfg, async () => [task({
-      afterDone: 'pr', platformBinding: { mode: 'server', repoKey: 'github.com/a/b', tool: 'gh' },
-    })]);
-    expect(retained).toEqual(new Set(['p']));
+    expect(retained).toEqual(new Set());
   });
 
   it('drops the project once that task reaches a terminal status', async () => {
-    const retained = await retainedPlatformProjectIds(serverBranchCfg, async () => [
+    const retained = await retainedPlatformProjectIds(platformCfg, async () => [
       task({
-        afterDone: 'pr', status: 'merged',
-        platformBinding: { mode: 'server', repoKey: 'github.com/a/b', tool: 'gh' },
+        status: 'merged',
+        platformBinding: { mode: 'git', repoKey: 'github.com/a/b', tool: 'gh' },
       }),
     ]);
     expect(retained.size).toBe(0);
@@ -162,8 +138,8 @@ describe('retainedPlatformProjectIds', () => {
 
   it('reports and excludes an active task whose project was removed offline', async () => {
     const onMismatch = vi.fn();
-    const retained = await retainedPlatformProjectIds(serverBranchCfg, async () => [task({
-      projectId: 'removed', reviewMode: 'git',
+    const retained = await retainedPlatformProjectIds(platformCfg, async () => [task({
+      projectId: 'removed',
       platformBinding: { mode: 'git', repoKey: 'github.com/removed/repo', tool: 'gh' },
     })], onMismatch);
     expect(retained).toEqual(new Set());
@@ -174,8 +150,8 @@ describe('retainedPlatformProjectIds', () => {
 
   it('reports and excludes an active task whose binding no longer matches the configured identity', async () => {
     const onMismatch = vi.fn();
-    const retained = await retainedPlatformProjectIds(serverBranchCfg, async () => [task({
-      platformBinding: { mode: 'server', repoKey: 'github.com/other/repo', tool: 'forge' },
+    const retained = await retainedPlatformProjectIds(platformCfg, async () => [task({
+      platformBinding: { mode: 'git', repoKey: 'github.com/other/repo', tool: 'forge' },
     })], onMismatch);
     expect(retained).toEqual(new Set());
     expect(onMismatch).toHaveBeenCalledWith(expect.objectContaining({ id: 't1' }), expect.objectContaining({
@@ -185,7 +161,7 @@ describe('retainedPlatformProjectIds', () => {
 
   it('reports an active platform task that lacks its required binding', async () => {
     const onMismatch = vi.fn();
-    const retained = await retainedPlatformProjectIds(serverBranchCfg, async () => [task({ afterDone: 'pr' })], onMismatch);
+    const retained = await retainedPlatformProjectIds(platformCfg, async () => [task()], onMismatch);
     expect(retained).toEqual(new Set());
     expect(onMismatch).toHaveBeenCalledWith(expect.objectContaining({ id: 't1' }), expect.objectContaining({
       reason: 'missing-binding-snapshot', differences: ['mode', 'repoKey', 'tool'],
@@ -197,14 +173,10 @@ describe('config hot reload platform interventions', () => {
   it('emits binding and repo-conflict interventions and retains their active fingerprints', async () => {
     const validated = cfg([
       { id: 'b-live', repo: 'https://github.com/a/b.git' },
-      { id: 'a-retained', repo: 'git@github.com:a/b.git', review: { mode: 'server' } },
-    ], { afterDone: 'branch' });
-    const retained = task({
-      id: 'retained', projectId: 'a-retained', afterDone: 'pr',
-      platformBinding: { mode: 'server', repoKey: 'github.com/a/b', tool: 'gh' },
-    });
+      { id: 'a-live', repo: 'git@github.com:a/b.git' },
+    ]);
     const removed = task({
-      id: 'removed', projectId: 'removed-project', reviewMode: 'git',
+      id: 'removed', projectId: 'removed-project',
       platformBinding: { mode: 'git', repoKey: 'github.com/removed/repo', tool: 'gh' },
     });
     const retainKeys = vi.fn();
@@ -213,7 +185,7 @@ describe('config hot reload platform interventions', () => {
     const reconcile = vi.fn();
     const reschedule = vi.fn();
     const manager = {
-      listActiveGitTasks: vi.fn(async () => [retained, removed]),
+      listActiveGitTasks: vi.fn(async () => [removed]),
       replaceConfig: vi.fn(),
       platformBindingInterventionKey: vi.fn((t: TaskState) => `binding:${t.id}`),
       configInterventionKey: vi.fn((projectId: string) => `config:${projectId}`),
@@ -235,19 +207,19 @@ describe('config hot reload platform interventions', () => {
       }),
     ]);
     expect(prepared.platform?.conflicts).toEqual([
-      { projectId: 'b-live', repoKey: 'github.com/a/b', claimedBy: 'a-retained' },
+      { projectId: 'a-live', repoKey: 'github.com/a/b', claimedBy: 'b-live' },
     ]);
 
     await applyConfigHotReload(ctx, validated, prepared);
 
     expect(reconcile).toHaveBeenCalledWith(prepared.platform?.entries);
-    expect(retainKeys).toHaveBeenCalledWith(new Set(['binding:removed', 'config:b-live']));
+    expect(retainKeys).toHaveBeenCalledWith(new Set(['binding:removed', 'config:a-live']));
     expect(emitBinding).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'removed' }),
       expect.objectContaining({ reason: 'project-missing' }),
     );
-    expect(emitConflict).toHaveBeenCalledWith('b-live', {
-      phase: 'repo-conflict', repoKey: 'github.com/a/b', claimedBy: 'a-retained',
+    expect(emitConflict).toHaveBeenCalledWith('a-live', {
+      phase: 'repo-conflict', repoKey: 'github.com/a/b', claimedBy: 'b-live',
     });
   });
 });
@@ -450,9 +422,9 @@ describe('PlatformPoller.reconcile', () => {
       const p = new PlatformPoller({
         onEvent,
         tasks: async () => [{
-          taskId: 't1', terminal: false, reviewMode: 'git', branch: 'bx/t1', expectedBase: 'main',
+          taskId: 't1', terminal: false, branch: 'bx/t1', expectedBase: 'main',
         }],
-        task: async taskId => ({ taskId, terminal: false, reviewMode: 'git', branch: `bx/${taskId}` }),
+        task: async taskId => ({ taskId, terminal: false, branch: `bx/${taskId}` }),
       });
       p.reconcile([{
         projectId: 'a', repoUrl: 'https://github.com/o/a.git', driver: retiringDriver,
@@ -493,7 +465,7 @@ describe('PlatformPoller.reconcile', () => {
         runCommentSource: vi.fn(async () => []),
       };
       const taskView: PlatformTaskView = {
-        taskId: 't1', terminal: false, reviewMode: 'git' as const, branch: 'bx/t1', expectedBase: 'main',
+        taskId: 't1', terminal: false, branch: 'bx/t1', expectedBase: 'main',
       };
       const statePath = join(dir, 'a.json');
       const onEvent = vi.fn(async () => {
@@ -599,7 +571,7 @@ describe('platformTaskView', () => {
       passToken: 'pass', failToken: 'fail', signalToken: 'sig', baseBranch: 'main',
     }));
     expect(view).toMatchObject({
-      taskId: 't1', terminal: false, reviewMode: 'server', status: 'review', inReview: true, prNumber: 7,
+      taskId: 't1', terminal: false, status: 'review', inReview: true, prNumber: 7,
       anchorSha: 'a'.repeat(40), passToken: 'pass', failToken: 'fail', expectedBase: 'main',
     });
   });
@@ -621,6 +593,6 @@ describe('platformTaskView', () => {
 
   it('omits absent optional fields instead of publishing undefined values', () => {
     expect(Object.keys(platformTaskView(task())).sort())
-      .toEqual(['closedUnmergedAnchor', 'inReview', 'reviewMode', 'status', 'taskId', 'terminal']);
+      .toEqual(['closedUnmergedAnchor', 'inReview', 'status', 'taskId', 'terminal']);
   });
 });

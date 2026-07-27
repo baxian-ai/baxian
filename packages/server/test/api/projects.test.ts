@@ -22,17 +22,24 @@ const { post, put, del } = requesters(() => app);
 function devAgent(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return { id, runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true, ...extra };
 }
-function qaAgent(id: string, pairWith: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
-  return { id, runtime: 'codex', role: 'qa', mode: 'local', yolo: true, pairWith, ...extra };
+function qaAgent(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { id, runtime: 'codex', role: 'qa', mode: 'local', yolo: true, ...extra };
 }
-function researchAgent(id: string, pairWith: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
-  return { id, runtime: 'claude-code', role: 'research', mode: 'local', yolo: true, pairWith, ...extra };
+function qaIdFor(devId: string): string {
+  return /-dev\d*$/.test(devId) ? devId.replace(/-dev(\d*)$/, '-qa$1') : `${devId}-qa`;
 }
 
 function createProject(id: string, extra: Record<string, unknown> = {}): ReturnType<typeof post> {
   return post('/api/projects', { id, repo: 'a/b', ...extra });
 }
-function addAgent(projectId: string, body: Record<string, unknown>): ReturnType<typeof post> {
+function addAgent(
+  projectId: string,
+  dev: Record<string, unknown>,
+  qa: Record<string, unknown> = qaAgent(qaIdFor(String(dev.id))),
+): ReturnType<typeof post> {
+  return post(`/api/projects/${projectId}/agents`, { agents: [dev, qa] });
+}
+function addAgentsRaw(projectId: string, body: Record<string, unknown>): ReturnType<typeof post> {
   return post(`/api/projects/${projectId}/agents`, body);
 }
 function findProject(id: string) {
@@ -56,11 +63,16 @@ function seedAgent(id: string, projectId: string, extra: Partial<AgentFacts> = {
 
 function seedTask(id: string, projectId: string, extra: Partial<TaskFacts> = {}): Promise<void> {
   const devAgentId = extra.devAgentId ?? extra.agentId ?? extra.preferredAgentId ?? '';
-  const reviewMode = app.ctx.agentManager.effectiveReviewMode(projectId);
+  const group = app.ctx.config.project
+    .find(project => project.id === projectId)
+    ?.agent.find(candidate => candidate.some(agent => agent.id === devAgentId));
+  const qaAgentId = extra.qaAgentId
+    ?? group?.find(agent => agent.role === 'qa')?.id
+    ?? (devAgentId === '' ? undefined : qaIdFor(devAgentId));
   return app.ctx.taskStore.set({
     id, projectId, title: 't', description: 'd', reviewRound: 0,
-    preferredAgentId: devAgentId, agentId: devAgentId, devAgentId,
-    phase: 'code', reviewMode, status: 'pending',
+    preferredAgentId: devAgentId, agentId: devAgentId, devAgentId, qaAgentId,
+    phase: 'code', status: 'pending',
     ...app.ctx.agentManager.platformBindingFields(projectId),
     createdAt: now(), updatedAt: now(), ...extra,
   } as TaskFacts);
@@ -97,9 +109,10 @@ beforeEach(async () => {
       /\/api\/projects\/[^/]+\/agents$/.test(opts.url)
     ) {
       try {
-        const body = JSON.parse(response.body) as { agent?: { id?: string } };
-        const id = body?.agent?.id;
-        if (id) await app.ctx.agentManager.waitForBootstrapSettled(id, 2_000);
+        const body = JSON.parse(response.body) as { agents?: Array<{ id?: string }> };
+        for (const agent of body.agents ?? []) {
+          if (agent.id) await app.ctx.agentManager.waitForBootstrapSettled(agent.id, 2_000);
+        }
       } catch {}
     }
     return response;
@@ -183,69 +196,14 @@ describe('POST /api/projects', () => {
     expect(bad.statusCode).toBe(400);
   });
 
-  it('persists project review mode when provided', async () => {
-    const response = await post('/api/projects', { id: 'serverproj', repo: 'a/server', review: { mode: 'server' } });
-    expect(response.statusCode).toBe(201);
-    const body = JSON.parse(response.body);
-    expect(body.project.review).toEqual({ mode: 'server' });
-    expect(app.ctx.config.project.find(p => p.id === 'serverproj')?.review?.mode).toBe('server');
-  });
-
-  it('creates a non-github project with an explicit server review mode override', async () => {
-    const response = await post('/api/projects', {
-      id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git', review: { mode: 'server' },
-    });
-    expect(response.statusCode).toBe(201);
-    const body = JSON.parse(response.body);
-    expect(body.project.review).toEqual({ mode: 'server' });
-  });
-
   it.each([
-    ['non-github repo falling back to github review → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git' }, 400],
+    ['non-github repo without gitCli driver → 400', { id: 'gitlabproj', repo: 'https://gitlab.example.com/group/proj.git' }, 400],
     ['duplicate project id → 409', { id: 'proj', repo: 'a/b' }, 409],
     ['invalid repo format → 400', { id: 'badrepo', repo: 'not-a-valid-repo' }, 400],
     ['empty id → 400', { id: '', repo: 'a/b' }, 400],
   ] as const)('%s', async (_label, body, status) => {
     const response = await post('/api/projects', body);
     expect(response.statusCode).toBe(status);
-  });
-
-  it('rejects creating a project on a repo locked by another project\'s active tasks (§5.5)', async () => {
-    // 既有项目 proj(repo a/b) 有一个活动的绑定任务;新建 B 指向同一 repo 应 409
-    await createProject('proj-owner', { repo: 'https://github.com/shared/repo.git', review: { mode: 'server' } });
-    await app.ctx.taskStore.set({
-      id: 'task-lock', projectId: 'proj-owner', title: 'T', description: 'D',
-      preferredAgentId: '', agentId: '', devAgentId: '',
-      status: 'review', reviewMode: 'git', reviewRound: 1,
-      platformBinding: { mode: 'git', repoKey: 'github.com/shared/repo', tool: 'gh' },
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    } as never);
-
-    const response = await post('/api/projects', { id: 'intruder', repo: 'git@github.com:shared/repo.git' });
-
-    expect(response.statusCode).toBe(409);
-    const body = JSON.parse(response.body);
-    expect(body.tasks).toEqual(['task-lock']);
-    expect(body.details).toEqual([{
-      path: 'project.intruder.repo',
-      message: 'repo is locked by active tasks in project proj-owner: task-lock',
-    }]);
-    expect(body.error).toMatch(/locked by/);
-    expect(app.ctx.config.project.some(p => p.id === 'intruder')).toBe(false);
-  });
-
-  it('allows creating a project on a repo whose locking tasks have gone terminal', async () => {
-    await createProject('proj-done', { repo: 'https://github.com/free/repo.git', review: { mode: 'server' } });
-    await app.ctx.taskStore.set({
-      id: 'task-terminal', projectId: 'proj-done', title: 'T', description: 'D',
-      preferredAgentId: '', agentId: '', devAgentId: '',
-      status: 'merged', reviewMode: 'git', reviewRound: 1,
-      platformBinding: { mode: 'git', repoKey: 'github.com/free/repo', tool: 'gh' },
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    } as never);
-
-    const response = await post('/api/projects', { id: 'newcomer', repo: 'git@github.com:free/repo.git' });
-    expect(response.statusCode).toBe(201);
   });
 
   it('creates a project from a git URL repo and stores it verbatim', async () => {
@@ -276,12 +234,35 @@ describe('POST /api/projects', () => {
     for (const [id, repo] of [
       ['glproj', 'https://gitlab.example.com/group/proj.git'],
       ['glsub', 'https://gitlab.example.com/group/sub/proj.git'],
-      ['glssh', 'git@gitlab.example.com:group/proj.git'],
     ] as const) {
-      const response = await post('/api/projects', { id, repo, merge: null, review: { mode: 'server' } });
+      const response = await post('/api/projects', {
+        id,
+        repo,
+        merge: null,
+        gitCli: { tool: 'glab' },
+      });
       expect.soft(response.statusCode, repo).toBe(201);
       expect.soft(JSON.parse(response.body).project.repo, repo).toBe(repo);
     }
+  });
+
+  it('rejects a non-github SSH repo because its platform driver needs an HTTP API endpoint', async () => {
+    const response = await post('/api/projects', {
+      id: 'glssh',
+      repo: 'ssh://git@gitlab.example.com:2222/group/other.git',
+      merge: null,
+      gitCli: { tool: 'glab' },
+    });
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body) as {
+      error: string;
+      details: Array<{ path: string; message: string }>;
+    };
+    expect(body.error).toBe('Invalid config');
+    expect(body.details).toContainEqual(expect.objectContaining({
+      path: 'project[1].repo',
+      message: expect.stringMatching(/require an http\(s\):\/\//),
+    }));
   });
 
   it('writes to baxian.json with backup', async () => {
@@ -289,7 +270,7 @@ describe('POST /api/projects', () => {
     const written = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
     const project = written.project.find(p => p.id === 'persisted');
     expect(project).toBeDefined();
-    expect(project?.review?.mode).toBeUndefined();
+    expect(project?.review).toBeUndefined();
     const files = await readdir(tempDir);
     expect(files.some(f => /^baxian\.json\.\d{8}-\d{6}$/.test(f))).toBe(true);
   });
@@ -432,14 +413,7 @@ describe('POST /api/projects/:id/checks', () => {
     driverSpy.mockRestore();
   });
 
-  it('checks gh only on the fixed-workdir dev publisher plus the server platform channel', async () => {
-    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: 'pr' };
-    app.ctx.config.project[0]!.review = { mode: 'server' };
-    app.ctx.config.project[0]!.agent[0]!.push({
-      id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local',
-      workdir: join(tempDir, 'research-1'),
-    });
-    app.ctx.agentManager.replaceConfig(app.ctx.config);
+  it('checks gh only on the fixed-workdir dev publisher plus the platform channel', async () => {
     const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
       { step: 'gh', ok: true, message: 'GitHub CLI authenticated' },
     ]);
@@ -451,11 +425,10 @@ describe('POST /api/projects/:id/checks', () => {
     const response = await post('/api/projects/proj/checks', {});
 
     expect(response.statusCode).toBe(201);
-    expect(runSpy).toHaveBeenCalledTimes(3);
+    expect(runSpy).toHaveBeenCalledTimes(2);
     expect(Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[6]]))).toEqual({
-      dev: { requireGitHubCli: true, requireGitPush: true },
-      qa: { requireGitHubCli: false, requireGitPush: false },
-      research: { requireGitHubCli: false, requireGitPush: false },
+      dev: { requireGitPush: true },
+      qa: { requireGitPush: false },
     });
     const body = JSON.parse(response.body) as {
       server?: { results: Array<{ step: string; ok: boolean }> };
@@ -466,12 +439,7 @@ describe('POST /api/projects/:id/checks', () => {
     ]));
   });
 
-  it('skips platform CLI checks for fixed-workdir research but retains them for git review participants', async () => {
-    app.ctx.config.project[0]!.agent[0]!.push({
-      id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local',
-      workdir: join(tempDir, 'research-1'),
-    });
-    app.ctx.agentManager.replaceConfig(app.ctx.config);
+  it('passes the git platform context to dev and qa participants', async () => {
     const gitPlatform = {
       tool: 'gh', minToolVersion: '2.40.0', steps: [], agentCommands: [],
       renderCtx: { scheme: 'https', hostname: 'github.com', host: 'github.com', repoPath: 'owner/repo', binary: 'gh' },
@@ -490,12 +458,9 @@ describe('POST /api/projects/:id/checks', () => {
     const contexts = Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[5]]));
     expect(contexts.dev).toBe(gitPlatform);
     expect(contexts.qa).toBe(gitPlatform);
-    expect(contexts.research).toBeUndefined();
   });
 
-  it('still checks gh for an automatic-workdir QA because bootstrap clones through gh', async () => {
-    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: 'pr' };
-    app.ctx.config.project[0]!.review = { mode: 'server' };
+  it('checks gh for an automatic-workdir QA because bootstrap clones through gh', async () => {
     app.ctx.config.project[0]!.agent[0]![1]!.workdir = undefined;
     app.ctx.agentManager.replaceConfig(app.ctx.config);
     const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
@@ -510,61 +475,29 @@ describe('POST /api/projects/:id/checks', () => {
 
     expect(response.statusCode).toBe(201);
     const qaCall = runSpy.mock.calls.find(call => call[1].role === 'qa');
-    expect(qaCall?.[6]).toEqual({ requireGitHubCli: true, requireGitPush: false });
+    expect(qaCall?.[6]).toEqual({ requireGitPush: false });
   });
 
-  it('does not require gh on a fixed Workdir when server review only publishes a branch', async () => {
-    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: 'branch' };
-    app.ctx.config.project[0]!.review = { mode: 'server' };
-    app.ctx.agentManager.replaceConfig(app.ctx.config);
-    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
-      { step: 'git', ok: true, message: 'origin push access OK' },
-    ]);
-    const platformDriver = vi.spyOn(app.ctx.agentManager, 'platformDriverFor');
-
-    const response = await post('/api/projects/proj/checks', {});
-
-    expect(response.statusCode).toBe(201);
-    expect(Object.fromEntries(runSpy.mock.calls.map(call => [call[1].role, call[6]]))).toEqual({
-      dev: { requireGitHubCli: false, requireGitPush: true },
-      qa: { requireGitHubCli: false, requireGitPush: false },
-    });
-    expect(JSON.parse(response.body).server).toBeUndefined();
-    expect(platformDriver).not.toHaveBeenCalled();
-  });
-
-  it('does not require push for fixed Workdirs when server review does not publish', async () => {
-    app.ctx.config.review = { ...app.ctx.config.review, mode: 'server', afterDone: null };
-    app.ctx.config.project[0]!.review = { mode: 'server' };
-    app.ctx.agentManager.replaceConfig(app.ctx.config);
-    const runSpy = vi.spyOn(preflight, 'runPreflight').mockResolvedValue([
-      { step: 'workdir', ok: true, message: 'clone root OK' },
-    ]);
-
-    const response = await post('/api/projects/proj/checks', {});
-
-    expect(response.statusCode).toBe(201);
-    for (const call of runSpy.mock.calls) {
-      expect(call[6]).toEqual({ requireGitHubCli: false, requireGitPush: false });
-    }
-    expect(JSON.parse(response.body).server).toBeUndefined();
-  });
 });
 
 describe('POST /api/projects/:projectId/agents', () => {
-  it('appends a dev agent as a new pair', async () => {
+  it('appends one complete Dev + QA group in a single request', async () => {
     await createProject('empty');
 
     const response = await addAgent('empty', devAgent('new-dev'));
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
-    expect(body.agent.id).toBe('new-dev');
-    expect(body.agent.yolo).toBe(true);
+    expect(body.agents).toEqual([
+      expect.objectContaining({ id: 'new-dev', role: 'dev', yolo: true }),
+      expect.objectContaining({ id: 'new-qa', role: 'qa', yolo: true }),
+    ]);
 
     const proj = findProject('empty');
     expect(proj.agent).toHaveLength(1);
-    expect(proj.agent[0]).toHaveLength(1);
-    expect(proj.agent[0][0].id).toBe('new-dev');
+    expect(proj.agent[0]).toHaveLength(2);
+    expect(proj.agent[0].map(agent => agent.id)).toEqual(['new-dev', 'new-qa']);
+    const persisted = JSON.parse(await readFile(configPath, 'utf8')) as BaxianConfig;
+    expect(persisted.project.find(project => project.id === 'empty')?.agent[0]).toHaveLength(2);
   });
 
   it('accepts yolo: false and persists it (issue #475)', async () => {
@@ -573,7 +506,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     const response = await addAgent('ny', { ...devAgent('ny-dev'), yolo: false });
     expect(response.statusCode).toBe(201);
     const body = JSON.parse(response.body);
-    expect(body.agent.yolo).toBe(false);
+    expect(body.agents.find((agent: { role: string }) => agent.role === 'dev').yolo).toBe(false);
     expect(findProject('ny').agent[0][0].yolo).toBe(false);
   });
 
@@ -587,40 +520,146 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(await app.ctx.agentStore.get('rr1-dev')).not.toBeNull();
   });
 
-  it('appends a qa agent to existing dev pair when pairWith provided', async () => {
-    await projectWithDev('pp3', 'pp3-dev');
+  it('commits the complete group and reports restartRequired when the in-memory switch fails', async () => {
+    await createProject('add-switch-fail');
+    vi.spyOn(app.ctx.agentManager, 'replaceConfig').mockImplementationOnce(() => {
+      throw new Error('switch exploded');
+    });
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync');
 
-    const response = await addAgent('pp3', qaAgent('pp3-qa', 'pp3-dev'));
+    const response = await addAgent(
+      'add-switch-fail',
+      devAgent('add-switch-fail-dev'),
+      qaAgent('add-switch-fail-qa'),
+    );
+
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(response.body)).toMatchObject({
+      agents: [
+        { id: 'add-switch-fail-dev', role: 'dev' },
+        { id: 'add-switch-fail-qa', role: 'qa' },
+      ],
+      restartRequired: true,
+      warnings: [expect.stringMatching(/restart the server/)],
+    });
+    const persisted = JSON.parse(await readFile(configPath, 'utf8')) as BaxianConfig;
+    expect(persisted.project.find(project => project.id === 'add-switch-fail')?.agent[0]
+      .map(agent => agent.id)).toEqual(['add-switch-fail-dev', 'add-switch-fail-qa']);
+    expect(app.ctx.agentManager.isDeletionInFlight('add-switch-fail-dev')).toBe(true);
+    expect(app.ctx.agentManager.isDeletionInFlight('add-switch-fail-qa')).toBe(true);
+    expect(await app.ctx.agentStore.get('add-switch-fail-dev')).toMatchObject({
+      id: 'add-switch-fail-dev',
+      creationToken: expect.any(String),
+    });
+    expect(await app.ctx.agentStore.get('add-switch-fail-qa')).toMatchObject({
+      id: 'add-switch-fail-qa',
+      creationToken: expect.any(String),
+    });
+    expect(bootstrap).not.toHaveBeenCalled();
+  });
+
+  it('initializes both member states before exposing the group to task dispatch', async () => {
+    await createProject('add-state-order');
+    const sequence: string[] = [];
+    const originalSet = app.ctx.agentStore.set.bind(app.ctx.agentStore);
+    vi.spyOn(app.ctx.agentStore, 'set').mockImplementation(async facts => {
+      sequence.push(`state:${facts.id}`);
+      await originalSet(facts);
+    });
+    const originalReplace = app.ctx.agentManager.replaceConfig.bind(app.ctx.agentManager);
+    vi.spyOn(app.ctx.agentManager, 'replaceConfig').mockImplementation(config => {
+      sequence.push('config-switch');
+      originalReplace(config);
+    });
+
+    const response = await addAgent(
+      'add-state-order',
+      devAgent('add-state-order-dev'),
+      qaAgent('add-state-order-qa'),
+    );
+
+    expect(response.statusCode).toBe(201);
+    expect(sequence.slice(0, 3)).toEqual([
+      'state:add-state-order-dev',
+      'state:add-state-order-qa',
+      'config-switch',
+    ]);
+  });
+
+  it('rolls back both member states and leaves the group uncommitted when state initialization fails', async () => {
+    await createProject('add-state-fail');
+    const originalSet = app.ctx.agentStore.set.bind(app.ctx.agentStore);
+    vi.spyOn(app.ctx.agentStore, 'set').mockImplementation(async facts => {
+      if (facts.id === 'add-state-fail-qa') throw new Error('state disk full');
+      await originalSet(facts);
+    });
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
+
+    const response = await addAgent(
+      'add-state-fail',
+      devAgent('add-state-fail-dev'),
+      qaAgent('add-state-fail-qa'),
+    );
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/group was not committed.*state disk full/);
+    expect(findProject('add-state-fail').agent).toEqual([]);
+    const persisted = JSON.parse(await readFile(configPath, 'utf8')) as BaxianConfig;
+    expect(persisted.project.find(project => project.id === 'add-state-fail')?.agent).toEqual([]);
+    expect(await app.ctx.agentStore.get('add-state-fail-dev')).toBeNull();
+    expect(await app.ctx.agentStore.get('add-state-fail-qa')).toBeNull();
+    expect(bootstrap).not.toHaveBeenCalled();
+  });
+
+  it('restores staged member states when config persistence fails', async () => {
+    await createProject('add-save-fail');
+    const realSave = loaderModule.saveConfig;
+    vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
+      if (config.project.some(project =>
+        project.id === 'add-save-fail' && project.agent.length > 0)) {
+        throw new Error('config disk full');
+      }
+      return realSave(path, config);
+    });
+
+    const response = await addAgent(
+      'add-save-fail',
+      devAgent('add-save-fail-dev'),
+      qaAgent('add-save-fail-qa'),
+    );
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body).error).toMatch(/staged agent state was restored.*config disk full/);
+    expect(findProject('add-save-fail').agent).toEqual([]);
+    expect(await app.ctx.agentStore.get('add-save-fail-dev')).toBeNull();
+    expect(await app.ctx.agentStore.get('add-save-fail-qa')).toBeNull();
+  });
+
+  it('accepts the complete group in either request order and stores Dev before QA', async () => {
+    await createProject('pp3');
+    const response = await addAgentsRaw('pp3', {
+      agents: [qaAgent('pp3-qa'), devAgent('pp3-dev')],
+    });
     expect(response.statusCode).toBe(201);
     const proj = findProject('pp3');
     expect(proj.agent).toHaveLength(1);
     expect(proj.agent[0]).toHaveLength(2);
-    expect(proj.agent[0][1].id).toBe('pp3-qa');
+    expect(proj.agent[0].map(agent => agent.id)).toEqual(['pp3-dev', 'pp3-qa']);
   });
 
-  it('adds QA and Research independently to the same dev group', async () => {
-    await projectWithDev('prg', 'prg-dev');
-    expect((await addAgent('prg', qaAgent('prg-qa', 'prg-dev'))).statusCode).toBe(201);
-
-    const response = await addAgent('prg', researchAgent('prg-research', 'prg-dev'));
-
-    expect(response.statusCode).toBe(201);
-    expect(findProject('prg').agent[0]).toEqual([
-      expect.objectContaining({ id: 'prg-dev', role: 'dev' }),
-      expect.objectContaining({ id: 'prg-qa', role: 'qa' }),
-      expect.objectContaining({ id: 'prg-research', role: 'research' }),
-    ]);
-  });
-
-  it('rejects a second Research agent in the same dev group', async () => {
-    await projectWithDev('pr2', 'pr2-dev');
-    expect((await addAgent('pr2', researchAgent('pr2-research-1', 'pr2-dev'))).statusCode).toBe(201);
-
-    const response = await addAgent('pr2', researchAgent('pr2-research-2', 'pr2-dev'));
-
+  it('rejects the research role', async () => {
+    await createProject('prg');
+    const response = await addAgentsRaw('prg', {
+      agents: [{
+        id: 'prg-research',
+        runtime: 'claude-code',
+        role: 'research',
+        mode: 'local',
+        yolo: true,
+      }, qaAgent('prg-qa')],
+    });
     expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/has no research yet/);
-    expect(findProject('pr2').agent[0].filter(agent => agent.role === 'research')).toHaveLength(1);
+    expect(JSON.parse(response.body).error).toMatch(/exactly one dev and one qa/);
   });
 
   it('returns 404 when project does not exist', async () => {
@@ -649,19 +688,20 @@ describe('POST /api/projects/:projectId/agents', () => {
     app.ctx.agentManager.releaseDeletionClaim(['td-dev']);
   });
 
-  it('returns 400 when role=qa but no pairWith provided', async () => {
-    await projectWithDev('pq', 'pq-dev');
-
-    const response = await addAgent('pq', { id: 'pq-qa', runtime: 'codex', role: 'qa', mode: 'local', yolo: true });
+  it('returns 400 for an incomplete group', async () => {
+    await createProject('pq');
+    const response = await addAgentsRaw('pq', { agents: [devAgent('pq-dev')] });
     expect(response.statusCode).toBe(400);
+    expect(findProject('pq').agent).toEqual([]);
   });
 
-  it('returns 400 when pairWith refers to dev that already has a qa', async () => {
-    await projectWithDev('pf', 'pf-dev');
-    await addAgent('pf', qaAgent('pf-qa1', 'pf-dev'));
-
-    const response = await addAgent('pf', qaAgent('pf-qa2', 'pf-dev'));
+  it('returns 400 when the two members have the same role', async () => {
+    await createProject('pf');
+    const response = await addAgentsRaw('pf', {
+      agents: [qaAgent('pf-qa1'), qaAgent('pf-qa2')],
+    });
     expect(response.statusCode).toBe(400);
+    expect(findProject('pf').agent).toEqual([]);
   });
 
   it.each([
@@ -670,7 +710,7 @@ describe('POST /api/projects/:projectId/agents', () => {
     ['role is not dev or qa', 'pi', { id: 'pi-x', runtime: 'codex', role: 'invalid', mode: 'local', yolo: true }],
   ] as const)('returns 400 when %s', async (_label, projectId, body) => {
     await createProject(projectId);
-    const response = await addAgent(projectId, body);
+    const response = await addAgentsRaw(projectId, body);
     expect(response.statusCode).toBe(400);
   });
 
@@ -683,9 +723,9 @@ describe('POST /api/projects/:projectId/agents', () => {
 
   it('returns 400 for a whitespace-only agent id', async () => {
     await createProject('pid');
-    const response = await addAgent('pid', devAgent('   '));
+    const response = await addAgent('pid', devAgent('   '), qaAgent('pid-qa'));
     expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/agent id is required/);
+    expect(JSON.parse(response.body).error).toMatch(/both agent ids are required/);
   });
 
   it('returns 400 instead of 500 for a malformed Workdir value', async () => {
@@ -770,32 +810,34 @@ describe('POST /api/projects/:projectId/agents', () => {
     expect(JSON.parse(response.body).error).toMatch(/root-agent.*must not share a directory/);
   });
 
-  it('returns 409 when pairWith dev is still being created (creationToken set)', async () => {
-    await projectWithDev('qc', 'qc-dev');
-    await seedAgent('qc-dev', 'qc', { creationToken: 'tok-mid-bootstrap' });
-    const response = await addAgent('qc', qaAgent('qc-qa', 'qc-dev'));
+  it('returns 409 when either requested id is tombstoned', async () => {
+    await createProject('qc');
+    app.ctx.agentManager.tryClaimDeletion(['qc-qa']);
+    const response = await addAgent('qc', devAgent('qc-dev'), qaAgent('qc-qa'));
     expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/being created/);
-    expect(findProject('qc').agent[0]).toHaveLength(1);
+    expect(JSON.parse(response.body).error).toMatch(/being deleted/);
+    expect(findProject('qc').agent).toEqual([]);
+    app.ctx.agentManager.releaseDeletionClaim(['qc-qa']);
   });
 
-  it('returns 400 when role=dev is sent with pairWith', async () => {
-    await projectWithDev('pdp', 'pdp-dev');
-    const response = await addAgent('pdp', devAgent('pdp-dev2', { pairWith: 'pdp-dev' }));
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/pairWith is only valid for qa or research agents/);
+  it('returns 409 when the two requested members use the same id', async () => {
+    await createProject('pdp');
+    const response = await addAgent('pdp', devAgent('same-id'), qaAgent('same-id'));
+    expect(response.statusCode).toBe(409);
+    expect(findProject('pdp').agent).toEqual([]);
   });
 
-  it('adding a qa leaves unrelated pairs untouched (multi-pair project)', async () => {
+  it('adding a group leaves unrelated groups untouched', async () => {
     await createProject('mp');
     await addAgent('mp', devAgent('mp-dev1'));
     await addAgent('mp', devAgent('mp-dev2'));
-    const response = await addAgent('mp', qaAgent('mp-qa', 'mp-dev1'));
+    const response = await addAgent('mp', devAgent('mp-dev3'));
     expect(response.statusCode).toBe(201);
     const proj = findProject('mp');
     expect(proj.agent).toEqual([
-      [expect.objectContaining({ id: 'mp-dev1' }), expect.objectContaining({ id: 'mp-qa' })],
-      [expect.objectContaining({ id: 'mp-dev2' })],
+      [expect.objectContaining({ id: 'mp-dev1' }), expect.objectContaining({ id: 'mp-qa1' })],
+      [expect.objectContaining({ id: 'mp-dev2' }), expect.objectContaining({ id: 'mp-qa2' })],
+      [expect.objectContaining({ id: 'mp-dev3' }), expect.objectContaining({ id: 'mp-qa3' })],
     ]);
   });
 
@@ -833,14 +875,267 @@ describe('POST /api/projects/:projectId/agents', () => {
   });
 });
 
+describe('PUT /api/projects/:projectId/agents/:agentId', () => {
+  it('replaces one QA member while preserving a complete group in memory and on disk', async () => {
+    await projectWithDev('replace-qa', 'replace-qa-dev');
+    const cleanup = vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime);
+    const realSave = loaderModule.saveConfig;
+    const persistedGroups: string[][] = [];
+    vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
+      const group = config.project.find(project => project.id === 'replace-qa')?.agent[0];
+      if (group) persistedGroups.push(group.map(agent => agent.id));
+      return realSave(path, config);
+    });
+
+    const response = await put(
+      '/api/projects/replace-qa/agents/replace-qa-qa',
+      qaAgent('replace-qa-next', { model: 'o3', yolo: undefined }),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({
+      agent: { id: 'replace-qa-next', role: 'qa', model: 'o3', yolo: true },
+      replaced: 'replace-qa-qa',
+      runtimeStatus: 'pending',
+      restartRequired: false,
+    });
+    expect(cleanup).toHaveBeenCalledWith(['replace-qa-qa']);
+    expect(findProject('replace-qa').agent[0].map(agent => agent.id))
+      .toEqual(['replace-qa-dev', 'replace-qa-next']);
+    expect(persistedGroups).toEqual([['replace-qa-dev', 'replace-qa-next']]);
+    expect(await app.ctx.agentStore.get('replace-qa-qa')).toBeNull();
+    expect(await app.ctx.agentStore.get('replace-qa-next')).toMatchObject({
+      id: 'replace-qa-next',
+      projectId: 'replace-qa',
+    });
+  });
+
+  it('replaces one Dev member without changing its QA partner', async () => {
+    await projectWithDev('replace-dev', 'replace-dev-old');
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
+
+    const response = await put(
+      '/api/projects/replace-dev/agents/replace-dev-old',
+      devAgent('replace-dev-next'),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(findProject('replace-dev').agent[0].map(agent => agent.id))
+      .toEqual(['replace-dev-next', 'replace-dev-old-qa']);
+    expect(bootstrap).toHaveBeenCalledWith('replace-dev-next', expect.any(String));
+  });
+
+  it.each([
+    ['same id', qaAgent('replace-invalid-qa'), /must differ/],
+    ['role change', devAgent('replace-invalid-next'), /role must remain "qa"/],
+  ] as const)('rejects %s before runtime cleanup', async (_label, replacement, error) => {
+    await projectWithDev('replace-invalid', 'replace-invalid-dev');
+    const cleanup = vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime);
+
+    const response = await put(
+      '/api/projects/replace-invalid/agents/replace-invalid-qa',
+      replacement,
+    );
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toMatch(error);
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(findProject('replace-invalid').agent[0].map(agent => agent.id))
+      .toEqual(['replace-invalid-dev', 'replace-invalid-qa']);
+  });
+
+  it('rejects a globally used replacement id', async () => {
+    await projectWithDev('replace-duplicate', 'replace-duplicate-dev');
+
+    const response = await put(
+      '/api/projects/replace-duplicate/agents/replace-duplicate-qa',
+      qaAgent('qa-1'),
+    );
+
+    expect(response.statusCode).toBe(409);
+    expect(findProject('replace-duplicate').agent[0].map(agent => agent.id))
+      .toEqual(['replace-duplicate-dev', 'replace-duplicate-qa']);
+  });
+
+  it('rejects a replacement Workdir that conflicts with the partner', async () => {
+    await createProject('replace-workdir');
+    await addAgent(
+      'replace-workdir',
+      devAgent('replace-workdir-dev', { workdir: '/tmp/replace-shared' }),
+      qaAgent('replace-workdir-qa', { workdir: '/tmp/replace-qa' }),
+    );
+
+    const response = await put(
+      '/api/projects/replace-workdir/agents/replace-workdir-qa',
+      qaAgent('replace-workdir-next', { workdir: '/tmp/replace-shared' }),
+    );
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/must not share a directory/);
+  });
+
+  it('rejects replacement while either group participant is referenced by an active task', async () => {
+    await projectWithDev('replace-active', 'replace-active-dev');
+    await seedTask('replace-active-task', 'replace-active', {
+      preferredAgentId: 'replace-active-dev',
+      agentId: 'replace-active-dev',
+      status: 'review',
+    });
+
+    const response = await put(
+      '/api/projects/replace-active/agents/replace-active-qa',
+      qaAgent('replace-active-next'),
+    );
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by open task/);
+  });
+
+  it('rejects replacement while a pending task still references the member snapshot', async () => {
+    await projectWithDev('replace-pending', 'replace-pending-dev');
+    await seedTask('replace-pending-task', 'replace-pending', {
+      preferredAgentId: 'replace-pending-dev',
+      agentId: '',
+      devAgentId: 'replace-pending-dev',
+      qaAgentId: 'replace-pending-qa',
+      status: 'pending',
+    });
+    const cleanup = vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime);
+
+    const response = await put(
+      '/api/projects/replace-pending/agents/replace-pending-qa',
+      qaAgent('replace-pending-next'),
+    );
+
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by open task replace-pending-task/);
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(findProject('replace-pending').agent[0].map(agent => agent.id))
+      .toEqual(['replace-pending-dev', 'replace-pending-qa']);
+  });
+
+  it('restores the original state and lock when runtime cleanup fails', async () => {
+    await projectWithDev('replace-cleanup', 'replace-cleanup-dev');
+    await seedAgent('replace-cleanup-qa', 'replace-cleanup', {
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+      paneId: '%9',
+    });
+    vi.mocked(app.ctx.agentManager.cleanupRemovedAgentRuntime)
+      .mockRejectedValueOnce(new Error('ssh unavailable'));
+
+    const response = await put(
+      '/api/projects/replace-cleanup/agents/replace-cleanup-qa',
+      qaAgent('replace-cleanup-next'),
+    );
+
+    expect(response.statusCode).toBe(502);
+    expect(findProject('replace-cleanup').agent[0].map(agent => agent.id))
+      .toEqual(['replace-cleanup-dev', 'replace-cleanup-qa']);
+    expect(await app.ctx.agentStore.get('replace-cleanup-qa')).toMatchObject({
+      id: 'replace-cleanup-qa',
+      status: 'awaiting_human',
+      awaitingPhase: 'agent_dialog_pending',
+    });
+    expect((await app.ctx.agentStore.get('replace-cleanup-qa'))?.paneId).toBeUndefined();
+    expect(await app.ctx.lockManager.claimOf('replace-cleanup-qa')).toBeNull();
+  });
+
+  it('keeps the original complete group when config persistence fails', async () => {
+    await projectWithDev('replace-save', 'replace-save-dev');
+    const realSave = loaderModule.saveConfig;
+    vi.spyOn(loaderModule, 'saveConfig').mockImplementation(async (path, config) => {
+      if (config.project.some(project =>
+        project.id === 'replace-save'
+        && project.agent.flat().some(agent => agent.id === 'replace-save-next'))) {
+        throw new Error('disk full');
+      }
+      return realSave(path, config);
+    });
+
+    const response = await put(
+      '/api/projects/replace-save/agents/replace-save-qa',
+      qaAgent('replace-save-next'),
+    );
+
+    expect(response.statusCode).toBe(500);
+    expect(findProject('replace-save').agent[0].map(agent => agent.id))
+      .toEqual(['replace-save-dev', 'replace-save-qa']);
+    expect(await app.ctx.agentStore.get('replace-save-qa')).not.toBeNull();
+    expect(await app.ctx.agentStore.get('replace-save-next')).toBeNull();
+  });
+
+  it('commits the replacement and reports an orphan-state warning when old state deletion fails', async () => {
+    await projectWithDev('replace-state-delete', 'replace-state-delete-dev');
+    vi.spyOn(app.ctx.agentStore, 'delete').mockRejectedValueOnce(new Error('state disk read-only'));
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
+
+    const response = await put(
+      '/api/projects/replace-state-delete/agents/replace-state-delete-qa',
+      qaAgent('replace-state-delete-next'),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({
+      restartRequired: false,
+      warnings: [expect.stringMatching(/old agent replace-state-delete-qa state delete failed.*read-only/)],
+    });
+    expect(findProject('replace-state-delete').agent[0].map(agent => agent.id))
+      .toEqual(['replace-state-delete-dev', 'replace-state-delete-next']);
+    const persisted = JSON.parse(await readFile(configPath, 'utf-8')) as BaxianConfig;
+    expect(persisted.project.find(project => project.id === 'replace-state-delete')?.agent[0]
+      .map(agent => agent.id)).toEqual(['replace-state-delete-dev', 'replace-state-delete-next']);
+    expect(await app.ctx.agentStore.get('replace-state-delete-qa')).not.toBeNull();
+    expect(await app.ctx.agentStore.get('replace-state-delete-next')).not.toBeNull();
+    expect(await app.ctx.lockManager.claimOf('replace-state-delete-qa')).toBeNull();
+    expect(bootstrap).toHaveBeenCalledWith('replace-state-delete-next', expect.any(String));
+  });
+
+  it('surfaces a failed post-commit lock release as a warning', async () => {
+    await projectWithDev('replace-lock', 'replace-lock-dev');
+    vi.spyOn(app.ctx.lockManager, 'releaseIfOwner').mockResolvedValue(false);
+    const bootstrap = vi.spyOn(app.ctx.agentManager, 'startBootstrapAsync').mockResolvedValue();
+
+    const response = await put(
+      '/api/projects/replace-lock/agents/replace-lock-qa',
+      qaAgent('replace-lock-next'),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).warnings).toEqual([
+      expect.stringMatching(/replacement lock release.*owner claim changed/),
+    ]);
+    expect(bootstrap).toHaveBeenCalledWith('replace-lock-next', expect.any(String));
+  });
+
+  it('requires a restart when the post-commit in-memory switch fails', async () => {
+    await projectWithDev('replace-memory', 'replace-memory-dev');
+    vi.spyOn(app.ctx.agentManager, 'replaceConfig')
+      .mockImplementationOnce(() => { throw new Error('memory switch failed'); });
+
+    const response = await put(
+      '/api/projects/replace-memory/agents/replace-memory-qa',
+      qaAgent('replace-memory-next'),
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({
+      restartRequired: true,
+      warnings: [expect.stringMatching(/restart the server/)],
+    });
+    expect(app.ctx.agentManager.isDeletionInFlight('replace-memory-qa')).toBe(true);
+    expect(app.ctx.agentManager.isDeletionInFlight('replace-memory-next')).toBe(true);
+  });
+});
+
 describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
-  it('removes orphan dev (sole member of pair) and returns it', async () => {
+  it('deleting the Dev removes the complete group', async () => {
     await projectWithDev('da1', 'da1-dev');
 
     const response = await del('/api/projects/da1/agents/da1-dev');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.removed).toEqual(['da1-dev']);
+    expect(body.removed).toEqual(['da1-dev', 'da1-qa']);
 
     expect(findProject('da1').agent).toEqual([]);
   });
@@ -852,6 +1147,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     const body = JSON.parse(response.body);
     expect(body.restartRequired).toBe(false);
     expect(app.ctx.agentManager.getAgentConfig('rrd-dev')).toBeUndefined();
+    expect(app.ctx.agentManager.getAgentConfig('rrd-qa')).toBeUndefined();
   });
 
   it('purges errorRecordStore entries for deleted agent (so a recreate with same id starts clean)', async () => {
@@ -860,6 +1156,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     await projectWithDev('purge1', 'purge1-dev');
     await del('/api/projects/purge1/agents/purge1-dev');
     expect(purgeAgent).toHaveBeenCalledWith('purge1-dev');
+    expect(purgeAgent).toHaveBeenCalledWith('purge1-qa');
   });
 
   it('clears the deleted agent\'s pet assignment (so a recreate with same id starts clean)', async () => {
@@ -874,7 +1171,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('removes paired dev together with its qa', async () => {
     await projectWithDev('da2', 'da2-dev');
-    await addAgent('da2', qaAgent('da2-qa', 'da2-dev'));
 
     const response = await del('/api/projects/da2/agents/da2-dev');
     expect(response.statusCode).toBe(200);
@@ -884,16 +1180,14 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(findProject('da2').agent).toEqual([]);
   });
 
-  it('removes only the qa, leaving dev', async () => {
+  it('deleting the QA also removes the complete group', async () => {
     await projectWithDev('da3', 'da3-dev');
-    await addAgent('da3', qaAgent('da3-qa', 'da3-dev'));
 
     const response = await del('/api/projects/da3/agents/da3-qa');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.removed).toEqual(['da3-qa']);
-
-    expect(findProject('da3').agent).toEqual([[expect.objectContaining({ id: 'da3-dev' })]]);
+    expect(body.removed).toEqual(['da3-dev', 'da3-qa']);
+    expect(findProject('da3').agent).toEqual([]);
   });
 
   it('returns 409 when the agent is bound to an active task', async () => {
@@ -911,7 +1205,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('cascading dev delete is blocked if its paired qa is active', async () => {
     await projectWithDev('da-pair-busy', 'da-pair-dev');
-    await addAgent('da-pair-busy', qaAgent('da-pair-qa', 'da-pair-dev'));
     await seedAgent('da-pair-qa', 'da-pair-busy', { taskId: 'task-da-pair' });
     await seedTask('task-da-pair', 'da-pair-busy', {
       preferredAgentId: 'da-pair-dev', agentId: 'da-pair-dev', qaAgentId: 'da-pair-qa', status: 'review',
@@ -1055,7 +1348,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
     const response = await del('/api/projects/da-mr-ref/agents/da-mr-ref-dev');
     expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/referenced by active task/);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by open task/);
   });
 
   it('bootstrap-in-progress (creationToken set, status ok) returns 409', async () => {
@@ -1168,20 +1461,22 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
     const response = await del('/api/projects/ref-a/agents/ref-a-dev');
     expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-a/);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by open task task-ref-a/);
     expect(findProject('ref-a').agent[0][0].id).toBe('ref-a-dev');
   });
 
   it('refuses deleting a qa referenced via qaAgentId by an active task', async () => {
     await projectWithDev('ref-q', 'ref-q-dev');
-    await addAgent('ref-q', qaAgent('ref-q-qa', 'ref-q-dev'));
     await seedTask('task-ref-q', 'ref-q', {
-      preferredAgentId: '', agentId: '', qaAgentId: 'ref-q-qa', status: 'review',
+      preferredAgentId: 'ref-q-dev',
+      agentId: 'ref-q-dev',
+      qaAgentId: 'ref-q-qa',
+      status: 'review',
     });
 
     const response = await del('/api/projects/ref-q/agents/ref-q-qa');
     expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-q/);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by open task task-ref-q/);
     expect(findProject('ref-q').agent[0]).toHaveLength(2);
   });
 
@@ -1197,30 +1492,8 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
     const response = await del('/api/projects/ref-d/agents/ref-d-dev');
     expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-d/);
+    expect(JSON.parse(response.body).error).toMatch(/referenced by open task task-ref-d/);
     expect(findProject('ref-d').agent[0][0].id).toBe('ref-d-dev');
-  });
-
-  it('refuses deleting an unbound Research referenced via researchAgentId by an active code task', async () => {
-    await projectWithDev('ref-r', 'ref-r-dev');
-    await addAgent('ref-r', researchAgent('ref-r-research', 'ref-r-dev'));
-    await seedAgent('ref-r-research', 'ref-r', { status: 'idle' });
-    await seedTask('task-ref-r', 'ref-r', {
-      preferredAgentId: 'ref-r-research',
-      agentId: 'ref-r-dev',
-      devAgentId: 'ref-r-dev',
-      researchAgentId: 'ref-r-research',
-      phase: 'code',
-      status: 'in_progress',
-    });
-
-    const response = await del('/api/projects/ref-r/agents/ref-r-research');
-    expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/referenced by active task task-ref-r/);
-    expect(findProject('ref-r').agent[0]).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'ref-r-dev' }),
-      expect.objectContaining({ id: 'ref-r-research' }),
-    ]));
   });
 
   it('409 when a non-awaiting agent is locked by another op', async () => {
@@ -1237,7 +1510,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('releases locks it already acquired when a later pair member is locked', async () => {
     await projectWithDev('lk2', 'lk2-dev');
-    await addAgent('lk2', qaAgent('lk2-qa', 'lk2-dev'));
     await seedAgent('lk2-qa', 'lk2', { status: 'idle' });
     const token = await app.ctx.lockManager.acquire('lk2-qa', 'test:foreign');
 
@@ -1261,7 +1533,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(body.error).toBe('Invalid config');
     expect(body.details).toEqual([{ path: 'project', message: 'bad' }]);
     expect(await app.ctx.lockManager.isLocked('v1-dev')).toBe(false);
-    expect(findProject('v1').agent.flat().map(a => a.id)).toEqual(['v1-dev']);
+    expect(findProject('v1').agent.flat().map(a => a.id)).toEqual(['v1-dev', 'v1-qa']);
   });
 
   it('phase1 prepareConfig unknown failure → 500 internal_error + locks released', async () => {
@@ -1274,7 +1546,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('internal_error');
     expect(await app.ctx.lockManager.isLocked('v1b-dev')).toBe(false);
-    expect(findProject('v1b').agent.flat().map(a => a.id)).toEqual(['v1b-dev']);
+    expect(findProject('v1b').agent.flat().map(a => a.id)).toEqual(['v1b-dev', 'v1b-qa']);
   });
 
   it('phase3 prepareConfig validation failure → 400 + state rollback + lock released', async () => {
@@ -1295,7 +1567,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(state?.paneId).toBeUndefined();
     expect(state?.workdir).toBe('/tmp/repo3');
     expect(await app.ctx.lockManager.isLocked('v3-dev')).toBe(false);
-    expect(findProject('v3').agent.flat().map(a => a.id)).toEqual(['v3-dev']);
+    expect(findProject('v3').agent.flat().map(a => a.id)).toEqual(['v3-dev', 'v3-qa']);
   });
 
   it('phase3 prepareConfig unknown failure → 500 internal_error after rollback', async () => {
@@ -1312,7 +1584,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toBe('internal_error');
     expect(await app.ctx.lockManager.isLocked('v3b-dev')).toBe(false);
-    expect(findProject('v3b').agent.flat().map(a => a.id)).toEqual(['v3b-dev']);
+    expect(findProject('v3b').agent.flat().map(a => a.id)).toEqual(['v3b-dev', 'v3b-qa']);
   });
 
   it('runtime cleanup CleanupFailedError → 502 + failures payload + state rollback, config intact', async () => {
@@ -1333,7 +1605,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
       { agentId: 'cf1-dev', step: 'kill-session', error: 'ssh down' },
       { agentId: 'cf1-dev', step: 'worktree', error: 'raw failure string' },
     ]);
-    expect(findProject('cf1').agent.flat().map(a => a.id)).toEqual(['cf1-dev']);
+    expect(findProject('cf1').agent.flat().map(a => a.id)).toEqual(['cf1-dev', 'cf1-qa']);
     const state = await app.ctx.agentStore.get('cf1-dev');
     expect(state?.paneId).toBeUndefined();
     expect(state?.workdir).toBe('/tmp/r');
@@ -1350,7 +1622,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(JSON.parse(response.body).failures).toEqual([
       { agentId: 'cf2-dev', step: 'runtime.cleanup', error: 'flaky ssh' },
     ]);
-    expect(findProject('cf2').agent.flat().map(agent => agent.id)).toEqual(['cf2-dev']);
+    expect(findProject('cf2').agent.flat().map(agent => agent.id)).toEqual(['cf2-dev', 'cf2-qa']);
     expect(await app.ctx.agentStore.get('cf2-dev')).toMatchObject({ id: 'cf2-dev', projectId: 'cf2' });
   });
 
@@ -1422,13 +1694,15 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
   it('DELETE pre-commit throw after rotating one target rolls the original owners back (not release)', async () => {
     await createProject('cf-rb');
     await addAgent('cf-rb', devAgent('cf-rb-dev'));
-    await addAgent('cf-rb', qaAgent('cf-rb-qa', 'cf-rb-dev'));
-    await seedTask('cf-rb-td', 'cf-rb', { agentId: 'cf-rb-dev', preferredAgentId: 'cf-rb-dev', status: 'failed' });
-    await seedTask('cf-rb-tq', 'cf-rb', { agentId: 'cf-rb-qa', preferredAgentId: 'cf-rb-qa', status: 'failed' });
-    const devToken = await app.ctx.lockManager.acquire('cf-rb-dev', 'cf-rb-td');
-    const qaToken = await app.ctx.lockManager.acquire('cf-rb-qa', 'cf-rb-tq');
-    await seedAgent('cf-rb-dev', 'cf-rb', { taskId: 'cf-rb-td', lockToken: devToken!, paneId: '%1' });
-    await seedAgent('cf-rb-qa', 'cf-rb', { taskId: 'cf-rb-tq', lockToken: qaToken!, paneId: '%2' });
+    await seedTask('cf-rb-task', 'cf-rb', {
+      agentId: 'cf-rb-dev',
+      preferredAgentId: 'cf-rb-dev',
+      status: 'failed',
+    });
+    const devToken = await app.ctx.lockManager.acquire('cf-rb-dev', 'cf-rb-task');
+    const qaToken = await app.ctx.lockManager.acquire('cf-rb-qa', 'cf-rb-task');
+    await seedAgent('cf-rb-dev', 'cf-rb', { taskId: 'cf-rb-task', lockToken: devToken!, paneId: '%1' });
+    await seedAgent('cf-rb-qa', 'cf-rb', { taskId: 'cf-rb-task', lockToken: qaToken!, paneId: '%2' });
 
     // Rotation processes the sorted targets; throw on the SECOND target's claimOf, after the first rotated.
     let claimOfCalls = 0;
@@ -1444,8 +1718,8 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     // Nothing committed: both agents still in config.
     expect(findProject('cf-rb').agent.flat().map(a => a.id).sort()).toEqual(['cf-rb-dev', 'cf-rb-qa']);
     // The already-rotated target's ORIGINAL owner is restored (rollback), not released to nobody.
-    expect(await app.ctx.lockManager.isOwner('cf-rb-dev', 'cf-rb-td', devToken!)).toBe(true);
-    expect(await app.ctx.lockManager.isOwner('cf-rb-qa', 'cf-rb-tq', qaToken!)).toBe(true);
+    expect(await app.ctx.lockManager.isOwner('cf-rb-dev', 'cf-rb-task', devToken!)).toBe(true);
+    expect(await app.ctx.lockManager.isOwner('cf-rb-qa', 'cf-rb-task', qaToken!)).toBe(true);
   });
 
   it('DELETE rollback surfaces a failed lock restore instead of reporting success', async () => {
@@ -1474,7 +1748,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toMatch(/could not be restored|rollback/i);
     // Config left intact (nothing committed).
-    expect(findProject('cf-rbf').agent.flat().map(a => a.id)).toEqual(['cf-rbf-dev']);
+    expect(findProject('cf-rbf').agent.flat().map(a => a.id)).toEqual(['cf-rbf-dev', 'cf-rbf-qa']);
   });
 
   it('config changed during cleanup → phase3 recomputes the removal from the fresh config', async () => {
@@ -1500,13 +1774,21 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
     const del1 = await del('/api/projects/dv1/agents/dv1-dev');
     expect(del1.statusCode).toBe(200); // disk committed → deletion reported (with warnings)
-    expect(JSON.parse(del1.body).warnings === undefined || Array.isArray(JSON.parse(del1.body).warnings)).toBe(true);
+    expect(JSON.parse(del1.body)).toMatchObject({
+      restartRequired: true,
+      warnings: [expect.stringMatching(/restart the server/)],
+    });
 
     // After the request fully returned, the tombstone persists (fail-stop) → recreate is refused.
     expect(app.ctx.agentManager.isDeletionInFlight('dv1-dev')).toBe(true);
     const recreate = await app.inject({
       method: 'POST', url: '/api/projects/dv1/agents',
-      payload: { id: 'dv1-dev', runtime: 'claude-code', role: 'dev', mode: 'local' },
+      payload: {
+        agents: [
+          devAgent('dv1-dev'),
+          qaAgent('dv1-qa'),
+        ],
+      },
     });
     expect(recreate.statusCode).toBe(409);
     expect(JSON.parse(recreate.body).error).toMatch(/being deleted|diverged/);
@@ -1520,7 +1802,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     const response = await del('/api/projects/be1/agents/be1-dev');
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.removed).toEqual(['be1-dev']);
+    expect(body.removed).toEqual(['be1-dev', 'be1-qa']);
     expect(body.warnings).toBeUndefined();
     expect(findProject('be1').agent).toEqual([]);
     expect(await app.ctx.lockManager.isLocked('be1-dev')).toBe(false);
@@ -1535,7 +1817,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     // saveConfig commits FIRST (reorder); a post-commit state-delete failure is a surfaced warning, not a 502.
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.removed).toEqual(['be2-dev']);
+    expect(body.removed).toEqual(['be2-dev', 'be2-qa']);
     expect(body.warnings).toEqual(
       expect.arrayContaining([expect.stringMatching(/agent be2-dev state delete failed post-commit/)]));
     // config committed: the agent row is gone from memory and disk.
@@ -1551,7 +1833,6 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
   it('pair delete with a post-commit second state-delete failure → 200 + warning; first state gone, second orphaned', async () => {
     await projectWithDev('be3', 'be3-dev');
-    await addAgent('be3', qaAgent('be3-qa', 'be3-dev'));
     await seedAgent('be3-dev', 'be3', { workdir: '/tmp/be3', paneId: '%7' });
     const realDelete = app.ctx.agentStore.delete.bind(app.ctx.agentStore);
     vi.spyOn(app.ctx.agentStore, 'delete').mockImplementation(async (id) => {
@@ -1588,8 +1869,9 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     const response = await del('/api/projects/ord1/agents/ord1-dev');
 
     expect(response.statusCode).toBe(200);
-    expect(order).toEqual(['saveConfig', 'delete:ord1-dev']);
+    expect(order).toEqual(['saveConfig', 'delete:ord1-dev', 'delete:ord1-qa']);
     expect(app.ctx.agentManager.deletionGenerationOf('ord1-dev')).toBe(1);
+    expect(app.ctx.agentManager.deletionGenerationOf('ord1-qa')).toBe(1);
   });
 
   it('post-commit lock release failure → 200 with warnings[] (deletion committed, not rolled back)', async () => {
@@ -1600,11 +1882,31 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
 
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.removed).toEqual(['wl1-dev']);
-    expect(body.warnings).toEqual([expect.stringMatching(/lock release for wl1-dev failed: lock fs io/)]);
+    expect(body.removed).toEqual(['wl1-dev', 'wl1-qa']);
+    expect(body.warnings).toEqual([
+      expect.stringMatching(/lock release for wl1-dev failed: lock fs io/),
+      expect.stringMatching(/lock release for wl1-qa failed: lock fs io/),
+    ]);
     expect(findProject('wl1').agent).toEqual([]);
     expect(await app.ctx.agentStore.get('wl1-dev')).toBeNull();
     expect(await app.ctx.lockManager.isLocked('wl1-dev')).toBe(true);
+  });
+
+  it('post-commit lock release refusal → 200 with warnings[] instead of silently clearing ownership evidence', async () => {
+    await projectWithDev('wlr1', 'wlr1-dev');
+    vi.spyOn(app.ctx.lockManager, 'releaseIfOwner').mockResolvedValue(false);
+
+    const response = await del('/api/projects/wlr1/agents/wlr1-dev');
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({
+      removed: ['wlr1-dev', 'wlr1-qa'],
+      warnings: [
+        expect.stringMatching(/lock release for wlr1-dev failed: deletion-owner claim changed/),
+        expect.stringMatching(/lock release for wlr1-qa failed: deletion-owner claim changed/),
+      ],
+    });
+    expect(await app.ctx.lockManager.isLocked('wlr1-dev')).toBe(true);
   });
 
   it('saveConfig failure with no prior agent state → 500, config intact, deletion lock rolled back for retry', async () => {
@@ -1623,7 +1925,7 @@ describe('DELETE /api/projects/:projectId/agents/:agentId', () => {
     expect(response.statusCode).toBe(500);
     expect(JSON.parse(response.body).error).toMatch(/failed to persist config/);
     expect(await app.ctx.agentStore.get('rb0-dev')).toBeNull();
-    expect(findProject('rb0').agent.flat().map(a => a.id)).toEqual(['rb0-dev']);
+    expect(findProject('rb0').agent.flat().map(a => a.id)).toEqual(['rb0-dev', 'rb0-qa']);
     // freshly-acquired deletion-owner lock rolled back so a retry DELETE re-rotates cleanly (no EEXIST).
     expect(await app.ctx.lockManager.claimOf('rb0-dev')).toBeNull();
     expect(app.ctx.agentManager.deletionGenerationOf('rb0-dev')).toBe(0);
@@ -2475,7 +2777,7 @@ describe('DELETE /api/projects/:id', () => {
     await createProject('locked');
     await app.ctx.taskStore.set({
       id: 'task-locked', projectId: 'locked', title: 'T', description: 'D', preferredAgentId: '', agentId: '', devAgentId: '',
-      status: 'review', reviewMode: 'git', reviewRound: 1,
+      status: 'review', reviewRound: 1,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     } as never);
 
@@ -2492,26 +2794,11 @@ describe('DELETE /api/projects/:id', () => {
     expect(app.ctx.config.project.some(p => p.id === 'locked')).toBe(true);
   });
 
-  it('refuses the delete for a server task that already bound its publish target', async () => {
-    await createProject('locked-srv');
-    await app.ctx.taskStore.set({
-      id: 'task-srv', projectId: 'locked-srv', title: 'T', description: 'D', preferredAgentId: '', agentId: '', devAgentId: '',
-      status: 'approved', reviewMode: 'server', afterDone: 'pr', reviewRound: 1,
-      platformBinding: { mode: 'server', repoKey: 'github.com/a/b', tool: 'gh' },
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-    } as never);
-
-    const response = await del('/api/projects/locked-srv');
-
-    expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).tasks).toEqual(['task-srv']);
-  });
-
   it('allows the delete once the blocking task reaches a terminal status', async () => {
     await createProject('unlocks');
     const base = {
       id: 'task-unlocks', projectId: 'unlocks', title: 'T', description: 'D', preferredAgentId: '', agentId: '', devAgentId: '',
-      reviewMode: 'git', reviewRound: 1,
+      reviewRound: 1,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
     await app.ctx.taskStore.set({ ...base, status: 'review' } as never);
@@ -2541,7 +2828,7 @@ describe('DELETE /api/projects/:id', () => {
     expect(response.statusCode).toBe(409);
     const body = JSON.parse(response.body);
     expect(body.error).toMatch(/agent/i);
-    expect(body.agents).toEqual(['busy-dev']);
+    expect(body.agents).toEqual(['busy-dev', 'busy-qa']);
     expect(app.ctx.config.project.some(p => p.id === 'busy')).toBe(true);
   });
 

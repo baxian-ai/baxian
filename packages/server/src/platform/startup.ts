@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import { PluginRegistry, type PluginDiagnostic, type LoadedPlugin } from './plugin-registry.js';
 import { builtinPluginRoot, userPluginRoot } from './plugin-roots.js';
 import { repoIdentityKey, TASK_TERMINAL_STATUS_SET, type BaxianConfig, type ProjectConfig, type TaskState } from '../shared/index.js';
-import { projectNeedsPlatformEntry, projectReviewMode, resolveProjectTool } from '../config/validator.js';
+import { projectNeedsPlatformEntry, resolveProjectTool } from '../config/validator.js';
 import type { PlatformDriver, PlatformPollerEntryInit } from './platform-poller.js';
 
 export async function loadPluginsOrExplainWithRoots(
@@ -57,7 +57,6 @@ export async function loadPluginsOrExplainWithRoots(
 export function referencedGitTools(config: BaxianConfig): Set<string> {
   const tools = new Set<string>();
   for (const project of config.project) {
-    if (projectReviewMode(config, project) !== 'git') continue;
     const tool = resolveProjectTool(project);
     if (tool !== undefined) tools.add(tool);
   }
@@ -109,7 +108,9 @@ export interface PlatformBindingMismatch {
 }
 
 export function taskNeedsPlatformBindingAudit(task: TaskState): boolean {
-  return task.reviewMode === 'git' || task.afterDone === 'pr' || task.platformBinding !== undefined;
+  return task.platformBinding !== undefined
+    || task.remoteCleanup !== undefined
+    || !TASK_TERMINAL_STATUS_SET.has(task.status);
 }
 
 export function platformBindingMismatch(
@@ -126,7 +127,7 @@ export function platformBindingMismatch(
     return { reason: 'project-missing', differences: ['project'], binding };
   }
   const live = {
-    mode: projectReviewMode(config, project),
+    mode: 'git',
     repoKey: repoIdentityKey(project.repo),
     tool: resolveProjectTool(project) ?? '',
   };

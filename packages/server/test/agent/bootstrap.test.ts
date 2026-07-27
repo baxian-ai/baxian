@@ -81,18 +81,16 @@ describe('bootstrapAutoRepos', () => {
     expect(ensure).toHaveBeenCalledTimes(2);
   });
 
-  it.each<{ mode: 'git' | 'server'; tool: string; cloneViaGh: boolean | undefined }>([
-    { mode: 'git', tool: 'forge', cloneViaGh: false },
-    { mode: 'git', tool: 'gh', cloneViaGh: true },
-    { mode: 'server', tool: 'forge', cloneViaGh: undefined },
-  ])('passes cloneViaGh=$cloneViaGh in $mode mode with tool $tool', async ({ mode, tool, cloneViaGh }) => {
+  it.each<{ tool: string; cloneViaGh: boolean }>([
+    { tool: 'forge', cloneViaGh: false },
+    { tool: 'gh', cloneViaGh: true },
+  ])('passes cloneViaGh=$cloneViaGh for tool $tool', async ({ tool, cloneViaGh }) => {
     const repoStoreFactory = vi.fn(() => repoStore(async () => '/r'));
     const config: BaxianConfig = {
       ...baseConfig,
       project: [{
         ...baseConfig.project[0],
         repo: 'https://github.com/u/r1.git',
-        review: { mode },
         gitCli: { tool },
       }],
     };

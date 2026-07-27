@@ -93,7 +93,10 @@ describe('GET /api/config', () => {
       ...app.ctx.config,
       project: [{
         id: 'proj', repo: 'user/repo', merge: null,
-        agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: { hostname: 'legacy', password: 'inline-secret' } }]],
+        agent: [[
+          { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: { hostname: 'legacy', password: 'inline-secret' } },
+          { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: { hostname: 'legacy', password: 'inline-secret' } },
+        ]],
       }],
     };
     const cfg = JSON.parse((await get('/api/config')).body) as BaxianConfig;
@@ -163,6 +166,27 @@ describe('PATCH /api/config', () => {
     expect(app.ctx.config.server.token).toBeUndefined();
   });
 
+  it('returns unknown-key warnings while stripping the keys from memory and disk', async () => {
+    const configPath = await seedConfigPath(app, tempDir);
+
+    const response = await patch('/api/config', {
+      obsolete: true,
+      review: { rounds: 3, mode: 'server', afterDone: 'pr' },
+    }, { headers: JSON_HEADERS });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).warnings).toEqual(expect.arrayContaining([
+      { path: 'obsolete', message: 'unknown configuration key; it will be ignored' },
+      { path: 'review.mode', message: 'unknown configuration key; it will be ignored' },
+      { path: 'review.afterDone', message: 'unknown configuration key; it will be ignored' },
+    ]));
+    expect(app.ctx.config.review).toEqual({ rounds: 3 });
+    expect(app.ctx.config).not.toHaveProperty('obsolete');
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.review).toEqual({ rounds: 3 });
+    expect(saved).not.toHaveProperty('obsolete');
+  });
+
   it('rejects host edits via PATCH /config (registry is managed via /hosts) and preserves current.host', async () => {
     await seedConfigPath(app, tempDir);
     app.ctx.config = { ...app.ctx.config, host: [{ id: 'box', hostname: 'h', port: 22, password: 'real-secret' }] };
@@ -200,7 +224,10 @@ describe('PATCH /api/config', () => {
       host: [{ id: 'box', hostname: 'h', port: 22 }, { id: 'box2', hostname: 'h2', port: 22 }],
       project: [{
         id: 'proj', repo: 'user/repo', merge: null,
-        agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' }]],
+        agent: [[
+          { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box' },
+          { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: 'box' },
+        ]],
       }],
     };
     app.ctx.tmuxSessionStatusStore.set('rdev', { tmuxSessionStatus: 'present' });
@@ -208,7 +235,10 @@ describe('PATCH /api/config', () => {
     const response = await patch('/api/config', {
       project: [{
         id: 'proj', repo: 'user/repo', merge: null,
-        agent: [[{ id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box2' }]],
+        agent: [[
+          { id: 'rdev', runtime: 'claude-code', role: 'dev', mode: 'remote', host: 'box2' },
+          { id: 'rqa', runtime: 'codex', role: 'qa', mode: 'remote', host: 'box' },
+        ]],
       }],
     }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(409);
@@ -284,6 +314,13 @@ describe('PATCH /api/config', () => {
           mode: 'remote',
           host: 'box',
           workdir: '/srv/repo',
+        }, {
+          id: 'rqa',
+          runtime: 'codex',
+          role: 'qa',
+          mode: 'remote',
+          host: 'box',
+          workdir: '/srv/qa-repo',
         }]],
       }],
     };
@@ -297,7 +334,8 @@ describe('PATCH /api/config', () => {
     });
     const nextProjects = app.ctx.config.project.map(project => ({
       ...project,
-      agent: project.agent.map(pair => pair.map(agent => ({ ...agent, workdir: '/srv/repo-new' }))),
+      agent: project.agent.map(pair => pair.map(agent =>
+        agent.id === 'rdev' ? { ...agent, workdir: '/srv/repo-new' } : agent)),
     }));
 
     const response = await patch('/api/config', { project: nextProjects }, { headers: JSON_HEADERS });
@@ -401,7 +439,10 @@ describe('PATCH /api/config', () => {
       ...project,
       agent: [
         ...project.agent,
-        [{ id: 'ghost-dev', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: join(tempDir, 'ghost-dev') }],
+        [
+          { id: 'ghost-dev', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: join(tempDir, 'ghost-dev') },
+          { id: 'ghost-qa', runtime: 'codex', role: 'qa', mode: 'local', workdir: join(tempDir, 'ghost-qa') },
+        ],
       ],
     }));
 
@@ -501,7 +542,10 @@ describe('PATCH /api/config', () => {
       ...app.ctx.config,
       project: [{
         id: 'p1', repo: 'a/b', merge: null,
-        agent: [[{ id: 'going-away', runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true }]],
+        agent: [[
+          { id: 'going-away', runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true },
+          { id: 'going-away-qa', runtime: 'codex', role: 'qa', mode: 'local', yolo: true },
+        ]],
       }],
     };
     const sweepStaleBootstrapErrors = vi.fn().mockResolvedValue({ removed: 0 });
@@ -519,7 +563,10 @@ describe('PATCH /api/config', () => {
       ...app.ctx.config,
       project: [{
         id: 'p1', repo: 'a/b', merge: null,
-        agent: [[{ id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true }]],
+        agent: [[
+          { id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', yolo: true },
+          { id: 'becoming-manual-qa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/manual-qa', yolo: true },
+        ]],
       }],
     };
     const sweepStaleBootstrapErrors = vi.fn().mockResolvedValue({ removed: 1 });
@@ -527,7 +574,10 @@ describe('PATCH /api/config', () => {
 
     const response = await patch('/api/config', { project: [{
       id: 'p1', repo: 'a/b', merge: null,
-      agent: [[{ id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/manual', yolo: true }]],
+      agent: [[
+        { id: 'becoming-manual', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/manual', yolo: true },
+        { id: 'becoming-manual-qa', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/manual-qa', yolo: true },
+      ]],
     }] }, { headers: JSON_HEADERS });
     expect(response.statusCode).toBe(200);
     const activeSet = sweepStaleBootstrapErrors.mock.calls[0][0] as Set<string>;

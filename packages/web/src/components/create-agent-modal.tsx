@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import type { AgentMode, AgentRuntime, AgentRole, ProjectConfig, AgentConfig, HostConfig } from '../shared/index.js';
+import type { AgentMode, AgentRuntime, AgentRole, AgentConfig, HostConfig } from '../shared/index.js';
 import { AGENT_RUNTIME_LAUNCH_FLAG } from '../shared/index.js';
 import { Modal } from './modal.tsx';
 import { inputCls, labelCls, fieldErrCls, helpCls, radioCls } from './form-styles.ts';
-import { api, type ProbeResponse, type AddAgentBody } from '../api.ts';
+import { api, type ProbeResponse } from '../api.ts';
 import { useToast } from './toast.tsx';
 import { usePendingRestart } from '../hooks/use-pending-restart.tsx';
 import { useT } from '../i18n/index.tsx';
@@ -21,8 +21,6 @@ const PROBE_DEBOUNCE_MS = 500;
 
 interface FormState {
   id: string;
-  role: AgentRole;
-  pairWith: string;
   mode: AgentMode;
   host: string;
   runtime: AgentRuntime | '';
@@ -33,7 +31,7 @@ interface FormState {
 }
 
 const INITIAL_FORM: FormState = {
-  id: '', role: 'dev', pairWith: '',
+  id: '',
   mode: 'local', host: '',
   runtime: '', workdir: '', yolo: true,
   model: '', addDirs: '',
@@ -47,7 +45,7 @@ function hostLabel(h: HostConfig): string {
 export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props) {
   const t = useT();
   const [form, setForm] = useState<FormState>(INITIAL_FORM);
-  const [project, setProject] = useState<ProjectConfig | null>(null);
+  const [devDraft, setDevDraft] = useState<{ agent: AgentConfig; form: FormState } | null>(null);
   const [hosts, setHosts] = useState<HostConfig[]>([]);
   const [allAgentIds, setAllAgentIds] = useState<Set<string>>(new Set());
   const [probe, setProbe] = useState<ProbeResponse | null>(null);
@@ -69,7 +67,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     sessionRef.current += 1;
     const session = sessionRef.current;
     setForm(INITIAL_FORM);
-    setProject(null);
+    setDevDraft(null);
     setHosts([]);
     setAllAgentIds(new Set());
     setProbe(null);
@@ -82,8 +80,6 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
 
     api.config.get().then(cfg => {
       if (session !== sessionRef.current) return;
-      const proj = cfg.project.find(p => p.id === projectId) ?? null;
-      setProject(proj);
       setHosts(cfg.host ?? []);
       const ids = new Set<string>();
       cfg.project.forEach(p => p.agent.forEach(pair => pair.forEach(a => ids.add(a.id))));
@@ -132,7 +128,7 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     return () => {
       if (probeDebounceRef.current) clearTimeout(probeDebounceRef.current);
     };
-  }, [open, form.mode, form.host, runProbe]);
+  }, [open, form.mode, form.host, devDraft, runProbe]);
 
   useEffect(() => {
     if (open) return;
@@ -166,52 +162,58 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       });
   };
 
-  const devGroups: AgentConfig[][] = project?.agent.filter(group => group.some(a => a.role === 'dev')) ?? [];
-  const eligibleDevs = (role: 'qa' | 'research'): AgentConfig[] => devGroups
-    .filter(group => !group.some(a => a.role === role))
-    .map(group => group.find(a => a.role === 'dev')!);
-  const qaEligibleDevs = eligibleDevs('qa');
-  const researchEligibleDevs = eligibleDevs('research');
-
-  const canSelectQa = qaEligibleDevs.length > 0;
-  const canSelectResearch = researchEligibleDevs.length > 0;
-
-  const idValid = ID_PATTERN.test(form.id) && !allAgentIds.has(form.id);
+  const role: AgentRole = devDraft ? 'qa' : 'dev';
+  const idValid = ID_PATTERN.test(form.id)
+    && !allAgentIds.has(form.id)
+    && form.id !== devDraft?.agent.id;
   const hostValid = form.mode === 'local' || (form.mode === 'remote' && form.host !== '');
   const runtimeValid = form.runtime !== '' && !!probe?.runtimes[form.runtime]?.ok;
   const tmuxValid = !!probe?.tmux.ok;
   const sshValid = form.mode === 'local' || !!probe?.ssh?.ok;
-  const pairValid = form.role === 'dev'
-    || ((form.role === 'qa' || form.role === 'research') && form.pairWith !== '');
-  const canSubmit = !submitting && idValid && hostValid && pairValid && runtimeValid && tmuxValid && sshValid;
+  const canSubmit = !submitting && idValid && hostValid && runtimeValid && tmuxValid && sshValid;
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
-    setSubmitting(true);
     setError(null);
+    const trimmedAddDirs = form.addDirs
+      .split('\n')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+    const agent: AgentConfig = {
+      id: form.id,
+      role,
+      runtime: form.runtime as AgentRuntime,
+      mode: form.mode,
+      ...(form.mode === 'remote' ? { host: form.host } : {}),
+      ...(form.workdir ? { workdir: form.workdir } : {}),
+      yolo: form.yolo,
+      ...(form.model.trim() ? { model: form.model.trim() } : {}),
+      ...(trimmedAddDirs.length > 0 ? { addDirs: trimmedAddDirs } : {}),
+    };
+    if (!devDraft) {
+      setDevDraft({ agent, form });
+      setForm(INITIAL_FORM);
+      setProbe(null);
+      setTmuxInstall(null);
+      setShowAdvanced(false);
+      return;
+    }
+
+    setSubmitting(true);
     try {
-      const trimmedAddDirs = form.addDirs
-        .split('\n')
-        .map(s => s.trim())
-        .filter(s => s.length > 0);
-      const body: AddAgentBody = {
-        id: form.id,
-        role: form.role,
-        runtime: form.runtime as AgentRuntime,
-        mode: form.mode,
-        ...(form.mode === 'remote' ? { host: form.host } : {}),
-        ...(form.workdir ? { workdir: form.workdir } : {}),
-        yolo: form.yolo,
-        ...(form.model.trim() ? { model: form.model.trim() } : {}),
-        ...(trimmedAddDirs.length > 0 ? { addDirs: trimmedAddDirs } : {}),
-        ...(form.role === 'qa' || form.role === 'research' ? { pairWith: form.pairWith } : {}),
-      };
-      const result = await api.projects.addAgent(projectId, body);
+      const result = await api.projects.addAgentGroup(projectId, {
+        agents: [devDraft.agent, agent],
+      });
       if (result.restartRequired) flagDirty();
       show({
-        kind: 'success',
-        title: t.createAgent.addedToastTitle(result.agent.id, projectId),
+        kind: result.warnings?.length ? 'warn' : 'success',
+        title: t.createAgent.addedToastTitle(
+          result.agents.find(member => member.role === 'dev')!.id,
+          result.agents.find(member => member.role === 'qa')!.id,
+          projectId,
+        ),
+        ...(result.warnings?.length ? { body: result.warnings.join('\n') } : {}),
       });
       onCreated();
       onClose();
@@ -220,6 +222,15 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleBack = () => {
+    if (!devDraft || submitting) return;
+    setForm(devDraft.form);
+    setDevDraft(null);
+    setProbe(null);
+    setTmuxInstall(null);
+    setShowAdvanced(false);
   };
 
   const RuntimeStatus = ({ rt }: { rt: AgentRuntime }) => {
@@ -277,11 +288,20 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
       size="lg"
       footer={
         <>
+          {devDraft && (
+            <button type="button" onClick={handleBack} disabled={submitting} className="btn-secondary">
+              {t.common.back}
+            </button>
+          )}
           <button type="button" onClick={handleDismiss} disabled={submitting} className="btn-secondary">
             {t.common.cancel}
           </button>
           <button type="submit" form="create-agent-form" disabled={!canSubmit} className="btn-primary">
-            {submitting ? t.createAgent.submitting : t.createAgent.submitLabel}
+            {submitting
+              ? t.createAgent.submitting
+              : devDraft
+                ? t.createAgent.submitLabel
+                : t.createAgent.continueLabel}
           </button>
         </>
       }
@@ -301,51 +321,26 @@ export function CreateAgentModal({ open, onClose, projectId, onCreated }: Props)
             value={form.id}
             onChange={e => setForm({ ...form, id: e.target.value })}
             className={inputCls}
-            placeholder={t.createAgent.idPlaceholder(projectId, form.role)}
+            placeholder={t.createAgent.idPlaceholder(projectId, role)}
             disabled={submitting}
           />
           {form.id && !ID_PATTERN.test(form.id) && (
             <div className={fieldErrCls}>{t.common.idFormatError}</div>
           )}
-          {form.id && allAgentIds.has(form.id) && (
+          {form.id && (allAgentIds.has(form.id) || form.id === devDraft?.agent.id) && (
             <div className={fieldErrCls}>{t.createAgent.idTakenGlobalError}</div>
           )}
         </div>
 
         <div>
           <span className={labelCls}>{t.createAgent.roleLabel}</span>
-          <label className="mr-4 inline-flex items-center gap-2">
-            <input type="radio" name="role" checked={form.role === 'dev'} className={radioCls}
-              onChange={() => setForm({ ...form, role: 'dev', pairWith: '' })} disabled={submitting} />
-            <span className="text-sm text-og-800">Dev agent</span>
-          </label>
-          <label className="mr-4 inline-flex items-center gap-2" title={!canSelectQa ? t.createAgent.createDevFirstHint : ''}>
-            <input type="radio" name="role" checked={form.role === 'qa'} className={radioCls}
-              onChange={() => setForm({ ...form, role: 'qa', pairWith: '' })} disabled={submitting || !canSelectQa} />
-            <span className={`text-sm ${!canSelectQa ? 'text-og-400' : 'text-og-800'}`}>QA agent</span>
-          </label>
-          <label className="inline-flex items-center gap-2" title={!canSelectResearch ? t.createAgent.createDevFirstHint : ''}>
-            <input type="radio" name="role" checked={form.role === 'research'} className={radioCls}
-              onChange={() => setForm({ ...form, role: 'research', pairWith: '' })} disabled={submitting || !canSelectResearch} />
-            <span className={`text-sm ${!canSelectResearch ? 'text-og-400' : 'text-og-800'}`}>
-              {t.createAgent.roleResearch}
-            </span>
-          </label>
-        </div>
-
-        {(form.role === 'qa' || form.role === 'research') && (
-          <div>
-            <label className={labelCls} htmlFor="pair-with">{t.createAgent.pairWithLabel}</label>
-            <select id="pair-with" value={form.pairWith}
-              onChange={e => setForm({ ...form, pairWith: e.target.value })}
-              className={inputCls} disabled={submitting}>
-              <option value="">{t.createAgent.pairWithPlaceholder}</option>
-              {(form.role === 'qa' ? qaEligibleDevs : researchEligibleDevs).map(d => (
-                <option key={d.id} value={d.id}>{t.createAgent.pairOptionLabel(d.id, d.mode)}</option>
-              ))}
-            </select>
+          <div className="text-sm text-og-800">
+            {role === 'dev' ? t.createAgent.devStepLabel : t.createAgent.qaStepLabel}
           </div>
-        )}
+          {devDraft && (
+            <div className={helpCls}>{t.createAgent.pairedDevLabel(devDraft.agent.id)}</div>
+          )}
+        </div>
 
         <div>
           <span className={labelCls}>{t.createAgent.modeLabel}</span>

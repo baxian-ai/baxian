@@ -51,9 +51,9 @@ async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     phase: 'code',
     reviewRound: 0,
-    reviewMode: 'git',
     platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
     status: 'in_progress',
     branch: `bx/${overrides.id}`,
@@ -66,7 +66,13 @@ async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise
 }
 
 function seedPending(id: string, preferredAgentId: string): Promise<TaskState> {
-  return seedTask({ id, status: 'pending', agentId: '', preferredAgentId });
+  return seedTask({
+    id,
+    status: 'pending',
+    agentId: '',
+    preferredAgentId,
+    ...(preferredAgentId === '' ? { devAgentId: '', qaAgentId: undefined } : {}),
+  });
 }
 
 function stubStartSession(result: boolean): void {
@@ -182,24 +188,6 @@ describe('dispatchPendingTask', () => {
     expect(result.error).toMatch(/agentId is required/);
   });
 
-  it('keeps the snapshotted participants when a pending task has no QA', async () => {
-    stubStartSession(true);
-
-    const task = await seedTask({
-      id: 'task-002b',
-      status: 'pending',
-      agentId: '',
-      preferredAgentId: 'dev-1',
-      qaAgentId: undefined,
-    });
-
-    const result = await manager.dispatchPendingTask(task.id, 'dev-1');
-
-    expect(result.errorCode).toBeUndefined();
-    const updated = await taskStore.get(task.id);
-    expect(updated!.qaAgentId).toBeUndefined();
-  });
-
   it('returns 409 when agent is busy (canDispatchWithBinding=false), leaves task untouched', async () => {
     await agentStore.set({
       id: 'dev-1',
@@ -247,11 +235,11 @@ describe('dispatchPendingTask', () => {
     expect(result.errorCode).toBe(400);
   });
 
-  it('returns 400 when the requested agent is neither dev nor research role', async () => {
+  it('returns 400 when the requested agent is not a dev', async () => {
     const task = await seedPending('task-role', '');
     const result = await manager.dispatchPendingTask(task.id, 'qa-1');
     expect(result.errorCode).toBe(400);
-    expect(result.error).toMatch(/not dev or research role/);
+    expect(result.error).toMatch(/not a dev agent/);
   });
 
   it('returns 400 when a known dev is requested for a task preferring another dev', async () => {
@@ -268,7 +256,10 @@ describe('dispatchPendingTask', () => {
         ...manager.getConfig().project,
         {
           id: 'proj2', repo: 'user/other', merge: null,
-          agent: [[{ id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: tempDir }]],
+          agent: [[
+            { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: tempDir },
+            { id: 'qa-2', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: join(tempDir, 'qa-2') },
+          ]],
         },
       ],
     });

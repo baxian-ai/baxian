@@ -24,30 +24,11 @@ const TASK: TaskState = {
   devAgentId: 'dev-1',
   phase: 'code',
   reviewRound: 0,
-  reviewMode: 'git',
   status: 'pending',
   createdAt: '2026-04-28T10:00:00Z',
   updatedAt: '2026-04-28T10:00:00Z',
 };
 const REVIEW_PAIR = { passToken: 'abc123abc123', failToken: 'def456def456' } as const;
-
-function useServerPhaseRegistry(prefix: string): () => SkillRegistry {
-  let tempDir: string;
-  let registry: SkillRegistry;
-  beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), prefix));
-    for (const name of ['baxian-signals', 'baxian-server-review', 'baxian-server-feedback']) {
-      await mkdir(join(tempDir, name), { recursive: true });
-      await writeFile(join(tempDir, name, 'SKILL.md'), `${name} stub`);
-    }
-    registry = new SkillRegistry(tempDir);
-    await registry.scan();
-  });
-  afterEach(async () => {
-    await rm(tempDir, { recursive: true, force: true });
-  });
-  return () => registry;
-}
 
 describe('buildPromptInline', () => {
   let tempDir: string;
@@ -75,7 +56,6 @@ describe('buildPromptInline', () => {
 
   async function seedAllPhaseSkills(): Promise<void> {
     await makeSkill('baxian-task-check', 'task-check stub');
-    await makeSkill('baxian-research', 'research stub');
     await makeSkill('baxian-pr-feedback', 'pr-feedback stub');
     await makeSkill('baxian-pr-review', 'pr-review stub');
     await makeSkill('baxian-pr-recheck', 'pr-recheck stub');
@@ -110,10 +90,11 @@ describe('buildPromptInline', () => {
     });
   }
 
+  function expectNoCompletionKindFields(prompt: string): void {
+    expect(prompt).not.toMatch(/^(?:spec-)?signal:/m);
+  }
+
   const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/repo' };
-  const RESEARCH_AGENT: AgentConfig = {
-    id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: '/tmp/research-repo',
-  };
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'baxian-prompt-skills-'));
@@ -128,7 +109,7 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain('phase: develop');
     expect(prompt).not.toContain('role:');
     expect(prompt).not.toContain('task: task-001');
-    expect(prompt).toContain('exchange: git-pr');
+    expect(prompt).not.toContain('exchange:');
     expect(prompt).toContain('workdir: /tmp/repo/.baxian-worktrees/task-001_abc');
     expect(prompt).toContain('title: Fix login redirect');
     expect(prompt).not.toContain('cd into the worktree');
@@ -136,30 +117,6 @@ describe('buildPromptInline', () => {
     expect(prompt).not.toContain('<skills>');
     expect(prompt).not.toContain('<task>');
     expect(prompt).not.toContain('<![CDATA[');
-  });
-
-  it('research dispatch loads only the Research workflow and exposes only spec completion', async () => {
-    await seedAndScan();
-    const prompt = build({
-      task: {
-        ...TASK,
-        preferredAgentId: 'research-1',
-        agentId: 'research-1',
-        researchAgentId: 'research-1',
-        phase: 'research',
-        status: 'in_progress',
-      },
-      phase: 'research',
-      agent: RESEARCH_AGENT,
-      workdir: '/tmp/research-repo',
-      signalToken: 'research-token-1',
-    });
-
-    expect(prompt.startsWith('/baxian-research\nphase: research\n')).toBe(true);
-    expect(prompt).toContain('signal: spec-done');
-    expect(prompt).toContain('token: research-token-1');
-    expect(prompt).not.toContain('signal: pr-created');
-    expect(prompt).not.toContain('signal: code-done');
   });
 
   it('codex runtime uses the $ sigil to force-load the primary skill', async () => {
@@ -200,7 +157,7 @@ describe('buildPromptInline', () => {
     expect(build()).not.toContain('images:');
   });
 
-  it('fix phase descriptor carries pr/branch and the pr-fixed signal field, never round', async () => {
+  it('fix phase descriptor carries pr/branch/token without a completion kind, never round', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
@@ -212,8 +169,8 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain('pr: 42');
     expect(prompt).toContain('\nbranch: ');
     expect(prompt).not.toContain('round:');
-    expect(prompt).toContain('signal: pr-fixed');
     expect(prompt).toContain('token: fix-token-42');
+    expectNoCompletionKindFields(prompt);
   });
 
   it('fix phase prompt requires a signalToken', async () => {
@@ -224,23 +181,23 @@ describe('buildPromptInline', () => {
     })).toThrow(/fix prompt requires signalToken/);
   });
 
-  it('represents the signal as structured signal/token fields, never a fireable literal', async () => {
+  it('represents completion dispatch as a token only, never a kind field or fireable literal', async () => {
     await seedAndScan();
     const withSignal = build({
       task: { ...TASK, status: 'fixing', prNumber: 42, reviewRound: 2 },
       phase: 'fix',
       signalToken: 'fix-token-42',
     });
-    expect(withSignal).toContain('signal: pr-fixed');
     expect(withSignal).toContain('token: fix-token-42');
+    expectNoCompletionKindFields(withSignal);
     expect(scanPhaseSignals(withSignal)).toEqual([]);
     expect(withSignal).not.toContain('[bx:pr-fixed:');
     const noSignal = build();
-    expect(noSignal).not.toContain('signal:');
+    expectNoCompletionKindFields(noSignal);
     expect(noSignal).not.toContain('token:');
   });
 
-  it('post-approve descriptor carries pr + the pr-merge-ready signal field', async () => {
+  it('post-approve descriptor carries pr + token without a completion kind', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'approved', prNumber: 42 },
@@ -251,8 +208,8 @@ describe('buildPromptInline', () => {
     expect(prompt.startsWith('/baxian-pr-feedback\n')).toBe(true);
     expect(prompt).toContain('phase: post-approve');
     expect(prompt).toContain('pr: 42');
-    expect(prompt).toContain('signal: pr-merge-ready');
     expect(prompt).toContain('token: post-token-42');
+    expectNoCompletionKindFields(prompt);
     expect(prompt).not.toContain('T_self');
     expect(prompt).not.toContain('redispatch:');
     expect(prompt).not.toContain(buildPhaseSignal('pr-merge-ready', 'post-token-42'));
@@ -266,7 +223,7 @@ describe('buildPromptInline', () => {
       phase: 'post-approve',
       signalToken: 'post-token-42',
     });
-    expect(prompt).toContain('signal: pr-merge-ready');
+    expectNoCompletionKindFields(prompt);
     expect(prompt).not.toContain('redispatch:');
   });
 
@@ -274,7 +231,8 @@ describe('buildPromptInline', () => {
     await seedAndScan();
     const codePrompt = build({ phase: 'code', signalToken: 'code-token-1' });
     expect(codePrompt.startsWith('/baxian-task-check\nphase: code\n')).toBe(true);
-    expect(codePrompt).toContain('signal: pr-created');
+    expect(codePrompt).toContain('token: code-token-1');
+    expectNoCompletionKindFields(codePrompt);
     const codexCode = build({ phase: 'code', signalToken: 'code-token-1', agent: { ...DEV_AGENT, runtime: 'codex' } });
     expect(codexCode.startsWith('$baxian-task-check\n')).toBe(true);
   });
@@ -335,67 +293,25 @@ describe('buildPromptInline', () => {
     expect(prompt.endsWith(`title: ${TASK.title}\n`)).toBe(true);
   });
 
-  it('develop descriptor carries both spec and code completion signals when the task has QA', async () => {
+  it('develop descriptor carries the token while completion routes live in the skill', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress' },
       signalToken: 'spec-token-1',
     });
-    expect(prompt).toContain('spec-signal: spec-done');
-    expect(prompt).toContain('signal: pr-created');
     expect(prompt).toContain('token: spec-token-1');
+    expectNoCompletionKindFields(prompt);
     expect(prompt).not.toContain('Specification-Driven Development');
     expect(prompt).not.toContain('gh pr ready');
-    expect(prompt).not.toContain(buildPhaseSignal('spec-done', 'spec-token-1'));
+    expect(prompt).not.toContain(buildPhaseSignal('spec-done', 'spec-token-1', 42, 'Nzc'));
     expect(scanPhaseSignals(prompt)).toEqual([]);
   });
 
-  it('develop without signalToken carries no signal fields', async () => {
+  it('develop without signalToken carries neither token nor completion kind fields', async () => {
     await seedAndScan();
     const prompt = build({ task: { ...TASK, status: 'in_progress' } });
-    expect(prompt).not.toContain('spec-signal:');
-    expect(prompt).not.toContain('signal:');
-  });
-
-  it('server develop descriptor uses server-files exchange and the code-done signal', async () => {
-    await seedAndScan();
-    const prompt = build({
-      task: { ...TASK, status: 'in_progress', reviewMode: 'server' },
-      signalToken: 'spec-token-srv',
-    });
-    expect(prompt).toContain('exchange: server-files');
-    expect(prompt).toContain('spec-signal: spec-done');
-    expect(prompt).toContain('signal: code-done');
-    expect(prompt).not.toContain('gh pr ready');
-    expect(scanPhaseSignals(prompt)).toEqual([]);
-  });
-
-  it.each([
-    ['git chain', 'git' as const, 'pr-created' as const],
-    ['server chain', 'server' as const, 'code-done' as const],
-  ])('develop drops the spec route when the task has no QA partner (%s)', async (_label, reviewMode, replacementSignal) => {
-    await seedAndScan();
-    const prompt = build({
-      task: { ...TASK, status: 'in_progress', reviewMode },
-      signalToken: 'spec-token-1',
-      hasQaPartner: false,
-    });
-    expect(prompt).not.toContain('spec-signal:');
-    expect(prompt).toContain(`signal: ${replacementSignal}`);
-    expect(prompt).toContain('token: spec-token-1');
-  });
-
-  it('develop keeps the spec route when hasQaPartner is true or omitted', async () => {
-    await seedAndScan();
-    for (const extra of [{ hasQaPartner: true }, {}]) {
-      const prompt = build({
-        task: { ...TASK, status: 'in_progress' },
-        signalToken: 'spec-token-1',
-        ...extra,
-      });
-      expect(prompt).toContain('spec-signal: spec-done');
-      expect(prompt).toContain('signal: pr-created');
-    }
+    expectNoCompletionKindFields(prompt);
+    expect(prompt).not.toContain('token:');
   });
 
   it('review descriptor carries pr + token; verdict procedure lives in the skill', async () => {
@@ -449,7 +365,7 @@ describe('buildPromptInline', () => {
     expect(prompt).toContain('token: recheck-token-N');
   });
 
-  it('code descriptor carries the pr-created signal field', async () => {
+  it('code descriptor carries the token without a completion kind field', async () => {
     await seedAndScan();
     const prompt = build({
       task: { ...TASK, status: 'in_progress', phase: 'code' },
@@ -457,9 +373,9 @@ describe('buildPromptInline', () => {
       signalToken: 'code-token-1',
     });
     expect(prompt).toContain('phase: code');
-    expect(prompt).toContain('exchange: git-pr');
-    expect(prompt).toContain('signal: pr-created');
+    expect(prompt).not.toContain('exchange:');
     expect(prompt).toContain('token: code-token-1');
+    expectNoCompletionKindFields(prompt);
     expect(prompt).not.toContain('gh pr create');
     expect(prompt).not.toContain('docs/spec/');
   });
@@ -467,28 +383,27 @@ describe('buildPromptInline', () => {
 
   it('signal emit block keeps the template + token on separate lines so the prompt itself never matches scanPhaseSignals', () => {
     expect(scanPhaseSignals('[bx:spec-done:<token>]')).toEqual([]);
-    expect(scanPhaseSignals(buildPhaseSignal('spec-done', 'abc123def456'))).toEqual([
-      { kind: 'spec-done', token: 'abc123def456' },
+    expect(scanPhaseSignals(buildPhaseSignal('spec-done', 'abc123def456', 42, 'Nzc'))).toEqual([
+      { kind: 'spec-done', prNumber: 42, actorB64: 'Nzc', token: 'abc123def456' },
     ]);
   });
 
-  describe('git review mode descriptor', () => {
+  describe('PR review descriptor', () => {
     const CLI = { tool: 'gh', host: 'github.com', repo: 'user/repo', repoEncoded: 'user%2Frepo' };
     const GIT_TASK: TaskState = {
       ...TASK,
-      reviewMode: 'git',
       branch: 'bx/task-001',
       baseBranch: 'main',
     };
 
-    it('develop carries the cli family, branch/base snapshot and the git-pr exchange', async () => {
+    it('develop carries the cli family and branch/base snapshot', async () => {
       await seedAndScan();
       const prompt = build({
         task: GIT_TASK,
         signalToken: 'dev-token-1',
         platformCli: { ...CLI, notes: 'instance runs behind :8443' },
       });
-      expect(prompt).toContain('exchange: git-pr');
+      expect(prompt).not.toContain('exchange:');
       expect(prompt).toContain('cli: gh');
       expect(prompt).toContain('cli-host: github.com');
       expect(prompt).toContain('cli-repo: user/repo');
@@ -496,7 +411,7 @@ describe('buildPromptInline', () => {
       expect(prompt).toContain('cli-notes: instance runs behind :8443');
       expect(prompt).toContain('branch: bx/task-001');
       expect(prompt).toContain('base: main');
-      expect(prompt).toContain('signal: pr-created');
+      expectNoCompletionKindFields(prompt);
       expect(prompt).not.toContain('cli-binary');
       expect(prompt).not.toContain('cli-env');
     });
@@ -504,15 +419,16 @@ describe('buildPromptInline', () => {
     it('code renders the same platform family as develop', async () => {
       await seedAndScan();
       const prompt = build({
-        task: { ...GIT_TASK, status: 'in_progress', phase: 'code' },
+        task: { ...GIT_TASK, status: 'in_progress', phase: 'code', prNumber: 42 },
         phase: 'code',
         signalToken: 'code-token-1',
         platformCli: CLI,
       });
-      expect(prompt).toContain('exchange: git-pr');
+      expect(prompt).not.toContain('exchange:');
       expect(prompt).toContain('cli: gh');
       expect(prompt).toContain('branch: bx/task-001');
       expect(prompt).toContain('base: main');
+      expect(prompt).toContain('pr: 42');
       expect(prompt).not.toContain('cli-notes:');
     });
 
@@ -550,6 +466,52 @@ describe('buildPromptInline', () => {
       }
     });
 
+    it('adds stage: spec only to spec review, recheck, and fix descriptors', async () => {
+      await seedAndScan();
+      for (const phase of ['review', 'recheck'] as const) {
+        const specPrompt = build({
+          task: {
+            ...GIT_TASK,
+            status: 'review',
+            phase: 'spec',
+            prNumber: 42,
+            reviewHeadAnchorSha: 'sha-review-spec',
+            passToken: 'a1b2c3d4e5f6',
+            failToken: 'f6e5d4c3b2a1',
+          },
+          phase,
+          agent: QA_AGENT,
+          signalToken: 'qa-token-spec',
+          platformCli: CLI,
+        });
+        expect(specPrompt).toContain('stage: spec');
+      }
+      const specFix = build({
+        task: { ...GIT_TASK, status: 'fixing', phase: 'spec', prNumber: 42, specReviewRound: 2 },
+        phase: 'fix',
+        signalToken: 'fix-token-spec',
+        platformCli: CLI,
+      });
+      expect(specFix).toContain('stage: spec');
+
+      const codeReview = build({
+        task: {
+          ...GIT_TASK,
+          status: 'review',
+          phase: 'code',
+          prNumber: 42,
+          reviewHeadAnchorSha: 'sha-review-code',
+          passToken: 'a1b2c3d4e5f6',
+          failToken: 'f6e5d4c3b2a1',
+        },
+        phase: 'review',
+        agent: QA_AGENT,
+        signalToken: 'qa-token-code',
+        platformCli: CLI,
+      });
+      expect(codeReview).not.toContain('stage: spec');
+    });
+
     it('review for a git task without a minted pair fails loud', async () => {
       await seedAndScan();
       expect(() => build({
@@ -578,7 +540,7 @@ describe('buildPromptInline', () => {
         platformCli: CLI,
       });
       expect(paPrompt).toContain('cli: gh');
-      expect(paPrompt).toContain('signal: pr-merge-ready');
+      expectNoCompletionKindFields(paPrompt);
       expect(paPrompt).not.toMatch(/^branch: /m);
     });
 
@@ -594,502 +556,75 @@ describe('buildPromptInline', () => {
       expect(Buffer.byteLength(rendered ?? '', 'utf8')).toBeLessThanOrEqual(512);
     });
 
-    it('a git task without a resolved platform cli keeps the exchange but omits cli fields', async () => {
+    it('a task without a resolved platform cli omits cli fields', async () => {
       await seedAndScan();
       const prompt = build({ task: TASK, signalToken: 'dev-token-4' });
-      expect(prompt).toContain('exchange: git-pr');
+      expect(prompt).not.toContain('exchange:');
       expect(prompt).not.toContain('cli: gh');
       expect(prompt).not.toContain('cli-host:');
       expect(prompt).not.toMatch(/^base: /m);
     });
   });
 
+  describe('signal leak self-check scans both the raw body and its visible rendering', () => {
+    const ESC = '\x1b';
+    const BEL = '\x07';
+    const TOKEN = 'leak-token-1';
+
+    function taskWith(field: 'title' | 'description', literal: string): TaskState {
+      return { ...TASK, [field]: `see ${literal} here` };
+    }
+
+    // The body carries external text, so a live literal can arrive torn by an escape the
+    // TUI would drop, or buried in a control string the TUI would echo as plain text.
+    it.each([
+      ['plain', (m: string) => m],
+      ['torn by a 7-bit SGR', (m: string) => m.replace('spec-', `spec-${ESC}[31m`)],
+      ['torn by an 8-bit CSI', (m: string) => m.replace('spec-', 'spec-\x9b31m')],
+      ['buried in an OSC', (m: string) => `${ESC}]0;${m}${BEL}`],
+      ['buried in an APC', (m: string) => `${ESC}_${m}${ESC}\\`],
+    ])('rejects a filled phase literal %s in the title', async (_name, wrap) => {
+      await seedAndScan();
+      const literal = wrap(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'));
+      expect(() => build({ task: taskWith('title', literal), signalToken: TOKEN }))
+        .toThrow(/must not contain a filled/);
+    });
+
+    it.each([
+      ['torn by a 7-bit SGR', (m: string) => m.replace('spec-', `spec-${ESC}[31m`)],
+      ['buried in an OSC', (m: string) => `${ESC}]0;${m}${BEL}`],
+    ])('rejects a filled phase literal %s in the description', async (_name, wrap) => {
+      await seedAndScan();
+      const literal = wrap(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'));
+      expect(() => build({ task: taskWith('description', literal), signalToken: TOKEN }))
+        .toThrow(/must not contain a filled/);
+    });
+
+    it.each([
+      ['plain', (m: string) => m],
+      ['torn by a 7-bit SGR', (m: string) => m.replace('need-', `need-${ESC}[31m`)],
+      ['buried in an OSC', (m: string) => `${ESC}]0;${m}${BEL}`],
+    ])('rejects a filled need-input literal %s', async (_name, wrap) => {
+      await seedAndScan();
+      expect(() => build({
+        task: taskWith('description', wrap(`[bx:need-input:${TOKEN}:1]`)),
+        signalToken: TOKEN,
+      })).toThrow(/must not contain a filled need-input signal literal/);
+    });
+
+    it('accepts a literal carrying some OTHER token — only this dispatch is a leak', async () => {
+      await seedAndScan();
+      const stale = buildPhaseSignal('spec-done', 'some-other-token', 42, 'Nzc');
+      expect(() => build({ task: taskWith('description', stale), signalToken: TOKEN })).not.toThrow();
+      expect(() => build({
+        task: taskWith('description', `${ESC}]0;${stale}${BEL}`),
+        signalToken: TOKEN,
+      })).not.toThrow();
+    });
+  });
+
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
-  });
-});
-
-describe('server review mode prompt builders', () => {
-  const getRegistry = useServerPhaseRegistry('baxian-server-prompt-');
-
-  const QA_AGENT: AgentConfig = { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local' };
-  const DEV_AGENT: AgentConfig = { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local' };
-
-  function build(phase: string, agent: AgentConfig, extra: Record<string, unknown> = {}): string {
-    return buildPromptInline({
-      task: { ...TASK, reviewMode: 'server' },
-      phase,
-      agent,
-      workdir: '/wt/x',
-      skillRegistry: getRegistry(),
-      signalToken: 'srvtok123456',
-      serverFindingsDigest: 'a'.repeat(64),
-      ...extra,
-    } as Parameters<typeof buildPromptInline>[0]);
-  }
-
-  const CODE_FINDINGS = '{"round":1,"verdict":"request-changes","findings":[]}';
-  const SPEC_TASK = { task: { ...TASK, reviewMode: 'server', phase: 'spec' } };
-
-  type Expect = { contains?: string[]; notContains?: string[]; matches?: RegExp[]; notMatches?: RegExp[] };
-  function assertFragments(prompt: string, { contains = [], notContains = [], matches = [], notMatches = [] }: Expect): void {
-    for (const f of contains) expect(prompt).toContain(f);
-    for (const f of notContains) expect(prompt).not.toContain(f);
-    for (const r of matches) expect(prompt).toMatch(r);
-    for (const r of notMatches) expect(prompt).not.toMatch(r);
-  }
-
-  it('every server phase force-loads its role skill (server-after-done now reads baxian-server-feedback §Publish)', () => {
-    const codexReview = build('server-review', QA_AGENT, { serverContent: 'diff x' });
-    expect(codexReview.startsWith('$baxian-server-review\n')).toBe(true);
-    const QA_CC: AgentConfig = { id: 'qa-cc', runtime: 'claude-code', role: 'qa', mode: 'local' };
-    const ccReview = build('server-review', QA_CC, { serverContent: 'diff x' });
-    expect(ccReview.startsWith('/baxian-server-review\n')).toBe(true);
-    const feedback = build('server-feedback', DEV_AGENT, { serverPriorFindings: CODE_FINDINGS });
-    expect(feedback.startsWith('/baxian-server-feedback\n')).toBe(true);
-    const afterDone = build('server-after-done', DEV_AGENT, { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } });
-    expect(afterDone.startsWith('/baxian-server-feedback\n')).toBe(true);
-  });
-
-  it.each<[string, string, AgentConfig, Record<string, unknown>, Expect]>([
-    ['server-review injects diff + diffstat blocks, carries round + signal fields', 'server-review', QA_AGENT,
-      { serverContent: 'diff --git a/a.ts b/a.ts\n+new line', serverDiffstat: ' a.ts | 1 +\n' },
-      { contains: ['phase: server-review', 'round: 1', 'signal: code-reviewed', 'srvtok123456', 'diffstat:', ' a.ts | 1 +', 'diff:', 'diff --git a/a.ts'] }],
-    ['server-review labels legacy batches with a batch field', 'server-review', QA_AGENT,
-      { serverContent: 'diff x', serverBatch: { index: 1, total: 3 } },
-      { contains: ['batch: 2/3'] }],
-    ['server-recheck carries prior-findings + prior-response blocks', 'server-recheck', QA_AGENT,
-      { serverContent: 'diff y', serverPriorFindings: CODE_FINDINGS, serverPriorResponse: '{"round":1,"responses":[]}' },
-      { contains: ['phase: server-recheck', 'prior-findings:', 'request-changes', 'prior-response:', 'responses', 'signal: code-reviewed'] }],
-    ['server-spec-review injects the spec block + spec-reviewed signal', 'server-spec-review', QA_AGENT,
-      { serverContent: '# Spec doc' },
-      { contains: ['spec:', '# Spec doc', 'round: 1', 'signal: spec-reviewed'] }],
-    ['server-feedback spec variant: feedback=spec + spec-fixed signal, no commit wording inline', 'server-feedback', DEV_AGENT,
-      { ...SPEC_TASK, serverPriorFindings: CODE_FINDINGS },
-      { contains: ['feedback: spec', 'signal: spec-fixed'], notContains: ['commit'] }],
-    ['server-feedback code variant: feedback=code + code-fixed signal', 'server-feedback', DEV_AGENT,
-      { serverPriorFindings: CODE_FINDINGS },
-      { contains: ['feedback: code', 'signal: code-fixed'] }],
-    ['server-after-done pr variant: publish=pr + code-ready', 'server-after-done', DEV_AGENT,
-      { serverAfterDone: { kind: 'pr', branch: 'bx/task-001' } },
-      { contains: ['publish: pr', 'branch: bx/task-001', 'signal: code-ready'], notContains: ['gh pr create', 'exchange:'] }],
-    ['server-after-done branch variant: publish=branch', 'server-after-done', DEV_AGENT,
-      { serverAfterDone: { kind: 'branch', branch: 'bx/task-001' } },
-      { contains: ['publish: branch', 'signal: code-ready'], notContains: ['publish: pr', 'exchange:'] }],
-  ])('%s', (_label, phase, agent, extra, expectations) => {
-    assertFragments(build(phase, agent, extra), expectations);
-  });
-
-  it('publish=pr carries the normalized repo identity and the base snapshot', () => {
-    const prompt = build('server-after-done', DEV_AGENT, {
-      task: {
-        ...TASK, reviewMode: 'server', baseBranch: 'main',
-        platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
-      },
-      serverAfterDone: { kind: 'pr', branch: 'bx/task-001' },
-    });
-    assertFragments(prompt, { contains: ['publish: pr', 'repo: github.com/owner/repo', 'base: main'] });
-  });
-
-  it('publish=branch carries no PR targeting fields even with both snapshots present', () => {
-    const prompt = build('server-after-done', DEV_AGENT, {
-      task: {
-        ...TASK, reviewMode: 'server', baseBranch: 'main',
-        platformBinding: { mode: 'server', repoKey: 'github.com/owner/repo', tool: 'gh' },
-      },
-      serverAfterDone: { kind: 'branch', branch: 'bx/task-001' },
-    });
-    assertFragments(prompt, { contains: ['publish: branch'], notMatches: [/^repo: /m, /^base: /m] });
-  });
-
-  it('server-feedback picks the signal + feedback fields by task phase', () => {
-    const codePrompt = build('server-feedback', DEV_AGENT, { serverPriorFindings: CODE_FINDINGS });
-    expect(codePrompt).toContain('signal: code-fixed');
-    expect(codePrompt).toContain('feedback: code');
-
-    const specPrompt = build('server-feedback', DEV_AGENT, { ...SPEC_TASK, serverPriorFindings: '{}' });
-    expect(specPrompt).toContain('signal: spec-fixed');
-    expect(specPrompt).toContain('feedback: spec');
-  });
-
-  it('phases outside develop/code omit the exchange field', () => {
-    const review = build('server-review', QA_AGENT, { serverContent: 'diff x' });
-    expect(review).not.toContain('exchange:');
-    const sddSpec = buildPromptInline({
-      task: TASK,
-      phase: 'server-spec-review',
-      agent: QA_AGENT,
-      workdir: '/wt/x',
-      skillRegistry: getRegistry(),
-      signalToken: 'srvtok123456',
-      serverContent: '# spec',
-    } as Parameters<typeof buildPromptInline>[0]);
-    expect(sddSpec).not.toContain('exchange:');
-    const merge = buildPromptInline({
-      task: TASK,
-      phase: 'merge',
-      agent: DEV_AGENT,
-      workdir: '/wt/x',
-      skillRegistry: getRegistry(),
-    } as Parameters<typeof buildPromptInline>[0]);
-    expect(merge).not.toContain('exchange:');
-  });
-
-  // machine-readable invocation policy (frontmatter + openai.yaml), not SKILL.md prose — no other test covers it
-  it('every baxian skill disables implicit model-invocation (Claude frontmatter + Codex policy) so only baxian explicitly invokes the per-phase skill', async () => {
-    const skillsRoot = fileURLToPath(new URL('../../../../skills', import.meta.url));
-    for (const name of ['baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-server-review', 'baxian-server-feedback']) {
-      const md = await readFile(join(skillsRoot, name, 'SKILL.md'), 'utf-8');
-      expect(md).toContain('disable-model-invocation: true');
-      const policy = await readFile(join(skillsRoot, name, 'agents', 'openai.yaml'), 'utf-8');
-      expect(policy).toContain('allow_implicit_invocation: false');
-    }
-  });
-
-  it('quotes the task-check frontmatter description that contains YAML mapping delimiters', async () => {
-    const skill = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-task-check/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    const description = skill.split('\n').find(line => line.startsWith('description:'));
-    expect(description).toMatch(/^description: ".*"$/);
-  });
-
-  it('keeps the descriptor-selected platform CLI skill model-invocable', async () => {
-    const root = fileURLToPath(new URL('../../src/platform/plugins/github/skills/baxian-cli-gh', import.meta.url));
-    const md = await readFile(join(root, 'SKILL.md'), 'utf-8');
-    const policy = await readFile(join(root, 'agents', 'openai.yaml'), 'utf-8');
-    expect(md).not.toContain('disable-model-invocation: true');
-    expect(md).toContain('Load when the dispatch descriptor carries `cli: gh`');
-    expect(policy).toContain('allow_implicit_invocation: true');
-  });
-
-  it('guards every git CLI Workdir temp write against symlink redirection in one shell invocation', async () => {
-    const root = fileURLToPath(new URL('../../src/platform/plugins/github/skills/baxian-cli-gh', import.meta.url));
-    const md = await readFile(join(root, 'SKILL.md'), 'utf-8');
-    expect(md).toContain('pwd -P');
-    expect(md).toContain('[ ! -e "$target" ] && [ ! -L "$target" ]');
-    expect(md).toContain('quoted heredoc whose delimiter you generated and verified');
-    expect(md).toContain('Never use a file-editing tool for these Workdir temp files');
-    expect(md).toContain('never split the ancestor guards, creation, writes, and final checks across tool calls');
-  });
-
-  it('server PR publication is fully non-interactive and marks the PR as managed', async () => {
-    const skill = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(skill).toContain('--title "$(cat <title-file>)"');
-    expect(skill).toContain('--body-file <body-file>');
-    expect(skill).toContain('<!-- baxian:managed -->');
-    expect(skill).toContain('Strip a leading `Draft:`');
-    expect(skill).toContain('--json isDraft --jq .isDraft');
-    expect(skill).toContain('GH_HOST=<repo-host> gh pr ready <pr_number> -R <repo:>');
-    expect(skill).toContain('Stage the title and body in one shell invocation rooted at the descriptor Workdir');
-    expect(skill).toContain('pwd -P');
-    expect(skill).toContain('[ ! -e "$target" ] && [ ! -L "$target" ]');
-    expect(skill).toContain('quoted heredocs whose delimiters cannot occur as a line in their payloads');
-    expect(skill).toContain('require both targets to be regular files and non-symlinks');
-    expect(skill).toContain('Never split the ancestor guards, creation, writes, and final checks across tool calls');
-    expect(skill).toContain('GH_HOST=<repo-host> gh api repos/<repo-path> --jq .default_branch');
-    expect(skill).toContain('GH_HOST=<repo-host> gh pr create -R <repo:>');
-    expect(skill).toContain('Split the authoritative `repo:` value at its first `/`');
-    expect(skill).not.toContain('with `gh api repos/<owner/repo>');
-    expect(skill).not.toContain('gh repo view <repo:> --json defaultBranchRef');
-  });
-
-  it('requires actor-bound pr-created signals whenever a cli descriptor is present', async () => {
-    const skill = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-signals/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    expect(skill).toContain('allowed only when the dispatch has no `cli:` field');
-    expect(skill).toContain('whenever `cli:` is present, `pr-created` MUST use this form');
-    expect(skill).toContain('omitting the actor prevents feedback acknowledgements from being authorized');
-    expect(skill).toContain("created or published by the current phase's instructions");
-    expect(skill).not.toContain("baxian-cli-<tool>` skill's create command");
-  });
-
-  it('server feedback documents how every correction descriptor changes the replacement response', async () => {
-    const skill = await readFile(
-      fileURLToPath(new URL('../../../../skills/baxian-server-feedback/SKILL.md', import.meta.url)),
-      'utf-8',
-    );
-    for (const field of [
-      'correction-reason:', 'missing-finding-ids:', 'unknown-finding-ids:', 'schema-violation-codes:',
-    ]) {
-      expect(skill).toContain(field);
-    }
-    expect(skill).toContain('every current id still appears exactly once');
-  });
-
-  it('server phases without signalToken throw', () => {
-    expect(() => buildPromptInline({
-      task: { ...TASK, reviewMode: 'server' },
-      phase: 'server-review',
-      agent: QA_AGENT,
-      workdir: '/wt/x',
-      skillRegistry: getRegistry(),
-      serverContent: 'diff',
-    } as Parameters<typeof buildPromptInline>[0])).toThrow(/requires signalToken/);
-  });
-
-  it('server-spec-review renders a file reference field instead of the spec block', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', phase: 'spec', specReviewRound: 2 },
-      phase: 'server-spec-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      currentSpecRound: 2,
-      serverContentFile: { path: '.baxian/review/inbox/spec-round-2.md', bytes: 35 * 1024 },
-    });
-    expect(prompt).toContain('spec-file: .baxian/review/inbox/spec-round-2.md (35KB)');
-    expect(prompt).not.toContain('\nspec:\n');
-  });
-
-  it('server-review renders diff-file and prior-* file fields without checkout metadata mirrors', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 4 },
-      phase: 'server-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverDiffstatFile: { path: '.baxian/review/inbox/diffstat-round-4.txt', bytes: 18 * 1024 },
-      serverContentFile: { path: '.baxian/review/inbox/diff-round-4.patch', bytes: 120 * 1024 },
-      serverPriorFindingsFile: { path: '.baxian/review/inbox/prior-findings-round-4.json', bytes: 11 * 1024 },
-      serverPriorResponse: '{"round":3,"responses":[]}',
-    });
-    expect(prompt).not.toContain('review-checkout:');
-    expect(prompt).not.toContain('base-sha:');
-    expect(prompt).not.toContain('head-sha:');
-    expect(prompt).not.toContain('head-tree:');
-    expect(prompt).not.toContain('fallback-reason:');
-    expect(prompt).toContain('diff-file: .baxian/review/inbox/diff-round-4.patch (120KB)');
-    expect(prompt).toContain('diffstat-file: .baxian/review/inbox/diffstat-round-4.txt (18KB)');
-    expect(prompt).toContain('prior-findings-file: .baxian/review/inbox/prior-findings-round-4.json (11KB)');
-    expect(prompt).toContain('prior-response:');
-    expect(prompt).not.toContain('\ndiffstat:\n');
-    expect(prompt).not.toContain('\ndiff:\n');
-  });
-
-  it('legacy base continuation re-states review-checkout: base explicitly', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2, batchIndex: 1, batchTotal: 3 },
-      phase: 'server-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverReviewCheckout: 'base',
-      serverContent: 'diff body',
-      serverBatch: { index: 1, total: 3 },
-    });
-    expect(prompt).toContain('review-checkout: base');
-    expect(prompt).toContain('batch: 2/3');
-    expect(prompt).not.toContain('head-tree:');
-  });
-
-  it('server-feedback renders findings-file instead of the findings block', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 5, phase: 'code' },
-      phase: 'server-feedback',
-      agent: DEV_AGENT,
-      workdir: '/wt/dev',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverFindingsDigest: 'a'.repeat(64),
-      serverPriorFindingsFile: { path: '.baxian/review/inbox/findings-round-5.json', bytes: 20 * 1024 },
-    });
-    expect(prompt).toContain('findings-file: .baxian/review/inbox/findings-round-5.json (20KB)');
-    expect(prompt).not.toContain('\nfindings:\n');
-  });
-
-  it('server-feedback carries the findings generation and stable correction details', () => {
-    const prompt = build('server-feedback', DEV_AGENT, {
-      serverPriorFindings: CODE_FINDINGS,
-      serverFindingsDigest: 'b'.repeat(64),
-      serverFeedbackCorrection: {
-        reason: 'coverage-gap',
-        missingFindingIds: ['f-2'],
-        unknownFindingIds: ['f-old'],
-        schemaViolationCodes: [],
-      },
-    });
-    expect(prompt).toContain(`findings-digest: ${'b'.repeat(64)}`);
-    expect(prompt).toContain('correction-reason: coverage-gap');
-    expect(prompt).toContain('missing-finding-ids: ["f-2"]');
-    expect(prompt).toContain('unknown-finding-ids: ["f-old"]');
-  });
-
-  it('server-feedback rejects a prompt without a findings generation', () => {
-    expect(() => buildPromptInline({
-      task: { ...TASK, reviewMode: 'server' },
-      phase: 'server-feedback',
-      agent: DEV_AGENT,
-      workdir: '/wt/dev',
-      skillRegistry: getRegistry(),
-      signalToken: 'tok',
-      serverPriorFindings: CODE_FINDINGS,
-    })).toThrow(/requires findings digest/);
-  });
-
-  it('inline server payloads render exactly as before (no truncation markers anywhere)', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
-      phase: 'server-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'diff --git a/a b/a\n+1',
-    });
-    expect(prompt).toContain('diff:\ndiff --git a/a b/a\n+1');
-    expect(prompt).not.toContain('truncated');
-    expect(prompt).not.toContain('-file:');
-  });
-
-  it('rejects a payload passed in both inline and file form', async () => {
-    const registry = getRegistry();
-    expect(() => buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 1 },
-      phase: 'server-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'x',
-      serverContentFile: { path: '.baxian/review/inbox/diff-round-1.patch', bytes: 1 },
-    })).toThrow(/mutually exclusive/);
-  });
-
-  it('rejects prior-response passed in both inline and file form', async () => {
-    const registry = getRegistry();
-    expect(() => buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
-      phase: 'server-recheck',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'diff',
-      serverPriorResponse: '{"round":1,"responses":[]}',
-      serverPriorResponseFile: { path: '.baxian/review/inbox/prior-response-round-1.json', bytes: 1 },
-    })).toThrow(/mutually exclusive/);
-  });
-
-  it('rejects diffstat passed in both inline and file form', async () => {
-    const registry = getRegistry();
-    expect(() => buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
-      phase: 'server-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'diff',
-      serverDiffstat: 'stat',
-      serverDiffstatFile: { path: '.baxian/review/inbox/diffstat-round-2.txt', bytes: 1 },
-    })).toThrow(/mutually exclusive/);
-  });
-
-  it('server-recheck renders prior-response-file instead of the prior-response block', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
-      phase: 'server-recheck',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'diff',
-      serverPriorResponseFile: { path: '.baxian/review/inbox/prior-response-round-1.json', bytes: 12 * 1024 },
-    });
-    expect(prompt).toContain('prior-response-file: .baxian/review/inbox/prior-response-round-1.json (12KB)');
-    expect(prompt).not.toContain('prior-response:\n');
-  });
-
-  it('server-recheck renders the interdiff block before the full diff, with prioritize-increment wording', async () => {
-    const prompt = build('server-recheck', QA_AGENT, {
-      serverContent: 'FULLDIFFMARKER',
-      serverInterdiff: 'INTERDIFFMARKER',
-      serverPriorFindings: CODE_FINDINGS,
-    });
-    expect(prompt).toContain('INTERDIFFMARKER');
-    expect(prompt).toContain('diff:\nFULLDIFFMARKER');
-    expect(prompt).toContain('优先核对');
-    expect(prompt).toContain('交叉确认');
-    // increment precedes the full diff so QA reads the delta first
-    expect(prompt.indexOf('INTERDIFFMARKER')).toBeLessThan(prompt.indexOf('FULLDIFFMARKER'));
-  });
-
-  it('server-recheck renders an interdiff-file field when the interdiff was delivered to the inbox', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
-      phase: 'server-recheck',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'diff',
-      serverInterdiffFile: { path: '.baxian/review/inbox/interdiff-round-2.patch', bytes: 30 * 1024 },
-    });
-    expect(prompt).toContain('interdiff-file: .baxian/review/inbox/interdiff-round-2.patch (30KB)');
-    expect(prompt).not.toContain('interdiff (');
-  });
-
-  it('rejects an interdiff passed in both inline and file form', async () => {
-    const registry = getRegistry();
-    expect(() => buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 2 },
-      phase: 'server-recheck',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverContent: 'diff',
-      serverInterdiff: 'x',
-      serverInterdiffFile: { path: '.baxian/review/inbox/interdiff-round-2.patch', bytes: 1 },
-    })).toThrow(/mutually exclusive/);
-  });
-
-  it('server-feedback floors the rendered round at 1, matching the delivery filename floor', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', reviewRound: 0, phase: 'code' },
-      phase: 'server-feedback',
-      agent: DEV_AGENT,
-      workdir: '/wt/dev',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      serverFindingsDigest: 'a'.repeat(64),
-      serverPriorFindings: '{"round":1,"verdict":"request-changes","findings":[]}',
-    });
-    expect(prompt).toContain('round: 1');
-    expect(prompt).not.toContain('round: 0');
-  });
-
-  it('sub-KB file refs round up to 1KB', async () => {
-    const registry = getRegistry();
-    const prompt = buildPromptInline({
-      task: { ...TASK, reviewMode: 'server', phase: 'spec', specReviewRound: 1 },
-      phase: 'server-spec-review',
-      agent: QA_AGENT,
-      workdir: '/wt/qa',
-      skillRegistry: registry,
-      signalToken: 'tok',
-      currentSpecRound: 1,
-      serverContentFile: { path: '.baxian/review/inbox/spec-round-1.md', bytes: 100 },
-    });
-    expect(prompt).toContain('spec-file: .baxian/review/inbox/spec-round-1.md (1KB)');
   });
 });
 

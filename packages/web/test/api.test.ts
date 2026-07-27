@@ -148,16 +148,15 @@ describe('request contract per endpoint', () => {
     },
     { name: 'tasks.retry', run: () => api.tasks.retry('t-1'), url: '/api/tasks/t-1/retry', method: 'POST' },
     { name: 'tasks.review', run: () => api.tasks.review('t-1'), url: '/api/tasks/t-1/review', method: 'POST' },
+    {
+      name: 'tasks.review recovery',
+      run: () => api.tasks.review('t-1', { stage: 'spec', actorId: '77', prNumber: 73 }),
+      url: '/api/tasks/t-1/review',
+      method: 'POST',
+      body: { stage: 'spec', actorId: '77', prNumber: 73 },
+    },
     { name: 'tasks.complete', run: () => api.tasks.complete('t-1'), url: '/api/tasks/t-1/complete', method: 'POST' },
     { name: 'tasks.continue', run: () => api.tasks.continue('t-1'), url: '/api/tasks/t-1/continue', method: 'POST' },
-    {
-      name: 'tasks.code',
-      run: () => api.tasks.code('t-1', { verdict: 'request-changes', comments: '打回' }),
-      url: '/api/tasks/t-1/code',
-      method: 'POST',
-      body: { verdict: 'request-changes', comments: '打回' },
-    },
-    { name: 'tasks.reviews', run: () => api.tasks.reviews('t-1'), url: '/api/tasks/t-1/reviews' },
     { name: 'tasks.prReview', run: () => api.tasks.prReview('t-1'), url: '/api/tasks/t-1/pr-review' },
     {
       name: 'tasks.dispatch',
@@ -177,12 +176,35 @@ describe('request contract per endpoint', () => {
     },
     { name: 'projects.delete', run: () => api.projects.delete('p-1'), url: '/api/projects/p-1', method: 'DELETE' },
     {
-      name: 'projects.addAgent',
+      name: 'projects.addAgentGroup',
       run: () =>
-        api.projects.addAgent('p-1', { id: 'dev-3', runtime: 'claude-code', role: 'dev', mode: 'local' }),
+        api.projects.addAgentGroup('p-1', {
+          agents: [
+            { id: 'dev-3', runtime: 'claude-code', role: 'dev', mode: 'local' },
+            { id: 'qa-3', runtime: 'codex', role: 'qa', mode: 'local' },
+          ],
+        }),
       url: '/api/projects/p-1/agents',
       method: 'POST',
-      body: { id: 'dev-3', runtime: 'claude-code', role: 'dev', mode: 'local' },
+      body: {
+        agents: [
+          { id: 'dev-3', runtime: 'claude-code', role: 'dev', mode: 'local' },
+          { id: 'qa-3', runtime: 'codex', role: 'qa', mode: 'local' },
+        ],
+      },
+    },
+    {
+      name: 'projects.replaceAgent',
+      run: () =>
+        api.projects.replaceAgent('p-1', 'qa-3', {
+          id: 'qa-4',
+          runtime: 'codex',
+          role: 'qa',
+          mode: 'local',
+        }),
+      url: '/api/projects/p-1/agents/qa-3',
+      method: 'PUT',
+      body: { id: 'qa-4', runtime: 'codex', role: 'qa', mode: 'local' },
     },
     {
       name: 'projects.deleteAgent',
@@ -313,17 +335,17 @@ describe('response handling helpers', () => {
     fetchSpy.mockImplementationOnce(async () => jsonResponse({
       error: 'Invalid config',
       details: [
-        { path: 'project[0].gitCli.tool', message: "declare a tool or use review.mode: 'server'" },
+        { path: 'project[0].gitCli.tool', message: 'required for non-GitHub repositories' },
         { path: 7, message: 'invalid path' },
         null,
       ],
     }, 400));
     const err = await api.projects.list().catch((e: unknown) => e) as ApiError;
     expect(err.message).toBe(
-      "Invalid config\nproject[0].gitCli.tool: declare a tool or use review.mode: 'server'",
+      'Invalid config\nproject[0].gitCli.tool: required for non-GitHub repositories',
     );
     expect(err.details).toEqual([
-      { path: 'project[0].gitCli.tool', message: "declare a tool or use review.mode: 'server'" },
+      { path: 'project[0].gitCli.tool', message: 'required for non-GitHub repositories' },
     ]);
   });
 

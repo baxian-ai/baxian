@@ -1,9 +1,8 @@
-import { randomBytes } from 'node:crypto';
 import { BRANCH_PREFIX, isValidBranchName } from '../shared/index.js';
 import { execNetwork, GIT_NET_ENV } from './net-exec.js';
 import type { CommandRunner } from './runner.js';
 import { shellQuote } from './runner.js';
-import { ensureBaxianRuntimeDirsSafe, stageFileGuarded, canonicalSelfGuard, ancestorSymlinkGuard } from './repo-store.js';
+import { canonicalSelfGuard } from './repo-store.js';
 
 export interface AutoDeleteIdentity {
   taskId?: string;
@@ -33,17 +32,6 @@ export class ReviewHeadMismatchError extends Error {
     super(`Fetched review head mismatch for ${branch}: expected ${expectedHeadSha}, got ${actualHeadSha}`);
     this.name = 'ReviewHeadMismatchError';
   }
-}
-
-export interface ReviewHeadOpts {
-  baseSha?: string;
-  headSha?: string;
-  headTree?: string;
-  patch: string;
-}
-
-export interface ReviewCheckoutResult {
-  mode: 'head' | 'base';
 }
 
 export type BranchCleanupResult =
@@ -189,65 +177,6 @@ export class BranchManager {
   async parkOnDefaultDetached(workdir: string): Promise<void> {
     await this.assertClean(workdir);
     await this.switchDetached(workdir, await this.resolveCommit(workdir, 'origin/HEAD'));
-  }
-
-  async materializeReviewHead(workdir: string, opts: ReviewHeadOpts): Promise<ReviewCheckoutResult> {
-    await this.assertClean(workdir);
-    if (!opts.baseSha || !opts.headSha || !opts.headTree) {
-      throw new Error('Server review head metadata is incomplete; refusing an unverified checkout');
-    }
-    const head = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} cat-file -e ${shellQuote(`${opts.headSha}^{commit}`)}`,
-    );
-    if (head.exitCode === 0) {
-      await this.switchDetached(workdir, opts.headSha);
-      await this.verifyTree(workdir, opts.headTree);
-      return { mode: 'head' };
-    }
-
-    await this.fetch(workdir);
-    await this.resolveCommit(workdir, opts.baseSha);
-    await this.switchDetached(workdir, opts.baseSha);
-    await ensureBaxianRuntimeDirsSafe(this.runner, workdir);
-    const patchFile = `${workdir}/.baxian/review-inbox/.materialize-${randomBytes(8).toString('hex')}.patch`;
-    // Guarded staged write (not raw writeFile): attacker-influenced patch content must never land through a rebound Workdir ancestor.
-    await stageFileGuarded(this.runner, workdir, patchFile, opts.patch);
-    let operationError: unknown;
-    try {
-      if (opts.patch.trim() !== '') {
-        const apply = await this.runner.exec(
-          `${canonicalSelfGuard(workdir)} && git -C ${shellQuote(workdir)} apply --index --binary ${shellQuote(patchFile)}`,
-        );
-        if (apply.exitCode !== 0) {
-          throw new Error(`Review patch apply failed: ${apply.stderr.trim()}`);
-        }
-      }
-      const staged = await this.runner.exec(
-        `git -C ${shellQuote(workdir)} diff --cached --quiet`,
-      );
-      if (staged.exitCode === 1) await this.commitReviewHead(workdir, opts.headSha);
-      else if (staged.exitCode !== 0) throw new Error(`Review index probe failed: ${staged.stderr.trim()}`);
-      await this.verifyTree(workdir, opts.headTree);
-      return { mode: 'head' };
-    } catch (err) {
-      operationError = err;
-      throw err;
-    } finally {
-      // Same-command ancestor guard as the write: a rebound Workdir ancestor must never let the rm escape.
-      const removed = await this.runner.exec(
-        `${ancestorSymlinkGuard(workdir, patchFile)} && rm -f ${shellQuote(patchFile)}`,
-      );
-      if (removed.exitCode !== 0) {
-        const cleanupError = new Error(`Review patch cleanup failed: ${removed.stderr.trim()}`);
-        if (operationError !== undefined) {
-          throw new AggregateError(
-            [operationError, cleanupError],
-            'Review head materialization and patch cleanup both failed',
-          );
-        }
-        throw cleanupError;
-      }
-    }
   }
 
   async cleanupTaskBranch(
@@ -513,27 +442,4 @@ export class BranchManager {
     if (actual !== expected) throw new Error(`Checkout mismatch: expected ${expected}, got ${actual ?? 'detached HEAD'}`);
   }
 
-  private async verifyTree(workdir: string, expected: string): Promise<void> {
-    const result = await this.runner.exec(
-      `git -C ${shellQuote(workdir)} rev-parse --verify ${shellQuote('HEAD^{tree}')}`,
-    );
-    if (result.exitCode !== 0 || result.stdout.trim() !== expected) {
-      throw new Error(`Review head tree mismatch: expected ${expected}, got ${result.stdout.trim() || '<unresolved>'}`);
-    }
-  }
-
-  private async commitReviewHead(workdir: string, headSha: string): Promise<void> {
-    const identity = [
-      `GIT_AUTHOR_NAME=${shellQuote('baxian review')}`,
-      'GIT_AUTHOR_EMAIL=baxian-review@localhost',
-      `GIT_COMMITTER_NAME=${shellQuote('baxian review')}`,
-      'GIT_COMMITTER_EMAIL=baxian-review@localhost',
-    ].join(' ');
-    const result = await this.runner.exec(
-      `${canonicalSelfGuard(workdir)} && ${identity} git -C ${shellQuote(workdir)} -c user.email=baxian-review@localhost ` +
-        `-c user.name=${shellQuote('baxian review')} commit --no-gpg-sign --no-verify -q ` +
-        `-m ${shellQuote(`baxian review head ${headSha}`)}`,
-    );
-    if (result.exitCode !== 0) throw new Error(`Review patch commit failed: ${result.stderr.trim()}`);
-  }
 }

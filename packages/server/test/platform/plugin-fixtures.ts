@@ -43,6 +43,10 @@ export const DRIVER = JSON.stringify({
       parse: 'json-paged',
       map: { id: 'id', body: 'body', createdAt: 'created_at', updatedAt: 'updated_at' },
     },
+    comment: {
+      argv: ['{binary}', 'api', '-X', 'POST', 'repos/{repoPath}/issues/{prNumber}/comments', '-F', 'body=@-'],
+      stdin: '{body}',
+    },
     merge: {
       argv: ['{binary}', 'api', '-X', 'PUT', 'repos/{repoPath}/pulls/{prNumber}/merge', '-f', 'sha={expectedHeadSha}'],
     },

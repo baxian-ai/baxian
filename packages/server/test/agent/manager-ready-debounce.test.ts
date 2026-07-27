@@ -139,8 +139,8 @@ describe('任务边界注入前的稳定就绪门（task-209 回归）', () => {
     vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
 
     const boundary = (manager as unknown as {
-      clearRuntimeForTaskBoundary(t: TmuxManager, p: string, a: string, r: string, rv: () => Promise<void>): Promise<void>;
-    }).clearRuntimeForTaskBoundary.bind(manager);
+      clearRuntimeForDispatchBoundary(t: TmuxManager, p: string, a: string, r: string, rv: () => Promise<void>): Promise<void>;
+    }).clearRuntimeForDispatchBoundary.bind(manager);
 
     await expect(boundary(tmux, '%0', 'qa-1', 'codex', async () => undefined))
       .rejects.toBeInstanceOf(ReplNotReadyError);
@@ -159,8 +159,8 @@ describe('任务边界注入前的稳定就绪门（task-209 回归）', () => {
     vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined);
 
     const boundary = (manager as unknown as {
-      clearRuntimeForTaskBoundary(t: TmuxManager, p: string, a: string, r: string, rv: () => Promise<void>): Promise<void>;
-    }).clearRuntimeForTaskBoundary.bind(manager);
+      clearRuntimeForDispatchBoundary(t: TmuxManager, p: string, a: string, r: string, rv: () => Promise<void>): Promise<void>;
+    }).clearRuntimeForDispatchBoundary.bind(manager);
 
     await expect(boundary(tmux, '%0', 'qa-1', 'codex', async () => undefined)).resolves.toBeUndefined();
     expect(clearDraft).toHaveBeenCalled();

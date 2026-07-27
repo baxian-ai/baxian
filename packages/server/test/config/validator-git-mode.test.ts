@@ -8,7 +8,6 @@ function baseProject(overrides: Partial<ProjectConfig> = {}): ProjectConfig {
     id: 'p1',
     repo: 'https://gitlab.example.com/g/sub/proj.git',
     merge: null,
-    review: { mode: 'git' },
     gitCli: { tool: 'glab' },
     agent: [],
     ...overrides,
@@ -28,43 +27,28 @@ function messages(config: BaxianConfig): string {
   return validateConfig(config).map(e => e.message).join('\n');
 }
 
-describe("validateConfig: review.mode 'git'", () => {
-  it('is an operational mode: a well-formed git project passes clean', () => {
+describe('validateConfig: PR platform workflow', () => {
+  it('accepts a well-formed project', () => {
     expect(messages(baseConfig())).toBe('');
   });
 
-  it("rejects the retired 'github' value at both scopes with a指引 to the live enum", () => {
-    const globalScope = messages({
-      review: { rounds: 3, mode: 'github' as never },
-      server: DEFAULT_SERVER_CONFIG,
-      host: [],
-      project: [baseProject()],
-    });
-    expect(globalScope).toMatch(/review\.mode must be 'git' or 'server'/);
-
-    const projectScope = messages(baseConfig({ review: { mode: 'github' as never } }));
-    expect(projectScope).toMatch(/project\.review\.mode must be 'git' or 'server'/);
-  });
-
-  it("defaults to 'git' when no mode is declared anywhere", () => {
+  it('requires an explicit driver tool for non-GitHub projects', () => {
     const cfg: BaxianConfig = {
       review: { rounds: 3 },
       server: DEFAULT_SERVER_CONFIG,
       host: [],
       project: [{ id: 'p1', repo: 'https://gitlab.example.com/g/p.git', merge: null, agent: [] }],
     };
-    // 缺省即 git：非 github 仓库缺 gitCli 会命中 git 模式的结构校验，正是「缺省已是 git」的证据
     expect(messages(cfg)).toMatch(/require gitCli\.tool/);
   });
 
-  it("github repos may use mode 'git' with zero config", () => {
+  it('GitHub repos use gh with zero config', () => {
     const msgs = messages(baseConfig({ repo: 'https://github.com/a/b.git', gitCli: undefined }));
     expect(msgs).toBe('');
-    expect(msgs).not.toMatch(/must use review\.mode/);
     expect(msgs).not.toMatch(/gitCli/);
   });
 
-  it("github ssh/scp/bare-slug repos pass the URL-form check in mode 'git'", () => {
+  it('accepts GitHub ssh, scp, and bare-slug forms', () => {
     for (const repo of ['git@github.com:a/b.git', 'ssh://git@github.com/a/b.git', 'a/b']) {
       const msgs = messages(baseConfig({ repo, gitCli: undefined }));
       expect(msgs, repo).toBe('');
@@ -85,14 +69,13 @@ describe("validateConfig: review.mode 'git'", () => {
     expect(fullUrl).not.toMatch(/bare owner\/repo slug/);
   });
 
-  it('non-github repos in git mode require gitCli, with the install-or-server hint', () => {
+  it('non-GitHub repos require a matching git-driver plugin declaration', () => {
     const msgs = messages(baseConfig({ gitCli: undefined }));
     expect(msgs).toMatch(/gitCli\.tool/);
     expect(msgs).toMatch(/plugins/);
-    expect(msgs).toMatch(/review\.mode 'server'/);
   });
 
-  it('requires gitCli for git mode; rejects ssh/scp/userinfo repo URLs', () => {
+  it('requires gitCli and rejects unsupported or credential-bearing repo URLs', () => {
     expect(messages(baseConfig({ gitCli: undefined }))).toMatch(/gitCli/);
 
     for (const repo of [
@@ -109,7 +92,7 @@ describe("validateConfig: review.mode 'git'", () => {
     expect(messages(baseConfig({ gitCli: { tool: 'glab', binary: 'relative/glab' } }))).toMatch(/absolute/);
   });
 
-  it('rejects a duplicate normalized repo URL across git-mode projects', () => {
+  it('rejects a duplicate normalized repo URL', () => {
     const config = baseConfig();
     config.project.push({ ...config.project[0], id: 'p2' });
     expect(messages(config)).toMatch(/unique|duplicate/i);
@@ -166,9 +149,9 @@ describe("validateConfig: review.mode 'git'", () => {
       .toMatch(/control characters/);
   });
 
-  it('rejects control characters in project.repo on any project, git mode or not', () => {
+  it('rejects control characters in project.repo', () => {
     for (const repo of ['https://gl.example.com/g/p\u0000.git', 'a/b\rc', 'https://gl.example.com/g/\np.git']) {
-      const msgs = messages(baseConfig({ repo, review: { mode: 'server' }, gitCli: undefined }));
+      const msgs = messages(baseConfig({ repo, gitCli: undefined }));
       expect(msgs, JSON.stringify(repo)).toMatch(/control characters/);
     }
   });
@@ -178,14 +161,15 @@ describe("validateConfig: review.mode 'git'", () => {
     expect(msgs).toMatch(/not.*parseable|parseable.*URL/i);
   });
 
-  it('gitCli on a github project is legal (redundant but harmless); server mode stays untouched', () => {
+  it('GitHub uses its built-in gh binding and accepts an explicit gh declaration', () => {
     expect(messages(baseConfig({
       repo: 'https://github.com/a/b.git',
-      review: { mode: 'git' },
+      gitCli: undefined,
+    }))).toBe('');
+    expect(messages(baseConfig({
+      repo: 'https://github.com/a/b.git',
       gitCli: { tool: 'gh' },
     }))).toBe('');
-
-    expect(validateConfig(baseConfig({ review: { mode: 'server' }, gitCli: undefined }))).toEqual([]);
   });
 });
 
@@ -193,14 +177,14 @@ function malformed(overrides: Record<string, unknown>): BaxianConfig {
   return baseConfig(overrides as unknown as Partial<ProjectConfig>);
 }
 
-describe('validateGitMode: malformed input does not crash', () => {
+describe('platform config: malformed input does not crash', () => {
   it('gitCli: null is reported as an object-shape error, not a crash', () => {
     const config = malformed({ gitCli: null });
     expect(() => validateConfig(config)).not.toThrow();
     expect(messages(config)).toMatch(/gitCli must be an object/);
   });
 
-  it("repo missing on a 'git' mode project does not crash and is not double-reported", () => {
+  it('a missing repo does not crash and is not double-reported', () => {
     const config = malformed({ repo: undefined, gitCli: undefined });
     expect(() => validateConfig(config)).not.toThrow();
     const msgs = messages(config);
@@ -208,76 +192,35 @@ describe('validateGitMode: malformed input does not crash', () => {
     expect(msgs).not.toMatch(/http\(s\)/);
   });
 
-  it("repo non-string on a 'git' mode project does not crash", () => {
+  it('a non-string repo does not crash', () => {
     const config = malformed({ repo: 12345, gitCli: undefined });
     expect(() => validateConfig(config)).not.toThrow();
     expect(messages(config)).toMatch(/project\.repo must be a non-empty string/);
   });
 
-  it('gitCli present with repo missing does not crash even outside git mode', () => {
-    const config = malformed({ repo: undefined, review: { mode: 'server' }, gitCli: { tool: 'glab' } });
+  it('gitCli present with repo missing does not crash', () => {
+    const config = malformed({ repo: undefined, gitCli: { tool: 'glab' } });
     expect(() => validateConfig(config)).not.toThrow();
     expect(messages(config)).toMatch(/project\.repo must be a non-empty string/);
   });
 });
 
 describe('platform repo uniqueness (entry-set scope)', () => {
-  const cfg = (projects: ProjectConfig[], review: BaxianConfig['review']): BaxianConfig =>
-    ({ review, server: DEFAULT_SERVER_CONFIG, host: [], project: projects });
+  const cfg = (projects: ProjectConfig[]): BaxianConfig =>
+    ({ review: { rounds: 3 }, server: DEFAULT_SERVER_CONFIG, host: [], project: projects });
   const gh = (id: string, over: Partial<ProjectConfig> = {}): ProjectConfig =>
     ({ id, repo: 'https://github.com/owner/repo.git', merge: null, agent: [], ...over });
 
-  it('rejects two server projects that both publish PRs into one repo', () => {
-    const errors = validateConfig(cfg(
-      [gh('proj-a', { review: { mode: 'server' } }), gh('proj-b', { review: { mode: 'server' } })],
-      { rounds: 3, mode: 'server', afterDone: 'pr' },
-    ));
-    expect(errors.map(e => e.message).join('\n')).toMatch(/must be unique across platform-polled projects/);
-  });
-
-  it('allows two server projects on one repo when neither opens a PR', () => {
-    expect(validateConfig(cfg(
-      [gh('proj-a', { review: { mode: 'server' } }), gh('proj-b', { review: { mode: 'server' } })],
-      { rounds: 3, mode: 'server', afterDone: 'branch' },
-    ))).toEqual([]);
-  });
-
-  it('rejects a git project sharing its repo with a PR-publishing server project', () => {
-    const errors = validateConfig(cfg(
-      [gh('proj-a'), gh('proj-b', { review: { mode: 'server' } })],
-      { rounds: 3, afterDone: 'pr' },
-    ));
+  it('rejects two projects sharing one normalized repo', () => {
+    const errors = validateConfig(cfg([gh('proj-a'), gh('proj-b')]));
     expect(errors.map(e => e.message).join('\n')).toMatch(/must be unique across platform-polled projects/);
   });
 
   it('reports the collision on the second project, naming the first', () => {
-    const errors = validateConfig(cfg([gh('first'), gh('second')], { rounds: 3 }));
+    const errors = validateConfig(cfg([gh('first'), gh('second')]));
     expect(errors).toEqual([expect.objectContaining({
       path: 'project[1].repo',
       message: expect.stringContaining("already used by project 'first'"),
     })]);
-  });
-});
-
-describe("server+afterDone 'pr' gitCli.tool constraint", () => {
-  const cfg = (over: Partial<ProjectConfig>, afterDone: BaxianConfig['review']['afterDone']): BaxianConfig =>
-    ({ review: { rounds: 3, mode: 'server', afterDone }, server: DEFAULT_SERVER_CONFIG, host: [],
-      project: [{ id: 'proj', repo: 'https://github.com/a/b.git', merge: null, agent: [], ...over }] });
-
-  it('rejects a non-gh tool when the server project publishes PRs', () => {
-    const errors = validateConfig(cfg({ gitCli: { tool: 'forge' } }, 'pr'));
-    expect(errors).toEqual([expect.objectContaining({ path: 'project[0].gitCli.tool' })]);
-  });
-
-  it('allows gitCli.tool gh (redundant but harmless)', () => {
-    expect(validateConfig(cfg({ gitCli: { tool: 'gh' } }, 'pr'))).toEqual([]);
-  });
-
-  it("allows gh + a custom binary (binary is server-face, doesn't fork transport)", () => {
-    expect(validateConfig(cfg({ gitCli: { tool: 'gh', binary: '/opt/bin/gh' } }, 'pr'))).toEqual([]);
-  });
-
-  it('allows a non-gh tool when the server project only pushes a branch (no publish fork)', () => {
-    expect(validateConfig(cfg({ gitCli: { tool: 'forge' } }, 'branch'))).toEqual([]);
   });
 });

@@ -1,15 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   PhaseSignalWatcher,
-  settlePermitOf,
   type NeedInputCommitIntent,
   type NeedInputCommitResult,
 } from '../../src/agent/phase-signal-watcher.js';
-import { buildPhaseSignal, PASSIVE_VERDICT_WATCH, type PhaseSignalKind } from '../../src/agent/phase-signal.js';
-import type { AgentConfig, BaxianEvent, EventType } from '../../src/shared/index.js';
+import { buildPhaseSignal, PASSIVE_VERDICT_WATCH } from '../../src/agent/phase-signal.js';
+import type { AgentConfig, BaxianEvent } from '../../src/shared/index.js';
 import type { EventBus } from '../../src/event/bus.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
 import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
+import { VisibleTextExtractor } from '../../src/agent/vt-visible-text.js';
 
 const DEV_AGENT: AgentConfig = {
   id: 'dev-1',
@@ -30,13 +30,22 @@ interface FakeStreamer {
 
 function createFakeStreamer(): FakeStreamer {
   // Per-subscription records: an old generation's unsubscribe must not silence a newer one.
-  const subs: Array<{ live?: SubscriberCallbacks['onLive']; sessionGone?: SubscriberCallbacks['onSessionGone'] }> = [];
+  const subs: Array<{
+    live?: SubscriberCallbacks['onLive'];
+    visible?: SubscriberCallbacks['onVisible'];
+    sessionGone?: SubscriberCallbacks['onSessionGone'];
+  }> = [];
+  // Mirrors PaneStreamer: one decoder bound to the whole stream, shared by every subscription.
+  const decoder = new VisibleTextExtractor();
   let snapshotData = '';
   let failNext = false;
   let holdNext: Promise<void> | null = null;
   const state: FakeStreamer = {
     unsubscribed: false,
-    triggerLive: (data: string) => { for (const sub of subs) sub.live?.(data); },
+    triggerLive: (data: string) => {
+      const visible = decoder.write(data);
+      for (const sub of subs) { sub.live?.(data, 0); sub.visible?.(visible, 0); }
+    },
     triggerSessionGone: () => { for (const sub of subs) sub.sessionGone?.(); },
     setSnapshot: (data: string) => { snapshotData = data; },
     failNextSubscribe: () => { failNext = true; },
@@ -55,13 +64,14 @@ function createFakeStreamer(): FakeStreamer {
         holdNext = null;
         await gate;
       }
-      const record: typeof subs[number] = { live: cbs.onLive, sessionGone: cbs.onSessionGone };
+      const record: typeof subs[number] = { live: cbs.onLive, visible: cbs.onVisible, sessionGone: cbs.onSessionGone };
       subs.push(record);
       return {
         snapshot: { data: snapshotData },
         unsubscribe: () => {
           state.unsubscribed = true;
           record.live = undefined;
+          record.visible = undefined;
           record.sessionGone = undefined;
         },
       };
@@ -148,11 +158,13 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'tok123abc456';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(1);
-    expect(captured[0].type).toBe('server.spec.ready');
+    expect(captured[0].type).toBe('spec.ready');
     expect(captured[0].data).toMatchObject({
       kind: 'spec-done',
+      prNumber: 42,
+      actorB64: 'Nzc',
       token,
       source: 'pane-signal',
     });
@@ -177,7 +189,7 @@ describe('PhaseSignalWatcher', () => {
   it('start() returns false when subscribeAtomic rejects (transient pane fault)', async () => {
     const { watcher, streamer } = makeWatcher();
     streamer.subscribeAtomic.mockRejectedValueOnce(new Error('streamer destroyed'));
-    const armed = await startWatch(watcher, { expectedKinds: 'spec-reviewed', token: 'tok123abc456' });
+    const armed = await startWatch(watcher, { expectedKinds: 'pr-fixed', token: 'tok123abc456' });
     expect(armed).toBe(false);
     expect(watcher.has('t1')).toBe(false);
   });
@@ -195,7 +207,7 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'tokenABCDEF12';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-reviewed', token)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('pr-fixed', token)}\n`);
     expect(captured).toHaveLength(0);
   });
 
@@ -203,7 +215,7 @@ describe('PhaseSignalWatcher', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'correctTok01' });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'wrongTok123x')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'wrongTok123x', 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
     // The mismatch is the point here; the foreign-token warn is expected, not stderr noise
     expect(warn.mock.calls.some(c => String(c[0]).includes('foreign token'))).toBe(true);
@@ -226,10 +238,10 @@ describe('PhaseSignalWatcher', () => {
   it('matches signal wrapped in ANSI color codes', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'ansiTok123ab';
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token });
-    streamer.triggerLive(`\x1b[32m${buildPhaseSignal('spec-fixed', token)}\x1b[0m\n`);
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token });
+    streamer.triggerLive(`\x1b[32m${buildPhaseSignal('pr-fixed', token)}\x1b[0m\n`);
     expect(captured).toHaveLength(1);
-    expect(captured[0].type).toBe('server.spec.fix.submitted');
+    expect(captured[0].type).toBe('pr.fix.submitted');
   });
 
   it('matches a soft-wrapped signal (TUI breaks mid-token with whitespace)', async () => {
@@ -258,8 +270,8 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     const token = 'oncetok123ab';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -269,6 +281,39 @@ describe('PhaseSignalWatcher', () => {
     streamer.setSnapshot(`prior output\n${buildPhaseSignal('pr-merge-ready', token)}\n`);
     await startWatch(watcher, { expectedKinds: 'pr-merge-ready', token });
     expect(captured).toHaveLength(1);
+  });
+
+  it('exposes a matching snapshot event until its handler settles', async () => {
+    const { watcher, streamer, emit } = makeWatcher();
+    const token = 'snapshotSettle1';
+    streamer.setSnapshot(buildPhaseSignal('pr-fixed', token));
+    let release!: () => void;
+    emit.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token });
+
+    expect(watcher.isSettling('t1')).toBe(true);
+    release();
+    await watcher.awaitSettled('t1');
+    expect(watcher.isSettling('t1')).toBe(false);
+  });
+
+  it('releases a snapshot settlement when event delivery fails', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { watcher, streamer, emit } = makeWatcher();
+    const token = 'snapshotFailed1';
+    streamer.setSnapshot(buildPhaseSignal('pr-fixed', token));
+    emit.mockRejectedValueOnce(new Error('bus down'));
+
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token });
+    await watcher.awaitSettled('t1');
+
+    expect(watcher.isSettling('t1')).toBe(false);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('eventBus.emit failed'),
+      expect.any(Error),
+    );
+    error.mockRestore();
   });
 
   it('skipSnapshot=true: ignores signal sitting in pane snapshot at subscribe', async () => {
@@ -288,9 +333,9 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'old1tok234ab' });
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'new1tok234ab' });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'old1tok234ab')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'old1tok234ab', 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'new1tok234ab')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'new1tok234ab', 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(1);
     warn.mockRestore();
   });
@@ -300,7 +345,7 @@ describe('PhaseSignalWatcher', () => {
     const token = 'stoptok1234a';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
     watcher.stop('t1');
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
   });
 
@@ -308,15 +353,15 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed',
       token: 'qatok1234567', replaceScope: 'agent',
     });
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42, 'Nzc')}\n`);
     // 同任务完成信号经互斥段串行投递，第二发排在第一发结算之后
     await flushMicrotasks();
     expect(captured).toHaveLength(2);
@@ -327,12 +372,12 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'qatok1234567',
     });
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42)}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -340,28 +385,28 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'qatok1234567', replaceScope: 'agent',
     });
     watcher.stopAgent('t1', DEV_AGENT.id);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
     watcher.stop('t1');
     expect(watcher.has('t1')).toBe(false);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(0);
   });
 
   it('an agent-scoped fenced arm ignores a sibling entry holding a rotated token', async () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qarotated456', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'qarotated456', replaceScope: 'agent',
     });
     const armed = await startWatch(watcher, {
       expectedKinds: 'pr-created', token: 'devtok123456',
       replaceScope: 'agent', onlyReplaceOwnToken: true,
     });
     expect(armed).toBe(true);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 7)}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 7, 'Nzc')}\n`);
     expect(captured).toHaveLength(1);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
   });
@@ -370,12 +415,12 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'devtok123456' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'qatok1234567', replaceScope: 'agent',
     });
     watcher.stopIfToken('t1', 'devtok123456');
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -383,14 +428,14 @@ describe('PhaseSignalWatcher', () => {
     const { watcher, streamers, captured } = makeDualWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token: 'sharedtok1234' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'sharedtok1234', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'sharedtok1234', replaceScope: 'agent',
     });
 
     watcher.stopAgentIfToken('t1', DEV_AGENT.id, 'sharedtok1234');
 
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'sharedtok1234')}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'sharedtok1234')}\n`);
     expect(captured).toHaveLength(1);
   });
 
@@ -401,7 +446,7 @@ describe('PhaseSignalWatcher', () => {
     const newToken = 'devnewtok1234';
     await startWatch(watcher, { expectedKinds: 'pr-created', token: oldToken, replaceScope: 'agent' });
     await startWatch(watcher, {
-      agentId: QA_AGENT.id, expectedKinds: 'spec-reviewed', token: 'qatok1234567', replaceScope: 'agent',
+      agentId: QA_AGENT.id, expectedKinds: 'pr-fixed', token: 'qatok1234567', replaceScope: 'agent',
     });
     const claim = watcher.claimArm({
       taskId: 't1', agentId: DEV_AGENT.id, token: newToken, replaceFromToken: oldToken,
@@ -420,10 +465,10 @@ describe('PhaseSignalWatcher', () => {
     expect(await handoff).toBe(true);
     watcher.releaseArm(claim);
 
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', oldToken, 1)}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', oldToken, 1, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
-    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('spec-reviewed', 'qatok1234567')}\n`);
-    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', newToken, 2)}\n`);
+    streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
+    streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', newToken, 2, 'Nzc')}\n`);
     // 同任务完成信号经互斥段串行投递
     await flushMicrotasks();
     expect(captured.map(event => event.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
@@ -460,7 +505,7 @@ describe('PhaseSignalWatcher', () => {
 
     watcher.stopIfToken('t1', token);
     expect(watcher.has('t1')).toBe(false);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
   });
 
@@ -472,9 +517,9 @@ describe('PhaseSignalWatcher', () => {
     watcher.stopIfToken('t1', 'staletok1234');
 
     expect(watcher.has('t1')).toBe(true);
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'freshtok1234')}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', 'freshtok1234', 42, 'Nzc')}\n`);
     expect(captured.length).toBeGreaterThan(0);
-    expect(captured[0].type).toBe('server.spec.ready');
+    expect(captured[0].type).toBe('spec.ready');
   });
 
   it('a fenced arm never displaces a successor watch already re-armed with a rotated token', async () => {
@@ -580,7 +625,7 @@ describe('PhaseSignalWatcher', () => {
     });
     const token = 'emitFail1234';
     await startWatch(watcher, { expectedKinds: 'spec-done', token });
-    streamer.triggerLive(`${buildPhaseSignal('spec-done', token)}\n`);
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', token, 42, 'Nzc')}\n`);
     await flushMicrotasks();
     expect(captured.length).toBe(1);
     expect((captured[0].data as { phase: string }).phase).toMatch(/^signal-emit-failed:/);
@@ -588,92 +633,12 @@ describe('PhaseSignalWatcher', () => {
 
   it('expectedKindsFor(taskId): reports the watched set; empty Set after stop', async () => {
     const { watcher } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: ['spec-reviewed', 'pr-fixed'], token: 'introspct123' });
+    await startWatch(watcher, { expectedKinds: ['spec-done', 'pr-fixed'], token: 'introspct123' });
     const armed = watcher.expectedKindsFor('t1');
-    expect(armed.has('spec-reviewed')).toBe(true);
+    expect(armed.has('spec-done')).toBe(true);
     expect(armed.has('pr-fixed')).toBe(true);
-    expect(armed.has('spec-done')).toBe(false);
     watcher.stop('t1');
     expect(watcher.expectedKindsFor('t1').size).toBe(0);
-  });
-});
-
-describe('kind → event type routing', () => {
-  const ROUTING: ReadonlyArray<[PhaseSignalKind, EventType]> = [
-    ['spec-fixed', 'server.spec.fix.submitted'],
-    ['spec-done', 'server.spec.ready'],
-    ['spec-reviewed', 'server.spec.review.submitted'],
-    ['code-done', 'server.code.ready'],
-    ['code-reviewed', 'server.code.review.submitted'],
-    ['code-fixed', 'server.code.fix.submitted'],
-    ['code-ready', 'server.code.published'],
-    ['pr-created', 'pr.created'],
-    ['pr-fixed', 'pr.fix.submitted'],
-    ['pr-merge-ready', 'pr.updated'],
-  ];
-
-  it.each(ROUTING)('a watched %s signal emits %s', async (kind, eventType) => {
-    const { watcher, streamer, captured } = makeWatcher();
-    const token = 'routetok1234';
-    await startWatch(watcher, { expectedKinds: kind, token });
-    const wire = kind === 'pr-created' ? buildPhaseSignal('pr-created', token, 7) : buildPhaseSignal(kind, token);
-    streamer.triggerLive(`${wire}\n`);
-    expect(captured).toHaveLength(1);
-    expect(captured[0].type).toBe(eventType);
-  });
-
-});
-
-describe('server-chain signal watching', () => {
-  it('emits the server event type for a server-chain kind', async () => {
-    const { watcher, streamer, captured } = makeWatcher();
-    const token = 'srvtok123456';
-    await startWatch(watcher, { expectedKinds: 'code-reviewed', token });
-    streamer.triggerLive(`${buildPhaseSignal('code-reviewed', token)}\n`);
-    expect(captured).toHaveLength(1);
-    expect(captured[0].type).toBe('server.code.review.submitted');
-  });
-
-  it('code-ready event data carries prNumber when present', async () => {
-    const { watcher, streamer, captured } = makeWatcher();
-    const token = 'srvtok123456';
-    await startWatch(watcher, { expectedKinds: 'code-ready', token });
-    streamer.triggerLive(`[bx:code-ready:42:${token}]\n`);
-    expect(captured).toHaveLength(1);
-    expect(captured[0].type).toBe('server.code.published');
-    expect(captured[0].data.prNumber).toBe(42);
-  });
-
-  it('fires onReadFile once per distinct request, not on tail rescans', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const seen: string[] = [];
-    await startWatch(watcher, {
-      expectedKinds: 'code-reviewed',
-      token: 'srvtok123456',
-      onReadFile: req => seen.push(`${req.file}:${req.startLine}-${req.endLine}`),
-    });
-    streamer.triggerLive('[bx:read-file:src/a.ts:1-50]');
-    streamer.triggerLive(' trailing chunk keeps old bytes in buffer ');
-    streamer.triggerLive('[bx:read-file:src/b.ts:5-9]');
-    expect(seen).toEqual(['src/a.ts:1-50', 'src/b.ts:5-9']);
-  });
-});
-
-describe('snapshot read-file suppression', () => {
-  it('marks scrollback requests seen without firing; live requests still fire', async () => {
-    const { watcher, streamer } = makeWatcher();
-    const seen: string[] = [];
-    streamer.setSnapshot('[bx:read-file:old/a.ts:1-10]');
-    await startWatch(watcher, {
-      expectedKinds: 'code-reviewed',
-      token: 'srvtok123456',
-      onReadFile: req => seen.push(req.raw),
-    });
-    expect(seen).toEqual([]);
-    streamer.triggerLive('[bx:read-file:new/b.ts:5-9]');
-    expect(seen).toEqual(['[bx:read-file:new/b.ts:5-9]']);
-    streamer.triggerLive('[bx:read-file:old/a.ts:1-10]');
-    expect(seen).toEqual(['[bx:read-file:new/b.ts:5-9]']);
   });
 });
 
@@ -694,12 +659,12 @@ describe('stale signal token visibility', () => {
   it('logs a live marker of the expected kind carrying a foreign token, without eventing', async () => {
     const warn = spyWarn();
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(buildPhaseSignal('spec-fixed', stale));
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(buildPhaseSignal('pr-fixed', stale));
     await flushMicrotasks();
     const lines = staleWarnings(warn);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('spec-fixed');
+    expect(lines[0]).toContain('pr-fixed');
     expect(lines[0]).toContain(`observed=${stale}`);
     expect(lines[0]).toContain(`expected=${armed}`);
     expect(lines[0]).toContain('task=t1');
@@ -711,14 +676,14 @@ describe('stale signal token visibility', () => {
   it('logs each distinct stale token once despite tail rescans and redraws', async () => {
     const warn = spyWarn();
     const { watcher, streamer } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(buildPhaseSignal('spec-fixed', stale));
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(buildPhaseSignal('pr-fixed', stale));
     streamer.triggerLive(' redraw keeps the old marker in the tail window ');
-    streamer.triggerLive(buildPhaseSignal('spec-fixed', stale));
+    streamer.triggerLive(buildPhaseSignal('pr-fixed', stale));
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(1);
 
-    streamer.triggerLive(buildPhaseSignal('spec-fixed', 'ff00ff00ff00'));
+    streamer.triggerLive(buildPhaseSignal('pr-fixed', 'ff00ff00ff00'));
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(2);
     warn.mockRestore();
@@ -727,8 +692,8 @@ describe('stale signal token visibility', () => {
   it('stays silent on the arm-time snapshot: scrollback holds markers of every past round', async () => {
     const warn = spyWarn();
     const { watcher, streamer } = makeWatcher();
-    streamer.setSnapshot(buildPhaseSignal('spec-fixed', stale));
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
+    streamer.setSnapshot(buildPhaseSignal('pr-fixed', stale));
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
     // 快照尾部留在 entry.buffer：首个 live chunk 会连同它一起重扫，历史 marker 不得被当成新到的外来令牌
@@ -741,11 +706,11 @@ describe('stale signal token visibility', () => {
   it('surfaces a live mis-send even when that token was already sitting in the arm snapshot', async () => {
     const warn = spyWarn();
     const { watcher, streamer } = makeWatcher();
-    streamer.setSnapshot(buildPhaseSignal('spec-fixed', stale));
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
+    streamer.setSnapshot(buildPhaseSignal('pr-fixed', stale));
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
-    streamer.triggerLive(buildPhaseSignal('spec-fixed', stale));
+    streamer.triggerLive(buildPhaseSignal('pr-fixed', stale));
     await flushMicrotasks();
     const lines = staleWarnings(warn);
     expect(lines).toHaveLength(1);
@@ -756,34 +721,34 @@ describe('stale signal token visibility', () => {
   it('stays silent for an unwatched kind and when the armed token does arrive', async () => {
     const warn = spyWarn();
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(buildPhaseSignal('code-fixed', stale));
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(buildPhaseSignal('pr-merge-ready', stale));
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
 
-    streamer.triggerLive(buildPhaseSignal('spec-fixed', armed));
+    streamer.triggerLive(buildPhaseSignal('pr-fixed', armed));
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
-    expect(captured.some(e => e.type === 'server.spec.fix.submitted')).toBe(true);
+    expect(captured.some(e => e.type === 'pr.fix.submitted')).toBe(true);
     warn.mockRestore();
   });
 
   it('logs the stale token even when it shares a chunk with an unrelated marker', async () => {
     const warn = spyWarn();
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(`noise ${buildPhaseSignal('spec-fixed', stale)} [bx:read-file:src/a.ts:1-2]`);
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(`noise ${buildPhaseSignal('pr-fixed', stale)} [bx:unknown:abcdef123456]`);
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(1);
-    expect(captured.some(e => e.type === 'server.spec.fix.submitted')).toBe(false);
+    expect(captured.some(e => e.type === 'pr.fix.submitted')).toBe(false);
     warn.mockRestore();
   });
 
   it('reports a foreign marker even when the PTY splits it across two live chunks', async () => {
     const warn = spyWarn();
     const { watcher, streamer } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    const marker = buildPhaseSignal('spec-fixed', stale);
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    const marker = buildPhaseSignal('pr-fixed', stale);
     const cut = Math.floor(marker.length / 2);
     streamer.triggerLive(marker.slice(0, cut));
     streamer.triggerLive(marker.slice(cut));
@@ -797,9 +762,9 @@ describe('stale signal token visibility', () => {
   it('does not invent a foreign token from an OSC title split across chunks', async () => {
     const warn = spyWarn();
     const { watcher, streamer } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
     streamer.triggerLive('\x1b]0;');
-    streamer.triggerLive(`${buildPhaseSignal('spec-fixed', stale)}\x07`);
+    streamer.triggerLive(`${buildPhaseSignal('pr-fixed', stale)}\x07`);
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
     warn.mockRestore();
@@ -807,40 +772,40 @@ describe('stale signal token visibility', () => {
 
   it('reassembles a marker interrupted mid-stream by a complete OSC control string', async () => {
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive('[bx:spec-\x1b]0;title');
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive('[bx:pr-\x1b]0;title');
     streamer.triggerLive(`\x07fixed:${armed}]`);
     await flushMicrotasks();
-    expect(captured.some(e => e.type === 'server.spec.fix.submitted')).toBe(true);
+    expect(captured.some(e => e.type === 'pr.fix.submitted')).toBe(true);
   });
 
   it('logs a foreign token that precedes the armed marker in the same chunk', async () => {
     const warn = spyWarn();
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(`${buildPhaseSignal('spec-fixed', stale)} ${buildPhaseSignal('spec-fixed', armed)}`);
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(`${buildPhaseSignal('pr-fixed', stale)} ${buildPhaseSignal('pr-fixed', armed)}`);
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(1);
     expect(staleWarnings(warn)[0]).toContain(`observed=${stale}`);
-    expect(captured.some(e => e.type === 'server.spec.fix.submitted')).toBe(true);
+    expect(captured.some(e => e.type === 'pr.fix.submitted')).toBe(true);
     warn.mockRestore();
   });
 
   it('does not log a foreign token that trails the armed marker in the same chunk', async () => {
     const warn = spyWarn();
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(`${buildPhaseSignal('spec-fixed', armed)} ${buildPhaseSignal('spec-fixed', stale)}`);
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(`${buildPhaseSignal('pr-fixed', armed)} ${buildPhaseSignal('pr-fixed', stale)}`);
     await flushMicrotasks();
-    expect(captured.some(e => e.type === 'server.spec.fix.submitted')).toBe(true);
+    expect(captured.some(e => e.type === 'pr.fix.submitted')).toBe(true);
     expect(staleWarnings(warn)).toHaveLength(0);
     warn.mockRestore();
   });
 
   it('does not re-parse a complete OSC longer than the retained window as later output', async () => {
     const { watcher, streamer, captured } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
-    streamer.triggerLive(`\x1b]52;c;${'Q'.repeat(1400)}${buildPhaseSignal('spec-fixed', armed)}\x07`);
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
+    streamer.triggerLive(`\x1b]52;c;${'Q'.repeat(1400)}${buildPhaseSignal('pr-fixed', armed)}\x07`);
     streamer.triggerLive('ordinary later output');
     await flushMicrotasks();
     expect(captured).toHaveLength(0);
@@ -849,9 +814,9 @@ describe('stale signal token visibility', () => {
   it('caps per-entry foreign-token warnings when the pane spews distinct tokens', async () => {
     const warn = spyWarn();
     const { watcher, streamer } = makeWatcher();
-    await startWatch(watcher, { expectedKinds: 'spec-fixed', token: armed });
+    await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
     const churn = Array.from({ length: 40 }, (_, i) =>
-      buildPhaseSignal('spec-fixed', `churntok${String(i).padStart(4, '0')}`)).join(' ');
+      buildPhaseSignal('pr-fixed', `churntok${String(i).padStart(4, '0')}`)).join(' ');
     streamer.triggerLive(churn);
     await flushMicrotasks();
     // STALE_TOKEN_WARN_CAP distinct discards, then one summary line; no unbounded growth
@@ -1160,7 +1125,7 @@ describe('need-input ask/answer watermark', () => {
     await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     streamer.triggerLive('y'.repeat(2000));
-    streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
+    streamer.triggerLive(`[bx:pr-created:7:Nzc:${token}]\n`);
     expect(captured).toHaveLength(1);
     expect(commits).toEqual([intent(1, 1, 0), intent(1, 1, 1)]);
   });
@@ -1168,7 +1133,7 @@ describe('need-input ask/answer watermark', () => {
   it('a phase signal with nothing open commits no clear', async () => {
     const { watcher, streamer, commits } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
-    streamer.triggerLive(`[bx:pr-created:7:${token}]\n`);
+    streamer.triggerLive(`[bx:pr-created:7:Nzc:${token}]\n`);
     expect(commits).toEqual([]);
   });
 
@@ -1275,11 +1240,11 @@ describe('need-input ask/answer watermark', () => {
       expectedKinds: 'pr-created', token: 'tokDEV1234567',
       needInput: { epoch: 3, askSeq: 0, answeredSeq: 0 },
     });
-    streamers[DEV_AGENT.id].triggerLive('[bx:pr-created:7:tokDEV1234567]\n');
+    streamers[DEV_AGENT.id].triggerLive('[bx:pr-created:7:Nzc:tokDEV1234567]\n');
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(false);
     await watcher.start({
       taskId: 't1', projectId: 'p1', agentId: QA_AGENT.id,
-      expectedKinds: 'spec-reviewed', token: 'tokQA12345678',
+      expectedKinds: 'pr-fixed', token: 'tokQA12345678',
       needInput: { epoch: 1, askSeq: 0, answeredSeq: 0 },
     });
     expect(await watcher.start({
@@ -1288,8 +1253,8 @@ describe('need-input ask/answer watermark', () => {
       needInput: { epoch: 2, askSeq: 0, answeredSeq: 0 },
     })).toBe(false);
     expect(watcher.has('t1', QA_AGENT.id)).toBe(true);
-    streamers[QA_AGENT.id].triggerLive('[bx:spec-reviewed:tokQA12345678]\n');
-    expect(captured.some(e => e.type === 'server.spec.review.submitted')).toBe(true);
+    streamers[QA_AGENT.id].triggerLive('[bx:pr-fixed:tokQA12345678]\n');
+    expect(captured.some(e => e.type === 'pr.fix.submitted')).toBe(true);
   });
 
   it('a degraded fresh arm restarts ordinals so the new prompt cannot be swallowed', async () => {
@@ -1491,149 +1456,291 @@ describe('PhaseSignalWatcher.awaitOnce (bootstrap greeting)', () => {
   });
 });
 
-describe('completion settling barrier', () => {
-  function holdEmit(emit: ReturnType<typeof vi.fn>, captured: BaxianEvent[]) {
-    let release!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    emit.mockImplementation(async (event: BaxianEvent) => {
-      captured.push(event);
-      await gate;
-    });
-    return { release };
-  }
+describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
+  const ESC = '\x1b';
+  const BEL = '\x07';
+  const TOKEN = 'tok123abc456';
 
-  it('registers settling synchronously on a snapshot match, before start() resolves', async () => {
-    const { watcher, streamer, emit, captured } = makeWatcher();
-    const { release } = holdEmit(emit, captured);
-    streamer.setSnapshot(`done\n${buildPhaseSignal('code-reviewed', 'tok123456789')}\n`);
-
-    await startWatch(watcher, { expectedKinds: 'code-reviewed', token: 'tok123456789' });
-
-    expect(watcher.isSettling('t1')).toBe(true);
-    const permit = settlePermitOf(captured[0]!);
-    expect(permit).toBeDefined();
-    expect(watcher.settlePermitMatches('t1', permit)).toBe(true);
-    expect(watcher.settlePermitMatches('t1', Symbol('forged'))).toBe(false);
-
-    release();
-    await watcher.awaitSettled('t1');
-    expect(watcher.isSettling('t1')).toBe(false);
-    expect(watcher.settlePermitMatches('t1', permit)).toBe(false);
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it('registers settling for a live match and releases after the handler chain returns', async () => {
-    const { watcher, streamer, emit, captured } = makeWatcher();
-    const { release } = holdEmit(emit, captured);
-    await startWatch(watcher, { expectedKinds: 'code-done', token: 'tok123456789' });
-
-    streamer.triggerLive(buildPhaseSignal('code-done', 'tok123456789'));
-    expect(watcher.isSettling('t1')).toBe(true);
-
-    release();
-    await watcher.awaitSettled('t1');
-    expect(watcher.isSettling('t1')).toBe(false);
-  });
-
-  it('does not serialize the permit into the event payload', async () => {
+  it.each([
+    ['an OSC cancelled by a CSI', (m: string) => `${ESC}]0;title${ESC}[31m${m}${BEL}`],
+    ['an OSC cancelled by CAN', (m: string) => `${ESC}]0;title\x18${m}${BEL}`],
+    ['an OSC cancelled by SUB', (m: string) => `${ESC}]0;title\x1a${m}${BEL}`],
+    ['a marker torn by an 8-bit CSI', (m: string) => m.replace('spec-', `spec-\x9b31m`)],
+    ['a marker torn by a 7-bit SGR', (m: string) => m.replace('spec-', `spec-${ESC}[31m`)],
+  ])('fires on a marker the terminal displays after %s', async (_name, wrap) => {
     const { watcher, streamer, captured } = makeWatcher();
-    streamer.setSnapshot(buildPhaseSignal('spec-done', 'tok123456789'));
-
-    await startWatch(watcher, { expectedKinds: 'spec-done', token: 'tok123456789' });
-    await watcher.awaitSettled('t1');
-
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${wrap(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'))}\n`);
     expect(captured).toHaveLength(1);
-    expect(JSON.parse(JSON.stringify(captured[0]))).not.toHaveProperty('settlePermit');
-    expect(Object.keys(captured[0]!)).not.toContain('settlePermit');
+    expect(captured[0].type).toBe('spec.ready');
   });
 
-  it('releases settling even when the event emit fails', async () => {
-    const { watcher, streamer, emit } = makeWatcher();
-    emit.mockRejectedValueOnce(new Error('bus down'));
-    streamer.setSnapshot(buildPhaseSignal('code-fixed', 'tok123456789'));
-
-    await startWatch(watcher, { expectedKinds: 'code-fixed', token: 'tok123456789' });
-    await watcher.awaitSettled('t1');
-
-    expect(watcher.isSettling('t1')).toBe(false);
-  });
-});
-
-describe('runExclusive (settlement / manual pipeline mutex)', () => {
-  it('serializes same-task sections FIFO and runs different tasks independently', async () => {
-    const { watcher } = makeWatcher();
-    const order: string[] = [];
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
-
-    const first = watcher.runExclusive('t1', async () => {
-      order.push('first-start');
-      await firstGate;
-      order.push('first-end');
-    });
-    const second = watcher.runExclusive('t1', async () => {
-      order.push('second');
-    });
-    const other = watcher.runExclusive('t2', async () => {
-      order.push('other-task');
-    });
-
-    await other;
-    expect(order).toEqual(['first-start', 'other-task']);
-    releaseFirst();
-    await Promise.all([first, second]);
-    expect(order).toEqual(['first-start', 'other-task', 'first-end', 'second']);
-  });
-
-  it('delivers a matched completion only after a held exclusive section releases', async () => {
+  it.each([
+    ['an OSC closed by an 8-bit ST', (m: string) => `${ESC}]0;${m}\x9c`],
+    ['an 8-bit OSC introducer', (m: string) => `\x9d0;${m}\x9c`],
+    ['an APC string', (m: string) => `${ESC}_${m}${ESC}\\`],
+    ['a PM string', (m: string) => `${ESC}^${m}${ESC}\\`],
+    ['a DCS string', (m: string) => `${ESC}P${m}${ESC}\\`],
+  ])('stays armed when the marker is hidden inside %s', async (_name, wrap) => {
     const { watcher, streamer, captured } = makeWatcher();
-    let releaseManual!: () => void;
-    const manualGate = new Promise<void>(resolve => { releaseManual = resolve; });
-    const manual = watcher.runExclusive('t1', async () => { await manualGate; });
-
-    await startWatch(watcher, { expectedKinds: 'code-done', token: 'tok123456789' });
-    streamer.triggerLive(buildPhaseSignal('code-done', 'tok123456789'));
-    expect(watcher.isSettling('t1')).toBe(true);
-    await flushMicrotasks();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${wrap(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'))}\n`);
     expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
 
-    releaseManual();
-    await manual;
-    await watcher.awaitSettled('t1');
+  it('does not fire on a marker inside a control string torn across chunks', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${ESC}]0;`);
+    streamer.triggerLive(buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc'));
+    streamer.triggerLive(BEL);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  // The decoder belongs to the streamer, so a watcher armed mid control string inherits
+  // the open state instead of reading the hidden payload as fresh output.
+  it('does not fire when the control string opened before the watcher armed', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    streamer.triggerLive(`${ESC}]0;title-start`);
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}${BEL}`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(1);
-    expect(watcher.isSettling('t1')).toBe(false);
-  });
-});
-
-describe('exclusive owner permit', () => {
-  it('mints an owner per section, matches only inside it, and invalidates on release', async () => {
-    const { watcher } = makeWatcher();
-    let insideOwner: symbol | undefined;
-    await watcher.runExclusive('t1', async (owner) => {
-      insideOwner = owner;
-      expect(watcher.exclusiveOwnerMatches('t1', owner)).toBe(true);
-      expect(watcher.exclusiveOwnerMatches('t1', Symbol('forged'))).toBe(false);
-      expect(watcher.exclusiveOwnerMatches('t2', owner)).toBe(false);
-    });
-    expect(insideOwner).toBeDefined();
-    expect(watcher.exclusiveOwnerMatches('t1', insideOwner)).toBe(false);
   });
 
-  it('a queued section gets a fresh owner; the prior owner stays invalid', async () => {
-    const { watcher } = makeWatcher();
-    let releaseFirst!: () => void;
-    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
-    const owners: symbol[] = [];
-    const first = watcher.runExclusive('t1', async (owner) => {
-      owners.push(owner);
-      await firstGate;
+  it('ignores a need-input literal hidden in an APC string', async () => {
+    const { watcher, streamer } = makeWatcher();
+    await startWatch(watcher, {
+      expectedKinds: 'spec-done',
+      token: TOKEN,
+      needInput: { epoch: 1, askSeq: 0, answeredSeq: 0 },
     });
-    const second = watcher.runExclusive('t1', async (owner) => {
-      owners.push(owner);
-      expect(watcher.exclusiveOwnerMatches('t1', owners[0]!)).toBe(false);
-      expect(watcher.exclusiveOwnerMatches('t1', owner)).toBe(true);
-    });
-    releaseFirst();
-    await Promise.all([first, second]);
-    expect(new Set(owners).size).toBe(2);
+    streamer.triggerLive(`${ESC}_[bx:need-input:${TOKEN}:1]${ESC}\\`);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+
+    streamer.triggerLive(`[bx:need-input:${TOKEN}:1]\n`);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
+
+  // A backspace rewinds the cursor, so the screen never shows a well-formed marker; the
+  // watcher must not complete the dispatch on one.
+  it('stays armed when a backspace rewrote the marker off the screen', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`[bx:spec-\x08done:${TOKEN}]\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+
+    streamer.triggerLive(`${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  // A designated non-ASCII charset renders the marker bytes as other glyphs, so the screen
+  // never shows a well-formed marker.
+  it.each([
+    ['G1 = DEC graphics with SO/SI', (t: string) => `[bx:spec-\x1b)0\x0edone\x0f:${t}]`],
+    ['G0 = DEC graphics', (t: string) => `\x1b(0[bx:spec-done:42:Nzc:${t}]`],
+    ['G2 = DEC graphics locked in with LS2', (t: string) => `\x1b*0\x1bn[bx:spec-done:42:Nzc:${t}]`],
+    ['G3 = DEC graphics locked in with LS3', (t: string) => `\x1b+0\x1bo[bx:spec-done:42:Nzc:${t}]`],
+  ])('stays armed when %s rewrote the marker', async (_name, wrap) => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${wrap(TOKEN)}\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+
+    // SI shifts GL back to G0 before re-designating it; re-designating alone leaves a locked
+    // shift pointing at the graphics set.
+    streamer.triggerLive(`\x0f\x1b(B${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it.each([
+    ['DECRC restores a graphics set saved earlier',
+      (t: string) => `\x1b(0\x1b7\x1b(B[bx:spec-\x1b8done:${t}]`],
+    ['RIS wipes the first half off the screen', (t: string) => `[bx:spec-\x1bcdone:${t}]`],
+    ['DECALN wipes the first half off the screen', (t: string) => `[bx:spec-\x1b#8done:${t}]`],
+  ])('stays armed when %s', async (_name, wrap) => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${wrap(TOKEN)}\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it.each([
+    ['a CR inside an 8-bit SGR', (t: string) => `[bx:spec-\x9b\r31mdone:${t}]`],
+    ['a CR inside an 8-bit CSI that leaves through csiIgnore', (t: string) => `[bx:spec-\x9b1?\rmdone:${t}]`],
+    ['a CR inside a 7-bit CSI', (t: string) => `[bx:spec-\x1b[\r31mdone:${t}]`],
+    ['RI moving the tail above the prefix', (t: string) => `\n[bx:spec-\x1bMdone:${t}]`],
+    ['conceal hiding the tail', (t: string) => `[bx:spec-\x1b[8mdone:${t}]`],
+    ['conceal surviving an extended-colour payload', (t: string) => `\x1b[8m\x1b[38;5;28m[bx:spec-done:42:Nzc:${t}]`],
+  ])('stays armed when the pane only looks complete because of %s', async (_name, wrap) => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`${wrap(TOKEN)}\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('still completes once the tail is revealed again', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b[8m\x1b[28m${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it.each([
+    ['RIS', '\x1bc'],
+    ['DECSTR', '\x1b[!p'],
+  ])('completes again once %s puts the terminal back on US-ASCII', async (_name, reset) => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0${reset}${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  // Composite charset state: each of these needs more than one action to reach.
+  it('stays armed when an unrecognised designation leaves the graphics set in place', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`[bx:spec-\x1b(0\x1b(Xdone:${TOKEN}]\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('completes when RIS clears the saved charset a later DECRC would have restored', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0\x1b7\x1bc\x1b8${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('stays armed when a GR designation arms a later shift', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b-0\x0e${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  // CSI parameters are numbers, not strings: a leading zero still names the mode.
+  it('completes when a leading-zero mode number re-saves the ASCII charset', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(
+      `\x1b(0\x1b[?1048h\x1b(B\x1b[?01048h\x1b[?1048l${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`,
+    );
+    expect(captured).toHaveLength(1);
+  });
+
+  it.each([
+    ['a sub-parameter leaves the primary intact', '\x1b[?1049:0h', '\x1b[?1049:0l'],
+    ['capacity counts parameters, not characters',
+      '\x1b[?1048;1;2;3;4;5;6;7;8;9;10;11;12;13;14h', '\x1b[?1048;1;2;3;4;5;6;7;8;9;10;11;12;13;14l'],
+  ])('stays armed when %s', async (_name, enter, leave) => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0${enter}\x1b(B${leave}${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('stays armed when CSI ?2h leaves the saved charset for a later DECRC', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0\x1b7\x1b[?2h[bx:spec-\x1b8done:${TOKEN}]\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it.each([
+    ['a > prefix is not a DEC private mode', '>'],
+    ['a < prefix is not a DEC private mode', '<'],
+    ['an = prefix is not a DEC private mode', '='],
+  ])('completes despite %s', async (_name, prefix) => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(
+      `\x1b(0\x1b[${prefix}1049h\x1b(B\x1b[${prefix}1049l${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`,
+    );
+    expect(captured).toHaveLength(1);
+  });
+
+  it('completes when a save taken across a ?47 buffer switch is not read back', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(
+      `\x1b(0\x1b[?47h\x1b7\x1b(B\x1b[?47l\x1b8${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`,
+    );
+    expect(captured).toHaveLength(1);
+  });
+
+  it('stays armed when leaving the alternate screen restores the graphics set', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0\x1b[?1049h\x1b(B\x1b[?1049l${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('completes when a shift after DECRC reloads the ASCII slot', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0\x1b7\x1b(B\x1b8\x0f${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('stays armed when a multi-intermediate CSI is mistaken for DECSTR', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`[bx:spec-\x1b(0\x1b[!!pdone:${TOKEN}]\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+  });
+
+  it('stays armed when an unrecognised ESC % final leaves the graphics set in place', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`[bx:spec-\x1b(0\x1b%Xdone:${TOKEN}]\n`);
+    expect(captured).toHaveLength(0);
+    expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
+
+    streamer.triggerLive(`\x1b%G${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('completes when ESC %G selects the default without disturbing G1', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(0\x1b%G${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  // UK rewrites only '#', so the marker really is on screen — dropping it would stall the task.
+  it('completes on a marker a partially-remapping charset leaves intact', async () => {
+    const { watcher, streamer, captured } = makeWatcher();
+    await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
+    streamer.triggerLive(`\x1b(A${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
+    expect(captured).toHaveLength(1);
+  });
+
+  it('still fires across controls the terminal renders as nothing (BEL/NUL/CAN/DEL)', async () => {
+    for (const control of ['\x07', '\x00', '\x18', '\x7f']) {
+      const { watcher, streamer, captured } = makeWatcher();
+      await startWatch(watcher, { expectedKinds: 'pr-fixed', token: TOKEN });
+      streamer.triggerLive(`[bx:pr-${control}fixed:${TOKEN}]\n`);
+      expect(captured, `control ${JSON.stringify(control)}`).toHaveLength(1);
+    }
+  });
+
 });

@@ -10,8 +10,6 @@ import type {
   GitCliConfig,
   MergeStrategy,
   SpecApprovalStrategy,
-  ProjectReviewConfig,
-  ReviewRound,
   PrReviewConversation,
   PetMeta,
 } from './shared/index.js';
@@ -184,8 +182,8 @@ export interface TmuxInstallResponse {
   tmux: ProbeStatus;
 }
 
-export interface AddAgentBody extends AgentConfig {
-  pairWith?: string;
+export interface AddAgentGroupBody {
+  agents: AgentConfig[];
 }
 
 export interface HostInput {
@@ -285,16 +283,15 @@ export const api = {
       },
     ) => patch<TaskState>(`/tasks/${enc(id)}`, body),
     retry: (id: string) => post<TaskState>(`/tasks/${enc(id)}/retry`),
-    review: (id: string) => post<TaskState>(`/tasks/${enc(id)}/review`),
+    review: (
+      id: string,
+      body?: { stage?: 'spec' | 'code'; actorId?: string; prNumber?: number },
+    ) =>
+      post<TaskState>(`/tasks/${enc(id)}/review`, body),
     complete: (id: string) => post<TaskState>(`/tasks/${enc(id)}/complete`),
     continue: (id: string) => post<TaskState>(`/tasks/${enc(id)}/continue`),
-    spec: (id: string, body: { verdict: 'approve' | 'request-changes' | 'archive'; comments?: string }) =>
+    spec: (id: string, body: { verdict: 'approve' | 'request-changes'; comments?: string }) =>
       post<TaskState>(`/tasks/${enc(id)}/spec`, body),
-    code: (id: string, body: { verdict: 'request-changes'; comments: string }) =>
-      post<TaskState>(`/tasks/${enc(id)}/code`, body),
-    reviews: (id: string) => get<ReviewRound[]>(`/tasks/${enc(id)}/reviews`),
-    interdiff: (id: string, round: number) =>
-      get<{ diff: string }>(`/tasks/${enc(id)}/reviews/code/${round}/interdiff`),
     prReview: (id: string) =>
       get<PrReviewConversation>(`/tasks/${enc(id)}/pr-review`),
     dispatch: (id: string, body: { agentId: string }) =>
@@ -303,17 +300,22 @@ export const api = {
   projects: {
     list: () => get<ProjectConfig[]>('/projects'),
     get: (id: string) => get<ProjectConfig>(`/projects/${enc(id)}`),
-    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; review?: ProjectReviewConfig; gitCli?: GitCliConfig }) =>
+    create: (body: { id: string; repo: string; merge?: MergeStrategy; specApproval?: SpecApprovalStrategy; gitCli?: GitCliConfig }) =>
       post<{ project: ProjectConfig; restartRequired: boolean }>('/projects', body),
     delete: (id: string) =>
       del<{ removed: string; restartRequired: boolean }>(`/projects/${enc(id)}`),
-    addAgent: (projectId: string, body: AddAgentBody) =>
-      post<{ agent: AgentConfig; restartRequired: boolean }>(
+    addAgentGroup: (projectId: string, body: AddAgentGroupBody) =>
+      post<{ agents: AgentConfig[]; restartRequired: boolean; warnings?: string[] }>(
         `/projects/${enc(projectId)}/agents`,
         body,
       ),
+    replaceAgent: (projectId: string, agentId: string, body: AgentConfig) =>
+      put<{ agent: AgentConfig; replaced: string; restartRequired: boolean; warnings?: string[] }>(
+        `/projects/${enc(projectId)}/agents/${enc(agentId)}`,
+        body,
+      ),
     deleteAgent: (projectId: string, agentId: string) =>
-      del<{ removed: string[]; restartRequired: boolean }>(
+      del<{ removed: string[]; restartRequired: boolean; warnings?: string[] }>(
         `/projects/${enc(projectId)}/agents/${enc(agentId)}`,
       ),
     resumeAgent: (projectId: string, agentId: string) =>
@@ -347,7 +349,12 @@ export const api = {
   config: {
     get: () => get<BaxianConfig>('/config'),
     patch: (body: Partial<BaxianConfig>) =>
-      patch<{ config: BaxianConfig; restartRequired: boolean; note: string }>('/config', body),
+      patch<{
+        config: BaxianConfig;
+        restartRequired: boolean;
+        warnings?: Array<{ path: string; message: string }>;
+        note: string;
+      }>('/config', body),
   },
   health: {
     get: fetchHealth,

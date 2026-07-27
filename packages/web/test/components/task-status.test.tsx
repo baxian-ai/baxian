@@ -52,7 +52,6 @@ describe('TaskStatusDot', () => {
       ['approved', 'bg-success'],
       ['spec-ready', 'bg-warn'],
       ['merge-ready', 'bg-warn'],
-      ['ready', 'bg-warn'],
       ['failed', 'bg-danger'],
       ['max_rounds', 'bg-warn'],
     ];

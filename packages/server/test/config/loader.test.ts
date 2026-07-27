@@ -22,6 +22,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(tempDir, { recursive: true });
 });
 
@@ -85,9 +86,7 @@ describe('loadConfig', () => {
     expect(config.review.rounds).toBe(10);
     expect(config.server.port).toBe(3000);
     expect(config.project[0].merge).toBeNull();
-    expect(config.review.mode).toBe('git');
-    expect(config.project[0].review?.mode).toBeUndefined();
-    expect(config.review.afterDone).toBeUndefined();
+    expect(config.review).toEqual({ rounds: 10 });
   });
 
   it('normalizes plural keys', async () => {
@@ -343,93 +342,57 @@ describe('prepareConfig type guards', () => {
     expect(cfg.review.rounds).toBe(10);
   });
 
-  it('defaults review.mode to git but leaves an omitted project override and afterDone undefined', () => {
+  it('keeps review config limited to rounds', () => {
     const cfg = prepareConfig({
       review: { rounds: 10 },
       project: [PROJECT],
     });
-    expect(cfg.review.mode).toBe('git');
-    expect(cfg.project[0].review?.mode).toBeUndefined();
-    expect(cfg.review.afterDone).toBeUndefined();
+    expect(cfg.review).toEqual({ rounds: 10 });
   });
 
-  it('passes through project.review.mode overrides', () => {
-    const cfg = prepareConfig({
-      review: { rounds: 10, mode: 'server' },
-      project: [{
-        ...PROJECT,
-        review: { mode: 'git' },
-      }],
-    });
-    expect(cfg.project[0].review?.mode).toBe('git');
-  });
-
-  it("rejects the retired 'github' review.mode at load time", () => {
-    expect(() => prepareConfig({
-      review: { rounds: 10, mode: 'github' },
-      project: [{
-        id: 'gl',
-        repo: 'https://gitlab.example.com/group/proj.git',
-        merge: null,
-        agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
-      }],
-    })).toThrow(ConfigValidationError);
-  });
-
-  it('defaults non-github project.review={} to mode=server when global mode is server', () => {
-    const cfg = prepareConfig({
-      review: { rounds: 10, mode: 'server' },
-      project: [{
-        id: 'gl',
-        repo: 'https://gitlab.example.com/group/proj.git',
-        merge: null,
-        review: {},
-        agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
-      }],
-    });
-    expect(cfg.project[0].review?.mode).toBe('server');
-  });
-
-  it('passes through review.mode=server and afterDone=pr', () => {
-    const cfg = prepareConfig({
+  it('warns for unknown keys at every supported scope and ignores them', async () => {
+    const path = join(tempDir, 'baxian.json');
+    await writeFile(path, JSON.stringify({
+      legacyTop: true,
       review: { rounds: 10, mode: 'server', afterDone: 'pr' },
+      server: { reviewBaseDir: '/tmp/reviews' },
       project: [{
         ...PROJECT,
-        agent: [[
-          { id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' },
-          { id: 'qq', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qq' },
-        ]],
+        review: { mode: 'server' },
+        agent: PROJECT.agent.map(group => group.map(agent => ({
+          ...agent,
+          serverReview: true,
+        }))),
       }],
-    });
-    expect(cfg.review.mode).toBe('server');
-    expect(cfg.review.afterDone).toBe('pr');
+    }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const cfg = await loadConfig(path);
+
+    expect(warn.mock.calls.map(call => String(call[0]))).toEqual(expect.arrayContaining([
+      expect.stringContaining('legacytop'),
+      expect.stringContaining('review.mode'),
+      expect.stringContaining('review.afterDone'),
+      expect.stringContaining('server.reviewBaseDir'),
+      expect.stringContaining('project[0].review'),
+      expect.stringContaining('project[0].agent[0][0].serverReview'),
+      expect.stringContaining('project[0].agent[0][1].serverReview'),
+    ]));
+    expect(cfg.review).toEqual({ rounds: 10 });
+    expect((cfg.server as unknown as Record<string, unknown>).reviewBaseDir).toBeUndefined();
+    expect((cfg.project[0] as unknown as Record<string, unknown>).review).toBeUndefined();
+    expect((cfg.project[0].agent[0][0] as unknown as Record<string, unknown>).serverReview).toBeUndefined();
   });
 
-  it('allows server mode config with a dev-only pair for incremental agent setup', () => {
-    const cfg = prepareConfig({
-      review: { rounds: 10, mode: 'server' },
+  it('rejects an incomplete agent group', () => {
+    expect(() => prepareConfig({
+      review: { rounds: 10 },
       project: [{
         id: 'pp',
         repo: 'u/r',
         agent: [[{ id: 'dd', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp' }]],
       }],
-    });
-    expect(cfg.review.mode).toBe('server');
-    expect(cfg.project[0].review?.mode).toBeUndefined();
-  });
-
-  it('passes through invalid review.mode for the validator to reject', () => {
-    expect(() => prepareConfig({
-      review: { rounds: 10, mode: 'gitlab' },
-      project: [PROJECT],
-    })).toThrow(/review\.mode/);
-  });
-
-  it('passes through invalid project.review.mode for the validator to reject', () => {
-    expect(() => prepareConfig({
-      review: { rounds: 10 },
-      project: [{ ...PROJECT, review: { mode: 'gitlab' } }],
-    })).toThrow(/project\[0\]\.review\.mode/);
+    })).toThrow(/exactly one qa agent/);
   });
 
   it('rejects partial server.https (missing certFile) instead of silently dropping to plain HTTP', () => {

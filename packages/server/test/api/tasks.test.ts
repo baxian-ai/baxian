@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { TaskState } from '../../src/shared/index.js';
-import { DispatchTerminalError } from '../../src/agent/manager.js';
 import { ApiError } from '../../src/errors.js';
 import {
   TASK_IMAGE_MAX_COUNT,
@@ -34,9 +33,9 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     preferredAgentId: 'dev-1',
     agentId: 'dev-1',
     devAgentId: 'dev-1',
+    qaAgentId: 'qa-1',
     phase: 'code',
     reviewRound: 0,
-    reviewMode: 'git',
     platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
     status: 'in_progress',
     branch: 'bx/task-001',
@@ -465,6 +464,42 @@ describe('POST /api/tasks/:id/review', () => {
     expect(response.statusCode).toBe(409);
     expect(JSON.parse(response.body).error).toContain('generation changed');
   });
+
+  it('forwards the explicit PR number, review stage, and trimmed actor identity for git delivery recovery', async () => {
+    const updated = makeTask({ id: 'task-001', status: 'review', phase: 'spec' });
+    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa').mockResolvedValue(updated);
+
+    const response = await post('/api/tasks/task-001/review', {
+      prNumber: 73,
+      stage: 'spec',
+      actorId: '  77  ',
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(spy).toHaveBeenCalledWith('task-001', {
+      confirmUncertainNotDelivered: true,
+      prNumber: 73,
+      stage: 'spec',
+      actorId: '77',
+    });
+  });
+
+  it.each([
+    [{ stage: 'design' }, 'stage must be'],
+    [{ actorId: '' }, 'actorId must be'],
+    [{ actorId: 77 }, 'actorId must be'],
+    [{ prNumber: 0 }, 'prNumber must be'],
+    [{ prNumber: 1.5 }, 'prNumber must be'],
+    [{ prNumber: '73' }, 'prNumber must be'],
+  ])('rejects an invalid manual review selector %# without dispatching', async (body, message) => {
+    const spy = vi.spyOn(app.ctx.agentManager, 'dispatchReviewToQa');
+
+    const response = await post('/api/tasks/task-001/review', body);
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body).error).toContain(message);
+    expect(spy).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/tasks/:id/retry', () => {
@@ -565,156 +600,6 @@ describe('POST /api/tasks/:id/spec', () => {
     expect(response.statusCode).toBe(409);
   });
 
-  it('202 request-changes on a spec-phase max_rounds task extends the cap and dispatches', async () => {
-    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 10, agentId: '' });
-    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
-      round: 10,
-      phase: 'spec',
-      content: '# Spec v10',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
-      startedAt: new Date().toISOString(),
-    });
-    const dispatchSpy = vi.spyOn(app.ctx.agentManager, 'dispatchServerFixToDev')
-      .mockResolvedValue(makeTask({ status: 'fixing', phase: 'spec', maxRoundsContinues: 1 }));
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '再收敛一轮' });
-
-    expect(response.statusCode).toBe(202);
-    expect(dispatchSpy).toHaveBeenCalledWith('task-001', expect.stringContaining('u-1'));
-    expect((await app.ctx.taskStore.get('task-001'))?.maxRoundsContinues).toBe(1);
-  });
-
-  it('409 with an actionable reason when the spec holder is gone from the config', async () => {
-    await seedTask({
-      status: 'max_rounds', phase: 'spec', specReviewRound: 10,
-      agentId: '', preferredAgentId: 'ghost', devAgentId: 'ghost',
-    });
-    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
-      round: 10,
-      phase: 'spec',
-      content: '# Spec v10',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
-      startedAt: new Date().toISOString(),
-    });
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '再收敛一轮' });
-
-    expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/not in the current config/);
-  });
-
-  it('an undelivered code prompt after approve answers 500 with Resume guidance, not a retry hint', async () => {
-    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 10, agentId: '' });
-    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
-      round: 10,
-      phase: 'spec',
-      content: '# Spec v10',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
-      startedAt: new Date().toISOString(),
-    });
-    vi.spyOn(app.ctx.agentManager, 'transitionToCodePhase').mockImplementation(async (taskId) => {
-      const t = (await app.ctx.taskStore.get(taskId))!;
-      t.status = 'in_progress';
-      t.phase = 'code';
-      t.agentId = t.devAgentId;
-      await app.ctx.taskStore.set(t);
-      return null;
-    });
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
-
-    expect(response.statusCode).toBe(500);
-    expect(JSON.parse(response.body).error).toMatch(/Resume the dev agent/);
-  });
-
-  it('a terminal fix dispatch on request-changes answers 500 with failed-task Retry guidance', async () => {
-    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 10, agentId: '' });
-    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
-      round: 10,
-      phase: 'spec',
-      content: '# Spec v10',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v10' }],
-      startedAt: new Date().toISOString(),
-    });
-    vi.spyOn(app.ctx.agentManager, 'continueSession').mockRejectedValue(
-      new DispatchTerminalError('prompt_too_large', 'prompt exceeds the runtime composer limit'),
-    );
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'request-changes', comments: '再收敛一轮' });
-
-    expect(response.statusCode).toBe(500);
-    const body = JSON.parse(response.body);
-    expect(body.error).toContain('prompt_too_large');
-    expect(body.error).toContain('marked failed');
-    expect(body.error).toContain('Retry');
-    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('failed');
-    const round = await app.ctx.agentManager.getReviewStore()!.getRound('task-001', 'spec', 10);
-    expect(round?.userDecision).toMatchObject({ verdict: 'request-changes' });
-  });
-
-  it('a terminal code-phase dispatch failure surfaces an actionable 500, not internal_error', async () => {
-    await seedTask({ status: 'max_rounds', phase: 'spec', specReviewRound: 1, agentId: '' });
-    await app.ctx.agentManager.getReviewStore()!.putRound('task-001', 'spec', {
-      round: 1,
-      phase: 'spec',
-      content: '# Spec',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec' }],
-      startedAt: new Date().toISOString(),
-    });
-    vi.spyOn(app.ctx.agentManager, 'continueSession').mockRejectedValue(
-      new DispatchTerminalError('prompt_too_large', 'prompt exceeds the runtime composer limit'),
-    );
-
-    const response = await post('/api/tasks/task-001/spec', { verdict: 'approve' });
-
-    expect(response.statusCode).toBe(500);
-    const body = JSON.parse(response.body);
-    expect(body.error).toContain('prompt_too_large');
-    expect(body.error).toContain('marked failed');
-    expect(body.error).toContain('Retry');
-    expect((await app.ctx.taskStore.get('task-001'))?.status).toBe('failed');
-  });
-});
-
-describe('POST /api/tasks/:id/code', () => {
-  it('202 request-changes passes comments through', async () => {
-    const updated = makeTask({ id: 'task-001', status: 'fixing' });
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict').mockResolvedValue(updated);
-
-    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: '这里漏了空态处理' });
-
-    expect(response.statusCode).toBe(202);
-    expect(spy).toHaveBeenCalledWith('task-001', '这里漏了空态处理');
-  });
-
-  it('non-request-changes verdict → 400 pointing at /complete, manager untouched', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict');
-    const response = await post('/api/tasks/task-001/code', { verdict: 'approve', comments: 'x' });
-    expect(response.statusCode).toBe(400);
-    expect(JSON.parse(response.body).error).toMatch(/complete/);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('empty comments → 400 without touching the manager', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict');
-    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: '   ' });
-    expect(response.statusCode).toBe(400);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('non-string comments → 400 without touching the manager', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict');
-    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: 123 });
-    expect(response.statusCode).toBe(400);
-    expect(spy).not.toHaveBeenCalled();
-  });
-
-  it('round cap → 409 pass-through', async () => {
-    vi.spyOn(app.ctx.agentManager, 'submitCodeVerdict')
-      .mockRejectedValue(new ApiError(409, 'Task task-001 has reached the code review round cap (2); confirm completion, or cancel the task'));
-    const response = await post('/api/tasks/task-001/code', { verdict: 'request-changes', comments: '还差点' });
-    expect(response.statusCode).toBe(409);
-  });
 });
 
 describe('POST /api/tasks/:id/continue', () => {
@@ -863,7 +748,13 @@ describe('PATCH /api/tasks/:id', () => {
   });
 
   it('preferredAgentId 空字符串 → 200（清空当前分配）', async () => {
-    const cleared = makeTask({ id: 'task-001', preferredAgentId: '', qaAgentId: undefined });
+    const cleared = makeTask({
+      id: 'task-001',
+      preferredAgentId: '',
+      agentId: '',
+      devAgentId: '',
+      qaAgentId: undefined,
+    });
     vi.spyOn(app.ctx.agentManager, 'editTask').mockResolvedValue(cleared);
     const response = await patch('/api/tasks/task-001', { preferredAgentId: '' });
     expect(response.statusCode).toBe(200);
@@ -995,88 +886,10 @@ describe('POST /api/tasks - op-aware gates', () => {
   });
 });
 
-describe('server review mode API', () => {
-  it('GET /api/tasks/:id/reviews returns [] when no rounds exist', async () => {
-    const response = await get('/api/tasks/task-x/reviews');
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toEqual([]);
-  });
-
-  it('GET /api/tasks/:id/reviews returns stored rounds across phases', async () => {
-    const store = app.ctx.agentManager.getReviewStore()!;
-    await store.putRound('task-r', 'spec', {
-      round: 1, phase: 'spec', content: 'S',
-      documents: [{ relPath: '.baxian/spec.md', content: 'S' }],
-      startedAt: 'now',
-    });
-    await store.putRound('task-r', 'code', {
-      round: 1, phase: 'code', content: 'C', startedAt: 'now',
-      findings: { round: 1, verdict: 'approve', findings: [] },
-    });
-    const response = await get('/api/tasks/task-r/reviews');
-    const rounds = JSON.parse(response.body) as Array<{ phase: string; round: number }>;
-    expect(rounds.map(r => `${r.phase}-${r.round}`)).toEqual(['spec-1', 'code-1']);
-  });
-
-  it('GET .../reviews/code/:round/interdiff → 200 { diff }; manager called with (id, round)', async () => {
-    const spy = vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
-      .mockResolvedValue({ ok: true, diff: 'PATCH-BODY' });
-    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toEqual({ diff: 'PATCH-BODY' });
-    expect(spy).toHaveBeenCalledWith('task-r', 2);
-  });
-
-  it('interdiff → 404 when no-anchor (historical round without headSha)', async () => {
-    vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
-      .mockResolvedValue({ ok: false, reason: 'no-anchor' });
-    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
-    expect(response.statusCode).toBe(404);
-    expect(JSON.parse(response.body).error).toBeTruthy();
-  });
-
-  it('interdiff → 409 when the dev worktree is released', async () => {
-    vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
-      .mockResolvedValue({ ok: false, reason: 'released' });
-    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
-    expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error).toMatch(/工作区已释放/);
-  });
-
-  it('interdiff → 500 when the manager throws', async () => {
-    vi.spyOn(app.ctx.agentManager, 'computeCodeInterdiff')
-      .mockRejectedValue(new Error('git exploded'));
-    const response = await get('/api/tasks/task-r/reviews/code/2/interdiff');
-    expect(response.statusCode).toBe(500);
-    expect(JSON.parse(response.body).error).toMatch(/git exploded/);
-  });
-
-  it('POST /api/tasks/:id/complete confirms a ready task to done', async () => {
-    await seedTask({ id: 'task-ready', status: 'ready', reviewMode: 'server', branch: 'bx/task-ready' });
-    const response = await post('/api/tasks/task-ready/complete');
-    expect(response.statusCode).toBe(202);
-    expect(JSON.parse(response.body).status).toBe('done');
-  });
-
-  it('PATCH cancel works from ready', async () => {
-    await seedTask({ id: 'task-ready2', status: 'ready', reviewMode: 'server', branch: 'bx/task-ready2' });
-    const response = await patch('/api/tasks/task-ready2', { status: 'cancelled' });
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).status).toBe('cancelled');
-  });
-});
-
 describe('GET /api/tasks/:id/pr-review', () => {
   it('404 when the task does not exist', async () => {
     const res = await get('/api/tasks/missing/pr-review');
     expect(res.statusCode).toBe(404);
-  });
-
-  it('available:false (server-mode) for server-mode tasks', async () => {
-    await seedTask({ id: 'gh-srv', reviewMode: 'server', prNumber: 9 });
-    const res = await get('/api/tasks/gh-srv/pr-review');
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toMatchObject({ available: false, reason: 'server-mode', items: [] });
   });
 
   it('available:false (no-pr) when the task has no PR', async () => {
@@ -1105,7 +918,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
   }
 
   it('git tasks render the driver timeline instead of the gh hardcoded path', async () => {
-    await seedTask({ id: 'git-ok', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-ok', prNumber: 7, platformBinding: GIT_BINDING });
     const fakeDriver = {
       commentSources: [
         { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
@@ -1125,7 +938,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
   });
 
   it('git tasks without a resolvable driver report driver-unavailable', async () => {
-    await seedTask({ id: 'git-nodrv', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-nodrv', prNumber: 7, platformBinding: GIT_BINDING });
     const bindingSpy = spyLiveBinding();
     const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(undefined);
     const res = await get('/api/tasks/git-nodrv/pr-review');
@@ -1135,7 +948,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
   });
 
   it('a drifted platform binding never queries the live repo for a historical task', async () => {
-    await seedTask({ id: 'git-drift', reviewMode: 'git', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-drift', prNumber: 7, status: 'merged', platformBinding: GIT_BINDING });
     const bindingSpy = spyLiveBinding({ mode: 'git', repoKey: 'github.com/user/other-repo', tool: 'gh' });
     const driverSpy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor');
     const res = await get('/api/tasks/git-drift/pr-review');
@@ -1161,7 +974,7 @@ describe('GET /api/tasks/:id/pr-review', () => {
     const { driver, calls } = countingDriver();
     const bindingSpy = spyLiveBinding();
     const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
-    await seedTask({ id: 'git-cache', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-cache', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-cache/pr-review');
     const res = await get('/api/tasks/git-cache/pr-review');
     expect(calls).toEqual([7]);
@@ -1174,10 +987,10 @@ describe('GET /api/tasks/:id/pr-review', () => {
     const { driver, calls } = countingDriver();
     const bindingSpy = spyLiveBinding();
     const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
-    await seedTask({ id: 'git-rev', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-rev', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-rev/pr-review');
     await seedTask({
-      id: 'git-rev', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING,
+      id: 'git-rev', prNumber: 7, platformBinding: GIT_BINDING,
       reviewDispatchedAt: '2026-07-01T00:00:00Z',
     });
     await get('/api/tasks/git-rev/pr-review');
@@ -1190,9 +1003,9 @@ describe('GET /api/tasks/:id/pr-review', () => {
     const { driver, calls } = countingDriver();
     const bindingSpy = spyLiveBinding();
     const spy = vi.spyOn(app.ctx.agentManager, 'platformDriverFor').mockReturnValue(driver as never);
-    await seedTask({ id: 'git-rebind', reviewMode: 'git', prNumber: 7, platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-rebind', prNumber: 7, platformBinding: GIT_BINDING });
     await get('/api/tasks/git-rebind/pr-review');
-    await seedTask({ id: 'git-rebind', reviewMode: 'git', prNumber: 9, platformBinding: GIT_BINDING });
+    await seedTask({ id: 'git-rebind', prNumber: 9, platformBinding: GIT_BINDING });
     const res = await get('/api/tasks/git-rebind/pr-review');
     expect(calls).toEqual([7, 9]);
     expect(JSON.parse(res.body).prNumber).toBe(9);

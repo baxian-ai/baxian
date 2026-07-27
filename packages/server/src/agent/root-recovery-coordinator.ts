@@ -32,7 +32,6 @@ import {
   type TaskState,
 } from '../shared/index.js';
 import { PeriodicTaskRunner } from '../timing/periodic-task-runner.js';
-import { stripSignalAnsi } from './phase-signal.js';
 
 interface RootRecoveryCoordinatorDeps {
   config: RootAgentConfig;
@@ -1114,7 +1113,6 @@ export class RootRecoveryCoordinator {
       task.agentId,
       task.devAgentId,
       task.qaAgentId,
-      task.researchAgentId,
     ].filter((id): id is string => typeof id === 'string' && id !== ''));
     const secrets = collectSecretValues(this.manager.getConfig());
     collectSecretValues(task, secrets);
@@ -1176,7 +1174,6 @@ export class RootRecoveryCoordinator {
       agentId: event.agentId,
       data: sanitizeEventData(event.data, secrets),
     }));
-    const artifacts = await this.artifactSummary(task, contextErrors, secrets);
     const request = {
       version: 1,
       requestId: record.id,
@@ -1193,11 +1190,9 @@ export class RootRecoveryCoordinator {
         agentId: task.agentId,
         devAgentId: task.devAgentId,
         qaAgentId: task.qaAgentId,
-        researchAgentId: task.researchAgentId,
         prNumber: task.prNumber,
         prUrl: task.prUrl,
         branch: task.branch,
-        reviewMode: task.reviewMode,
         reviewRound: task.reviewRound,
         specReviewRound: task.specReviewRound,
         createdAt: task.createdAt,
@@ -1205,7 +1200,6 @@ export class RootRecoveryCoordinator {
       },
       agents,
       recentEvents: events,
-      artifacts,
       contextErrors: contextErrors.map(value => redactContext(value, secrets)),
       allowedDecisions: [
         ...(canRedispatch(record) ? [{
@@ -1242,52 +1236,6 @@ export class RootRecoveryCoordinator {
       console.warn(`[root-agent] ${sanitizedDetail}`);
       return [];
     }
-  }
-
-  private async artifactSummary(
-    task: TaskState,
-    contextErrors: string[],
-    secrets: ReadonlySet<string>,
-  ): Promise<Record<string, unknown>> {
-    if (task.reviewMode !== 'server' && task.phase !== 'spec') return {};
-    const summary: Record<string, unknown> = {};
-    const transport = this.manager.getReviewTransport();
-    const dev = this.manager.getAgentConfig(task.devAgentId || task.agentId);
-    if (dev) {
-      try {
-        await this.manager.refreshWorkdirCacheFor(dev.id);
-        const response = await transport.readResponse(task, dev);
-        summary.response = response ? {
-          round: response.round,
-          responseCount: response.responses.length,
-          actions: countBy(response.responses.map(item => item.action)),
-        } : null;
-      } catch (err) {
-        const detail = `response artifact: ${err instanceof Error ? err.message : String(err)}`;
-        const sanitizedDetail = sanitizeContextError(detail, secrets);
-        contextErrors.push(sanitizedDetail);
-        console.warn(`[root-agent] ${sanitizedDetail}`);
-      }
-    }
-    const qa = task.qaAgentId ? this.manager.getAgentConfig(task.qaAgentId) : undefined;
-    if (qa) {
-      try {
-        await this.manager.refreshWorkdirCacheFor(qa.id);
-        const findings = await transport.readFindings(task, qa);
-        summary.findings = findings ? {
-          round: findings.round,
-          verdict: findings.verdict,
-          findingCount: findings.findings.length,
-          severities: countBy(findings.findings.map(item => item.severity)),
-        } : null;
-      } catch (err) {
-        const detail = `findings artifact: ${err instanceof Error ? err.message : String(err)}`;
-        const sanitizedDetail = sanitizeContextError(detail, secrets);
-        contextErrors.push(sanitizedDetail);
-        console.warn(`[root-agent] ${sanitizedDetail}`);
-      }
-    }
-    return summary;
   }
 
   private projectEnabled(projectId: string): boolean {
@@ -1592,13 +1540,49 @@ function sanitizeContextError(value: string, secrets: ReadonlySet<string>): stri
   return truncateUtf8(redactContext(value, secrets), MAX_CONTEXT_ERROR_BYTES);
 }
 
-function redactContext(value: string, secrets: ReadonlySet<string>): string {
-  let redacted = stripSignalAnsi(value)
-    .replace(/\[bx:[^\]]{0,2048}\]/g, '[bx:redacted]');
-  for (const secret of [...secrets].sort((left, right) => right.length - left.length)) {
-    redacted = redacted.split(secret).join('[redacted]');
+// 无状态、无长度上限：被吞掉的未闭合序列与漏匹配剩下的残渣，都会挤掉真正的故障证据。
+const OSC_TERMINATOR_RE = /\x07|\x1b\\/g;
+const COMPLETE_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const RESIDUAL_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
+
+function stripCompleteOsc(value: string): string {
+  let out = '';
+  let cursor = 0;
+  for (;;) {
+    const start = value.indexOf('\x1b]', cursor);
+    if (start < 0) break;
+    OSC_TERMINATOR_RE.lastIndex = start + 2;
+    const terminator = OSC_TERMINATOR_RE.exec(value);
+    // 这里找不到终结符，更靠后的起始符就更找不到——不能退回去逐个重扫，那是平方级。
+    if (!terminator) break;
+    // 终结符配的是它前面最后一个起始符；更早那些没终结，得连同其后的证据一起留成可读文本。
+    let paired = start;
+    for (let probe = value.indexOf('\x1b]', paired + 2); probe >= 0 && probe < terminator.index;) {
+      paired = probe;
+      probe = value.indexOf('\x1b]', paired + 2);
+    }
+    out += value.slice(cursor, paired);
+    cursor = terminator.index + terminator[0].length;
   }
-  return redactLabeledValues(redacted);
+  return cursor === 0 ? value : out + value.slice(cursor);
+}
+
+function stripControlSequences(value: string): string {
+  return stripCompleteOsc(value)
+    .replace(COMPLETE_CSI_RE, '')
+    .replace(RESIDUAL_CONTROL_RE, '');
+}
+
+function redactContext(value: string, secrets: ReadonlySet<string>): string {
+  // 凭据自带控制字节、回显又被转义序列打断时，原串与清洗串各自都命中不了，两侧同规则归一化才盖得全。
+  const ordered = [...new Set([...secrets].flatMap(secret => [secret, stripControlSequences(secret)]))]
+    .filter(candidate => candidate.length >= MIN_GLOBAL_SECRET_CHARS)
+    .sort((left, right) => right.length - left.length);
+  const replaceSecrets = (text: string): string =>
+    ordered.reduce((carried, secret) => carried.split(secret).join('[redacted]'), text);
+  const redacted = stripControlSequences(replaceSecrets(value))
+    .replace(/\[bx:[^\]]{0,2048}\]/g, '[bx:redacted]');
+  return redactLabeledValues(replaceSecrets(redacted));
 }
 
 function redactLabeledValues(value: string): string {
@@ -1644,12 +1628,6 @@ function labeledValueEnd(value: string, start: number): number {
   let end = start;
   while (end < value.length && !/[\s,;]/.test(value[end])) end++;
   return end;
-}
-
-function countBy(values: string[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const value of values) counts[value] = (counts[value] ?? 0) + 1;
-  return counts;
 }
 
 function isLaterObservation(current: string | undefined, previous: string): boolean {

@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
-import { render, screen, cleanup, fireEvent, act, waitFor, within } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, act, within } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import type { ProjectConfig, ReviewRound, TaskState } from '../../src/shared/index.js';
+import type { ProjectConfig, TaskState } from '../../src/shared/index.js';
 
 const { useProjectsMock } = vi.hoisted(() => ({
   useProjectsMock: vi.fn(),
@@ -70,11 +70,9 @@ const tasksReviewMock = vi.mocked(api.tasks.review);
 const tasksCompleteMock = vi.mocked(api.tasks.complete);
 const tasksContinueMock = vi.mocked(api.tasks.continue);
 const tasksSpecMock = vi.mocked(api.tasks.spec);
-const tasksCodeMock = vi.mocked(api.tasks.code);
-const tasksReviewsMock = vi.mocked(api.tasks.reviews);
 
 function makeTask(overrides: Partial<TaskState> = {}): TaskState {
-  return makeTaskFixture({
+  const task = makeTaskFixture({
     id: 'task-010',
     projectId: 'baxian',
     title: 'Clean tests',
@@ -92,6 +90,18 @@ function makeTask(overrides: Partial<TaskState> = {}): TaskState {
     updatedAt: '2026-05-10T13:00:00.000Z',
     ...overrides,
   });
+  if (task.phase !== undefined) {
+    if (!Object.hasOwn(overrides, 'deliveryConfirmation')) {
+      task.deliveryConfirmation = {
+        phase: task.phase,
+        source: 'signal',
+        at: '2026-05-10T12:30:00.000Z',
+      };
+    }
+    if (!Object.hasOwn(overrides, 'replyActorId')) task.replyActorId = '77';
+    if (!Object.hasOwn(overrides, 'replyActorStatus')) task.replyActorStatus = 'verified';
+  }
+  return task;
 }
 
 const PROJECT: ProjectConfig = {
@@ -177,9 +187,6 @@ beforeEach(() => {
   tasksCompleteMock.mockReset();
   tasksContinueMock.mockReset();
   tasksSpecMock.mockReset();
-  tasksCodeMock.mockReset();
-  tasksReviewsMock.mockReset();
-  tasksReviewsMock.mockResolvedValue([]);
   toastShowMock.mockReset();
 });
 
@@ -321,37 +328,6 @@ describe('TaskDetail page — layout & agent cards', () => {
     }
   });
 
-  it('renders the stable Research participant before Dev and QA', () => {
-    setProjects([{
-      ...PROJECT,
-      agent: [[
-        ...PROJECT.agent[0],
-        { id: 'bx-research', runtime: 'claude-code', role: 'research', mode: 'local' },
-      ]],
-    }]);
-    useAgentsMock.mockReturnValue({
-      data: [
-        { id: 'bx-dev', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-        { id: 'bx-qa', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-        { id: 'bx-research', projectId: 'baxian', runtimeStatus: 'idle', tmuxSessionStatus: 'present', stale: false },
-      ],
-      loaded: true,
-      error: null,
-    });
-
-    const { container } = open({
-      preferredAgentId: 'bx-research',
-      agentId: 'bx-research',
-      researchAgentId: 'bx-research',
-      phase: 'research',
-      status: 'in_progress',
-    });
-
-    const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
-    expect(cards.map(card => card.getAttribute('data-role'))).toEqual(['research', 'dev', 'qa']);
-    expect(cards[0].getAttribute('data-agent-id')).toBe('bx-research');
-  });
-
   it('activates one task detail agent card at a time and clears it on outside click', () => {
     const { container } = open();
     const cards = Array.from(container.querySelector('aside')!.querySelectorAll('[data-testid="agent-card"]'));
@@ -490,7 +466,7 @@ describe('TaskDetail page — actions & states', () => {
     expect(tasksUpdateMock).toHaveBeenCalledWith('task-010', { status: 'cancelled' });
   });
 
-  it.each(['in_progress', 'review', 'fixing', 'approved', 'spec-ready', 'max_rounds', 'ready', 'merge-ready', 'pending'] as const)(
+  it.each(['in_progress', 'review', 'fixing', 'approved', 'spec-ready', 'max_rounds', 'merge-ready', 'pending'] as const)(
     'Cancel stays clickable at non-terminal status %s with the force-cancel tooltip',
     (status) => {
       open({ status });
@@ -583,11 +559,11 @@ describe('TaskDetail page — actions & states', () => {
       expect(mock).toHaveBeenCalledWith('task-010');
     });
 
-    it('spec-phase shows Retry, hides the code actions, disables Call review', () => {
+    it('spec-phase shows Retry, hides the code actions, and keeps PR review available', () => {
       openMaxRounds({ phase: 'spec' });
       expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
       expect(screen.queryByRole('button', { name: 'Mark complete' })).toBeNull();
-      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(false);
       expect(screen.getByText(/Spec review round limit reached \(round 0\)/)).toBeTruthy();
     });
 
@@ -614,24 +590,6 @@ describe('TaskDetail page — actions & states', () => {
       expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '按分歧点再收敛一轮' });
     });
 
-    it('spec-phase research task can be archived from max_rounds', async () => {
-      tasksSpecMock.mockResolvedValue(makeTask({ status: 'done', phase: 'spec' }));
-      openMaxRounds({
-        phase: 'spec',
-        specReviewRound: 10,
-        preferredAgentId: 'bx-research',
-        agentId: '',
-        researchAgentId: 'bx-research',
-      });
-
-      fireEvent.click(screen.getByRole('button', { name: 'Archive research' }));
-      const dialog = await findConfirmDialog();
-      await act(async () => {
-        fireEvent.click(within(dialog).getByRole('button', { name: 'Archive research' }));
-      });
-
-      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'archive' });
-    });
   });
 
   describe('spec-ready actions', () => {
@@ -679,32 +637,6 @@ describe('TaskDetail page — actions & states', () => {
       expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Spec rejected; Dev agent is revising' });
     });
 
-    it('Research spec-ready explains the handoff and can be archived without coding', async () => {
-      tasksSpecMock.mockResolvedValue(makeTask({
-        status: 'done',
-        phase: 'spec',
-        preferredAgentId: 'bx-research',
-        agentId: 'bx-research',
-        researchAgentId: 'bx-research',
-      }));
-      openSpecReady({
-        preferredAgentId: 'bx-research',
-        agentId: 'bx-research',
-        researchAgentId: 'bx-research',
-      });
-
-      expect(screen.getByText(/Approving hands the exact documents to the Dev agent/)).toBeTruthy();
-      fireEvent.click(screen.getByRole('button', { name: 'Archive research' }));
-      const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Archive this research task?')).toBeTruthy();
-      await act(async () => {
-        fireEvent.click(within(dialog).getByRole('button', { name: 'Archive research' }));
-      });
-
-      expect(tasksSpecMock).toHaveBeenCalledWith('task-010', { verdict: 'archive' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Research task archived' });
-    });
-
     it('verdict failure surfaces an error toast', async () => {
       tasksSpecMock.mockRejectedValue(new Error('task-010 is fixing'));
       openSpecReady();
@@ -716,50 +648,6 @@ describe('TaskDetail page — actions & states', () => {
     });
   });
 
-  describe('code-ready gate (server)', () => {
-    function openCodeReady(overrides: Partial<TaskState> = {}) {
-      open({ status: 'ready', phase: 'code', reviewMode: 'server', reviewRound: 2, prNumber: undefined, prUrl: undefined, ...overrides });
-    }
-
-    it('shows the request-changes textarea + button on a server code ready task; disabled until comments filled', () => {
-      openCodeReady();
-      const reject = screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement;
-      expect(reject.disabled).toBe(true);
-      fireEvent.change(screen.getByPlaceholderText(/[Cc]hange request/), { target: { value: '这里漏了空态' } });
-      expect((screen.getByRole('button', { name: 'Request changes' }) as HTMLButtonElement).disabled).toBe(false);
-    });
-
-    it('does not show the reject affordance for a git-mode ready task', () => {
-      openCodeReady({ reviewMode: 'git', prNumber: 5 });
-      expect(screen.queryByRole('button', { name: 'Request changes' })).toBeNull();
-    });
-
-    it('does not show the reject affordance for a spec-phase task', () => {
-      openCodeReady({ phase: 'spec' });
-      expect(screen.queryByRole('button', { name: 'Request changes' })).toBeNull();
-    });
-
-    it('Request changes submits request-changes with trimmed comments and reports success', async () => {
-      tasksCodeMock.mockResolvedValue(makeTask({ status: 'fixing' }));
-      openCodeReady();
-      fireEvent.change(screen.getByPlaceholderText(/[Cc]hange request/), { target: { value: ' 补一下测试 ' } });
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Request changes' }));
-      });
-      expect(tasksCodeMock).toHaveBeenCalledWith('task-010', { verdict: 'request-changes', comments: '补一下测试' });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Sent back; Dev agent is revising' });
-    });
-
-    it('reject failure surfaces an error toast', async () => {
-      tasksCodeMock.mockRejectedValue(new Error('task-010 is fixing'));
-      openCodeReady();
-      fireEvent.change(screen.getByPlaceholderText(/[Cc]hange request/), { target: { value: '打回' } });
-      await act(async () => {
-        fireEvent.click(screen.getByRole('button', { name: 'Request changes' }));
-      });
-      expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to send back', body: 'task-010 is fixing' });
-    });
-  });
 });
 
 describe('TaskDetail page — call review', () => {
@@ -780,20 +668,149 @@ describe('TaskDetail page — call review', () => {
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
   });
 
-  it('warns that re-reviewing a terminal task will not feed back into the state machine', async () => {
-    open({ status: 'merged' });
-
-    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
-    const dialog = await findConfirmDialog();
-    expect(within(dialog).getByText('Re-review a finished task?')).toBeTruthy();
-    expect(within(dialog).getByText(/is already in status "Merged"/)).toBeTruthy();
-    await act(async () => {
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+  it('collects the stage and platform actor when recovering an unconfirmed git delivery', async () => {
+    tasksReviewMock.mockResolvedValue(makeTask({
+      status: 'review',
+      phase: 'code',
+      reviewRound: 1,
+      updatedAt: '2026-05-11T00:00:00.000Z',
+    }));
+    open({
+      status: 'in_progress',
+      phase: undefined,
+      deliveryConfirmation: undefined,
+      replyActorId: '99',
+      replyActorStatus: 'provisional',
     });
 
-    expect(tasksReviewMock).not.toHaveBeenCalled();
-    expect(toastShowMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Recover PR delivery' });
+    const stage = within(dialog).getByLabelText('Delivered stage (required)') as HTMLSelectElement;
+    const actor = within(dialog).getByLabelText('Platform actor ID (required)') as HTMLInputElement;
+    expect(stage.value).toBe('spec');
+    expect(actor.value).toBe('99');
+    fireEvent.change(stage, { target: { value: 'code' } });
+    fireEvent.change(actor, { target: { value: ' 77 ' } });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Recover and start review' }));
+    });
+
+    expect(tasksReviewMock).toHaveBeenCalledWith('task-010', {
+      stage: 'code',
+      actorId: '77',
+    });
+    expect(toastShowMock).toHaveBeenCalledWith({
+      kind: 'success',
+      title: 'QA re-review started (round 1)',
+    });
   });
+
+  it('does not submit manual recovery without a platform actor', async () => {
+    open({
+      status: 'in_progress',
+      phase: undefined,
+      deliveryConfirmation: undefined,
+      replyActorId: undefined,
+      replyActorStatus: undefined,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Call review' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Recover PR delivery' });
+    const submit = within(dialog).getByRole('button', {
+      name: 'Recover and start review',
+    }) as HTMLButtonElement;
+    const actor = within(dialog).getByLabelText('Platform actor ID (required)');
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(actor, { target: { value: '   ' } });
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    expect(tasksReviewMock).not.toHaveBeenCalled();
+  });
+
+  it('collects and forwards a PR number when a custom-branch task lost its initial signal', async () => {
+    tasksReviewMock.mockResolvedValue(makeTask({
+      status: 'review',
+      prNumber: 73,
+      prUrl: undefined,
+      branch: 'feature/manual-review',
+      phase: 'code',
+      updatedAt: '2026-05-11T00:00:00.000Z',
+    }));
+    open({
+      status: 'in_progress',
+      prNumber: undefined,
+      prUrl: undefined,
+      branch: 'feature/manual-review',
+      phase: undefined,
+      deliveryConfirmation: undefined,
+      replyActorId: undefined,
+      replyActorStatus: undefined,
+    });
+
+    const callReview = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+    expect(callReview.disabled).toBe(false);
+    fireEvent.click(callReview);
+    const dialog = await screen.findByRole('dialog', { name: 'Recover PR delivery' });
+    const submit = within(dialog).getByRole('button', {
+      name: 'Recover and start review',
+    }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText('PR number (required)'), {
+      target: { value: '73' },
+    });
+    fireEvent.change(within(dialog).getByLabelText('Delivered stage (required)'), {
+      target: { value: 'code' },
+    });
+    fireEvent.change(within(dialog).getByLabelText('Platform actor ID (required)'), {
+      target: { value: '77' },
+    });
+    await act(async () => {
+      fireEvent.click(submit);
+    });
+
+    expect(tasksReviewMock).toHaveBeenCalledWith('task-010', {
+      prNumber: 73,
+      stage: 'code',
+      actorId: '77',
+    });
+  });
+
+  it('keeps Call review disabled for a pending task that already has its assigned branch', () => {
+    open({
+      status: 'pending',
+      prNumber: undefined,
+      prUrl: undefined,
+      branch: 'bx/task-010',
+      phase: undefined,
+      deliveryConfirmation: undefined,
+    });
+
+    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(tasksReviewMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['merged', 'done', 'failed', 'cancelled'] as const)(
+    'keeps Call review disabled for terminal status %s even without delivery confirmation',
+    (status) => {
+      open({
+        status,
+        phase: undefined,
+        deliveryConfirmation: undefined,
+        replyActorStatus: undefined,
+      });
+
+      const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe('Finished tasks cannot start another PR review');
+      fireEvent.click(button);
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(tasksReviewMock).not.toHaveBeenCalled();
+    },
+  );
 
   it('shows an error toast when review dispatch fails', async () => {
     tasksReviewMock.mockRejectedValue(new Error('qa is busy'));
@@ -805,48 +822,9 @@ describe('TaskDetail page — call review', () => {
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'qa is busy' });
   });
 
-  it('server-mode task without a PR dispatches a review while under review', async () => {
-    tasksReviewMock.mockResolvedValue(makeTask({ reviewMode: 'server', status: 'review', reviewRound: 2, prNumber: undefined, prUrl: undefined }));
-    open({ reviewMode: 'server', status: 'review', prNumber: undefined, prUrl: undefined });
-
-    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(false);
-    expect(button.title).toBe('Has the QA agent start a new review round right away');
-    fireEvent.click(button);
-    await settleConfirmDialog('Start re-review');
-
-    expect(tasksReviewMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
-  });
-
-  it.each(['in_progress', 'fixing'] as const)(
-    'server-mode Call review is enabled at %s (code phase) without a PR',
-    (status) => {
-      open({ reviewMode: 'server', status, phase: 'code', prNumber: undefined, prUrl: undefined });
-      expect((screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement).disabled).toBe(false);
-    },
-  );
-
-  it('server-mode unphased in_progress task disables Call review with the unphased tooltip', () => {
-    open({ reviewMode: 'server', status: 'in_progress', phase: undefined, prNumber: undefined, prUrl: undefined });
-    const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    expect(button.title).toBe('The dev has not delivered a spec/code signal yet, so there is nothing to review');
-  });
-
-  it.each(['approved', 'spec-ready', 'max_rounds', 'ready', 'merged'] as const)(
-    'server-mode Call review is disabled at %s with the status tooltip',
-    (status) => {
-      open({ reviewMode: 'server', status, prNumber: undefined, prUrl: undefined });
-      const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
-      expect(button.disabled).toBe(true);
-      expect(button.title).toBe('Reviews can only be started while the task is in progress, in review, or fixing');
-    },
-  );
-
-  it('spec-phase task reports the spec round in the toast (git mode without a PR)', async () => {
-    tasksReviewMock.mockResolvedValue(makeTask({ phase: 'spec', status: 'review', specReviewRound: 2, reviewRound: 0, prNumber: undefined, prUrl: undefined }));
-    open({ phase: 'spec', status: 'review', specReviewRound: 1, prNumber: undefined, prUrl: undefined });
+  it('spec-phase task reports the spec round in the toast', async () => {
+    tasksReviewMock.mockResolvedValue(makeTask({ phase: 'spec', status: 'review', specReviewRound: 2, reviewRound: 0 }));
+    open({ phase: 'spec', status: 'review', specReviewRound: 1 });
 
     const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
     expect(button.disabled).toBe(false);
@@ -856,8 +834,8 @@ describe('TaskDetail page — call review', () => {
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'QA re-review started (round 2)' });
   });
 
-  it('git-mode code-phase task without a PR keeps Call review disabled with the no-PR tooltip', () => {
-    open({ status: 'review', prNumber: undefined, prUrl: undefined });
+  it('a task without a PR or bound branch keeps Call review disabled with the no-PR tooltip', () => {
+    open({ status: 'review', prNumber: undefined, prUrl: undefined, branch: undefined });
     const button = screen.getByRole('button', { name: 'Call review' }) as HTMLButtonElement;
     expect(button.disabled).toBe(true);
     expect(button.title).toBe('This task has no PR yet; cannot start a review');
@@ -914,42 +892,12 @@ describe('TaskDetail page — action failures surface error toasts', () => {
 });
 
 describe('TaskDetail page — human confirmation gates', () => {
-  function makeRounds(): ReviewRound[] {
-    return [
-      {
-        round: 1,
-        phase: 'code',
-        content: 'round 1 review',
-        startedAt: '2026-05-10T12:30:00.000Z',
-        findings: {
-          round: 1,
-          verdict: 'request-changes',
-          findings: [
-            { id: 'f1', severity: 'major', message: 'bug one' },
-            { id: 'f2', severity: 'minor', message: 'nit two' },
-          ],
-        },
-      },
-      {
-        round: 2,
-        phase: 'code',
-        content: 'round 2 review',
-        startedAt: '2026-05-10T13:30:00.000Z',
-        findings: { round: 2, verdict: 'approve', findings: [{ id: 'f3', severity: 'minor', message: 'nit three' }] },
-      },
-    ];
-  }
-
-  it('ready gate renders the banner plus review summary, and Confirm completes the task', async () => {
-    tasksReviewsMock.mockResolvedValue(makeRounds());
+  it('merge-ready gate renders the PR banner and Confirm completes the task', async () => {
     tasksCompleteMock.mockResolvedValue(makeTask({ status: 'done', updatedAt: '2026-05-11T00:00:00.000Z' }));
-    const { container } = open({ status: 'ready' });
+    open({ status: 'merge-ready' });
 
-    expect(screen.getByText('Review approved · Awaiting your confirmation')).toBeTruthy();
+    expect(screen.getByText('PR ready · Awaiting your confirmation')).toBeTruthy();
     expect(screen.getByRole('link', { name: 'View PR #55' })).toBeTruthy();
-    await waitFor(() => expect(container.textContent).toContain('Review rounds: 2'));
-    expect(container.textContent).toContain('Final verdict approve');
-    expect(container.textContent).toContain('Findings: 3 total');
 
     fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
     const dialog = await findConfirmDialog();
@@ -976,19 +924,6 @@ describe('TaskDetail page — human confirmation gates', () => {
     expect(toastShowMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to confirm', body: 'gate says no' });
   });
 
-  it('server-mode approved task offers Retry publish which re-runs the publish step', async () => {
-    tasksCompleteMock.mockResolvedValue(
-      makeTask({ reviewMode: 'server', status: 'ready', updatedAt: '2026-05-11T00:00:00.000Z' }),
-    );
-    open({ reviewMode: 'server', status: 'approved' });
-
-    expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Retry publish' }));
-    await settleConfirmDialog('Confirm complete');
-
-    expect(tasksCompleteMock).toHaveBeenCalledWith('task-010');
-    expect(toastShowMock).toHaveBeenCalledWith({ kind: 'success', title: 'Confirmed (ready)' });
-  });
 });
 
 describe('TaskDetail page — review verdict watchdog', () => {
@@ -1075,16 +1010,22 @@ describe('TaskDetail page — agent snapshot fallbacks', () => {
     expect(card.getAttribute('data-terminal-loading')).toBe('true');
   });
 
-  it('shows the QA slot placeholder when the group has no QA agent', () => {
-    setProjects([{ ...PROJECT, agent: [[PROJECT.agent[0][0]]] }]);
-    setTask(makeTask({ qaAgentId: undefined }));
+  it('shows the QA slot placeholder when the snapshotted QA no longer belongs to the group', () => {
+    setProjects([{
+      ...PROJECT,
+      agent: [[
+        PROJECT.agent[0][0],
+        { ...PROJECT.agent[0][1], id: 'replacement-qa' },
+      ]],
+    }]);
+    setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
     expect(screen.getByText('No QA agent')).toBeTruthy();
     expect(container.querySelectorAll('[data-testid="agent-card"]')).toHaveLength(1);
   });
 
   it('does not attach a group QA that was not snapshotted on the task', () => {
-    setTask(makeTask({ qaAgentId: undefined }));
+    setTask(makeTask({ qaAgentId: 'retired-qa' }));
     const { container } = renderPage();
     expect(screen.getByText('No QA agent')).toBeTruthy();
     const cards = Array.from(container.querySelectorAll('[data-testid="agent-card"]'));

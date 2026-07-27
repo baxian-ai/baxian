@@ -32,11 +32,10 @@ export function AgentGroup({
 }: AgentGroupProps) {
   const t = useT();
   const dev = group.find(agent => agent.role === 'dev') ?? group[0];
-  const research = group.find(agent => agent.role === 'research');
   const activeTasks = tasks.filter(task => taskBelongsToGroup(task, dev?.id));
   const claimableTasks = dev
     ? tasks
-        .filter(task => claimableForGroup(task, projectId, dev.id, research?.id))
+        .filter(task => claimableForGroup(task, projectId, dev.id))
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     : [];
 
@@ -112,6 +111,9 @@ export function AgentGroup({
             tmuxSessionStatus: 'unknown',
             stale: true,
           };
+          const boundTask = state.binding?.taskId === undefined
+            ? undefined
+            : tasks.find(task => task.id === state.binding?.taskId);
           return (
             <AgentCard
               key={cfg.id}
@@ -125,6 +127,7 @@ export function AgentGroup({
               onDeleted={onDeleted}
               showTaskBinding={false}
               terminalMode={terminalMode}
+              task={boundTask}
               {...(selectableTerminals
                 ? { active: activeAgentId === cfg.id, onActivate: () => activateAgentCard(cfg.id) }
                 : {})}
@@ -223,11 +226,9 @@ function claimableForGroup(
   task: TaskState,
   projectId: string,
   devId: string,
-  researchId: string | undefined,
 ): boolean {
   if (task.projectId !== projectId) return false;
   if (task.status !== 'pending') return false;
   return task.preferredAgentId === devId
-    || task.preferredAgentId === researchId
     || task.preferredAgentId === '';
 }

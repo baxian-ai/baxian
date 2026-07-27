@@ -9,8 +9,7 @@ import {
 } from '../../src/agent/branch.js';
 import { LocalRunner, shellQuote, type CommandRunner } from '../../src/agent/runner.js';
 import { ReplNotReadyError } from '../../src/agent/tmux.js';
-import { AgentManager, EnsureSessionError } from '../../src/agent/manager.js';
-import { ReviewStore } from '../../src/state/review-store.js';
+import { AgentManager } from '../../src/agent/manager.js';
 import { AgentStore } from '../../src/state/agent-store.js';
 import { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
@@ -327,13 +326,6 @@ describe('BranchManager', () => {
     expect(await new BranchManager(local).currentRef(workdir)).toBe('refs/heads/main');
   });
 
-  it('refuses server review materialization without the full head proof', async () => {
-    await expect(new BranchManager(local).materializeReviewHead(workdir, {
-      patch: '',
-      baseSha: await run(`git -C ${shellQuote(workdir)} rev-parse HEAD`),
-    })).rejects.toThrow(/metadata is incomplete/i);
-  });
-
   it('fails closed when an intermediate Workdir ancestor is a symlink (guarded git never writes through it)', async () => {
     // A real clone at <tempDir>/real/agent, reached via a symlinked parent so `cd && pwd -P` != the given path.
     const realParent = join(tempDir, 'real');
@@ -350,39 +342,6 @@ describe('BranchManager', () => {
     // The remote-tracking ref was NOT written into the real repo through the rebound path.
     const ref = await local.exec(`git -C ${shellQuote(realWorkdir)} rev-parse --verify -q refs/remotes/origin/bx/task-x`);
     expect(ref.exitCode).not.toBe(0);
-  });
-
-  it('materializeReviewHead cleans up its temp patch behind the full ancestor symlink guard', async () => {
-    const baseSha = 'a'.repeat(40);
-    const headSha = 'c'.repeat(40);
-    const headTree = 'b'.repeat(40);
-    const commands: string[] = [];
-    const runner = {
-      exec: vi.fn(async (cmd: string) => {
-        commands.push(cmd);
-        if (cmd.includes('rev-parse --verify') && cmd.includes('HEAD^{tree}')) return { stdout: headTree, stderr: '', exitCode: 0 };
-        if (cmd.includes('rev-parse --verify') && cmd.includes('HEAD^{commit}')) return { stdout: baseSha, stderr: '', exitCode: 0 };
-        if (cmd.includes('rev-parse --verify')) return { stdout: baseSha, stderr: '', exitCode: 0 };
-        if (cmd.includes('cat-file -e')) return { stdout: '', stderr: '', exitCode: 1 };
-        if (cmd.includes('diff --cached --quiet')) return { stdout: '', stderr: '', exitCode: 0 };
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      execWithStdin: vi.fn(async () => ({ stdout: '', stderr: '', exitCode: 0 })),
-      writeFile: vi.fn(async () => {}),
-    } as unknown as CommandRunner;
-
-    const result = await new BranchManager(runner).materializeReviewHead('/repo/wt', {
-      patch: '', baseSha, headSha, headTree,
-    });
-    expect(result).toEqual({ mode: 'head' });
-
-    const rmCmd = commands.find(c => c.includes('rm -f') && c.includes('.materialize-'));
-    expect(rmCmd).toBeDefined();
-    // The full ancestor chain (canonical root + per-component non-symlink checks) precedes the rm.
-    expect(rmCmd).toContain('pwd -P');
-    expect(rmCmd).toContain("[ ! -L '/repo/wt/.baxian'");
-    expect(rmCmd).toContain("[ ! -L '/repo/wt/.baxian/review-inbox'");
-    expect(rmCmd!.indexOf('[ ! -L')).toBeLessThan(rmCmd!.indexOf('rm -f'));
   });
 
   it('refuses an existing task branch that tracks a different upstream', async () => {
@@ -659,8 +618,8 @@ describe('BranchManager', () => {
     const now = new Date().toISOString();
     const autoTask: TaskState = {
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', phase: 'code', branch: 'bx/task-1',
+      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
     };
     const customTask: TaskState = {
       ...autoTask, id: 'task-2', title: 'custom', branch: 'bx/task-2', branchCreatedByBaxian: false,
@@ -687,7 +646,10 @@ describe('BranchManager', () => {
       review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [{
         id: 'proj', repo: 'owner/repo', merge: null,
-        agent: [[{ id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir }]],
+        agent: [[
+          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+        ]],
       }],
     };
     const lockManager = new LockManager(join(stateRoot, 'locks'));
@@ -720,8 +682,8 @@ describe('BranchManager', () => {
     const now = new Date().toISOString();
     const task: TaskState = {
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', phase: 'code', branch: 'bx/task-1',
+      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
     };
     await run(
       `git -C ${shellQuote(workdir)} switch -q -c bx/task-1 && ` +
@@ -743,7 +705,10 @@ describe('BranchManager', () => {
       review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [{
         id: 'proj', repo: 'owner/repo', merge: null,
-        agent: [[{ id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir }]],
+        agent: [[
+          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+        ]],
       }],
     };
     const runtimeRunner: CommandRunner = {
@@ -802,8 +767,8 @@ describe('BranchManager', () => {
     await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
     await taskStore.set({
       id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, status: 'merged',
+      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', phase: 'code', branch: 'bx/task-1',
+      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged',
       branchCleanupSkipped: {
         agentId: 'dev-1',
         reason: 'remote branch is absent; preserving the local branch without retry',
@@ -815,7 +780,10 @@ describe('BranchManager', () => {
       review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
       project: [{
         id: 'proj', repo: 'owner/repo', merge: null,
-        agent: [[{ id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir }]],
+        agent: [[
+          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
+          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+        ]],
       }],
     };
     const manager = new AgentManager({
@@ -833,89 +801,4 @@ describe('BranchManager', () => {
     expect(acquireSpy).not.toHaveBeenCalled();
   });
 
-  it('a real dirty tree: rollback holds the dev, cleanup + Resume releases it, request-changes leaks nothing', async () => {
-    const now = new Date().toISOString();
-    const stateRoot = join(tempDir, 'handoff-manager-state');
-    for (const dir of ['agents', 'tasks', 'locks', 'reviews', 'events', 'skills']) {
-      await mkdir(join(stateRoot, dir), { recursive: true });
-    }
-    const agentStore = new AgentStore(join(stateRoot, 'agents'));
-    const taskStore = new TaskStore(join(stateRoot, 'tasks'));
-    const lockManager = new LockManager(join(stateRoot, 'locks'));
-    const reviewStore = new ReviewStore(join(stateRoot, 'reviews'));
-    const config: BaxianConfig = {
-      review: { rounds: 2 }, server: DEFAULT_SERVER_CONFIG,
-      project: [{
-        id: 'proj', repo: 'owner/repo', merge: null,
-        agent: [[
-          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
-          { id: 'research-1', runtime: 'claude-code', role: 'research', mode: 'local', workdir: join(tempDir, 'research') },
-        ]],
-      }],
-    };
-    const maintenanceRunner: CommandRunner = {
-      exec: (command, options) => command.includes('tmux has-session')
-        ? Promise.resolve({ stdout: '', stderr: "can't find session", exitCode: 1 })
-        : local.exec(command, options),
-      writeFile: (path, content) => local.writeFile(path, content),
-      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
-    };
-    const watcherStub = { start: vi.fn(async () => true), stop: vi.fn(), has: vi.fn(() => false) };
-    const manager = new AgentManager({
-      config, agentStore, taskStore, lockManager, reviewStore,
-      eventBus: new EventBus(new EventLog(join(stateRoot, 'events'))),
-      skillRegistry: new SkillRegistry(join(stateRoot, 'skills')),
-      runnerFactory: () => maintenanceRunner,
-      phaseSignalWatcher: watcherStub as never,
-    });
-    await new BranchManager(local).switchToTaskBranch(workdir, 'task-1', 'bx/task-1', true);
-    await run(`printf dirty > ${shellQuote(join(workdir, 'wip.txt'))}`);
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'spec', description: '',
-      preferredAgentId: 'research-1', agentId: '', devAgentId: 'dev-1',
-      researchAgentId: 'research-1', phase: 'spec', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewMode: 'server', reviewRound: 0, specReviewRound: 2,
-      status: 'max_rounds', createdAt: now, updatedAt: now,
-    });
-    await reviewStore.putRound('task-1', 'spec', {
-      round: 2, phase: 'spec', content: '# Spec v2',
-      documents: [{ relPath: '.baxian/spec.md', content: '# Spec v2' }],
-      startedAt: now,
-    });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
-    await agentStore.set({ id: 'research-1', projectId: 'proj', updatedAt: now });
-    vi.spyOn(manager, 'startSession').mockImplementation(async () => {
-      await agentStore.update('dev-1', existing => ({
-        ...existing!,
-        status: 'awaiting_human',
-        awaitingPhase: 'dirty-workdir',
-        awaitingReason: `Workdir ${workdir} has staged, tracked, untracked, conflicted, or dirty submodule changes`,
-        awaitingSince: now,
-        updatedAt: now,
-      }));
-      throw new EnsureSessionError(
-        { createdSession: false, agentId: 'dev-1', handled: true },
-        'checkout preparation failed for task task-1: dirty workdir',
-      );
-    });
-
-    await expect(manager.submitSpecVerdict('task-1', 'approve')).rejects.toMatchObject({ status: 500 });
-    expect(await taskStore.get('task-1')).toMatchObject({ status: 'max_rounds', phase: 'spec', agentId: '' });
-    const heldDev = await agentStore.get('dev-1');
-    expect(heldDev?.taskId).toBe('task-1');
-    expect(heldDev?.awaitingPhase).toBe('branch-cleanup-pending');
-
-    await run(`rm ${shellQuote(join(workdir, 'wip.txt'))}`);
-    const resumeResult = await manager.resumeAgent('dev-1');
-    expect(resumeResult).toMatchObject({ resumed: true, releasedBinding: true });
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-    expect(await lockManager.isLocked('dev-1')).toBe(false);
-
-    vi.spyOn(manager, 'continueSession').mockResolvedValue(true);
-    const rejected = await manager.submitSpecVerdict('task-1', 'request-changes', '再收敛一轮');
-    expect(rejected.status).toBe('fixing');
-    expect(rejected.agentId).toBe('research-1');
-    expect((await agentStore.get('research-1'))?.taskId).toBe('task-1');
-    expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
-  });
 });

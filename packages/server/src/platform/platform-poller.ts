@@ -20,7 +20,6 @@ import { checkPrBinding, type BindingCheck } from './pr-binding.js';
 export interface PlatformTaskView {
   taskId: string;
   terminal: boolean;
-  reviewMode: TaskState['reviewMode'];
   status?: TaskState['status'];
   phase?: TaskState['phase'];
   branch?: string;
@@ -44,7 +43,6 @@ export function platformTaskView(task: TaskState): PlatformTaskView {
   return {
     taskId: task.id,
     terminal: TASK_TERMINAL_STATUS_SET.has(task.status),
-    reviewMode: task.reviewMode,
     status: task.status,
     inReview: task.status === 'review',
     closedUnmergedAnchor: task.closedUnmergedAnchor !== undefined && task.closedUnmergedAnchor.cleared !== true,
@@ -728,7 +726,6 @@ export class PlatformPoller {
           task.status ?? '',
           task.phase ?? '',
           task.signalToken ?? '',
-          task.reviewMode,
           base.branch,
           target,
           String(row.headSha),
@@ -858,10 +855,6 @@ export class PlatformPoller {
     }
 
     observed.closedUnmerged = false;
-    if (task.reviewMode === 'server') {
-      this.engine.dropCandidate(task.taskId, prNumber);
-      return;
-    }
     const headSha = String(prRow.headSha);
     if (task.latestHeadSha !== undefined && headSha !== task.latestHeadSha.toLowerCase() && observed.pushSha !== headSha) {
       try {

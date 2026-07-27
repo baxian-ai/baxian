@@ -1,5 +1,5 @@
 import type { BaxianConfig } from '../shared/types.js';
-import { projectNeedsPlatformEntry, projectReviewMode, resolveProjectTool } from '../config/validator.js';
+import { projectNeedsPlatformEntry, resolveProjectTool } from '../config/validator.js';
 import { repoIdentityKey } from '../shared/git-url.js';
 import type { AgentManager } from '../agent/manager.js';
 
@@ -93,7 +93,7 @@ function identityTrio(
   const project = config.project.find(p => p.id === projectId);
   if (!project) return undefined;
   return {
-    mode: projectReviewMode(config, project),
+    mode: 'git',
     repoKey: repoIdentityKey(project.repo),
     tool: resolveProjectTool(project) ?? '',
   };

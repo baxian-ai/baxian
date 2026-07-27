@@ -1507,3 +1507,99 @@ describe('viewport follow tick', () => {
     expect(normalizeFollowIntervalMs(2000)).toBe(2000);
   });
 });
+
+describe('PaneStreamer visible-text stream', () => {
+  const ESC = '\x1b';
+  const BEL = '\x07';
+  const MARKER = '[bx:pr-fixed:tok123abc]';
+
+  function visibleSub(): { cbs: SubscriberCallbacks; seen: Array<{ visible: string; seq: number }> } {
+    const seen: Array<{ visible: string; seq: number }> = [];
+    return {
+      seen,
+      cbs: { onVisible: (visible, seq) => seen.push({ visible, seq }), onSessionGone: () => undefined },
+    };
+  }
+
+  it('broadcasts the decoded chunk alongside the raw one, on the same seq', async () => {
+    const { streamer, fakePty } = makeStreamer();
+    const raw: Array<{ data: string; seq: number }> = [];
+    const { cbs: visCbs, seen } = visibleSub();
+    await streamer.subscribeAtomic({
+      onLive: (data, seq) => raw.push({ data, seq }),
+      onVisible: visCbs.onVisible,
+      onSessionGone: () => undefined,
+    });
+
+    fakePty.emitData(`${ESC}[31mhello${ESC}[0m`);
+    await flush(streamer);
+
+    expect(raw).toEqual([{ data: `${ESC}[31mhello${ESC}[0m`, seq: 0 }]);
+    expect(seen).toEqual([{ visible: 'hello', seq: 0 }]);
+    streamer.destroy();
+  });
+
+  // The reason the decoder lives here and not on each subscription: subscribeAtomic can
+  // only join at a PTY chunk boundary, which is not necessarily a Ground boundary.
+  it('keeps a control string opened BEFORE the subscription open for the new subscriber', async () => {
+    const { streamer, fakePty } = makeStreamer();
+    await streamer.subscribeAtomic(NOOP_CBS);
+
+    fakePty.emitData(`${ESC}]0;title-start`); // unterminated OSC, no marker yet
+    await flush(streamer);
+
+    const { cbs: lateCbs, seen } = visibleSub();
+    await streamer.subscribeAtomic(lateCbs);
+
+    fakePty.emitData(`${MARKER}${BEL}`); // payload still inside the OSC the terminal hides
+    await flush(streamer);
+    expect(seen.map(s => s.visible).join('')).toBe('');
+
+    fakePty.emitData('now visible');
+    await flush(streamer);
+    expect(seen.map(s => s.visible).join('')).toBe('now visible');
+    streamer.destroy();
+  });
+
+  it('decodes once and hands every subscriber the same text', async () => {
+    const { streamer, fakePty } = makeStreamer();
+    const a = visibleSub();
+    const b = visibleSub();
+    await streamer.subscribeAtomic(a.cbs);
+    await streamer.subscribeAtomic(b.cbs);
+
+    fakePty.emitData(`${ESC}]0;x${BEL}shared`);
+    await flush(streamer);
+
+    expect(a.seen).toEqual([{ visible: 'shared', seq: 0 }]);
+    expect(b.seen).toEqual(a.seen);
+    streamer.destroy();
+  });
+
+  it('carries decode state across chunk splits, so a torn control string never leaks', async () => {
+    const { streamer, fakePty } = makeStreamer();
+    const { cbs: visCbs, seen } = visibleSub();
+    await streamer.subscribeAtomic(visCbs);
+
+    for (const chunk of [`${ESC}]0;`, MARKER, BEL, 'tail']) {
+      fakePty.emitData(chunk);
+      await flush(streamer);
+    }
+    expect(seen.map(s => s.visible).join('')).toBe('tail');
+    streamer.destroy();
+  });
+
+  it('a visible-only subscriber keeps the streamer alive (idle accounting counts it)', async () => {
+    const { streamer, fakePty } = makeStreamer({ idleGraceMs: 10 });
+    const { cbs: visCbs, seen } = visibleSub();
+    await streamer.subscribeAtomic(visCbs);
+
+    await new Promise(resolve => setTimeout(resolve, 40));
+    expect(streamer.isDestroyed()).toBe(false);
+
+    fakePty.emitData('still here');
+    await flush(streamer);
+    expect(seen.map(s => s.visible).join('')).toBe('still here');
+    streamer.destroy();
+  });
+});

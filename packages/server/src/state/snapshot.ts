@@ -29,7 +29,7 @@ export interface AgentSnapshotCtx {
 }
 
 const WORKING_TASK_STATUSES = new Set<TaskState['status']>(['in_progress', 'fixing']);
-const WAITING_TASK_STATUSES = new Set<TaskState['status']>(['review', 'spec-ready', 'approved', 'merge-ready', 'ready', 'max_rounds']);
+const WAITING_TASK_STATUSES = new Set<TaskState['status']>(['review', 'spec-ready', 'approved', 'merge-ready', 'max_rounds']);
 const ERROR_TASK_STATUSES = new Set<TaskState['status']>(['failed']);
 const UNREACHABLE_ACTIVE_TASK_GRACE_MS = 30_000;
 
@@ -207,8 +207,11 @@ export async function buildAgentSnapshotById(
 }
 
 export function enrichTaskSnapshot(task: TaskState): TaskState {
-  if (task.status !== 'review' || !task.reviewDispatchedAt || !task.qaAgentId || !task.signalToken) {
+  if (task.status !== 'review' || !task.reviewDispatchedAt || !task.signalToken) {
     return task;
+  }
+  if (!task.qaAgentId) {
+    throw new Error(`enrichTaskSnapshot: review task ${task.id} has no QA participant`);
   }
   const elapsed = Date.now() - Date.parse(task.reviewDispatchedAt);
   if (!Number.isFinite(elapsed) || elapsed < REVIEW_VERDICT_TIMEOUT_MS) return task;

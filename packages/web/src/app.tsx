@@ -4,7 +4,6 @@ import { Dashboard } from './pages/dashboard.tsx';
 import { Project } from './pages/project.tsx';
 import { TaskDetail } from './pages/task-detail.tsx';
 import { Terminal } from './pages/terminal.tsx';
-import { ReviewRoundPage } from './pages/review-round.tsx';
 import { PrReviewPage } from './pages/pr-review.tsx';
 import { BrandToggle } from './components/brand-toggle.tsx';
 import { GithubConnectivityBanner } from './components/github-connectivity-banner.tsx';
@@ -215,7 +214,6 @@ function AppShell() {
           <Route path="/project/:id" element={<Project />} />
           <Route path="/project/:id/task/:taskId" element={<TaskDetail />} />
           <Route path="/terminal/:agentId" element={<Terminal />} />
-          <Route path="/tasks/:taskId/rounds/:phase/:round" element={<ReviewRoundPage />} />
           <Route path="/tasks/:taskId/pr-review" element={<PrReviewPage />} />
         </Routes>
         {showBottomBrand && (

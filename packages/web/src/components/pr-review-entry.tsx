@@ -1,6 +1,6 @@
 import { type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { PrReviewItem, TaskState } from '../shared/index.js';
+import { isSpecStagePhase, type PrReviewItem, type TaskState } from '../shared/index.js';
 import {
   PR_REVIEW_VERDICT_CLASS,
   groupPrReviewRounds,
@@ -20,7 +20,6 @@ interface Props {
 
 function reasonText(t: Messages): Record<string, string> {
   return {
-    'server-mode': t.prReview.reasonServerModeEntry,
     'no-pr': t.prReview.reasonNoPr,
     'driver-unavailable': t.prReview.reasonDriverUnavailable,
   };
@@ -74,6 +73,9 @@ export function PrReviewEntry({ task }: Props) {
   const navigate = useNavigate();
   const revision = prReviewRevision(task);
   const { data, loaded, error } = usePrReview(task.id, revision);
+  const heading = isSpecStagePhase(task.phase)
+    ? t.prReview.specReviewHeading
+    : t.prReview.codeReviewHeading;
 
   function open(anchor?: string) {
     navigate(`/tasks/${encodeURIComponent(task.id)}/pr-review${anchor ? `#${anchor}` : ''}`);
@@ -81,7 +83,7 @@ export function PrReviewEntry({ task }: Props) {
 
   if (error) {
     return (
-      <ReviewGroup>
+      <ReviewGroup title={heading}>
         <div className="text-sm text-accent">{t.review.loadFailed(error)}</div>
       </ReviewGroup>
     );
@@ -89,7 +91,7 @@ export function PrReviewEntry({ task }: Props) {
 
   if (!loaded) {
     return (
-      <ReviewGroup>
+      <ReviewGroup title={heading}>
         <div className="text-sm text-og-400">{t.review.loadingRecords}</div>
       </ReviewGroup>
     );
@@ -98,7 +100,7 @@ export function PrReviewEntry({ task }: Props) {
   if (!data?.available) {
     const reasons = reasonText(t);
     return (
-      <ReviewGroup>
+      <ReviewGroup title={heading}>
         <div className="text-sm text-og-400">{reasons[data?.reason ?? 'no-pr'] ?? reasons['no-pr']}</div>
       </ReviewGroup>
     );
@@ -106,7 +108,7 @@ export function PrReviewEntry({ task }: Props) {
 
   if (data.items.length === 0) {
     return (
-      <ReviewGroup>
+      <ReviewGroup title={heading}>
         {data.truncated ? (
           <div className="text-sm text-accent">{t.prReview.listTruncated}</div>
         ) : data.error ? (
@@ -121,7 +123,7 @@ export function PrReviewEntry({ task }: Props) {
   const rounds = groupPrReviewRounds(data.items);
 
   return (
-    <ReviewGroup>
+    <ReviewGroup title={heading}>
       {data.error && (
         <div className="text-xs text-accent">{t.prReview.partialFetchFailed(data.error)}</div>
       )}
@@ -133,11 +135,10 @@ export function PrReviewEntry({ task }: Props) {
   );
 }
 
-function ReviewGroup({ children }: { children: ReactNode }) {
-  const t = useT();
+function ReviewGroup({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div>
-      <div className="mb-1.5 text-xs text-og-700">{t.prReview.codeReviewHeading}</div>
+      <div className="mb-1.5 text-xs text-og-700">{title}</div>
       <div className="space-y-3">{children}</div>
     </div>
   );

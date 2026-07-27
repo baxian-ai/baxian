@@ -5,7 +5,13 @@ import { buildDriverRunContext, GitDriver, type DriverExec } from './git-driver.
 import type { PluginRegistry } from './plugin-registry.js';
 
 export function makeDriverExec(runner: CommandRunner): DriverExec {
-  return (command, opts) => runner.exec(command, { timeout: opts.timeout, maxBuffer: opts.maxBuffer });
+  return (command, opts) => opts.stdin === undefined
+    ? runner.exec(command, { timeout: opts.timeout, maxBuffer: opts.maxBuffer })
+    : runner.execWithStdin(
+        command,
+        opts.stdin,
+        { timeout: opts.timeout, maxBuffer: opts.maxBuffer },
+      );
 }
 
 export function buildProjectDriver(

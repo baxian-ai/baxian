@@ -45,35 +45,9 @@ describe('loadPluginsOrExplainWithRoots', () => {
     expect((r as { fatal: string[] }).fatal.join('\n')).toMatch(/no git-driver plugin provides tool 'gh'/);
   });
 
-  it('a server + afterDone pr github project is fatal when the gh driver is unavailable (it needs a poller entry)', async () => {
-    const cfg = {
-      review: { rounds: 3, mode: 'server', afterDone: 'pr' }, server: { port: 3000, host: '127.0.0.1' }, host: [],
-      project: [{ id: 'srv', repo: 'https://github.com/a/b.git', merge: null, review: { mode: 'server' }, agent: [] }],
-    } as never;
-    const r = await loadPluginsOrExplainWithRoots(cfg, { builtin: '/nonexistent-a', user: '/nonexistent-b' });
-    expect('fatal' in r).toBe(true);
-    expect((r as { fatal: string[] }).fatal.join('\n')).toMatch(/no git-driver plugin provides tool 'gh'/);
-  });
-
-  it('a server + afterDone branch project still needs no plugin', async () => {
-    const cfg = {
-      review: { rounds: 3, mode: 'server', afterDone: 'branch' }, server: { port: 3000, host: '127.0.0.1' }, host: [],
-      project: [{ id: 'srv', repo: 'https://github.com/a/b.git', merge: null, review: { mode: 'server' }, agent: [] }],
-    } as never;
-    const r = await loadPluginsOrExplainWithRoots(cfg, { builtin: '/nonexistent-a', user: '/nonexistent-b' });
-    expect('registry' in r).toBe(true);
-  });
-
-  it('a server-mode project needs no plugin at all', async () => {
+  it('a project with an unresolvable tool is fatal with an install hint', async () => {
     const r = await loadPluginsOrExplainWithRoots(cfgWith([
-      { id: 'p', repo: 'https://github.com/a/b.git', merge: null, review: { mode: 'server' }, agent: [] },
-    ]), { builtin: '/nonexistent-a', user: '/nonexistent-b' });
-    expect('registry' in r).toBe(true);
-  });
-
-  it('git project with unresolvable tool is fatal with install hint', async () => {
-    const r = await loadPluginsOrExplainWithRoots(cfgWith([
-      { id: 'p', repo: 'https://gl.example.com/g/p.git', merge: null, review: { mode: 'git' }, gitCli: { tool: 'forge' }, agent: [] },
+      { id: 'p', repo: 'https://gl.example.com/g/p.git', merge: null, gitCli: { tool: 'forge' }, agent: [] },
     ]), { builtin: '/nonexistent-a', user: '/nonexistent-b' });
     expect('fatal' in r).toBe(true);
     const msg = (r as { fatal: string[] }).fatal.join('\n');
@@ -81,11 +55,11 @@ describe('loadPluginsOrExplainWithRoots', () => {
     expect(msg).toMatch(/\.baxian\/plugins/);
   });
 
-  it('git project with a resolvable tool returns a registry', async () => {
+  it('a project with a resolvable tool returns a registry', async () => {
     const roots = await createRoots();
     await writeValidPlugin(roots.builtin, 'glab');
     const r = await loadPluginsOrExplainWithRoots(cfgWith([
-      { id: 'p', repo: 'https://gl.example.com/g/p.git', merge: null, review: { mode: 'git' }, gitCli: { tool: 'glab' }, agent: [] },
+      { id: 'p', repo: 'https://gl.example.com/g/p.git', merge: null, gitCli: { tool: 'glab' }, agent: [] },
     ]), roots);
     expect('registry' in r).toBe(true);
     expect((r as { registry: { resolveTool: (t: string) => unknown } }).registry.resolveTool('glab')).toBeTruthy();
@@ -275,13 +249,13 @@ describe('scanPluginSkillPools', () => {
     await expect(scanPluginSkillPools(registry, plugins, new Set(['forge']))).rejects.toThrow(/invalid UTF-8/);
   });
 
-  it('resolves referenced tools from effective git projects only', () => {
+  it('resolves referenced tools from every project', () => {
     const cfg = cfgWith([
-      { id: 'a', repo: 'https://gl.example.com/g/a.git', merge: null, review: { mode: 'git' }, gitCli: { tool: 'glab' }, agent: [] },
-      { id: 'b', repo: 'https://github.com/o/r.git', merge: null, review: { mode: 'git' }, agent: [] },
-      { id: 'c', repo: 'https://gl.example.com/g/c.git', merge: null, review: { mode: 'server' }, gitCli: { tool: 'forge' }, agent: [] },
+      { id: 'a', repo: 'https://gl.example.com/g/a.git', merge: null, gitCli: { tool: 'glab' }, agent: [] },
+      { id: 'b', repo: 'https://github.com/o/r.git', merge: null, agent: [] },
+      { id: 'c', repo: 'https://gl.example.com/g/c.git', merge: null, gitCli: { tool: 'forge' }, agent: [] },
     ]);
-    expect([...referencedGitTools(cfg)].sort()).toEqual(['gh', 'glab']);
+    expect([...referencedGitTools(cfg)].sort()).toEqual(['forge', 'gh', 'glab']);
   });
 });
 

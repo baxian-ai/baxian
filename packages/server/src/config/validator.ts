@@ -3,19 +3,22 @@ import { isBareRepoSlug,
   CONTROL_CHAR_RE, TOOL_PATTERN,
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
   ROOT_AGENT_ID,
-  type AfterDone, type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type ReviewMode, type SpecApprovalStrategy,
+  type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type SpecApprovalStrategy,
 } from '../shared/index.js';
 import { mayShareHostAccount, resolveAgentHost } from '../agent/runner.js';
-
-const VALID_REVIEW_MODES: ReadonlySet<string> = new Set(['git', 'server']);
 
 export interface ValidationError {
   path: string;
   message: string;
 }
 
+export interface ValidationWarning {
+  path: string;
+  message: string;
+}
+
 const VALID_RUNTIMES: AgentRuntime[] = ['claude-code', 'codex', 'opencode', 'qodercli'];
-const VALID_ROLES: AgentRole[] = ['dev', 'qa', 'research'];
+const VALID_ROLES: AgentRole[] = ['dev', 'qa'];
 const VALID_MODES: AgentMode[] = ['local', 'remote'];
 const VALID_MERGE: MergeStrategy[] = ['auto', null];
 const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', null, undefined];
@@ -25,6 +28,57 @@ const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const ROOT_FIELDS = new Set([
   'runtime', 'mode', 'host', 'workdir', 'yolo', 'model', 'projects', 'responseTimeoutMinutes',
 ]);
+const TOP_LEVEL_FIELDS = new Set(['language', 'review', 'server', 'host', 'project', 'root']);
+const REVIEW_FIELDS = new Set(['rounds']);
+const SERVER_FIELDS = new Set([
+  'port', 'host', 'token', 'https', 'allowedHosts', 'githubPollIntervalMs',
+  'tmuxProbePollIntervalMs', 'tmuxProbeTimeoutMs', 'tmuxProbeConcurrency',
+  'bootstrapRetryIntervalMs', 'dispatchReconcileIntervalMs', 'dispatchBusyWaitBudgetMs',
+  'dispatchReconcileMaxAttempts',
+]);
+const PROJECT_FIELDS = new Set(['id', 'repo', 'merge', 'specApproval', 'gitCli', 'agent']);
+const AGENT_FIELDS = new Set([
+  'id', 'runtime', 'mode', 'host', 'workdir', 'yolo', 'model', 'addDirs', 'role',
+]);
+
+function unknownKeyWarnings(
+  value: unknown,
+  allowed: ReadonlySet<string>,
+  prefix: string,
+): ValidationWarning[] {
+  if (!isRecord(value)) return [];
+  return Object.keys(value)
+    .filter(key => !allowed.has(key))
+    .map(key => ({
+      path: prefix === '' ? key : `${prefix}.${key}`,
+      message: 'unknown configuration key; it will be ignored',
+    }));
+}
+
+export function collectUnknownConfigWarnings(config: Record<string, unknown>): ValidationWarning[] {
+  const warnings = [
+    ...unknownKeyWarnings(config, TOP_LEVEL_FIELDS, ''),
+    ...unknownKeyWarnings(config.review, REVIEW_FIELDS, 'review'),
+    ...unknownKeyWarnings(config.server, SERVER_FIELDS, 'server'),
+  ];
+  if (!Array.isArray(config.project)) return warnings;
+  config.project.forEach((project, projectIndex) => {
+    const projectPath = `project[${projectIndex}]`;
+    warnings.push(...unknownKeyWarnings(project, PROJECT_FIELDS, projectPath));
+    if (!isRecord(project) || !Array.isArray(project.agent)) return;
+    project.agent.forEach((group, groupIndex) => {
+      if (!Array.isArray(group)) return;
+      group.forEach((agent, agentIndex) => {
+        warnings.push(...unknownKeyWarnings(
+          agent,
+          AGENT_FIELDS,
+          `${projectPath}.agent[${groupIndex}][${agentIndex}]`,
+        ));
+      });
+    });
+  });
+  return warnings;
+}
 
 function isValidRepo(repo: string): boolean {
   if (isGitHubRepo(repo)) return REPO_SLUG_PATTERN.test(repoSlug(repo));
@@ -44,9 +98,7 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateGlobals(config, errors);
   validateHosts(config, errors);
   validateProjectFields(config, errors);
-  validateProjectReviewModes(config, errors);
-  validateGitMode(config, errors);
-  validateServerPublishTool(config, errors);
+  validatePlatformProjects(config, errors);
   validatePlatformRepoUniqueness(config, errors);
   validateProjectIds(config, errors);
   validateAgentFields(config, errors);
@@ -64,11 +116,6 @@ function nonEmptyString(v: unknown): boolean {
 }
 
 
-export function projectReviewMode(config: BaxianConfig, project: ProjectConfig): ReviewMode {
-  const review = (project as { review?: unknown }).review;
-  return (isRecord(review) && review.mode !== undefined ? review.mode : (config.review.mode ?? 'git')) as ReviewMode;
-}
-
 // tool 解析的唯一定义（spec v2 §4）：显式 gitCli.tool 优先；github 仓库零配置自动 'gh'（内置插件）；
 // 非 github 且未声明 → undefined（validator 已报配置错误，消费端跳过）。
 export function resolveProjectTool(project: ProjectConfig): string | undefined {
@@ -76,18 +123,8 @@ export function resolveProjectTool(project: ProjectConfig): string | undefined {
   return nonEmptyString(project.repo) && isGitHubRepo(project.repo) ? 'gh' : undefined;
 }
 
-// afterDone 的唯一投影：非 github 仓库不支持开 PR，'pr'/未声明一律落到 'branch'。
-export function projectAfterDone(config: BaxianConfig, project: ProjectConfig): AfterDone {
-  if (!isGitHubRepo(project.repo)) {
-    const configured = config.review.afterDone;
-    return configured === 'pr' || configured === undefined ? 'branch' : configured;
-  }
-  return config.review.afterDone ?? null;
-}
-
-export function projectNeedsPlatformEntry(config: BaxianConfig, project: ProjectConfig): boolean {
-  if (resolveProjectTool(project) === undefined) return false;
-  return projectReviewMode(config, project) === 'git' || projectAfterDone(config, project) === 'pr';
+export function projectNeedsPlatformEntry(_config: BaxianConfig, project: ProjectConfig): boolean {
+  return resolveProjectTool(project) !== undefined;
 }
 
 function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void {
@@ -149,13 +186,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
   if (!Number.isInteger(config.review.rounds) || config.review.rounds <= 0) {
     errors.push({ path: 'review.rounds', message: 'review.rounds must be a positive integer' });
   }
-  if (config.review.mode !== undefined && !VALID_REVIEW_MODES.has(config.review.mode)) {
-    errors.push({ path: 'review.mode', message: "review.mode must be 'git' or 'server'" });
-  }
-  const afterDone = config.review.afterDone;
-  if (afterDone !== undefined && afterDone !== null && afterDone !== 'pr' && afterDone !== 'branch') {
-    errors.push({ path: 'review.afterDone', message: "review.afterDone must be 'pr', 'branch', or null" });
-  }
   if (config.server.https !== undefined) {
     const https = config.server.https as unknown;
     if (typeof https !== 'object' || https === null || Array.isArray(https)) {
@@ -198,23 +228,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
   }
 }
 
-function validateProjectReviewModes(config: BaxianConfig, errors: ValidationError[]): void {
-  config.project.forEach((project, i) => {
-    const path = `project[${i}]`;
-    const review = (project as { review?: unknown }).review;
-    if (review !== undefined) {
-      if (!isRecord(review)) {
-        errors.push({ path: `${path}.review`, message: 'project.review must be an object' });
-        return;
-      }
-      if (review.mode !== undefined && !(typeof review.mode === 'string' && VALID_REVIEW_MODES.has(review.mode))) {
-        errors.push({ path: `${path}.review.mode`, message: "project.review.mode must be 'git' or 'server'" });
-      }
-    }
-
-  });
-}
-
 function validatePlatformRepoUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
   // 查重范围 = platform entry 集合（spec §4/§5.5 同谓词）：共用一个 repo 就共用一份 cursor
   // 与观察缓存，两个 entry 指向同一仓库会互相吞事件。都不进 entry 的项目共用 repo 无妨。
@@ -234,31 +247,13 @@ function validatePlatformRepoUniqueness(config: BaxianConfig, errors: Validation
   });
 }
 
-// server 模式 + afterDone 解析 'pr' 的 agent 发布面走 baxian-server-feedback 的 gh 契约；
-// server 生命周期面复用 driver。gitCli 若声明 tool 必须为 'gh'，binary 仅覆盖 server 面可执行文件。
-function validateServerPublishTool(config: BaxianConfig, errors: ValidationError[]): void {
-  config.project.forEach((project, i) => {
-    if (!nonEmptyString(project.repo)) return;
-    if (projectReviewMode(config, project) !== 'server' || projectAfterDone(config, project) !== 'pr') return;
-    const gitCli = project.gitCli;
-    if (isRecord(gitCli) && typeof gitCli.tool === 'string' && gitCli.tool !== 'gh') {
-      errors.push({
-        path: `project[${i}].gitCli.tool`,
-        message: "server-mode projects that publish PRs (afterDone: 'pr') may only declare gitCli.tool 'gh' (the agent publish contract uses gh); drop the tool or use a git-mode project",
-      });
-    }
-  });
-}
-
-function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void {
+function validatePlatformProjects(config: BaxianConfig, errors: ValidationError[]): void {
   config.project.forEach((project, i) => {
     const path = `project[${i}]`;
     const gitCli = project.gitCli;
 
     // project.repo 的存在性/类型错误已由 validateProjectFields 报告；此处短路，避免对畸形 repo 重复报告或在 isGitHubRepo/dedupe 上崩溃
     if (!nonEmptyString(project.repo)) return;
-
-    if (projectReviewMode(config, project) !== 'git') return;
 
     // github 仓库豁免 http(s) 形态与 gitCli 声明：内置 gh 驱动只用 {hostname}/{repoPath} 占位符
     // 且 tool 自动解析为 'gh'（spec v2 §4），SSH/scp/裸 slug 形态照常合法。
@@ -267,7 +262,7 @@ function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void 
       if (!/^https?:\/\//i.test(project.repo)) {
         errors.push({
           path: `${path}.repo`,
-          message: "mode 'git' requires an http(s):// repo URL (the git-driver CLI derives its API endpoint from it; ssh/scp forms would target the SSH port instead)",
+          message: 'non-GitHub repos require an http(s):// repo URL because the platform driver derives its API endpoint from it',
         });
       } else {
         // 补 isValidRepo 段模式不查的 URL 结构错误（如非数字端口）；退化路径形态
@@ -282,7 +277,7 @@ function validateGitMode(config: BaxianConfig, errors: ValidationError[]): void 
       if (gitCli === undefined) {
         errors.push({
           path: `${path}.gitCli`,
-          message: "non-GitHub repos in review.mode 'git' require gitCli.tool — declare it and install the matching git-driver plugin under ~/.baxian/plugins/, or use review.mode 'server'",
+          message: 'non-GitHub repos require gitCli.tool and a matching git-driver plugin under ~/.baxian/plugins/',
         });
       }
     } else if (isBareRepoSlug(project.repo) && resolveProjectTool(project) !== 'gh') {
@@ -364,7 +359,7 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
   }
 }
 
-// gitCli 形状与 review mode 无关（对任意项目合法，spec v2 §4），归字段形状层——
+// gitCli 对任意项目合法（spec v2 §4），归字段形状层——
 // 放 validateGitMode 会被其 repo 短路压掉，repo 与 gitCli 同坏时用户要修两轮才见全错。
 function validateGitCliShape(project: ProjectConfig, path: string, errors: ValidationError[]): void {
   const gitCli = project.gitCli;
@@ -730,19 +725,16 @@ function validateAgentPairs(config: BaxianConfig, errors: ValidationError[]): vo
         errors.push({ path, message: 'Agent group cannot be empty' });
         continue;
       }
-      if (group.length > 3) {
-        errors.push({ path, message: 'Agent group can have at most 3 agents' });
+      if (group.length > 2) {
+        errors.push({ path, message: 'Agent group can have at most 2 agents' });
       }
       const counts = new Map<AgentRole, number>();
       for (const agent of group) counts.set(agent.role, (counts.get(agent.role) ?? 0) + 1);
       if (counts.get('dev') !== 1) {
         errors.push({ path, message: 'Agent group must contain exactly one dev agent' });
       }
-      if ((counts.get('qa') ?? 0) > 1) {
-        errors.push({ path, message: 'Agent group can contain at most one qa agent' });
-      }
-      if ((counts.get('research') ?? 0) > 1) {
-        errors.push({ path, message: 'Agent group can contain at most one research agent' });
+      if (counts.get('qa') !== 1) {
+        errors.push({ path, message: 'Agent group must contain exactly one qa agent' });
       }
     }
   }

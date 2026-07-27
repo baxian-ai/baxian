@@ -111,7 +111,7 @@ export async function runPreflight(
   host?: HostConfig,
   projectId?: string,
   gitPlatform?: AgentGitPreflight,
-  options: { requireGitHubCli?: boolean; requireGitPush?: boolean } = {},
+  options: { requireGitPush?: boolean } = {},
 ): Promise<PreflightResult[]> {
   repo = repo.trim();
   const results: PreflightResult[] = [];
@@ -172,7 +172,7 @@ export async function runPreflight(
 
   if (gitPlatform !== undefined) {
     await runGitPlatformChecks(runner, agent, gitPlatform, results);
-  } else if (isGitHubRepo(repo) && (options.requireGitHubCli ?? isAuto)) {
+  } else if (isGitHubRepo(repo) && isAuto) {
     const slug = repoSlug(repo);
     const ghCheck = await probeNetwork(runner, 'gh auth status');
     const ghOutcomeUnknown = ghCheck.exitCode === 124 || execOutcomeUnknown(ghCheck);
@@ -274,8 +274,7 @@ async function runGitPlatformChecks(
   if (stepResults.some((s) => !s.ok)) return;
 
   // 插件自声明的 agent 面运行期命令按**该角色实际会执行的路径**检查：内置 gh skill 只在
-  // §Create/§Reply 用到 openssl 与摘要工具，QA 的 review/recheck 只走 §Inspect/§Verdict，
-  // research 更不接收 cli: 描述符——对它们探测只会制造假红。
+  // §Create/§Reply 用到 openssl 与摘要工具，QA 的 review/recheck 只走 §Inspect/§Verdict。
   const runsPlatformWrites = agent.role === 'dev';
   if (runsPlatformWrites && git.agentCommands.length > 0) {
     const missing: string[] = [];
@@ -343,24 +342,18 @@ async function runGitPlatformChecks(
   if (push === true) {
     results.push({ step: 'platform-push', ok: true, message: 'push permission confirmed' });
   } else if (push === false) {
-    // 可读不证可写：push 只是 dev 的发布前置；QA 的 PR write 无法静态自省，research 不发布。
+    // 可读不证可写：push 只是 dev 的发布前置；QA 的 PR write 无法静态自省。
     results.push(agent.role === 'dev'
       ? {
         step: 'platform-push',
         ok: false,
         message: 'repo is readable but push is not permitted — dev publish requires push access',
       }
-      : agent.role === 'qa'
-        ? {
-          step: 'platform-push',
-          ok: true,
-          message: 'read access OK; push is not required for QA (PR write scope cannot be probed statically — deploy credentials must include it)',
-        }
-        : {
-          step: 'platform-push',
-          ok: true,
-          message: 'read access OK; push is not required for research',
-        });
+      : {
+        step: 'platform-push',
+        ok: true,
+        message: 'read access OK; push is not required for QA (PR write scope cannot be probed statically — deploy credentials must include it)',
+      });
   } else {
     results.push({
       step: 'platform-push',

@@ -13,15 +13,17 @@ const ERROR_CLASS_RE = /^[A-Z][A-Z0-9_]*$/;
 // driverSchema 1 加载期契约（spec §5.3 增量⑥）：仅查「已声明字段合法」挡不住整键省略——
 // 漏 sourceProjectId 会让 fork 防护恒等式静默成立，装机期拒载优于运行期静默失败。
 const REQUIRED_OPS = [
-  'listPrs', 'prView', 'projectView', 'branchView', 'listComments', 'merge', 'close', 'deleteBranch',
+  'listPrs', 'prView', 'projectView', 'branchView', 'listComments', 'comment', 'merge', 'close', 'deleteBranch',
 ] as const;
 // treatAsSuccess 的语义是「错误已证明目标状态达成」的幂等写——权威读取没有这种状态，
 // 声明在读 op 上会把 404/权限失败折叠成空行集或截断页并以 ok 进完整性门。
-const TREAT_AS_SUCCESS_LABEL = [...WRITE_OPS].join('/');
+const TREAT_AS_SUCCESS_OPS: ReadonlySet<string> = new Set(['merge', 'close', 'deleteBranch']);
+const TREAT_AS_SUCCESS_LABEL = [...TREAT_AS_SUCCESS_OPS].join('/');
 // 写 op 不消费作用域/原子保护占位符时 schema 照常通过，但 merge 会失去 REST sha 陈旧保护、
 // close/deleteBranch 可指向固定资源——占位符消费纳入加载期契约（argv 与 env 值合并检查）。
 const REQUIRED_OP_PLACEHOLDERS: ReadonlyArray<readonly [string, readonly string[][]]> = [
   ['merge', [['prNumber'], ['expectedHeadSha']]],
+  ['comment', [['prNumber'], ['body']]],
   ['close', [['prNumber']]],
   ['deleteBranch', [['branch', 'branchEncoded'], ['expectedHeadSha'], ['remoteProjectId']]],
   ['branchView', [['branch', 'branchEncoded'], ['remoteProjectId']]],
@@ -156,6 +158,15 @@ export function parseDriverSpec(
     }
   };
 
+  const checkStdin = (stdin: unknown, ctx: string, allowed: ReadonlySet<string>) => {
+    if (stdin === undefined) return;
+    if (typeof stdin !== 'string' || stdin.length === 0) {
+      err(`${ctx}.stdin must be a non-empty string`);
+      return;
+    }
+    checkPlaceholders(stdin, `${ctx}.stdin`, allowed);
+  };
+
   // errorClasses 先于 ops 校验：ops 的 treatAsSuccess 引用比对直接消费这里收集的合法类名，
   // 免得再维护一份「宽松预收集」的第二定义（何为已声明的 class 只有一个答案）。
   const errorClassNames = new Set<string>();
@@ -200,6 +211,7 @@ export function parseDriverSpec(
     // argv 坏只跳过依赖它的 {page} 检查（join 会在非数组上崩）；env/map/flatten 不依赖 argv，照常单遍聚合校验（与下方 preflight 一致，作者不必多轮试错）。
     const argvOk = checkArgv(op.argv, ctx, allowed);
     checkEnv(op.env, ctx, allowed);
+    checkStdin(op.stdin, ctx, allowed);
 
     if (op.parse !== undefined && op.parse !== 'json' && op.parse !== 'json-paged') {
       err(`${ctx}.parse must be 'json' | 'json-paged'`);
@@ -278,7 +290,8 @@ export function parseDriverSpec(
     const op = opValue as DriverOp;
     const argvText = Array.isArray(op.argv) ? op.argv.filter(a => typeof a === 'string').join(' ') : '';
     const envText = isRecord(op.env) ? Object.values(op.env).filter(v => typeof v === 'string').join(' ') : '';
-    return `${argvText} ${envText}`;
+    const stdinText = typeof op.stdin === 'string' ? op.stdin : '';
+    return `${argvText} ${envText} ${stdinText}`;
   };
 
   const requirePlaceholders = (opValue: unknown, ctx: string, groups: readonly string[][]) => {
@@ -420,12 +433,27 @@ export function parseDriverSpec(
       // 生命周期必需 op 声明 optional 是矛盾声明：调用方无从降级，运行期仍按必需失败。
       err(`ops.${opName}.optional must not be true (lifecycle-required op)`);
     }
-    if (!WRITE_OPS.has(opName) && op.treatAsSuccess !== undefined) {
+    if (!TREAT_AS_SUCCESS_OPS.has(opName) && op.treatAsSuccess !== undefined) {
       err(`ops.${opName}.treatAsSuccess is only allowed on ${TREAT_AS_SUCCESS_LABEL}`);
     }
   }
   for (const [opName, groups] of REQUIRED_OP_PLACEHOLDERS) {
     if (rawOps[opName] !== undefined) requirePlaceholders(rawOps[opName], `ops.${opName}`, groups);
+  }
+  if (isRecord(rawOps.comment)) {
+    const comment = rawOps.comment as unknown as DriverOp;
+    const argvText = Array.isArray(comment.argv)
+      ? comment.argv.filter(a => typeof a === 'string').join(' ')
+      : '';
+    const envText = isRecord(comment.env)
+      ? Object.values(comment.env).filter(v => typeof v === 'string').join(' ')
+      : '';
+    if (`${argvText} ${envText}`.includes('{body}')) {
+      err('ops.comment must not inline {body} in argv/env; transport it through stdin');
+    }
+    if (comment.stdin !== '{body}') {
+      err("ops.comment.stdin must be exactly '{body}'");
+    }
   }
   for (const [cls, requiredBy] of RESERVED_ERROR_CLASSES) {
     if (requiredBy !== 'core' && rawOps[requiredBy] === undefined) continue;

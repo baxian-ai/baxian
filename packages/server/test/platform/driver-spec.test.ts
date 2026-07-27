@@ -39,6 +39,10 @@ const MINIMAL = {
       parse: 'json-paged',
       map: { id: 'id', body: 'body', createdAt: 'created_at', updatedAt: 'updated_at' },
     },
+    comment: {
+      argv: ['{binary}', 'api', '-X', 'POST', 'projects/{repoPathEncoded}/merge_requests/{prNumber}/notes', '--input', '-'],
+      stdin: '{body}',
+    },
     merge: {
       argv: ['{binary}', 'api', '-X', 'PUT', 'projects/{repoPathEncoded}/merge_requests/{prNumber}/merge', '-f', 'sha={expectedHeadSha}'],
     },
@@ -77,6 +81,35 @@ describe('parseDriverSpec', () => {
   it('accepts minimal valid spec', () => {
     const r = parseDriverSpec(j(MINIMAL), '/p/glab');
     expect('spec' in r).toBe(true);
+  });
+
+  it('requires comment bodies to use exact stdin transport instead of argv or env', () => {
+    const inline = clone(MINIMAL);
+    inline.ops.comment.argv = [
+      '{binary}',
+      'api',
+      'projects/{repoPathEncoded}/merge_requests/{prNumber}/notes',
+      '-f',
+      'body={body}',
+    ];
+    delete inline.ops.comment.stdin;
+
+    expect(errMsgs(inline).join('\n')).toMatch(/must not inline \{body\} in argv\/env/);
+    expect(errMsgs(inline).join('\n')).toMatch(/stdin must be exactly '\{body\}'/);
+
+    const wrapped = clone(MINIMAL);
+    wrapped.ops.comment.stdin = 'body={body}';
+    expect(errMsgs(wrapped).join('\n')).toMatch(/stdin must be exactly '\{body\}'/);
+  });
+
+  it('validates stdin placeholder shape and type at load time', () => {
+    const unknown = clone(MINIMAL);
+    unknown.ops.comment.stdin = '{nope}';
+    expect(errMsgs(unknown).join('\n')).toMatch(/ops\.comment\.stdin: unknown placeholder \{nope\}/);
+
+    const nonString = clone(MINIMAL);
+    nonString.ops.comment.stdin = 42;
+    expect(errMsgs(nonString).join('\n')).toMatch(/ops\.comment\.stdin must be a non-empty string/);
   });
 
   it('unknown placeholder in argv is a load error', () => {
@@ -385,7 +418,7 @@ describe('parseDriverSpec', () => {
     expect('spec' in parseDriverSpec(j(ok), '/p/glab')).toBe(true);
   });
 
-  it('rejects treatAsSuccess on authoritative reads', () => {
+  it('rejects treatAsSuccess on reads and non-idempotent comments', () => {
     const onRead = clone(MINIMAL);
     onRead.ops.prView.treatAsSuccess = ['NOT_FOUND'];
     expect(errMsgs(onRead).join('\n')).toMatch(/ops\.prView\.treatAsSuccess is only allowed on merge\/close\/deleteBranch/);
@@ -393,6 +426,10 @@ describe('parseDriverSpec', () => {
     const onSource = clone(MINIMAL);
     onSource.ops.listComments.treatAsSuccess = ['NOT_FOUND'];
     expect(errMsgs(onSource).join('\n')).toMatch(/ops\.listComments\.treatAsSuccess is only allowed on/);
+
+    const onComment = clone(MINIMAL);
+    onComment.ops.comment.treatAsSuccess = ['NOT_FOUND'];
+    expect(errMsgs(onComment).join('\n')).toMatch(/ops\.comment\.treatAsSuccess is only allowed on/);
   });
 
   it('rejects op-level optional on lifecycle-required ops and comment sources', () => {

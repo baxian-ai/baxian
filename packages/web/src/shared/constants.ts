@@ -38,7 +38,6 @@ export const TASK_ACTIVE_STATUS_SET: ReadonlySet<TaskStatus> = new Set<TaskStatu
   'spec-ready',
   'approved',
   'merge-ready',
-  'ready',
   'max_rounds',
 ]);
 

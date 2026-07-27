@@ -58,11 +58,6 @@ export const PET_SPRITESHEET_MAX_BYTES = 8 * 1024 * 1024;
 export const PET_UPLOAD_ROUTE_BODY_LIMIT = 12 * 1024 * 1024;
 
 export const MAX_INLINE_CONTENT_BYTES = 10 * 1024;
-export const MAX_READ_FILE_BYTES = 50 * 1024;
-export const REVIEW_EXCHANGE_DIR = '.baxian/review';
-export const REVIEW_INBOX_DIR = '.baxian/review/inbox';
-export const SPEC_DOC_RELPATH = '.baxian/spec.md';
-export const RESEARCH_DOCS_DIR = '.baxian/research';
 
 export const USER_CONFIG_REL = '.baxian/config.json';
 export const USER_STATE_REL = '.baxian';
@@ -73,18 +68,12 @@ export const CONTROL_CHAR_RE = /\p{Cc}/u;
 
 export type DispatchPhase =
   | 'develop'
-  | 'research'
   | 'code'
   | 'fix'
   | 'post-approve'
   | 'merge'
   | 'review'
-  | 'recheck'
-  | 'server-review'
-  | 'server-recheck'
-  | 'server-spec-review'
-  | 'server-feedback'
-  | 'server-after-done';
+  | 'recheck';
 
 export const AGENT_PHASES: Record<AgentRole, Record<string, { skills: string[] }>> = {
   dev: {
@@ -93,56 +82,35 @@ export const AGENT_PHASES: Record<AgentRole, Record<string, { skills: string[] }
     'post-approve': { skills: ['baxian-pr-feedback'] },
     merge: { skills: [] },
     code: { skills: ['baxian-task-check'] },
-    'server-feedback': { skills: ['baxian-server-feedback'] },
-    'server-after-done': { skills: ['baxian-server-feedback'] },
   },
   qa: {
     review: { skills: ['baxian-pr-review'] },
     recheck: { skills: ['baxian-pr-recheck'] },
     merge: { skills: [] },
-    'server-review': { skills: ['baxian-server-review'] },
-    'server-recheck': { skills: ['baxian-server-review'] },
-    'server-spec-review': { skills: ['baxian-server-review'] },
-  },
-  research: {
-    research: { skills: ['baxian-research'] },
-    'server-feedback': { skills: ['baxian-server-feedback'] },
   },
 };
 
 export const PHASE_EXPECTED_STATUS: Record<string, TaskStatus[]> = {
   develop: ['in_progress'],
-  research: ['in_progress'],
   review: ['review'],
   recheck: ['review'],
   fix: ['fixing'],
   'post-approve': ['approved'],
   merge: ['approved', 'merge-ready', 'review'],
   code: ['in_progress'],
-  'server-review': ['review'],
-  'server-recheck': ['review'],
-  'server-spec-review': ['review'],
-  'server-feedback': ['fixing'],
-  'server-after-done': ['approved'],
 };
 
 export const PHASE_REQUIRES_AGENT_BOUND_TO_TASK: Record<string, boolean> = {
   develop: true,
-  research: true,
   fix: true,
   'post-approve': true,
   review: false,
   recheck: false,
   merge: false,
   code: true,
-  'server-review': false,
-  'server-recheck': false,
-  'server-spec-review': false,
-  'server-feedback': true,
-  'server-after-done': true,
 };
 
-export const TASK_OWNER_ROLES: ReadonlySet<AgentRole> = new Set(['dev', 'research']);
+export const TASK_OWNER_ROLES: ReadonlySet<AgentRole> = new Set(['dev']);
 
 export const TASK_TERMINAL_STATUSES: readonly TaskStatus[] = [
   'merged',
@@ -160,7 +128,6 @@ const TASK_ACTIVE_STATUSES: readonly TaskStatus[] = [
   'spec-ready',
   'approved',
   'merge-ready',
-  'ready',
   'max_rounds',
 ];
 
@@ -173,7 +140,7 @@ const TASK_STATUSES: readonly TaskStatus[] = [
 ];
 
 export const TASK_STATUS_SET: ReadonlySet<TaskStatus> = new Set(TASK_STATUSES);
-export const TASK_PHASE_SET: ReadonlySet<TaskPhase> = new Set(['research', 'spec', 'code']);
+export const TASK_PHASE_SET: ReadonlySet<TaskPhase> = new Set(['spec', 'code']);
 
 export function isTaskOpen(status: TaskStatus): boolean {
   return !TASK_TERMINAL_STATUS_SET.has(status);

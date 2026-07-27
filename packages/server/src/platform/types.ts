@@ -30,6 +30,7 @@ export type MapValueSpec = string | { sources: string[]; optional?: boolean; val
 export interface DriverOp {
   argv: string[];
   env?: Record<string, string>;
+  stdin?: string;
   parse?: 'json' | 'json-paged';
   responseEnvelope?: 'graphql';
   flatten?: string;
@@ -58,12 +59,12 @@ export interface DriverSpec {
 
 export const PLACEHOLDERS: ReadonlySet<string> = new Set([
   'scheme', 'hostname', 'host', 'hostUrl', 'repoPath', 'repoPathEncoded',
-  'prNumber', 'expectedHeadSha', 'remoteProjectId', 'branch', 'branchEncoded', 'binary',
+  'prNumber', 'expectedHeadSha', 'remoteProjectId', 'branch', 'branchEncoded', 'body', 'binary',
 ]);
 
 // preflight 跑在任务收编前，没有任务上下文占位符可用——从 PLACEHOLDERS 派生以强制子集不变量。
 const TASK_CONTEXT_PLACEHOLDERS: ReadonlySet<string> = new Set([
-  'prNumber', 'expectedHeadSha', 'remoteProjectId', 'branch', 'branchEncoded',
+  'prNumber', 'expectedHeadSha', 'remoteProjectId', 'branch', 'branchEncoded', 'body',
 ]);
 export const PREFLIGHT_PLACEHOLDERS: ReadonlySet<string> = new Set(
   [...PLACEHOLDERS].filter(p => !TASK_CONTEXT_PLACEHOLDERS.has(p)),
@@ -92,7 +93,7 @@ export const MAP_TARGET_FIELDS: ReadonlySet<string> = new Set(Object.keys(MAP_FI
 // 生命周期 op 分类为加载期契约与运行期执行共用（parse 形态门 ↔ 单行基数门、
 // treatAsSuccess 允许域 ↔ 幂等成功折叠），两处各自拼写会改一漏一。
 export const SINGLE_RESOURCE_OPS: ReadonlySet<string> = new Set(['prView', 'projectView', 'branchView']);
-export const WRITE_OPS: ReadonlySet<string> = new Set(['merge', 'close', 'deleteBranch']);
+export const WRITE_OPS: ReadonlySet<string> = new Set(['comment', 'merge', 'close', 'deleteBranch']);
 
 // sha 段文法单点定义：加载期/渲染期/行 schema/线协议共用，收放接受域不再多处同步。
 export const SHA_HEX_SOURCE = '[0-9a-fA-F]{7,64}';

@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PluginRegistry, type LoadedPlugin } from '../../src/platform/plugin-registry.js';
-import { renderCommand, renderFixMessage, type RenderContext } from '../../src/platform/command-renderer.js';
+import {
+  renderCommand,
+  renderCommandStdin,
+  renderFixMessage,
+  type RenderContext,
+} from '../../src/platform/command-renderer.js';
 import { classifyCommentSource } from '../../src/platform/markers.js';
 
 const BUILTIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../src/platform/plugins');
@@ -83,6 +88,17 @@ describe('builtin github plugin: rendered argv equivalence', () => {
     expect(render('close')).toBe(
       "GH_HOST='github.com' 'gh' 'api' '-X' 'PATCH' 'repos/owner/repo/pulls/42' '-f' 'state=closed'",
     );
+  });
+
+  it('posts comment bodies through stdin instead of the bash command argument', () => {
+    const body = "reviewer's note\nsecond line";
+    const op = plugin.spec.ops.comment!;
+    const context = { ...CTX, body };
+
+    expect(renderCommand(op, context)).toBe(
+      "GH_HOST='github.com' 'gh' 'api' '-X' 'POST' 'repos/owner/repo/issues/42/comments' '-F' 'body=@-'",
+    );
+    expect(renderCommandStdin(op, context)).toEqual(Buffer.from(body));
   });
 
   it('deleteBranch renders updateRefs with the expected tip and repository id', () => {

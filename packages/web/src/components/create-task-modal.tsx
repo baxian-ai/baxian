@@ -179,7 +179,7 @@ export function CreateTaskModal(props: Props) {
   );
 
   const projectTargets = useMemo(
-    () => (project ? project.agent.flat().filter(a => a.role === 'dev' || a.role === 'research') : []),
+    () => (project ? project.agent.flat().filter(a => a.role === 'dev') : []),
     [project],
   );
 
@@ -394,7 +394,7 @@ export function CreateTaskModal(props: Props) {
             )}
             {visibleTargets.map(target => (
               <option key={target.id} value={target.id}>
-                {target.role === 'research' ? t.createTask.researchTargetOption(target.id) : target.id}
+                {target.id}
               </option>
             ))}
           </select>

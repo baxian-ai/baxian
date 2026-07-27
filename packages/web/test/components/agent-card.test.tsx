@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import type { AgentBindingFacts, AgentRole, AgentRuntime, AgentSnapshot } from '../../src/shared/index.js';
+import type {
+  AgentBindingFacts,
+  AgentRole,
+  AgentRuntime,
+  AgentSnapshot,
+  TaskState,
+} from '../../src/shared/index.js';
 
 vi.mock('../../src/components/toast.tsx', async () => (await import('../helpers/toast-mock.tsx')).createToastMock());
 vi.mock('../../src/hooks/use-pending-restart.tsx', async () => (await import('../helpers/pending-restart-mock.tsx')).createPendingRestartMock());
@@ -40,10 +46,11 @@ type RenderCardOptions = {
   terminalLoading?: boolean;
   active?: boolean;
   onActivate?: () => void;
+  task?: TaskState;
 };
 
 function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void {
-  const { runtime, model, role = 'dev', terminalMode, terminalLoading, active, onActivate } = options;
+  const { runtime, model, role = 'dev', terminalMode, terminalLoading, active, onActivate, task } = options;
   render(
     <MemoryRouter>
       <ConfirmProvider>
@@ -57,6 +64,7 @@ function renderCard(agent: AgentSnapshot, options: RenderCardOptions = {}): void
           terminalLoading={terminalLoading}
           active={active}
           onActivate={onActivate}
+          task={task}
         />
       </ConfirmProvider>
     </MemoryRouter>,
@@ -875,8 +883,8 @@ describe('AgentCard', () => {
 
       await clickMenuItem('Delete');
       const dialog = await findConfirmDialog();
-      expect(within(dialog).getByText('Delete agent dev-actions?')).toBeTruthy();
-      expect(within(dialog).getByText('This action cannot be undone.')).toBeTruthy();
+      expect(within(dialog).getByText('Delete the agent group containing dev-actions?')).toBeTruthy();
+      expect(within(dialog).getByText('Both paired agents will be removed. This action cannot be undone.')).toBeTruthy();
       await act(async () => { fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' })); });
 
       expect(deleteAgentMock).toHaveBeenCalledWith('proj', 'dev-actions');
@@ -1115,6 +1123,29 @@ describe('AgentCard', () => {
 
       expect(showMock).toHaveBeenCalledWith({ kind: 'error', title: 'Failed to start review', body: 'task has no PR' });
     });
+
+    it('defers an unconfirmed git delivery to the task recovery form', () => {
+      renderCard(makeSnapshot({
+        id: 'dev-review',
+        binding: makeBinding('dev-review', { taskId: 'task-9' }),
+      }), {
+        task: makeTask({
+          id: 'task-9',
+          status: 'in_progress',
+          phase: undefined,
+          prNumber: 7,
+          replyActorId: '99',
+          replyActorStatus: 'provisional',
+        }),
+      });
+
+      openMenu();
+
+      const item = screen.getByRole('menuitem', { name: 'Call review' }) as HTMLButtonElement;
+      expect(item.disabled).toBe(true);
+      expect(item.title).toContain('Open task task-9');
+      expect(reviewMock).not.toHaveBeenCalled();
+    });
   });
 
   describe('bootstrap error card', () => {
@@ -1186,7 +1217,7 @@ describe('AgentCard', () => {
   });
 
   describe('paired deletion', () => {
-    it('warns that the paired QA agent was removed together and flags the restart', async () => {
+    it('warns that the paired agent was removed together and flags the restart', async () => {
       deleteAgentMock.mockResolvedValue({ removed: ['dev-actions', 'qa-actions'], restartRequired: true });
       renderCard(makeSnapshot({ id: 'dev-actions' }));
 
@@ -1199,8 +1230,31 @@ describe('AgentCard', () => {
       expect(flagDirtyMock).toHaveBeenCalled();
       expect(showMock).toHaveBeenCalledWith({
         kind: 'warn',
-        title: 'Deleted agent dev-actions',
-        body: 'The paired QA agent qa-actions was removed as well.',
+        title: 'Deleted the agent group containing dev-actions',
+        body: 'The paired agent qa-actions was removed as well.',
+      });
+    });
+
+    it('includes post-commit cleanup warnings in the paired deletion toast', async () => {
+      deleteAgentMock.mockResolvedValue({
+        removed: ['dev-actions', 'qa-actions'],
+        restartRequired: false,
+        warnings: ['lock release for qa-actions failed: ownership changed'],
+      });
+      renderCard(makeSnapshot({ id: 'dev-actions' }));
+
+      openMenu();
+      await act(async () => {
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
+      });
+      await settleConfirmDialog('Delete');
+
+      expect(showMock).toHaveBeenCalledWith({
+        kind: 'warn',
+        title: 'Deleted the agent group containing dev-actions',
+        body:
+          'The paired agent qa-actions was removed as well.\n'
+          + 'lock release for qa-actions failed: ownership changed',
       });
     });
   });

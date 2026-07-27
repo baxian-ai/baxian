@@ -24,7 +24,10 @@ function spec(raw: string = DRIVER) {
 const CTX = buildDriverRunContext('git@github.com:o/r.git', 'gh');
 
 function driverWith(routes: Record<string, DriverExecResult | ((page: number) => DriverExecResult)>, rawSpec?: string) {
-  const calls: Array<{ cmd: string; opts: { timeout: number; maxBuffer: number } }> = [];
+  const calls: Array<{
+    cmd: string;
+    opts: { timeout: number; maxBuffer: number; stdin?: Buffer };
+  }> = [];
   const exec: DriverExec = async (cmd, opts) => {
     calls.push({ cmd, opts });
     for (const [needle, result] of Object.entries(routes)) {
@@ -61,6 +64,19 @@ describe('GitDriver: single-command ops', () => {
   it('returns no rows for write ops without parse', async () => {
     const { driver } = driverWith({ '/merge': { stdout: '{"merged":true}', stderr: '', exitCode: 0 } });
     expect(await driver.runOp('merge', { prNumber: 42, expectedHeadSha: SHA })).toEqual([]);
+  });
+
+  it('sends comment bodies through stdin without expanding the rendered command', async () => {
+    const body = "'".repeat(40 * 1024);
+    const { driver, calls } = driverWith({
+      'issues/42/comments': { stdout: '', stderr: '', exitCode: 0 },
+    });
+
+    expect(await driver.runOp('comment', { prNumber: 42, body })).toEqual([]);
+
+    expect(calls[0]?.cmd).toContain("'body=@-'");
+    expect(calls[0]?.cmd).not.toContain(body);
+    expect(calls[0]?.opts.stdin).toEqual(Buffer.from(body));
   });
 
   it('rejects paged ops on the single-command runner', async () => {
