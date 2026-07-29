@@ -7,7 +7,6 @@ type PendingRestartValue = ReturnType<PendingRestartModule['usePendingRestart']>
 export const flagDirtyMock = vi.fn();
 export const triggerRestartMock = vi.fn(async () => {});
 
-// 可变对象：测试内 Object.assign(pendingRestartValue, {...}) 调整 phase/count 等分支
 export const pendingRestartValue: PendingRestartValue = {
   phase: 'idle',
   count: 0,

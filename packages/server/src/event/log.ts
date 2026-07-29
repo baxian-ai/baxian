@@ -41,8 +41,6 @@ export class EventLog {
   }
 }
 
-// 只收敛 outbox 的确定性重投 id：常规事件 id 是「毫秒 + 4 位随机」，同毫秒碰撞虽罕见但
-// 会让通用去重静默吞掉一条不同事件。
 function dedupeById(events: BaxianEvent[]): BaxianEvent[] {
   const seen = new Set<string>();
   const out: BaxianEvent[] = [];

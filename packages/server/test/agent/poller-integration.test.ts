@@ -2,61 +2,59 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { AgentConfig, BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { AgentManager } from '../../src/agent/manager.js';
+import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import type { EventBus } from '../../src/event/bus.js';
+import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxProbePoller, TmuxSessionStatusStore } from '../../src/agent/tmux-probe-poller.js';
 import { BootstrapPoller } from '../../src/agent/bootstrap-poller.js';
 import { createRepoStoreCache } from '../../src/agent/repo-store.js';
-import { initStateDir } from '../../src/state/init.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
 import type { CommandRunner } from '../../src/agent/runner.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const NOW = '2026-04-28T10:00:00Z';
-const devAgent: AgentConfig = {
-  id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local',
-};
-const qaAgent: AgentConfig = {
-  id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local',
-};
-const config: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{ id: 'proj', repo: 'user/repo', merge: null, agent: [[devAgent, qaAgent]] }],
-};
-const noopRunner: CommandRunner = {
-  exec: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-  writeFile: async () => {},
-};
 
 let tempDir: string;
+let config: BaxianConfig;
 let agentStore: AgentStore;
-let taskStore: TaskStore;
 let lockManager: LockManager;
 let eventBus: EventBus;
 let agentManager: AgentManager;
-const events: BaxianEvent[] = [];
+let noopRunner: CommandRunner;
+let events: BaxianEvent[];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-integration-'));
-  await initStateDir(tempDir);
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
-  events.length = 0;
-  eventBus.on('*', (e) => { events.push(e); });
-  const skillRegistry = new SkillRegistry(join(tempDir, 'skills'));
-  agentManager = new AgentManager({
-    config, agentStore, taskStore, lockManager, eventBus,
-    skillRegistry,
-    runnerFactory: () => noopRunner,
+  noopRunner = fakeRunner({ defaultResult: {} });
+  const pollerConfig = makeConfig({
+    project: [{
+      id: 'proj',
+      repo: 'user/repo',
+      merge: null,
+      agent: [[
+        makeAgent({ workdir: undefined }),
+        makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: undefined }),
+      ]],
+    }],
   });
+  const harness = await createManagerHarness(tempDir, {
+    config: pollerConfig,
+    deps: {
+      runnerFactory: () => noopRunner,
+      platformRunner: noopRunner,
+    },
+  });
+  ({
+    config,
+    manager: agentManager,
+    agentStore,
+    lockManager,
+    eventBus,
+    events,
+  } = harness);
 });
 
 afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
@@ -74,11 +72,12 @@ describe('poller integration', () => {
 
     const probePoller = new TmuxProbePoller({
       config, store: new TmuxSessionStatusStore(), agentManager,
-      runnerFactory: () => ({
-        exec: async (cmd: string) => cmd.includes('tmux has-session')
-          ? { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }
-          : { stdout: '', stderr: '', exitCode: 0 },
-        writeFile: async () => {},
+      runnerFactory: () => fakeRunner({
+        rules: [{
+          match: 'tmux has-session',
+          reply: { stderr: "can't find session: dev-1", exitCode: 1 },
+        }],
+        defaultResult: {},
       }),
       intervalMs: 10_000,
     });
@@ -104,11 +103,12 @@ describe('poller integration', () => {
 
     const probePoller = new TmuxProbePoller({
       config, store: new TmuxSessionStatusStore(), agentManager,
-      runnerFactory: () => ({
-        exec: async (cmd: string) => cmd.includes('tmux has-session')
-          ? { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 }
-          : { stdout: '', stderr: '', exitCode: 0 },
-        writeFile: async () => {},
+      runnerFactory: () => fakeRunner({
+        rules: [{
+          match: 'tmux has-session',
+          reply: { stderr: "can't find session: dev-1", exitCode: 1 },
+        }],
+        defaultResult: {},
       }),
       intervalMs: 10_000,
     });

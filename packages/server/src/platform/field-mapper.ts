@@ -20,8 +20,6 @@ function getPath(obj: unknown, path: string): unknown | typeof MISSING {
   return cur;
 }
 
-// map 源路径取值器：点路径 + 单层 [] 展平（spec §5.3），供 resolveField 使用；
-// op 级 flatten（上面的 getPath）语义不同（缺失/非数组按形状损坏拒绝），两者不合并。
 function resolveSourceSegments(
   obj: unknown, segments: string[], fullPath: string, opName: string, field: string,
 ): unknown | typeof MISSING {
@@ -36,10 +34,8 @@ function resolveSourceSegments(
   }
 
   const key = seg.slice(0, -2);
-  if (!Object.hasOwn(record, key)) return MISSING; // 数组键本身不存在 → MISSING，走必需/optional 语义
+  if (!Object.hasOwn(record, key)) return MISSING;
   const arr = record[key];
-  // null-as-present（spec §5.3）：键存在值 null 不触发任何缺失语义；集合投影统一空数组，
-  // 与 [] 响应同构、required 不抛。仅键不存在才是 MISSING。
   if (arr === null) return [];
   if (!Array.isArray(arr)) {
     throw new FieldMappingError(
@@ -49,12 +45,11 @@ function resolveSourceSegments(
   const results: unknown[] = [];
   for (const element of arr) {
     const v = resolveSourceSegments(element, rest, fullPath, opName, field);
-    if (v !== MISSING) results.push(v); // 元素缺剩余路径键则跳过该元素（宽松聚合）
+    if (v !== MISSING) results.push(v);
   }
   return results;
 }
 
-// map 对一次 mapResponse 恒定：路径 split 与双层 [] 检查在行循环前编译一次，行内只消费。
 interface CompiledSource { fromParent: boolean; segments: string[]; raw: string }
 interface CompiledField {
   field: string; sources: CompiledSource[]; sourceKeys: string; optional: boolean;
@@ -88,9 +83,8 @@ function resolveField(
   for (const src of compiled.sources) {
     const v = resolveSourceSegments(src.fromParent ? parent : element, src.segments, src.raw, opName, compiled.field);
     if (v !== MISSING) {
-      // values 翻译只作用于字符串命中（spec §5.3 增量③）：null/数字等命中原样透传。
       if (compiled.values && typeof v === 'string' && Object.hasOwn(compiled.values, v)) return compiled.values[v];
-      return v; // null 是合法值，键存在即命中
+      return v;
     }
   }
   if (compiled.optional) return undefined;
@@ -101,7 +95,6 @@ export function mapResponse(opName: string, op: DriverOp, payload: unknown): Map
   const compiledFields = compileMap(opName, op.map ?? {});
   const units: Array<{ element: unknown; parent: unknown }> = [];
 
-  // null 或非对象 payload 按零行处理
   if (payload === null || typeof payload !== 'object') {
     return [];
   }
@@ -110,8 +103,6 @@ export function mapResponse(opName: string, op: DriverOp, payload: unknown): Map
   for (const item of top) {
     if (op.flatten) {
       const arr = getPath(item, op.flatten);
-      // 键缺失/非数组是响应形状损坏而非空集合：静默跳过会把整页伪装成合法空页，被跳过的
-      // discussion 若含令牌或人类反馈，完整性门照样放行——fail closed；显式 null/[] 才是空集合。
       if (arr === MISSING) {
         throw new FieldMappingError(`op ${opName}: flatten path '${op.flatten}' missing on a response item`);
       }

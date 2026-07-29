@@ -2,34 +2,18 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentManager } from '../../src/agent/manager.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
+import type { BaxianEvent } from '../../src/shared/index.js';
+import type { AgentManager } from '../../src/agent/manager.js';
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { TaskStore } from '../../src/state/task-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import type { EventBus } from '../../src/event/bus.js';
 import { ErrorRecordStore } from '../../src/state/error-record-store.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeTask } from '../helpers/fixtures.js';
 
 const NOW = '2026-04-28T10:00:00Z';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'user/repo',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-    ]],
-  }],
-};
 
 let tempDir: string;
 let agentStore: AgentStore;
@@ -38,35 +22,20 @@ let lockManager: LockManager;
 let eventBus: EventBus;
 let manager: AgentManager;
 let errorRecordStore: ErrorRecordStore;
-const events: BaxianEvent[] = [];
+let events: BaxianEvent[];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-reconcile-'));
-  await initStateDir(tempDir);
-
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
   errorRecordStore = new ErrorRecordStore(join(tempDir, 'state', 'errors'));
-  events.length = 0;
-  eventBus.on('*', (e) => { events.push(e); });
-
-  const noopRunner: CommandRunner = {
-    exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    writeFile: vi.fn(async (): Promise<void> => undefined),
-  };
-
-  manager = new AgentManager({
-    config: CONFIG,
-    agentStore,
-    taskStore,
-    lockManager,
-    eventBus,
-    errorRecordStore,
-    skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-    runnerFactory: () => noopRunner,
+  const runner = fakeRunner({ defaultResult: {} });
+  const harness = await createManagerHarness(tempDir, {
+    deps: {
+      errorRecordStore,
+      runnerFactory: () => runner,
+      platformRunner: runner,
+    },
   });
+  ({ manager, agentStore, taskStore, lockManager, eventBus, events } = harness);
 });
 
 afterEach(async () => {
@@ -84,22 +53,14 @@ describe('AgentManager.reconcileFailedAgent', () => {
       paneId: 'P-1',
       updatedAt: NOW,
     });
-    await taskStore.set({
+    await taskStore.set(makeTask({
       id: 'task-old',
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
       phase: 'code',
-      branch: 'bx/task-old',
-      reviewRound: 0,
-      status: 'in_progress',
+      branchCreatedByBaxian: undefined,
+      platformBinding: undefined,
       createdAt: NOW,
       updatedAt: NOW,
-    });
+    }));
     await lockManager.acquire('dev-1', 'task-old');
 
     expect(await manager.reconcileFailedAgent('dev-1')).toBe(true);

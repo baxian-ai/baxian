@@ -7,7 +7,6 @@ import {
   scanInputReceivedSignals,
   scanNeedInputSignals,
   scanPhaseSignals,
-  scanRootDoneSignals,
 } from '../../src/agent/phase-signal.js';
 import { visibleText } from '../../src/agent/vt-visible-text.js';
 
@@ -102,6 +101,13 @@ describe('phase signal protocol', () => {
     ]);
   });
 
+  it.each([
+    ['CSI cursor movement', '[bx:pr-\x1b[6Dfixed:tok123abc]'],
+    ['carriage-return redraw', '[bx:pr-\rfixed:tok123abc]'],
+  ])('does not complete a phase from marker bytes overwritten by %s', (_name, overwritten) => {
+    expect(scanPhaseSignals(visibleText(overwritten))).toEqual([]);
+  });
+
   it('ignores unknown kinds and malformed tokens', () => {
     expect(scanPhaseSignals('[bx:unknown-kind:abc123]')).toEqual([]);
     expect(scanPhaseSignals('[bx:spec-done:42:Nzc:abc]')).toEqual([]);
@@ -177,20 +183,6 @@ describe('need-input signal', () => {
       { token: 'abcdef123456', seq: 7, raw: '[bx:input-received:abcdef123456:7]', index: 0 },
     ]);
     expect(scanInputReceivedSignals('[bx:input-received:abcdef123456:00a]')).toEqual([]);
-  });
-});
-
-describe('root-done signal', () => {
-  it('survives ANSI noise and TUI soft-wrap whitespace', () => {
-    expect(scanRootDoneSignals(visibleText('\x1b[32m[bx:root-\ndone:0123456789ab\n  cdef0123456789abcdef]\x1b[0m'))).toEqual([
-      '0123456789abcdef0123456789abcdef',
-    ]);
-  });
-
-  it('ignores templates, short tokens, and extra segments', () => {
-    expect(scanRootDoneSignals('[bx:root-done:<attemptToken>]')).toEqual([]);
-    expect(scanRootDoneSignals('[bx:root-done:short]')).toEqual([]);
-    expect(scanRootDoneSignals('[bx:root-done:0123456789abcdef:extra]')).toEqual([]);
   });
 });
 

@@ -279,7 +279,6 @@ describe('DispatchReconciler review 侧补派', () => {
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
     let armed = 0;
-    // mock 须实现 onPassArmed 契约（真实实现在 claim2 后回调），否则返回值不可证明属本次 pass
     const dispatchSpy = vi.spyOn(manager, 'dispatchReviewToQa').mockImplementation(async (taskId, opts) => {
       armed += 1;
       const token = `tok-armed-fb${armed}`;
@@ -380,8 +379,8 @@ describe('DispatchReconciler review 侧补派', () => {
   });
 });
 
-describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）', () => {
-  it('pending 记录首评相位 + 任务持久化未计轮 intent → 补派携带 qaPhase=review 与 bumpRound=true（C2/R7/R17）', async () => {
+describe('DispatchReconciler 补派世系与安全门禁', () => {
+  it('pending 记录首评相位 + 任务持久化未计轮 intent → 补派携带 qaPhase=review 与 bumpRound=true', async () => {
     const t = await seedTask({ reviewRound: 0, reviewRoundPending: true });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, {
@@ -401,7 +400,7 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     }));
   });
 
-  it('外部换代重置尝试计数：新 pass 拿全新预算，reconciler 自身补派延续世系（C1）', async () => {
+  it('外部换代重置尝试计数：新 pass 拿全新预算，reconciler 自身补派延续世系', async () => {
     const t = await seedTask();
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
@@ -428,7 +427,7 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     expect(dispatchSpy).toHaveBeenCalledTimes(3);
   });
 
-  it('PENDING_HUMAN（交互式菜单）阻断补派并计入预算告警通道（C4）', async () => {
+  it('PENDING_HUMAN（交互式菜单）阻断补派并计入预算告警通道', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -444,7 +443,7 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     expect(interventions()[0].data).toMatchObject({ observationReason: 'PENDING_HUMAN' });
   });
 
-  it('观测早于 pending 登记（陈旧 idle）→ 不补派（C4）', async () => {
+  it('观测早于 pending 登记（陈旧 idle）→ 不补派', async () => {
     const t = await seedTask();
     await seedQa();
     obs({ observedAt: new Date(Date.now() - 60_000).toISOString() });
@@ -457,7 +456,7 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('intervention 首次落盘失败不锁存告警标志，下一周期重试（R6）', async () => {
+  it('intervention 首次落盘失败不锁存告警标志，下一周期重试', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -489,7 +488,7 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('明确 anchor≠head 仍让位 push 事件路径（R8 边界不回退）', async () => {
+  it('明确 anchor≠head 仍让位 push 事件路径', async () => {
     const t = await seedTask({ latestHeadSha: 'b'.repeat(40) });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -502,11 +501,11 @@ describe('DispatchReconciler 评审加固（#563 R1/R6/R8/C1/C2/C4/C5/R7/R11）'
   });
 });
 
-describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3）', () => {
+describe('DispatchReconciler 持久化补派的世系与故障恢复', () => {
   it.each([
     ['PANE_PROBE_FAILED', { runtimeStatusHint: 'error' as const, reason: 'PANE_PROBE_FAILED' }],
     ['UNSUPPORTED_FOREGROUND_PROCESS', { runtimeStatusHint: 'error' as const, reason: 'UNSUPPORTED_FOREGROUND_PROCESS', paneState: 'other' as const }],
-  ])('R14：%s 观测不可注入 → 不补派，进入预算告警通道', async (_name, over) => {
+  ])('%s 观测不可注入 → 不补派，进入预算告警通道', async (_name, over) => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -522,7 +521,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('CX3：stalled-idle 兜底要求观测晚于本 pass 的 reviewDispatchedAt（换绑残留旧空闲不触发）', async () => {
+  it('stalled-idle 兜底要求观测晚于本 pass 的 reviewDispatchedAt（换绑残留旧空闲不触发）', async () => {
     await seedTask({ reviewDispatchedAt: new Date(Date.now() + 120_000).toISOString() });
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
@@ -533,7 +532,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
-  it('R15/R20：内部重排的预算随 armedToken fence 在登记时注入，since/alerted 延续且不计次', async () => {
+  it('内部重排的预算随 armedToken fence 在登记时注入，since/alerted 延续且不计次', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -544,7 +543,6 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
       const fresh = (await taskStore.get(taskId))!;
       const rotated = { ...fresh, signalToken: 'tok-requeue1', updatedAt: new Date().toISOString() };
       await taskStore.set(rotated);
-      // 模拟 startSession 的 fence 注入：内部重排的登记携带 pendingBudget override
       manager.registerPendingDispatchRetry(
         taskId,
         { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'tok-requeue1' },
@@ -570,7 +568,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy2).toHaveBeenCalledTimes(1);
   });
 
-  it('R20：await 窗口内的外部 successor 登记不被内部重排污染（保留新鲜预算与告警位）', async () => {
+  it('await 窗口内的外部 successor 登记不被内部重排污染（保留新鲜预算与告警位）', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -581,9 +579,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
       const fresh = (await taskStore.get(taskId))!;
       const rotated = { ...fresh, signalToken: 'internal-res1', updatedAt: new Date().toISOString() };
       await taskStore.set(rotated);
-      // 生产中原登记至少早一个对账周期；测试里隔开毫秒钟面避免同毫秒巧合
       await new Promise(r => setTimeout(r, 3));
-      // 外部 successor（push/手工重派）在 await 窗口内登记：不带 budget override
       manager.registerPendingDispatchRetry(
         taskId,
         { kind: 'qa-recheck', agentId: 'qa-1', signalToken: 'external-succ1' },
@@ -599,7 +595,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(after.budgetAlerted).toBeUndefined();
   });
 
-  it('R17：进程重启（无内存登记）+ anchor 缺失 + PENDING_IDLE → 按持久化 intent 补派', async () => {
+  it('进程重启（无内存登记）+ anchor 缺失 + PENDING_IDLE → 按持久化 intent 补派', async () => {
     const t = await seedTask({
       reviewRound: 0, reviewRoundPending: true,
       reviewHeadAnchorSha: undefined, latestHeadSha: undefined,
@@ -617,7 +613,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     }));
   });
 
-  it('R18：预算告警落盘窗口内换代 → 标记只落在原登记代，successor 不受污染', async () => {
+  it('预算告警落盘窗口内换代 → 标记只落在原登记代，successor 不受污染', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -634,7 +630,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(manager.getPendingDispatchRetry(t.id)?.budgetAlerted).toBeUndefined();
   });
 
-  it('R18：taskStore.list 缺行（返回空）时 pending/计数不得被当孤儿清掉', async () => {
+  it('taskStore.list 缺行（返回空）时 pending/计数不得被当孤儿清掉', async () => {
     const t = await seedTask();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     vi.spyOn(taskStore, 'list').mockResolvedValue([]);
@@ -644,7 +640,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('R18：prune 单读失败 fail closed 保留登记', async () => {
+  it('prune 单读失败 fail closed 保留登记', async () => {
     const t = await seedTask({ status: 'merged' });
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     vi.spyOn(taskStore, 'list').mockResolvedValue([]);
@@ -655,7 +651,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('R19：无 token 世代耗尽后，真实 pass 建立即重置计数恢复补派', async () => {
+  it('无 token 世代耗尽后，真实 pass 建立即重置计数恢复补派', async () => {
     const t = await seedTask({ signalToken: undefined });
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
@@ -674,7 +670,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('CX1：fixing 任务的 dev-fix pending 不被清掉且由对账补投', async () => {
+  it('fixing 任务的 dev-fix pending 不被清掉且由对账补投', async () => {
     const t = await seedTask({ status: 'fixing' });
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, workdir: '/tmp/repo',
@@ -691,7 +687,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     }));
   });
 
-  it('busy pending 由对账的观测门消费（sweep 让位），hold/绑定丢失仍归平台机制（R21/CX-3.2）', async () => {
+  it('busy pending 由对账的观测门消费（sweep 让位），hold/绑定丢失仍归平台机制', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -714,7 +710,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
-  it('R22：任务确认删除（get 返回 null）时按代清理登记与计数', async () => {
+  it('任务确认删除（get 返回 null）时按代清理登记与计数', async () => {
     const t = await seedTask();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
     vi.spyOn(taskStore, 'list').mockResolvedValue([]);
@@ -725,7 +721,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
   });
 
-  it('CX-3.3：QA 绑定丢失 + anchor 缺失 → 驻留后由标准入口重建派发', async () => {
+  it('QA 绑定丢失 + anchor 缺失 → 驻留后由标准入口重建派发', async () => {
     const t = await seedTask({ reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
     await seedQa({ taskId: undefined });
     obs();
@@ -739,7 +735,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('CX-3.5：git QA hold 不消费 reconciler 内存中的旧 pass 登记', async () => {
+  it('git QA hold 不消费 reconciler 内存中的旧 pass 登记', async () => {
     const t = await seedTask({ signalToken: 'new-pass-tok1' });
     await seedQa({
       status: 'awaiting_human',
@@ -759,7 +755,7 @@ describe('DispatchReconciler 第 8 轮加固（R14/R15/R16/R17/R18/R19/CX1/CX3�
   });
 });
 
-describe('DispatchReconciler 端到端补派（验收 #1 后半）', () => {
+describe('DispatchReconciler 端到端补派', () => {
   it('pending + QA 空闲 → 真实 dispatchReviewToQa 补派：token 轮换、round 不加、watcher 重装、QA 重新绑定', async () => {
     const t = await seedTask({ reviewRound: 2, signalToken: 'tok-current1' });
     await seedQa({ workdir: undefined });
@@ -868,7 +864,7 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('continueSession 返回 false（门禁拒绝）也消费重试额度，耗尽后升级且指引不指向 QA 接口（R1/R11）', async () => {
+  it('continueSession 返回 false（门禁拒绝）也消费重试额度，耗尽后升级且指引不指向 QA 接口', async () => {
     const t = await seedTask({ status: 'fixing' });
     await seedDev();
     manager.registerPendingDispatchRetry(t.id, { kind: 'dev-fix', agentId: 'dev-1', signalToken: t.signalToken! });
@@ -889,7 +885,7 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
     expect(String(alerts[0].data.note)).not.toContain('Resume the agent or POST /tasks/:id/review');
   });
 
-  it('pending dev-fix 但 dev 已进入 awaiting_human → 不得覆盖 hold，pane 不投递（C5）', async () => {
+  it('pending dev-fix 但 dev 已进入 awaiting_human → 不得覆盖 hold，pane 不投递', async () => {
     const t = await seedTask({ status: 'fixing' });
     await seedDev({ status: 'awaiting_human', awaitingPhase: 'runtime-missing', awaitingSince: NOW });
     manager.registerPendingDispatchRetry(t.id, { kind: 'dev-fix', agentId: 'dev-1', signalToken: t.signalToken! });
@@ -912,8 +908,8 @@ describe('DispatchReconciler fixing 侧 re-continue', () => {
   });
 });
 
-describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
-  it('R29：pending + anchor 缺失 → 不经 gh 刷新（平台 driver 在补派内重新锚定）', async () => {
+describe('DispatchReconciler 补派恢复与有界升级', () => {
+  it('pending + anchor 缺失 → 不经 gh 刷新（平台 driver 在补派内重新锚定）', async () => {
     const t = await seedTask({ reviewHeadAnchorSha: undefined, latestHeadSha: undefined });
     await seedQa();
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -926,7 +922,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('R30：QA 绑定丢失（durable pending 已清、sweep 无凭据）→ 驻留两周期后由对账补派', async () => {
+  it('QA 绑定丢失（durable pending 已清、sweep 无凭据）→ 驻留两周期后由对账补派', async () => {
     const t = await seedTask();
     await seedQa({ taskId: undefined });
     obs();
@@ -940,7 +936,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('R30：送达后静默失联（PENDING_IDLE 无 verdict）→ 无登记兜底补派', async () => {
+  it('送达后静默失联（PENDING_IDLE 无 verdict）→ 无登记兜底补派', async () => {
     const t = await seedTask();
     await seedQa();
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
@@ -952,7 +948,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('CX-5.1：git pending 登记 + QA 解绑 → 不再双让位（对账驻留后补派并消费登记）', async () => {
+  it('git pending 登记 + QA 解绑 → 不再双让位（对账驻留后补派并消费登记）', async () => {
     const t = await seedTask();
     await seedQa({ taskId: undefined });
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -968,7 +964,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeUndefined();
   });
 
-  it('R28：pending + 探测 unreachable 超预算 → 一次性 dispatch-busy-budget-exhausted，不注入', async () => {
+  it('pending + 探测 unreachable 超预算 → 一次性 dispatch-busy-budget-exhausted，不注入', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(
@@ -989,7 +985,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(alerts[0].data).toMatchObject({ observationStatus: 'unreachable' });
   });
 
-  it('R28：dev-fix pending + 探测 unreachable 超预算 → 同样进入预算告警通道', async () => {
+  it('dev-fix pending + 探测 unreachable 超预算 → 同样进入预算告警通道', async () => {
     const t = await seedTask({ status: 'fixing' });
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, workdir: '/tmp/repo',
@@ -1010,9 +1006,8 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(alerts).toHaveLength(1);
   });
 
-  it('R42：dev-fix pending 但 dev 绑定丢失 → 有界升级为 intervention，不静默留着无人可送的 fix', async () => {
+  it('dev-fix pending 但 dev 绑定丢失 → 有界升级为 intervention，不静默留着无人可送的 fix', async () => {
     const t = await seedTask({ status: 'fixing' });
-    // dev 绑定已丢失/改派：continueSession 无从投递
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', workdir: '/tmp/repo', paneId: '%1',
       startedAt: NOW, updatedAt: NOW,
@@ -1036,7 +1031,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(String((alerts[0].data as { note?: string }).note)).toMatch(/no longer bound/i);
   });
 
-  it('R37：verdict 在 await 窗口内接管 → 不把 successor 的 token 记成本次补派的世系', async () => {
+  it('verdict 在 await 窗口内接管 → 不把 successor 的 token 记成本次补派的世系', async () => {
     const t = await seedTask();
     await seedQa();
     await agentStore.set({
@@ -1047,7 +1042,6 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     obs({ runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' });
     vi.spyOn(manager, 'dispatchReviewToQa').mockImplementation(async (taskId, opts) => {
       opts?.onPassArmed?.('armed-review-tok');
-      // await 窗口内 REQUEST_CHANGES 接管：切 fixing、轮换 token 并登记 dev-fix pending
       const fresh = (await taskStore.get(taskId))!;
       const takenOver = {
         ...fresh, status: 'fixing' as const, signalToken: 'fix-tok-1', updatedAt: new Date().toISOString(),
@@ -1072,7 +1066,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
       .toHaveLength(0);
   });
 
-  it('R36：同一份观测只驱动一次补派——内部重排后不再每周期空转 release/acquire/轮换', async () => {
+  it('同一份观测只驱动一次补派——内部重排后不再每周期空转 release/acquire/轮换', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(
@@ -1080,7 +1074,6 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
       { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! },
       { since: Date.now() - 10_000 },
     );
-    // 生产中的观测时刻为真实过去时；粗粒度探测说 idle，而 stable-idle 判定仍会判忙 → 内部重排
     statusStore.set('qa-1', {
       tmuxSessionStatus: 'present', observedAt: new Date(Date.now() - 5_000).toISOString(),
     });
@@ -1104,7 +1097,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('R36：内部重排后等待预算照常到期——发一次性 intervention，不静默 churn', async () => {
+  it('内部重排后等待预算照常到期——发一次性 intervention，不静默 churn', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(
@@ -1137,7 +1130,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(alerts[0].data).toMatchObject({ kind: 'qa-recheck' });
   });
 
-  it('R36：等到真正新鲜的空闲观测后恢复补派（水位线不是永久闸门）', async () => {
+  it('等到真正新鲜的空闲观测后恢复补派（水位线不是永久闸门）', async () => {
     const t = await seedTask();
     await seedQa();
     manager.registerPendingDispatchRetry(
@@ -1170,7 +1163,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(dispatchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it('R32：pending 补派前复核 needInput.at——QA 正等人回答时不得覆盖问题（与兜底同门禁）', async () => {
+  it('pending 补派前复核 needInput.at——QA 正等人回答时不得覆盖问题（与兜底同门禁）', async () => {
     const t = await seedTask();
     await seedQa({ needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: new Date().toISOString() } });
     manager.registerPendingDispatchRetry(t.id, { kind: 'qa-recheck', agentId: 'qa-1', signalToken: t.signalToken! });
@@ -1183,7 +1176,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('R32：等人回答的阻塞同样有界升级（超预算一次性告警，标注 blockedBy）', async () => {
+  it('等人回答的阻塞同样有界升级（超预算一次性告警，标注 blockedBy）', async () => {
     const t = await seedTask();
     await seedQa({ needInput: { epoch: 1, askSeq: 1, answeredSeq: 0, at: new Date().toISOString() } });
     manager.registerPendingDispatchRetry(
@@ -1202,7 +1195,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(alerts[0].data).toMatchObject({ blockedBy: 'need-input' });
   });
 
-  it('R32：dev-fix pending 补派前同样复核 needInput.at', async () => {
+  it('dev-fix pending 补派前同样复核 needInput.at', async () => {
     const t = await seedTask({ status: 'fixing' });
     await agentStore.set({
       id: 'dev-1', projectId: 'proj', taskId: t.id, workdir: '/tmp/repo', paneId: '%1',
@@ -1221,7 +1214,7 @@ describe('DispatchReconciler 第 11 轮加固（R28/R29/R30/CX-5.x）', () => {
     expect(manager.getPendingDispatchRetry(t.id)).toBeTruthy();
   });
 
-  it('CX-5.3：丢绑驻留计数按 pass 世系归零（外部换代后不得继承旧 pass 的驻留）', async () => {
+  it('丢绑驻留计数按 pass 世系归零（外部换代后不得继承旧 pass 的驻留）', async () => {
     const t = await seedTask();
     await seedQa({ taskId: undefined });
     obs();

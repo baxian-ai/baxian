@@ -59,14 +59,11 @@ export function TaskNotificationsProvider({ children }: { children: ReactNode })
   useEffect(() => {
     const onFocus = () => {
       setPermission(notificationPermission());
-      // 自身授权请求 pending 期间存储值尚未写入(见 enable),回读会吃掉本次开启意图
       if (!requestInFlight.current) setPreferenceEnabled(readPreference());
     };
     const onStorage = (e: StorageEvent) => {
       if (e.key !== null && e.key !== STORAGE_KEY) return;
       setPermission(notificationPermission());
-      // storage 事件异步排队,可能滞后于当前存储值:关闭动作必须按事件自身的 newValue 记录,
-      // 回读会把滞后的关闭事件误判成开启;仅 clear(key===null)场景回读当前值
       const stored = e.key === null ? readPreference() : e.newValue !== '0';
       if (!stored) disableEpoch.current += 1;
       setPreferenceEnabled(stored);
@@ -102,8 +99,6 @@ export function TaskNotificationsProvider({ children }: { children: ReactNode })
         setPermission(notificationPermission());
       })
       .finally(() => {
-        // 授权结束后才持久化(其他标签页收到 storage 同步时权限已定型),
-        // 且仅当期间没有更新的关闭操作,过期授权不得复活开启
         if (disableEpoch.current === intentEpoch) persistPreference(true);
         requestInFlight.current = false;
         setRequesting(false);

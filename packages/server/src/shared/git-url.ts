@@ -61,10 +61,6 @@ export interface RepoUrlParts {
   path: string;
 }
 
-// 非 github URL 的三段分解单点定义：身份键与 driver 渲染上下文各自投影同一分解结果，
-// 归一化细节（.git/尾斜杠剥离、默认端口折叠）双写会各自漂移——cursor 身份与命令渲染
-// 对同一 URL 的解读必须一致。先走 WHATWG URL 是为消默认端口别名（https:443 → port ''）；
-// scp/ssh 缺省按 https 语义投影（凭据通道由 git 自身处理，此处只描述 API 面）。
 export function parseRepoUrlParts(repo: string): RepoUrlParts | null {
   const t = repo.trim();
   try {
@@ -83,13 +79,8 @@ export function parseRepoUrlParts(repo: string): RepoUrlParts | null {
   }
 }
 
-// 归一化 repo 身份键的唯一定义（spec v2 §4）：M1 服务配置查重；M3 poller entry key / 状态文件 key 收敛到此，
-// 取代 manager.projectRepoKey 与 poller 的 repoSlug 键（legacy 路径届时随 spec §13 一并退役）。
-// github：owner/repo 大小写不敏感（平台契约），全形态（含裸 slug）折叠进 github.com 命名空间；
-// 非 github：RFC 3986 仅 scheme/host 不敏感，路径大小写保留——自定义 forge 上 /Team/App 与 /team/app 可以是两个仓库。
 export function repoIdentityKey(repo: string): string {
   const t = repo.trim();
-  // repoSlug 的正则只剥小写 .git；先折叠大小写再剥后缀，否则 Repo.GIT 与 repo 归一成不同键绕过查重。
   if (isGitHubRepo(t)) return `github.com/${repoSlug(t).toLowerCase().replace(/\.git$/, '')}`;
   const parts = parseRepoUrlParts(t);
   if (parts === null) return t;

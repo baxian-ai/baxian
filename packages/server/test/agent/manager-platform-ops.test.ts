@@ -7,16 +7,14 @@ import type {
   SpecVerdictOutboxEntry,
   TaskState,
 } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import {
-  AgentManager, DispatchTerminalError, PlatformMergeRecheckError,
+  DispatchTerminalError, PlatformMergeRecheckError, type AgentManager,
 } from '../../src/agent/manager.js';
 import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
+import type { TaskStore } from '../../src/state/task-store.js';
 import { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
-import { initStateDir } from '../../src/state/init.js';
 import type { GitDriver, OpVars } from '../../src/platform/git-driver.js';
 import { DriverOpError } from '../../src/platform/git-driver.js';
 import type { NormalizedRow } from '../../src/platform/row-schema.js';
@@ -24,25 +22,12 @@ import type { CommentSourceOp } from '../../src/platform/types.js';
 import { buildAckMarker, buildReviewTokenLine } from '../../src/platform/markers.js';
 import { sha256Hex } from '../../src/platform/body-digest.js';
 import { COMMENT_BODY_MAX_BYTES } from '../../src/platform/command-renderer.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
 const SHA1 = 'a'.repeat(40);
 const TS = '2026-07-17T01:02:03Z';
 const POST_APPROVE_GENERATION = 'feedfeedfeed';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 2 },
-  server: DEFAULT_SERVER_CONFIG,
-  host: [],
-  project: [{
-    id: 'proj',
-    repo: 'git@github.com:owner/repo.git',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-    ]],
-  }],
-};
 
 const SOURCES: CommentSourceOp[] = [
   { key: 'issue-comments', argv: ['{binary}'], map: { id: 'id', body: 'body' } },
@@ -129,9 +114,8 @@ const failLine = buildReviewTokenLine({ kind: 'fail', anchorSha: SHA1, token: '1
 
 function gitTask(over: Partial<TaskState> = {}): TaskState {
   const now = new Date().toISOString();
-  const task = {
-    id: 'task-1', projectId: 'proj', title: 'T', description: 'd',
-    preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1',
+  const task = makeTask({
+    description: 'd',
     reviewRound: 1, status: 'merge-ready', createdAt: now, updatedAt: now,
     phase: 'code',
     deliveryConfirmation: { phase: 'code', source: 'signal', at: now },
@@ -145,7 +129,7 @@ function gitTask(over: Partial<TaskState> = {}): TaskState {
       failToken: '123456abcdef', anchorSha: SHA1,
     },
     ...over,
-  } as TaskState;
+  });
   if (task.phase === undefined) delete task.deliveryConfirmation;
   else if (!Object.hasOwn(over, 'deliveryConfirmation')) {
     task.deliveryConfirmation = { phase: task.phase, source: 'signal', at: now };
@@ -154,26 +138,30 @@ function gitTask(over: Partial<TaskState> = {}): TaskState {
 }
 
 let tempDir: string;
+let config: BaxianConfig;
 let agentStore: AgentStore;
 let lockManager: LockManager;
 let taskStore: TaskStore;
 let manager: AgentManager;
+let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
 let driver: FakeDriver;
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'bx-mgr-platform-'));
-  await initStateDir(tempDir);
-  agentStore = new AgentStore(`${tempDir}/state/agents`);
-  taskStore = new TaskStore(`${tempDir}/state/tasks`);
-  lockManager = new LockManager(`${tempDir}/state`);
-  const eventBus = new EventBus(new EventLog(`${tempDir}/events`));
-  manager = new AgentManager({
-    config: CONFIG,
-    agentStore,
-    taskStore,
-    lockManager,
-    eventBus,
+  config = makeConfig({
+    review: { rounds: 2 },
+    project: [{
+      id: 'proj',
+      repo: 'git@github.com:owner/repo.git',
+      merge: null,
+      agent: [[
+        makeAgent(),
+        makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
+      ]],
+    }],
   });
+  const harness = await createManagerHarness(tempDir, { config });
+  ({ manager, createManager, agentStore, taskStore, lockManager } = harness);
   driver = new FakeDriver();
   vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
 });
@@ -809,12 +797,8 @@ describe('processGitRemoteCleanup', () => {
 
   it('converges a missing project configuration to manual', async () => {
     await seed({ status: 'cancelled', remoteCleanup: intent() });
-    const missingConfigManager = new AgentManager({
-      config: { ...CONFIG, project: [] },
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: new EventBus(new EventLog(`${tempDir}/events`)),
+    const missingConfigManager = createManager({
+      config: makeConfig({ ...config, project: [] }),
     });
 
     await missingConfigManager.processGitRemoteCleanup('task-1');
@@ -975,11 +959,7 @@ describe('processGitRemoteCleanup', () => {
       status: 'cancelled', branch: 'feat/custom', branchCreatedByBaxian: false,
       remoteCleanup: intent({ branch: 'feat/custom' }),
     });
-    const auditFailureManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
+    const auditFailureManager = createManager({
       eventBus: new EventBus({
         append: async (event: { type: string; data: Record<string, unknown> }) => {
           if (event.type === 'task.updated' && event.data.operation === 'git-pr-close') {
@@ -1045,11 +1025,7 @@ describe('processGitRemoteCleanup', () => {
       status: 'cancelled',
       remoteCleanup: intent({ stage: 'delete-pending', remoteProjectId: 'R_repo' }),
     });
-    const auditFailureManager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
+    const auditFailureManager = createManager({
       eventBus: new EventBus({
         append: async (event: { type: string; data: Record<string, unknown> }) => {
           if (event.type === 'task.updated' && event.data.operation === 'git-branch-delete') {
@@ -1103,11 +1079,9 @@ describe('processGitRemoteCleanup', () => {
 
     driver.deleteError = new Error('GraphQL ref no longer exists');
     await mkdir(`${tempDir}/events-restarted`, { recursive: true });
-    const restarted = new AgentManager({
-      config: CONFIG,
-      agentStore: new AgentStore(`${tempDir}/state/agents`),
-      taskStore,
-      lockManager: new LockManager(`${tempDir}/state`),
+    const restarted = createManager({
+      agentStore: new AgentStore(join(tempDir, 'state', 'agents')),
+      lockManager: new LockManager(join(tempDir, 'locks')),
       eventBus: new EventBus(new EventLog(`${tempDir}/events-restarted`)),
     });
     vi.spyOn(restarted, 'platformDriverFor').mockReturnValue(driver as unknown as GitDriver);
@@ -2545,26 +2519,6 @@ describe('manual dispatch binding recheck', () => {
     expect(await taskStore.get('task-1')).toEqual(result);
   });
 
-  it('rejects a non-recoverable git QA hold before creating a review lease', async () => {
-    await seed({
-      status: 'review', phase: 'code', signalToken: 'entry-pass', reviewDispatch: undefined,
-    });
-    await agentStore.set({
-      id: 'qa-1', projectId: 'proj', taskId: 'task-1', status: 'awaiting_human',
-      awaitingPhase: 'dispatch-failed:ack_unknown', awaitingSince: TS,
-      awaitingNonce: 'uncertain-hold', updatedAt: TS,
-    });
-    const verify = vi.spyOn(manager, 'platformVerifyPrBinding');
-
-    await expect(manager.redispatchCurrentTaskPhase('task-1', {
-      status: 'review', phase: 'code', signalToken: 'entry-pass',
-      agentId: 'dev-1', reviewRound: 1,
-    })).resolves.toBe('unsupported');
-
-    expect(verify).not.toHaveBeenCalled();
-    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
-  });
-
   it('restores a claimed git lease and reports unsupported if the QA hold races the route precheck', async () => {
     await seed({ status: 'review', phase: 'code', signalToken: 'entry-pass' });
     const begun = await manager.beginGitReviewPass('task-1', {
@@ -2608,87 +2562,6 @@ describe('manual dispatch binding recheck', () => {
     });
     expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
     expect(dispatchSpy).not.toHaveBeenCalled();
-  });
-
-  it('does not recreate a git pass after concurrent delivery commits the guarded round', async () => {
-    await seed({
-      status: 'review', phase: 'code', reviewRound: 1, signalToken: 'entry-pass',
-    });
-    const begun = await manager.beginGitReviewPass('task-1', {
-      fromStatus: ['review'], headSha: SHA1, bumpRound: true,
-    });
-    const claimed = await manager.claimGitReviewDispatch(
-      'task-1',
-      begun!.task.reviewDispatch!.generation,
-    );
-    const complete = manager as unknown as {
-      completeGitReviewDispatch: (
-        taskId: string,
-        lease: NonNullable<TaskState['reviewDispatch']>,
-      ) => Promise<boolean>;
-    };
-    const realGet = taskStore.get.bind(taskStore);
-    let routeReads = 0;
-    let completed = false;
-    vi.spyOn(taskStore, 'get').mockImplementation(async taskId => {
-      routeReads++;
-      if (!completed && routeReads === 2) {
-        completed = true;
-        expect(await complete.completeGitReviewDispatch('task-1', claimed!.lease)).toBe(true);
-      }
-      return realGet(taskId);
-    });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease').mockImplementation(
-      async () => (await realGet('task-1'))!,
-    );
-
-    await expect(manager.redispatchCurrentTaskPhase('task-1', {
-      status: 'review',
-      phase: 'code',
-      signalToken: claimed!.task.signalToken,
-      agentId: 'dev-1',
-      reviewRound: 1,
-    })).resolves.toBe('stale');
-
-    expect(dispatch).not.toHaveBeenCalled();
-    expect(await realGet('task-1')).toMatchObject({
-      status: 'review',
-      reviewRound: 2,
-      signalToken: claimed!.lease.signalToken,
-    });
-    expect((await realGet('task-1'))?.reviewDispatch).toBeUndefined();
-  });
-
-  it('rechecks the guarded round inside git pass creation after PR verification', async () => {
-    await seed({
-      status: 'review', phase: 'code', reviewRound: 1, signalToken: 'entry-pass',
-      reviewDispatch: undefined,
-    });
-    vi.spyOn(manager, 'platformVerifyPrBinding').mockImplementation(async () => {
-      const current = await taskStore.get('task-1');
-      await taskStore.set({
-        ...current!,
-        reviewRound: 2,
-        updatedAt: new Date().toISOString(),
-      });
-      return { ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main' };
-    });
-    const dispatch = vi.spyOn(manager, 'dispatchGitReviewLease');
-
-    await expect(manager.redispatchCurrentTaskPhase('task-1', {
-      status: 'review',
-      phase: 'code',
-      signalToken: 'entry-pass',
-      agentId: 'dev-1',
-      reviewRound: 1,
-    })).resolves.toBe('stale');
-
-    expect(dispatch).not.toHaveBeenCalled();
-    expect(await taskStore.get('task-1')).toMatchObject({
-      reviewRound: 2,
-      signalToken: 'entry-pass',
-    });
-    expect((await taskStore.get('task-1'))?.reviewDispatch).toBeUndefined();
   });
 
   it('checks the full task generation while claiming an existing git lease', async () => {
@@ -2741,7 +2614,7 @@ describe('manual dispatch binding recheck', () => {
   });
 });
 
-describe('third review round: merge gate integrity', () => {
+describe('merge gate and post-review recovery integrity', () => {
   it('human override merges a never-passed task claimed at merge-ready, but not one that left the gate', async () => {
     await seed({ status: 'merge-ready', passProvenance: undefined, latestHeadSha: SHA1 });
     await manager.mergePr('task-1', { matchHeadSha: SHA1, humanOverride: true });
@@ -2801,17 +2674,17 @@ describe('platform dispatch descriptor context', () => {
 
   it('carries operator notes and follows config changes live', () => {
     manager.replaceConfig({
-      ...CONFIG,
-      project: [{ ...CONFIG.project[0], gitCli: { tool: 'gh', notes: 'runs behind :8443' } }],
+      ...config,
+      project: [{ ...config.project[0], gitCli: { tool: 'gh', notes: 'runs behind :8443' } }],
     });
     expect(manager.platformCliContextOf(gitTask())?.notes).toBe('runs behind :8443');
   });
 
   it('fails loud when the identity drifted away', () => {
     manager.replaceConfig({
-      ...CONFIG,
+      ...config,
       project: [{
-        ...CONFIG.project[0],
+        ...config.project[0],
         repo: 'https://git.corp.example.com/g/p.git',
         gitCli: { tool: 'gh' },
       }],
@@ -2822,12 +2695,7 @@ describe('platform dispatch descriptor context', () => {
 
 describe('ensureGitBaseSnapshot', () => {
   function managerWithBaseSource(source?: (projectId: string) => string | undefined): AgentManager {
-    const m = new AgentManager({
-      config: CONFIG,
-      agentStore: new AgentStore(`${tempDir}/state/agents`),
-      taskStore,
-      lockManager: new LockManager(`${tempDir}/state`),
-      eventBus: new EventBus(new EventLog(`${tempDir}/events`)),
+    const m = createManager({
       ...(source ? { platformDefaultBranchOf: source } : {}),
     });
     return m;
@@ -2860,12 +2728,7 @@ describe('ensureGitBaseSnapshot', () => {
 
 describe('ensureGitBaseSnapshot binding guard', () => {
   it('refuses to persist a base from a drifted project and leaves the task untouched', async () => {
-    const m = new AgentManager({
-      config: CONFIG,
-      agentStore: new AgentStore(`${tempDir}/state/agents`),
-      taskStore,
-      lockManager: new LockManager(`${tempDir}/state`),
-      eventBus: new EventBus(new EventLog(`${tempDir}/events`)),
+    const m = createManager({
       platformDefaultBranchOf: () => 'main',
     });
     const task = await seed({
@@ -2992,11 +2855,10 @@ describe('listTasksForPlatformEntry', () => {
   });
 
   it('fail-closes on a tool drift (gh→forge) even when repoKey still matches', async () => {
-    manager.replaceConfig({ ...CONFIG, project: [
+    manager.replaceConfig({ ...config, project: [
       { id: 'proj', repo: 'https://github.com/owner/repo.git', merge: null,
         gitCli: { tool: 'forge' }, agent: [] },
     ] });
-    // 任务 binding tool=gh,项目离线改成 forge:旧 gh 任务不得落到 forge entry/driver 上
     await taskStore.set(gitTask({ id: 'task-gh', projectId: 'proj' }));
     await taskStore.set({
       ...gitTask({ id: 'task-forge', projectId: 'proj' }),
@@ -3008,10 +2870,9 @@ describe('listTasksForPlatformEntry', () => {
   });
 
   it('fail-closes on an offline-drifted binding that no longer matches the entry repo', async () => {
-    manager.replaceConfig({ ...CONFIG, project: [
+    manager.replaceConfig({ ...config, project: [
       { id: 'proj', repo: 'git@github.com:owner/repo.git', merge: null, agent: [] },
     ] });
-    // 任务的 binding 指向旧仓库(离线把 repo 改了),不得被交给新仓库的 driver
     await taskStore.set({
       ...gitTask({ id: 'task-drift', projectId: 'proj' }),
       platformBinding: { mode: 'git', repoKey: 'github.com/owner/OLD-repo', tool: 'gh' },
@@ -3028,7 +2889,7 @@ describe('guardGitConfigCommit', () => {
 
   it('commits inside the task lock when the scan finds no blocker', async () => {
     const commit = vi.fn(async () => undefined);
-    const result = await manager.guardGitConfigCommit(CONFIG, CONFIG, noBlockers, commit);
+    const result = await manager.guardGitConfigCommit(config, config, noBlockers, commit);
     expect(result).toEqual({ ok: true });
     expect(commit).toHaveBeenCalledTimes(1);
   });
@@ -3036,14 +2897,14 @@ describe('guardGitConfigCommit', () => {
   it('never commits when the scan reports blockers, and hands them back', async () => {
     const commit = vi.fn(async () => undefined);
     const blockers = [{ projectId: 'proj', taskIds: ['task-1'] }];
-    const result = await manager.guardGitConfigCommit(CONFIG, CONFIG, async () => blockers, commit);
+    const result = await manager.guardGitConfigCommit(config, config, async () => blockers, commit);
     expect(result).toEqual({ ok: false, blockers });
     expect(commit).not.toHaveBeenCalled();
   });
 
   it('serializes the scan against a concurrent task write so a late task cannot slip past it', async () => {
     let scanned = false;
-    const guarded = manager.guardGitConfigCommit(CONFIG, CONFIG, async (m) => {
+    const guarded = manager.guardGitConfigCommit(config, config, async (m) => {
       scanned = true;
       return (await m.listActiveGitTasks('proj')).map(t => ({ projectId: 'proj', taskIds: [t.id] }));
     }, async () => undefined);
@@ -3052,14 +2913,13 @@ describe('guardGitConfigCommit', () => {
     const [result] = await Promise.all([guarded, concurrent]);
 
     expect(scanned).toBe(true);
-    // 两者共用任务锁：任一顺序都合法，但绝不能出现「扫描看不见却已落盘」的中间态
     const active = await manager.listActiveGitTasks('proj');
     if (result.ok) expect(active.some(t => t.id === 'task-late-arrival')).toBe(true);
     else expect(result.blockers.length).toBeGreaterThan(0);
   });
 
   it('lets a commit failure surface instead of reporting success', async () => {
-    await expect(manager.guardGitConfigCommit(CONFIG, CONFIG, noBlockers, async () => {
+    await expect(manager.guardGitConfigCommit(config, config, noBlockers, async () => {
       throw new Error('disk gone');
     })).rejects.toThrow('disk gone');
   });

@@ -19,7 +19,6 @@ import type { RestartCoordinator } from './lifecycle/restart.js';
 import type { EventBroker } from './event/broker.js';
 import type { ErrorRecordStore } from './state/error-record-store.js';
 import type { PetStore } from './state/pet-store.js';
-import type { RootRecoveryCoordinator } from './agent/root-recovery-coordinator.js';
 import { agentRoutes } from './api/agents.js';
 import { petRoutes } from './api/pets.js';
 import { taskRoutes } from './api/tasks.js';
@@ -56,7 +55,6 @@ export interface AppContext {
   eventBroker?: EventBroker;
   errorRecordStore?: ErrorRecordStore;
   petStore?: PetStore;
-  rootRecoveryCoordinator?: RootRecoveryCoordinator;
 }
 
 declare module 'fastify' {
@@ -139,11 +137,6 @@ export async function buildApp(ctx: AppContext, opts: BuildAppOpts = {}): Promis
     app.ctx.bootstrapPoller?.stop();
     app.ctx.dispatchReconciler?.stop();
     app.ctx.poller?.stop();
-    try {
-      await app.ctx.rootRecoveryCoordinator?.stop();
-    } catch (err) {
-      console.error('[app] rootRecoveryCoordinator.stop on close failed:', err);
-    }
     try {
       await app.ctx.paneStreamerManager?.destroyAll();
     } catch (err) {

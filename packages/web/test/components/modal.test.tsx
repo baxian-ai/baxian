@@ -212,7 +212,6 @@ describe('Modal', () => {
 });
 
 describe('Modal focus trap (visible elements)', () => {
-  // jsdom 不做布局，offsetParent 恒为 null；垫一个 getter 让可见性过滤通过
   const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetParent');
   beforeAll(() => {
     Object.defineProperty(HTMLElement.prototype, 'offsetParent', {

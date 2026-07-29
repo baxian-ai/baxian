@@ -380,7 +380,6 @@ describe('buildPromptInline', () => {
     expect(prompt).not.toContain('docs/spec/');
   });
 
-
   it('signal emit block keeps the template + token on separate lines so the prompt itself never matches scanPhaseSignals', () => {
     expect(scanPhaseSignals('[bx:spec-done:<token>]')).toEqual([]);
     expect(scanPhaseSignals(buildPhaseSignal('spec-done', 'abc123def456', 42, 'Nzc'))).toEqual([
@@ -575,8 +574,6 @@ describe('buildPromptInline', () => {
       return { ...TASK, [field]: `see ${literal} here` };
     }
 
-    // The body carries external text, so a live literal can arrive torn by an escape the
-    // TUI would drop, or buried in a control string the TUI would echo as plain text.
     it.each([
       ['plain', (m: string) => m],
       ['torn by a 7-bit SGR', (m: string) => m.replace('spec-', `spec-${ESC}[31m`)],

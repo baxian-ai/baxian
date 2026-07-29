@@ -1,5 +1,3 @@
-// 转移表按 https://vt100.net/emu/dec_ansi_parser
-
 const S = {
   ground: 0,
   escape: 1,
@@ -19,25 +17,19 @@ const S = {
 
 type State = (typeof S)[keyof typeof S];
 
-// 这几个状态显式忽略 xterm 的 NON_ASCII_PRINTABLE 槽；其余状态无表项，走 ERROR 打回 ground。
 const NON_ASCII_IGNORED: ReadonlySet<State> = new Set([
   S.oscString, S.dcsPassthrough, S.csiIgnore, S.dcsIgnore,
 ]);
 
-// 转移动作为 EXECUTE 的状态；Dcs*/Osc/SosPmApc 里是 ignore/put，屏幕无效果。
 const EXECUTES_C0: ReadonlySet<State> = new Set([
   S.ground, S.escape, S.escapeIntermediate,
   S.csiEntry, S.csiParam, S.csiIntermediate, S.csiIgnore,
 ]);
 
-// 保留原字节：属不属 \s 正好就编码了会不会隔断 marker——BS 隔断，HT/LF/CR 让软换行接得回去。
 const CURSOR_MOVING_C0 = new Set([0x08, 0x09, 0x0a, 0x0d]);
 
-// 被字符集改写的字节在屏幕上是别的字形，拼出来的 marker 终端根本不显示。既不能原样吐也不能丢
-// ——两者都会拼出 marker——所以吐一个 compact 删不掉、又不可能出现在 marker 里的分隔符。
 const REMAPPED = '\x00';
 
-// 必须精确到字节：UK('A') 只改 '#'，把整套字符集判为不可见会漏掉屏幕上真实可见的 marker。
 const CHARSET_REMAPS: Readonly<Record<string, string>> = {
   '0': '`abcdefghijklmnopqrstuvwxyz{|}~',
   '4': '#@[\\]{|}~',
@@ -60,23 +52,40 @@ const REMAPPED_CODES: ReadonlyMap<string, ReadonlySet<number>> = new Map(
   Object.entries(CHARSET_REMAPS).map(([d, chars]) => [d, new Set([...chars].map(c => c.charCodeAt(0)))]),
 );
 
-// 只有终端认得的 designator 才会改写槽位；认不出的整条 designation 被忽略、旧字符集留任。
 const RECOGNISED_DESIGNATORS: ReadonlySet<string> = new Set([...Object.keys(CHARSET_REMAPS), 'B']);
 
 const MAX_CSI_PARAMS = 32;
 const MAX_CSI_PARAM = 0x7fffffff;
+const DEFAULT_COLUMNS = 80;
+const DEFAULT_ROWS = 24;
 
 type Slot = 0 | 1 | 2 | 3;
-interface CursorState { charset: string | undefined; conceal: boolean }
+interface CursorPosition { row: number; column: number }
+interface Continuation extends CursorPosition {
+  buffer: number;
+  firstPrintedColumn: number;
+  firstPrintedRow: number;
+  lastPrintedColumn: number;
+  lastPrintedRow: number;
+  printedInScrollback: boolean;
+  reliable: boolean;
+  wrapPending: boolean;
+}
+interface CursorState extends CursorPosition {
+  charset: string | undefined;
+  conceal: boolean;
+  continuation: Continuation | undefined;
+  printSequence: number;
+  reliable: boolean;
+}
+interface ScrollRegion { top: number; bottom: number }
 const SGR_FINAL = 'm';
-// GR 的 '-' '.' 与 GL 的 ')' '*' 落在同一批槽位上，后续 SO/LS2 会把它们选出来；'/' 被忽略。
+const POSITIONING_CSI_FINALS = new Set([...'ABCDEFGHILMZ`abdefr']);
 const DESIGNATE_INTERMEDIATES: Readonly<Record<string, Slot>> = {
   '(': 0, ')': 1, '*': 2, '+': 3, '-': 1, '.': 2,
 };
-// xterm 5.5.0 把 LS1R/LS2R/LS3R 也当作 GL 移位处理，与标准的 GR 语义不同。
 const LOCKING_SHIFTS: Readonly<Record<string, Slot>> = { n: 2, o: 3, '|': 3, '}': 2, '~': 1 };
 
-// ESC、CAN/SUB 与全部 C1 控制取消进行中的序列，从任何状态生效。
 function anywhereTransition(code: number): State | undefined {
   if (code === 0x1b) return S.escape;
   if (code === 0x18 || code === 0x1a) return S.ground;
@@ -91,21 +100,28 @@ function anywhereTransition(code: number): State | undefined {
 export class VisibleTextExtractor {
   private state: State = S.ground;
   private pendingHigh = '';
-  // 装载的那张表与槽位是两样东西：DECSC/DECRC 只存取 active，移位则从 charsets 重新装载。
   private active: string | undefined;
   private readonly charsets: Array<string | undefined> = [undefined, undefined, undefined, undefined];
   private gl: Slot = 0;
-  // 每个缓冲区各存一份（`CSI ?1049h` 进备用屏时存的是主屏那份）；
-  // 存了 undefined 与没存过是两回事，故用外层 undefined 表示"没存过"。
   private savedByBuffer: Array<CursorState | undefined> = [undefined, undefined];
+  private cursorByBuffer: CursorPosition[] = [
+    { row: 0, column: 0 },
+    { row: 0, column: 0 },
+  ];
+  private cursorReliableByBuffer = [true, true];
+  private tabStopsReliableByBuffer = [true, true];
+  private scrollRegionByBuffer: [ScrollRegion, ScrollRegion];
+  private continuation: Continuation | undefined;
+  private carriageReturnContinuation: Continuation | undefined;
+  private contentInvalidatedByBuffer = [false, false];
+  private printSequenceByBuffer = [0, 0];
+  private wraparound = true;
+  private originMode = false;
   private conceal = false;
   private altBuffer = 0;
   private pendingIntermediate: string | undefined;
-  // 私有前缀要留原字节：只有 '?' 是 DEC private mode，'<' '=' '>' 各有别的含义。
   private csiPrefix = '';
   private csiIntermediates = '';
-  // 按 xterm 的 Params 语义收数值主参数：前导零归一、冒号子参数只取冒号前的值、
-  // 容量算的是**参数个数**（超出的丢弃，已收下的照常派发），不是原始字符数。
   private csiParamValues: number[] = [];
   private csiParamHasSub: boolean[] = [];
   private csiParamValue = 0;
@@ -113,6 +129,29 @@ export class VisibleTextExtractor {
   private csiInSubParam = false;
   private csiOverflowed = false;
   private csiEightBit = false;
+  private columns: number;
+  private rows: number;
+
+  constructor(columns = DEFAULT_COLUMNS, rows = DEFAULT_ROWS) {
+    this.columns = this.normalizeColumns(columns);
+    this.rows = this.normalizeRows(rows);
+    this.scrollRegionByBuffer = [this.fullScrollRegion(), this.fullScrollRegion()];
+  }
+
+  resize(columns: number, rows = this.rows): void {
+    const normalizedColumns = this.normalizeColumns(columns);
+    const normalizedRows = this.normalizeRows(rows);
+    if (normalizedColumns === this.columns && normalizedRows === this.rows) return;
+    this.columns = normalizedColumns;
+    this.rows = normalizedRows;
+    this.scrollRegionByBuffer = [this.fullScrollRegion(), this.fullScrollRegion()];
+    for (const cursor of this.cursorByBuffer) {
+      cursor.column = Math.min(cursor.column, this.columns - 1);
+      cursor.row = Math.min(cursor.row, this.rows - 1);
+    }
+    this.contentInvalidatedByBuffer = [true, true];
+    this.cursorReliableByBuffer = [false, false];
+  }
 
   reset(): void {
     this.state = S.ground;
@@ -121,6 +160,20 @@ export class VisibleTextExtractor {
     this.altBuffer = 0;
     this.pendingIntermediate = undefined;
     this.clearCsiCollect();
+  }
+
+  private normalizeColumns(columns: number): number {
+    if (!Number.isFinite(columns) || columns < 1) return DEFAULT_COLUMNS;
+    return Math.min(Math.trunc(columns), MAX_CSI_PARAM);
+  }
+
+  private normalizeRows(rows: number): number {
+    if (!Number.isFinite(rows) || rows < 1) return DEFAULT_ROWS;
+    return Math.min(Math.trunc(rows), MAX_CSI_PARAM);
+  }
+
+  private fullScrollRegion(): ScrollRegion {
+    return { top: 0, bottom: this.rows - 1 };
   }
 
   private collectCsiParam(ch: string): void {
@@ -180,46 +233,79 @@ export class VisibleTextExtractor {
     this.active = this.charsets[slot];
   }
 
-  // `CSI ?2h` 只重指定 G0-G3，不碰 GL，也不碰已保存的那份。
   private resetCharsetSlots(): void {
     this.charsets.fill(undefined);
     this.active = undefined;
   }
 
-  // DECSTR 连 GL 与**当前 buffer** 保存的那份一起清；另一个 buffer 的存档不归它管。
   private softReset(): void {
     this.resetCharsetSlots();
     this.gl = 0;
     this.conceal = false;
+    this.wraparound = true;
+    this.originMode = false;
+    this.scrollRegionByBuffer[this.altBuffer] = this.fullScrollRegion();
     this.savedByBuffer[this.altBuffer] = undefined;
   }
 
-  // RIS 是整机复位：连 buffer 身份与两份存档一起回到初始。
   private fullReset(): void {
     this.resetCharsetSlots();
     this.gl = 0;
     this.conceal = false;
+    this.wraparound = true;
     this.savedByBuffer = [undefined, undefined];
+    this.cursorByBuffer = [
+      { row: 0, column: 0 },
+      { row: 0, column: 0 },
+    ];
+    this.cursorReliableByBuffer = [true, true];
+    this.tabStopsReliableByBuffer = [true, true];
+    this.scrollRegionByBuffer = [this.fullScrollRegion(), this.fullScrollRegion()];
+    this.continuation = undefined;
+    this.carriageReturnContinuation = undefined;
+    this.contentInvalidatedByBuffer = [false, false];
+    this.printSequenceByBuffer = [0, 0];
+    this.originMode = false;
     this.altBuffer = 0;
   }
 
-  // ESC % G/@ 只是"选回默认"：动 G0 与 GL，不碰 G1-G3。
   private selectDefaultCharset(): void {
     this.setgCharset(0, undefined);
     this.setgLevel(0);
   }
 
   private saveCursorState(): void {
-    this.savedByBuffer[this.altBuffer] = { charset: this.active, conceal: this.conceal };
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const continuation = this.continuation?.buffer === this.altBuffer
+      ? { ...this.continuation }
+      : undefined;
+    this.savedByBuffer[this.altBuffer] = {
+      charset: this.active,
+      conceal: this.conceal,
+      continuation,
+      printSequence: this.printSequenceByBuffer[this.altBuffer],
+      row: cursor.row,
+      column: cursor.column,
+      reliable: this.cursorReliableByBuffer[this.altBuffer],
+    };
   }
 
   private restoreCursorState(): void {
     const saved = this.savedByBuffer[this.altBuffer];
     this.active = saved?.charset;
     this.conceal = saved?.conceal ?? false;
+    const reliable = saved?.reliable ?? true;
+    if (!reliable || !this.cursorReliableByBuffer[this.altBuffer]) this.contentInvalidated = true;
+    const printedSinceSave = saved !== undefined
+      && saved.printSequence !== this.printSequenceByBuffer[this.altBuffer];
+    if (printedSinceSave && saved.continuation !== undefined) this.contentInvalidated = true;
+    this.assignCursor(saved?.column ?? 0, saved?.row ?? 0);
+    this.cursorReliableByBuffer[this.altBuffer] = reliable;
+    if (saved?.continuation !== undefined && !printedSinceSave && !this.contentInvalidated) {
+      this.continuation = { ...saved.continuation };
+    }
   }
 
-  // SGR 8 让字形在屏幕上消失，单元格里却还留着字符——和字符集重映射是同一类问题。
   private dispatchSgr(): void {
     for (let i = 0; i < this.csiParamValues.length; i++) {
       const param = this.csiParamValues[i];
@@ -230,7 +316,6 @@ export class VisibleTextExtractor {
     }
   }
 
-  // 照搬 xterm 的 _extractColor 推进量：颜色载荷里的 8/28 是分量值，当成独立参数两个方向都会错。
   private extendedColourSpan(leader: number): number {
     let advance = 0;
     let cSpace = 0;
@@ -244,23 +329,423 @@ export class VisibleTextExtractor {
     }
   }
 
+  private csiParam(index = 0): number {
+    return this.csiParamValues[index] || 1;
+  }
+
+  private activeScrollRegion(): ScrollRegion {
+    return this.scrollRegionByBuffer[this.altBuffer];
+  }
+
+  private get contentInvalidated(): boolean {
+    return this.contentInvalidatedByBuffer[this.altBuffer];
+  }
+
+  private set contentInvalidated(value: boolean) {
+    this.contentInvalidatedByBuffer[this.altBuffer] = value;
+  }
+
+  private assignCursor(column: number, row: number): void {
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const region = this.activeScrollRegion();
+    const top = this.originMode ? region.top : 0;
+    const bottom = this.originMode ? region.bottom : this.rows - 1;
+    cursor.column = Math.max(0, Math.min(column, this.columns - 1));
+    cursor.row = Math.max(top, Math.min(row, bottom));
+  }
+
+  private setAbsoluteCursor(column: number, row: number): void {
+    const region = this.activeScrollRegion();
+    this.assignCursor(column, row + (this.originMode ? region.top : 0));
+    this.cursorReliableByBuffer[this.altBuffer] = true;
+  }
+
+  private moveCursor(columns: number, rows: number): void {
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    this.assignCursor(Math.min(cursor.column, this.columns - 1) + columns, cursor.row + rows);
+  }
+
+  private moveCursorToVerticalMargin(count: number, direction: 1 | -1): void {
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const region = this.activeScrollRegion();
+    const margin = direction === 1 ? region.bottom : region.top;
+    const inside = direction === 1 ? cursor.row <= margin : cursor.row >= margin;
+    const row = inside
+      ? direction === 1
+        ? Math.min(cursor.row + count, margin)
+        : Math.max(cursor.row - count, margin)
+      : cursor.row + direction * count;
+    this.assignCursor(cursor.column, row);
+  }
+
+  private moveToTab(direction: 1 | -1, count: number): void {
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    if (!this.tabStopsReliableByBuffer[this.altBuffer]) {
+      this.contentInvalidated = true;
+      this.cursorReliableByBuffer[this.altBuffer] = false;
+      return;
+    }
+    cursor.column = direction === 1
+      ? Math.min((Math.floor(cursor.column / 8) + count) * 8, this.columns - 1)
+      : Math.max(Math.ceil(cursor.column / 8) * 8 - 8 * count, 0);
+  }
+
+  private invalidateTabStops(): void {
+    this.tabStopsReliableByBuffer[this.altBuffer] = false;
+  }
+
+  private shiftContinuationForScroll(region: ScrollRegion, shiftPosition: boolean): void {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return;
+    if (region.top === 0
+      && region.bottom === this.rows - 1
+      && continuation.firstPrintedRow === region.top) {
+      if (this.altBuffer === 1) {
+        this.contentInvalidated = true;
+        return;
+      }
+      continuation.printedInScrollback = true;
+    }
+    const positionInRegion = continuation.row >= region.top && continuation.row <= region.bottom;
+    if (positionInRegion && continuation.row === region.top) {
+      this.contentInvalidated = true;
+      return;
+    }
+    if (positionInRegion && shiftPosition) continuation.row--;
+    if (continuation.firstPrintedRow > region.top
+      && continuation.firstPrintedRow <= region.bottom) {
+      continuation.firstPrintedRow--;
+    }
+    if (continuation.lastPrintedRow > region.top
+      && continuation.lastPrintedRow <= region.bottom) {
+      continuation.lastPrintedRow--;
+    }
+  }
+
+  private indexCursor(scrollContinuation: boolean): boolean {
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const region = this.activeScrollRegion();
+    if (cursor.row === region.bottom) {
+      this.shiftContinuationForScroll(region, scrollContinuation);
+      return true;
+    }
+    if (cursor.row === this.rows - 1) {
+      if (!scrollContinuation) this.contentInvalidated = true;
+      return false;
+    }
+    this.assignCursor(cursor.column, cursor.row + 1);
+    return true;
+  }
+
+  private setScrollRegion(): void {
+    const top = this.csiParamValues[0] || 1;
+    const requestedBottom = this.csiParamValues[1] || this.rows;
+    const bottom = requestedBottom > this.rows ? this.rows : requestedBottom;
+    if (bottom <= top) return;
+    this.scrollRegionByBuffer[this.altBuffer] = { top: top - 1, bottom: bottom - 1 };
+    this.setAbsoluteCursor(0, 0);
+  }
+
+  private printedColumnsOnRow(continuation: Continuation, row: number): [number, number] | undefined {
+    if (row < continuation.firstPrintedRow || row > continuation.lastPrintedRow) return undefined;
+    return [
+      row === continuation.firstPrintedRow ? continuation.firstPrintedColumn : 0,
+      row === continuation.lastPrintedRow ? continuation.lastPrintedColumn : this.columns - 1,
+    ];
+  }
+
+  private eraseLineTouchesContinuation(mode: number): boolean {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return false;
+    if (!continuation.reliable || !this.cursorReliableByBuffer[this.altBuffer]) return true;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const printed = this.printedColumnsOnRow(continuation, cursor.row);
+    if (printed === undefined) return false;
+    if (mode === 2) return true;
+    if (mode === 1) return cursor.column >= printed[0];
+    if (mode !== 0 || cursor.column >= this.columns) return false;
+    return cursor.column <= printed[1];
+  }
+
+  private characterEditTouchesContinuation(final: '@' | 'P' | 'X'): boolean {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return false;
+    if (!continuation.reliable || !this.cursorReliableByBuffer[this.altBuffer]) return true;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const printed = this.printedColumnsOnRow(continuation, cursor.row);
+    if (printed === undefined) return false;
+    const start = Math.min(cursor.column, this.columns - 1);
+    if (final !== 'X') return start <= printed[1];
+    const end = Math.min(start + this.csiParam() - 1, this.columns - 1);
+    return start <= printed[1] && end >= printed[0];
+  }
+
+  private lineEditTouchesContinuation(): boolean {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return false;
+    if (!continuation.reliable || !this.cursorReliableByBuffer[this.altBuffer]) return true;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const region = this.activeScrollRegion();
+    if (cursor.row < region.top || cursor.row > region.bottom) return false;
+    return continuation.firstPrintedRow <= region.bottom
+      && continuation.lastPrintedRow >= cursor.row;
+  }
+
+  private columnEditTouchesContinuation(): boolean {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return false;
+    if (!continuation.reliable || !this.cursorReliableByBuffer[this.altBuffer]) return true;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const region = this.activeScrollRegion();
+    if (cursor.row < region.top || cursor.row > region.bottom) return false;
+    const firstAffectedRow = Math.max(continuation.firstPrintedRow, region.top);
+    const lastAffectedRow = Math.min(continuation.lastPrintedRow, region.bottom);
+    if (firstAffectedRow > lastAffectedRow) return false;
+    const start = Math.min(cursor.column, this.columns - 1);
+    return firstAffectedRow < continuation.lastPrintedRow
+      || start <= continuation.lastPrintedColumn;
+  }
+
+  private eraseDisplayToEndTouchesContinuation(): boolean {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return false;
+    if (!continuation.reliable || !this.cursorReliableByBuffer[this.altBuffer]) return true;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    if (cursor.column >= this.columns) return false;
+    return cursor.row < continuation.lastPrintedRow
+      || (cursor.row === continuation.lastPrintedRow
+        && cursor.column <= continuation.lastPrintedColumn);
+  }
+
+  private eraseDisplayToStartTouchesContinuation(): boolean {
+    const continuation = this.continuation;
+    if (continuation?.buffer !== this.altBuffer) return false;
+    if (!continuation.reliable || !this.cursorReliableByBuffer[this.altBuffer]) return true;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const column = Math.min(cursor.column, this.columns - 1);
+    return continuation.firstPrintedRow < cursor.row
+      || (continuation.firstPrintedRow === cursor.row
+        && continuation.firstPrintedColumn <= column);
+  }
+
+  private dispatchCursorCsi(final: string): void {
+    if (!this.cursorReliableByBuffer[this.altBuffer] && POSITIONING_CSI_FINALS.has(final)) {
+      this.contentInvalidated = true;
+    }
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    switch (final) {
+      case '@':
+      case 'P':
+      case 'X':
+        if (this.characterEditTouchesContinuation(final)) this.contentInvalidated = true;
+        this.assignCursor(Math.min(cursor.column, this.columns - 1), cursor.row);
+        break;
+      case 'A': this.moveCursorToVerticalMargin(this.csiParam(), -1); break;
+      case 'B': this.moveCursorToVerticalMargin(this.csiParam(), 1); break;
+      case 'C':
+      case 'a': this.moveCursor(this.csiParam(), 0); break;
+      case 'D': this.moveCursor(-this.csiParam(), 0); break;
+      case 'E':
+        this.moveCursorToVerticalMargin(this.csiParam(), 1);
+        this.assignCursor(0, cursor.row);
+        break;
+      case 'F':
+        this.moveCursorToVerticalMargin(this.csiParam(), -1);
+        this.assignCursor(0, cursor.row);
+        break;
+      case 'G':
+      case '`': this.assignCursor(this.csiParam() - 1, cursor.row); break;
+      case 'H':
+      case 'f': this.setAbsoluteCursor(this.csiParam(1) - 1, this.csiParam(0) - 1); break;
+      case 'I': this.moveToTab(1, this.csiParam()); break;
+      case 'J':
+      case 'K': {
+        const mode = this.csiParamValues[0] ?? 0;
+        const touches = final === 'K'
+          ? this.eraseLineTouchesContinuation(mode)
+          : mode === 2
+            || (mode === 0 && this.eraseDisplayToEndTouchesContinuation())
+            || (mode === 1 && this.eraseDisplayToStartTouchesContinuation())
+            || (mode === 3
+              && this.continuation?.buffer === this.altBuffer
+              && this.continuation.printedInScrollback);
+        if (touches) {
+          this.contentInvalidated = true;
+        }
+        break;
+      }
+      case 'L':
+      case 'M': {
+        const region = this.activeScrollRegion();
+        this.assignCursor(Math.min(cursor.column, this.columns - 1), cursor.row);
+        if (cursor.row >= region.top && cursor.row <= region.bottom) {
+          if (this.lineEditTouchesContinuation()) this.contentInvalidated = true;
+          this.assignCursor(0, cursor.row);
+        }
+        break;
+      }
+      case 'S':
+      case 'T':
+        this.contentInvalidated = true;
+        break;
+      case 'Z': this.moveToTab(-1, this.csiParam()); break;
+      case 'b': this.moveCursor(this.csiParam(), 0); break;
+      case 'd':
+        this.assignCursor(
+          cursor.column,
+          this.csiParam() - 1 + (this.originMode ? this.activeScrollRegion().top : 0),
+        );
+        break;
+      case 'e': this.moveCursor(0, this.csiParam()); break;
+      case 'g':
+        if (this.csiParamValues[0] === 0 || this.csiParamValues[0] === 3) this.invalidateTabStops();
+        break;
+      case 'r': this.setScrollRegion(); break;
+      default: break;
+    }
+  }
+
+  private emitPrint(text: string, widthReliable = true): string {
+    this.carriageReturnContinuation = undefined;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    const reliable = this.cursorReliableByBuffer[this.altBuffer];
+    const consumesPendingWrap = reliable && cursor.column >= this.columns && this.wraparound;
+    if (reliable && cursor.column >= this.columns) {
+      if (this.wraparound) {
+        cursor.column = 0;
+        this.indexCursor(false);
+      } else {
+        cursor.column = this.columns - 1;
+      }
+    }
+    const printedRow = cursor.row;
+    const printedColumn = cursor.column;
+    const previous = this.continuation;
+    const continuous = this.continuation === undefined
+      || (
+        this.continuation.buffer === this.altBuffer
+        && this.continuation.reliable === reliable
+        && (!this.continuation.wrapPending || consumesPendingWrap)
+        && (
+          (this.continuation.row === cursor.row && this.continuation.column === cursor.column)
+          || (cursor.row === this.continuation.row + 1 && cursor.column === 0)
+        )
+      );
+    const boundary = this.contentInvalidated || !continuous ? REMAPPED : '';
+    this.contentInvalidated = false;
+    this.printSequenceByBuffer[this.altBuffer]++;
+    const nextColumn = cursor.column + 1;
+    if (reliable) {
+      cursor.column = this.wraparound ? nextColumn : Math.min(nextColumn, this.columns - 1);
+    } else {
+      cursor.column = Math.min(nextColumn, MAX_CSI_PARAM);
+    }
+    const nextReliable = reliable && widthReliable;
+    this.cursorReliableByBuffer[this.altBuffer] = nextReliable;
+    const region = this.activeScrollRegion();
+    const wraps = nextReliable && this.wraparound && nextColumn === this.columns;
+    const nextRow = wraps
+      ? cursor.row === region.bottom || cursor.row === this.rows - 1
+        ? cursor.row
+        : cursor.row + 1
+      : cursor.row;
+    this.continuation = {
+      buffer: this.altBuffer,
+      firstPrintedColumn: boundary === '' && previous?.buffer === this.altBuffer
+        ? previous.firstPrintedColumn
+        : printedColumn,
+      firstPrintedRow: boundary === '' && previous?.buffer === this.altBuffer
+        ? previous.firstPrintedRow
+        : printedRow,
+      lastPrintedColumn: printedColumn,
+      lastPrintedRow: printedRow,
+      printedInScrollback: boundary === '' && previous?.buffer === this.altBuffer
+        ? previous.printedInScrollback
+        : false,
+      row: nextRow,
+      column: wraps ? 0 : nextColumn,
+      reliable: nextReliable,
+      wrapPending: wraps && nextRow === cursor.row,
+    };
+    return boundary + text;
+  }
+
+  private acceptCursorMovement(): void {
+    if (this.continuation?.buffer !== this.altBuffer) return;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    this.continuation = {
+      ...this.continuation,
+      row: cursor.row,
+      column: cursor.column,
+      reliable: this.cursorReliableByBuffer[this.altBuffer],
+      wrapPending: false,
+    };
+  }
+
+  private cursorIsAtContinuation(): boolean {
+    const continuation = this.continuation;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    return continuation?.buffer === this.altBuffer
+      && continuation.reliable === this.cursorReliableByBuffer[this.altBuffer]
+      && continuation.row === cursor.row
+      && continuation.column === cursor.column;
+  }
+
+  private canAcceptVerticalMovement(): boolean {
+    if (this.cursorIsAtContinuation()) return true;
+    const continuation = this.continuation;
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    return continuation !== undefined
+      && continuation === this.carriageReturnContinuation
+      && continuation.buffer === this.altBuffer
+      && continuation.reliable === this.cursorReliableByBuffer[this.altBuffer]
+      && continuation.row === cursor.row
+      && cursor.column === 0;
+  }
+
+  private executeCursorC0(code: number, acceptMovement: boolean): void {
+    const cursor = this.cursorByBuffer[this.altBuffer];
+    let moved = true;
+    let acceptsVerticalMovement = true;
+    if (code === 0x08) this.moveCursor(-1, 0);
+    else if (code === 0x09) this.moveToTab(1, 1);
+    else if (code === 0x0a || code === 0x0b || code === 0x0c) {
+      acceptsVerticalMovement = this.canAcceptVerticalMovement();
+      moved = this.indexCursor(true);
+      this.carriageReturnContinuation = undefined;
+    } else if (code === 0x0d) {
+      this.carriageReturnContinuation = this.cursorIsAtContinuation()
+        ? this.continuation
+        : undefined;
+      this.assignCursor(0, cursor.row);
+    }
+    if (acceptMovement && moved && acceptsVerticalMovement) this.acceptCursorMovement();
+  }
+
   private dispatchCsi(final: string): string {
     this.flushCsiParam();
-    if (this.csiOverflowed) {
-      // fall through to the reset below
-    } else if (this.csiPrefix === '?') {
-      if (this.csiIntermediates === '') this.dispatchPrivateMode(final);
-    } else if (this.csiPrefix === '' && this.csiIntermediates === '' && final === 's') {
-      this.saveCursorState();
-    } else if (this.csiPrefix === '' && this.csiIntermediates === '' && final === 'u') {
-      this.restoreCursorState();
-    } else if (this.csiPrefix === '' && this.csiIntermediates === '' && final === SGR_FINAL) {
-      this.dispatchSgr();
-    } else if (this.csiPrefix === '' && this.csiIntermediates === '!' && final === 'p') {
-      this.softReset(); // DECSTR
+    if (!this.csiOverflowed) {
+      if (this.csiPrefix === '?' && this.csiIntermediates === '') {
+        if (final === 'J' || final === 'K') this.dispatchCursorCsi(final);
+        else this.dispatchPrivateMode(final);
+      } else if (this.csiPrefix === '' && this.csiIntermediates === '' && final === 's') {
+        this.saveCursorState();
+      } else if (this.csiPrefix === '' && this.csiIntermediates === '' && final === 'u') {
+        this.restoreCursorState();
+      } else if (this.csiPrefix === '' && this.csiIntermediates === '' && final === SGR_FINAL) {
+        this.dispatchSgr();
+      } else if (this.csiPrefix === '' && this.csiIntermediates === '') {
+        this.dispatchCursorCsi(final);
+      } else if (this.csiPrefix === ''
+        && this.csiIntermediates === "'"
+        && (final === '}' || final === '~')) {
+        if (this.columnEditTouchesContinuation()) this.contentInvalidated = true;
+      } else if (this.csiPrefix === '' && this.csiIntermediates === '!' && final === 'p') {
+        this.softReset();
+      } else if (this.csiPrefix === '' && this.csiIntermediates === ' ' && (final === '@' || final === 'A')) {
+        this.contentInvalidated = true;
+      }
     }
-    // 派发出去的 8-bit CSI 真会动屏幕，而 main 的正则不认 0x9b、天然隔开 marker——只有 SGR 例外，
-    // 它唯一的可见性影响（conceal）已经建模。取消/ignore 的序列 xterm 整条丢弃，不在此列。
     const transparent = this.csiPrefix === '' && this.csiIntermediates === '' && final === SGR_FINAL;
     const boundary = this.csiEightBit && !transparent ? REMAPPED : '';
     this.clearCsiCollect();
@@ -268,19 +753,62 @@ export class VisibleTextExtractor {
     return boundary;
   }
 
+  private activateAltBuffer(): void {
+    if (this.altBuffer === 1) return;
+    const saved = this.savedByBuffer[1];
+    if (saved !== undefined) {
+      this.savedByBuffer[1] = { ...saved, continuation: undefined };
+    }
+    if (this.continuation?.buffer === 1) {
+      this.continuation = undefined;
+      this.contentInvalidatedByBuffer[1] = true;
+    } else {
+      this.contentInvalidatedByBuffer[1] = false;
+    }
+    const cursor = this.cursorByBuffer[0];
+    this.altBuffer = 1;
+    this.cursorByBuffer[1] = { ...cursor };
+    this.cursorReliableByBuffer[1] = this.cursorReliableByBuffer[0];
+    this.tabStopsReliableByBuffer[1] = true;
+    this.scrollRegionByBuffer[1] = this.fullScrollRegion();
+  }
+
+  private activateMainBuffer(): void {
+    if (this.altBuffer === 0) return;
+    const cursor = this.cursorByBuffer[1];
+    const cursorReliable = this.cursorReliableByBuffer[1];
+    this.altBuffer = 0;
+    this.cursorByBuffer[0] = { ...cursor };
+    this.cursorReliableByBuffer[0] = cursorReliable;
+    this.contentInvalidatedByBuffer[1] = false;
+    this.cursorByBuffer[1] = { row: 0, column: 0 };
+    this.cursorReliableByBuffer[1] = true;
+    this.tabStopsReliableByBuffer[1] = true;
+    this.scrollRegionByBuffer[1] = this.fullScrollRegion();
+  }
+
   private dispatchPrivateMode(final: string): void {
     if (final !== 'h' && final !== 'l') return;
     const set = final === 'h';
     for (const param of this.csiParamValues) {
-      // 保存/恢复与切屏是两件事：1048 只在当前 buffer 存取游标字符集、不切屏；
-      // 47/1047 只切屏、不存取；1049 两件都做。
       if (param === 1048) {
         if (set) this.saveCursorState(); else this.restoreCursorState();
       } else if (param === 1049) {
-        if (set) { this.saveCursorState(); this.altBuffer = 1; }
-        else { this.altBuffer = 0; this.restoreCursorState(); }
+        if (set) {
+          this.saveCursorState();
+          this.activateAltBuffer();
+        } else {
+          this.activateMainBuffer();
+          this.restoreCursorState();
+        }
       } else if (param === 47 || param === 1047) {
-        this.altBuffer = set ? 1 : 0;
+        if (set) this.activateAltBuffer(); else this.activateMainBuffer();
+      } else if (param === 6) {
+        if (!this.cursorReliableByBuffer[this.altBuffer]) this.contentInvalidated = true;
+        this.originMode = set;
+        this.setAbsoluteCursor(0, 0);
+      } else if (param === 7) {
+        this.wraparound = set;
       } else if (param === 2 && set) {
         this.resetCharsetSlots();
       }
@@ -292,7 +820,6 @@ export class VisibleTextExtractor {
   }
 
   write(rawChunk: string): string {
-    // 按码点解析：跨 write 拆开的代理对要缝回去，否则低代理会落在与高代理不同的状态里。
     const chunk = this.pendingHigh + rawChunk;
     this.pendingHigh = '';
     let out = '';
@@ -309,20 +836,34 @@ export class VisibleTextExtractor {
           width = 2;
         }
       }
-      if (code === 0xfeff) continue; // xterm 的 StringToUtf32 在喂进转移表前就丢掉 BOM
+      if (code === 0xfeff) continue;
       if (code >= 0xa0) {
-        if (this.state === S.ground) out += this.conceal ? REMAPPED : chunk.slice(i, i + width);
+        if (this.state === S.ground) {
+          out += this.emitPrint(this.conceal ? REMAPPED : chunk.slice(i, i + width), false);
+        }
         else if (!NON_ASCII_IGNORED.has(this.state)) { this.pendingIntermediate = undefined; this.state = S.ground; }
         i += width - 1;
         continue;
       }
       if (CURSOR_MOVING_C0.has(code)) {
-        // 序列里的 CR 不是软换行的一半，而是真把后半段重画到行首。
-        if (EXECUTES_C0.has(this.state)) out += code === 0x0d && this.state !== S.ground ? REMAPPED : chunk[i];
-        continue; // EXECUTE 与 ignore 都保持当前状态
+        if (EXECUTES_C0.has(this.state)) {
+          out += code === 0x0d && this.state !== S.ground ? REMAPPED : chunk[i];
+          this.executeCursorC0(code, code !== 0x0d && code !== 0x09);
+        }
+        continue;
+      }
+      if ((code === 0x0b || code === 0x0c) && EXECUTES_C0.has(this.state)) {
+        this.executeCursorC0(code, true);
+        continue;
       }
       if (code === 0x0e || code === 0x0f) {
         if (EXECUTES_C0.has(this.state)) this.setgLevel(code === 0x0e ? 1 : 0);
+        continue;
+      }
+      if (code === 0x88) {
+        this.invalidateTabStops();
+        this.pendingIntermediate = undefined;
+        this.state = S.ground;
         continue;
       }
       const jump = anywhereTransition(code);
@@ -335,7 +876,7 @@ export class VisibleTextExtractor {
       switch (this.state) {
         case S.ground:
           if (code >= 0x20 && code <= 0x7e) {
-            out += this.conceal || this.remapsCode(code) ? REMAPPED : chunk[i];
+            out += this.emitPrint(this.conceal || this.remapsCode(code) ? REMAPPED : chunk[i]);
           }
           break;
         case S.escape:
@@ -353,8 +894,25 @@ export class VisibleTextExtractor {
             if (shifted !== undefined) this.setgLevel(shifted);
             else if (code === 0x37) this.saveCursorState();
             else if (code === 0x38) this.restoreCursorState();
-            else if (code === 0x63) { this.fullReset(); out += REMAPPED; } // RIS wipes the screen
-            else if (code === 0x4d) out += REMAPPED; // RI 把后半段挪到前半段上一行
+            else if (code === 0x63) { this.fullReset(); out += REMAPPED; }
+            else if (code === 0x44) {
+              const acceptsMovement = this.canAcceptVerticalMovement();
+              const moved = this.indexCursor(true);
+              this.carriageReturnContinuation = undefined;
+              if (moved && acceptsMovement) this.acceptCursorMovement();
+            }
+            else if (code === 0x45) {
+              const cursor = this.cursorByBuffer[this.altBuffer];
+              const acceptsMovement = this.canAcceptVerticalMovement();
+              const moved = this.indexCursor(true);
+              this.assignCursor(0, cursor.row);
+              this.carriageReturnContinuation = undefined;
+              if (moved && acceptsMovement) this.acceptCursorMovement();
+            } else if (code === 0x4d) {
+              this.moveCursor(0, -1);
+              out += REMAPPED;
+              this.continuation = undefined;
+            } else if (code === 0x48) this.invalidateTabStops();
             this.state = S.ground;
           }
           break;
@@ -366,9 +924,9 @@ export class VisibleTextExtractor {
             if (slot !== undefined) {
               if (RECOGNISED_DESIGNATORS.has(chunk[i])) this.setgCharset(slot, chunk[i]);
             } else if (intermediate === '%' && (code === 0x47 || code === 0x40)) {
-              this.selectDefaultCharset(); // only ESC % G / ESC % @; other finals are ignored
+              this.selectDefaultCharset();
             }
-            else if (intermediate === '#' && code === 0x38) out += REMAPPED; // DECALN wipes the screen
+            else if (intermediate === '#' && code === 0x38) out += REMAPPED;
             this.state = S.ground;
           } else if (code >= 0x20 && code <= 0x2f) {
             this.pendingIntermediate = undefined;
@@ -392,7 +950,7 @@ export class VisibleTextExtractor {
             this.collectCsiIntermediate(chunk[i]);
             this.state = S.csiIntermediate;
           } else if (code >= 0x30 && code <= 0x3b) this.collectCsiParam(chunk[i]);
-          break; // 剩下的 C0/DEL 在参数态是 execute/ignore，不能当数字累进参数
+          break;
         case S.csiIntermediate:
           if (code >= 0x40 && code <= 0x7e) out += this.dispatchCsi(chunk[i]);
           else if (code >= 0x30 && code <= 0x3f) this.state = S.csiIgnore;
@@ -416,7 +974,7 @@ export class VisibleTextExtractor {
           else if (code >= 0x30 && code <= 0x3f) this.state = S.dcsIgnore;
           break;
         case S.oscString:
-          if (code === 0x07) this.state = S.ground; // BEL 只终结 OSC，其余控制串忽略它
+          if (code === 0x07) this.state = S.ground;
           break;
         default:
           break;
@@ -426,6 +984,6 @@ export class VisibleTextExtractor {
   }
 }
 
-export function visibleText(text: string): string {
-  return new VisibleTextExtractor().write(text);
+export function visibleText(text: string, columns = DEFAULT_COLUMNS, rows = DEFAULT_ROWS): string {
+  return new VisibleTextExtractor(columns, rows).write(text);
 }

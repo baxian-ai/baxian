@@ -9,10 +9,8 @@ export const AGENT_STORE_NOOP = Symbol.for('@baxian/agent-store-noop');
 export type AgentStoreUpdateResult = AgentBindingFacts | null | typeof AGENT_STORE_NOOP;
 export type AgentStoreCommit = 'committed' | 'noop' | 'deleted';
 
-// a store id becomes a filename; constrain it so a path-like id can't escape the store dir
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
 
-// Unpredictable so a crash can't leave a guessable half-written state file behind.
 let tmpCounter = 0;
 
 export class AgentStore {
@@ -38,7 +36,6 @@ export class AgentStore {
     return normalizeBinding(JSON.parse(content) as Record<string, unknown>, id);
   }
 
-  // Single serialization gate: set/delete/update all run under the same per-id chain (public ones via setLocked/deleteLocked, which only run inside here) so a set/delete can't interleave an update's read-modify-write.
   private async runExclusive<T>(id: string, body: () => Promise<T>): Promise<T> {
     const prev = this.mutex.get(id) ?? Promise.resolve();
     const task = prev.then(body, body);
@@ -103,8 +100,6 @@ export class AgentStore {
     await this.runExclusive(id, () => this.deleteLocked(id));
   }
 
-  // A non-ENOENT unlink failure now throws so callers (e.g. DELETE phase 3) can treat the
-  // deletion as unconfirmed and roll back instead of reporting a removal that did not happen.
   private async deleteLocked(id: string): Promise<void> {
     if (!SAFE_ID.test(id)) return;
     try {
@@ -169,7 +164,6 @@ function normalizeNeedInput(raw: Record<string, unknown>): NeedInputWatermark | 
       return w;
     }
   }
-  // Pre-watermark data: a lit flat needInputAt maps to "epoch 0, question #1 open".
   if (typeof raw.needInputAt === 'string') {
     return { epoch: 0, askSeq: 1, answeredSeq: 0, at: raw.needInputAt };
   }

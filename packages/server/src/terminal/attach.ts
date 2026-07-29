@@ -14,11 +14,9 @@ export interface AttachExpectedRef {
   claim: string;
 }
 
-// Re-prove the pinned session immediately before attaching it so stale generation references fail closed.
 function attachGenerationGuard(expected: AttachExpectedRef): string {
   const identity = `${expected.serverPid}|${expected.serverStart}|${expected.sessionId}|${expected.claim}`;
   const target = shellQuote(`${expected.sessionId}:`);
-  // display-message takes the format as its message argument (-p to print); it has no -F flag.
   const probe = `tmux display-message -p -t ${target} '#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}' 2>/dev/null`;
   return `[ "$(${probe})" = ${shellQuote(identity)} ] || { echo BX_ATTACH_GENERATION_MISMATCH >&2; exit 47; }`;
 }
@@ -69,8 +67,6 @@ export function buildAttachInteractiveCommand(
   };
 }
 
-// The probe must resolve tmux in the SAME shell context the interactive attach uses
-// (login-interactive remotely), or PATH skew can gate the flag on a different binary.
 export function buildAttachProbeCommand(agent: AgentRuntimeConfig, host?: HostConfig): AttachCommand {
   if (agent.mode === 'remote') {
     return remoteCommand(agent, host, 'tmux -V');

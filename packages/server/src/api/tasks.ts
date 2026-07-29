@@ -277,7 +277,6 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     if (task.prNumber === undefined) {
       return reply.send({ available: false, reason: 'no-pr', items: empty });
     }
-    // 终态任务不受配置锁保护：身份快照失配即按不可用兜底，不拿旧 PR 号查新仓库。
     const binding = task.platformBinding;
     const live = app.ctx.agentManager.getProjectConfig(task.projectId) === undefined
       ? undefined

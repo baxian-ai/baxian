@@ -28,7 +28,6 @@ describe('index.css base typography', () => {
 
   it('limits app font-size utilities to xs and sm', () => {
     const allowed = new Set(['text-xs', 'text-sm']);
-    // Markdown 标题按需求必须比 14px 正文稍大且分级；豁免仅限该文件的四个刻度。
     const fileExceptions: Record<string, Set<string>> = {
       'components/markdown-lite.tsx': new Set(['text-[18px]', 'text-[17px]', 'text-[16px]', 'text-[15px]']),
     };

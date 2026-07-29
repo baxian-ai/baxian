@@ -47,7 +47,6 @@ export class LockManager {
     });
   }
 
-  // Atomically re-owner a claim (DELETE moves a stale task lock onto its deletion owner) so a concurrent releaseIfOwner(expected) fails owner-scoped; false if expected no longer holds.
   async rotateClaim(
     agentId: string,
     expected: { taskId: string; token: string } | { unbound: true },

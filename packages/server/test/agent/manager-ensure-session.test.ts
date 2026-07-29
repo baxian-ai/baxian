@@ -1,42 +1,25 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { BaxianConfig } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
 import {
-  AgentManager,
   CleanupFailedError,
   EnsureSessionError,
+  type AgentManager,
 } from '../../src/agent/manager.js';
 import { RepoStore } from '../../src/agent/repo-store.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'owner/repo',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', yolo: true },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo', yolo: true },
-    ]],
-  }],
-};
+import { createManagerHarness, seedTask } from '../helpers/manager-harness.js';
+import { fakeRunner, type FakeRunner } from '../helpers/fake-runner.js';
+import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 describe('AgentManager.ensureSession', () => {
   let tempDir: string;
+  let config: BaxianConfig;
   let manager: AgentManager;
-  let runner: { exec: ReturnType<typeof vi.fn>; writeFile: ReturnType<typeof vi.fn>; execWithStdin: ReturnType<typeof vi.fn> };
+  let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
+  let runner: FakeRunner;
 
   let tmuxSessions: Map<string, { claim: string; readyOnce: boolean; sessionId: string }>;
   let nextSessionId: number;
@@ -104,14 +87,8 @@ describe('AgentManager.ensureSession', () => {
     });
   }
 
-  function makeManager(suffix: string, paneStreamerManager: unknown): AgentManager {
-    return new AgentManager({
-      config: CONFIG,
-      agentStore: new AgentStore(join(tempDir, 'state', `agents-${suffix}`)),
-      taskStore: new TaskStore(join(tempDir, 'state', `tasks-${suffix}`)),
-      lockManager: new LockManager(join(tempDir, `locks-${suffix}`)),
-      eventBus: new EventBus(new EventLog(join(tempDir, `events-${suffix}`))),
-      skillRegistry: new SkillRegistry(join(tempDir, `skills-${suffix}`)),
+  function makeManager(_suffix: string, paneStreamerManager: unknown): AgentManager {
+    return createManager({
       runnerFactory: () => runner as unknown as CommandRunner,
       repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
       paneStreamerManager: paneStreamerManager as never,
@@ -119,19 +96,25 @@ describe('AgentManager.ensureSession', () => {
   }
 
   function expandedConfig(): BaxianConfig {
-    return {
-      ...CONFIG,
+    return makeConfig({
+      ...config,
       project: [{
-        ...CONFIG.project[0],
+        ...config.project[0],
         agent: [
-          ...CONFIG.project[0].agent,
+          ...config.project[0].agent,
           [
-            { id: 'dev-2', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo-2', yolo: true },
-            { id: 'qa-2', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo-2', yolo: true },
+            makeAgent({ id: 'dev-2', workdir: '/tmp/repo-2', yolo: true }),
+            makeAgent({
+              id: 'qa-2',
+              runtime: 'codex',
+              role: 'qa',
+              workdir: '/tmp/qa-repo-2',
+              yolo: true,
+            }),
           ],
         ],
       }],
-    };
+    });
   }
 
   async function setPaneId(id: string, paneId: string): Promise<void> {
@@ -141,27 +124,35 @@ describe('AgentManager.ensureSession', () => {
 
   function seedRunningTask(id: string): Promise<void> {
     const now = new Date().toISOString();
-    return manager['taskStore'].set({
+    return seedTask(manager['taskStore'], {
       id,
-      projectId: 'proj',
-      title: 'T',
-      description: 'D',
-      preferredAgentId: 'dev-1',
-      agentId: 'dev-1',
-      devAgentId: 'dev-1',
-      qaAgentId: 'qa-1',
       phase: 'code',
-      branch: `bx/${id}`,
-      reviewRound: 0,
-      status: 'in_progress',
+      branchCreatedByBaxian: undefined,
+      platformBinding: undefined,
       createdAt: now,
       updatedAt: now,
-    });
+    }).then(() => undefined);
   }
 
   function makeMockExec(
     _overrides: { trustDialogReady?: boolean } = {},
   ): (cmd: string) => Promise<ExecResult> {
+    const base = fakeRunner({
+      agents: {
+        'dev-1': { screen: '⏵⏵ bypass permissions on\n' },
+      },
+      rules: [
+        {
+          match: cmd => cmd.includes('pane_current_command') && cmd.includes('capture-pane'),
+          reply: { stdout: 'BX_PANE_OKclaude\n⏵⏵ bypass permissions on\n' },
+        },
+        {
+          match: 'BX_PANE_OK#{@baxian-skills-version}',
+          reply: () => ({ stdout: `BX_PANE_OK${currentSkillsVersion}\n` }),
+        },
+        { match: 'BX_SKILLS_NON_GIT', reply: { stdout: 'BX_SKILLS_OK\n' } },
+      ],
+    });
     return async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('has-session')) {
         const m = cmd.match(/'=([^']+)'/);
@@ -203,7 +194,6 @@ describe('AgentManager.ensureSession', () => {
           entry[1].claim = claimM[1];
           return { stdout: '', stderr: '', exitCode: 0 };
         }
-        // guarded pane/session ops fall through to the content handlers below
       }
       if (cmd.includes('show-environment')) {
         return { stdout: '', stderr: 'unknown variable: BAXIAN_CREATION_NONCE', exitCode: 1 };
@@ -243,79 +233,38 @@ describe('AgentManager.ensureSession', () => {
         }
         return { stdout: '%0 zsh\n', stderr: '', exitCode: 0 };
       }
-      if (cmd.includes('send-keys')) {
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('pane_current_command') && cmd.includes('capture-pane')) {
-        return {
-          stdout: 'BX_PANE_OKclaude\n⏵⏵ bypass permissions on\n',
-          stderr: '', exitCode: 0,
-        };
-      }
-      if (cmd.includes('display-message') && cmd.includes('pane_current_path')) {
-        return { stdout: 'BX_PANE_OK/tmp/repo\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('BX_PANE_OK#{@baxian-skills-version}')) {
-        return { stdout: `BX_PANE_OK${currentSkillsVersion}\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        const header = cmd.includes('history_size') ? 'BX_PANE_OK|0' : 'BX_PANE_OK';
-        return {
-          stdout: `${header}\n⏵⏵ bypass permissions on\n`,
-          stderr: '', exitCode: 0,
-        };
-      }
-      if (cmd.includes('display-message')) {
-        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('BX_SKILLS_NON_GIT')) {
-        return { stdout: 'BX_SKILLS_OK\n', stderr: '', exitCode: 0 };
-      }
-      return { stdout: '', stderr: '', exitCode: 0 };
+      return base.exec(cmd);
     };
   }
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), 'baxian-ensure-session-'));
-    await initStateDir(tempDir);
     tmuxSessions = new Map<string, { claim: string; readyOnce: boolean; sessionId: string }>();
     nextSessionId = 1;
-
-    runner = {
-      exec: vi.fn(),
-      writeFile: vi.fn().mockResolvedValue(undefined),
-      execWithStdin: vi.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
-    };
-    runner.exec.mockImplementation(makeMockExec({ trustDialogReady: true }));
-
-    const agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-    const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-    const lockManager = new LockManager(join(tempDir, 'locks'));
-    const eventLog = new EventLog(join(tempDir, 'events'));
-    const eventBus = new EventBus(eventLog);
-    const skillsDir = join(tempDir, 'skills');
-    for (const name of ['baxian-rules', 'baxian-task-check', 'baxian-pr-feedback', 'baxian-pr-review', 'baxian-pr-recheck', 'baxian-signals']) {
-      await mkdir(join(skillsDir, name), { recursive: true });
-      await writeFile(
-        join(skillsDir, name, 'SKILL.md'),
-        `---\nname: ${name}\ndescription: ${name} stub\n---\nstub`,
-      );
-    }
-    const skillRegistry = new SkillRegistry(skillsDir);
-    await skillRegistry.scan();
-    currentSkillsVersion = skillRegistry.contentHash();
-
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry,
-      runnerFactory: () => runner as unknown as CommandRunner,
-      repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
-      bootstrapTimeoutsMs: { trustDialog: 200, waitReplReady: 400 },
+    config = makeConfig({
+      project: [{
+        id: 'proj',
+        repo: 'owner/repo',
+        merge: null,
+        agent: [[
+          makeAgent({ yolo: true }),
+          makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo', yolo: true }),
+        ]],
+      }],
     });
+    runner = fakeRunner();
+    runner.exec.mockImplementation(makeMockExec({ trustDialogReady: true }));
+    const harness = await createManagerHarness(tempDir, {
+      config,
+      deps: {
+        runnerFactory: () => runner,
+        platformRunner: runner,
+        repoStoreFactory: () => ({ ensure: async () => '/tmp/repo' }) as never,
+        bootstrapTimeoutsMs: { trustDialog: 200, waitReplReady: 400 },
+      },
+    });
+    ({ manager, createManager } = harness);
+    currentSkillsVersion = harness.skillRegistry.contentHash();
   });
 
   afterEach(async () => {
@@ -376,8 +325,6 @@ describe('AgentManager.ensureSession', () => {
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('new-session')) {
         const result = await makeMockExec({ trustDialogReady: true })(cmd);
-        // The freshly created session dies and an outsider recreates the name
-        // before the first option write — the classic rebind window.
         replacementId = `$${nextSessionId++}`;
         tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: replacementId });
         return result;
@@ -420,8 +367,6 @@ describe('AgentManager.ensureSession', () => {
     tmuxSessions.set('dev-1', { claim: '', readyOnce: true, sessionId: leftoverId });
     runner.exec.mockImplementation(async (cmd: string): Promise<ExecResult> => {
       if (cmd.includes('show-environment')) {
-        // The nonce probe is the last read before the kill: a concurrent
-        // bootstrap claims the session right after it, inside the race window.
         const sess = tmuxSessions.get('dev-1');
         if (sess) sess.claim = 'dev-1';
         return { stdout: 'BAXIAN_CREATION_NONCE=stranded-nonce\n', stderr: '', exitCode: 0 };
@@ -640,18 +585,14 @@ describe('AgentManager.ensureSession', () => {
   });
 
   it('acquireAgentForTask is ABA-safe: a bumped deletion generation NOOPs a suspended commit', async () => {
-    // Simulate an allocation that captured its generation, then a full DELETE (bump) landing before
-    // the store commit runs: the updater must refuse to write the stale incarnation's binding.
     const realGenOf = manager.deletionGenerationOf.bind(manager);
     let firstCall = true;
     const spy = vi.spyOn(manager, 'deletionGenerationOf').mockImplementation((id: string) => {
-      // entry capture sees 0; the in-updater re-check sees the post-DELETE bump (1).
       if (firstCall) { firstCall = false; return 0; }
       return id === 'dev-1' ? 1 : realGenOf(id);
     });
     expect(await manager.acquireAgentForTask('dev-1', 'task-1', 'develop')).toBe(false);
     expect(await manager['agentStore'].get('dev-1')).toBeNull();
-    // the lock the allocation grabbed must have been released, not leaked
     expect(await manager['lockManager'].claimOf('dev-1')).toBeNull();
     spy.mockRestore();
   });
@@ -764,8 +705,8 @@ describe('AgentManager.ensureSession', () => {
     });
     const notes = '汉'.repeat(170);
     manager.replaceConfig({
-      ...CONFIG,
-      project: [{ ...CONFIG.project[0], gitCli: { tool: 'gh', notes } }],
+      ...config,
+      project: [{ ...config.project[0], gitCli: { tool: 'gh', notes } }],
     });
 
     const withNotes = manager.previewPromptBytesForTaskInput('proj', {
@@ -823,8 +764,8 @@ describe('AgentManager.ensureSession', () => {
     manager.getRepoCache().owners.set('local:/tmp/repo', 'dev-1');
 
     manager.replaceConfig({
-      ...CONFIG,
-      project: [{ ...CONFIG.project[0], agent: agent as BaxianConfig['project'][number]['agent'] }],
+      ...config,
+      project: [{ ...config.project[0], agent: agent as BaxianConfig['project'][number]['agent'] }],
     });
 
     expect(manager.getRepoCache().owners.has('local:/tmp/repo')).toBe(false);

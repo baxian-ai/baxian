@@ -2,7 +2,7 @@ import { readFile, writeFile, access, mkdir, stat, open, rename, rm, realpath } 
 import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { isRecord, type AgentConfig, type BaxianConfig, type HostConfig, type ProjectConfig, type RootAgentConfig, type ServerConfig } from '../shared/index.js';
+import { isRecord, type AgentConfig, type BaxianConfig, type HostConfig, type ProjectConfig, type ServerConfig } from '../shared/index.js';
 import {
   CONFIG_FILE,
   DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS,
@@ -11,7 +11,6 @@ import {
   DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS,
   DEFAULT_GITHUB_POLL_INTERVAL_MS,
   DEFAULT_REVIEW_ROUNDS,
-  DEFAULT_ROOT_RESPONSE_TIMEOUT_MINUTES,
   DEFAULT_SERVER_HOST,
   DEFAULT_SERVER_PORT,
   DEFAULT_TMUX_PROBE_CONCURRENCY,
@@ -49,11 +48,6 @@ export function prepareConfigWithWarnings(
   }
   const normalized = normalizeConfig(raw);
   const warnings = collectUnknownConfigWarnings(normalized);
-  if ('main' in normalized) {
-    throw new ConfigValidationError([
-      { path: 'main', message: 'main agent was renamed to root agent; configure the top-level root object instead' },
-    ]);
-  }
   if ('project' in normalized && normalized.project !== undefined && !Array.isArray(normalized.project)) {
     throw new ConfigValidationError([
       { path: 'project', message: 'project must be an array' },
@@ -62,11 +56,6 @@ export function prepareConfigWithWarnings(
   if ('host' in normalized && normalized.host !== undefined && !Array.isArray(normalized.host)) {
     throw new ConfigValidationError([
       { path: 'host', message: 'host must be an array' },
-    ]);
-  }
-  if ('root' in normalized && normalized.root !== undefined && !isRecord(normalized.root)) {
-    throw new ConfigValidationError([
-      { path: 'root', message: 'root must be an object' },
     ]);
   }
   if (Array.isArray(normalized.host)) {
@@ -147,7 +136,6 @@ export async function createDefaultConfig(path: string): Promise<void> {
   await writeFile(path, JSON.stringify(DEFAULT_CONFIG_TEMPLATE, null, 2) + '\n');
 }
 
-// Atomic + credential-safe (config can hold a plaintext HostConfig.password): O_EXCL temp with the target's mode, rename-swapped over the realpath'd target so a symlink keeps its link and a failure leaves the original untouched.
 export async function saveConfig(configPath: string, config: BaxianConfig): Promise<void> {
   await backupConfig(configPath);
   const physical = await realpathOrSelf(configPath);
@@ -163,7 +151,6 @@ export async function saveConfig(configPath: string, config: BaxianConfig): Prom
       console.warn(`[config] failed to remove config temp ${tmp}:`, rmErr);
     });
   };
-  // close() shares the cleanup path: a deferred write/fsync error surfaced at close (ENOSPC/NFS) must not leave the plaintext temp behind.
   let handle;
   try {
     handle = await open(tmp, 'wx', mode);
@@ -187,7 +174,6 @@ async function realpathOrSelf(p: string): Promise<string> {
     throw err;
   }
 }
-
 
 function validateProjectShapes(project: unknown): ValidationError[] {
   if (!Array.isArray(project)) return [];
@@ -229,7 +215,6 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
   const hosts = Array.isArray(normalized.host)
     ? normalized.host.filter(isRecord).map(h => ({ ...(h as unknown as HostConfig) }))
     : [];
-  const root = isRecord(normalized.root) ? normalized.root : undefined;
 
   const hasHttps = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'https');
   const hasAllowedHosts = sv !== undefined && Object.prototype.hasOwnProperty.call(sv, 'allowedHosts');
@@ -258,17 +243,6 @@ function applyDefaults(normalized: Record<string, unknown>): BaxianConfig {
     },
     host: hosts,
     project: projects.map(applyProjectDefaults),
-    ...(root ? { root: applyRootDefaults(root) } : {}),
-  };
-}
-
-function applyRootDefaults(root: Record<string, unknown>): RootAgentConfig {
-  return {
-    ...(root as unknown as RootAgentConfig),
-    yolo: root.yolo === undefined ? true : root.yolo as boolean,
-    responseTimeoutMinutes: root.responseTimeoutMinutes === undefined
-      ? DEFAULT_ROOT_RESPONSE_TIMEOUT_MINUTES
-      : root.responseTimeoutMinutes as number,
   };
 }
 

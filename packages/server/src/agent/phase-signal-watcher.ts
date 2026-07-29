@@ -30,7 +30,6 @@ interface SettlingEntry {
 
 const MATCH_BUFFER_CHARS = 1024;
 
-// Cap so a stuck pane spewing endless distinct tokens can't grow the set or the logs unbounded.
 const STALE_TOKEN_WARN_CAP = 32;
 
 const KIND_TO_EVENT_TYPE: Record<Exclude<PhaseSignalKind, 'greeting'>, EventType> = {
@@ -48,23 +47,11 @@ interface WatchEntry {
   expectedToken: string;
   seenStaleToken: Set<string>;
   staleWarnCapped: boolean;
-  // Ask/answer watermark: lit ⟺ askSeq > answeredSeq. Monotonic within the entry;
-  // replayed literals (redraw/reattach) carry seq ≤ watermark and are swallowed.
   askSeq: number;
   answeredSeq: number;
-  // Persistence generation fixed by the arm-time bump write; stale-epoch commits fence server-side.
   epoch: number;
-  // Whether this arm may read the pane snapshot as a record of its own generation.
-  // False once a same-token replay has put two generations of the same ordinals on the
-  // pane: nothing in a framebuffer can then attribute a literal to a generation.
   snapshotReconcile: boolean;
-  // False when the arm could not establish a generation (bump failed / binding absent):
-  // the badge degrades for this dispatch but signal watching must not — commits are
-  // skipped instead of ghost-fencing against the persisted epoch.
   commitEnabled: boolean;
-  // Separate tail window for ask/answer literals, distinct from the phase-signal
-  // buffer (clearing THAT could lose a phase signal torn across chunks). Cleared on
-  // every answered edge so a windowed BARE ask cannot re-fire after the answer.
   needInputBuffer: string;
   recovered: boolean;
   buffer: string;
@@ -85,19 +72,12 @@ export interface PhaseSignalWatcherStartArgs {
   agentId: string;
   expectedKinds: PhaseSignalKind | readonly PhaseSignalKind[] | ReadonlySet<PhaseSignalKind>;
   token: string;
-  // Watermark state established by the arm-time epoch bump (restore carries prior seqs).
   needInput?: { epoch: number; askSeq: number; answeredSeq: number };
-  // Merge the evicted same-token entry's in-memory seqs into the replacement. Only a
-  // restore arm wants this: a fresh replay restarts its ordinals at 1, and inherited
-  // seqs would swallow the new prompt's questions.
   needInputInherit?: boolean;
   skipSnapshot?: boolean;
   recovered?: boolean;
-  // A fenced (re)arm may replace its own token's watch but never a successor's rotated one.
   onlyReplaceOwnToken?: boolean;
-  // A token-rotating replay may hand off exactly its same-agent predecessor.
   replaceFromToken?: string;
-  // Claim from claimArm(), excluded from this arm's own ownership probes.
   armClaimId?: number;
   replaceScope?: 'task' | 'agent';
 }
@@ -117,21 +97,13 @@ function entryKey(taskId: string, agentId: string): string {
 const ARM_FENCE_CAP = 4096;
 
 interface ArmFence {
-  // Highest generation any arm ever CARRIED for this key (recorded at start entry, not
-  // install): a successor that failed to subscribe or already exited must still fence a
-  // late-settling older arm, or the stale watcher would resurrect on a dead generation.
   highWater: number;
-  // Latest start() arrival for this key — orders arms that carry no generation
-  // (degraded bump) where epochs cannot be compared.
   latestSeq: number;
 }
 
 export class PhaseSignalWatcher {
   private readonly entries = new Map<string, WatchEntry>();
   private readonly armFences = new Map<string, ArmFence>();
-  // Arms that claimed ownership but have not installed yet (their subscribe is in
-  // flight). The own-token fence must see them, or a stale replay would evict a
-  // current-token pass whose watcher is merely slow to attach.
   private readonly pendingArms = new Map<number, { taskId: string; agentId: string; token: string }>();
   private armCounter = 0;
   private readonly settlingByTask = new Map<string, SettlingEntry>();
@@ -184,19 +156,12 @@ export class PhaseSignalWatcher {
   }
 
   async start(args: PhaseSignalWatcherStartArgs): Promise<boolean> {
-    // Everything up to the first await is one atomic section with the caller's epoch bump.
     const key = entryKey(args.taskId, args.agentId);
     const predecessor = this.entries.get(key);
-    // The predecessor keeps consuming pane data while we subscribe: hand it this arm's
-    // generation now, or answers it consumes in that window fence against the store.
     if (args.needInput !== undefined && args.needInputInherit
       && predecessor?.expectedToken === args.token) {
       this.migrateEntryGeneration(predecessor, args.needInput, true);
     }
-    // Our caller bumped the store before calling us, so any rejection leaves the store
-    // ahead of the installed entry. Rescue it — but only when it is still the very entry
-    // this arm started against: a successor installed meanwhile owns a newer generation
-    // and adopting ours would drag it back to a superseded watermark.
     const rejectArm = (): false => {
       if (args.needInput !== undefined
         && predecessor
@@ -212,11 +177,8 @@ export class PhaseSignalWatcher {
     };
     if (!this.ownsArmClaim(args, args.armClaimId)) return rejectArm();
     if (this.hasForeignTokenOwner(args, args.armClaimId)) return rejectArm();
-    // Fence bookkeeping happens on ENTRY, before any await: even an arm that later
-    // fails to subscribe leaves its generation/arrival behind to fence older stragglers.
     const armSeq = ++this.armCounter;
     this.touchArmFence(key, armSeq, args.needInput?.epoch);
-    // The old entry keeps consuming until the replacement subscription exists; a failed start must not orphan the signal.
     const expectedKinds = normalizeKinds(args.expectedKinds);
     const kindsLabel = [...expectedKinds].join(',');
 
@@ -276,8 +238,6 @@ export class PhaseSignalWatcher {
       return rejectArm();
     }
 
-    // ---- Fences first: every rejection must happen BEFORE any raced entry is dropped,
-    // or a doomed stale arm would tear down a live sibling watcher on its way out.
     const raced = this.replaceTargets(args);
     const rejectAfterSubscribe = (): false => {
       try { sub.unsubscribe(); } catch {}
@@ -285,9 +245,6 @@ export class PhaseSignalWatcher {
     };
     if (this.hasForeignTokenOwner(args, args.armClaimId)) return rejectAfterSubscribe();
     const own = this.entries.get(key);
-    // Generation-monotonic install: the bump order IS the arm order, so a smaller epoch
-    // identifies a late arrival that must not demote the persisted generation. The fence
-    // record (not the live entry) carries this across subscribe failures and exits.
     if (own?.commitEnabled && args.needInput !== undefined && own.epoch > args.needInput.epoch) {
       return rejectAfterSubscribe();
     }
@@ -295,17 +252,11 @@ export class PhaseSignalWatcher {
     if (args.needInput !== undefined && (fence?.highWater ?? 0) > args.needInput.epoch) {
       return rejectAfterSubscribe();
     }
-    // Arrival-order fence covers what epochs cannot: a degraded successor (no generation)
-    // must still win over an older arm whose subscription settled after it.
     if (fence !== undefined && fence.latestSeq !== armSeq) {
       return rejectAfterSubscribe();
     }
 
-    // ---- Install: merge, evict, subscribe hand-off.
     if (args.needInput === undefined && own) {
-      // Degraded arm (bump failed): keep watching signals on the surviving entry's
-      // generation, but honour the wm-null contract — no badge commits, and only a
-      // restore intent may carry the ordinals (a fresh replay restarts at 1).
       entry.epoch = own.epoch;
       entry.commitEnabled = false;
       if (args.needInputInherit) {
@@ -313,8 +264,6 @@ export class PhaseSignalWatcher {
         entry.answeredSeq = Math.max(entry.answeredSeq, own.answeredSeq);
       }
     }
-    // Same-token restore transfer merges the predecessor's in-memory watermark: seqs it
-    // advanced but never persisted (error'd commits) must survive the swap.
     const prior = args.needInputInherit
       ? raced.find(existing =>
           existing.taskId === args.taskId
@@ -330,17 +279,13 @@ export class PhaseSignalWatcher {
     entry.unsubscribe = sub.unsubscribe;
     this.entries.set(key, entry);
 
-    // A merged watermark ahead of the bump write (the predecessor's error'd commits, whose
-    // retry intents the arm just cleared) must reach the new generation's persistence now,
-    // or a cleared badge could stay lit in the store forever.
     if (args.needInput !== undefined
       && (entry.askSeq > args.needInput.askSeq || entry.answeredSeq > args.needInput.answeredSeq)) {
       this.commitWatermark(entry);
     }
 
     if (!args.skipSnapshot) {
-      // A serialized framebuffer is its own byte stream, not a continuation of the PTY one.
-      this.onPaneData(entry, visibleText(sub.snapshot.data), true);
+      this.onPaneData(entry, visibleText(sub.snapshot.data, sub.snapshot.cols, sub.snapshot.rows), true);
     }
     return true;
   }
@@ -389,7 +334,6 @@ export class PhaseSignalWatcher {
     return false;
   }
 
-  // Read-only ownership probe (no claim) — the fence a would-be arm faces right now.
   wouldRejectOwnTokenArm(args: {
     taskId: string;
     agentId: string;
@@ -401,9 +345,6 @@ export class PhaseSignalWatcher {
     return this.hasForeignTokenOwner(args);
   }
 
-  // Atomic decide-and-claim, called before the caller's epoch bump: a rejected arm must
-  // not bump (it would fence the owner), and a claimed arm must be visible to every
-  // later ownership probe until it installs or fails.
   claimArm(args: {
     taskId: string;
     agentId: string;
@@ -430,8 +371,6 @@ export class PhaseSignalWatcher {
       && claim.token === args.token;
   }
 
-  // Monotonic: never demote a generation a successor already owns. An in-memory lead
-  // (seqs the entry advanced but could not persist) is written out immediately.
   private migrateEntryGeneration(
     entry: WatchEntry,
     wm: { epoch: number; askSeq: number; answeredSeq: number },
@@ -442,16 +381,12 @@ export class PhaseSignalWatcher {
     entry.commitEnabled = true;
     this.touchArmFence(entryKey(entry.taskId, entry.agentId), 0, wm.epoch);
     if (!inherit) {
-      // A fresh generation superseded whatever was open: adopt its stripped ordinals
-      // instead of re-committing the old question into it.
       entry.askSeq = wm.askSeq;
       entry.answeredSeq = wm.answeredSeq;
       entry.snapshotReconcile = false;
       return;
     }
     const leads = entry.askSeq > wm.askSeq || entry.answeredSeq > wm.answeredSeq;
-    // The watermark may lead the entry too (queue/ledger merges): adopt it, or the entry
-    // would answer a question it does not know is open.
     entry.askSeq = Math.max(entry.askSeq, wm.askSeq);
     entry.answeredSeq = Math.max(entry.answeredSeq, wm.answeredSeq);
     if (leads) this.commitWatermark(entry);
@@ -471,7 +406,6 @@ export class PhaseSignalWatcher {
     if (entry) this.dropEntry(entry);
   }
 
-  // Token-fenced teardown: a stale pass undoing its own arm must never kill a successor's watcher.
   stopIfToken(taskId: string, expectedToken: string): void {
     for (const entry of this.taskEntries(taskId)) {
       if (entry.expectedToken === expectedToken) this.dropEntry(entry);
@@ -536,7 +470,7 @@ export class PhaseSignalWatcher {
         .then((sub) => {
           unsubscribe = sub.unsubscribe;
           if (done) { try { sub.unsubscribe(); } catch {} return; }
-          if (matches(visibleText(sub.snapshot.data))) finish('matched');
+          if (matches(visibleText(sub.snapshot.data, sub.snapshot.cols, sub.snapshot.rows))) finish('matched');
         })
         .catch(() => finish('session-gone'));
     });
@@ -545,8 +479,6 @@ export class PhaseSignalWatcher {
   private commitWatermark(entry: WatchEntry): void {
     const commit = this.deps.commitNeedInputWatermark;
     if (!commit || !entry.commitEnabled) return;
-    // Fire-and-forget by design: memory seqs never roll back on a failed write —
-    // the manager-side retry queue owns persistence convergence.
     void commit({
       agentId: entry.agentId,
       taskId: entry.taskId,
@@ -562,20 +494,11 @@ export class PhaseSignalWatcher {
     return true;
   }
 
-  // The user submitted input through baxian's own channel — the open question
-  // (if any) counts as answered. Returns whether any entry watches this agent:
-  // when one does, the store fallback must NOT run (it would re-read a moving
-  // watermark and could confirm an ask that arrived after this input).
-  // Returns the tasks whose watermark actually absorbed this input. Entries are settled
-  // synchronously, before any await: a question printed while this runs must not be
-  // swallowed as if it had been answered.
   async rearmNeedInput(agentId: string): Promise<Set<string>> {
     const handled = new Set<string>();
     const commits: Promise<NeedInputCommitResult>[] = [];
     for (const entry of this.entries.values()) {
       if (entry.agentId !== agentId) continue;
-      // A commit-disabled (degraded) entry cannot persist the answer, so it must not
-      // count as handled — the store fallback has to run instead.
       if (entry.commitEnabled) handled.add(entry.taskId);
       if (!this.markAnswered(entry)) continue;
       const commit = this.deps.commitNeedInputWatermark;
@@ -592,13 +515,11 @@ export class PhaseSignalWatcher {
     return handled;
   }
 
-
   private onAskSignal(entry: WatchEntry, sig: NeedInputSignal): void {
     if (sig.seq !== undefined) {
       if (sig.seq <= entry.askSeq) return;
       entry.askSeq = sig.seq;
     } else {
-      // Bare legacy ask: trust it only when no question is open (idempotent while lit).
       if (entry.askSeq > entry.answeredSeq) return;
       entry.askSeq += 1;
     }
@@ -612,19 +533,9 @@ export class PhaseSignalWatcher {
   }
 
   private scanNeedInput(entry: WatchEntry, chunk: string, isSnapshot: boolean): void {
-    // Snapshot asks and BARE answers stay blind (replaying them would relight or clear
-    // ambiguously), but a seq'd answer proves its numbered question was answered no
-    // matter when it was printed — this recovers a reply given while the server was
-    // down, which nothing else can carry (no ledger, no fallback, no live edge).
     if (isSnapshot) {
-      // Seed the tail so a literal torn across the snapshot/live boundary still matches;
-      // the old/new region split keeps the seeded bytes from being applied twice.
       entry.needInputBuffer = chunk.slice(-MATCH_BUFFER_CHARS);
       if (!entry.snapshotReconcile) return;
-      // A snapshot is a serialized framebuffer, not an output log: a TUI redraw can put
-      // later output on an earlier row, so screen position says nothing about time.
-      // Ordinals do — within one generation each question is asked once and confirmed
-      // once, so a literal's mere presence is the fact, wherever it sits.
       let maxAsk = 0;
       let maxAnswer = 0;
       for (const sig of scanAskAnswerSignals(chunk)) {
@@ -640,13 +551,6 @@ export class PhaseSignalWatcher {
       this.commitWatermark(entry);
       return;
     }
-    // Matches that end inside the old tail are rescans of already-processed bytes:
-    // applying them again would let a swallowed answer clear a later ask, while
-    // clearing the buffer instead would drop a torn next-ask prefix. Skipping them
-    // keeps both; genuinely new literals (even replayed by a redraw as fresh bytes)
-    // land in the new region and are handled by the seq watermark. The boundary is
-    // mapped through the COMBINED compact transform — compacting the tail on its own
-    // would misplace it whenever an escape/whitespace run straddles the chunk seam.
     const combined = entry.needInputBuffer + chunk;
     const oldRegionLen = compactBoundaryIndex(combined, entry.needInputBuffer.length);
     entry.needInputBuffer = combined.slice(-MATCH_BUFFER_CHARS);
@@ -658,7 +562,6 @@ export class PhaseSignalWatcher {
     }
   }
 
-  // `chunk` is always visible text — decoded by PaneStreamer (live) or at the call site (snapshot).
   private onPaneData(entry: WatchEntry, chunk: string, isSnapshot = false): void {
     if (this.entries.get(entryKey(entry.taskId, entry.agentId)) !== entry) return;
     if (entry.fired) return;
@@ -670,7 +573,6 @@ export class PhaseSignalWatcher {
     const armed = matches.find(m =>
       entry.expectedKinds.has(m.signal.kind) && m.signal.token === entry.expectedToken,
     );
-    // The armed marker ends the dispatch, so a foreign token after it belongs to the next task, not a mis-send here.
     if (!isSnapshot) {
       const endsBy = armed ? armed.index : Infinity;
       this.reportStaleTokens(
@@ -684,7 +586,6 @@ export class PhaseSignalWatcher {
     entry.fired = true;
     this.entries.delete(entryKey(entry.taskId, entry.agentId));
     try { entry.unsubscribe(); } catch {}
-    // The phase signal ends the dispatch: whatever question was open counts as closed.
     if (this.markAnswered(entry)) this.commitWatermark(entry);
     const event: BaxianEvent = {
       id: '',
@@ -707,7 +608,6 @@ export class PhaseSignalWatcher {
     void this.emitCompletion(event, entry, signal.kind, settling);
   }
 
-  // 静默丢弃会把"agent 以为已交付、任务实际停等"变成查无实据的失联；故留痕，但只记日志不发事件（避免重放刷屏）。
   private reportStaleTokens(entry: WatchEntry, candidates: readonly PhaseSignal[]): void {
     for (const candidate of candidates) {
       if (entry.staleWarnCapped) return;

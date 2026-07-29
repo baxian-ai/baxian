@@ -428,8 +428,6 @@ export class SshRunner implements CommandRunner {
   }
 
   async writeFile(filePath: string, content: Buffer | string): Promise<void> {
-    // Content travels over ssh stdin, not the command argv: Linux MAX_ARG_STRLEN caps a single
-    // argv string at 128KB, so embedding base64 in the command (as before) hard-fails past ~95KB.
     const buf = typeof content === 'string' ? Buffer.from(content, 'utf8') : content;
     const remoteCmd = `mkdir -p ${shellQuote(dirname(filePath))} && cat > ${shellQuote(filePath)}`;
     const r = await this.execRawRemoteWithStdin(remoteCmd, buf);

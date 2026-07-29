@@ -106,8 +106,6 @@ function emitProjectTasks(projectId: string, tasks: TaskState[]): void {
   });
 }
 
-// The app shell always subscribes to topics like 'pollers'; notification gating
-// is only about project task streams.
 function taskSubscribeCalls(): unknown[][] {
   return appMockState.subscribe.mock.calls.filter(
     (call) => typeof call[0] === 'string' && call[0].startsWith('project-tasks:'),

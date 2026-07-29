@@ -11,8 +11,6 @@ export const DEFAULT_BOOTSTRAP_RETRY_INTERVAL_MS = 60_000;
 export const DEFAULT_DISPATCH_RECONCILE_INTERVAL_MS = 30_000;
 export const DEFAULT_DISPATCH_BUSY_WAIT_BUDGET_MS = 30 * 60_000;
 export const DEFAULT_DISPATCH_RECONCILE_MAX_ATTEMPTS = 3;
-export const DEFAULT_ROOT_RESPONSE_TIMEOUT_MINUTES = 15;
-export const ROOT_AGENT_ID = 'root-agent';
 export const TERMINAL_INTERVENTION_PHASES = ['attach', 'detach', 'input', 'close'] as const;
 export const TERMINAL_INTERVENTION_PHASE_SET: ReadonlySet<string> = new Set(TERMINAL_INTERVENTION_PHASES);
 export type TerminalInterventionPhase = (typeof TERMINAL_INTERVENTION_PHASES)[number];
@@ -63,7 +61,6 @@ export const USER_CONFIG_REL = '.baxian/config.json';
 export const USER_STATE_REL = '.baxian';
 
 export const TOOL_PATTERN = /^[a-z][a-z0-9-]*$/;
-// 行协议值防注入是同一不变量（spec §4）：config 的 repo/binary/notes 与插件 driver env 模板值共用此谓词，防多处字面量漂移。
 export const CONTROL_CHAR_RE = /\p{Cc}/u;
 
 export type DispatchPhase =

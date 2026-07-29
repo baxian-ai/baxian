@@ -16,7 +16,6 @@ const HEADING_CLASS = [
 const LINK_PROTOCOL = /^(https?:\/\/|mailto:)/i;
 const IMAGE_PROTOCOL = /^https?:\/\//i;
 
-// GitHub 自有资产域；其余外链图片一律点击加载，避免绕过 Camo 直连泄露访问方 IP/时机。
 function isTrustedImageHost(src: string): boolean {
   try {
     const host = new URL(src).hostname.toLowerCase();
@@ -51,8 +50,6 @@ function MdImage({ src, alt }: { src: string; alt: string }) {
   );
 }
 
-// 单调 memo 扫描器：查询起点只前进，重扫只发生在越过上次命中点之后，均摊 O(n)。
-// 直接对原串 indexOf/exec，杜绝按 '[' 逐次 slice + 正则扫尾造成的 O(n²)。
 function makeScanner(text: string, needle: string): (start: number) => number {
   let cachedFrom = -1;
   let cachedAt = -2;
@@ -108,8 +105,6 @@ function matchLinkLike(text: string, openBracketAt: number, scan: LinkScanners):
 
 class BudgetExceeded extends Error {}
 
-// 预算计数单位 = 产出到任意 children 数组的每个 child（元素计 1、字符串 run 计 1）。
-// 相邻字面文本只经缓冲区合并后产出，因此挂载的 DOM 节点总数 ≤ 预算值。
 class Budget {
   private count = 0;
   constructor(private readonly max: number) {}

@@ -164,7 +164,6 @@ async function verifyInstalled(runner: CommandRunner, method: string): Promise<T
 }
 
 async function binaryPath(runner: CommandRunner, binary: string): Promise<string | undefined> {
-  // command -v over which: minimal Linux images may lack which, and every runner execs through a shell.
   const result = await runner.exec(`command -v ${binary}`, { timeout: PROBE_TIMEOUT_MS });
   const path = lastNonEmptyLine(result.stdout);
   return result.exitCode === 0 && path ? path : undefined;

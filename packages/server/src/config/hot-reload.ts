@@ -41,8 +41,6 @@ export async function applyConfigHotReload(
   ctx.bootstrapPoller?.replaceConfig(validated);
   ctx.dispatchReconciler?.replaceConfig(validated);
   if (ctx.poller === undefined) return;
-  // pollIntervalMs 是非重启字段：PATCH 后运行中的 poller 必须立即改用新间隔,否则 API 声称
-  // 「已应用」而实际直到进程重启才生效。
   ctx.poller.reschedule(validated.server.githubPollIntervalMs);
   if (prepared.platform === undefined) return;
   ctx.poller.reconcile(prepared.platform.entries);
@@ -61,8 +59,6 @@ export async function applyConfigHotReload(
       console.warn('[config] platform-binding intervention emit failed:', err);
     });
   }
-  // 离线编辑绕过在线锁后重载：同 repo 冲突项目发 repo-conflict intervention（spec §5.5），
-  // 与 startup 路径一致（index.ts）——受保护项目 entry 已在 plan.entries 中保留。
   for (const conflict of prepared.platform.conflicts) {
     await ctx.agentManager.emitConfigIntervention(conflict.projectId, {
       phase: 'repo-conflict', repoKey: conflict.repoKey, claimedBy: conflict.claimedBy,

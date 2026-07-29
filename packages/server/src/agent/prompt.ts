@@ -214,7 +214,6 @@ function buildTaskBody(args: TaskBodyArgs): string {
   const injected = blocks && blocks.length > 0 ? '\n\n' + blocks.join('\n') : '';
   const body = `${descriptor}\n\n${titleAndBody}${imagesBlock}${injected}\n`;
   if (signalToken) {
-    // 别删 raw 臂：藏在控制串里的 marker 不上屏，TUI 却会原样回显出去。
     for (const arm of [body, visibleText(body)]) {
       const leaked = scanPhaseSignals(arm).find(s => s.token === signalToken);
       if (leaked) {

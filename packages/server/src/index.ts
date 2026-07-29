@@ -14,7 +14,6 @@ import { AgentStore } from './state/agent-store.js';
 import { TaskStore } from './state/task-store.js';
 import { ErrorRecordStore } from './state/error-record-store.js';
 import { PetStore } from './state/pet-store.js';
-import { RootRecoveryStore } from './state/root-recovery-store.js';
 import { LockManager } from './state/lock.js';
 import { ProcessLock, ProcessLockError } from './state/process-lock.js';
 import { EventBus } from './event/bus.js';
@@ -36,8 +35,6 @@ import { TmuxProbePoller, TmuxSessionStatusStore } from './agent/tmux-probe-poll
 import { PeriodicTaskRunner } from './timing/periodic-task-runner.js';
 import { BootstrapPoller } from './agent/bootstrap-poller.js';
 import { DispatchReconciler } from './agent/dispatch-reconciler.js';
-import { RootAgentRuntime } from './agent/root-agent-runtime.js';
-import { RootRecoveryCoordinator } from './agent/root-recovery-coordinator.js';
 import { buildApp } from './app.js';
 import { RestartCoordinator } from './lifecycle/restart.js';
 import { consumeRestartSentinel } from './lifecycle/restart-sentinel.js';
@@ -122,7 +119,6 @@ export async function startServer(configPath?: string): Promise<void> {
     }
   };
   let appRef: Awaited<ReturnType<typeof buildApp>> | null = null;
-  let rootRecoveryCoordinatorRef: RootRecoveryCoordinator | undefined;
   let stopBackgroundRunners: () => void = () => undefined;
   let shuttingDown = false;
   const SHUTDOWN_GRACE_MS = 8000;
@@ -164,7 +160,6 @@ export async function startServer(configPath?: string): Promise<void> {
     const taskStore = new TaskStore(`${stateDir}/state/tasks`);
     const errorRecordStore = new ErrorRecordStore(`${stateDir}/state/errors`);
     const petStore = new PetStore(`${stateDir}/state/pets`);
-    const rootRecoveryStore = new RootRecoveryStore(`${stateDir}/state/root-recovery`);
     const lockManager = new LockManager(`${stateDir}/locks`);
     const eventLog = new EventLog(`${stateDir}/events`);
     const eventBus = new EventBus(eventLog);
@@ -240,37 +235,6 @@ export async function startServer(configPath?: string): Promise<void> {
     taskStore.onChange((kind, id) => eventPublisher.publishTaskChange(kind, id));
     petStore.onChange((id) => eventPublisher.publishAgentChange('set', id));
 
-    const rootRecoveryCoordinator = config.root
-      ? new RootRecoveryCoordinator({
-          config: config.root,
-          eventBus,
-          manager: agentManager,
-          taskStore,
-          agentStore,
-          statusStore: tmuxSessionStatusStore,
-          store: rootRecoveryStore,
-          runtime: new RootAgentRuntime({
-            config: config.root,
-            hosts: () => agentManager.getConfig().host,
-            agents: () => agentManager.getConfig().project.flatMap(project => project.agent.flat()),
-            paneStreamerManager,
-          }),
-          capturePane: async (agentId) => {
-            const agent = agentManager.getAgentConfig(agentId);
-            if (!agent) return undefined;
-            return (await paneStreamerManager.ensure(agent).getSnapshotAtomic()).snapshot.data;
-          },
-        })
-      : undefined;
-    rootRecoveryCoordinatorRef = rootRecoveryCoordinator;
-    if (rootRecoveryCoordinator) {
-      try {
-        await rootRecoveryCoordinator.start();
-      } catch (err) {
-        console.warn('[startup] root recovery is disabled because its durable state could not be recovered:', err);
-      }
-    }
-
     const onBootstrapAgentAffected = (ids: string[]) => {
       for (const id of ids) eventPublisher.publishAgentChange('set', id);
     };
@@ -332,7 +296,6 @@ export async function startServer(configPath?: string): Promise<void> {
     });
     poller.reconcile(entryPlan.entries);
     for (const conflict of entryPlan.conflicts) {
-      // 离线编辑绕过在线锁的同 repo 冲突:该项目 entry 不建,受保护项目 entry 保留(spec §5.5)
       await agentManager.emitConfigIntervention(conflict.projectId, {
         phase: 'repo-conflict', repoKey: conflict.repoKey, claimedBy: conflict.claimedBy,
       }).catch(err => console.warn('[startup] repo-conflict intervention emit failed:', err));
@@ -368,7 +331,6 @@ export async function startServer(configPath?: string): Promise<void> {
         eventBroker,
         errorRecordStore,
         petStore,
-        rootRecoveryCoordinator,
       },
       {
         ...(httpsOpts ? { https: httpsOpts } : {}),
@@ -399,11 +361,6 @@ export async function startServer(configPath?: string): Promise<void> {
     console.log(formatServerRunningMessage(host, config.server.port, Boolean(config.server.https)));
   } catch (err) {
     stopBackgroundRunners();
-    try {
-      await rootRecoveryCoordinatorRef?.stop();
-    } catch (cleanupErr) {
-      console.warn('[startup] root recovery cleanup after server startup failure failed:', cleanupErr);
-    }
     await releaseLockBestEffort();
     throw err;
   }

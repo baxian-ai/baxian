@@ -3,6 +3,7 @@ import type { AgentBindingFacts, AgentSnapshot, PollerSnapshot, TaskState } from
 import type { AgentSnapshotCtx } from '../../src/state/snapshot.js';
 import { EventBroker } from '../../src/event/broker.js';
 import { EventPublisher } from '../../src/event/publish.js';
+import { makeTask } from '../helpers/fixtures.js';
 
 function makeFakes() {
   const states = new Map<string, AgentBindingFacts>();
@@ -61,13 +62,13 @@ describe('EventPublisher', () => {
 
     const publisher = new EventPublisher(broker, ctx, taskStore, { agentsDebounceMs: 0 });
 
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
 
-    tasks.set('t1', { ...baseTask('t1'), status: 'review' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'review' }));
     publisher.publishTaskChange('set', 't1');
 
-    resolveFirst!({ ...baseTask('t1'), status: 'in_progress' });
+    resolveFirst!(makeTask({ id: 't1', status: 'in_progress' }));
 
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -137,13 +138,13 @@ describe('EventPublisher', () => {
 
     states.set('dev-1', baseAgentState('dev-1', 'task-1'));
     tmuxSessionStatus.set('dev-1', 'present');
-    tasks.set('task-1', { ...baseTask('task-1'), status: 'in_progress' });
+    tasks.set('task-1', makeTask({ id: 'task-1', status: 'in_progress' }));
     publisher.publishTaskChange('set', 'task-1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
 
-    tasks.set('task-1', { ...baseTask('task-1'), status: 'review' });
+    tasks.set('task-1', makeTask({ id: 'task-1', status: 'review' }));
     publisher.publishTaskChange('set', 'task-1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -163,13 +164,13 @@ describe('EventPublisher', () => {
       projectTasksDebounceMs: 0,
     });
 
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
     await Promise.resolve();
 
-    tasks.set('t2', { ...baseTask('t2'), status: 'pending' });
+    tasks.set('t2', makeTask({ id: 't2', status: 'pending' }));
     publisher.publishTaskChange('set', 't2');
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -189,10 +190,10 @@ describe('EventPublisher', () => {
       projectTasksDebounceMs: 0,
     });
 
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
-    tasks.set('t2', { ...baseTask('t2'), status: 'pending' });
-    tasks.set('t3', { ...baseTask('t3'), status: 'merged' });
-    tasks.set('t4', { ...baseTask('t4'), status: 'failed' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
+    tasks.set('t2', makeTask({ id: 't2', status: 'pending' }));
+    tasks.set('t3', makeTask({ id: 't3', status: 'merged' }));
+    tasks.set('t4', makeTask({ id: 't4', status: 'failed' }));
     publisher.publishTaskChange('set', 't1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -210,7 +211,7 @@ describe('EventPublisher', () => {
       projectTasksDebounceMs: 0,
     });
 
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -228,7 +229,7 @@ describe('EventPublisher', () => {
     });
 
     for (let i = 0; i < 20; i += 1) {
-      tasks.set(`t${i}`, { ...baseTask(`t${i}`), projectId: `proj-${i}`, status: 'pending' });
+      tasks.set(`t${i}`, makeTask({ id: `t${i}`, projectId: `proj-${i}`, status: 'pending' }));
       publisher.publishTaskChange('set', `t${i}`);
     }
     await vi.runAllTimersAsync();
@@ -245,7 +246,7 @@ describe('EventPublisher', () => {
     const broker = new EventBroker();
     const received: TaskState[][] = [];
     broker.subscribe('project-tasks:proj', (data) => { received.push(data as TaskState[]); });
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
     const publisher = new EventPublisher(broker, ctx, taskStore, {
       agentsDebounceMs: 0,
       projectTasksDebounceMs: 0,
@@ -272,7 +273,7 @@ describe('EventPublisher', () => {
       projectTasksDebounceMs: 0,
     });
 
-    tasks.set('t1', { ...baseTask('t1'), projectId: 'proj-a', status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', projectId: 'proj-a', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -290,7 +291,7 @@ describe('EventPublisher', () => {
       projectTasksDebounceMs: 0,
     });
 
-    tasks.set('t1', { ...baseTask('t1'), projectId: 'proj-a', status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', projectId: 'proj-a', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
     await vi.runAllTimersAsync();
     await Promise.resolve();
@@ -342,11 +343,11 @@ describe('EventPublisher', () => {
       projectTasksDebounceMs: 30,
     });
 
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
-    tasks.set('t1', { ...baseTask('t1'), status: 'review' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'review' }));
     publisher.publishTaskChange('set', 't1');
-    tasks.set('t1', { ...baseTask('t1'), status: 'approved' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'approved' }));
     publisher.publishTaskChange('set', 't1');
 
     expect(count).toBe(0);
@@ -450,7 +451,7 @@ describe('EventPublisher — deletes, failures and auxiliary channels', () => {
         expect.any(Error),
       );
 
-      tasks.set('t1', { ...baseTask('t1'), status: 'review' });
+      tasks.set('t1', makeTask({ id: 't1', status: 'review' }));
       publisher.publishTaskChange('set', 't1');
       await flush();
       expect(received.map((t) => t?.status)).toEqual(['review']);
@@ -575,7 +576,7 @@ describe('EventPublisher — deletes, failures and auxiliary channels', () => {
     const errSpy = spyConsoleError();
     try {
       taskStore.list.mockRejectedValue(new Error('scan boom'));
-      tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+      tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
       publisher.publishTaskChange('set', 't1');
       await flush();
       expect(errSpy).toHaveBeenCalledWith(
@@ -605,7 +606,7 @@ describe('EventPublisher — deletes, failures and auxiliary channels', () => {
     states.set('dev-1', baseAgentState('dev-1'));
     publisher.publishAgentChange('set', 'dev-1');
     publisher.publishPollersChange(() => []);
-    tasks.set('t1', { ...baseTask('t1'), status: 'in_progress' });
+    tasks.set('t1', makeTask({ id: 't1', status: 'in_progress' }));
     publisher.publishTaskChange('set', 't1');
     await vi.advanceTimersByTimeAsync(0);
     await Promise.resolve();
@@ -624,22 +625,6 @@ describe('EventPublisher — deletes, failures and auxiliary channels', () => {
     expect(broadcasts.size).toBe(0);
   });
 });
-
-function baseTask(id: string): TaskState {
-  const now = '2026-05-09T00:00:00Z';
-  return {
-    id,
-    projectId: 'proj',
-    title: 't',
-    description: '',
-    preferredAgentId: 'dev-1',
-    agentId: 'dev-1',
-    reviewRound: 0,
-    status: 'pending',
-    createdAt: now,
-    updatedAt: now,
-  };
-}
 
 function baseAgentState(id: string, taskId?: string): AgentBindingFacts {
   return {

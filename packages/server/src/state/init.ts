@@ -7,7 +7,6 @@ export async function initStateDir(baseDir: string): Promise<void> {
     mkdir(join(baseDir, 'state', 'errors'), { recursive: true }),
     mkdir(join(baseDir, 'state', 'tasks'), { recursive: true }),
     mkdir(join(baseDir, 'state', 'post-approve'), { recursive: true }),
-    mkdir(join(baseDir, 'state', 'root-recovery'), { recursive: true }),
     mkdir(join(baseDir, 'events'), { recursive: true }),
     mkdir(join(baseDir, 'locks'), { recursive: true }),
   ]);

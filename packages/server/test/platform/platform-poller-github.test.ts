@@ -12,15 +12,10 @@ import { parseDriverSpec } from '../../src/platform/driver-spec.js';
 import { buildReviewTokenLine, buildAckMarker } from '../../src/platform/markers.js';
 import { bodyDigest } from '../../src/platform/body-digest.js';
 import type { MappedEvent } from '../../src/platform/types.js';
-import { AgentManager } from '../../src/agent/manager.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { initStateDir } from '../../src/state/init.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
-import { DEFAULT_SERVER_CONFIG, type BaxianConfig, type BaxianEvent } from '../../src/shared/index.js';
+import type { BaxianEvent } from '../../src/shared/index.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const DRIVER_JSON = join(dirname(fileURLToPath(import.meta.url)), '../../src/platform/plugins/github/driver.json');
 const GH_SKILL = join(dirname(fileURLToPath(import.meta.url)), '../../src/platform/plugins/github/skills/baxian-cli-gh/SKILL.md');
@@ -127,7 +122,6 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
     const feedback = events.filter(e => e.type === 'pr.updated' && e.data.kind === 'comment');
     expect(feedback).toHaveLength(1);
     expect(feedback[0]!.data.revision).toMatchObject({ sourceKey: 'issue-comments', id: '300' });
-    // 事件的任务归属由 poller 收编时绑定，消费端不再按 branch/prNumber 反查
     expect(events.every(e => e.taskId === 'task-1')).toBe(true);
   });
 
@@ -141,7 +135,6 @@ describe('PlatformPoller over the real github driver.json (fake gh)', () => {
       ...world.reviews,
       ghReview(901, `recheck LGTM\n${buildReviewTokenLine({ kind: 'pass', anchorSha: ANCHOR, token: PASS })}`, 'COMMENTED'),
     ];
-    // 同 head 复检轮换新令牌对：旧轮 fail 属旧 pair、不参与本轮比较（spec §7）。
     Object.assign(tasks[0]!, { passToken: PASS, failToken: 'cccccccccccc' });
     events.length = 0;
     clockNow = T0 + 30_000;
@@ -284,8 +277,6 @@ async function lifecycleHarness(kind: LifecycleKind) {
     vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
   });
-  await initStateDir(dir);
-
   const githubDriverJson = await readFile(DRIVER_JSON, 'utf8');
   const driverJson = kind === 'github'
     ? githubDriverJson
@@ -376,28 +367,19 @@ async function lifecycleHarness(kind: LifecycleKind) {
     buildDriverRunContext(repo, kind === 'github' ? 'gh' : 'forge'),
     exec,
   );
-  const config: BaxianConfig = {
+  const config = makeConfig({
     review: { rounds: 3, mode: 'git' },
-    server: DEFAULT_SERVER_CONFIG,
-    host: [],
     project: [{
       id: 'proj', repo, merge: 'auto',
       ...(kind === 'forge' ? { gitCli: { tool: 'forge' } } : {}),
       agent: [[
-        { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/lifecycle-dev' },
-        { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/lifecycle-qa' },
+        makeAgent({ workdir: '/tmp/lifecycle-dev' }),
+        makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/lifecycle-qa' }),
       ]],
     }],
-  };
-  const taskStore = new TaskStore(join(dir, 'state', 'tasks'));
-  const eventBus = new EventBus(new EventLog(join(dir, 'events')));
-  const manager = new AgentManager({
-    config,
-    agentStore: new AgentStore(join(dir, 'state', 'agents')),
-    taskStore,
-    lockManager: new LockManager(join(dir, 'locks')),
-    eventBus,
   });
+  const harness = await createManagerHarness(dir, { config });
+  const { taskStore, eventBus, manager, events: emittedEvents } = harness;
   vi.spyOn(manager, 'platformDriverFor').mockReturnValue(driver);
   vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(true);
   vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
@@ -412,9 +394,6 @@ async function lifecycleHarness(kind: LifecycleKind) {
     return { token, armed: true };
   });
   registerEventHandlers(eventBus, manager);
-
-  const emittedEvents: BaxianEvent[] = [];
-  eventBus.on('*', event => { emittedEvents.push(event); });
 
   const verdictLog = join(dir, 'fake-gh-verdict.log');
   const fakeGh = join(dir, 'gh');

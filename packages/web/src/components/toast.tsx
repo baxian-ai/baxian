@@ -71,7 +71,6 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     timersRef.current.set(id, setTimeout(() => dismiss(id), duration));
   }, [clearTimer, dismiss]);
 
-  // hover 与 focus 是相互独立的暂停原因：只有两者都释放后才恢复倒计时。
   const hold = useCallback((id: number, reason: HoldReason) => {
     const set = holdsRef.current.get(id) ?? new Set<HoldReason>();
     set.add(reason);

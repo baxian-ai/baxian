@@ -566,7 +566,6 @@ describe('RepoStore destructive-cleanup guards', () => {
     const removal = runner.commands.find(c => c.includes('rm -rf '));
     expect(removal).toMatch(/then rm -rf '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-[0-9a-f-]+' && echo BX_STAGING_REMOVED;/);
     expect(runner.commands.some(c => /^mv '\/home\/u\/\.baxian\/agents\/dev-1\/repo\/repo\.claim-/.test(c))).toBe(false);
-    // On a nested race `final` is a foreign directory; its baxian-promote-claim must NOT be deleted.
     expect(runner.commands.some(c => /rm -f '[^']*baxian-promote-claim'/.test(c))).toBe(false);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('recreated concurrently'));
   });
@@ -577,10 +576,9 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/^test -d /, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
-      [/baxian-promote-claim'$/, ok], // stamp our nonce
-      [/&& mv '[^']*claim[^']*' '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, ok], // promote mv succeeds (exit 0)
-      [/^test -e /, { stdout: '', stderr: '', exitCode: 1 }], // no nested copy → `final` is where we landed
-      // The nonce-checked marker clear reports REFUSED: `final` was replaced after the mv (foreign clone).
+      [/baxian-promote-claim'$/, ok],
+      [/&& mv '[^']*claim[^']*' '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, ok],
+      [/^test -e /, { stdout: '', stderr: '', exitCode: 1 }],
       [/then rm -f '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_REFUSED\n', stderr: '', exitCode: 0 }],
     ]);
 
@@ -654,7 +652,6 @@ describe('RepoStore destructive-cleanup guards', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('reconciled as already-completed'));
     expect(runner.commands.some(c => c.includes('rm -rf '))).toBe(false);
     expect(runner.commands.some(c => c.includes('config --get-regexp '))).toBe(true);
-    // The marker rm re-checks the nonce in the SAME command (not a separate cat→rm that a race could exploit).
     expect(runner.commands.some(c =>
       c.includes("cat '") && c.includes('baxian-promote-claim')
       && c.includes('rm -f') && c.includes(nonce),
@@ -668,7 +665,6 @@ describe('RepoStore destructive-cleanup guards', () => {
       [/^test -d '\/home\/u\/\.baxian\/agents\/dev-1\/repo'$/, { stdout: '', stderr: '', exitCode: 1 }],
       [/mkdir -p /, ok],
       [/git clone /, ok],
-      // The atomic nonce-checked clear reports REFUSED: `final` was replaced after the separate cat.
       [/then rm -f '[^']*baxian-promote-claim'/, { stdout: 'BX_MARKER_REFUSED\n', stderr: '', exitCode: 0 }],
       [/baxian-promote-claim'$/, (c) => { nonce = /printf %s '([^']+)' >/.exec(c)![1]; return ok; }],
       [/&& mv '/, { stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 }],
@@ -923,7 +919,6 @@ describe('moveFileIntoPlace (real filesystem)', () => {
   let dir: string;
 
   beforeEach(async () => {
-    // The canonical root guard requires a symlink-free base (macOS tmpdir sits under /var -> /private/var).
     dir = await realpath(await mkdtemp(join(tmpdir(), 'bx-mvip-')));
   });
 
@@ -1050,16 +1045,13 @@ describe('moveFileIntoPlace (real filesystem)', () => {
 
   it('guarded discard (clone/promote cleanup) refuses to delete through a rebound managed parent', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    // Managed root `dir`; the per-agent parent `dir/agents/a1` is rebound to an external directory
-    // that happens to hold a same-named staging dir. The guarded sweep must leave the external file.
     await run(`mkdir -p ${shellQuote(`${dir}/agents`)} ${shellQuote(`${dir}/external/repo.claim-x`)}`);
     await write(`${dir}/external/repo.claim-x/precious`, 'foreign');
     await symlink(`${dir}/external`, `${dir}/agents/a1`);
-    const staging = `${dir}/agents/a1/repo.claim-x`; // logical path resolves into the external dir
+    const staging = `${dir}/agents/a1/repo.claim-x`;
 
     await sweepStrayFile(local, staging, ancestorSymlinkGuard(dir, staging));
 
-    // The guard (a1 is a symlink) fails closed → external file survives, and the keep is audited.
     expect(await run(`cat ${shellQuote(`${dir}/external/repo.claim-x/precious`)}`)).toBe('foreign');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('guard refused'));
   });
@@ -1195,7 +1187,7 @@ describe('stageFileGuarded parent directories (real filesystem)', () => {
   });
 });
 
-describe('mailbox mutation outcome classification', () => {
+describe('staged file mutation outcome classification', () => {
   function mutationRunner(results: {
     stage?: ExecResult;
     move?: ExecResult;

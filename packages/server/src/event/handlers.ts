@@ -214,7 +214,6 @@ async function cleanupPrematureMergeParticipants(
 
 const POST_APPROVE_REDISPATCH_CAP = 10;
 const POST_APPROVE_RECOVERY_MIN_AGE_MS = 60_000;
-// 损坏值不可自愈，每周期 sweep 会重踩同一分支：按 task+值去重，值变化或修复后允许重报
 const unparseableUpdatedAtWarned = new Map<string, string>();
 
 const VERDICT_FRESHNESS_SKEW_MS = 5000;
@@ -477,7 +476,6 @@ async function handlePrMergeReady(
           expectedHeadSha: gitEpisodeKey.headSha,
         });
         if (!revoked) {
-          // The pass rotated after the entry re-validation; this merge-ready and its cap decision are stale.
           await emitIntervention(bus, taskNow.projectId, taskNow.agentId, taskNow.id, {
             phase: 'post-approve-merge-skipped-stale-task',
           });
@@ -778,13 +776,10 @@ async function redispatchReviewForStaleVerdict(
 ): Promise<boolean> {
   if (task.status !== 'review') return false;
   const qaAgentId = requireTaskQaAgentId(task, 'redispatchReviewForStaleVerdict');
-  // 当前 pass 的 QA 会话还在跑时，迟到的旧 verdict 只是噪音，不能重派打断；
-  // 派发期 hold（checkout 未备好）意味着从未开工，等同无会话，可安全重派
   let qaState: Awaited<ReturnType<AgentManager['getAgentState']>>;
   try {
     qaState = await manager.getAgentState(qaAgentId);
   } catch (err) {
-    // 无状态证据时 fail closed：不自动重派，让调用方落 stale-verdict 兜底介入
     console.warn(
       `[EventHandler] stale-verdict QA state read failed for ${qaAgentId}; not redispatching:`,
       err,
@@ -793,8 +788,6 @@ async function redispatchReviewForStaleVerdict(
   }
   if (qaState?.taskId === task.id && !isRecoverableQaDispatchHold(qaState)) return false;
   try {
-    // fromStatus/expectSignalToken 在 dispatch 锁内复核：本地快照到这里的窗口里任务可能已离开 review
-    // 或被并发 dispatcher 换代 pass，不能靠上面的预检
     const entry = manager.getPendingDispatchRetry(task.id);
     const qaPhase = entry?.kind === 'qa-recheck' && entry.signalToken === task.signalToken && entry.qaPhase !== undefined
       ? entry.qaPhase
@@ -1597,7 +1590,6 @@ export function registerEventHandlers(
       return;
     }
     if (!verify.ok) {
-      // PR 在修复期间被关闭/转 draft/retarget：推进 recheck 只会造出无裁决入口的评审轮
       await stayFixing({ phase: 'fix-verify-binding-mismatch', reason: verify.reason });
       return;
     }
@@ -1628,12 +1620,8 @@ export function registerEventHandlers(
         return;
       }
     }
-    // head fetch / 回复检查是秒级网络等待，期间真 push / verdict 可能已换代 pass；旧信号不得再驱动派发
     const preEmit = await manager.getTask(task.id);
     if (!preEmit || preEmit.status !== 'fixing' || preEmit.signalToken !== token) return;
-
-    // head 前进时不能指望 poller：push 事件已被消费（cursor 不回退），若那次派发失败回滚，
-    // 这里的合成 push 是唯一重试入口；宁可与迟到的真 push 竞态重派一轮，也不静默滞留 fixing
 
     await bus.emit({
       id: '',

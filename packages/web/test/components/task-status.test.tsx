@@ -71,7 +71,6 @@ describe('TaskStatusDot', () => {
 });
 
 describe('formatTaskTimestamp', () => {
-  // tests are pinned to TZ=Asia/Shanghai (UTC+8) via vitest config
   it('converts UTC timestamps to the local browser timezone', () => {
     expect(formatTaskTimestamp('2026-05-10T12:00:00.000Z')).toBe('2026-05-10 20:00:00');
     expect(formatTaskTimestamp('2026-05-10T13:00+08:00')).toBe('2026-05-10 13:00:00');
@@ -83,8 +82,6 @@ describe('formatTaskTimestamp', () => {
   });
 
   it('parses space- and T-separated local datetimes identically (no reliance on engine leniency)', () => {
-    // space form is normalized to the ISO 'T' form, so the result does not depend on
-    // Date.parse accepting the non-standard space separator (Safari rejects it).
     expect(formatTaskTimestamp('2026-05-10 14:30')).toBe(formatTaskTimestamp('2026-05-10T14:30'));
     expect(formatTaskTimestamp('2026-05-10 14:30:45')).toBe(formatTaskTimestamp('2026-05-10T14:30:45'));
     expect(formatTaskTimestamp('2026-05-10T14:30')).toBe('2026-05-10 14:30:00');

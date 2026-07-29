@@ -13,7 +13,6 @@ class MockApiError extends Error {
   }
 }
 
-// 返回类型标注为真实模块类型：真实模块新增导出或 namespace 方法而这里未跟进时，typecheck 直接失败
 export function createApiMock(): ApiModule {
   return {
     UNAUTHORIZED_EVENT: 'baxian:unauthorized',

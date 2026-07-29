@@ -9,14 +9,9 @@ import {
 } from '../../src/agent/branch.js';
 import { LocalRunner, shellQuote, type CommandRunner } from '../../src/agent/runner.js';
 import { ReplNotReadyError } from '../../src/agent/tmux.js';
-import { AgentManager } from '../../src/agent/manager.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { DEFAULT_SERVER_CONFIG, type BaxianConfig, type TaskState } from '../../src/shared/index.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
 const local = new LocalRunner();
 let tempDir: string;
@@ -31,8 +26,6 @@ async function run(command: string): Promise<string> {
 }
 
 beforeEach(async () => {
-  // realpath so the Workdir path is canonical (matches production's pwd -P workdir); the guarded git
-  // commands re-prove `cd && pwd -P == workdir`, which a symlinked /var tmpdir would otherwise fail.
   tempDir = await realpath(await mkdtemp(join(tmpdir(), 'baxian-branch-')));
   origin = join(tempDir, 'origin.git');
   seed = join(tempDir, 'seed');
@@ -327,19 +320,16 @@ describe('BranchManager', () => {
   });
 
   it('fails closed when an intermediate Workdir ancestor is a symlink (guarded git never writes through it)', async () => {
-    // A real clone at <tempDir>/real/agent, reached via a symlinked parent so `cd && pwd -P` != the given path.
     const realParent = join(tempDir, 'real');
     await mkdir(realParent, { recursive: true });
     const realWorkdir = join(realParent, 'agent');
     await run(`git clone -q ${shellQuote(origin)} ${shellQuote(realWorkdir)}`);
     await symlink(realParent, join(tempDir, 'linked'));
-    const viaSymlink = join(tempDir, 'linked', 'agent'); // same inode, but the path text has a symlink component
+    const viaSymlink = join(tempDir, 'linked', 'agent');
 
-    // switchToTaskBranch's first Workdir mutation is the guarded fetch → the canonical self-guard rejects it.
     await expect(
       new BranchManager(local).switchToTaskBranch(viaSymlink, 'task-x', 'bx/task-x', true),
     ).rejects.toThrow(/fetch/i);
-    // The remote-tracking ref was NOT written into the real repo through the rebound path.
     const ref = await local.exec(`git -C ${shellQuote(realWorkdir)} rev-parse --verify -q refs/remotes/origin/bx/task-x`);
     expect(ref.exitCode).not.toBe(0);
   });
@@ -616,14 +606,19 @@ describe('BranchManager', () => {
 
   it('periodic reconciliation deletes a proven terminal task branch and leaves user branches untouched', async () => {
     const now = new Date().toISOString();
-    const autoTask: TaskState = {
-      id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
-    };
-    const customTask: TaskState = {
+    const autoTask = makeTask({
+      id: 'task-1',
+      title: 'auto',
+      description: '',
+      phase: 'code',
+      platformBinding: undefined,
+      status: 'merged',
+      createdAt: now,
+      updatedAt: now,
+    });
+    const customTask = makeTask({
       ...autoTask, id: 'task-2', title: 'custom', branch: 'bx/task-2', branchCreatedByBaxian: false,
-    };
+    });
     await run(
       `git -C ${shellQuote(workdir)} switch -q -c bx/task-1 && ` +
       `printf task > ${shellQuote(join(workdir, 'task.txt'))} && ` +
@@ -634,42 +629,38 @@ describe('BranchManager', () => {
       `git -C ${shellQuote(workdir)} branch bx/task-2`,
     );
     const stateRoot = join(tempDir, 'manager-state');
-    await mkdir(stateRoot, { recursive: true });
-    const agentStore = new AgentStore(join(stateRoot, 'agents'));
-    const taskStore = new TaskStore(join(stateRoot, 'tasks'));
-    await mkdir(join(stateRoot, 'agents'), { recursive: true });
-    await mkdir(join(stateRoot, 'tasks'), { recursive: true });
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
-    await taskStore.set(autoTask);
-    await taskStore.set(customTask);
-    const config: BaxianConfig = {
-      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
+    const config = makeConfig({
       project: [{
         id: 'proj', repo: 'owner/repo', merge: null,
         agent: [[
-          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
-          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+          makeAgent({ runtime: 'codex', workdir }),
+          makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
         ]],
       }],
-    };
-    const lockManager = new LockManager(join(stateRoot, 'locks'));
-    await mkdir(join(stateRoot, 'locks'), { recursive: true });
-    const maintenanceRunner: CommandRunner = {
-      exec: (command, options) => command.includes('tmux has-session')
-        ? Promise.resolve({ stdout: '', stderr: "can't find session: dev-1", exitCode: 1 })
-        : local.exec(command, options),
-      writeFile: (path, content) => local.writeFile(path, content),
-      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
-    };
-    const manager = new AgentManager({
-      config,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus: new EventBus(new EventLog(join(stateRoot, 'events'))),
-      skillRegistry: new SkillRegistry(join(stateRoot, 'skills')),
-      runnerFactory: () => maintenanceRunner,
     });
+    const maintenanceRunner = fakeRunner({
+      rules: [
+        {
+          match: 'tmux has-session',
+          reply: { stderr: "can't find session: dev-1", exitCode: 1 },
+        },
+        {
+          match: command => !command.includes('tmux '),
+          reply: (command, options) => local.exec(command, options),
+        },
+      ],
+    });
+    const harness = await createManagerHarness(stateRoot, {
+      config,
+      deps: {
+        runnerFactory: () => maintenanceRunner,
+        platformRunner: maintenanceRunner,
+      },
+    });
+    const { manager, agentStore, taskStore, lockManager } = harness;
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
+    await taskStore.set(autoTask);
+    await taskStore.set(customTask);
 
     await manager.reconcileTaskBranches();
 
@@ -680,11 +671,16 @@ describe('BranchManager', () => {
 
   it('periodic reconciliation leaves branches untouched while the runtime is not idle', async () => {
     const now = new Date().toISOString();
-    const task: TaskState = {
-      id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged', createdAt: now, updatedAt: now,
-    };
+    const task = makeTask({
+      id: 'task-1',
+      title: 'auto',
+      description: '',
+      phase: 'code',
+      platformBinding: undefined,
+      status: 'merged',
+      createdAt: now,
+      updatedAt: now,
+    });
     await run(
       `git -C ${shellQuote(workdir)} switch -q -c bx/task-1 && ` +
       `git -C ${shellQuote(workdir)} config branch.bx/task-1.baxian-task-id task-1 && ` +
@@ -693,44 +689,36 @@ describe('BranchManager', () => {
       `git -C ${shellQuote(workdir)} push -q origin bx/task-1`,
     );
     const stateRoot = join(tempDir, 'busy-manager-state');
-    await mkdir(join(stateRoot, 'agents'), { recursive: true });
-    await mkdir(join(stateRoot, 'tasks'), { recursive: true });
-    await mkdir(join(stateRoot, 'locks'), { recursive: true });
-    const agentStore = new AgentStore(join(stateRoot, 'agents'));
-    const taskStore = new TaskStore(join(stateRoot, 'tasks'));
-    const lockManager = new LockManager(join(stateRoot, 'locks'));
-    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', workdir, updatedAt: now });
-    await taskStore.set(task);
-    const config: BaxianConfig = {
-      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
+    const config = makeConfig({
       project: [{
         id: 'proj', repo: 'owner/repo', merge: null,
         agent: [[
-          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
-          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
+          makeAgent({ runtime: 'codex', workdir }),
+          makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
         ]],
       }],
-    };
-    const runtimeRunner: CommandRunner = {
-      exec: async (command, options) => {
-        if (command.includes('tmux has-session')) return { stdout: '', stderr: '', exitCode: 0 };
-        if (command.includes('tmux list-sessions')) {
-          return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
-        }
-        if (command.includes('tmux list-panes')) {
-          return { stdout: '%7 codex\n', stderr: '', exitCode: 0 };
-        }
-        return local.exec(command, options);
-      },
-      writeFile: (path, content) => local.writeFile(path, content),
-      execWithStdin: (command, stdin, options) => local.execWithStdin(command, stdin, options),
-    };
-    const manager = new AgentManager({
-      config, agentStore, taskStore, lockManager,
-      eventBus: new EventBus(new EventLog(join(stateRoot, 'events'))),
-      skillRegistry: new SkillRegistry(join(stateRoot, 'skills')),
-      runnerFactory: () => runtimeRunner,
     });
+    const runtimeRunner = fakeRunner({
+      agents: {
+        'dev-1': { paneId: '%7', process: 'codex' },
+      },
+      rules: [
+        {
+          match: command => !command.includes('tmux '),
+          reply: (command, options) => local.exec(command, options),
+        },
+      ],
+    });
+    const harness = await createManagerHarness(stateRoot, {
+      config,
+      deps: {
+        runnerFactory: () => runtimeRunner,
+        platformRunner: runtimeRunner,
+      },
+    });
+    const { manager, agentStore, taskStore, lockManager } = harness;
+    await agentStore.set({ id: 'dev-1', projectId: 'proj', paneId: '%7', workdir, updatedAt: now });
+    await taskStore.set(task);
     vi.spyOn(
       manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
       'waitForReplPromptReady',
@@ -758,40 +746,39 @@ describe('BranchManager', () => {
   it('does not acquire a maintenance lock for a terminal branch already marked as preserved', async () => {
     const now = new Date().toISOString();
     const stateRoot = join(tempDir, 'skipped-manager-state');
-    await mkdir(join(stateRoot, 'agents'), { recursive: true });
-    await mkdir(join(stateRoot, 'tasks'), { recursive: true });
-    await mkdir(join(stateRoot, 'locks'), { recursive: true });
-    const agentStore = new AgentStore(join(stateRoot, 'agents'));
-    const taskStore = new TaskStore(join(stateRoot, 'tasks'));
-    const lockManager = new LockManager(join(stateRoot, 'locks'));
+    const config = makeConfig({
+      project: [{
+        id: 'proj', repo: 'owner/repo', merge: null,
+        agent: [[
+          makeAgent({ runtime: 'codex', workdir }),
+          makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa-repo' }),
+        ]],
+      }],
+    });
+    const harness = await createManagerHarness(stateRoot, {
+      config,
+      deps: {
+        runnerFactory: () => local,
+        platformRunner: local,
+      },
+    });
+    const { manager, agentStore, taskStore, lockManager } = harness;
     await agentStore.set({ id: 'dev-1', projectId: 'proj', workdir, updatedAt: now });
-    await taskStore.set({
-      id: 'task-1', projectId: 'proj', title: 'auto', description: '',
-      preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1', qaAgentId: 'qa-1', phase: 'code', branch: 'bx/task-1',
-      branchCreatedByBaxian: true, reviewRound: 0, status: 'merged',
+    await taskStore.set(makeTask({
+      id: 'task-1',
+      title: 'auto',
+      description: '',
+      phase: 'code',
+      platformBinding: undefined,
+      status: 'merged',
       branchCleanupSkipped: {
         agentId: 'dev-1',
         reason: 'remote branch is absent; preserving the local branch without retry',
         updatedAt: now,
       },
-      createdAt: now, updatedAt: now,
-    });
-    const config: BaxianConfig = {
-      review: { rounds: 10 }, server: DEFAULT_SERVER_CONFIG,
-      project: [{
-        id: 'proj', repo: 'owner/repo', merge: null,
-        agent: [[
-          { id: 'dev-1', runtime: 'codex', role: 'dev', mode: 'local', workdir },
-          { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-        ]],
-      }],
-    };
-    const manager = new AgentManager({
-      config, agentStore, taskStore, lockManager,
-      eventBus: new EventBus(new EventLog(join(stateRoot, 'events'))),
-      skillRegistry: new SkillRegistry(join(stateRoot, 'skills')),
-      runnerFactory: () => local,
-    });
+      createdAt: now,
+      updatedAt: now,
+    }));
     const acquireSpy = vi.spyOn(lockManager, 'acquire');
     const refSpy = vi.spyOn(BranchManager.prototype, 'listLocalTaskRefs');
 

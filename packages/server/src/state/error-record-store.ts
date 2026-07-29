@@ -24,7 +24,6 @@ export interface ErrorRecord extends Required<Omit<ErrorRecordInput, 'taskId' | 
 
 export class ErrorRecordStore {
   private chain: Promise<unknown> = Promise.resolve();
-  // reads dominate (every per-agent snapshot publish re-reads); this store is the dir's single writer
   private cache: ErrorRecord[] | null = null;
 
   constructor(private dir: string) {}
@@ -114,7 +113,6 @@ export class ErrorRecordStore {
       try {
         files = await readdir(this.dir);
       } catch (err) {
-        // ENOENT means zero records; anything else means the sweep never ran.
         if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { removed: 0 };
         console.warn(`[ErrorRecordStore] rewriteFiltered: cannot list ${this.dir}:`, err);
         throw err;
@@ -159,7 +157,6 @@ export class ErrorRecordStore {
           try {
             await unlink(tmp);
           } catch (rmErr) {
-            // A write that failed before creating tmp leaves nothing to remove.
             if ((rmErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
               console.warn(`[error-record-store] failed to remove tmp ${tmp}:`, rmErr);
             }
@@ -182,8 +179,6 @@ export class ErrorRecordStore {
     };
   }
 
-  // the cache fill rides the write chain so an in-flight append lands on disk
-  // before the first read snapshots it — a plain fill could miss it forever
   private readAll(): Promise<ErrorRecord[]> {
     if (this.cache) return Promise.resolve(this.cache);
     const load = this.chain.then(async () => {

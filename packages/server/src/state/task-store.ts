@@ -9,7 +9,6 @@ import {
   TASK_PHASE_SET,
 } from '../shared/index.js';
 
-// a store id becomes a filename; constrain it so a path-like id can't escape the store dir
 const SAFE_ID = /^[A-Za-z0-9_-]+$/;
 
 export interface TaskFilter {
@@ -403,7 +402,6 @@ export class TaskStore {
       if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return null;
       throw err;
     }
-    // the filename is the store key; it overrides whatever id the file body carries
     return sanitizeTask({ ...(JSON.parse(content) as Record<string, unknown>), id });
   }
 
@@ -457,7 +455,6 @@ export class TaskStore {
     });
   }
 
-  // ids come from filenames, so the max scan never needs to read file contents
   async nextId(): Promise<string> {
     let files: string[];
     try {

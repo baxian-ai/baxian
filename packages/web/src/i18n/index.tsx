@@ -32,7 +32,6 @@ function cacheLocale(locale: SupportedLanguage): void {
 
 let currentLocale: SupportedLanguage = readCachedLocale();
 const localeListeners = new Set<(locale: SupportedLanguage) => void>();
-// epoch 只计有意切换（PATCH/跨标签/权威同步），refresh 排序由 appliedSeq 负责
 let localeEpoch = 0;
 let refreshSeq = 0;
 let refreshAppliedSeq = 0;
@@ -83,7 +82,6 @@ interface I18nContextValue {
   setLocale: (next: SupportedLanguage) => Promise<void>;
 }
 
-// 默认值让无 Provider 的渲染（测试）直接得到静态英文字典
 const I18nContext = createContext<I18nContextValue>({
   locale: DEFAULT_LOCALE,
   messages: enUS,

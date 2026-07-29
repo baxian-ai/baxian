@@ -1,26 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { buildAgentSnapshotById, buildAllAgentSnapshots } from '../state/snapshot.js';
 import { decodeBase64Image, ImageValidationError } from '../agent/image-input.js';
-import { RootRuntimeStopIncompleteError } from '../agent/root-recovery-coordinator.js';
-import { IMAGE_UPLOAD_ROUTE_BODY_LIMIT, ROOT_AGENT_ID } from '../shared/index.js';
+import { IMAGE_UPLOAD_ROUTE_BODY_LIMIT } from '../shared/index.js';
 
 export async function agentRoutes(app: FastifyInstance): Promise<void> {
   app.get('/agents', async () => buildAllAgentSnapshots(app.ctx));
-
-  app.get(`/agents/${ROOT_AGENT_ID}/session`, async (_request, reply) => {
-    const coordinator = app.ctx.rootRecoveryCoordinator;
-    if (!coordinator) {
-      return reply.status(404).send({ error: 'Root agent is not configured' });
-    }
-    const recoveryStatus = coordinator.getRuntimeControlStatus();
-    const warning = coordinator.getRuntimeStopWarning();
-    return {
-      id: ROOT_AGENT_ID,
-      recoveryStatus,
-      recoveryEnabled: recoveryStatus === 'active',
-      ...(warning ? { warning } : {}),
-    };
-  });
 
   app.get<{ Params: { id: string } }>('/agents/:id', async (request, reply) => {
     const configured = app.ctx.agentManager.getAgentConfig(request.params.id);
@@ -32,31 +16,6 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.delete<{ Params: { id: string } }>('/agents/:id/session', async (request, reply) => {
-    if (request.params.id === ROOT_AGENT_ID) {
-      if (!app.ctx.rootRecoveryCoordinator) {
-        return reply.status(404).send({ error: 'Root agent is not configured' });
-      }
-      try {
-        await app.ctx.rootRecoveryCoordinator.stopRuntime();
-      } catch (err) {
-        if (err instanceof RootRuntimeStopIncompleteError) {
-          return reply.status(503).send({
-            error: err.message,
-            recoveryStatus: app.ctx.rootRecoveryCoordinator.getRuntimeControlStatus(),
-            retryable: true,
-          });
-        }
-        throw err;
-      }
-      const warning = app.ctx.rootRecoveryCoordinator.getRuntimeStopWarning();
-      return reply.status(200).send({
-        stopped: true,
-        recoveryStatus: app.ctx.rootRecoveryCoordinator.getRuntimeControlStatus(),
-        message: warning
-          ? `Root recovery is disabled until the Baxian server restarts. ${warning}`
-          : 'Root recovery is disabled until the Baxian server restarts.',
-      });
-    }
     const state = await app.ctx.agentStore.get(request.params.id);
     if (state?.taskId) {
       try {

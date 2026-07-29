@@ -29,13 +29,11 @@ interface FakeStreamer {
 }
 
 function createFakeStreamer(): FakeStreamer {
-  // Per-subscription records: an old generation's unsubscribe must not silence a newer one.
   const subs: Array<{
     live?: SubscriberCallbacks['onLive'];
     visible?: SubscriberCallbacks['onVisible'];
     sessionGone?: SubscriberCallbacks['onSessionGone'];
   }> = [];
-  // Mirrors PaneStreamer: one decoder bound to the whole stream, shared by every subscription.
   const decoder = new VisibleTextExtractor();
   let snapshotData = '';
   let failNext = false;
@@ -217,7 +215,6 @@ describe('PhaseSignalWatcher', () => {
     await startWatch(watcher, { expectedKinds: 'spec-done', token: 'correctTok01' });
     streamer.triggerLive(`${buildPhaseSignal('spec-done', 'wrongTok123x', 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(0);
-    // The mismatch is the point here; the foreign-token warn is expected, not stderr noise
     expect(warn.mock.calls.some(c => String(c[0]).includes('foreign token'))).toBe(true);
     warn.mockRestore();
   });
@@ -362,7 +359,6 @@ describe('PhaseSignalWatcher', () => {
     expect(captured).toHaveLength(1);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
     streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', 'devtok123456', 42, 'Nzc')}\n`);
-    // 同任务完成信号经互斥段串行投递，第二发排在第一发结算之后
     await flushMicrotasks();
     expect(captured).toHaveLength(2);
     expect(captured.map(e => e.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
@@ -469,7 +465,6 @@ describe('PhaseSignalWatcher', () => {
     expect(captured).toHaveLength(0);
     streamers[QA_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-fixed', 'qatok1234567')}\n`);
     streamers[DEV_AGENT.id]!.triggerLive(`${buildPhaseSignal('pr-created', newToken, 2, 'Nzc')}\n`);
-    // 同任务完成信号经互斥段串行投递
     await flushMicrotasks();
     expect(captured.map(event => event.agentId).sort()).toEqual([DEV_AGENT.id, QA_AGENT.id]);
     warn.mockRestore();
@@ -668,7 +663,6 @@ describe('stale signal token visibility', () => {
     expect(lines[0]).toContain(`observed=${stale}`);
     expect(lines[0]).toContain(`expected=${armed}`);
     expect(lines[0]).toContain('task=t1');
-    // 静默丢弃是既定契约：留痕不得改变状态机行为，也不得新增事件噪声
     expect(captured).toHaveLength(0);
     warn.mockRestore();
   });
@@ -696,7 +690,6 @@ describe('stale signal token visibility', () => {
     await startWatch(watcher, { expectedKinds: 'pr-fixed', token: armed });
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
-    // 快照尾部留在 entry.buffer：首个 live chunk 会连同它一起重扫，历史 marker 不得被当成新到的外来令牌
     streamer.triggerLive(' later output on the same pane ');
     await flushMicrotasks();
     expect(staleWarnings(warn)).toHaveLength(0);
@@ -819,7 +812,6 @@ describe('stale signal token visibility', () => {
       buildPhaseSignal('pr-fixed', `churntok${String(i).padStart(4, '0')}`)).join(' ');
     streamer.triggerLive(churn);
     await flushMicrotasks();
-    // STALE_TOKEN_WARN_CAP distinct discards, then one summary line; no unbounded growth
     expect(staleWarnings(warn)).toHaveLength(32);
     const capped = warn.mock.calls
       .map(call => String(call[0]))
@@ -917,7 +909,6 @@ describe('need-input ask/answer watermark', () => {
     });
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     expect(commits).toHaveLength(1);
-    // Reported under its own task, so the manager can tell it is not the current one.
     expect(await watcher.rearmNeedInput(DEV_AGENT.id)).toEqual(new Set(['old-task']));
   });
 
@@ -948,7 +939,6 @@ describe('need-input ask/answer watermark', () => {
 
   it('an unanswered question stays open however the redraw arranged the rows', async () => {
     const { watcher, streamer, commits } = makeWatcher();
-    // A redraw put the older ask BELOW the newer one; only ordinals matter.
     streamer.setSnapshot(
       `[bx:need-input:${token}:2] and above it on screen [bx:need-input:${token}:1]`,
     );
@@ -960,7 +950,6 @@ describe('need-input ask/answer watermark', () => {
 
   it('reconciles asked-and-answered ordinals regardless of their screen order', async () => {
     const { watcher, streamer, commits } = makeWatcher();
-    // The answer to Q2 was redrawn ABOVE the follow-up ask that came after it.
     streamer.setSnapshot(
       `[bx:input-received:${token}:2] then higher up [bx:need-input:${token}:3]`,
     );
@@ -1003,7 +992,6 @@ describe('need-input ask/answer watermark', () => {
 
   it('an answer redrawn above its own question still clears the badge', async () => {
     const { watcher, streamer, commits } = makeWatcher();
-    // Exactly the xterm redraw shape: the later answer serializes on an earlier row.
     streamer.setSnapshot(
       `[bx:input-received:${token}:1] ...rows below... [bx:need-input:${token}:1]`,
     );
@@ -1029,8 +1017,6 @@ describe('need-input ask/answer watermark', () => {
     expect(await startWatch(watcher, {
       expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), skipSnapshot: true,
     })).toBe(false);
-    // Rescued onto the fresh generation with its stripped ordinals: no stale re-commit,
-    // and the new prompt's first question still lights the badge.
     expect(commits).toEqual([intent(1, 3, 0)]);
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     expect(commits).toEqual([intent(1, 3, 0), intent(2, 1, 0)]);
@@ -1160,16 +1146,11 @@ describe('need-input ask/answer watermark', () => {
     await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
     streamer.triggerLive(`[bx:need-input:${token}:3]\n`);
     expect(commits).toEqual([intent(1, 3, 0)]);
-    // The bump write knows {epoch 2, ask 3} but the entry's in-memory lead (answered 3,
-    // e.g. an error'd commit whose retry the arm just cleared) must be re-persisted.
     streamer.triggerLive(`[bx:input-received:${token}:3]\n`);
     expect(commits).toEqual([intent(1, 3, 0), intent(1, 3, 3)]);
     await startWatch(watcher, {
       expectedKinds: 'pr-created', token, needInput: wm(2, 3, 0), needInputInherit: true,
     });
-    // The predecessor is migrated synchronously (before subscribe) and re-persists its
-    // lead there; the installed replacement inherits the same watermark, so its own
-    // post-install lead commit repeats it.
     expect(commits).toEqual([
       intent(1, 3, 0), intent(1, 3, 3), intent(2, 3, 3), intent(2, 3, 3),
     ]);
@@ -1267,13 +1248,9 @@ describe('need-input ask/answer watermark', () => {
     })).toBe(true);
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     expect(commits).toEqual([intent(1, 3, 0)]);
-    // The restore successor inherits the degraded entry's memory: its immediate lead
-    // commit proves ask 1 was tracked, not swallowed.
     expect(await startWatch(watcher, {
       expectedKinds: 'pr-created', token, needInput: wm(2, 0, 0), needInputInherit: true, skipSnapshot: true,
     })).toBe(true);
-    // Pre-subscribe migration lifts the degraded entry (ask 1 tracked, never swallowed),
-    // then the replacement inherits and re-persists the same watermark.
     expect(commits).toEqual([intent(1, 3, 0), intent(2, 1, 0), intent(2, 1, 0)]);
   });
 
@@ -1313,14 +1290,11 @@ describe('need-input ask/answer watermark', () => {
     const lateP = startWatch(watcher, {
       expectedKinds: 'pr-created', token, needInput: wm(2, 3, 2), needInputInherit: true, skipSnapshot: true,
     });
-    // A newer same-token replay whose bump failed installs a degraded successor.
     expect(await startWatch(watcher, {
       expectedKinds: 'pr-created', token, skipSnapshot: true,
     })).toBe(true);
     gate.release();
     expect(await lateP).toBe(false);
-    // The rescue is bound to the predecessor the late arm started against, which the
-    // degraded successor already replaced — it must stay commit-disabled.
     commits.length = 0;
     streamer.triggerLive(`[bx:need-input:${token}:1]\n`);
     expect(commits).toEqual([]);
@@ -1331,14 +1305,12 @@ describe('need-input ask/answer watermark', () => {
     await startWatch(watcher, { expectedKinds: 'pr-created', token, needInput: wm(1, 0, 0) });
     const claim = watcher.claimArm({ taskId: 't1', agentId: DEV_AGENT.id, token: 'tokNEW1234567' });
     expect(claim).not.toBeNull();
-    // The stale same-token replay loses to the pending new-token owner...
     expect(watcher.claimArm({
       taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
     })).toBeNull();
     expect(watcher.wouldRejectOwnTokenArm({
       taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
     })).toBe(true);
-    // ...and regains its chance once that arm settles.
     watcher.releaseArm(claim);
     expect(watcher.wouldRejectOwnTokenArm({
       taskId: 't1', agentId: DEV_AGENT.id, token, onlyReplaceOwnToken: true,
@@ -1456,7 +1428,7 @@ describe('PhaseSignalWatcher.awaitOnce (bootstrap greeting)', () => {
   });
 });
 
-describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
+describe('PhaseSignalWatcher terminal-control semantics', () => {
   const ESC = '\x1b';
   const BEL = '\x07';
   const TOKEN = 'tok123abc456';
@@ -1503,8 +1475,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
 
-  // The decoder belongs to the streamer, so a watcher armed mid control string inherits
-  // the open state instead of reading the hidden payload as fresh output.
   it('does not fire when the control string opened before the watcher armed', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     streamer.triggerLive(`${ESC}]0;title-start`);
@@ -1531,8 +1501,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
 
-  // A backspace rewinds the cursor, so the screen never shows a well-formed marker; the
-  // watcher must not complete the dispatch on one.
   it('stays armed when a backspace rewrote the marker off the screen', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
@@ -1544,8 +1512,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(captured).toHaveLength(1);
   });
 
-  // A designated non-ASCII charset renders the marker bytes as other glyphs, so the screen
-  // never shows a well-formed marker.
   it.each([
     ['G1 = DEC graphics with SO/SI', (t: string) => `[bx:spec-\x1b)0\x0edone\x0f:${t}]`],
     ['G0 = DEC graphics', (t: string) => `\x1b(0[bx:spec-done:42:Nzc:${t}]`],
@@ -1558,8 +1524,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(captured).toHaveLength(0);
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
 
-    // SI shifts GL back to G0 before re-designating it; re-designating alone leaves a locked
-    // shift pointing at the graphics set.
     streamer.triggerLive(`\x0f\x1b(B${buildPhaseSignal('spec-done', TOKEN, 42, 'Nzc')}\n`);
     expect(captured).toHaveLength(1);
   });
@@ -1609,7 +1573,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(captured).toHaveLength(1);
   });
 
-  // Composite charset state: each of these needs more than one action to reach.
   it('stays armed when an unrecognised designation leaves the graphics set in place', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
@@ -1633,7 +1596,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(watcher.has('t1', DEV_AGENT.id)).toBe(true);
   });
 
-  // CSI parameters are numbers, not strings: a leading zero still names the mode.
   it('completes when a leading-zero mode number re-saves the ASCII charset', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });
@@ -1726,7 +1688,6 @@ describe('PhaseSignalWatcher terminal-control semantics (issue #594)', () => {
     expect(captured).toHaveLength(1);
   });
 
-  // UK rewrites only '#', so the marker really is on screen — dropping it would stall the task.
   it('completes on a marker a partially-remapping charset leaves intact', async () => {
     const { watcher, streamer, captured } = makeWatcher();
     await startWatch(watcher, { expectedKinds: 'spec-done', token: TOKEN });

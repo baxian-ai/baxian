@@ -430,7 +430,6 @@ it('prefills the Agent ID placeholder for each group-creation step', async () =>
 it('describes YOLO by the selected runtime real launch flag instead of explaining the mode', async () => {
   await renderReady();
 
-  // no runtime picked yet: falls back to the claude-code flag
   expect(screen.getByText('--permission-mode bypassPermissions')).toBeTruthy();
 
   fireEvent.click(screen.getByRole('radio', { name: /Codex/ }));

@@ -16,12 +16,8 @@ export function parseJsonResponse(stdout: string): unknown {
 
 export function parseJsonPagedPage(stdout: string): unknown[] {
   const s = stdout.trim();
-  // 平台的合法空列表恒输出字面 []；exit 0 + 空 stdout 是工具/管道损坏而非空页，
-  // 当空页会让整源以 ok 进完整性门、漏掉其中的 fail/反馈后照常裁决。
   if (s === '') throw new ResponseParseError('json-paged page has empty stdout (expected a JSON array, e.g. [])');
 
-  // 最常见形态是单个合并数组：整体 parse 命中即免掉逐字符分帧扫描；
-  // 失败才回退扫描器（gh --paginate 式的多数组拼接），错误语义与扫描路径一致。
   try {
     const whole = JSON.parse(s) as unknown;
     if (Array.isArray(whole)) return whole;

@@ -305,7 +305,6 @@ describe('TaskDetail page — layout & agent cards', () => {
     const { container } = open();
     const grid = container.querySelector('.lg\\:grid-cols-2')!;
     expect(grid).toBeTruthy();
-    // items-start keeps agent cards at their natural height (no bottom blank at narrow widths)
     expect(grid.className).toContain('items-start');
     expect(grid.querySelector('section')).toBeTruthy();
     expect(grid.querySelector('aside')).toBeTruthy();
@@ -511,8 +510,6 @@ describe('TaskDetail page — actions & states', () => {
   });
 
   it('does not leak an optimistic override when switching tasks on the same route', async () => {
-    // Cancel resolves to a NEWER updatedAt than task-011 — the stale-override guard
-    // by updatedAt alone would keep showing task-010 on the new URL; remount must win.
     tasksUpdateMock.mockResolvedValue(
       makeTask({ id: 'task-010', title: 'AAA', status: 'cancelled', updatedAt: '2026-05-12T00:00:00.000Z' }),
     );

@@ -111,7 +111,6 @@ import { SHA_HEX_SOURCE } from '../platform/types.js';
 import { bodyDigest } from '../platform/body-digest.js';
 import { validateCommentBody } from '../platform/command-renderer.js';
 
-// 这两个入口冲突证明当前调用已被并发 pass 接管，应判 stale 而不是派发失败。
 const BENIGN_DISPATCH_CONFLICT_CODES = new Set(['dispatch-superseded', 'dispatch-in-flight']);
 
 export function isBenignDispatchConflict(err: unknown): err is ApiError {
@@ -190,10 +189,6 @@ export class DispatchTerminalError extends Error {
 
 export type EnsureSessionMode = 'create' | 'runtime' | 'recover';
 
-export type RedispatchCurrentPhaseGuard = TaskGenerationGuard;
-
-export type RedispatchCurrentPhaseResult = 'dispatched' | 'stale' | 'unsupported';
-
 interface GitPrObservation {
   prNumber: number;
   prUrl?: string;
@@ -230,10 +225,6 @@ export function buildLaunchCommand(agent: AgentRuntimeConfig): string {
       if (yolo) segments.push('--dangerously-bypass-approvals-and-sandbox');
       break;
     case 'opencode':
-      // opencode materializes skills into .agents/skills (shared with codex; see skillSubdirFor).
-      // Its .agents/.claude compatibility scans can't both be disabled by env, so also turn off
-      // the .claude/skills scan — that closes the last collision source: a claude-code agent's
-      // .claude/skills/baxian-* in a shared base repo.
       segments.push('env OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 opencode');
       if (yolo) segments.push('--auto');
       break;
@@ -245,7 +236,6 @@ export function buildLaunchCommand(agent: AgentRuntimeConfig): string {
   if (agent.model) {
     segments.push(`--model ${shellQuote(agent.model)}`);
   }
-  // opencode has no --add-dir; extra roots go through its permission model instead (validator rejects the pairing).
   if (agent.addDirs && agent.addDirs.length > 0 && agent.runtime !== 'opencode') {
     for (const dir of agent.addDirs) {
       segments.push(`--add-dir ${shellQuote(dir)}`);
@@ -254,7 +244,6 @@ export function buildLaunchCommand(agent: AgentRuntimeConfig): string {
   return segments.join(' ');
 }
 
-// cd re-resolves by pathname: a reused pane shell may sit on a deleted-and-recreated cwd inode.
 export function launchCommandIn(dir: string, agent: AgentRuntimeConfig): string {
   return `cd ${shellQuote(dir)} && ${buildLaunchCommand(agent)}`;
 }
@@ -263,8 +252,6 @@ function agentRuntimeKindFor(agent: AgentConfig): AgentConfig['runtime'] {
   return agent.runtime;
 }
 
-// restart-repl drives the REPL back to a shell before relaunch. Each runtime exits
-// via its own slash command (a bare "exit" would be sent to the model as chat text).
 const REPL_EXIT_COMMAND: Record<AgentConfig['runtime'], string> = {
   'claude-code': '/exit',
   codex: '/quit',
@@ -308,11 +295,6 @@ export function skillSubdirFor(runtime: AgentRuntimeConfig['runtime']): string {
   switch (runtime) {
     case 'codex':
     case 'opencode':
-      // opencode has no way to disable its .agents/skills compatibility scan (only .claude via
-      // env), and when it shares a base repo with a codex agent it loads the codex copy of a
-      // same-named baxian-* skill (verified: the .agents copy wins over .opencode). So opencode
-      // materializes into .agents/skills too — both runtimes share one runtime-agnostic copy
-      // (serialized by the same skill-dir lock) instead of colliding on duplicate names.
       return '.agents/skills';
     case 'qodercli':
       return '.qoder/skills';
@@ -358,8 +340,6 @@ export interface AgentManagerDeps {
 const DEFAULT_DISPATCH_ACK_TIMEOUT_MS = 30_000;
 const DEFAULT_NEED_INPUT_RETRY_INTERVAL_MS = 5_000;
 const DEFAULT_DISPATCH_SETTLE_TIMEOUT_MS = 3_000;
-// DELETE runtime cleanup runs while holding the deletion tombstone + rotated lock; an unbounded remote
-// probe/kill would block rollback/finally forever, so every tmux round-trip in it carries this deadline.
 const DELETE_CLEANUP_TIMEOUT_MS = 15_000;
 const PLATFORM_HEAD_SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 
@@ -401,11 +381,8 @@ interface StartSessionOpts extends SessionDispatchOpts {
 
 export interface ContinueSessionOpts extends SessionDispatchOpts {
   postApproveEpisode?: PostApproveEpisodeKey;
-  // In-flight replay: the dirty tree is the holder's own work, so only the branch pointer is asserted.
   allowDirtyWorkdir?: boolean;
-  // Post-arm binding/lock rechecks don't re-verify task state; the replay fence extends to the pre-paste gates.
   guardBeforeInject?: () => Promise<boolean>;
-  // Replay holds CAS on the entry hold generation so a successor hold is never overwritten.
   expectedHold?: { phase?: string; since?: string; nonce?: string };
 }
 
@@ -433,7 +410,6 @@ export function canDispatchWithBinding(binding: AgentBindingFacts | null | undef
   return !binding?.taskId && !binding?.creationToken && binding?.status !== 'awaiting_human';
 }
 
-// 派发期 hold：prompt 从未注入、pane 无在途回合，重派安全；ack_unknown 一类不在此列
 export const RECOVERABLE_QA_DISPATCH_HOLD_PHASES = new Set<string>([
   'checkout-preparation-failed',
   'dirty-workdir',
@@ -445,8 +421,6 @@ export function isRecoverableQaDispatchHold(binding: AgentBindingFacts | null | 
     && RECOVERABLE_QA_DISPATCH_HOLD_PHASES.has(binding.awaitingPhase);
 }
 
-// REPL 忙碌是常态（QA 回合分钟级、dev 修完即推），遇忙派发不落 hold 而登记待补派；
-// 内存态即可：进程重启丢失后由对账兜底路径按 PENDING_IDLE 观察恢复。
 export interface PendingDispatchRetry {
   kind: 'qa-recheck' | 'dev-fix';
   agentId: string;
@@ -487,8 +461,6 @@ function shouldReleaseHeldBinding(
 ): boolean {
   if (state.awaitingPhase != null && REGREET_REQUIRED_HOLD_PHASES.has(state.awaitingPhase)) return false;
   const taskIsTerminal = !!boundTask && TERMINAL_STATUSES.includes(boundTask.status);
-  // 任务已退回 verdict 门禁且当前持有者不是本 agent：这次绑定是转码失败的残留
-  // （fresh-acquire 释放被脏树挡下），Resume 时补完释放，否则 dev 被永久占住
   const staleCodeHandoff =
     state.awaitingPhase != null
     && CHECKOUT_HOLD_PHASES.has(state.awaitingPhase)
@@ -553,10 +525,8 @@ export class AgentManager {
   protected cancelInterruptGuardWaitMs = DEFAULT_DISPATCH_ACK_TIMEOUT_MS + 5_000;
   private markCompleteInFlight = new Set<string>();
   private specVerdictInFlight = new Set<string>();
-  // 引用计数：cancelTask 与 startCreatedTaskSession 的清理段可合法并存（启动期 Stop），先完成者不得清掉后者的 guard。
   private cancelCleanupInFlight = new Map<string, number>();
   private deletionInFlight = new Set<string>();
-  // Diverged ids live in a separate set the DELETE finally never clears: a post-commit replaceConfig throw must fail-stop for the whole process.
   private divergedAgents = new Set<string>();
   private deletionGeneration = new Map<string, number>();
   private compactInFlight = new Set<string>();
@@ -706,7 +676,6 @@ export class AgentManager {
     });
   }
 
-  // 配置层 intervention（无 agent/task 上下文）：如 repo-conflict——离线绕过锁的同 repo 冲突项目。
   async emitConfigIntervention(
     projectId: string,
     data: Record<string, unknown> & { phase: string },
@@ -800,7 +769,6 @@ export class AgentManager {
     return null;
   }
 
-  // Scan + claim share createTask/dispatchPendingTask's withTaskLock, so a delete can't pass an open-task scan that a concurrent commit then orphans.
   async scanOpenThenClaimDeletion(targets: readonly string[]): Promise<DeletionClaimOutcome> {
     return this.withTaskLock(async () => {
       for (const id of targets) {
@@ -830,7 +798,6 @@ export class AgentManager {
     for (const id of agentIds) this.deletionInFlight.delete(id);
   }
 
-  // strict 读取：守卫扫描不能把读失败折叠成「无活跃任务」放行提交
   async listActiveParticipantSeats(): Promise<Array<{
     taskId: string;
     projectId: string;
@@ -856,7 +823,6 @@ export class AgentManager {
       });
   }
 
-  // A completed DELETE keeps blocking this id past tombstone release; the process dies with any suspended flow, so no persistence is needed.
   bumpDeletionGeneration(agentId: string): void {
     this.deletionGeneration.set(agentId, this.deletionGenerationOf(agentId) + 1);
   }
@@ -865,7 +831,6 @@ export class AgentManager {
     return this.deletionGeneration.get(agentId) ?? 0;
   }
 
-  // Boolean tombstone alone is ABA-prone (delete→recreate same id); commits must hold both the tombstone-clear and an unchanged generation from entry.
   private deletionGateOpen(agentId: string, genAtEntry: number): boolean {
     return !this.isDeletionInFlight(agentId) && this.deletionGenerationOf(agentId) === genAtEntry;
   }
@@ -874,7 +839,6 @@ export class AgentManager {
     return this.deletionInFlight.has(agentId) || this.divergedAgents.has(agentId);
   }
 
-  // replaceConfig 抛错后的 fail-stop：进入 divergedAgents（不随 DELETE finally 释放），重建/分配持续被拒直到重启。
   retainTombstoneForDivergence(agentId: string): void {
     this.divergedAgents.add(agentId);
   }
@@ -905,7 +869,6 @@ export class AgentManager {
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
 
-    // Side-effects run inside the lifecycle section (serialized with DELETE cleanup) behind a re-checked generation gate; the entry gate is only a fast-fail.
     return this.runUnderSessionLifecycle(agentId, () =>
       this.ensureSessionLocked(tmux, runner, agent, project, agentId, mode, genAtEntry),
     );
@@ -940,7 +903,6 @@ export class AgentManager {
         `ensureWorkdir failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    // Gate the Workdir write too: a DELETE→recreate during the slow ensureWorkdir must not persist a stale Workdir onto the new incarnation.
     assertGenerationOpen();
     await this.agentStore.update(agentId, (existing) => {
       if (!existing || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
@@ -967,7 +929,6 @@ export class AgentManager {
           `if tmux is missing, ${tmuxInstallHint(agent.projectId)}`,
       );
     }
-    // Re-gate after the probe await: a DELETE may have tombstoned mid-probe, and build/adopt would else create a session cleanup can only reap later.
     assertGenerationOpen();
     if (!snapshot) {
       return this.buildFreshSession(tmux, agent, agentId, workdir, workdir);
@@ -1013,11 +974,6 @@ export class AgentManager {
     const subdir = skillSubdirFor(agent.runtime);
     const destRoot = `${workdir}/${subdir}`;
     await this.excludeInjectedSkills(runner, workdir, subdir);
-    // opencode's skills are model-invoked, not slash commands; the dispatched /<skill> sigil
-    // reaches the model as message text and it loads the skill from .opencode/skills. We do NOT
-    // wrap skills as .opencode/commands: opencode expands $ARGUMENTS in a command template and
-    // would execute a `!`cmd`` / inline a @path embedded in an untrusted task title/description
-    // before the skill runs. Message-body payloads are not expanded, so this path is injection-safe.
     await this.runUnderSkillDirLock(this.skillDirLockKey(agent, workdir), async () => {
       await this.ensureSkillDirSafe(runner, workdir, subdir, [
         ...this.skillRegistry.names(),
@@ -1031,7 +987,6 @@ export class AgentManager {
     });
   }
 
-  // A rollback only kills if no adoption bumped the generation since its create.
   private sessionLifecycleChain = new Map<string, Promise<unknown>>();
   private adoptGeneration = new Map<string, number>();
 
@@ -1046,7 +1001,6 @@ export class AgentManager {
     return cur;
   }
 
-  // Inside the lifecycle lock, a generation bump since create means handoff — stand down.
   private async rollbackCreatedSession(
     agentId: string,
     partial: { sessionRef?: TmuxSessionRef; genAtCreate?: number },
@@ -1094,7 +1048,6 @@ export class AgentManager {
           return;
         }
         const runner = this.createRunnerFor(cfg);
-        // Rollback may run before or after the claim write, so accept empty-or-ours.
         const outcome = await new TmuxManager(runner).killSessionRef(ref, { kind: 'emptyOr', claim: agentId });
         if (outcome === 'refused') {
           console.warn(
@@ -1159,7 +1112,7 @@ export class AgentManager {
     const top = subdir.split('/')[0];
     const keep = keepNames.map((n) => `! -name ${shellQuote(n)}`).join(' ');
     const inner =
-      // canonicalSelfGuard (cd+pwd -P) rejects a rebound MIDDLE ancestor, not just a symlinked leaf, so the find/rm can't escape.
+      // Keep the canonical Workdir check and find/rm in one command to fail closed on a rebound ancestor.
       `${canonicalSelfGuard(workdir)} && ` +
       `cd ${shellQuote(workdir)} && ` +
       `for d in ${top} ${subdir}; do if [ -L "$d" ]; then ` +
@@ -1200,7 +1153,6 @@ export class AgentManager {
     subdir: string,
   ): Promise<void> {
     const inner =
-      // canonicalSelfGuard (cd+pwd -P) rejects a rebound MIDDLE ancestor too, so the info/exclude write can't escape.
       `${canonicalSelfGuard(workdir)} && ` +
       `cd ${shellQuote(workdir)} && ` +
       `if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo BX_SKILLS_NON_GIT; exit 0; fi; ` +
@@ -1239,8 +1191,6 @@ export class AgentManager {
     ];
   }
 
-  // A name (or even a bare $id) can rebind to a same-name successor mid-flight;
-  // every option write goes through the identity-checked by-ref batch.
   private async setSessionOptions(
     tmux: TmuxManager,
     agentId: string,
@@ -1256,7 +1206,6 @@ export class AgentManager {
     }
   }
 
-  // Snapshot's claim check is a filter; the returned PaneRef re-proves generation+claim on every op.
   private async resolveClaimedPane(
     tmux: TmuxManager,
     agentId: string,
@@ -1301,7 +1250,6 @@ export class AgentManager {
     try {
       createdRef = await tmux.createSession(agentId, sessionDir);
       createdSession = true;
-      // First batch writes the claim itself, so it must prove the session is still unclaimed.
       await this.setSessionOptions(tmux, agentId, createdRef, [
         ['@baxian-agent-id', agentId],
         ['@baxian-runtime', agent.runtime],
@@ -1503,7 +1451,6 @@ export class AgentManager {
   async regreetHeldAgent(agentId: string): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) return false;
-    // Pin the incarnation before reading state so a DELETE→recreate reusing %0 can't route the greeting handshake to the new session.
     const genAtEntry = this.deletionGenerationOf(agentId);
     const state = await this.agentStore.get(agentId);
     if (state?.awaitingPhase !== 'greeting_failed') return false;
@@ -1636,7 +1583,6 @@ export class AgentManager {
     if (!(err instanceof EnsureSessionError) || !err.partial.dialogPending) {
       return false;
     }
-    // The error belongs to the caller's incarnation; gate every side-effect so a DELETE→recreate reusing %0 can't write the stale dialog/fail onto the new agent.
     const gateOpen = (): boolean =>
       opts.expectedGeneration === undefined || this.deletionGateOpen(agentId, opts.expectedGeneration);
     let state = await this.agentStore.get(agentId);
@@ -1905,7 +1851,6 @@ export class AgentManager {
     });
   }
 
-  // Runs inside the caller's lifecycle section (ensureSessionLocked routed the snapshot here).
   private async adoptOrRestartSessionLocked(
     tmux: TmuxManager,
     runner: CommandRunner,
@@ -2093,8 +2038,6 @@ export class AgentManager {
     }
   }
 
-  // Frees a bootstrap blocked on its predecessor's half-created session (nonce
-  // env present but claim never written); anything else is left alone.
   private async reclaimHalfCreatedSession(
     tmux: TmuxManager,
     agentId: string,
@@ -2123,7 +2066,6 @@ export class AgentManager {
     if (!halfCreated) return false;
     let outcome: Awaited<ReturnType<TmuxManager['killSessionRef']>>;
     try {
-      // claim-still-empty rides the kill itself — a claim racing the probes makes the server refuse.
       outcome = await tmux.killSessionRef(snapshot.ref, { kind: 'unclaimed' });
     } catch (err) {
       throw new EnsureSessionError(
@@ -2177,7 +2119,6 @@ export class AgentManager {
     }
   }
 
-  // Create-on-null only under this predicate (evaluated inside the store's serialized commit): closes the delete→recreate ABA yet keeps lazy first-allocation for config-only agents.
   private bindingInitPredicate(agentId: string, genAtEntry: number): boolean {
     return this.deletionGateOpen(agentId, genAtEntry) && this.getAgentConfig(agentId) !== undefined;
   }
@@ -2186,8 +2127,6 @@ export class AgentManager {
     agentId: string,
     taskId: string,
     phase: string,
-    // 锁代必须由 acquire 原子交出：事后重读 claim/binding 的窗口里并发派发方可以
-    // release + re-acquire 同一 agent/同一 task，读到的会是 successor 的代
     opts: { onAcquired?: (lockToken: string) => void } = {},
   ): Promise<boolean> {
     const genAtEntry = this.deletionGenerationOf(agentId);
@@ -2264,8 +2203,6 @@ export class AgentManager {
       expectedPostApproveEpisode?: PostApproveEpisodeKey;
       expectedHold?: { phase: string | undefined; since: string | undefined; nonce: string | undefined };
       expectedLockToken?: string;
-      // 调用方承诺把「忙碌拒绝」转成待补派登记时才置位；否则遇忙仍按原样落 hold 告警，
-      // 免得终态/清理路径静默留下绑定
       deferWhenBusy?: boolean;
     } = {},
   ): Promise<boolean> {
@@ -2340,15 +2277,12 @@ export class AgentManager {
           return false;
         }
       }
-      // expectedHold 是 hold 世代快照的严格 CAS（全 undefined 表示“期望无 hold”）：
-      // hold 消失（被并发 Resume 清掉）或换代同样意味着接管，不得继续释放
       const matchesExpectedHold = (binding: AgentBindingFacts): boolean => {
         const held = binding.status === 'awaiting_human';
         return (held ? binding.awaitingPhase : undefined) === opts.expectedHold!.phase
           && (held ? binding.awaitingSince : undefined) === opts.expectedHold!.since
           && (held ? binding.awaitingNonce : undefined) === opts.expectedHold!.nonce;
       };
-      // 世代门前置：hold 换代时任何 pane/workdir 副作用都不得发生（末尾 CAS 只兜最后窗口）
       if (opts.expectedHold && !matchesExpectedHold(state)) {
         console.warn(
           `[AgentManager] releaseAgentForTask: agent ${agentId} hold generation changed or cleared before release; refusing`,
@@ -2378,7 +2312,6 @@ export class AgentManager {
         await this.agentStore.update(agentId, (latest) => {
           if (!latest) return AGENT_STORE_NOOP;
           if (opts.clearAwaitingHuman && latest.status === 'awaiting_human') {
-            // The hold-generation CAS lives inside the atomic update: a hold written after any pre-read survives.
             if (
               opts.expectedHold
               && (
@@ -2400,8 +2333,6 @@ export class AgentManager {
               ...(latest.workdir !== undefined ? { workdir: latest.workdir } : {}),
               ...(latest.startedAt !== undefined ? { startedAt: latest.startedAt } : {}),
               ...(latest.creationToken !== undefined ? { creationToken: latest.creationToken } : {}),
-              // Release voids the open question: strip the watermark, bump the epoch so
-              // any in-flight/queued commit of the old generation fences server-side.
               needInput: { epoch: (latest.needInput?.epoch ?? 0) + 1 },
             };
             return cleared;
@@ -2439,7 +2370,6 @@ export class AgentManager {
           ) {
             return false;
           }
-          // 释放中被写入的新 hold（如 ack_unknown）比 cleanup 失败信息更关键，不得覆盖
           if (!holdMatchesExpected(latest)) {
             console.warn(
               `[AgentManager] releaseAgentForTask: agent ${agentId} hold generation changed during release; not overwriting with branch-cleanup-pending`,
@@ -2518,7 +2448,6 @@ export class AgentManager {
             sessionConfirmedAbsent = true;
           }
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
-          // 仍重验持久化世代，防护当前进程租约之外的状态写入。
           if (opts.expectedHold) {
             const beforeBranchOps = await this.agentStore.get(agentId);
             if (!beforeBranchOps || !matchesExpectedHold(beforeBranchOps)) {
@@ -2596,9 +2525,6 @@ export class AgentManager {
           }
           await this.assertTaskGeneration(agentId, expectedTaskId, lockToken, releaseWorkdir);
         } catch (err) {
-          // REPL 忙碌不是清理失败：pane 完好、绑定未动、非 dev 无分支凭据可留。落
-          // branch-cleanup-pending（不在可恢复白名单）会把常态忙碌变成永久 hold（#558 验收 1），
-          // 故拒绝释放而不落 hold，由调用方按「仍绑定且未 hold」判定重新排队本 pass
           if (opts.deferWhenBusy && err instanceof ReplNotReadyError && cfg.role !== 'dev') {
             console.warn(
               `[AgentManager] releaseAgentForTask: agent ${agentId} REPL is busy; refusing release without a hold ` +
@@ -2627,7 +2553,6 @@ export class AgentManager {
         ) {
           return AGENT_STORE_NOOP;
         }
-        // 世代 CAS 在原子写入内判定：预读后被重写或清除的 hold 都不得被这次释放清掉
         if (opts.expectedHold && !matchesExpectedHold(existing)) {
           holdGenerationChanged = true;
           return AGENT_STORE_NOOP;
@@ -2754,7 +2679,6 @@ export class AgentManager {
       );
       if (candidateTasks.length === 0) continue;
       const candidateByBranch = new Map(candidateTasks.map(task => [task.branch!, task]));
-      // Pin the incarnation before the first state/workdir/refs snapshot so a DELETE→same-id recreate (possibly a different workdir) in the read→gate window is rejected.
       const genAtEntry = this.deletionGenerationOf(cfg.id);
       const state = await this.agentStore.get(cfg.id);
       if (!state || !canDispatchWithBinding(state)) continue;
@@ -2847,21 +2771,11 @@ export class AgentManager {
     }
   }
 
-  // ---- need-input watermark: epoch-fenced monotonic persistence + retry convergence ----
-
   private readonly needInputRetry = new Map<string, { askSeq: number; answeredSeq: number }>();
   private readonly needInputRetryInFlight = new Set<string>();
   private readonly gitReviewRecoveryAlerted = new Set<string>();
-  // Watermark writes currently in the store chain. A restore bump snapshots these along
-  // with the queue: an answer whose write has not settled yet would otherwise be invisible
-  // to the migration and its error-enqueue would land after the arm already cleared the
-  // queue — deleting the only proof the user answered.
   private readonly needInputWritesInFlight = new Map<number, NeedInputCommitIntent>();
   private needInputWriteSeq = 0;
-  // Serializes the probe→bump→queue-clear section of concurrent arms for one
-  // (agentId, taskId): without it a stale replay probed before a successor's bump can
-  // itself bump afterwards, ghost-fencing the installed successor. All locked steps are
-  // bounded (memory probe + one store update); subscribe stays outside the lock.
   private readonly needInputArmLocks = new Map<string, Promise<void>>();
   private needInputRetryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -2877,12 +2791,6 @@ export class AgentManager {
     return { agentId, taskId, epoch };
   }
 
-  // Standard commit entry: one agentStore.update, NEVER called from inside another
-  // updater (the store's per-id chain is non-reentrant).
-  // The ledger entry lives until the result is fully handed over — an error is IN the
-  // retry queue before deregistration, in the same synchronous continuation. Splitting
-  // those two across promise jobs would open a window where neither the ledger nor the
-  // queue holds the intent and a concurrent restore snapshot loses the answer.
   async commitNeedInputWatermark(intent: NeedInputCommitIntent): Promise<NeedInputCommitResult> {
     const writeId = ++this.needInputWriteSeq;
     this.needInputWritesInFlight.set(writeId, intent);
@@ -2952,8 +2860,6 @@ export class AgentManager {
     this.ensureNeedInputRetryTimer();
   }
 
-  // ok deletes only when the queued item is still covered by what was written
-  // (a concurrent edge may have raised it mid-flight); fenced is terminal either way.
   private settleNeedInputRetry(
     key: string,
     wroteAskSeq: number,
@@ -3044,9 +2950,6 @@ export class AgentManager {
     return owed;
   }
 
-  // Only the generation this arm directly succeeds (bumps are +1 and serialized per key).
-  // Anything older was already superseded — a fresh arm in between stripped its question
-  // on purpose, and transplanting it would relight a prompt nobody asked.
   private collectPredecessorNeedInputDelta(
     agentId: string,
     taskId: string,
@@ -3087,9 +2990,6 @@ export class AgentManager {
     return run;
   }
 
-  // 'restore' must also merge queued retry seqs of the CURRENT persisted epoch: after
-  // session-gone the queue can hold the only proof an answer happened (the entry is
-  // gone, so needInputInherit has nothing to merge), and the arm clears the queue.
   private async bumpNeedInputEpochForArm(
     agentId: string,
     taskId: string,
@@ -3098,10 +2998,6 @@ export class AgentManager {
     wm: { epoch: number; askSeq: number; answeredSeq: number } | null;
     bumped: boolean;
   }> {
-    // Contributions are collected INSIDE the updater: it runs when the store chain
-    // reaches this bump, so an answer whose commit started while the bump was queued
-    // (registered in the ledger, or already error-queued) is still visible. A snapshot
-    // taken at call time would miss exactly that window.
     const collectContributions = (): Map<number, { askSeq: number; answeredSeq: number }> => {
       const queued = new Map<number, { askSeq: number; answeredSeq: number }>();
       if (mode !== 'restore') return queued;
@@ -3147,16 +3043,10 @@ export class AgentManager {
       });
     } catch (err) {
       console.warn(`[AgentManager] needInput epoch bump failed (agent=${agentId} task=${taskId}):`, err);
-      // Fall back to the persisted watermark for a restore: without it the entry would
-      // start at 0/0 and swallow the answer to a question that is still open in the
-      // store, leaving the badge lit forever. No bump means no generation advance —
-      // the caller must not treat this as a fresh generation.
       if (mode === 'restore') {
         try {
           const cur = await this.agentStore.get(agentId);
           if (cur?.taskId === taskId && cur.needInput) {
-            // Same-generation intents still owed to the store hold questions the
-            // persisted watermark has not caught up with; merge them in.
             const owed = this.collectSameEpochNeedInput(agentId, taskId, cur.needInput.epoch);
 
             return {
@@ -3177,8 +3067,6 @@ export class AgentManager {
     return { wm, bumped: wm !== null };
   }
 
-  // Single entry for arming phase-signal watches — every path must flow through the
-  // epoch bump, or stale-generation commits could survive the re-arm.
   private async startPhaseSignalWatch(
     args: Omit<PhaseSignalWatcherStartArgs, 'needInput' | 'needInputInherit'>
       & { needInputMode?: 'fresh' | 'restore' },
@@ -3187,8 +3075,6 @@ export class AgentManager {
     const { needInputMode, ...rest } = args;
     const mode = needInputMode ?? 'restore';
     const watcher = this.phaseSignalWatcher;
-    // Claim ownership before bumping: a rejected arm must not bump (it would fence the
-    // owner), and the claim keeps this arm visible to later probes while it subscribes.
     const gateResult = await this.withNeedInputArmLock(args.agentId, args.taskId, async () => {
       const claim = watcher.claimArm?.({
         taskId: args.taskId,
@@ -3200,15 +3086,11 @@ export class AgentManager {
       });
       if (claim === null) return 'rejected' as const;
       const bump = await this.bumpNeedInputEpochForArm(args.agentId, args.taskId, mode);
-      // Only a real generation advance may drop the queue: same-generation intents
-      // (bump failed, watermark read back) are still owed to the store.
       if (bump.bumped) this.clearNeedInputRetryFor(args.agentId, args.taskId);
       return { ...bump, claim };
     });
     if (gateResult === 'rejected') return false;
     const { wm, bumped, claim } = gateResult;
-    // Same synchronous section as the bump result: old-generation answers must not slip
-    // between the bump and the handoff (start() migrates the predecessor synchronously).
     if (wm !== null && bumped && mode === 'restore') {
       const delta = this.collectPredecessorNeedInputDelta(args.agentId, args.taskId, wm.epoch);
       if (delta) {
@@ -3221,14 +3103,10 @@ export class AgentManager {
         });
       }
     }
-    // wm === null (no binding / store error): arm anyway with badge commits disabled —
-    // the badge is display-only, the signal watch drives task progress.
     try {
       return await watcher.start({
         ...rest,
         ...(claim != null ? { armClaimId: claim } : {}),
-        // Inherit is about restore semantics, not about having a generation: a degraded
-        // restore still has to keep the predecessor's pending question in memory.
         needInputInherit: mode === 'restore',
         ...(wm !== null ? { needInput: wm } : {}),
       });
@@ -3237,10 +3115,6 @@ export class AgentManager {
     }
   }
 
-  // Web-fallback confirm: settles the newest known question (store ∪ retry queue) as
-  // answered in ONE store update — usable when no watch entry exists (pre-recovery,
-  // arm failure, post-stop). Queue contributions are snapshotted synchronously; the
-  // updater derives everything else from `existing`, so no nested store calls.
   private async confirmNeedInputAnswered(agentId: string): Promise<void> {
     const queueAsk = new Map<string, number>();
     for (const [key, wm] of this.needInputRetry) {
@@ -3290,15 +3164,7 @@ export class AgentManager {
     }
   }
 
-  // The user typed into the agent's terminal — its open question counts as answered.
-  // The store fallback runs only when no watch entry exists (pre-recovery, arm failure,
-  // post-stop): with a live entry it would race the entry's in-flight writes and could
-  // confirm an ask that arrived after this input.
   async notifyHumanTerminalInput(agentId: string): Promise<void> {
-    // Rearm first: it settles entry state synchronously, so a question printed during
-    // this call cannot be confirmed by mistake. The binding read only decides whether a
-    // watcher of the CURRENT task took the input — a leftover entry of a finished task
-    // must not suppress the store fallback.
     const handled = await this.phaseSignalWatcher?.rearmNeedInput(agentId);
     let taskId: string | undefined;
     try {
@@ -3498,12 +3364,9 @@ export class AgentManager {
       if (
         (state.awaitingPhase === 'dirty-workdir' || state.awaitingPhase === 'checkout-preparation-failed')
         && boundTask && ACTIVE_TASK_STATUSES.has(boundTask.status)
-        // verdict 门禁状态没有在途派发：清掉 hold 后由 spec verdict 重新走完整转码，Resume 放行
         && boundTask.status !== 'spec-ready' && boundTask.status !== 'max_rounds'
       ) {
         if (state.taskId && boundTask.qaAgentId === agentId) {
-          // 停驻的 review pass 已死（任务离开 review）：重派会伪造新 pass，只清 hold 并释放绑定；
-          // 快照 hold/task 世代供释放路径 CAS，且不得借用 cancel-cleanup 的绕行凭据
           if (boundTask.status !== 'review') {
             return {
               resumed: true,
@@ -3693,8 +3556,6 @@ export class AgentManager {
           ).catch(() => undefined);
           return { resumed: false, releasedBinding: false, reason };
         }
-        // 重派与首派同样不经 startSession 的 post-ack finalize：残留的 bootstrap 标记
-        // 会让下一次 recover 把已送达的 code prompt 再判成未送达
         const lockToken = (await this.agentStore.get(agentId))?.lockToken;
         await this.finalizeReplayedBootstrap(agentId, result.redispatchCodeTaskId, 'code', lockToken);
       } catch (err) {
@@ -3759,7 +3620,6 @@ export class AgentManager {
         console.error(`[AgentManager] resumeAgent review redispatch failed for ${agentId}:`, err);
         const reason = `QA review redispatch on Resume failed: ${err instanceof Error ? err.message : String(err)}`;
         const reviewTaskId = result.redispatchReviewTaskId;
-        // 锁代未变（未被 successor re-acquire）才允许补挂；markAwaitingHuman 内的 CAS 原子复核同一条件
         const restoreHoldIfStillOurs = async (phase: string, holdReason: string): Promise<void> => {
           const after = await this.agentStore.get(agentId);
           if (
@@ -3773,7 +3633,6 @@ export class AgentManager {
             });
           }
         };
-        // handled 只代表 startSession 已尝试落 hold；落库可能已失败，必须核实并按需补挂
         if (err instanceof EnsureSessionError && err.partial.handled) {
           try {
             await restoreHoldIfStillOurs(result.previousPhase ?? 'checkout-preparation-failed', reason);
@@ -3788,7 +3647,6 @@ export class AgentManager {
             };
           }
         }
-        // ack_unknown：prompt 可能已在跑，必须恢复 ack hold 的可见性，而非按普通失败补挂 checkout hold
         if (err instanceof DispatchTerminalError && err.reason === 'ack_unknown') {
           try {
             await restoreHoldIfStillOurs(
@@ -3806,7 +3664,6 @@ export class AgentManager {
             };
           }
         }
-        // pass 被接管（token 轮换或任务离开 review）说明该 pass 已死，补挂会把新 pass 的 QA 打成 hold
         let passSuperseded = false;
         let recoveryReadFailed = false;
         try {
@@ -3819,7 +3676,6 @@ export class AgentManager {
         if (passSuperseded) return { resumed: false, releasedBinding: false, reason };
         try {
           if (recoveryReadFailed) {
-            // 读失败时无法证明接管，优先恢复可见性：锁代/绑定 CAS 全部由 markAwaitingHuman 原子判定
             await this.markAwaitingHuman(
               agentId,
               result.previousPhase ?? 'checkout-preparation-failed',
@@ -4148,7 +4004,6 @@ export class AgentManager {
       const out: TaskState[] = [];
       for (const t of tasks) {
         const bound = t.agentId === agentId || t.qaAgentId === agentId;
-        // spec-ready 不豁免：approve/打回都依赖 dev Workdir，dev 丢失后停驻只是假活
         if (t.status === 'merge-ready') continue;
         if (ACTIVE_TASK_STATUSES.has(t.status) && bound) {
           const failedTask = this.stripGitStatusScopedState(t, 'failed');
@@ -4224,7 +4079,6 @@ export class AgentManager {
   }
 
   async restartReplOnly(agentId: string, opts: { expectedGeneration?: number } = {}): Promise<void> {
-    // Re-verify the entry generation so a request that slept across a DELETE→recreate can't restart the NEW incarnation's REPL (claim check alone can't tell).
     const genAtEntry = opts.expectedGeneration ?? this.deletionGenerationOf(agentId);
     if (!this.deletionGateOpen(agentId, genAtEntry)) {
       throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
@@ -4260,7 +4114,6 @@ export class AgentManager {
 
     const project = this.getProjectConfig(cfg.projectId);
     if (!project) throw new Error(`restart-repl: project ${cfg.projectId} does not exist`);
-    // Re-verify before Workdir/skill/session-option side-effects: pane writes fail-closed on a stale PaneRef, but ensureWorkdir/skills would write old-cfg files under a recreated id.
     if (!this.deletionGateOpen(agentId, genAtEntry)) {
       throw new Error(`restart-repl: agent ${agentId} is being deleted or was recreated; aborting`);
     }
@@ -4293,7 +4146,6 @@ export class AgentManager {
     };
     await this.runUnderSkillDirLock(this.skillDirLockKey(cfg, workdir), relaunch);
 
-    // Final writeback is generation-gated too, so a DELETE→recreate reusing %0 can't persist the old incarnation's paneId onto the new agent.
     await this.agentStore.update(agentId, (state) => {
       if (!state || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
       return {
@@ -4304,7 +4156,6 @@ export class AgentManager {
     });
   }
 
-  // Holds only the pass captured in the task tuple: a successor pass (rotated token/phase/status) is never overwritten.
   async holdReplayFailureIfCurrent(
     agentId: string,
     taskAtEntry: Pick<TaskState, 'id' | 'status' | 'phase' | 'signalToken'>,
@@ -4326,7 +4177,6 @@ export class AgentManager {
         expectedTaskId: taskAtEntry.id,
         expectedHold: entryHold,
       })) return true;
-      // Entry hold gone (Resume raced): write over the empty generation, never over a foreign hold.
       if (await this.markAwaitingHuman(agentId, holdPhase, reason, {
         expectedTaskId: taskAtEntry.id,
         expectedHold: { phase: undefined, since: undefined, nonce: undefined },
@@ -4461,16 +4311,10 @@ export class AgentManager {
   async redispatchTaskPromptAfterReplRestart(
     agentId: string,
     taskId: string,
-    expected?: RedispatchCurrentPhaseGuard,
   ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     const loadedTask = await this.taskStore.get(taskId);
     if (!agent || !loadedTask || !TASK_OWNER_ROLES.has(agent.role)) return false;
-    if (expected && !taskMatchesGeneration(loadedTask, expected)) return false;
-    const rootGenerationMatches = (
-      fresh: TaskState,
-      signalToken: string | undefined = expected?.signalToken,
-    ): boolean => !expected || taskMatchesGeneration(fresh, { ...expected, signalToken });
     const task: TaskState = loadedTask;
     if (task.agentId !== agentId) return false;
     if (task.devAgentId !== agentId) return false;
@@ -4486,8 +4330,7 @@ export class AgentManager {
       return fresh?.agentId === agentId
         && fresh.status === task.status
         && fresh.phase === task.phase
-        && fresh.signalToken === signalToken
-        && rootGenerationMatches(fresh, signalToken);
+        && fresh.signalToken === signalToken;
     };
     const clearEntryHold = async (): Promise<boolean> => this.withTaskLock(async () => {
       if (!(await taskStillCurrent())) return false;
@@ -4504,7 +4347,6 @@ export class AgentManager {
         phase,
         reason,
         entryHold,
-        async fresh => rootGenerationMatches(fresh, task.signalToken),
       );
 
     try {
@@ -4513,7 +4355,7 @@ export class AgentManager {
           agentId,
           task,
           entryHold,
-          { clearEntryHold, holdReplayFailure, rootGenerationMatches },
+          { clearEntryHold, holdReplayFailure },
         );
       }
 
@@ -4542,7 +4384,6 @@ export class AgentManager {
             || fresh.status !== task.status
             || fresh.phase !== task.phase
             || fresh.signalToken !== signalToken
-            || !rootGenerationMatches(fresh, signalToken)
           ) return false;
           const rotatePendingPr = mapped.expectedKinds.includes('pr-created')
             && fresh.pendingPrSignalToken === signalToken;
@@ -4561,7 +4402,6 @@ export class AgentManager {
           'restart-redispatch-failed',
           reason,
           entryHold,
-          async fresh => rootGenerationMatches(fresh, newToken),
         ),
         continueWith: (newToken, fence) => this.continueSession(taskId, agentId, phase, {
           ...opts,
@@ -4591,7 +4431,6 @@ export class AgentManager {
       };
 
       if (task.status === 'in_progress' && task.phase === undefined && agent.role === 'dev') {
-        // An undelivered bootstrap never started work, so the fresh-dispatch clean gate still applies.
         const delivered = (await this.agentStore.get(agentId))?.bootstrappingTaskId !== taskId;
         return await replayInitialBootstrap('develop', {
           ...(delivered ? { allowDirtyWorkdir: true } : {}),
@@ -4615,7 +4454,6 @@ export class AgentManager {
         });
       }
 
-      // A direct (no-SDD) pass never persists a phase, so fixing + undefined is the plain code-feedback round.
       if (
         task.status === 'fixing'
         && (task.phase === 'code' || task.phase === undefined)
@@ -4629,7 +4467,6 @@ export class AgentManager {
 
       return false;
     } catch (err) {
-      // A post-entry throw may land after clearEntryHold; only a tuple-checked hold on the live generation is safe.
       const message = err instanceof Error ? err.message : String(err);
       if (await holdReplayFailure(
         'restart-redispatch-failed',
@@ -4641,48 +4478,6 @@ export class AgentManager {
     }
   }
 
-  async redispatchCurrentTaskPhase(
-    taskId: string,
-    expected: RedispatchCurrentPhaseGuard,
-  ): Promise<RedispatchCurrentPhaseResult> {
-    const current = await this.taskStore.get(taskId);
-    if (!current || !taskMatchesGeneration(current, expected)) return 'stale';
-    if (current.status === 'review') {
-      let changedByRedispatch = false;
-      try {
-        await this.dispatchReviewToQa(taskId, {
-          fromStatus: ['review'],
-          bumpRound: false,
-          expectSignalToken: current.signalToken,
-          expectPhase: current.phase,
-          expectedTask: expected,
-          onSideEffect: () => { changedByRedispatch = true; },
-        });
-        return 'dispatched';
-      } catch (err) {
-        if (!changedByRedispatch && isBenignDispatchConflict(err)) return 'stale';
-        if (!changedByRedispatch
-          && err instanceof ApiError
-          && err.code === 'dispatch-unsupported') {
-          return 'unsupported';
-        }
-        if (changedByRedispatch) throw err;
-        const fresh = await this.taskStore.get(taskId);
-        if (!fresh || !taskMatchesGeneration(fresh, expected)) return 'stale';
-        throw err;
-      }
-    }
-    const redispatched = await this.redispatchTaskPromptAfterReplRestart(
-      current.agentId,
-      taskId,
-      expected,
-    );
-    if (redispatched) return 'dispatched';
-    const fresh = await this.taskStore.get(taskId);
-    return !fresh || !taskMatchesGeneration(fresh, expected) ? 'stale' : 'unsupported';
-  }
-
-  // approved hosts the post-approve holder pass.
   private async replayApprovedHolderAfterReplRestart(
     agentId: string,
     task: TaskState,
@@ -4690,11 +4485,10 @@ export class AgentManager {
     holdGen: {
       clearEntryHold: () => Promise<boolean>;
       holdReplayFailure: (phase: string, reason: string) => Promise<boolean>;
-      rootGenerationMatches: (fresh: TaskState, signalToken?: string) => boolean;
     },
   ): Promise<boolean> {
     const taskId = task.id;
-    const { clearEntryHold, holdReplayFailure, rootGenerationMatches } = holdGen;
+    const { clearEntryHold, holdReplayFailure } = holdGen;
     if (task.postApproveRevoked) {
       return holdReplayFailure(
         'restart-redispatch-failed',
@@ -4712,7 +4506,6 @@ export class AgentManager {
         );
       }
       if (stored.approvedHeadSha !== task.postApproveHeadSha) {
-        // Provably a dead episode's residue: retire it by token, then rebuild for the current head.
         await this.clearPostApproveCompletionIfMatches(
           taskId,
           { generation: stored.generation, token: stored.token, headSha: stored.approvedHeadSha },
@@ -4731,7 +4524,6 @@ export class AgentManager {
       && fresh.status === task.status
       && fresh.phase === task.phase
       && fresh.signalToken === task.signalToken
-      && rootGenerationMatches(fresh, task.signalToken)
       && fresh.postApproveRevoked === undefined
       && fresh.postApproveHeadSha === task.postApproveHeadSha
       && fresh.postApproveGeneration === task.postApproveGeneration
@@ -4816,7 +4608,6 @@ export class AgentManager {
       const runner = this.createRunnerFor(cfg);
       const tmux = new TmuxManager(runner);
 
-      // No releaseAgentForTask: the binding dies with the state file in phase 3, and deletability was already enforced by the phase-1 API gates — so cleanup only stops watchers and kills the session.
       this.stopRuntimeMenuWatch(id);
 
       if (this.paneStreamerManager) {
@@ -4848,7 +4639,6 @@ export class AgentManager {
             return;
           }
           if (snapshot.claim === null) {
-            // A nonce-owned unclaimed session is this project's own half-created leftover — reclaim it.
             let nonceOwned: boolean;
             try {
               nonceOwned = await tmux.hasCreationNonce(id, cleanupOpts);
@@ -5016,8 +4806,6 @@ export class AgentManager {
     return task ? this.completionOf(task) : null;
   }
 
-  // completion 与效果字段同居 TaskState：consumedFeedback/pendingRedispatch 与 token CAS
-  // 必须同一次持久化（spec §6 双写协议）。
   private completionOf(task: TaskState): PostApproveCompletion | null {
     if (task.postApproveToken === undefined || task.postApproveHeadSha === undefined
       || task.postApproveGeneration === undefined || task.postApprovePhase === undefined) return null;
@@ -5176,7 +4964,6 @@ export class AgentManager {
     });
   }
 
-  // CAS for an existing pass: never creates a record nor touches the marker, so it cannot resurrect a revoked completion.
   async updatePostApproveCompletionIfToken(
     taskId: string,
     expectedToken: string,
@@ -5206,7 +4993,6 @@ export class AgentManager {
     });
   }
 
-  // Deliberate clear: the persisted marker keeps a restart replay from rebuilding the completion and bypassing the block.
   async revokePostApproveCompletion(
     taskId: string,
     reason: 'request-changes' | 'redispatch-cap',
@@ -5215,7 +5001,6 @@ export class AgentManager {
     return this.withTaskLock(async () => {
       const task = await this.taskStore.get(taskId);
       if (!task || task.status !== 'approved') return false;
-      // Head binds the revoke to one approved episode; an unpersisted head cannot disprove it, so blocking stays fail closed.
       if (
         opts.expectedHeadSha !== undefined
         && task.postApproveHeadSha !== undefined
@@ -5253,7 +5038,6 @@ export class AgentManager {
     });
   }
 
-  // Marker/token/head/pending are re-checked inside the committing critical section, so a concurrent revoke never loses.
   async completeApprovedPassToMergeReady(
     taskId: string,
     expected: string | PostApproveEpisodeKey,
@@ -5431,15 +5215,12 @@ export class AgentManager {
     });
   }
 
-  // 启动期按「未引用」跳过 skill 池的插件，被热配置首次引用时同步重扫；仍不可物化即拒绝提交——
-  // 可解析但物化为空的 tool 会让派发要求加载一个不存在的 skill。
   async ensurePluginSkillPools(next: BaxianConfig): Promise<void> {
     if (!this.pluginRegistry) return;
     for (const project of next.project) {
       const tool = resolveProjectTool(project);
       if (tool === undefined) continue;
       const plugin = this.pluginRegistry.resolveTool(tool);
-      // 静默放行会存下一个「无 driver、无平台 skill、重启即 fatal」的配置（启动期同判据）
       if (plugin === undefined) {
         throw new Error(
           `project '${project.id}': no git-driver plugin provides tool '${tool}' — install it under ~/.baxian/plugins/ first`,
@@ -5488,7 +5269,6 @@ export class AgentManager {
       && lease.effectiveRound === effectiveTaskReviewRound(task);
   }
 
-  // startSession 按 agent 的 projectId 解析 repo/workdir，项目归属不入判会跨仓库检出
   private gitReviewQaConfigUsable(task: Pick<TaskState, 'id' | 'qaAgentId' | 'projectId'>): boolean {
     const qaAgentId = requireTaskQaAgentId(task, 'gitReviewQaConfigUsable');
     const config = this.getAgentConfig(qaAgentId);
@@ -5915,7 +5695,6 @@ export class AgentManager {
       if (lease?.phase !== 'pending') continue;
       const qaAgentId = requireTaskQaAgentId(task, 'retryPendingGitReviewDispatches');
       if (!this.gitReviewQaConfigUsable(task)) {
-        // 快照可能已过期：告警前 live 复核；按 lease 代际告警一次，emit 成功才落闩
         const latch = `qa-config:${task.id}:${lease.generation}`;
         if (!this.gitReviewRecoveryAlerted.has(latch)) {
           try {
@@ -6111,7 +5890,6 @@ export class AgentManager {
     const tasks = await this.taskStore.list({ status: 'approved' });
     for (const task of tasks) {
       if (task.postApproveRevoked) {
-        // Finish an interrupted revoke: the marker is authoritative, the leftover record must not re-arm.
         try {
           if (task.postApproveToken !== undefined) {
             await this.taskStore.set({
@@ -6243,7 +6021,6 @@ export class AgentManager {
     }
   }
 
-  // 创建期快照（spec §4）：git 任务在建任务那一刻定身份。
   platformBindingFields(projectId: string): Partial<TaskState> {
     return { platformBinding: this.platformBindingFor(projectId) };
   }
@@ -6260,7 +6037,6 @@ export class AgentManager {
     };
   }
 
-  // agent 面一律 PATH 解析 tool；server 面 binary/env 不进入该轨。
   agentGitPreflightContext(projectId: string): AgentGitPreflight | undefined {
     const project = this.getProjectConfig(projectId);
     if (!project || !this.pluginRegistry) return undefined;
@@ -6279,8 +6055,6 @@ export class AgentManager {
     };
   }
 
-  // cli 字段族每次派发实时渲染，不做创建时快照。渲染前按持久化 binding 校验身份——
-  // 离线漂移的配置会把旧任务的 PR 号/分支/令牌带到新仓库，与平台操作同一守卫。
   platformCliContextOf(task: TaskState): PlatformCliDescriptor | undefined {
     this.assertPlatformBinding(task);
     const project = this.getProjectConfig(task.projectId);
@@ -6297,11 +6071,9 @@ export class AgentManager {
     };
   }
 
-  // base 快照一经持久化不可变；无快照保持缺省，由 agent 现场显式查询。
   async ensureGitBaseSnapshot(task: TaskState, phase: string): Promise<TaskState> {
     if (phase !== 'develop' && phase !== 'code') return task;
     if (task.baseBranch !== undefined) return task;
-    // 读默认分支与落快照都以 binding 为前提：失配任务先写入新仓库的 base 会永久污染不可变快照
     this.assertPlatformBinding(task);
     const base = this.platformDefaultBranchOf?.(task.projectId);
     if (base === undefined) return task;
@@ -6346,7 +6118,6 @@ export class AgentManager {
     return { task, driver };
   }
 
-  // 配置锁也覆盖终态任务尚未完成的远端清理；否则 cancel 落 intent 后即可改写/删除其 binding。
   async listActiveGitTasks(projectId?: string): Promise<TaskState[]> {
     const tasks = await this.taskStore.listStrict(projectId !== undefined ? { projectId } : undefined);
     return tasks.filter(t =>
@@ -6361,8 +6132,6 @@ export class AgentManager {
     return row!;
   }
 
-  // git 模式的 head 刷新一律经任务解析出的 driver（spec §4 两执行面）：QA checkout 的
-  // moved-head fallback 不得旁路到硬编码 gh，否则自定义/非 github driver 会错误调用 gh。
   async platformFetchPrHeadSha(taskId: string): Promise<string> {
     const headSha = String((await this.platformFetchPrView(taskId)).headSha);
     if (!PLATFORM_HEAD_SHA_RE.test(headSha)) {
@@ -7108,8 +6877,6 @@ export class AgentManager {
     reason?: { phase: string; message: string },
     expectedLockToken?: string,
   ): Promise<void> {
-    // Pin the incarnation: task rollback / intervention below await, and a DELETE→same-id recreate in that
-    // window must not let the final state write-back resurrect the deleted agent.
     const genAtEntry = this.deletionGenerationOf(agentId);
     const existing = await this.agentStore.get(agentId);
     if (existing && existing.taskId !== undefined && existing.taskId !== taskId) {
@@ -7167,8 +6934,6 @@ export class AgentManager {
     } else {
       const now = new Date().toISOString();
       await this.agentStore.update(agentId, (latest) => {
-        // Never resurrect a deleted/recreated incarnation: if the state is gone or the generation moved
-        // since entry, this rollback is stale — clear nothing rather than rebuild from the old snapshot.
         if (!latest || !this.deletionGateOpen(agentId, genAtEntry)) return AGENT_STORE_NOOP;
         if (latest.taskId === taskId && latest.lockToken !== expectedLockToken) return AGENT_STORE_NOOP;
         if (latest.taskId !== undefined && latest.taskId !== taskId) return AGENT_STORE_NOOP;
@@ -7283,7 +7048,6 @@ export class AgentManager {
         return this.persistQueuedTask(unassigned, 'unassigned');
       }
 
-      // Capture generation before the first config/group read so a DELETE→same-id recreate in the read→commit window fails the gate.
       const genAtEntry = this.deletionGenerationOf(input.preferredAgentId);
       const target = await this.pickAgent(projectId, input.preferredAgentId);
       const group = this.findAgentGroup(input.preferredAgentId);
@@ -7291,7 +7055,6 @@ export class AgentManager {
       if (!dev) throw new ApiError(409, `Agent ${input.preferredAgentId} has no dev agent in its group`);
       const qa = group?.find(agent => agent.role === 'qa');
       if (!qa) throw new ApiError(409, `Agent ${input.preferredAgentId} has no qa agent in its group`);
-      // Pin EVERY participant's generation: a member (e.g. QA) deleted→reintroduced after the snapshot leaves isDeletionInFlight false and the preferred generation unchanged, yet the task would still carry its stale id.
       const participantGens = new Map<string, number>(
         [dev.id, qa.id]
           .map(id => [id, this.deletionGenerationOf(id)] as const),
@@ -7308,8 +7071,6 @@ export class AgentManager {
         qaAgentId: qa.id,
         status: 'pending',
       };
-      // A DELETE→recreate of the preferred OR any participant after the group snapshot must not persist a
-      // pending task carrying its stale devAgentId/qaAgentId; reject and let the client re-select.
       const persistQueuedOrReject = (reason: 'preferred_agent_busy' | 'agent_locked'): Promise<TaskState> => {
         if (!participantsFresh()) {
           throw new ApiError(409, `Agent ${input.preferredAgentId} or a group member is being deleted or recreated during task creation; please retry`);
@@ -7329,7 +7090,6 @@ export class AgentManager {
         return persistQueuedOrReject('agent_locked');
       }
 
-      // Three-step transaction (queued task → binding → in_progress): any failure leaves at worst a queued task and/or a stale binding to it, both reclaimable — never an active task with no binding.
       const releaseLock = async (): Promise<void> => {
         try {
           await this.lockManager.releaseIfOwner(target.id, taskId, lockToken);
@@ -7358,7 +7118,6 @@ export class AgentManager {
             ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
             ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
             ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
-            // A new task never inherits the previous one's question: void the watermark.
             needInput: { epoch: (existing?.needInput?.epoch ?? 0) + 1 },
           };
         });
@@ -7370,7 +7129,6 @@ export class AgentManager {
         await releaseLock();
         return (await this.taskStore.get(taskId)) ?? queued;
       }
-      // Binding-before-active: a DELETE slipping in after the binding commit sees a still-'pending' task and can rotate the lock; re-verify lock ownership + preferred/participant generations before the active write, else roll back.
       if (this.isDeletionInFlight(target.id)
           || !this.deletionGateOpen(target.id, genAtEntry)
           || !participantsFresh()
@@ -7543,8 +7301,6 @@ export class AgentManager {
   ): Promise<{ path: string }> {
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new ApiError(404, `Unknown agent: ${agentId}`);
-    // Pin the incarnation before reading paneId: paneId equality is ABA-blind (a recreate reuses %0), so a
-    // DELETE→same-id recreate during the upload would otherwise paste the stale image into the new session.
     const genAtEntry = this.deletionGenerationOf(agentId);
     const state = await this.agentStore.get(agentId);
     const paneId = state?.paneId;
@@ -7577,7 +7333,6 @@ export class AgentManager {
       await assertUploadStillValid();
       const tmux = new TmuxManager(runner);
       const pane = await this.resolveClaimedPane(tmux, agentId, paneId);
-      // resolveClaimedPane resolved by the CURRENT same-name session; re-verify once more before injecting so a DELETE→recreate in that gap can't take the paste.
       await assertUploadStillValid();
       await tmux.injectPrompt(pane, `${path} `, agentId);
       return { path };
@@ -7654,9 +7409,6 @@ export class AgentManager {
     budgetOverride?: { since: number; budgetAlerted?: boolean },
   ): void {
     const prev = this.pendingDispatchRetryByTask.get(taskId);
-    // 预算随登记代走：同 kind 但 pass 换代（token/agent 变化）时必须重置 since 与告警标志。
-    // budgetOverride 供对账内部重排延续同一笔欠投递的预算——它只经 startSession 的 armedToken
-    // fence 注入，外部 successor 的登记结构上拿不到
     const sameGeneration = prev?.kind === entry.kind
       && prev.agentId === entry.agentId
       && prev.signalToken === entry.signalToken;
@@ -7703,7 +7455,6 @@ export class AgentManager {
     }
   }
 
-
   private async queueQaBusyPendingRetry(
     taskId: string,
     agentId: string,
@@ -7714,8 +7465,6 @@ export class AgentManager {
   ): Promise<EnsureSessionError | null> {
     if (!(err instanceof ReplNotReadyError)) return null;
     if (phase !== 'review' && phase !== 'recheck') return null;
-    // 无本次派发的 pass 令牌就不登记（宁走既有失败路径，不造无 fence 重试）；
-    // 令牌漂移说明 pass 已被接管，忙碌属于旧派发，不得登记到 successor 上
     const passToken = dispatch.passToken;
     if (!passToken) return null;
     let current: TaskState | null;
@@ -7871,7 +7620,6 @@ export class AgentManager {
           error: `Task ${taskId} has no preferredAgentId; agentId is required in request body`,
         };
       }
-      // Capture generation before the first config/state read so a DELETE→same-id recreate in the read→commit window fails the gate.
       const genAtEntry = this.deletionGenerationOf(agentId);
       const cfg = this.getAgentConfig(agentId);
       if (!cfg) return { task: fresh, errorCode: 400 as const, error: `Unknown agent: ${agentId}` };
@@ -7917,7 +7665,6 @@ export class AgentManager {
         await this.lockManager.releaseIfOwner(agentId, taskId, lockToken);
         return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} has no qa agent in its group` };
       }
-      // Pin every participant's generation (mirror createTask) so a member deleted→recreated before the active write isn't baked in.
       const participantGens = new Map<string, number>(
         [devId, qaId]
           .map(pid => [pid, this.deletionGenerationOf(pid)] as const),
@@ -7935,8 +7682,6 @@ export class AgentManager {
         status: 'in_progress',
         updatedAt: now,
       };
-      // Binding-first: the fresh task snapshot already exists on disk, so a failure at any later
-      // step leaves at worst a stale binding to a still-unclaimed task — an existing reclaimable state.
       const releaseLock = async (): Promise<void> => {
         try {
           await this.lockManager.releaseIfOwner(agentId, taskId, lockToken);
@@ -7959,7 +7704,6 @@ export class AgentManager {
             ...(existing?.paneId !== undefined ? { paneId: existing.paneId } : {}),
             ...(existing?.workdir !== undefined ? { workdir: existing.workdir } : {}),
             ...(existing?.creationToken !== undefined ? { creationToken: existing.creationToken } : {}),
-            // A new task never inherits the previous one's question: void the watermark.
             needInput: { epoch: (existing?.needInput?.epoch ?? 0) + 1 },
           };
         });
@@ -7971,7 +7715,6 @@ export class AgentManager {
         await releaseLock();
         return { task: fresh, errorCode: 409 as const, error: `Agent ${agentId} is being deleted` };
       }
-      // Re-verify lock ownership + preferred/participant generations before the active write, else a DELETE after the binding commit orphans it.
       if (this.isDeletionInFlight(agentId)
           || !this.deletionGateOpen(agentId, genAtEntry)
           || !participantsFresh()
@@ -8126,7 +7869,6 @@ export class AgentManager {
   ): Promise<boolean> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) throw new Error(`Unknown agent: ${agentId}`);
-    // Pin the incarnation: a DELETE completing during dispatch bumps this, and every gated commit/side-effect below refuses the stale generation.
     const genAtEntry = this.deletionGenerationOf(agentId);
 
     const task = await this.taskStore.get(taskId);
@@ -8185,8 +7927,6 @@ export class AgentManager {
       return false;
     }
     const assertOwner = async (): Promise<void> => {
-      // Also gate on the entry generation: a DELETE→same-id recreate can pass the task/lock check on the
-      // reused binding, so every Workdir/runtime side-effect guarded by assertOwner must fail closed on it.
       if (!this.deletionGateOpen(agentId, genAtEntry)) {
         throw new Error(`Agent ${agentId} is being deleted or was recreated for task ${taskId}; operation aborted`);
       }
@@ -8316,7 +8056,6 @@ export class AgentManager {
 
     await this.agentStore.update(agentId, (stateNow) => {
       if (!stateNow || stateNow.taskId !== taskId) return AGENT_STORE_NOOP;
-      // Watermark stays: the arm-time epoch bump owns superseding the old question.
       return {
         ...stateNow,
         paneId,
@@ -8408,7 +8147,6 @@ export class AgentManager {
       let deletedDuringDispatch = false;
       const runningCommit = await this.agentStore.update(agentId, (existing) => {
         if (isCancelCleanupHold(existing)) { cancelHoldWon = true; return AGENT_STORE_NOOP; }
-        // Binding must already exist and still hold our lock; never re-create a deleted agent's state nor write under a bumped deletion generation (ABA).
         if (!existing || existing.taskId !== taskId || existing.lockToken !== lockToken
             || !this.deletionGateOpen(agentId, genAtEntry)) {
           deletedDuringDispatch = true;
@@ -8444,10 +8182,6 @@ export class AgentManager {
       }
       agentMarkedRunning = true;
 
-      // armed pass 的 fence 延伸到最终 paste：checkout//clear/artifacts 的 await 窗口里 pass 可被
-      // push/其他 dispatcher 轮换，旧 prompt 不得注入 successor；guard 在 composer/paste/Enter
-      // 的 task-mutation 队列槽内复核（与轮换串行），漂移即放弃投递。
-      // cancel 只写终态不轮换 token，故 fence 须同时复核任务仍处本相位的可投递状态
       const passDeliverableStatuses =
         opts.dialogFailFromStatuses ?? PHASE_EXPECTED_STATUS[phase] ?? [...ACTIVE_TASK_STATUSES];
       const passStillArmed = opts.dispatchPassToken !== undefined
@@ -8472,8 +8206,6 @@ export class AgentManager {
         );
         return false;
       }
-      // prompt 已确认投递：只 CAS 清理本次派发那一代的登记；successor 在窗口内登记的新 pending 不受影响，
-      // 且清理先于可失败的审计事件——事件写失败不能把已投递的 prompt 重新变回 pending
       if (opts.dispatchPassToken !== undefined) {
         this.clearPendingDispatchRetryIfMatches(taskId, { agentId, signalToken: opts.dispatchPassToken });
       }
@@ -8504,8 +8236,6 @@ export class AgentManager {
       this.startRuntimeMenuWatch(agentId);
       return true;
     } catch (err) {
-      // 注入阶段的忙碌（预注入活回合检查）仍在任何按键之前：登记 pending 并保持 checkout/绑定原样，
-      // 在途回合还在使用该工作树，park/release 会拽走它
       const injectBusyPend = await this.queueQaBusyPendingRetry(
         taskId, agentId, phase, ensure.createdSession, err,
         { passToken: opts.dispatchPassToken, pendingBudget: opts.dispatchPendingBudget },
@@ -8642,7 +8372,6 @@ export class AgentManager {
     guardBeforePaste?: () => Promise<boolean>,
   ): Promise<{ acked: boolean; composerDelivered: boolean; aborted?: boolean }> {
     const paneId = pane.paneId;
-    // 静态忙信号（文本忙样式/working title）可能是残稿或 stale title 冒充，一律由帧活性仲裁；ready 视图覆盖 stale title。
     const preTitle = await tmux.readPaneTitle(pane);
     const preFrame = await tmux.capturePaneById(pane, { ansi: false, scrollback: 0 });
     const staticBusy = hasOscTitleWorking(preTitle)
@@ -8658,12 +8387,10 @@ export class AgentManager {
     }
     await revalidate?.();
     if (guardBeforePaste) {
-      // A stale replay must not touch the pane at all: the guard runs before the first composer scrub.
       if (!(await guardBeforePaste())) {
         return { acked: false, composerDelivered: false, aborted: true };
       }
       const staged = await tmux.stagePromptBuffer(paneId, prompt, agentId);
-      // Fence + scrub + paste share one task-mutation-queue slot, so a rotation lands before or after, never between.
       let pasted = false;
       try {
         pasted = await this.withTaskLock(async () => {
@@ -8673,7 +8400,6 @@ export class AgentManager {
           return true;
         });
       } catch (pasteErr) {
-        // Buffer still present proves the paste never landed; missing/unprobeable fails closed to a composer scrub.
         let bufferConsumed = true;
         try {
           await tmux.dropStagedBuffer(staged.buf);
@@ -8712,7 +8438,6 @@ export class AgentManager {
       baseline = await tmux.captureSettledSnapshot(pane, { timeoutMs: this.dispatchSettleTimeoutMs });
       baselineTitle = await tmux.readPaneTitle(pane);
       if (guardBeforePaste) {
-        // The Enter is the actual submission; it takes the same fenced queue slot.
         const submitted = await this.withTaskLock(async () => {
           if (!(await guardBeforePaste())) return false;
           await tmux.sendEnter(pane);
@@ -8722,7 +8447,6 @@ export class AgentManager {
           try {
             await tmux.clearComposerDraft(pane);
           } catch (err) {
-            // Fail closed: a submit-ready stale prompt could not be confirmed gone.
             const message = err instanceof Error ? err.message : String(err);
             throw new Error(
               `fence-rejected prompt could not be scrubbed from the composer of pane ${paneId}; verify the pane before reuse: ${message}`,
@@ -8748,7 +8472,6 @@ export class AgentManager {
         baselineTitle,
         resend: guardBeforePaste
           ? async () => {
-            // A resend is a fresh submission of whatever sits in the composer; it takes the same fence.
             const resent = await this.withTaskLock(async () => {
               if (!(await guardBeforePaste())) return false;
               await tmux.sendEnter(pane);
@@ -8948,8 +8671,6 @@ export class AgentManager {
       if (!opts.allowDirtyWorkdir) await branches.assertClean(verifiedWorkdir);
       const actualRef = await branches.currentRef(verifiedWorkdir);
       if (actualRef !== `refs/heads/${task.branch}`) {
-        // dev 可能已被释放过（如 spec max_rounds 停驻默认分支）；switchToTaskBranch 自带
-        // assertClean，脏树时抛 DirtyWorkdirError fail-closed，不会覆盖未提交的改动
         await this.assertTaskGeneration(agentId, taskId, lockToken, verifiedWorkdir);
         await branches.switchToTaskBranch(
           verifiedWorkdir,
@@ -9043,7 +8764,6 @@ export class AgentManager {
     }
     await this.assertTaskLockOwner(agentId, taskId, lockToken);
 
-    // A revoke marks before clearing and a push transitions before clearing; every half-window must abort the paste.
     const postApprovePassStillLive = async (): Promise<boolean> => {
       const [taskFresh, completionFresh] = await Promise.all([
         this.taskStore.get(taskId),
@@ -9115,9 +8835,6 @@ export class AgentManager {
       ) {
         return AGENT_STORE_NOOP;
       }
-      // The continuation prompt supersedes the previous question, but the arm-time
-      // epoch bump owns that transition — stripping here would race an arm that
-      // already re-established the watermark (post-approve arms before injecting).
       return {
         ...latest,
         paneId,
@@ -9267,7 +8984,6 @@ export class AgentManager {
     });
   }
 
-  // continueSession never runs startSession's post-ack finalization; a surviving marker would make recover() roll the running task back to pending.
   private async finalizeReplayedBootstrap(
     agentId: string,
     taskId: string,
@@ -9651,8 +9367,6 @@ export class AgentManager {
         throw new ApiError(409, `Task ${taskId} is being completed (merge in progress); try again shortly`);
       }
 
-      // 终态不早退：状态不再改写，但残留的 pane/绑定（上次清理中途失败）仍走同一条强制清理路径。
-      // 唯一例外：清理已在进行中的重复取消——重跑只会重复中断同一批 pane，等它收尾即可。
       const alreadyTerminal = TERMINAL_STATUSES.includes(task.status);
       if (alreadyTerminal && this.cancelCleanupInFlight.has(taskId)) return task;
       if (alreadyTerminal) remoteCleanupGeneration = task.remoteCleanup?.generation;
@@ -9700,10 +9414,8 @@ export class AgentManager {
       return task;
     });
 
-    // stop again post-write: a rollback may have re-armed between the pre-lock stop() and the cancelled write
     if (cleanupClaimed) this.phaseSignalWatcher?.stop(taskId);
 
-    // 两阶段：先中断全部 pane 再释放任一 binding，避免 dev 先空闲、被派新任务时旧任务的 qa prompt 仍在跑。
     try {
       const stopped: string[] = [];
       for (const id of [devToRelease, qaToRelease]) {
@@ -10656,8 +10368,6 @@ export class AgentManager {
   ): Promise<void> {
     const agent = this.getAgentConfig(agentId);
     if (!agent) return;
-    // Pin the incarnation before the first state/paneId read: paneId equality is ABA-blind (a recreated
-    // agent reuses %0), so a DELETE→same-id recreate would otherwise let post-merge /clear hit a new session.
     const genAtEntry = this.deletionGenerationOf(agentId);
     const state = await this.agentStore.get(agentId);
     if (!state) return;
@@ -10703,7 +10413,6 @@ export class AgentManager {
       }
     }
 
-    // A DELETE→recreate (gen bump) before this pane work must skip it, or /clear lands on the new incarnation's reused pane.
     if (!this.deletionGateOpen(agentId, genAtEntry)) return;
     const runner = this.createRunnerFor(agent);
     const tmux = new TmuxManager(runner);
@@ -10975,16 +10684,12 @@ export class AgentManager {
         return;
       }
       if (Date.now() >= deadline) {
-        // 与 stableIdle 分支同一类型：忙碌超时是「常态忙」而非故障，调用方（release/派发）
-        // 据此延后重排；菜单/对话框/REPL 退出等仍是普通 Error，不得被当成可延后
         throw new ReplNotReadyError(paneId, runtime, cap, `stayed busy past ${timeoutMs}ms`);
       }
       await new Promise(r => setTimeout(r, this.compactIdlePollMs));
     }
   }
 
-  // 注入前置门：codex 忙碌回合的工具间隙会闪现单帧 idle footer（#558 事故放大器），
-  // 连续 K 帧稳定就绪才放行，任何忙碌/不确定帧清零计数；超时按忙碌分类抛 ReplNotReadyError。
   private async waitForReplPromptStableIdle(
     tmux: TmuxManager,
     pane: PaneRef,
@@ -11096,8 +10801,6 @@ export class AgentManager {
   ): Promise<void> {
     const armed = await this.setupPhaseSignalWatcher(taskId, agentId, expectedKinds, token, {
       skipSnapshot,
-      // Every post-dispatch arm follows a freshly injected prompt: the previous
-      // question is superseded, its watermark must not carry over.
       needInputMode: 'fresh',
     });
     if (!armed) await this.holdAgentForUnarmedSignal(taskId, agentId, expectedKinds);
@@ -11656,7 +11359,6 @@ export class AgentManager {
     }
 
     const newToken = createSignalToken();
-    // spec 阶段的扩轮决策不延续到 code 评审：cap 共享字段，进入编码时归零
     const transition = await this.transitionTaskStatus(
       taskId,
       'in_progress',
@@ -11723,8 +11425,6 @@ export class AgentManager {
         err instanceof EnsureSessionError && err.partial.handled
         && (task.status === 'spec-ready' || task.status === 'max_rounds')
       ) {
-        // dev 已被 checkout/dialog hold 且 prompt 未送达；resumeAgent 不重派这些 hold，
-        // 任务停在 in_progress 会同时封死 Resume 与 verdict——退回 verdict 门禁状态
         const rolledBack = await this.transitionTaskStatus(
           taskId,
           task.status,
@@ -11742,8 +11442,6 @@ export class AgentManager {
             + 'moved on; leaving its status as-is',
           );
         } else if (!devBoundBefore) {
-          // 转码前 dev 未持有本任务（如 max_rounds 重占用）：任务已退回
-          // verdict 门禁，释放本次新占用，否则 dev 会被回退后的任务永久占住
           const released = await this.releaseAgentForTask(devAgentId, taskId, 'idle', { allowAwaitingHuman: true })
             .catch(() => false);
           if (!released) {
@@ -11780,12 +11478,9 @@ export class AgentManager {
       });
       return null;
     }
-    // 重占用（released dev）的 acquire 会写 bootstrappingTaskId，而 continueSession 不做
-    // startSession 的 post-ack finalize；残留标记会让 recover 把已运行的任务按未送达回滚
     await this.finalizeReplayedBootstrap(devAgentId, taskId, 'code', acquiredLockToken);
     return await this.taskStore.get(taskId);
   }
-
 
   async injectTextToAgent(
     agentId: string,
@@ -11794,7 +11489,6 @@ export class AgentManager {
   ): Promise<void> {
     const cfg = this.getAgentConfig(agentId);
     if (!cfg) throw new Error(`injectTextToAgent: unknown agent ${agentId}`);
-    // Pin the incarnation before reading state so a DELETE→recreate reusing %0 can't route the text to the new session.
     const genAtEntry = this.deletionGenerationOf(agentId);
     await this.acquireCompactGuard(agentId);
     try {
@@ -11834,7 +11528,6 @@ export class AgentManager {
       }
       const tmux = new TmuxManager(this.createRunnerFor(cfg));
       const pane = await this.resolveClaimedPane(tmux, agentId, paneId);
-      // resolveClaimedPane resolved by the CURRENT same-name session; re-verify incarnation + binding before paste (same as the image path).
       if (!this.deletionGateOpen(agentId, genAtEntry)) {
         throw new Error(`injectTextToAgent: agent ${agentId} was deleted or recreated before paste`);
       }
@@ -12002,7 +11695,6 @@ export class AgentManager {
     state: AgentBindingFacts,
     taskId: string,
   ): boolean {
-    // 人工介入/重建中的 pane 不发 /clear;confirm 语义要求解绑,落回直接释放
     const expectedPaneId = state.paneId;
     if (!expectedPaneId || state.status === 'awaiting_human' || state.creationToken) return false;
     const cfg = this.getAgentConfig(agentId);

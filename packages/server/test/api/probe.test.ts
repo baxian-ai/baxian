@@ -252,7 +252,6 @@ describe('POST /api/agents/probe', () => {
 
   it('non-timeout / non-Error runner failures map to generic "probe failed"', async () => {
     const probeApp = await buildProbeApp({
-      // non-Error throw exercises the String(err) fallback
       localRunnerFactory: () => makeStubRunner(async () => {
         throw 'spawn EPERM';
       }),

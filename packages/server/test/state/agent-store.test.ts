@@ -202,12 +202,10 @@ describe('AgentStore.update', () => {
     expect(await store.update('dev-x', () => makeState('dev-x'))).toBe('committed');
     expect(await store.update('dev-x', () => AGENT_STORE_NOOP)).toBe('noop');
     expect(await store.update('dev-x', () => null)).toBe('deleted');
-    // On an absent agent, a null updater is a confirmed no-op deletion (ENOENT is not an error).
     expect(await store.update('gone', () => null)).toBe('deleted');
   });
 
   it('serializes public set/delete on the same per-id chain as update (no reentrant deadlock)', async () => {
-    // update reads null then re-sets; a delete queued behind it must observe the write, not race it.
     await store.set(makeState('dev-x', { taskId: 't1' }));
     const order: string[] = [];
     const p1 = store.update('dev-x', (e) => { order.push('update'); return { ...e!, taskId: 't2', updatedAt: NOW }; });

@@ -138,7 +138,6 @@ export function HostManagementModal({ open, onClose }: Props) {
     && form.user.trim() === (editingHost.user ?? '')
     && form.port.trim() === (editingHost.port != null ? String(editingHost.port) : '');
 
-  // 结构未变且未改密码时按 hostId 探测，让服务端复用已存密码（表单里拿不到明文）
   const probeTarget = (): { host?: HostConfig; hostId?: string } => {
     if (editingId && structureUnchanged && !form.password && !clearPassword) {
       return { hostId: editingId };

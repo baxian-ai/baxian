@@ -411,7 +411,6 @@ describe('buildAttachInteractiveCommand', () => {
       );
       const script = cmd.args[1];
       expect(script.indexOf('display-message')).toBeLessThan(script.indexOf('attach-session'));
-      // display-message takes the format as its message arg (-p to print); it has NO -F flag (that would fail and abort every guarded attach).
       expect(script).toMatch(/display-message -p -t '\$1:' '#\{pid\}\|#\{start_time\}\|#\{session_id\}\|#\{@baxian-agent-id\}'/);
       expect(script).not.toContain('-F');
       expect(script).toContain("= '4242|1700000000|$1|dev-1'");
@@ -427,7 +426,6 @@ describe('buildAttachInteractiveCommand', () => {
       );
       const remoteCmd = cmd.args[cmd.args.length - 1];
       expect(remoteCmd.indexOf('display-message')).toBeLessThan(remoteCmd.indexOf('attach-session'));
-      // login-interactive wrapping escapes the inner quotes, but the identity content survives verbatim.
       expect(remoteCmd).toContain('4242|1700000000|$1|dev-1');
       expect(remoteCmd).toContain('$1:');
       expect(remoteCmd).not.toContain('=dev-1');
@@ -606,7 +604,6 @@ describe('attach capability probe + ignore-size flag', () => {
     const probePayload = probe.args.at(-1) as string;
     const attachPayload = attach.args.at(-1) as string;
     expect(probePayload).toContain('tmux -V');
-    // Same wrapper: strip the payload-specific tail and the shells must match.
     const wrapperOf = (payload: string) => payload.slice(0, payload.indexOf('tmux'));
     expect(wrapperOf(probePayload)).toBe(wrapperOf(attachPayload));
   });

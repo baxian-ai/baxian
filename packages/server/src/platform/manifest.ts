@@ -38,7 +38,6 @@ export function parseManifest(
   }
   const m = obj as Record<string, unknown>;
   if (typeof m.name !== 'string' || m.name === '') err('name must be a non-empty string');
-  // version 是插件元数据：spec §5.2 未声明格式契约、无消费者对其做 semver 比较（仅 minToolVersion 比较）——非空串即可，勿收成 semver。
   if (typeof m.version !== 'string' || m.version.trim() === '') err(`version must be a non-empty string (got ${JSON.stringify(m.version)})`);
   if (m.kind !== 'git-driver') err(`kind must be 'git-driver', got ${JSON.stringify(m.kind)}`);
   if (typeof m.tool !== 'string' || !TOOL_PATTERN.test(m.tool)) {
@@ -49,8 +48,6 @@ export function parseManifest(
   }
   if (m.driverSchema !== 1) err(`driverSchema must be 1 (got ${JSON.stringify(m.driverSchema)})`);
   if (errors.length > 0) {
-    // schema 失败仍保留各自通过格式校验的 name/tool 作 best-effort 身份——
-    // startup 的同名覆盖下毒靠它识别「坏损覆盖」，丢弃会静默回退内置（spec §5.4）。
     return {
       errors,
       name: typeof m.name === 'string' && m.name !== '' ? m.name : undefined,

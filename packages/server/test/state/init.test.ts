@@ -17,7 +17,7 @@ afterEach(async () => {
 describe('initStateDir', () => {
   it('creates all required subdirectories', async () => {
     await initStateDir(tempDir);
-    const dirs = ['state/agents', 'state/tasks', 'state/root-recovery', 'events', 'locks'];
+    const dirs = ['state/agents', 'state/tasks', 'events', 'locks'];
     for (const dir of dirs) {
       const s = await stat(join(tempDir, dir));
       expect(s.isDirectory()).toBe(true);

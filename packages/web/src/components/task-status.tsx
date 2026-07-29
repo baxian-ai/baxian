@@ -1,13 +1,10 @@
 import type { TaskStatus } from '../shared/index.js';
 import { getMessages } from '../i18n/index.tsx';
 
-// 仅供非组件命令式代码调用；组件内一律 useT() 取 t.status[status]，以订阅 locale 变化。
 export function taskStatusLabel(status: TaskStatus): string {
   return getMessages().status[status] ?? status;
 }
 
-// Status hues: green = on track/done, blue = agent busy in review, amber = needs a human
-// (approval gates, rework, round cap), red = hard failure, gray = inert.
 export const STATUS_BADGE_COLORS: Record<TaskStatus, string> = {
   pending: 'pill',
   in_progress: 'pill pill-live',
@@ -59,8 +56,6 @@ export function formatTaskTimestamp(value: unknown, withSeconds = true): string 
   if (value === null || value === undefined) return '';
   const normalized = String(value).trim();
   if (!normalized) return '';
-  // space-separated "YYYY-MM-DD HH:mm" is implementation-defined for Date.parse
-  // (Safari returns Invalid Date); normalize to the ISO 'T' form before parsing.
   const date = new Date(normalized.replace(/^(\d{4}-\d{2}-\d{2}) /, '$1T'));
   if (Number.isNaN(date.getTime())) return normalized;
   const pad = (n: number) => String(n).padStart(2, '0');

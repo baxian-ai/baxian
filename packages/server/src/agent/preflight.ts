@@ -34,8 +34,6 @@ const CLI_BINARY: Record<AgentRuntime, string> = {
 
 const PREFLIGHT_PROBE_TIMEOUT_MS = 5000;
 
-// Health checks must answer fast: a timeout is itself the diagnosis, so no retry,
-// and a timeout rejection becomes a failed step instead of aborting the preflight.
 const PREFLIGHT_NET = { timeout: GH_EXEC_TIMEOUT_MS, retries: 0 } as const;
 
 async function probeNetwork(
@@ -67,8 +65,6 @@ async function probeBinary(
   options: { remoteShell?: RemoteShellMode } = {},
 ): Promise<PreflightResult> {
   try {
-    // command -v over which: it must match installTmux's verification, or a --fix
-    // success on a which-less minimal host would still re-probe as FAIL.
     const result = await runner.exec(`command -v ${binary}`, {
       ...options,
       timeout: PREFLIGHT_PROBE_TIMEOUT_MS,
@@ -199,10 +195,6 @@ export async function runPreflight(
   return results;
 }
 
-// 探测通道必须等于运行期真正使用的通道，否则绿灯毫无诊断意义：
-//   manual Workdir ——运行期始终 fetch origin，发布角色还会 push origin ⇒ 分别探测实际 URL
-//   auto + gh      —— clone 是 `gh repo clone <slug>`，显式 URL 被丢弃 ⇒ 探测 gh 的 git_protocol 通道
-//   auto + 其它 tool —— 朴素 `git clone <repo>` ⇒ 探测 repo 原文
 async function gitLsRemoteProbeUrl(
   runner: CommandRunner,
   repo: string,
@@ -213,8 +205,6 @@ async function gitLsRemoteProbeUrl(
   const read = async (cmd: string): Promise<{ value: string; lines: string[] } | { error: string }> => {
     try {
       const res = await runner.exec(cmd, { timeout: PREFLIGHT_PROBE_TIMEOUT_MS });
-      // 探测失败三态（AGENTS.md）：exit 255 / 瞬态网络特征是「结果未知」，落进「未配置 → 默认
-      // https」会让 checks 按错误协议放行，而运行期 clone 仍按真实 SSH 配置执行。
       if (execOutcomeUnknown(res)) {
         return { error: `${cmd} exited ${res.exitCode}: ${lastNonEmptyLine(res.stderr) || 'transport failure'}` };
       }
@@ -273,8 +263,6 @@ async function runGitPlatformChecks(
   results.push(...stepResults);
   if (stepResults.some((s) => !s.ok)) return;
 
-  // 插件自声明的 agent 面运行期命令按**该角色实际会执行的路径**检查：内置 gh skill 只在
-  // §Create/§Reply 用到 openssl 与摘要工具，QA 的 review/recheck 只走 §Inspect/§Verdict。
   const runsPlatformWrites = agent.role === 'dev';
   if (runsPlatformWrites && git.agentCommands.length > 0) {
     const missing: string[] = [];
@@ -290,9 +278,6 @@ async function runGitPlatformChecks(
             break;
           }
         } catch (err) {
-          // 探测本身失败（超时/spawn）不得 reject 整个 preflight：/checks 的 Promise.all 会
-          // 让其余 agent 与 server 的结果一并丢失（500）。组内后项满足即契约已足，前项的
-          // 瞬态异常不算数。
           groupErrors.push(`${cmd}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
@@ -342,7 +327,6 @@ async function runGitPlatformChecks(
   if (push === true) {
     results.push({ step: 'platform-push', ok: true, message: 'push permission confirmed' });
   } else if (push === false) {
-    // 可读不证可写：push 只是 dev 的发布前置；QA 的 PR write 无法静态自省。
     results.push(agent.role === 'dev'
       ? {
         step: 'platform-push',
@@ -411,8 +395,6 @@ async function runAutoModePreflight(
   lsRemote: LsRemoteTarget,
 ): Promise<void> {
   const gh = isGitHubRepo(repo);
-  // ~ is expanded by the remote shell to $HOME; physicalize it first so the agent dir is created
-  // through a proven symlink-free chain, not the raw logical path (a rebound .baxian → external dir).
   const homeProbe = await runner.exec('cd ~ && pwd -P');
   const home = homeProbe.stdout.trim();
   if (homeProbe.exitCode !== 0 || home === '') {

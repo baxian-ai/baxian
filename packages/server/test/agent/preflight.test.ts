@@ -4,7 +4,7 @@ import { LocalRunner } from '../../src/agent/runner.js';
 import * as runnerModule from '../../src/agent/runner.js';
 import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
 import { DriverOpError } from '../../src/platform/git-driver.js';
-import type { AgentConfig } from '../../src/shared/index.js';
+import { makeAgent } from '../helpers/fixtures.js';
 
 const OK_PATH: ExecResult = { stdout: '/usr/local/bin/x', stderr: '', exitCode: 0 };
 const OK_TRUE: ExecResult = { stdout: 'true\n', stderr: '', exitCode: 0 };
@@ -30,10 +30,6 @@ function mockRunner(responses: Record<string, ExecResult>): CommandRunner {
       return OK_EMPTY;
     }),
   };
-}
-
-function makeAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
-  return { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/code', ...overrides };
 }
 
 const execCmds = (runner: CommandRunner): string[] =>
@@ -104,7 +100,6 @@ describe('runPreflight', () => {
       mode: 'remote',
       host: { hostname: 'remote.example.com', user: 'agent' },
     });
-    // Even with openssl unavailable, a remote agent must not get a preflight failure for it.
     const runner = mockRunner({ 'command -v openssl': FAIL });
     const results = await runPreflight(runner, remoteAgent, 'user/repo', { hostname: 'remote.example.com', user: 'agent' });
     expect(results.find(r => r.step === 'openssl')).toBeUndefined();

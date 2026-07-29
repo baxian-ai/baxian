@@ -61,8 +61,6 @@ function positivePrNumber(value: string): number | undefined {
 
 export function TaskDetail() {
   const { taskId = '' } = useParams<{ id: string; taskId: string }>();
-  // key on taskId so switching tasks on this shared route remounts with fresh
-  // per-task state (override/edit/busy) instead of leaking the previous task's.
   return <TaskDetailView key={taskId} taskId={taskId} />;
 }
 

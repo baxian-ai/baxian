@@ -2,35 +2,19 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig, BaxianEvent } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentManager, EnsureSessionError, DispatchTerminalError } from '../../src/agent/manager.js';
+import type { BaxianEvent } from '../../src/shared/index.js';
+import { EnsureSessionError, DispatchTerminalError, type AgentManager } from '../../src/agent/manager.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
+import type { CommandRunner } from '../../src/agent/runner.js';
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import type { EventBus } from '../../src/event/bus.js';
 import type { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'owner/repo',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo', yolo: true },
-      { id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo', yolo: true },
-    ]],
-  }],
-};
 
 const REF = { sessionId: '$7', serverPid: '4242', serverStart: '1700000000' };
 const PANE = { session: REF, paneId: '%0', claim: 'dev-1' };
@@ -39,14 +23,9 @@ let tempDir: string;
 let manager: AgentManager;
 let agentStore: AgentStore;
 let lockManager: LockManager;
-const events: BaxianEvent[] = [];
-
-function runner(): CommandRunner {
-  return {
-    exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    writeFile: vi.fn(async (): Promise<void> => undefined),
-  };
-}
+let eventBus: EventBus;
+let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
+let events: BaxianEvent[];
 
 async function waitFor(check: () => Promise<boolean>, timeoutMs = 2000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -59,28 +38,33 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs = 2000): Promise
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-bootstrap-test-'));
-  await initStateDir(tempDir);
-
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
-  events.length = 0;
-  eventBus.on('*', (event) => { events.push(event); });
-
-  manager = new AgentManager({
-    config: CONFIG,
-    agentStore,
-    taskStore,
-    lockManager,
-    eventBus,
-    skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-    runnerFactory: () => runner(),
+  const runner = fakeRunner({ defaultResult: {} });
+  const config = makeConfig({
+    project: [{
+      id: 'proj',
+      repo: 'owner/repo',
+      merge: null,
+      agent: [[
+        makeAgent({ yolo: true }),
+        makeAgent({
+          id: 'qa-1',
+          runtime: 'claude-code',
+          role: 'qa',
+          workdir: '/tmp/qa-repo',
+          yolo: true,
+        }),
+      ]],
+    }],
   });
-
-  await agentStore.set({
-    id: 'dev-1',
-    projectId: 'proj',
+  const harness = await createManagerHarness(tempDir, {
+    config,
+    deps: {
+      runnerFactory: () => runner,
+      platformRunner: runner,
+    },
+  });
+  ({ manager, agentStore, lockManager, eventBus, createManager, events } = harness);
+  await harness.seedAgent({
     creationToken: 'token-abc',
     updatedAt: NOW,
   });
@@ -157,8 +141,6 @@ describe('AgentManager.startBootstrapAsync', () => {
     )).toBe(true);
   });
 
-  // killSession-by-name no longer exists on TmuxManager, so a regression to
-  // name-based kills cannot even compile; only the ref path needs watching.
   function spyKills(): { byRef: ReturnType<typeof vi.spyOn> } {
     return {
       byRef: vi.spyOn(TmuxManager.prototype, 'killSessionRef').mockResolvedValue('killed'),
@@ -330,18 +312,9 @@ describe('AgentManager.startBootstrapAsync', () => {
 describe('AgentManager greeting capability gate', () => {
   function makeManagerWithWatcher(awaitOnce: ReturnType<typeof vi.fn>) {
     const localEvents: BaxianEvent[] = [];
-    const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-    const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
     eventBus.on('*', (event) => { localEvents.push(event); });
     const phaseSignalWatcher = { awaitOnce } as unknown as PhaseSignalWatcher;
-    const mgr = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
-      eventBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => runner(),
+    const mgr = createManager({
       phaseSignalWatcher,
     });
     vi.spyOn(mgr, 'ensureSession').mockResolvedValue({
@@ -549,7 +522,6 @@ describe('AgentManager greeting capability gate', () => {
     expect(state?.awaitingPhase).toBeUndefined();
   });
 
-
   it('Resume refuses a greeting_failed hold — capability must be re-proven, not overridden', async () => {
     const { mgr } = makeManagerWithWatcher(vi.fn().mockResolvedValue('matched'));
     await agentStore.set({
@@ -738,27 +710,25 @@ describe('AgentManager.slowPollDialogPending (no hard-fail timeout)', () => {
       '› ',
     ].join('\n');
 
-    const dispatchRunner: CommandRunner = {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('list-sessions')) {
-          return { stdout: '9999|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('list-panes')) {
-          return { stdout: '%2 node\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('%1') && !cmd.includes('%2')) {
-          return { stdout: '', stderr: "can't find pane: %1", exitCode: 1 };
-        }
-        if (cmd.includes('capture-pane') && cmd.includes('%2')) {
-          return { stdout: `BX_PANE_OK\n${READY_CODEX}`, stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('display-message') && cmd.includes('%2')) {
-          return { stdout: 'BX_PANE_OKnode\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
+    const dispatchRunner = fakeRunner({
+      rules: [
+        { match: 'list-sessions', reply: { stdout: '9999|1700000000|$1|dev-1\n' } },
+        { match: 'list-panes', reply: { stdout: '%2 node\n' } },
+        {
+          match: cmd => cmd.includes('%1') && !cmd.includes('%2'),
+          reply: { stderr: "can't find pane: %1", exitCode: 1 },
+        },
+        {
+          match: cmd => cmd.includes('capture-pane') && cmd.includes('%2'),
+          reply: { stdout: `BX_PANE_OK\n${READY_CODEX}` },
+        },
+        {
+          match: cmd => cmd.includes('display-message') && cmd.includes('%2'),
+          reply: { stdout: 'BX_PANE_OKnode\n' },
+        },
+      ],
+      defaultResult: {},
+    });
 
     vi.spyOn(manager as unknown as {
       createRunnerFor: (agent: unknown) => CommandRunner;

@@ -18,13 +18,13 @@ describe('field-mapper', () => {
   it('sources alias chain picks first existing key', () => {
     const op: DriverOp = { argv: ['x'], map: { draft: { sources: ['draft', 'work_in_progress'] } } };
     expect(mapResponse('prView', op, { draft: true })[0].draft).toBe(true);
-    expect(mapResponse('prView', op, { work_in_progress: false })[0].draft).toBe(false); // 13.x 形态
-    expect(() => mapResponse('prView', op, {})).toThrow(FieldMappingError); // 别名链全缺且非 optional
+    expect(mapResponse('prView', op, { work_in_progress: false })[0].draft).toBe(false);
+    expect(() => mapResponse('prView', op, {})).toThrow(FieldMappingError);
   });
 
   it('optional field absent maps to undefined without failing the op', () => {
     const op: DriverOp = { argv: ['x'], map: { detailedMergeStatus: { sources: ['detailed_merge_status'], optional: true } } };
-    const rows = mapResponse('prView', op, {}); // pre-15.6 响应
+    const rows = mapResponse('prView', op, {});
     expect(rows[0].detailedMergeStatus).toBe(undefined);
   });
 
@@ -98,16 +98,13 @@ describe('field-mapper: single-level [] source-path flatten (map value getter, s
   });
 
   it('a null array key is a present empty collection (spec null-as-present), never the missing path', () => {
-    // required source 不抛——键存在值 null 不触发缺失语义（spec §5.3），投影与 [] 同构
     const required: DriverOp = { argv: ['x'], map: { usernames: 'reviewers[].login' } };
     expect(mapResponse('prView', required, { reviewers: null })[0].usernames).toEqual([]);
     expect(mapResponse('prView', required, { reviewers: [] })[0].usernames).toEqual([]);
 
     const optional: DriverOp = { argv: ['x'], map: { usernames: { sources: ['reviewers[].login'], optional: true } } };
     expect(mapResponse('prView', optional, { reviewers: null })[0].usernames).toEqual([]);
-    // 缺失语义仅属于键不存在
     expect(() => mapResponse('prView', required, {})).toThrow(/missing/);
-    // 非 null 的形状损坏仍然是 shape error，不落入空集合容忍
     expect(() => mapResponse('prView', optional, { reviewers: 'oops' })).toThrow(/expects an array/);
   });
 

@@ -60,7 +60,6 @@ function sameSeat(
   return left.projectId === right.projectId && left.role === right.role;
 }
 
-// 派发链在 claim 临界区之外仍按配置解析 Workdir/session，热重载竞态只能在提交层拦截
 export async function activeParticipantBlockers(
   manager: AgentManager,
   current: BaxianConfig,

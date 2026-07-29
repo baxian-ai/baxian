@@ -24,7 +24,6 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
 
   const confirm = useCallback<ConfirmFn>((options) => {
     return new Promise<boolean>((resolve) => {
-      // 同一时刻只有一个确认框：后来者顶掉前者，前者按取消处理。
       pendingRef.current?.resolve(false);
       const next = { ...options, resolve };
       pendingRef.current = next;

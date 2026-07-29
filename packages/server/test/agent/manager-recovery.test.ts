@@ -3,106 +3,46 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AgentBindingFacts, BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentManager, EnsureSessionError, canDispatchWithBinding } from '../../src/agent/manager.js';
+import { EnsureSessionError, canDispatchWithBinding, type AgentManager } from '../../src/agent/manager.js';
 import { PhaseSignalWatcher } from '../../src/agent/phase-signal-watcher.js';
 import { buildPhaseSignal } from '../../src/agent/phase-signal.js';
 import type { PaneStreamerManager } from '../../src/agent/pane-streamer-manager.js';
 import type { SubscriberCallbacks } from '../../src/agent/pane-streamer.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
 import { BranchManager } from '../../src/agent/branch.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { TaskStore } from '../../src/state/task-store.js';
+import type { LockManager } from '../../src/state/lock.js';
 import { EventBus } from '../../src/event/bus.js';
 import { EventLog } from '../../src/event/log.js';
 import { registerEventHandlers } from '../../src/event/handlers.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
-import { ApiError } from '../../src/errors.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeConfig } from '../helpers/fixtures.js';
 
 const NOW = '2026-05-14T05:00:00.000Z';
 
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'user/repo',
-    merge: 'auto',
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-    ]],
-  }],
-};
-
 let tempDir: string;
+let config: BaxianConfig;
 let agentStore: AgentStore;
 let taskStore: TaskStore;
 let lockManager: LockManager;
 let eventBus: EventBus;
 let manager: AgentManager;
-const events: BaxianEvent[] = [];
+let createManager: Awaited<ReturnType<typeof createManagerHarness>>['createManager'];
+let seedAgent: Awaited<ReturnType<typeof createManagerHarness>>['seedAgent'];
+let seedHarnessTask: Awaited<ReturnType<typeof createManagerHarness>>['seedTask'];
+let events: BaxianEvent[];
 
 const REF = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
 
-function noopRunner(): CommandRunner {
-  return {
-    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      const sessionName = cmd.match(/session_name},([^}]+)}/)?.[1];
-      if (sessionName && cmd.includes('tmux list-sessions')) {
-        return { stdout: `4242|1700000000|$1|${sessionName}\n`, stderr: '', exitCode: 0 };
-      }
-      const claim = cmd.match(/@baxian-agent-id},([^}]+)}/)?.[1];
-      if (claim && cmd.includes('tmux list-panes')) {
-        const runtime = claim === 'qa-1' ? 'codex' : 'claude';
-        return { stdout: `%1 ${runtime}\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\n⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
-      }
-      return { stdout: '', stderr: '', exitCode: 0 };
-    }),
-    writeFile: vi.fn(async (): Promise<void> => undefined),
-  };
-}
-
-async function seedAgent(overrides: Partial<AgentBindingFacts> & { id: string }): Promise<void> {
-  await agentStore.set({ projectId: 'proj', updatedAt: NOW, ...overrides });
-  if (!overrides.taskId || await lockManager.isLocked(overrides.id)) return;
-  const token = await lockManager.acquire(overrides.id, overrides.taskId);
-  if (!token) return;
-  await agentStore.update(overrides.id, latest => latest?.taskId === overrides.taskId
-    ? { ...latest, lockToken: token, updatedAt: new Date().toISOString() }
-    : latest);
-}
-
-function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<void> {
-  const task = {
-    projectId: 'proj',
-    title: 'T',
-    description: 'D',
-    preferredAgentId: 'dev-1',
-    agentId: 'dev-1',
-    devAgentId: 'dev-1',
-    qaAgentId: 'qa-1',
-    branch: `bx/${overrides.id}`,
-    reviewRound: 0,
-    platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
-    status: 'in_progress',
-    createdAt: NOW,
-    updatedAt: NOW,
+function seedRecoveryTask(overrides: Partial<TaskState> & { id: string }): Promise<TaskState> {
+  return seedHarnessTask({
     ...overrides,
-  } as TaskState;
-  if (task.phase !== undefined && !Object.hasOwn(overrides, 'deliveryConfirmation')) {
-    task.deliveryConfirmation = { phase: task.phase, source: 'signal', at: NOW };
-  }
-  return taskStore.set(task);
+    ...(overrides.phase !== undefined && !Object.hasOwn(overrides, 'deliveryConfirmation')
+      ? { deliveryConfirmation: { phase: overrides.phase, source: 'signal', at: NOW } }
+      : {}),
+  });
 }
 
 function postApproveEpisode(token: string, headSha: string): Partial<TaskState> {
@@ -139,7 +79,7 @@ interface RecoveryHandles {
 
 async function runRecovery(scenario: RecoveryScenario): Promise<RecoveryHandles> {
   for (const agent of scenario.agents) await seedAgent(agent);
-  for (const task of scenario.tasks ?? []) await seedTask(task);
+  for (const task of scenario.tasks ?? []) await seedRecoveryTask(task);
   for (const event of scenario.emit ?? []) await eventBus.emit(event);
   for (const id of scenario.locks ?? []) await acquireBoundLock(id);
 
@@ -177,24 +117,40 @@ async function acquireBoundLock(agentId: string, taskId?: string): Promise<strin
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-recovery-'));
-  await initStateDir(tempDir);
-
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
-  events.length = 0;
-  eventBus.on('*', (event) => { events.push(event); });
-
-  manager = new AgentManager({
-    config: CONFIG,
+  config = makeConfig({
+    project: [{
+      ...makeConfig().project[0]!,
+      merge: 'auto',
+    }],
+  });
+  const harness = await createManagerHarness(tempDir, {
+    config,
+    taskDefaults: {
+      branchCreatedByBaxian: undefined,
+      createdAt: NOW,
+      updatedAt: NOW,
+    },
+    lockSeededAgents: true,
+    deps: {
+      runnerFactory: () => fakeRunner({
+        agents: {
+          'dev-1': { paneId: '%1' },
+          'qa-1': { paneId: '%1' },
+        },
+      }),
+    },
+  });
+  ({
+    manager,
+    createManager,
     agentStore,
     taskStore,
     lockManager,
     eventBus,
-    skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-    runnerFactory: () => noopRunner(),
-  });
+    seedAgent,
+    seedTask: seedHarnessTask,
+    events,
+  } = harness);
 });
 
 afterEach(async () => {
@@ -206,7 +162,7 @@ describe('recover()', () => {
   it('reclaims orphaned maintenance and task locks but preserves an exactly bound task lock', async () => {
     const maintenanceToken = await lockManager.acquire('dev-1', 'maintenance:branch-reconcile');
     const orphanedTaskToken = await lockManager.acquire('orphan-1', 'task-orphaned');
-    await seedTask({ id: 'task-live', status: 'review', qaAgentId: 'qa-1' });
+    await seedRecoveryTask({ id: 'task-live', status: 'review', qaAgentId: 'qa-1' });
     await seedAgent({ id: 'qa-1', taskId: 'task-live' });
     const boundTaskToken = (await agentStore.get('qa-1'))?.lockToken;
     mockEnsureSessionOk();
@@ -220,7 +176,7 @@ describe('recover()', () => {
 
   it('holds a bound agent without touching tmux when exclusive lock ownership is stale', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-stale-lock', paneId: '%1' });
-    await seedTask({ id: 'task-stale-lock' });
+    await seedRecoveryTask({ id: 'task-stale-lock' });
     const before = (await agentStore.get('dev-1'))!;
     await lockManager.releaseIfOwner('dev-1', 'task-stale-lock', before.lockToken!);
     const ensureSpy = vi.spyOn(manager, 'ensureSession');
@@ -251,7 +207,7 @@ describe('recover()', () => {
 
   it('redrives post-merge cleanup for a recovered merged-task binding', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
-    await seedTask({ id: 'task-merged', prNumber: 42, reviewRound: 1, status: 'merged' });
+    await seedRecoveryTask({ id: 'task-merged', prNumber: 42, reviewRound: 1, status: 'merged' });
     vi.spyOn(manager, 'ensureSession').mockResolvedValue({
       ok: true, createdSession: false, freshRuntime: false, paneId: '%1',
       pane: { session: REF, paneId: '%1', claim: 'dev-1' }, sessionRef: REF, workdir: '/tmp/repo',
@@ -276,7 +232,7 @@ describe('recover()', () => {
 
   it('redrives context compaction for a recovered done-task binding (terminal without pr)', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-done', paneId: '%0' });
-    await seedTask({ id: 'task-done', status: 'done' });
+    await seedRecoveryTask({ id: 'task-done', status: 'done' });
     mockEnsureSessionOk();
     let paneIdSeenByCompaction: string | undefined;
     const compactSpy = vi.spyOn(
@@ -300,7 +256,7 @@ describe('recover()', () => {
 
   it('redrives context compaction for a recovered merged binding without a PR (branch merge)', async () => {
     await seedAgent({ id: 'qa-1', taskId: 'task-branch-merged', paneId: '%0' });
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-branch-merged', status: 'merged',
       preferredAgentId: 'dev-1', agentId: 'dev-1', qaAgentId: 'qa-1',
     });
@@ -605,17 +561,11 @@ describe('recover()', () => {
       id: 'dev-1', taskId: 'task-1', startedAt: NOW, paneId: '%0',
       bootstrappingTaskId: 'task-1', workdir: '/tmp/repo',
     });
-    await seedTask({ id: 'task-1', signalToken: 'replay-tok-1' });
+    await seedRecoveryTask({ id: 'task-1', signalToken: 'replay-tok-1' });
     vi.spyOn(manager, 'continueSession').mockImplementation(async (_taskId, _agentId, _phase, opts) =>
       opts.guardBeforeInject?.() ?? true,
     );
-    await expect(manager.redispatchTaskPromptAfterReplRestart('dev-1', 'task-1', {
-      status: 'in_progress',
-      phase: undefined,
-      signalToken: 'replay-tok-1',
-      agentId: 'dev-1',
-      reviewRound: 0,
-    })).resolves.toBe(true);
+    await expect(manager.redispatchTaskPromptAfterReplRestart('dev-1', 'task-1')).resolves.toBe(true);
 
     const { cleanupSpy } = await runRecovery({ agents: [], tasks: [] });
 
@@ -667,277 +617,6 @@ describe('recover()', () => {
   });
 });
 
-describe('redispatchCurrentTaskPhase()', () => {
-  it('reuses the existing review dispatcher only when the persisted task generation still matches', async () => {
-    await seedTask({
-      id: 'task-review',
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 2,
-      qaAgentId: 'qa-1',
-    });
-    const dispatch = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue();
-    const guard = {
-      status: 'review' as const,
-      phase: 'code' as const,
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    };
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', guard)).resolves.toBe('dispatched');
-    expect(dispatch).toHaveBeenCalledWith('task-review', {
-      fromStatus: ['review'],
-      bumpRound: false,
-      expectSignalToken: 'abcdef123456',
-      expectPhase: 'code',
-      expectedTask: guard,
-      onSideEffect: expect.any(Function),
-    });
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      ...guard,
-      signalToken: 'fedcba654321',
-    })).resolves.toBe('stale');
-    expect(dispatch).toHaveBeenCalledOnce();
-  });
-
-  it('preserves explicit missing-token and phase fences when redispatching review', async () => {
-    await seedTask({
-      id: 'task-review',
-      status: 'review',
-      phase: undefined,
-      signalToken: undefined,
-      reviewRound: 2,
-      qaAgentId: 'qa-1',
-    });
-    const dispatch = vi.spyOn(manager, 'dispatchReviewToQa').mockResolvedValue();
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    })).resolves.toBe('dispatched');
-
-    expect(dispatch).toHaveBeenCalledWith('task-review', expect.objectContaining({
-      expectSignalToken: undefined,
-      expectPhase: undefined,
-    }));
-    expect(Object.hasOwn(dispatch.mock.calls[0]![1]!, 'expectSignalToken')).toBe(true);
-    expect(Object.hasOwn(dispatch.mock.calls[0]![1]!, 'expectPhase')).toBe(true);
-  });
-
-  it('does not classify a hard failure after its own review-pass mutation as stale', async () => {
-    await seedTask({
-      id: 'task-review',
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 2,
-      qaAgentId: 'qa-1',
-      prNumber: 42,
-      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-      replyActorId: '77',
-      replyActorStatus: 'verified',
-    });
-    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
-      ok: true,
-      headSha: '1111111111111111111111111111111111111111',
-      branch: 'bx/task-review',
-      targetBranch: 'main',
-    });
-    vi.spyOn(manager, 'dispatchGitReviewLease')
-      .mockRejectedValue(new ApiError(500, 'QA session failed after pass creation'));
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    })).rejects.toMatchObject({ status: 500 });
-    expect((await taskStore.get('task-review'))?.signalToken).not.toBe('abcdef123456');
-  });
-
-  it('does not classify a git re-acquire failure as stale after releasing the prior QA', async () => {
-    await seedTask({
-      id: 'task-review',
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 2,
-      qaAgentId: 'qa-1',
-      prNumber: 42,
-      deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
-      replyActorId: '77',
-      replyActorStatus: 'verified',
-    });
-    await seedAgent({ id: 'qa-1', taskId: 'task-review' });
-    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
-      ok: true,
-      headSha: '1111111111111111111111111111111111111111',
-      branch: 'bx/task-review',
-      targetBranch: 'main',
-    });
-    vi.spyOn(manager, 'acquireAgentForTask').mockResolvedValue(false);
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    })).rejects.toMatchObject({ status: 409, message: expect.stringContaining('busy or unavailable') });
-    expect((await agentStore.get('qa-1'))?.taskId).toBeUndefined();
-    expect((await taskStore.get('task-review'))?.signalToken).not.toBe('abcdef123456');
-  });
-
-  it('classifies a git review without a PR as unsupported without consuming recovery budget', async () => {
-    await seedTask({
-      id: 'task-review', status: 'review', phase: 'code', signalToken: 'entry-pass', reviewRound: 2,
-      qaAgentId: 'qa-1', prNumber: undefined,
-    });
-    const guard = {
-      status: 'review' as const,
-      phase: 'code' as const,
-      signalToken: 'entry-pass',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    };
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', guard)).resolves.toBe('unsupported');
-    expect((await taskStore.get('task-review'))?.signalToken).toBe('entry-pass');
-  });
-
-  it.each([
-    ['an invalid PR binding', { ok: false as const, reason: 'unverifiable' as const }],
-    ['an invalid platform head', {
-      ok: true as const,
-      headSha: 'not-a-sha',
-      branch: 'bx/task-review',
-      targetBranch: 'main',
-    }],
-  ])('classifies %s as unsupported before creating a git review pass', async (_name, verification) => {
-    await seedTask({
-      id: 'task-review', status: 'review', phase: 'code', signalToken: 'entry-pass', reviewRound: 2,
-      qaAgentId: 'qa-1', prNumber: 42,
-    });
-    vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue(verification);
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review', phase: 'code', signalToken: 'entry-pass', agentId: 'dev-1', reviewRound: 2,
-    })).resolves.toBe('unsupported');
-    expect((await taskStore.get('task-review'))?.signalToken).toBe('entry-pass');
-  });
-
-  it('does not collapse an unclassified git-review 409 into a side-effect-free unsupported result', async () => {
-    await seedTask({
-      id: 'task-review',
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 2,
-      qaAgentId: 'qa-1',
-    });
-    vi.spyOn(manager, 'dispatchReviewToQa').mockRejectedValue(
-      new ApiError(409, 'QA was released before reacquire failed'),
-    );
-
-    await expect(manager.redispatchCurrentTaskPhase('task-review', {
-      status: 'review',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 2,
-    })).rejects.toMatchObject({ status: 409, code: undefined });
-  });
-
-  it.each(['dispatch-superseded', 'dispatch-in-flight'])(
-    'treats the established benign concurrency code %s as stale instead of unknown',
-    async (code) => {
-      await seedTask({
-        id: 'task-review',
-        status: 'review',
-        phase: 'code',
-        signalToken: 'abcdef123456',
-        reviewRound: 2,
-        qaAgentId: 'qa-1',
-      });
-      vi.spyOn(manager, 'dispatchReviewToQa').mockRejectedValue(
-        new ApiError(409, 'concurrent review dispatcher won', code),
-      );
-
-      await expect(manager.redispatchCurrentTaskPhase('task-review', {
-        status: 'review',
-        phase: 'code',
-        signalToken: 'abcdef123456',
-        agentId: 'dev-1',
-        reviewRound: 2,
-      })).resolves.toBe('stale');
-    },
-  );
-
-  it('carries the root generation guard into the owner replay primitive', async () => {
-    await seedTask({
-      id: 'task-code',
-      status: 'in_progress',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 1,
-    });
-    const originalGet = taskStore.get.bind(taskStore);
-    let reads = 0;
-    vi.spyOn(taskStore, 'get').mockImplementation(async (taskId) => {
-      const current = await originalGet(taskId);
-      reads++;
-      if (reads === 2 && current) {
-        const advanced = {
-          ...current,
-          signalToken: 'fedcba654321',
-          updatedAt: '2026-05-14T05:01:00.000Z',
-        };
-        await taskStore.set(advanced);
-        return advanced;
-      }
-      return current;
-    });
-
-    await expect(manager.redispatchCurrentTaskPhase('task-code', {
-      status: 'in_progress',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 1,
-    })).resolves.toBe('stale');
-    expect(reads).toBe(3);
-  });
-
-  it('maps the existing owner replay result to dispatched or unsupported', async () => {
-    await seedTask({
-      id: 'task-code',
-      status: 'in_progress',
-      phase: 'code',
-      signalToken: 'abcdef123456',
-      reviewRound: 1,
-    });
-    const replay = vi.spyOn(manager, 'redispatchTaskPromptAfterReplRestart');
-    const guard = {
-      status: 'in_progress' as const,
-      phase: 'code' as const,
-      signalToken: 'abcdef123456',
-      agentId: 'dev-1',
-      reviewRound: 1,
-    };
-
-    replay.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-    await expect(manager.redispatchCurrentTaskPhase('task-code', guard)).resolves.toBe('dispatched');
-    await expect(manager.redispatchCurrentTaskPhase('task-code', guard)).resolves.toBe('unsupported');
-    expect(replay).toHaveBeenNthCalledWith(1, 'dev-1', 'task-code', guard);
-    expect(replay).toHaveBeenNthCalledWith(2, 'dev-1', 'task-code', guard);
-  });
-});
-
 describe('setupRecoveredPostApproveSignals()', () => {
   function snapshotPaneStreamerManager(snapshot: string): PaneStreamerManager {
     const streamer = {
@@ -958,7 +637,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
   }
 
   it('sets up approved tasks with stored completion records', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-approved', reviewRound: 1, status: 'approved',
       ...postApproveEpisode('tok', 'a'.repeat(40)),
     });
@@ -966,14 +645,8 @@ describe('setupRecoveredPostApproveSignals()', () => {
       start: vi.fn(async () => true),
       stop: vi.fn(),
     };
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
+    manager = createManager({
       eventBus: new EventBus(new EventLog(join(tempDir, 'events-2'))),
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
       phaseSignalWatcher: watcher as never,
     });
 
@@ -991,7 +664,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
   });
 
   it('reports an approved git task whose persisted post-approve episode is incomplete', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-approved-incomplete', reviewRound: 1, status: 'approved',
     });
 
@@ -1004,16 +677,16 @@ describe('setupRecoveredPostApproveSignals()', () => {
 
   it('replays a recovered pr-merge-ready snapshot for manual-merge projects', async () => {
     const token = 'posttok12345';
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-approved-manual', reviewRound: 1, status: 'approved',
       ...postApproveEpisode(token, 'b'.repeat(40)),
     });
     await seedAgent({ id: 'dev-1', taskId: 'task-approved-manual', paneId: '%1' });
 
-    const manualConfig: BaxianConfig = {
-      ...CONFIG,
-      project: CONFIG.project.map(p => ({ ...p, merge: null })),
-    };
+    const manualConfig = makeConfig({
+      ...config,
+      project: config.project.map(p => ({ ...p, merge: null })),
+    });
     const eventsDir = join(tempDir, 'events-post-approve-manual');
     await mkdir(eventsDir, { recursive: true });
     const localBus = new EventBus(new EventLog(eventsDir));
@@ -1021,17 +694,12 @@ describe('setupRecoveredPostApproveSignals()', () => {
       paneStreamerManager: snapshotPaneStreamerManager(`done\n${buildPhaseSignal('pr-merge-ready', token)}\n`),
       eventBus: localBus,
       resolveAgent: (id) => (
-        id === 'dev-1' ? { ...CONFIG.project[0]!.agent[0]![0]!, projectId: 'proj' } : undefined
+        id === 'dev-1' ? { ...config.project[0]!.agent[0]![0]!, projectId: 'proj' } : undefined
       ),
     });
-    manager = new AgentManager({
+    manager = createManager({
       config: manualConfig,
-      agentStore,
-      taskStore,
-      lockManager,
       eventBus: localBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
       phaseSignalWatcher: watcher,
     });
     registerEventHandlers(localBus, manager);
@@ -1047,7 +715,7 @@ describe('setupRecoveredPostApproveSignals()', () => {
 
 describe('git review dispatch recovery', () => {
   it('resets an unbound claimed lease to pending after restart', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-unbound-claim', status: 'in_progress', phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
       replyActorId: '77', replyActorStatus: 'verified', prNumber: 42,
@@ -1064,7 +732,7 @@ describe('git review dispatch recovery', () => {
   });
 
   it('marks a claimed lease uncertain when the QA binding may have received it', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-bound-claim', status: 'in_progress', phase: 'code',
       deliveryConfirmation: { phase: 'code', source: 'signal', at: NOW },
       replyActorId: '77', replyActorStatus: 'verified', prNumber: 42,
@@ -1105,14 +773,8 @@ describe('setupRecoveredSpecSignals()', () => {
     const localBus = new EventBus(new EventLog(eventsDir));
     const localEvents: BaxianEvent[] = [];
     localBus.on('*', (event) => { localEvents.push(event); });
-    manager = new AgentManager({
-      config: CONFIG,
-      agentStore,
-      taskStore,
-      lockManager,
+    manager = createManager({
       eventBus: localBus,
-      skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-      runnerFactory: () => noopRunner(),
       phaseSignalWatcher: watcher as never,
     });
     return { watcher, events: localEvents };
@@ -1148,7 +810,7 @@ describe('setupRecoveredSpecSignals()', () => {
         skipSnapshot: false, recovered: true, needInputInherit: true,
       }],
   ])('%s', async (_label, task, expectedArg) => {
-    await seedTask(task);
+    await seedRecoveryTask(task);
     const { watcher } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
@@ -1160,7 +822,7 @@ describe('setupRecoveredSpecSignals()', () => {
     ['spec', 'task-spec-review'],
     ['code', 'task-code-review'],
   ] as const)('restores the passive platform watcher for %s review', async (phase, id) => {
-    await seedTask({
+    await seedRecoveryTask({
       id,
       phase,
       status: 'review',
@@ -1189,7 +851,7 @@ describe('setupRecoveredSpecSignals()', () => {
       id: 'task-terminal', signalToken: 'tok-stale', status: 'merged',
     }],
   ])('%s', async (_label, task) => {
-    await seedTask(task);
+    await seedRecoveryTask(task);
     const { watcher } = await buildManagerWithSpecWatcher();
 
     await manager.setupRecoveredSpecSignals();
@@ -1198,7 +860,7 @@ describe('setupRecoveredSpecSignals()', () => {
   });
 
   it('reports a recovered fix signal without restoring the retired read-file side channel', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-fixing',
       phase: 'code',
       status: 'fixing',
@@ -1223,7 +885,7 @@ describe('setupRecoveredSpecSignals()', () => {
   });
 
   it('does not report a stale recovery intervention after the snapshot advances the task generation', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-fixing-snapshot',
       phase: 'code',
       status: 'fixing',
@@ -1251,7 +913,7 @@ describe('setupRecoveredSpecSignals()', () => {
   });
 
   it('restores both the passive review watcher and an unverified PR delivery watcher', async () => {
-    await seedTask({
+    await seedRecoveryTask({
       id: 'task-pending-pr',
       phase: 'code',
       status: 'review',
@@ -1285,7 +947,7 @@ describe('setupRecoveredSpecSignals()', () => {
 describe('recover() deferred branches', () => {
   it('skips the post-merge redrive when the binding refresh does not land', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
-    await seedTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
+    await seedRecoveryTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
     mockEnsureSessionOk();
     vi.spyOn(agentStore, 'update').mockImplementationOnce(async () => {});
     const cleanupSpy = vi.spyOn(manager, 'dispatchPostMergeCleanup').mockResolvedValue();
@@ -1297,7 +959,7 @@ describe('recover() deferred branches', () => {
 
   it('falls through to the release path when the post-merge redrive throws', async () => {
     await seedAgent({ id: 'dev-1', taskId: 'task-merged', paneId: '%0' });
-    await seedTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
+    await seedRecoveryTask({ id: 'task-merged', prNumber: 42, status: 'merged' });
     await acquireBoundLock('dev-1');
     mockEnsureSessionOk();
     vi.spyOn(manager, 'dispatchPostMergeCleanup').mockRejectedValue(new Error('cleanup exploded'));

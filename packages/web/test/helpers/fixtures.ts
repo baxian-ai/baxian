@@ -4,7 +4,6 @@ import type { ProbeResponse } from '../../src/api.ts';
 type ProbeRuntimes = ProbeResponse['runtimes'];
 type ProbeStatus = ProbeRuntimes[AgentRuntime];
 
-// Full four-runtime probe.runtimes so tests never miss a key when a new AgentRuntime is added.
 export function makeRuntimes(
   overrides: Partial<Record<AgentRuntime, ProbeStatus>> = {},
   fallback: ProbeStatus = { ok: true, message: '' },

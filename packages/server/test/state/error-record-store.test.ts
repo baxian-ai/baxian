@@ -208,7 +208,6 @@ describe('ErrorRecordStore', () => {
     const files = await readdir(dir);
     expect(files.filter(f => f.endsWith('.tmp'))).toHaveLength(0);
     expect(warn.mock.calls.some(c => String(c[0]).includes('atomic rewrite failed'))).toBe(true);
-    // The tmp never existed here; its ENOENT is not a cleanup failure.
     expect(warn.mock.calls.some(c => String(c[0]).includes('failed to remove tmp'))).toBe(false);
     warn.mockRestore();
   });

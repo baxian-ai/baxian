@@ -183,7 +183,6 @@ describe('gitBindingBlockers', () => {
       { id: 'a', repo: 'git@github.com:owner/repo.git' },
       { id: 'b', repo: 'https://github.com/owner/repo.git' },
     ]);
-    // b 在 current 已指向同 repo：这是既有状态,不是本次变更新引入的冲突
     expect(await gitBindingBlockers(manager, cfg, cfg)).toEqual([]);
   });
 });

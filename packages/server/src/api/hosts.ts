@@ -1,6 +1,5 @@
 import type { FastifyInstance } from 'fastify';
 import type { HostConfig, BaxianConfig } from '../shared/index.js';
-import { ROOT_AGENT_ID } from '../shared/index.js';
 import type { CommandRunner } from '../agent/runner.js';
 import {
   LocalRunner,
@@ -98,34 +97,7 @@ async function liveAgentsReferencingHost(app: FastifyInstance, hostId: string): 
       }
     }
   }
-  const coordinator = app.ctx.rootRecoveryCoordinator;
-  const rootStatus = coordinator?.getRuntimeControlStatus();
-  const currentRootUsesHost = app.ctx.config.root?.mode === 'remote'
-    && app.ctx.config.root.host === hostId;
-  const legacyRootNeedsProtection = coordinator?.usesHost(hostId)
-    && rootStatus !== 'stopped-until-restart';
-  const rootProbeRequired = (currentRootUsesHost || legacyRootNeedsProtection)
-    && (rootStatus !== 'stop-incomplete' || !coordinator?.canRepairHostAfterIncompleteStop());
-  if (coordinator && rootProbeRequired) {
-    try {
-      if (await coordinator.isRuntimeLive()) live.push(ROOT_AGENT_ID);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      console.warn(`[hosts] root-agent liveness probe failed for host ${hostId}: ${detail}`);
-      throw new HostLivenessUnknownError(hostId, detail);
-    }
-  }
   return live;
-}
-
-class HostLivenessUnknownError extends Error {
-  constructor(readonly hostId: string, detail: string) {
-    super(
-      `无法确认 host "${hostId}" 上 root-agent 的运行状态：${detail}。` +
-      '请恢复旧 host 连接，或先停用 root agent 后重试',
-    );
-    this.name = 'HostLivenessUnknownError';
-  }
 }
 
 function hostBodyError(body: HostBody, hostnameRequired: boolean): string | null {
@@ -171,9 +143,6 @@ async function invalidateStreamersForHost(app: FastifyInstance, hostId: string):
         }
       }
     }
-  }
-  if (app.ctx.rootRecoveryCoordinator?.usesHost(hostId)) {
-    await app.ctx.rootRecoveryCoordinator.invalidateRuntimeStreamer();
   }
 }
 
@@ -263,15 +232,7 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
 
     const probeHost = applyHostPatch(current, body);
     if (structuralChange(current, probeHost)) {
-      let live: string[];
-      try {
-        live = await liveAgentsReferencingHost(app, id);
-      } catch (err) {
-        if (err instanceof HostLivenessUnknownError) {
-          return reply.status(503).send({ error: err.message });
-        }
-        throw err;
-      }
+      const live = await liveAgentsReferencingHost(app, id);
       if (live.length > 0) {
         return reply.status(409).send({
           error:
@@ -294,15 +255,7 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
       const lockedCurrent = app.ctx.config.host[idx];
       const next = applyHostPatch(lockedCurrent, body);
       if (structuralChange(lockedCurrent, next)) {
-        let live: string[];
-        try {
-          live = await liveAgentsReferencingHost(app, id);
-        } catch (err) {
-          if (err instanceof HostLivenessUnknownError) {
-            return reply.status(503).send({ error: err.message });
-          }
-          throw err;
-        }
+        const live = await liveAgentsReferencingHost(app, id);
         if (live.length > 0) {
           return reply.status(409).send({
             error:
@@ -351,11 +304,6 @@ export async function hostRoutes(app: FastifyInstance, options: HostRoutesOption
             if (agent.host === id) referencing.push(agent.id);
           }
         }
-      }
-      const coordinator = app.ctx.rootRecoveryCoordinator;
-      if ((app.ctx.config.root?.mode === 'remote' && app.ctx.config.root.host === id)
-        || (coordinator?.usesHost(id) && !coordinator.isRuntimeExplicitlyStopped())) {
-        referencing.push(ROOT_AGENT_ID);
       }
       if (referencing.length > 0) {
         return reply.status(409).send({

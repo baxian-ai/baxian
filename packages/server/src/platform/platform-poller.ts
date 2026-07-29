@@ -38,7 +38,6 @@ export interface PlatformTaskView {
 
 export type PlatformTasksProvider = (projectId: string) => Promise<PlatformTaskView[]>;
 
-// TaskState 到轮询视图的唯一投影：poller 只看这些字段，其余任务状态一律不进轮询面。
 export function platformTaskView(task: TaskState): PlatformTaskView {
   return {
     taskId: task.id,
@@ -60,7 +59,6 @@ export function platformTaskView(task: TaskState): PlatformTaskView {
   };
 }
 
-// GitDriver 的结构子集：poller 只依赖执行面，测试可注入可编程 fake。
 export interface PlatformDriver {
   readonly visibilityLagMs: number;
   readonly commentSources: CommentSourceOp[];
@@ -90,7 +88,6 @@ export interface PlatformPollerOptions {
   onCursorCommitted?: (
     taskId: string, prNumber: number, sourceKey: string, watermarkTime: number,
   ) => void | Promise<void>;
-  // 纯展示通知，不参与裁决与反馈事件流
   onConversationRevision?: (taskId: string) => void | Promise<void>;
 }
 
@@ -126,8 +123,6 @@ interface InternalEntry extends PlatformPollerEntryInit {
   status: EntryStatus;
   defaultBranch?: string;
   defaultBranchStale: number;
-  // 观察缓存按 (taskId, prNumber) 隔离：同一 PR 号可被先后不同任务收编（自定义分支复用/reopen），
-  // 只按 PR 号会让新任务继承旧任务的 merged/push 观察、事件被永久抑制（与 cursor 代际同理）。
   observedPr: Map<string, ObservedPr>;
   conversationDigest: Map<string, string>;
   preflightPassed?: boolean;
@@ -143,11 +138,6 @@ interface CycleFailure {
   errorClass?: string;
 }
 
-
-// 限流后必须停止请求并退避（GitHub 平台要求，持续触发 secondary limit 会招致封禁）：
-// 命中即短路该 entry 本周期剩余工作，退避窗口内整周期跳过，成功周期重置。
-// abort 携带此前已入列的全部失败：混合周期（如 ACCESS_DENIED → RATE_LIMIT）的真实
-// 凭据故障不得被限流短路洗白成 healthy。
 class RateLimitAbort extends Error {
   constructor(readonly failure: CycleFailure, readonly failures: CycleFailure[]) {
     super(failure.message);
@@ -155,7 +145,6 @@ class RateLimitAbort extends Error {
   }
 }
 
-// 周期失败已在抛出前记入健康度——typed 标记让 catch 兜底不二次记账（不能用消息前缀嗅探）。
 class CycleFailuresError extends Error {
   constructor(message: string) {
     super(message);
@@ -172,7 +161,6 @@ class EntryRetiredError extends Error {
 
 const RATE_LIMIT_BACKOFF_MIN_MS = 60_000;
 const RATE_LIMIT_BACKOFF_MAX_MS = 900_000;
-// 与 spec §8 base 快照同一时效纪律：projectView 连续失败 ≥3 周期后缓存默认分支视为缺失。
 const DEFAULT_BRANCH_STALE_CYCLES = 3;
 const ADOPTION_DEFERRAL_INTERVENTION_CYCLES = 3;
 
@@ -233,7 +221,6 @@ export class PlatformPoller {
   }
 
   private upsertWantedEntries(wantedByKey: ReadonlyMap<string, PlatformPollerEntryInit>): void {
-    // Reusing repo-keyed entries keeps durable cursors and in-memory observations aligned across reloads.
     const existingByKey = new Map(this.entries.map(e => [e.repoKey, e]));
     for (const [key, init] of wantedByKey) {
       const existing = existingByKey.get(key);
@@ -276,7 +263,6 @@ export class PlatformPoller {
     }
   }
 
-  // 超龄即视为缺失；纯缓存读，派发路径零网络调用。
   defaultBranchSnapshot(repoKey: string): string | undefined {
     const entry = this.entries.find(e => e.repoKey === repoKey);
     if (entry?.defaultBranch === undefined) return undefined;
@@ -316,8 +302,6 @@ export class PlatformPoller {
     this.periodicRunner.start();
   }
 
-  // 热重载改 pollIntervalMs：只调整已在运行的 runner,不替一个从未 start 的 poller 启动
-  // （启动是 index 装配的职责）。未运行时仅记下新间隔,下次 start 生效。
   reschedule(intervalMs: number): void {
     this.intervalMs = intervalMs;
     this.periodicRunner?.reschedule(intervalMs);
@@ -327,8 +311,6 @@ export class PlatformPoller {
     this.periodicRunner?.stop();
   }
 
-  // 防重入设在唯一公开入口：定时 tick、手动触发与测试直调共用同一互斥，
-  // 并发周期会对同一 entry/cursor 双写（重复事件 + 状态文件竞争）。
   async poll(): Promise<void> {
     if (this.isPolling) {
       console.warn('[PlatformPoller] poll skipped: previous cycle still in flight');
@@ -377,7 +359,6 @@ export class PlatformPoller {
     } catch (e) {
       if (e instanceof EntryRetiredError) return;
       if (e instanceof RateLimitAbort) {
-        // 不计凭据健康度（spec §5.3 要点）：退避顺延重试并在状态里如实标注 rate-limited。
         const attempt = (entry.rateLimit?.attempt ?? 0) + 1;
         const backoffMs = computeBackoffMs(attempt, {
           baseMs: RATE_LIMIT_BACKOFF_MIN_MS, maxMs: RATE_LIMIT_BACKOFF_MAX_MS,
@@ -497,7 +478,6 @@ export class PlatformPoller {
       if (!activePrs.has(Number(key.split(':')[0]))) entry.loggedUndated.delete(key);
     }
 
-    // 首周期自证，失败进健康度周期重试；早退周期未刷新 projectView，须同步老化缓存。
     if (entry.preflightPassed !== true && entry.driver.runPreflightSteps !== undefined) {
       let steps: Array<{ step: string; ok: boolean; message: string }>;
       try {
@@ -542,8 +522,6 @@ export class PlatformPoller {
       entry.defaultBranchStale += 1;
       fail('projectView', e);
     }
-    // 收编快照必须用当周期值（写 durable base）；子轮询绑定校验是纯守卫谓词，可用
-    // 有界陈旧的缓存跨过瞬时 projectView 故障，超龄即视为缺失（fail closed 停子轮询）。
     const usableDefault = defaultBranch
       ?? (entry.defaultBranch !== undefined && entry.defaultBranchStale < DEFAULT_BRANCH_STALE_CYCLES
         ? entry.defaultBranch
@@ -554,8 +532,6 @@ export class PlatformPoller {
 
     for (const task of tasks) {
       if (task.terminal || task.prNumber === undefined) continue;
-      // closed-unmerged 锚在场即停子轮询：恢复只经主轮询 reopen 事件 → handler durable
-      // 解锚 → 下一周期任务视图锚已清（spec §6 reopen 显式 durable 观察协议）。
       if (task.closedUnmergedAnchor === true) continue;
       await this.subPoll(entry, task, usableDefault, fail);
       this.assertEntryActive(entry);
@@ -563,7 +539,6 @@ export class PlatformPoller {
     return failures;
   }
 
-  // PR 收编后仍可被 retarget/改写：产出生命周期/裁决事件前按 fresh prView 复核绑定，「无法核验」不得视同「匹配」。
   private bindingCheck(
     task: PlatformTaskView,
     prRow: NormalizedRow,
@@ -590,9 +565,6 @@ export class PlatformPoller {
     try {
       prRows = await entry.driver.runListPrs({}, pageRows => {
         if (prsCursor.watermarkTime === null) return false;
-        // 停止条件 = 观察到严格早于水位的行：desc 序下这证明 ≥ 水位的行（含水位同秒整桶）
-        // 已全部翻过；「整页都是已知水位行」证明不了同秒桶已扫完——同秒无稳定次序，
-        // 第二页可能还有同秒新 PR（spec v1 §6 停止条件）。
         return pageRows.some(r => {
           const vt = versionTimeOf(r);
           return vt !== undefined && vt < prsCursor.watermarkTime!;
@@ -655,7 +627,6 @@ export class PlatformPoller {
       const boundTask = boundByPr.get(prNumber);
       if (boundTask !== undefined) {
         await clearPending(prNumber);
-        // reopen 是显式 durable 观察：closed-unmerged 锚在 TaskState，主轮询见重开即合成（spec §6）。
         if (boundTask.closedUnmergedAnchor === true && row.state === 'open') {
           try {
             await this.emit(entry, 'pr.updated', { ...base, kind: 'reopened' }, boundTask.taskId);
@@ -681,8 +652,6 @@ export class PlatformPoller {
       }
       const pendingTaskId = pendingByPr.get(prNumber);
       if (pendingTaskId !== undefined && pendingTaskId !== task.taskId) await clearPending(prNumber);
-      // 统一谓词 branch === task.branch：branch 缺失的任务视图无从核验绑定，收编一并 fail closed
-      // （与子轮询 bindingCheck 对称——「无法核验」不是「匹配」）。
       if (task.branch !== base.branch) {
         await clearPending(prNumber);
         continue;
@@ -708,8 +677,6 @@ export class PlatformPoller {
             continue;
           }
           if (target !== defaultBranch) {
-            // 无快照档的失配交人工：PR 已存在、同 head 重试 create 必失败，静默拒收会永久卡死（spec §6）。
-            // 条件未变时跨周期去重（成功投递才记指纹，emit 失败下轮重试）；恢复/收编成功即清。
             const fp = [task.taskId, target, defaultBranch].join('\0');
             if (entry.baseMismatch.get(prNumber) !== fp) {
               await this.emit(entry, 'human.intervention', {
@@ -850,7 +817,6 @@ export class PlatformPoller {
           fail(`closed pr#${prNumber}`, e);
         }
       }
-      // 未合并关闭停子轮询，reopen 经主轮询恢复（spec §6）。
       return;
     }
 
@@ -869,10 +835,6 @@ export class PlatformPoller {
     await this.noteConversationProjection(entry, task.taskId, obsKey, scans);
 
     const anchorSha = task.anchorSha?.toLowerCase();
-    // 裁决资格门：head 偏离锚点只能走 push/recheck，旧锚令牌不得批准新 head；signalToken
-    // 缺失**或空白**的事件会绕过既有 handler 的令牌比对（guard 是 truthy 双与，两个空值照样
-    // 通过）——缺任一资格即清候选，跨不可裁决状态存活的候选会把恢复后首个扫描当成第二个
-    // 确认周期（spec §6 verdict ③）。
     const verdictEligible = task.inReview === true
       && prRow.draft === false
       && task.passToken !== undefined && task.failToken !== undefined
@@ -883,7 +845,6 @@ export class PlatformPoller {
       this.engine.dropCandidate(task.taskId, prNumber);
       return;
     }
-    // 源扫描失败的完整性门由 engine 单点持有（spec §6 verdict ①，含候选保留语义），此处不复检。
     const decision = this.engine.evaluate({
       taskId: task.taskId,
       prNumber,
@@ -896,8 +857,6 @@ export class PlatformPoller {
     const fp = [task.passToken, task.failToken, decision.kind, decision.carrier.sourceKey, decision.carrier.id, decision.carrier.bodyDigest].join(':');
     if (entry.deliveredVerdicts.get(obsKey) === fp) return;
     try {
-      // 评论源扫描最长可达分钟级，扫描期间 head/状态可被平台改写（TOCTOU）：emit 前以
-      // 权威 prView 复核 open/!draft/绑定/锚点，失配清候选走 push/recheck，查询失败按瞬态重试。
       const [freshRow] = await entry.driver.runOp('prView', { prNumber });
       this.assertEntryActive(entry);
       const freshEligible = freshRow !== undefined
@@ -926,7 +885,6 @@ export class PlatformPoller {
     }
   }
 
-  // 全源成功才比对（失败源缺行会伪刷新两次）；回调失败不推进基线，下轮重试。
   private async noteConversationProjection(
     entry: InternalEntry,
     taskId: string,
@@ -938,7 +896,6 @@ export class PlatformPoller {
     if (scans.length === 0 || scans.some(s => !s.ok)) return;
     const h = createHash('sha256');
     for (const scan of [...scans].sort((a, b) => a.key.localeCompare(b.key))) {
-      // 源未承诺稳定行序：按行身份规范化后再散列，重排不产生伪 revision。
       const rows = [...scan.rows].sort((a, b) => {
         const ai = String(a.id);
         const bi = String(b.id);
@@ -948,8 +905,6 @@ export class PlatformPoller {
         return ad < bd ? -1 : ad > bd ? 1 : 0;
       });
       for (const row of rows) {
-        // versionTime 入摘要：正文相同但 updatedAt 变化会改变时间线排序（进而改变分轮），
-        // 不计入就永远不推进展示 revision。
         h.update(`${scan.key}:${String(row.id)}:${rowBodyDigest(row)}:${String(row.reviewState ?? '')}:${String(versionTimeOf(row) ?? '')}\n`);
       }
     }
@@ -972,9 +927,6 @@ export class PlatformPoller {
     const scans = await scanCommentSourcesOnce(entry.driver, base.prNumber, this.now,
       (key, error) => fail(`listComments[${key}] pr#${base.prNumber}`, error));
 
-    // ack 完成集跨源计算一次：issue 类顶层 ack 可指向任意源的 revision，threaded 隶属
-    // 也要全源行集解析；已 ack 的 revision 即 dev 已处置——cursor 重置/源删重加后再变 fresh
-    // 也不得重发反馈事件（ack 是 durable 处置证据，ledger 只是投递优化）。
     const ackCollection = collectValidAcks(buildAckCarrierRows(scans), {
       replyActorId: task.replyActorId,
       replyActorStatus: task.replyActorStatus,

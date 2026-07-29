@@ -384,7 +384,6 @@ export function AgentCard({
             >
               {badge.label}
             </span>
-            {/* Real hidden text, not aria-label: span's generic role prohibits author naming. */}
             {badge.stale && <span className="sr-only">{badge.title}</span>}
           </>
         )}

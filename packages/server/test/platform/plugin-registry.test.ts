@@ -163,7 +163,6 @@ describe('PluginRegistry', () => {
     await writePlugin(roots.user, 'glab2', 'glab', { name: 'glab2' });
     const res = await PluginRegistry.load(roots);
     expect(res.registry.resolveTool('glab')?.source).toBe('builtin');
-    // 同 tool 必带同名必需 skill baxian-cli-<tool>，冲突在 skill 维度先现形
     expect(res.diagnostics.some(d => /provided by both/.test(d.messages.join(' ')))).toBe(true);
   });
 

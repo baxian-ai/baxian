@@ -168,9 +168,6 @@ function handleConnection(
               if (s.agentId === agentId) releaseSub(sid);
             }
           },
-          // Server-side geometry changes (external attach follow, spawn baseline,
-          // mixed full+preview resize) re-baseline previews; full subscribers keep
-          // their own resize/ack contract and must not receive these.
           onSnapshotRefresh: (snapshot, seq) => {
             for (const [sid, s] of subs) {
               if (s.agentId !== agentId || s.mode !== 'preview' || s.phase !== 'active') continue;
@@ -307,8 +304,6 @@ function handleConnection(
       void emitIntervention(app, sub.agentId, 'input');
     }
     psm.enqueueInput(sub.agentId, safeData).then(() => {
-      // Clear the need-input badge only once the answer actually reached the pane;
-      // a failed write must keep telling the user the question is still open.
       if (!submitted) return;
       app.ctx.agentManager.notifyHumanTerminalInput(sub.agentId).catch((err: unknown) => {
         console.warn(`[stream-ws] notifyHumanTerminalInput(${sub.agentId}) failed:`, err);

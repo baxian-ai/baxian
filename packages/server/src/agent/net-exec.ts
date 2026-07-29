@@ -8,8 +8,6 @@ export class ExecOutcomeUnknownError extends Error {
   }
 }
 
-// Aborts a stalled HTTP(S) transfer at the git layer (curl low-speed guard);
-// SSH transports ignore it and rely on the exec timeout below.
 export const GIT_NET_ENV = 'GIT_HTTP_LOW_SPEED_LIMIT=1024 GIT_HTTP_LOW_SPEED_TIME=30';
 
 export const NET_EXEC_TIMEOUT_MS = 60_000;
@@ -56,7 +54,6 @@ export function isTransientNetworkFailure(text: string): boolean {
   return TRANSIENT_PATTERNS.some((p) => p.test(text));
 }
 
-// exit 255 or transient noise on either stream: the command's outcome is unknown, not negative.
 export function execOutcomeUnknown(result: Pick<ExecResult, 'exitCode' | 'stdout' | 'stderr'>): boolean {
   return result.exitCode === 255
     || isTransientNetworkFailure(result.stderr)
@@ -101,8 +98,6 @@ export async function execNetwork(
       continue;
     }
     if (result.exitCode === 0) return result;
-    // Check both streams independently: an unrelated stderr warning (e.g. a gh
-    // update notice) must not mask a transient error reported on stdout.
     const transient = isTransientNetworkFailure(result.stderr) || isTransientNetworkFailure(result.stdout);
     if (attempt > retries || !transient) {
       return result;

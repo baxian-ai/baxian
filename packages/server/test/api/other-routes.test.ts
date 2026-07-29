@@ -346,7 +346,7 @@ describe('PATCH /api/config', () => {
 
   it('rejects removing addDirs from a live agent because its running process keeps the old grants', async () => {
     await seedConfigPath(app, tempDir);
-    const oldAddDir = join(tempDir, 'root-mailbox-grant');
+    const oldAddDir = join(tempDir, 'old-extra-grant');
     app.ctx.config = {
       ...app.ctx.config,
       project: app.ctx.config.project.map(project => ({
@@ -457,11 +457,8 @@ describe('PATCH /api/config', () => {
 
   it('rejects MOVING an existing agent id whose DELETE is in flight to another project (tombstone bypass)', async () => {
     await seedConfigPath(app, tempDir);
-    // dev-1 already exists in project 0; a concurrent DELETE holds its tombstone.
     const movingId = app.ctx.config.project[0].agent.flat()[0].id;
     app.ctx.agentManager.tryClaimDeletion([movingId]);
-    // A PATCH that keeps the SAME id (host/workdir unchanged) but relocates it to another project must NOT
-    // slip past the tombstone just because the id is still in the current config.
     const nextProjects = app.ctx.config.project.map((project, i) => ({
       ...project,
       id: i === 0 ? `${project.id}-moved` : project.id,
@@ -685,7 +682,9 @@ describe('PATCH /api/config', () => {
       });
       expect(statusCode).toBe(200);
       expect(body.restartRequired).toBe(true);
-      expect(body.note).toMatch(/restart/);
+      expect(body.note).toBe(
+        'Saved and hot-reloadable fields applied. server.host/port/https changes require a restart to take effect.',
+      );
       expect(agentReplace).toHaveBeenCalledTimes(1);
       expect(app.ctx.agentManager.getConfig().review.rounds).toBe(7);
       expect(reconcile).toHaveBeenCalledTimes(1);
@@ -736,151 +735,8 @@ describe('PATCH /api/config', () => {
         server: { port: 3000, https: { keyFile: tmpB, certFile: tmpCert } },
       });
       expect(body.restartRequired).toBe(true);
-    });
-
-    it('requires restart when root agent configuration is added or removed', async () => {
-      app.ctx.config = {
-        ...app.ctx.config,
-        project: app.ctx.config.project.map(project => ({
-          ...project,
-          agent: project.agent.map(pair => pair.map(agent => ({ ...agent, yolo: false }))),
-        })),
-      };
-      const added = await patchAndRead({
-        root: {
-          runtime: 'codex',
-          mode: 'local',
-          workdir: join(tempDir, 'root-agent'),
-          projects: ['proj'],
-          responseTimeoutMinutes: 10,
-        },
-      });
-      expect(added.statusCode).toBe(200);
-      expect(added.body.restartRequired).toBe(true);
-      expect(added.body.note).toContain('root');
-      expect(app.ctx.config.root?.responseTimeoutMinutes).toBe(10);
-
-      const removed = await patch('/api/config', { root: null }, { headers: JSON_HEADERS });
-      expect(removed.statusCode).toBe(200);
-      expect((JSON.parse(removed.body) as { restartRequired: boolean }).restartRequired).toBe(true);
-      expect(app.ctx.config.root).toBeUndefined();
-    });
-
-    it('requires an explicit root stop before changing runtime placement', async () => {
-      await seedConfigPath(app, tempDir);
-      app.ctx.config = {
-        ...app.ctx.config,
-        project: app.ctx.config.project.map(project => ({
-          ...project,
-          agent: project.agent.map(pair => pair.map(agent => ({ ...agent, yolo: false }))),
-        })),
-        root: {
-          runtime: 'codex',
-          mode: 'local',
-          workdir: join(tempDir, 'root-before'),
-          yolo: true,
-          responseTimeoutMinutes: 15,
-        },
-      };
-      const isRuntimeLive = vi.fn(async () => false);
-      app.ctx.rootRecoveryCoordinator = {
-        isRuntimeExplicitlyStopped: vi.fn(() => false),
-        isRuntimeLive,
-        stop: vi.fn(async () => undefined),
-      } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-      const response = await patch('/api/config', {
-        root: { ...app.ctx.config.root, workdir: join(tempDir, 'root-after') },
-      }, { headers: JSON_HEADERS });
-
-      expect(response.statusCode).toBe(409);
-      expect(JSON.parse(response.body).error).toMatch(/explicitly stopped/);
-      expect(isRuntimeLive).not.toHaveBeenCalled();
-      expect(app.ctx.config.root?.workdir).toBe(join(tempDir, 'root-before'));
-    });
-
-    it('allows a root runtime change only after stop and an absent-session recheck', async () => {
-      await seedConfigPath(app, tempDir);
-      app.ctx.config = {
-        ...app.ctx.config,
-        project: app.ctx.config.project.map(project => ({
-          ...project,
-          agent: project.agent.map(pair => pair.map(agent => ({ ...agent, yolo: false }))),
-        })),
-        root: {
-          runtime: 'codex',
-          mode: 'local',
-          workdir: join(tempDir, 'root-before'),
-          yolo: true,
-          responseTimeoutMinutes: 15,
-        },
-      };
-      const isRuntimeLive = vi.fn(async () => false);
-      app.ctx.rootRecoveryCoordinator = {
-        isRuntimeExplicitlyStopped: vi.fn(() => true),
-        isRuntimeLive,
-        stop: vi.fn(async () => undefined),
-      } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-      const nextWorkdir = join(tempDir, 'root-after');
-      const response = await patch('/api/config', {
-        root: { ...app.ctx.config.root, workdir: nextWorkdir },
-      }, { headers: JSON_HEADERS });
-
-      expect(response.statusCode).toBe(200);
-      expect(isRuntimeLive).toHaveBeenCalledOnce();
-      expect(app.ctx.config.root?.workdir).toBe(nextWorkdir);
-    });
-
-    it('rejects a root runtime change when the session reappears after stop', async () => {
-      await seedConfigPath(app, tempDir);
-      app.ctx.config = {
-        ...app.ctx.config,
-        root: {
-          runtime: 'codex',
-          mode: 'local',
-          workdir: join(tempDir, 'root-before'),
-          yolo: true,
-          responseTimeoutMinutes: 15,
-        },
-      };
-      app.ctx.rootRecoveryCoordinator = {
-        isRuntimeExplicitlyStopped: vi.fn(() => true),
-        isRuntimeLive: vi.fn(async () => true),
-        stop: vi.fn(async () => undefined),
-      } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-      const response = await patch('/api/config', { root: null }, { headers: JSON_HEADERS });
-
-      expect(response.statusCode).toBe(409);
-      expect(JSON.parse(response.body).error).toMatch(/became live/);
-      expect(app.ctx.config.root).toBeDefined();
-    });
-
-    it('fails closed when the stopped root session cannot be rechecked', async () => {
-      await seedConfigPath(app, tempDir);
-      app.ctx.config = {
-        ...app.ctx.config,
-        root: {
-          runtime: 'codex',
-          mode: 'remote',
-          host: { hostname: 'root.example.test' },
-          workdir: '/srv/root-before',
-          yolo: true,
-          responseTimeoutMinutes: 15,
-        },
-      };
-      app.ctx.rootRecoveryCoordinator = {
-        isRuntimeExplicitlyStopped: vi.fn(() => true),
-        isRuntimeLive: vi.fn(async () => { throw new Error('ssh timed out'); }),
-        stop: vi.fn(async () => undefined),
-      } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-      const response = await patch('/api/config', { root: null }, { headers: JSON_HEADERS });
-
-      expect(response.statusCode).toBe(503);
-      expect(JSON.parse(response.body).error).toMatch(/ssh timed out/);
-      expect(app.ctx.config.root).toBeDefined();
+      expect(body.note).toContain('server.host/port/https changes require a restart');
+      expect(body.note).not.toContain('root');
     });
 
     it('does not require restart when allowedHosts changes', async () => {

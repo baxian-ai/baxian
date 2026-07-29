@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { normalize } from 'node:path';
-import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig, RootAgentConfig } from '../shared/index.js';
+import type { BaxianConfig, HttpsConfig, HostConfig, ProjectConfig } from '../shared/index.js';
 import { autoBootstrapAgentIds } from '../agent/bootstrap.js';
 import {
   saveConfig,
@@ -61,24 +61,7 @@ const REDACTED = '***';
 function requiresRestart(prev: BaxianConfig, next: BaxianConfig): boolean {
   return prev.server.host !== next.server.host
     || prev.server.port !== next.server.port
-    || !sameHttps(prev.server.https, next.server.https)
-    || JSON.stringify(prev.root ?? null) !== JSON.stringify(next.root ?? null);
-}
-
-function rootRuntimeKey(root: RootAgentConfig | undefined): string {
-  if (!root) return 'none';
-  return JSON.stringify([
-    root.runtime,
-    root.mode,
-    hostRefKey(root.host),
-    normalize(root.workdir),
-    root.yolo ?? true,
-    root.model ?? null,
-  ]);
-}
-
-function rootRuntimeChanged(prev: RootAgentConfig | undefined, next: RootAgentConfig | undefined): boolean {
-  return rootRuntimeKey(prev) !== rootRuntimeKey(next);
+    || !sameHttps(prev.server.https, next.server.https);
 }
 
 function sameHttps(a: HttpsConfig | undefined, b: HttpsConfig | undefined): boolean {
@@ -121,14 +104,6 @@ export function redactConfig(config: BaxianConfig): BaxianConfig {
     },
     host: redactHosts(config.host ?? []),
     project: redactProjects(config.project ?? []),
-    ...(config.root ? { root: redactRoot(config.root) } : {}),
-  };
-}
-
-function redactRoot(root: RootAgentConfig): RootAgentConfig {
-  return {
-    ...root,
-    ...(root.host !== undefined ? { host: redactAgentHostRef(root.host) } : {}),
   };
 }
 
@@ -177,7 +152,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
 
       const unknownIncoming = Object.fromEntries(
         Object.entries(incoming).filter(
-          ([key]) => !['language', 'review', 'server', 'project', 'root'].includes(key),
+          ([key]) => !['language', 'review', 'server', 'project'].includes(key),
         ),
       );
       const merged: BaxianConfig & Record<string, unknown> = {
@@ -187,9 +162,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         server: mergedServer,
         host: current.host,
         project: incoming.project ?? current.project,
-        ...('root' in incoming
-          ? (incoming.root == null ? {} : { root: incoming.root })
-          : (current.root ? { root: current.root } : {})),
       };
 
       let validated: BaxianConfig;
@@ -213,9 +185,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         const nextHosts = agentHostRefs(validated.project);
         const nextWorkdirs = agentWorkdirRefs(validated.project);
         const nextPermissions = agentPermissionRefs(validated.project);
-        // A hot reload must not resurrect OR retain an id whose DELETE is in flight/diverged (fail-stop):
-        // checking only new ids let a PATCH move an existing deleting id (host/workdir unchanged) to another
-        // project and survive the DELETE's hash-mismatch removal. Any deleting id in the next config → 409.
         for (const [agentId] of nextHosts) {
           if (app.ctx.agentManager.isDeletionInFlight(agentId)) {
             return reply.status(409).send({
@@ -257,26 +226,6 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
           ].join(' or ');
           return reply.status(409).send({
             error: `cannot change the ${changes} while the agent is live; stop its session first`,
-          });
-        }
-      }
-
-      if (rootRuntimeChanged(current.root, validated.root) && app.ctx.rootRecoveryCoordinator) {
-        const coordinator = app.ctx.rootRecoveryCoordinator;
-        if (!coordinator.isRuntimeExplicitlyStopped()) {
-          return reply.status(409).send({
-            error: 'cannot change or remove root runtime configuration until root-agent is explicitly stopped',
-          });
-        }
-        try {
-          if (await coordinator.isRuntimeLive()) {
-            return reply.status(409).send({
-              error: 'root-agent became live after it was stopped; stop it again before changing root configuration',
-            });
-          }
-        } catch (err) {
-          return reply.status(503).send({
-            error: `cannot verify that root-agent is stopped: ${err instanceof Error ? err.message : String(err)}`,
           });
         }
       }
@@ -326,7 +275,7 @@ export async function configRoutes(app: FastifyInstance): Promise<void> {
         restartRequired: mustRestart,
         ...(warnings.length > 0 ? { warnings } : {}),
         note: mustRestart
-          ? 'Saved and hot-reloadable fields applied. server.host/port/https or root changes require a restart to take effect.'
+          ? 'Saved and hot-reloadable fields applied. server.host/port/https changes require a restart to take effect.'
           : 'Saved and applied immediately (no restart required).',
       });
     });

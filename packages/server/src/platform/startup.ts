@@ -13,14 +13,10 @@ export async function loadPluginsOrExplainWithRoots(
   const describe = (d: PluginDiagnostic) => `plugin at ${d.pluginPath}: ${d.messages.join('; ')}`;
   const fatal: string[] = [];
 
-  // fatal 判定收敛两条（spec v2 §5.4）：
-  // ① 内置根是随包分发内容，任何坏损即装机损坏（终态内置集合 = {github}，「根内任一坏损」≡「github 坏损」）；
   for (const d of diagnostics) {
     if (d.source === 'builtin') fatal.push(describe(d));
   }
 
-  // ② 某项目 resolved tool 的插件缺失或坏损。坏损用户插件占用的 tool 不静默回退内置——回退会掩盖覆盖意图；
-  // 被覆盖内置的 tool 由加载器按覆盖键（manifest.name）标注在诊断上，此处只做裁决。
   const poisonedByTool = new Map<string, string>();
   for (const d of diagnostics) {
     if (d.source !== 'user') continue;
@@ -36,7 +32,7 @@ export async function loadPluginsOrExplainWithRoots(
   }
   for (const project of config.project.filter(candidate => projectNeedsPlatformEntry(config, candidate))) {
     const tool = resolveProjectTool(project);
-    if (tool === undefined) continue; // 非 github 且缺 gitCli：validator 已报配置错误
+    if (tool === undefined) continue;
     const poisoned = poisonedByTool.get(tool);
     if (poisoned !== undefined) {
       fatal.push(`project '${project.id}': git-driver plugin for tool '${tool}' failed to load — ${poisoned}`);
@@ -49,7 +45,6 @@ export async function loadPluginsOrExplainWithRoots(
   }
   if (fatal.length > 0) return { fatal };
 
-  // 未被任何项目引用的用户插件坏损：警告 + 跳过，不得清空有效集合（§5.4）。
   for (const d of diagnostics) console.warn(`[PluginRegistry] skipped ${describe(d)}`);
   return { registry };
 }
@@ -63,7 +58,6 @@ export function referencedGitTools(config: BaxianConfig): Set<string> {
   return tools;
 }
 
-// skill 池扫描沿加载期同一部分成功模型：未引用用户插件坏损警告跳过，内置或被引用插件坏损才拖垮启动。
 export async function scanPluginSkillPools(
   skillRegistry: { scanPluginSkills(tool: string, skillsRoot: string): Promise<void> },
   plugins: LoadedPlugin[],
@@ -95,8 +89,6 @@ export interface PlatformEntryDeps {
 
 export interface PlatformEntryPlan {
   entries: PlatformPollerEntryInit[];
-  // 离线绕过在线锁后，同 repo 的第二个项目在此暴露为冲突：其 entry 不建、由调用方发
-  // repo-conflict intervention，受保护项目（先 claim 者）的 entry 保留（spec §5.5）。
   conflicts: Array<{ projectId: string; repoKey: string; claimedBy: string }>;
 }
 
@@ -140,9 +132,6 @@ export function platformBindingMismatch(
     : { reason: 'identity-mismatch', differences, binding, live };
 }
 
-// entry 集合按 repo 身份去重（spec §4/§5.5 同谓词）：同 repo 的多个项目共用一个 cursor 与观察缓存。
-// retained（有活动任务但配置已不需 entry）项目优先 claim,确保受保护任务的 entry 保留、冲突落到
-// 后来的项目上。
 export function planPlatformEntries(
   config: BaxianConfig,
   deps: PlatformEntryDeps,
@@ -175,8 +164,6 @@ export function planPlatformEntries(
   return { entries, conflicts };
 }
 
-// 配置改到不再需要 entry 时，仍在飞的任务不能失去轮询（PR 已开、裁决还没回）：
-// 按任务快照保留，与 live 配置解耦，任务转终态后下一次 reconcile 自然拆除。
 export async function retainedPlatformProjectIds(
   config: BaxianConfig,
   listActivePlatformTasks: () => Promise<TaskState[]>,

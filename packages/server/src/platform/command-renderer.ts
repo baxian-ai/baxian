@@ -25,7 +25,6 @@ export class PlaceholderValueError extends Error {
 
 const SHA_RE = new RegExp(`^${SHA_HEX_SOURCE}$`);
 export const COMMENT_BODY_MAX_BYTES = 64 * 1024;
-// String.replace 对全局正则自重置 lastIndex，模块级复用安全。
 const PLACEHOLDER_RE = /\{([a-zA-Z]+)\}/g;
 
 export function validateCommentBody(body: string): void {
@@ -70,8 +69,6 @@ function placeholderValue(name: string, ctx: RenderContext & { minToolVersion?: 
     }
     case 'branch': {
       if (ctx.branch === undefined) throw new PlaceholderValueError('branch required for {branch}');
-      // 原样值进 URL 路径（GitHub refs 端点按字面 / 展开，spec §5.3 增量⑤）：入口同款
-      // isValidBranchName 挡路径遍历——第二套渲染期专属谓词会与它各自漂移。
       if (!isValidBranchName(ctx.branch)) {
         throw new PlaceholderValueError(`branch has invalid shape (got ${ctx.branch})`);
       }

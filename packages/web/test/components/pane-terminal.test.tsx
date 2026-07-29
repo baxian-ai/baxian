@@ -594,10 +594,8 @@ describe('PaneTerminal', () => {
 
       expect(scrollState.value).toBe(474);
     } finally {
-      // @ts-expect-error remove scrollTop shim
-      delete HTMLElement.prototype.scrollTop;
-      // @ts-expect-error remove clientHeight shim — beforeEach re-installs the default 480 for the next case
-      delete HTMLElement.prototype.clientHeight;
+      Reflect.deleteProperty(HTMLElement.prototype, 'scrollTop');
+      Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
       _resetPaneStreamClientForTest(null);
     }
   });
@@ -648,10 +646,8 @@ describe('PaneTerminal', () => {
 
       expect(scrollState.value).toBe(474);
     } finally {
-      // @ts-expect-error remove scrollTop shim
-      delete HTMLElement.prototype.scrollTop;
-      // @ts-expect-error remove clientHeight shim — beforeEach re-installs the default 480 for the next case
-      delete HTMLElement.prototype.clientHeight;
+      Reflect.deleteProperty(HTMLElement.prototype, 'scrollTop');
+      Reflect.deleteProperty(HTMLElement.prototype, 'clientHeight');
       _resetPaneStreamClientForTest(null);
     }
   });

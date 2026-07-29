@@ -94,7 +94,6 @@ function useTaskCompletionNotifications(
   }, [projects]);
 
   useEffect(() => {
-    // 取消不可恢复:关闭通知/项目移除后,同一项目重回集合也不能复活此前在途的确认
     const bumpProjectEpoch = (projectId: string) => {
       projectEpochs.current.set(projectId, (projectEpochs.current.get(projectId) ?? 0) + 1);
     };
@@ -144,7 +143,6 @@ function useTaskCompletionNotifications(
             continue;
           }
           const epochAtIssue = projectEpochs.current.get(projectId) ?? 0;
-          // epoch 入 key:项目移除再加回后,残留的旧代次 in-flight 不能压住新一轮确认
           const confirmationKey = `${projectId}:${epochAtIssue}:${taskId}`;
           if (confirmationInFlight.current.has(confirmationKey)) continue;
           confirmationInFlight.current.add(confirmationKey);

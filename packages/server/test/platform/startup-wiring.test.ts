@@ -70,7 +70,6 @@ describe('loadPluginsOrExplainWithRoots', () => {
     const broken = join(roots.builtin, 'broken');
     await mkdir(broken, { recursive: true });
     await writeFile(join(broken, 'baxian-plugin.json'), MANIFEST('broken'));
-    // deliberately no driver.json — triggers PluginRegistry's "driver.json not found"
 
     const r = await loadPluginsOrExplainWithRoots(cfgWith([
       { id: 'gh', repo: 'https://github.com/a/b.git', merge: null, agent: [] },
@@ -185,7 +184,6 @@ describe('loadPluginsOrExplainWithRoots', () => {
     const broken = join(roots.builtin, 'broken');
     await mkdir(broken, { recursive: true });
     await writeFile(join(broken, 'baxian-plugin.json'), MANIFEST('broken'));
-    // deliberately no driver.json — triggers PluginRegistry's "driver.json not found"
 
     const r = await loadPluginsOrExplainWithRoots(cfgWith([
       { id: 'p', repo: 'https://gl.example.com/g/p.git', merge: null, review: { mode: 'git' }, gitCli: { tool: 'glab' }, agent: [] },
@@ -216,7 +214,6 @@ describe('loadPluginsOrExplainWithRoots', () => {
     expect(joined).toMatch(/hub/);
   });
 });
-
 
 describe('scanPluginSkillPools', () => {
   async function loadedPlugins(roots: { builtin: string; user: string }) {

@@ -63,12 +63,6 @@ SDD spec flow:
 |---|---|
 | `spec-done` (+PR# and actor) | spec is ready on the selected PR |
 
-Root recovery runtime:
-
-| Signal | Meaning |
-|---|---|
-| `root-done` | root agent atomically wrote the requested recovery response; the request prompt supplies the attempt token |
-
 ## Need-input side-channel
 
 A paired ask/answer protocol. Neither signal consumes the phase-signal watch or advances the task.

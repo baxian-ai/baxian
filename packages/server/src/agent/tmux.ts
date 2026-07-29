@@ -10,7 +10,6 @@ const run = (runner: CommandRunner, cmd: string, opts?: ExecOptions): Promise<Ex
 
 export type AgentRuntimeKind = 'claude-code' | 'codex' | 'opencode' | 'qodercli';
 
-// $n is reused across tmux server restarts; the ref pins the server generation too.
 export interface TmuxSessionRef {
   sessionId: string;
   serverPid: string;
@@ -24,7 +23,6 @@ export interface TmuxSessionSnapshot {
 
 export type KillSessionOutcome = 'killed' | 'absent' | 'refused';
 
-// The claim condition a kill must prove server-side, in the same command as the kill itself.
 export type KillClaimCond =
   | { kind: 'unclaimed' }
   | { kind: 'equals'; claim: string }
@@ -36,8 +34,6 @@ const REFUSED_MARKER = 'BX_KILL_REFUSED';
 const TARGET_GONE_MARKER = 'BX_TARGET_GONE';
 const PANE_OK_MARKER = 'BX_PANE_OK';
 
-// %n and $n are reused by a fresh server; every pane op re-proves generation+session+pane+claim
-// inside the executing server itself.
 export interface PaneRef {
   session: TmuxSessionRef;
   paneId: string;
@@ -89,7 +85,6 @@ function assertPlainFormat(fmt: string): void {
   }
 }
 
-// Newline/NUL cannot survive tmux command re-parsing; everything else round-trips via '\'' splicing.
 export function tmuxQuote(value: string): string {
   if (value.includes('\n') || value.includes('\0')) {
     throw new Error(`tmux argument ${JSON.stringify(value)} contains unsupported characters (newline/NUL)`);
@@ -110,7 +105,6 @@ function parseSessionRef(line: string): TmuxSessionRef | null {
   return { serverPid: m[1], serverStart: m[2], sessionId: m[3] };
 }
 
-// Names land inside tmux format filters — reject syntax-altering characters outright.
 function assertPlainSessionName(name: string): void {
   if (!/^[A-Za-z0-9_@=[\]-]+$/.test(name)) {
     throw new Error(`tmux session name ${JSON.stringify(name)} contains unsupported characters`);
@@ -122,9 +116,6 @@ export interface PaneInfo {
   current: string;
 }
 
-// full: server proves format arithmetic (probe evaluates to 1) — triple ∧ claim ∧ gen guard.
-// legacy: server version parses below 3.2 — triple ∧ claim guard, no numeric gen compare.
-// null: unknown — owner writes are forbidden entirely (fail closed).
 export type OwnerWriteCapability = 'full' | 'legacy' | null;
 
 export interface WindowGeometry {
@@ -138,9 +129,6 @@ export interface WindowGeometry {
   ownerWriteCapability: OwnerWriteCapability;
 }
 
-// One read carries geometry, owner state, non-reusable session identity, the
-// session claim, and a feature probe evaluated by the same server that will
-// evaluate write guards (plus its version for the legacy determination).
 const WINDOW_GEOMETRY_FORMAT =
   '#{window_width} #{window_height} #{status} #{window-size} ' +
   '#{@bx_owner_gen}|#{pid}|#{start_time}|#{session_id}|#{@baxian-agent-id}|#{version}|#{e|<=:1,2}';
@@ -154,8 +142,6 @@ export function classifyOwnerWriteCapability(versionRaw: string, probeRaw: strin
   const major = parseInt(m[1], 10);
   const minor = parseInt(m[2], 10);
   if (major > 3 || (major === 3 && minor >= 2)) {
-    // A >=3.2 server whose arithmetic probe did NOT evaluate is contradictory
-    // evidence — never downgrade it to an unguarded-adjacent path.
     return null;
   }
   return 'legacy';
@@ -166,9 +152,6 @@ export interface TtySize {
   rows: number;
 }
 
-// A client's usable content area excludes its status line(s); tmux only keeps the
-// scroll-optimized incremental stream for clients whose content area matches the
-// window size, so both conversions must stay N-aware or geometry runs away.
 export function contentArea(tty: TtySize, statusLines: number): TtySize {
   return { cols: tty.cols, rows: Math.max(1, tty.rows - statusLines) };
 }
@@ -238,8 +221,6 @@ export interface WaitReplReadyOpts extends WaitOpts {
   failFastOnShell?: boolean;
   scrollback?: number;
   perCommandTimeoutMs?: number;
-  // 宽度无关的 idle 信号兜底：窄 pane 下 Ink 硬折行会打断 anchor/composer 的屏幕正则，
-  // 仅供"对运行中 REPL 等 idle"的路径开启；bootstrap 禁用（pane_title 会残留上一进程的值）。
   titleIdleFastPath?: boolean;
 }
 
@@ -247,17 +228,14 @@ export interface WaitSubmitAckOpts extends WaitOpts {
   resend?: () => Promise<void>;
   resendIntervalMs?: number;
   acceptComposerChange?: boolean;
-  // OSC title sampled by the caller BEFORE sendEnter — the idle anchor for the busy-baseline / transition check.
   baselineTitle?: string;
 }
 
-// A pattern that can never match — used where a runtime has no dialog of a given kind.
 const NEVER_RE = /[^\s\S]/;
 
 const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /^(?:claude(?:\.exe)?|\d+\.\d+\.\d+)$/,
   codex: /^(?:codex|node)$/,
-  // qodercli's npm bin reports a versioned process name (e.g. qodercli-1.0.40); the standalone binary may not.
   opencode: /^opencode$/,
   qodercli: /^qodercli(?:-[\d.]+)?$/,
 };
@@ -265,8 +243,6 @@ const REPL_PROC_TITLES: Record<AgentRuntimeKind, RegExp> = {
 const READY_ANCHORS: Record<AgentRuntimeKind, RegExp> = {
   'claude-code': /⏵⏵ bypass permissions on/,
   codex: /permissions: YOLO mode|(?:^|\n)› [^\n]+\n\n\s+[A-Za-z0-9][A-Za-z0-9._:/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._:/-]*){0,2}\s+·[^\n]*(?:\n\s*)?$/,
-  // opencode/qodercli have no idle-only anchor line (their footers persist while working);
-  // readiness for them is decided by the idle-composer + not-busy path in hasRuntimeReadyView.
   opencode: NEVER_RE,
   qodercli: NEVER_RE,
 };
@@ -323,8 +299,6 @@ function detectRuntimeCompletionPopup(stripped: string, runtime: AgentRuntimeKin
   return RUNTIME_COMPLETION_POPUP_RE.test(footer.join(' '));
 }
 
-// codex 空 composer 上按一次 Esc 会 arm backtrack，footer 变成此提示、替换掉带 `·` 的状态行；
-// 它只在空闲态出现（工作中 Esc 是打断），故等价于一个 ready anchor。锚定屏幕底部避免误吃历史输出。
 const CODEX_BACKTRACK_HINT_RE = /(?:^|\n)[ \t]*esc again to edit previous message[ \t]*(?:\n[ \t]*)*$/i;
 
 function hasReplReadyAnchor(stripped: string, runtime: AgentRuntimeKind): boolean {
@@ -337,8 +311,6 @@ export function hasOscTitleWorking(paneTitle: string): boolean {
   return OSC_TITLE_WORKING_RE.test(paneTitle);
 }
 
-// claude-code 独有契约（poller manifest osc_title_idle 同源）：idle 恒为 "✳ <摘要>"，working 为 braille 帧前缀。
-// codex 的 title 是 cwd 之类的弱信号，不构成 idle 契约。
 const OSC_TITLE_IDLE_RES: Partial<Record<AgentRuntimeKind, RegExp>> = {
   'claude-code': /^✳ /,
 };
@@ -359,24 +331,11 @@ const CODEX_IDLE_PROMPT_LINE_RE = /^[ \t]*[›→](?:[ \t].*)?$/im;
 const CODEX_IDLE_COMPOSER_LINE_RE = /(?:^|\n)→ [A-Za-z0-9][\w.-]*(?:\s+git:\([^\s)]+\))?\s*$/i;
 const CODEX_IDLE_PROMPT_TAIL_LINES = 6;
 const CODEX_WORKING_TAIL_LINES = 8;
-// claude-code ≥2.1 的空 composer 行是 ❯ + no-break space（U+00A0），[ \t] 不含它
 const CLAUDE_IDLE_COMPOSER_LINE_RE = /^[ \t\u00A0]*[❯>][ \t\u00A0]*$/m;
-// opencode working: progress bar `■■■⬝⬝⬝` + interrupt hint. Matches the herdr-listed
-// "esc to interrupt", the post-TUI-rewrite "esc interrupt" (no "to"), and the
-// "ctrl+c to interrupt" footer that can be the only busy evidence if the bar wraps out of tail.
 const OPENCODE_BUSY_RE = /(?:esc|ctrl\+c)\s+(?:to\s+)?interrupt|(?:■|⬝){4,}/i;
 const OPENCODE_IDLE_COMPOSER_RE = /ctrl\+p\s+commands/;
-// qodercli working: "(esc to cancel," suffix + braille "Thinking…" spinner line.
 const QODER_BUSY_RE = /\(esc to cancel,|^[ \t]*[⠀-⣿][ \t]+.*\p{L}/mu;
-// Only the composer placeholder marks idle. "? for shortcuts" is dropped on purpose: it is also
-// an OVERLAY_FOOTER_SIGNAL (help/shortcuts overlay), so using it as an idle cue would read an
-// overlay pane as ready and paste the prompt into the overlay instead of the composer.
 const QODER_IDLE_COMPOSER_RE = /Type your message or @/;
-// opencode/qodercli keep their idle footer visible while a permission prompt is up, so the
-// footer-based idle-composer check alone would read a pending pane as ready. Block the ready
-// view on the prompt text. Kept in sync with each manifest's pending rule (opencode.json
-// permission_required, qodercli.json confirmation_blocker) so ready gate and detection never
-// diverge. Misfire only degrades to a dispatch timeout (fail-closed), never an inject over a live prompt.
 const RUNTIME_PENDING_RES: Partial<Record<AgentRuntimeKind, RegExp>> = {
   opencode: /△\s*Permission required|Permission required|Allow once|Allow always/i,
   qodercli: /Permission Required|Allow this command to run|Do you want to allow|waiting for user confirmation|awaiting approval|allow once or always\?|asking user|enter your response|review your answers:|shell awaiting input/i,
@@ -464,8 +423,6 @@ export function hasRuntimeIdleComposerPrompt(stripped: string, runtime: AgentRun
     const t = tail(stripped, CODEX_IDLE_PROMPT_TAIL_LINES);
     return CODEX_IDLE_COMPOSER_LINE_RE.test(t) || CODEX_EMPTY_COMPOSER_RE.test(t);
   }
-  // opencode/qodercli 的 fresh 屏顶部锚定/垂直居中，idle 标记落在物理 tail 之外（下方是空行海），
-  // 取非空行窗口（与 manifest region tailNonEmpty 同语义）做到几何无关。
   if (runtime === 'opencode') {
     return OPENCODE_IDLE_COMPOSER_RE.test(tailNonEmpty(stripped, ACTIVE_SPINNER_TAIL_LINES));
   }
@@ -484,29 +441,18 @@ function screenBlocksReadyView(stripped: string, runtime: AgentRuntimeKind): boo
     || detectRuntimeOverlay(stripped);
 }
 
-// manifest blocker 规则（bash/generic permission、live_blocked_form、dynamic workflow、legacy）的文本指纹。
-// 这些 prompt 挂起时 OSC 标题仍是 ✳ idle 形态（manifest 里 blocker 优先级压过 osc_title_idle 即此语义），
-// 单短语 ≤22 字符，29 列窄 pane 下不折行。仅供 title fast path 消费：并入 hasRuntimeReadyView 会让
-// 历史输出里的这些短语误伤 bootstrap 等既有调用方。误拦仅退化为超时 409（fail-closed），
-// 但可能出现在回复正文的短语一律走组合判定（与选单形态同现）——裸判会把常态 idle 输出当 prompt。
-// 指纹一律用 \s+ 连接词间：Ink 在词边界硬折行，长短语（skip interview…35 字符）窄屏必断行
 const PENDING_PROMPT_SIGNALS: readonly RegExp[] = [
   /waiting\s+for\s+permission/i,
   /review\s+your\s+answers/i,
   /skip\s+interview\s+and\s+plan\s+immediately/i,
 ];
 const PENDING_OFFER_RE = /do\s+you\s+want\s+to|would\s+you\s+like\s+to|tab\s+to\s+amend|ctrl\+e\s+to\s+explain/i;
-// manifest bash/generic permission 的选项行形态并集：裸 Yes（反色选中无 ❯）、编号 Yes/No。
-// 不收 `❯ <任意文本>`（legacy manifest 形态）：clear 的 pre-clear wait 发生在清残稿之前，
-// composer 残稿正是 ❯+文本，收了会把修复目标场景 veto 成死锁。
 const PENDING_OPTION_LINE_RE = /^\s*(?:❯\s*)?(?:\d+\.\s*)?yes\b|^\s*(?:❯\s*)?\d+\.\s*no\b/im;
 const SELECT_FORM_ENTER_RE = /enter\s+to\s+(?:select|confirm)/i;
 const DYNAMIC_WORKFLOW_RE = /run\s+a\s+dynamic\s+workflow\?/i;
 const FORM_ESC_CANCEL_RE = /esc\s+to\s+cancel/i;
 const PENDING_PROMPT_TAIL_LINES = 15;
 
-// 活动 form 区域：最后一条水平线（form/composer box 边界）之后；无水平线（如极窄 pane 不渲染
-// box）时退回 tail 15。不学 extractRegion 的"无线取整屏"——这里误拦即 409，整屏会把正文引用扫进来。
 function pendingPromptRegion(stripped: string): string {
   const lines = stripped.split('\n');
   let lastRule = -1;
@@ -525,8 +471,6 @@ export function detectRuntimePendingPrompt(stripped: string): boolean {
   return SELECT_FORM_ENTER_RE.test(t) && FORM_ESC_CANCEL_RE.test(t);
 }
 
-// transcript viewer / model picker 挂起时按键落 overlay 而非 composer；与 manifest skipStateUpdate 规则同源。
-// footer（ctrl+o to toggle · esc to close，31 字符）窄屏会折两行，故看最后 2 个非空行而非 manifest 的 1 行。
 const OVERLAY_FOOTER_SIGNALS: readonly RegExp[] = [
   /ctrl\+o[^\n]{0,60}to\s+toggle/i,
   /ctrl\+e[^\n]{0,60}show\s+all/i,
@@ -643,7 +587,6 @@ export class TmuxManager {
   async createSession(name: string, workdir: string): Promise<TmuxSessionRef> {
     assertPlainSessionName(name);
     const PATH = '/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
-    // -e lands the nonce atomically with the session itself — the post-disconnect ownership proof.
     const nonce = randomUUID();
     let result: ExecResult;
     try {
@@ -671,7 +614,6 @@ export class TmuxManager {
         `new-session succeeded but returned unparseable ref ${JSON.stringify(result.stdout.trim())}`,
       );
     }
-    // "No success seen" is not "not created" — a session may be live behind a dropped connection.
     if (execOutcomeUnknown(result)) {
       return this.reconcileCreatedSession(
         name,
@@ -728,7 +670,6 @@ export class TmuxManager {
       const line = result.stdout.trim();
       return line.startsWith(`${CREATION_NONCE_ENV}=`) ? line.slice(CREATION_NONCE_ENV.length + 1) : null;
     }
-    // Transient-network / 255 markers on either stream must NOT be read as "no nonce"; treat as unknown.
     if (tmuxProbeOutcomeUnknown(result)) {
       throw new TmuxOutcomeUnknownError(`tmux creation-nonce probe for ${name} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
@@ -738,7 +679,6 @@ export class TmuxManager {
     throw new Error(`tmux creation-nonce probe for ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
   }
 
-  // Ref and claim come from one round trip — the claim can't belong to a different session.
   async getSessionSnapshot(name: string, opts?: ExecOptions): Promise<TmuxSessionSnapshot | null> {
     assertPlainSessionName(name);
     const result = await run(
@@ -769,8 +709,6 @@ export class TmuxManager {
     return (await this.readCreationNonce(name, opts)) !== null;
   }
 
-  // Every session-option write re-proves generation+session+claim inside the server itself;
-  // expectedClaim '' is the fresh-create batch writing the claim onto a still-unclaimed session.
   async setSessionOptionsIfAlive(
     ref: TmuxSessionRef,
     entries: ReadonlyArray<readonly [string, string]>,
@@ -823,7 +761,6 @@ export class TmuxManager {
     return value === '' ? null : value;
   }
 
-  // The web-terminal resize path: size change and window-size pin ride one claim-checked command.
   async resizeWindowByRef(ref: TmuxSessionRef, claim: string, cols: number, rows: number): Promise<void> {
     assertSessionRef(ref);
     assertPlainSessionName(claim);
@@ -850,8 +787,6 @@ export class TmuxManager {
     }
   }
 
-  // list-panes -a with an exact generation+session+claim filter cannot fall back to another
-  // session, and a fresh server reissuing the same $n fails the generation half.
   async getSinglePaneByRef(ref: TmuxSessionRef, claim: string, opts?: ExecOptions): Promise<PaneRef> {
     assertSessionRef(ref);
     assertPlainSessionName(claim);
@@ -881,7 +816,6 @@ export class TmuxManager {
     return { session: ref, paneId, claim };
   }
 
-  // Generation AND the caller-declared claim condition are evaluated inside the killing server itself.
   async killSessionRef(ref: TmuxSessionRef, claimCond: KillClaimCond, opts?: ExecOptions): Promise<KillSessionOutcome> {
     assertSessionRef(ref);
     let claimClause: string;
@@ -904,7 +838,6 @@ export class TmuxManager {
     if (result.exitCode === 0) {
       return result.stdout.includes(REFUSED_MARKER) ? 'refused' : 'killed';
     }
-    // Transient / 255 must not be read as "absent" — a stuck kill would otherwise let DELETE drop the session.
     if (tmuxProbeOutcomeUnknown(result)) {
       throw new TmuxOutcomeUnknownError(`tmux killSessionRef ${ref.sessionId} outcome unknown (transient): exit ${result.exitCode}: ${result.stderr}`);
     }
@@ -933,7 +866,6 @@ export class TmuxManager {
     throw new Error(`tmux guarded write to ${pane.paneId} failed (exit ${result.exitCode}): ${result.stderr}`);
   }
 
-  // Marker-first read: the FIRST line decides ok/gone, so pane text can never spoof the verdict.
   private async guardedPaneRead(
     pane: PaneRef,
     headerFmt: string,
@@ -970,8 +902,6 @@ export class TmuxManager {
     };
   }
 
-  // Absent / transient / other failures are distinct outcomes: SSH flakes and
-  // exit 255 must never be read as "session gone" (three-state discipline).
   async getWindowGeometry(name: string, opts?: ExecOptions): Promise<WindowGeometry> {
     assertPlainSessionName(name);
     const result = await run(
@@ -989,10 +919,6 @@ export class TmuxManager {
     throw new Error(`tmux getWindowGeometry ${name} failed (exit ${result.exitCode}): ${result.stderr}`);
   }
 
-  // The guard re-evaluates identity + claim (+ generation when the server proves
-  // format arithmetic) inside the tmux server at execution time: a delayed write —
-  // stale gen, a same-name session rebuilt after ours died, or a foreign/unclaimed
-  // same-name session — lands as a no-op instead of mutating a window we don't own.
   async ownerWrite(
     name: string,
     ref: TmuxSessionRef,
@@ -1053,7 +979,6 @@ export class TmuxManager {
     return path;
   }
 
-  // A gone pane reads as an empty title on purpose: title is an advisory signal, never an authority.
   async readPaneTitle(pane: PaneRef, opts?: ExecOptions): Promise<string> {
     try {
       return await this.displayMessage(pane, '#{pane_title}', opts);
@@ -1119,7 +1044,6 @@ export class TmuxManager {
     return body;
   }
 
-  // Probe-gated stdin load (bytes reach a buffer only on a five-field identity match, no openssl) then a claim-checked paste; once the load is confirmed, any paste non-success reconciles the named buffer so nothing leaks.
   async injectPrompt(pane: PaneRef, prompt: string, agentId: string): Promise<void> {
     assertPaneRef(pane);
     const bytes = Buffer.byteLength(prompt, 'utf8');
@@ -1138,7 +1062,6 @@ export class TmuxManager {
     const loadCmd =
       `[ "$(tmux display-message -p -t ${shellQuote(pane.paneId)} '${probeFmt}')" = ${shellQuote(expected)} ] && ` +
       `tmux load-buffer -b ${shellQuote(buf)} -`;
-    // Step 1 — probe-gated load via execWithStdin (login-shell PATH resolves tmux); a failed gate/load leaves NO buffer, only an unknown outcome reconciles.
     let loaded: ExecResult;
     try {
       loaded = await this.runner.execWithStdin(loadCmd, payload);
@@ -1159,7 +1082,6 @@ export class TmuxManager {
         `identity probe or buffer load failed before any buffer was created: ${loaded.stderr.trim() || 'probe mismatch'}`,
       );
     }
-    // Step 2 — the buffer now exists. Any non-success here may leave it behind → reconcile by name.
     const pasteCmd =
       `tmux if-shell -t ${shellQuote(pane.paneId)} -F ${shellQuote(paneCond(pane))} ` +
         `${shellQuote(`paste-buffer -b ${buf} -t ${pane.paneId} -d -p -r`)} ` +
@@ -1179,8 +1101,6 @@ export class TmuxManager {
       }
       return;
     }
-    // Non-zero after a confirmed load (e.g. pane vanished before if-shell resolved -t, returning
-    // "can't find pane") does NOT run the else-branch, so the buffer lingers — reconcile by name.
     await this.reconcileInjectBuffer(buf, `paste failed (exit ${pasted.exitCode}): ${pasted.stderr.trim()}`);
     if (pasted.exitCode === 1 && (isSessionAbsent(pasted.stderr) || isTargetGone(pasted.stderr))) {
       throw new PaneGoneError(pane.paneId, pasted.stderr.trim() || 'pane gone before paste');
@@ -1188,7 +1108,6 @@ export class TmuxManager {
     throw new Error(`tmux injectPrompt ${pane.paneId} paste failed (exit ${pasted.exitCode}): ${pasted.stderr}`);
   }
 
-  // The uuid buffer name is the non-rebindable credential: deleting it by name on any server removes only this call's bytes, so reconciliation ignores generation.
   private async reconcileInjectBuffer(buf: string, cause: string): Promise<void> {
     try {
       const del = await run(this.runner, `tmux delete-buffer -b ${shellQuote(buf)}`);
@@ -1209,7 +1128,6 @@ export class TmuxManager {
     }
   }
 
-  // Staging split from pasting lets a caller fence the paste after every await the staging exec hides.
   async stagePromptBuffer(paneId: string, prompt: string, agentId: string): Promise<{ buf: string }> {
     const bytes = Buffer.byteLength(prompt, 'utf8');
     if (bytes > MAX_PROMPT_BYTES) {
@@ -1222,7 +1140,6 @@ export class TmuxManager {
     let result: ExecResult;
     let transportErr: unknown;
     try {
-      // Raw stdin load (no openssl) — same transport as injectPrompt, keeping the guard path openssl-free.
       result = await this.runner.execWithStdin(`tmux load-buffer -b ${shellQuote(buf)} -`, payload);
     } catch (err) {
       transportErr = err;
@@ -1230,7 +1147,6 @@ export class TmuxManager {
     }
     if (transportErr !== undefined || result.exitCode !== 0) {
       let retirementNote = '';
-      // Unknown outcome may have created the full-prompt buffer remotely; retire it by its unique name.
       if (transportErr !== undefined || execOutcomeUnknown(result)) {
         let cleanupFailure: string | undefined;
         try {
@@ -1289,7 +1205,6 @@ export class TmuxManager {
     await this.sendKeysToPane(pane, 'Enter');
   }
 
-  // 空格先弄脏 composer——空 composer 上 C-c 会退出 codex；间隔防止连发被 codex 粘贴检测合并。
   async clearComposerDraft(pane: PaneRef): Promise<void> {
     await this.sendKeysLiteral(pane, ' ');
     await sleep(COMPOSER_DIRTY_SETTLE_MS);
@@ -1321,7 +1236,6 @@ export class TmuxManager {
     if (submitAckBusy(composerBaseline, runtime)) {
       throw new Error(`runtime ack timeout (paneId=${pane.paneId}): pane already busy at baseline`);
     }
-    // Width-independent busy authority: at narrow width the in-pane "working" line soft-wraps out of regex range, but the OSC title still transitions idle→working. Prefer the caller's PRE-Enter sample; reading here would race a runtime that flips to working right after submit.
     const baselineTitle = opts.baselineTitle ?? await this.readPaneTitle(pane);
     if (hasOscTitleWorking(baselineTitle)) {
       throw new Error(`runtime ack timeout (paneId=${pane.paneId}): pane already busy at baseline`);
@@ -1340,12 +1254,7 @@ export class TmuxManager {
         && !detectStartupDialog(bottomLine, runtime)
         && !TRUST_DIALOGS[runtime].test(visible)
         && !detectRuntimeCompletionPopup(visible, runtime)
-        // opencode/qodercli can open a permission/confirmation prompt right after submit,
-        // before any busy spinner. Resending Enter there would hit the default option
-        // (e.g. Allow once), so treat a pending prompt as "already left the composer".
         && !(RUNTIME_PENDING_RES[runtime]?.test(visible) ?? false)
-        // 非 YOLO 下 claude-code 的权限 prompt 底行（Esc to cancel · Tab to amend…）不落上面任何
-        // 守卫；区域限定的 pending 指纹兜底，误伤只退化为 ack 超时（fail-closed），绝不 Enter 进 prompt。
         && !detectRuntimePendingPrompt(visible);
       if (
         opts.resend
@@ -1476,10 +1385,6 @@ function isSessionAbsent(stderr: string): boolean {
   );
 }
 
-// A tmux probe outcome is UNKNOWN (not "absent") when exit 255 (ssh/exec layer) or an INDEPENDENT
-// transient marker appears. The local "error connecting to <socket> (No such file)" absence itself
-// matches the generic "error connecting to" transient pattern, so it is stripped before deciding —
-// only a remaining genuine transient (ssh drop, connection reset, …) makes the outcome unknown.
 function tmuxProbeOutcomeUnknown(result: Pick<ExecResult, 'exitCode' | 'stdout' | 'stderr'>): boolean {
   if (result.exitCode === 255) return true;
   const stderrSansSocketAbsence = (result.stderr || '').replace(
@@ -1489,7 +1394,6 @@ function tmuxProbeOutcomeUnknown(result: Pick<ExecResult, 'exitCode' | 'stdout' 
   return isTransientNetworkFailure(stderrSansSocketAbsence) || isTransientNetworkFailure(result.stdout);
 }
 
-// A pane/window that vanished (distinct from a whole-session/server absence).
 function isTargetGone(stderr: string): boolean {
   const s = (stderr || '').trim().toLowerCase();
   return /can'?t find (?:pane|window)/.test(s) || s.includes('no such pane') || s.includes('no such window');

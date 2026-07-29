@@ -119,7 +119,6 @@ describe('LockManager', () => {
       const delToken = 'deletion-token-xyz';
       expect(await locks.rotateClaim('dev-1', { taskId: 'task-a', token: taskToken }, { taskId: 'deletion:attempt-1', token: delToken })).toBe(true);
       expect(await locks.claimOf('dev-1')).toMatchObject({ taskId: 'deletion:attempt-1', token: delToken });
-      // a concurrent maintenance release of the old token is now harmless
       expect(await locks.releaseIfOwner('dev-1', 'task-a', taskToken)).toBe(false);
       expect(await locks.isOwner('dev-1', 'deletion:attempt-1', delToken)).toBe(true);
     });

@@ -68,16 +68,6 @@ describe('normalizeConfig', () => {
       expect(proj).not.toHaveProperty('gitcli');
     });
 
-    it('keeps root.projects plural while normalizing root-only camelCase keys', () => {
-      const result = normalizeConfig({
-        root: { projects: ['p'], WorkDir: '/tmp/root', ResponseTimeoutMinutes: 7 },
-      });
-      expect(result.root).toEqual({
-        projects: ['p'],
-        workdir: '/tmp/root',
-        responseTimeoutMinutes: 7,
-      });
-    });
   });
 
   describe('passthrough', () => {

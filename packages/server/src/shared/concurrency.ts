@@ -1,5 +1,3 @@
-// Bounded-concurrency map that preserves input order. Guards fs fan-outs from
-// exhausting the process fd limit (EMFILE) when a store dir grows large.
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
   limit: number,

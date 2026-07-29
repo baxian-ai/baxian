@@ -29,17 +29,6 @@ export interface AgentConfig extends AgentRuntimeConfig {
   role: AgentRole;
 }
 
-export interface RootAgentConfig {
-  runtime: AgentRuntime;
-  mode: AgentMode;
-  host?: string | HostConfig;
-  workdir: string;
-  yolo?: boolean;
-  model?: string;
-  projects?: string[];
-  responseTimeoutMinutes: number;
-}
-
 export interface ProjectConfig {
   id: string;
   repo: string;
@@ -86,7 +75,6 @@ export interface BaxianConfig {
   server: ServerConfig;
   host: HostConfig[];
   project: ProjectConfig[];
-  root?: RootAgentConfig;
 }
 
 export type AgentRuntimeStatus =
@@ -151,15 +139,10 @@ export interface AgentBindingFacts {
   awaitingPhase?: string;
   awaitingReason?: string;
   awaitingSince?: string;
-  // Random per-write hold generation: (phase, since) alone can ABA within one millisecond.
   awaitingNonce?: string;
-  // Display-only ask/answer watermark ([bx:need-input]/[bx:input-received]).
-  // Never consulted by scheduling — that is what status/awaiting* are for.
   needInput?: NeedInputWatermark;
 }
 
-// Invariants: epoch and per-epoch seqs only grow; `at` exists iff askSeq > answeredSeq.
-// Every whole-binding rebuild write must carry the object through (or bump epoch to void it).
 export interface NeedInputWatermark {
   epoch: number;
   askSeq?: number;
@@ -263,7 +246,6 @@ export interface TaskState {
     updatedAt: string;
   };
   remoteCleanup?: RemoteCleanupState;
-  // 释放时本地任务分支被清理（远端保留）的凭据；检出恢复只信这枚删除时刻的远端 tip
   branchLocalCleaned?: {
     remoteTipSha: string;
     updatedAt: string;
@@ -275,7 +257,6 @@ export interface TaskState {
   reviewConversationUpdatedAt?: string;
   fixDispatchedAt?: string;
   reviewRound: number;
-  // 本 pass 的轮次尚未计入（直派路径在 startSession 成功后才 bump）；补派/重启重放据此恰好补计一次
   reviewRoundPending?: boolean;
   specReviewRound?: number;
   phase?: TaskPhase;
@@ -283,9 +264,7 @@ export interface TaskState {
   images?: string[];
   signalToken?: string;
   maxRoundsContinues?: number;
-  // Deliberately cleared post-approve completion; a restart replay must not rebuild it while this stands.
   postApproveRevoked?: { generation: string; reason: 'request-changes' | 'redispatch-cap'; at: string };
-  // Approved head persisted at post-approve dispatch; the only SHA a completion rebuild may trust.
   postApproveHeadSha?: string;
   passToken?: string;
   failToken?: string;
@@ -355,7 +334,6 @@ export interface PrReviewItem {
   line?: number;
   commitSha?: string;
   inReplyTo?: boolean;
-  // 三源 id 无跨表唯一性：线程键 = (sourceKey, discussionId ?? id)
   sourceKey?: string;
   threadKey?: string;
   reviewState?: string;

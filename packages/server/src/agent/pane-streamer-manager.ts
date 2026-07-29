@@ -28,8 +28,6 @@ export interface PaneStreamerManagerOptions {
 
 const DEFAULT_INPUT_BATCH_MS = 10;
 const DEFAULT_GEOMETRY_TIMEOUT_MS = 3000;
-// Runner timeout only SIGTERMs; SIGKILL follows after a 2000ms grace and the
-// promise settles on close. The geometry layer must not inherit that tail.
 const GEOMETRY_SETTLE_SLACK_MS = 3000;
 const DEFAULT_MAX_PENDING_GLOBAL = 16;
 const DEFAULT_MAX_PENDING_PER_AGENT = 4;
@@ -62,9 +60,6 @@ interface OwnerState {
   epoch: number;
   fullHolds: number;
   dirty: boolean;
-  // A boot-time scan that could not complete (transient read failure, admission
-  // backpressure) keeps its retry credential here until the round succeeds or the
-  // session is provably absent.
   scanPending: boolean;
   gen: number;
   lastWrittenGen: number | null;
@@ -90,8 +85,6 @@ export class PaneStreamerManager {
   private readonly inputChains = new Map<string, Promise<void>>();
   private readonly pendingInput = new Map<string, InputBatch>();
   private readonly owners = new Map<string, OwnerState>();
-  // Epochs outlive owner-state deletion: a deleted-and-recreated agent id must
-  // never validate closures/tasks captured against its previous life.
   private readonly ownerEpochs = new Map<string, number>();
   private pendingGlobal = 0;
   private readonly pendingByAgent = new Map<string, number>();
@@ -159,10 +152,6 @@ export class PaneStreamerManager {
     this.tmuxByAgent.delete(agentId);
     this.streamers.delete(agentId);
     if (streamer) streamer.destroy(opts);
-    // Agent removal discards functional owner state; any queued/in-flight geometry
-    // task or hold-release closure from the old epoch lands as a no-op, and remote
-    // residue stays inert behind the session-identity fence. Raw liveness entries
-    // in the global registry survive until their own settle.
     const owner = this.owners.get(agentId);
     if (owner) {
       owner.epoch++;
@@ -171,8 +160,6 @@ export class PaneStreamerManager {
         clearInterval(owner.timer);
         owner.timer = null;
       }
-      // silent = planned shutdown (destroyAll): boot-time startupScan owns any
-      // leftover reconciliation, so a dirty owner is not worth a warning there.
       if (owner.dirty && !opts.silent) {
         console.warn(`[pane-streamer-manager] ${agentId} removed while owner state dirty; a rebuilt agent starts clean`);
       }
@@ -187,12 +174,6 @@ export class PaneStreamerManager {
     })));
   }
 
-  // Boot-time pass: process restarts lose in-memory owner state; one reconcile
-  // round per configured agent heals any manual left behind by a prior life.
-  // Sequential (bounded queue): a parallel fan-out would eat the global admission
-  // budget and deterministically starve agents past the cap. scanPending is the
-  // retry credential — a transient/backpressured round keeps it, the per-owner
-  // timer retries until the round succeeds or the session is provably absent.
   startupScan(agents: AgentRuntimeConfig[]): void {
     const queue: OwnerState[] = [];
     for (const agent of agents) {
@@ -353,9 +334,6 @@ export class PaneStreamerManager {
     return raceDeadline(raw, this.settleDeadlineMs, () => undefined);
   }
 
-  // Admission is reserved BEFORE the probe live-body exists (lazy start): a
-  // capacity-refused probe creates nothing, and a created probe is registered
-  // before it can race — no PTY ever lives outside the global registry.
   private raceProbeStart<T>(agentId: string, start: () => ProbeHandle<T>): Promise<T> {
     if (!this.admitLiveness(agentId)) {
       return Promise.reject(new Error(`geometry liveness capacity reached (${agentId}); probe not admitted`));
@@ -366,8 +344,6 @@ export class PaneStreamerManager {
       try {
         handle.onDeadline();
       } catch (err) {
-        // The registry entry stays until the probe's own exit is observed — the
-        // occupied slot IS the retry credential; the operator just needs to know.
         console.warn(`[pane-streamer-manager] ${agentId} capability probe kill failed (slot stays occupied until it exits):`, err);
       }
     });
@@ -383,7 +359,6 @@ export class PaneStreamerManager {
       || owner.identity.serverPid !== geom.ref.serverPid
       || owner.identity.serverStart !== geom.ref.serverStart
     )) {
-      // A rebuilt session has no relation to the previous full target or writes.
       owner.fullTarget = null;
       owner.lastWrittenGen = null;
     }
@@ -406,9 +381,6 @@ export class PaneStreamerManager {
     return run;
   }
 
-  // Every owner write is server-side guarded by session triple ∧ claim; 'full'
-  // capability adds the numeric generation compare. 'null' capability (unproven
-  // either way) issues NOTHING — fail closed, retry after the next read.
   private async issueOwnerWrite(
     owner: OwnerState,
     mode: 'manual' | 'latest',
@@ -435,9 +407,6 @@ export class PaneStreamerManager {
       owner.lastWrittenGen = gen;
       return;
     }
-    // Legacy server (<3.2, no format arithmetic): triple ∧ claim guard still holds;
-    // only the generation compare is unavailable, so same-session out-of-order
-    // writes remain possible. dirty must not clear while one is unsettled.
     await this.raceGeometryExec(owner.agent.id, () => {
       owner.legacyUnsettledWrites++;
       const raw = tmux.ownerWrite(owner.agent.id, owner.identity!, owner.agent.id, null, mode, resizeTo, opts);
@@ -471,10 +440,6 @@ export class PaneStreamerManager {
         }
       } catch (err) {
         if (err instanceof SessionAbsentError) {
-          // A PROVEN-absent session has nothing to reconcile; a rebuilt one starts
-          // at tmux defaults and is re-armed by ensure()/startupScan(). Transient
-          // failures (SSH flake, exit 255, admission backpressure) land in the
-          // other branch and keep every retry credential.
           owner.scanPending = false;
           if (owner.fullHolds === 0 && owner.dirty) owner.dirty = false;
           this.syncReconcilerTimer(owner);
@@ -488,8 +453,6 @@ export class PaneStreamerManager {
         return;
       }
       if (owner.epoch !== epoch || this.owners.get(owner.agent.id) !== owner) return;
-      // The read succeeded: the boot-scan credential is spent regardless of what
-      // the state machine decides next (dirty carries any follow-up work).
       owner.scanPending = false;
 
       if (geom.claim !== owner.agent.id) {
@@ -559,8 +522,6 @@ export class PaneStreamerManager {
     owner.resizeWriteQueued = true;
     const run = this.enqueueGeometry(owner, epoch, async () => {
       owner.resizeWriteQueued = false;
-      // Released or retargeted while queued: the reconciler owns 'latest'; a newer
-      // resize target is picked up here because we read fullTarget at run time.
       if (owner.fullHolds === 0) return;
       const target = owner.fullTarget;
       if (!target) return;

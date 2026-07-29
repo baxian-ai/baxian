@@ -82,14 +82,12 @@ function firstParagraph(text: string): string {
   return para.replace(/\s+/g, ' ').slice(0, 200);
 }
 
-// 仅顶层 skill 目录跟随 symlink；内部一律 lstat——后代链接可越界或成环，跟随会把外部内容物化进 Workdir。
 async function walk(dir: string, base: string = dir): Promise<SkillFile[]> {
   const out: SkillFile[] = [];
   let entries: string[];
   try {
     entries = await readdir(dir);
   } catch (err) {
-    // 静默跳过会把残缺 skill 标成功——不可遍历即整插件拒绝（usage-aware 层兜未引用插件）。
     throw new SkillScanError(`${dir}: unreadable skill directory (${err instanceof Error ? err.message : String(err)})`);
   }
   for (const entry of entries) {
@@ -132,7 +130,6 @@ export class SkillRegistry {
     }
   }
 
-  // 与核心同名即整插件抛错（原子淘汰，池不留半截）——只删单个 skill 会留下引用它的残缺插件。
   async scanPluginSkills(tool: string, skillsRoot: string): Promise<void> {
     const defs = await scanSkillRoot(skillsRoot);
     for (const def of defs) {
@@ -211,8 +208,6 @@ async function scanSkillRoot(root: string): Promise<SkillDef[]> {
     return defs;
   }
   for (const entry of entries) {
-    // 与插件加载器同候选集：隐藏目录与非 baxian- 前缀不入池——物化清理只回收 baxian-*，
-    // 越集注入的目录无法清理。
     if (entry.startsWith('.') || !entry.startsWith('baxian-')) continue;
     const entryPath = join(root, entry);
     let s;

@@ -2,40 +2,30 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentManager } from '../../src/agent/manager.js';
+import type { TaskState } from '../../src/shared/index.js';
+import type { AgentManager } from '../../src/agent/manager.js';
+import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
 import { BranchManager } from '../../src/agent/branch.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { TaskStore } from '../../src/state/task-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner, type FakeRunner } from '../helpers/fake-runner.js';
+import { makeTask } from '../helpers/fixtures.js';
 
 const NOW = '2026-04-28T10:00:00Z';
 
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'user/repo',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa-repo' },
-    ]],
-  }],
-};
+type ManagerHarness = Awaited<ReturnType<typeof createManagerHarness>>;
 
 let tempDir: string;
 let agentStore: AgentStore;
 let taskStore: TaskStore;
 let lockManager: LockManager;
 let manager: AgentManager;
+let createManager: ManagerHarness['createManager'];
+let seedAgent: ManagerHarness['seedAgent'];
+let seedTask: ManagerHarness['seedTask'];
+let acquireAgentLock: ManagerHarness['acquireAgentLock'];
 let onBranchCleanup: (() => Promise<void>) | undefined;
 
 function releaseProbeRunner(opts: {
@@ -43,80 +33,42 @@ function releaseProbeRunner(opts: {
   claim?: string | null;
   panes?: string;
   fail?: 'session' | 'claim' | 'panes';
-} = {}): CommandRunner {
+} = {}): FakeRunner {
   const session = opts.session ?? true;
   const claim = opts.claim === undefined ? 'dev-1' : opts.claim;
   const panes = opts.panes ?? '%0 claude\n';
-  return {
-    exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('tmux has-session')) {
-        if (opts.fail === 'session') {
-          return { stdout: '', stderr: 'ssh: connection timed out', exitCode: 255 };
-        }
-        return session
-          ? { stdout: '', stderr: '', exitCode: 0 }
-          : { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
-      }
-      if (cmd.includes('tmux list-sessions')) {
-        if (opts.fail === 'claim') {
-          return { stdout: '', stderr: 'tmux probe failed', exitCode: 2 };
-        }
-        return claim === null
-          ? { stdout: '4242|1700000000|$1|\n', stderr: '', exitCode: 0 }
-          : { stdout: `4242|1700000000|$1|${claim}\n`, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('tmux list-panes')) {
-        if (opts.fail === 'panes') {
-          return { stdout: '', stderr: 'tmux list failed', exitCode: 2 };
-        }
-        return { stdout: panes, stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-        return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
-      }
-      if (cmd.includes('capture-pane')) {
-        return { stdout: 'BX_PANE_OK\n⏵⏵ bypass permissions on /tmp/repo\n\n>', stderr: '', exitCode: 0 };
-      }
-      return { stdout: '', stderr: '', exitCode: 0 };
-    }),
-    writeFile: vi.fn(async (): Promise<void> => undefined),
-  };
-}
-
-function readyRunner(): CommandRunner {
-  return releaseProbeRunner();
-}
-
-function managerWithRunner(runner: CommandRunner): AgentManager {
-  return new AgentManager({
-    config: CONFIG,
-    agentStore,
-    taskStore,
-    lockManager,
-    eventBus: new EventBus(new EventLog(join(tempDir, 'events'))),
-    skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-    runnerFactory: () => runner,
+  return fakeRunner({
+    rules: [
+      ...(opts.fail === 'session'
+        ? [{ match: 'tmux has-session', reply: { stderr: 'ssh: connection timed out', exitCode: 255 } }]
+        : !session
+          ? [{ match: 'tmux has-session', reply: { stderr: "can't find session: dev-1", exitCode: 1 } }]
+          : []),
+      ...(opts.fail === 'claim'
+        ? [{ match: 'tmux list-sessions', reply: { stderr: 'tmux probe failed', exitCode: 2 } }]
+        : claim !== 'dev-1'
+          ? [{
+              match: 'tmux list-sessions',
+              reply: { stdout: `4242|1700000000|$1|${claim ?? ''}\n` },
+            }]
+          : []),
+      ...(opts.fail === 'panes'
+        ? [{ match: 'tmux list-panes', reply: { stderr: 'tmux list failed', exitCode: 2 } }]
+        : panes !== '%0 claude\n'
+          ? [{ match: 'tmux list-panes', reply: { stdout: panes } }]
+          : []),
+    ],
   });
 }
 
 async function seedActiveBinding(): Promise<void> {
-  await taskStore.set({
+  await taskStore.set(makeTask({
     id: 'task-001',
-    projectId: 'proj',
-    title: 'T',
-    description: 'D',
-    preferredAgentId: 'dev-1',
-    agentId: 'dev-1',
-    devAgentId: 'dev-1',
-    qaAgentId: 'qa-1',
     phase: 'code',
-    branch: 'bx/task-001',
-    branchCreatedByBaxian: true,
-    reviewRound: 0,
-    status: 'in_progress',
+    platformBinding: undefined,
     createdAt: NOW,
     updatedAt: NOW,
-  });
+  }));
   await agentStore.set({
     id: 'dev-1',
     projectId: 'proj',
@@ -129,36 +81,53 @@ async function seedActiveBinding(): Promise<void> {
   await lockManager.acquire('dev-1', 'task-001');
 }
 
-beforeEach(async () => {
-  onBranchCleanup = undefined;
-  tempDir = await mkdtemp(join(tmpdir(), 'baxian-release-lock-'));
-  await initStateDir(tempDir);
-
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-
-  manager = managerWithRunner(readyRunner());
-  vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
-    await onBranchCleanup?.();
-    return { status: 'deleted' };
+function useReleaseHarness(lockSeededAgents = false): void {
+  beforeEach(async () => {
+    onBranchCleanup = undefined;
+    tempDir = await mkdtemp(join(tmpdir(), 'baxian-release-lock-'));
+    const runner = releaseProbeRunner();
+    const harness = await createManagerHarness(tempDir, {
+      deps: {
+        runnerFactory: () => runner,
+        platformRunner: runner,
+      },
+      lockSeededAgents,
+    });
+    ({
+      manager,
+      createManager,
+      agentStore,
+      taskStore,
+      lockManager,
+      seedAgent,
+      seedTask,
+      acquireAgentLock,
+    } = harness);
+    vi.spyOn(BranchManager.prototype, 'cleanupTaskBranch').mockImplementation(async () => {
+      await onBranchCleanup?.();
+      return { status: 'deleted' };
+    });
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
   });
-  vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
-});
 
-afterEach(async () => {
-  vi.restoreAllMocks();
-  await rm(tempDir, { recursive: true, force: true });
-});
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await rm(tempDir, { recursive: true, force: true });
+  });
+}
 
 describe('releaseAgentForTask binding transitions', () => {
+  useReleaseHarness();
+
   it('waiting mode keeps the task binding and lock after the ready gate passes', async () => {
     await seedActiveBinding();
+    expect((await agentStore.get('dev-1'))?.lockToken).toBeUndefined();
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'waiting')).toBe(true);
 
     const state = await agentStore.get('dev-1');
     expect(state?.taskId).toBe('task-001');
+    expect(state?.lockToken).toEqual(expect.any(String));
     expect(state?.workdir).toBe('/tmp/repo');
     expect(state?.startedAt).toBe(NOW);
     expect(await lockManager.isLocked('dev-1')).toBe(true);
@@ -235,17 +204,16 @@ describe('releaseAgentForTask binding transitions', () => {
   it('idle release proceeds without a pane after confirming the tmux session is absent', async () => {
     await seedActiveBinding();
     await agentStore.update('dev-1', state => ({ ...state!, paneId: undefined }));
-    const absentRunner = readyRunner();
-    vi.mocked(absentRunner.exec).mockImplementation(async (cmd: string): Promise<ExecResult> => {
-      if (cmd.includes('tmux has-session')) {
-        return { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
-      }
-      if (cmd.includes('tmux list-panes')) {
-        return { stdout: '', stderr: "can't find session: dev-1", exitCode: 1 };
-      }
-      return { stdout: '', stderr: '', exitCode: 0 };
+    const absentRunner = fakeRunner({
+      rules: [{
+        match: cmd => cmd.includes('tmux has-session') || cmd.includes('tmux list-panes'),
+        reply: { stderr: "can't find session: dev-1", exitCode: 1 },
+      }],
     });
-    manager = managerWithRunner(absentRunner);
+    manager = createManager({
+      runnerFactory: () => absentRunner,
+      platformRunner: absentRunner,
+    });
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(true);
     expect((await agentStore.get('dev-1'))?.taskId).toBeUndefined();
@@ -255,7 +223,7 @@ describe('releaseAgentForTask binding transitions', () => {
   it('idle release treats a persisted pane as stale when the tmux session is absent', async () => {
     await seedActiveBinding();
     const runner = releaseProbeRunner({ session: false });
-    manager = managerWithRunner(runner);
+    manager = createManager({ runnerFactory: () => runner, platformRunner: runner });
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(true);
 
@@ -269,7 +237,7 @@ describe('releaseAgentForTask binding transitions', () => {
   it('idle release replaces a stale persisted pane with the unique live pane in the claimed session', async () => {
     await seedActiveBinding();
     const runner = releaseProbeRunner({ panes: '%9 claude\n' });
-    manager = managerWithRunner(runner);
+    manager = createManager({ runnerFactory: () => runner, platformRunner: runner });
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(true);
 
@@ -291,7 +259,8 @@ describe('releaseAgentForTask binding transitions', () => {
     ['pane probe error', { fail: 'panes' as const }],
   ])('idle release holds on %s', async (_label, probe) => {
     await seedActiveBinding();
-    manager = managerWithRunner(releaseProbeRunner(probe));
+    const runner = releaseProbeRunner(probe);
+    manager = createManager({ runnerFactory: () => runner, platformRunner: runner });
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(false);
 
@@ -332,7 +301,7 @@ describe('releaseAgentForTask binding transitions', () => {
       }
       return baseExec(cmd, opts);
     });
-    manager = managerWithRunner(runner);
+    manager = createManager({ runnerFactory: () => runner, platformRunner: runner });
 
     expect(await manager.releaseAgentForTask('dev-1', 'task-001', 'idle')).toBe(false);
 
@@ -346,39 +315,18 @@ describe('releaseAgentForTask binding transitions', () => {
 });
 
 describe('releaseAgentForTask does not interrupt the REPL', () => {
-  function busyRunner(sentKeys: string[]): CommandRunner {
-    return {
-      exec: vi.fn(async (cmd: string): Promise<ExecResult> => {
-        if (cmd.includes('tmux has-session')) {
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('tmux list-sessions')) {
-          return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('tmux list-panes')) {
-          return { stdout: '%0 claude\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('send-keys')) {
-          sentKeys.push(cmd);
-          return { stdout: '', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('display-message') && cmd.includes('pane_current_command')) {
-          return { stdout: 'BX_PANE_OKclaude\n', stderr: '', exitCode: 0 };
-        }
-        if (cmd.includes('capture-pane')) {
-          return { stdout: 'BX_PANE_OK\nTool use: Bash\nRunning gh pr comment...\n', stderr: '', exitCode: 0 };
-        }
-        return { stdout: '', stderr: '', exitCode: 0 };
-      }),
-      writeFile: vi.fn(async (): Promise<void> => undefined),
-    };
-  }
+  useReleaseHarness();
 
   let sentKeys: string[];
 
   beforeEach(async () => {
-    sentKeys = [];
-    manager = managerWithRunner(busyRunner(sentKeys));
+    const runner = fakeRunner({
+      agents: {
+        'dev-1': { screen: 'Tool use: Bash\nRunning gh pr comment...\n' },
+      },
+    });
+    sentKeys = runner.sentKeys;
+    manager = createManager({ runnerFactory: () => runner, platformRunner: runner });
   });
 
   it('idle release on busy pane: keeps binding and lock, no C-c sent', async () => {
@@ -406,5 +354,346 @@ describe('releaseAgentForTask does not interrupt the REPL', () => {
     expect(state?.updatedAt).not.toBe(NOW);
     expect(await lockManager.isLocked('dev-1')).toBe(true);
     expect(sentKeys.filter(k => k.includes('C-c'))).toHaveLength(0);
+  });
+});
+
+describe('AgentManager.releaseAgentForTask waiting-mode gate', () => {
+  useReleaseHarness(true);
+
+  it('refuses the waiting transition when the bound task is no longer active', async () => {
+    const t = await seedTask({ status: 'cancelled' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0' });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(manager.releaseAgentForTask('dev-1', t.id, 'waiting')).resolves.toBe(false);
+
+    expect((await agentStore.get('dev-1'))?.taskId).toBe(t.id);
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('not active'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+});
+
+describe('AgentManager.releaseAgentForTask idle-mode expectedHold gate', () => {
+  useReleaseHarness(true);
+
+  async function seedHeldQa(): Promise<TaskState> {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({
+      id: 'qa-1', taskId: t.id,
+      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
+      awaitingReason: 'repl not ready', awaitingSince: NOW, awaitingNonce: 'gen-a',
+    });
+    await acquireAgentLock('qa-1', t.id);
+    return t;
+  }
+
+  it('releases and clears the hold when the expected generation matches', async () => {
+    const t = await seedHeldQa();
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', {
+      allowAwaitingHuman: true,
+      expectedHold: { phase: 'checkout-preparation-failed', since: NOW, nonce: 'gen-a' },
+    });
+
+    expect(released).toBe(true);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBeUndefined();
+    expect(qa?.status).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  it('keeps the hold and the binding when the hold generation does not match', async () => {
+    const t = await seedHeldQa();
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', {
+      allowAwaitingHuman: true,
+      expectedHold: { phase: 'checkout-preparation-failed', since: NOW, nonce: 'gen-z' },
+    });
+
+    expect(released).toBe(false);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBe('awaiting_human');
+    expect(qa?.awaitingNonce).toBe('gen-a');
+    expect(await lockManager.isLocked('qa-1')).toBe(true);
+  });
+
+  it('refuses a mismatched hold generation before any workdir side effect', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo',
+      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+      awaitingReason: 'prompt may be running', awaitingSince: NOW, awaitingNonce: 'gen-b',
+    });
+    await acquireAgentLock('qa-1', t.id);
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', {
+      allowAwaitingHuman: true,
+      expectedHold: { phase: 'checkout-preparation-failed', since: NOW, nonce: 'gen-a' },
+    });
+
+    expect(released).toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
+    expect(await lockManager.isLocked('qa-1')).toBe(true);
+  });
+
+  it('QA REPL 仍忙 → 拒绝释放但不落 hold（忙碌不是清理失败，可再排队）', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireAgentLock('qa-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true });
+
+    expect(released).toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+    expect(qa?.awaitingPhase).toBeUndefined();
+  });
+
+  it('release 的忙碌等待走真实实现：持续忙碌时 deferWhenBusy 生效、不落 hold', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireAgentLock('qa-1', t.id);
+    Object.assign(manager, { compactIdlePollMs: 1, cleanComposerWaitMs: 5 });
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(TmuxManager.prototype, 'waitReplReady').mockResolvedValue(undefined as never);
+    vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
+    vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
+    vi.spyOn(TmuxManager.prototype, 'capturePaneById').mockResolvedValue(
+      '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n',
+    );
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', { deferWhenBusy: true });
+
+    expect(released).toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(qa?.status).toBeUndefined();
+  });
+
+  it('未声明 deferWhenBusy 的普通释放（终态/清理路径）遇忙仍落 hold 并告警', async () => {
+    const t = await seedTask({ status: 'merged', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireAgentLock('qa-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%1', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%1', 'codex', ''));
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle');
+
+    expect(released).toBe(false);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.status).toBe('awaiting_human');
+    expect(qa?.awaitingPhase).toBe('branch-cleanup-pending');
+  });
+
+  it('dev REPL 忙仍按 branch-cleanup-pending 落 hold（分支清理凭据不可丢）', async () => {
+    const t = await seedTask({ status: 'review', agentId: 'dev-1', branch: 'bx/task-review' });
+    await seedAgent({ id: 'dev-1', taskId: t.id, paneId: '%0', workdir: '/tmp/dev-repo' });
+    await acquireAgentLock('dev-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'pane', pane: { session: 'bx', paneId: '%0', claim: undefined } });
+    vi.spyOn(
+      manager as unknown as { waitForReplPromptReady: (...args: unknown[]) => Promise<unknown> },
+      'waitForReplPromptReady',
+    ).mockRejectedValue(new ReplNotReadyError('%0', 'claude-code', ''));
+
+    const released = await manager.releaseAgentForTask('dev-1', t.id, 'idle');
+
+    expect(released).toBe(false);
+    const dev = await agentStore.get('dev-1');
+    expect(dev?.status).toBe('awaiting_human');
+    expect(dev?.awaitingPhase).toBe('branch-cleanup-pending');
+  });
+
+  it('refuses an expectedHold release when the hold was already cleared', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id });
+    await acquireAgentLock('qa-1', t.id);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', {
+      allowAwaitingHuman: true,
+      expectedHold: { phase: 'checkout-preparation-failed', since: NOW, nonce: 'gen-a' },
+    });
+
+    expect(released).toBe(false);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBe(t.id);
+    expect(await lockManager.isLocked('qa-1')).toBe(true);
+  });
+
+  it('aborts before checkout cleanup when the hold is rewritten during runtime inspection', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo',
+      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
+      awaitingReason: 'repl not ready', awaitingSince: NOW, awaitingNonce: 'gen-a',
+    });
+    await acquireAgentLock('qa-1', t.id);
+    vi.spyOn(TmuxManager.prototype, 'hasSession').mockImplementation(async () => {
+      const held = await agentStore.get('qa-1');
+      await agentStore.set({
+        ...held!,
+        awaitingPhase: 'dispatch-failed:ack_unknown',
+        awaitingReason: 'prompt may be running',
+        awaitingNonce: 'gen-b',
+        updatedAt: new Date().toISOString(),
+      });
+      return false;
+    });
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', {
+      allowAwaitingHuman: true,
+      expectedHold: { phase: 'checkout-preparation-failed', since: NOW, nonce: 'gen-a' },
+    });
+
+    expect(released).toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    expect((await agentStore.get('qa-1'))?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
+  });
+
+  it('does not let a cleanup failure overwrite a hold rewritten mid-release', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({
+      id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo',
+      status: 'awaiting_human', awaitingPhase: 'checkout-preparation-failed',
+      awaitingReason: 'repl not ready', awaitingSince: NOW, awaitingNonce: 'gen-a',
+    });
+    await acquireAgentLock('qa-1', t.id);
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockImplementation(async () => {
+      const held = await agentStore.get('qa-1');
+      await agentStore.set({
+        ...held!,
+        awaitingPhase: 'dispatch-failed:ack_unknown',
+        awaitingReason: 'prompt may be running',
+        awaitingNonce: 'gen-b',
+        updatedAt: new Date().toISOString(),
+      });
+      throw new Error('park failed');
+    });
+
+    const released = await manager.releaseAgentForTask('qa-1', t.id, 'idle', {
+      allowAwaitingHuman: true,
+      expectedHold: { phase: 'checkout-preparation-failed', since: NOW, nonce: 'gen-a' },
+    });
+
+    expect(released).toBe(false);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.awaitingPhase).toBe('dispatch-failed:ack_unknown');
+    expect(qa?.awaitingNonce).toBe('gen-b');
+    expect(await lockManager.isLocked('qa-1')).toBe(true);
+  });
+
+  it('hold 先取得 agent lease 时，release 等待并在任何 checkout 副作用前拒绝', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireAgentLock('qa-1', t.id);
+    const parkSpy = vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockResolvedValue(undefined);
+    const realUpdate = agentStore.update.bind(agentStore);
+    let entered!: () => void;
+    let unblock!: () => void;
+    const updateEntered = new Promise<void>(resolve => { entered = resolve; });
+    const updateUnblocked = new Promise<void>(resolve => { unblock = resolve; });
+    vi.spyOn(agentStore, 'update').mockImplementationOnce(async (...args) => {
+      entered();
+      await updateUnblocked;
+      return realUpdate(...args);
+    });
+
+    const hold = manager.markAwaitingHuman('qa-1', 'dispatch-failed:ack_unknown', 'prompt unknown', {
+      expectedTaskId: t.id,
+    });
+    await updateEntered;
+    const release = manager.releaseAgentForTask('qa-1', t.id, 'idle');
+    await Promise.resolve();
+    expect(parkSpy).not.toHaveBeenCalled();
+
+    unblock();
+    await expect(hold).resolves.toBe(true);
+    await expect(release).resolves.toBe(false);
+    expect(parkSpy).not.toHaveBeenCalled();
+    expect(await agentStore.get('qa-1')).toMatchObject({
+      taskId: t.id,
+      status: 'awaiting_human',
+      awaitingPhase: 'dispatch-failed:ack_unknown',
+    });
+  });
+
+  it('release 先取得 agent lease 时，hold 不会在 park 期间落库并在解绑后被 CAS 拒绝', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id, paneId: '%1', workdir: '/tmp/qa-repo' });
+    await acquireAgentLock('qa-1', t.id);
+    vi.spyOn(
+      manager as unknown as { inspectReleaseRuntime: (...args: unknown[]) => Promise<unknown> },
+      'inspectReleaseRuntime',
+    ).mockResolvedValue({ kind: 'absent' });
+    let parkEntered!: () => void;
+    let unblockPark!: () => void;
+    const parked = new Promise<void>(resolve => { parkEntered = resolve; });
+    const parkUnblocked = new Promise<void>(resolve => { unblockPark = resolve; });
+    vi.spyOn(BranchManager.prototype, 'parkOnDefaultDetached').mockImplementation(async () => {
+      parkEntered();
+      await parkUnblocked;
+    });
+
+    const release = manager.releaseAgentForTask('qa-1', t.id, 'idle');
+    await parked;
+    const hold = manager.markAwaitingHuman('qa-1', 'dispatch-failed:ack_unknown', 'prompt unknown', {
+      expectedTaskId: t.id,
+    });
+    await Promise.resolve();
+    expect((await agentStore.get('qa-1'))?.status).not.toBe('awaiting_human');
+
+    unblockPark();
+    await expect(release).resolves.toBe(true);
+    await expect(hold).resolves.toBe(false);
+    const qa = await agentStore.get('qa-1');
+    expect(qa?.taskId).toBeUndefined();
+    expect(qa?.status).toBeUndefined();
+    expect(await lockManager.isLocked('qa-1')).toBe(false);
+  });
+
+  it('agent operation lease advances after a failed predecessor', async () => {
+    const t = await seedTask({ status: 'review', qaAgentId: 'qa-1' });
+    await seedAgent({ id: 'qa-1', taskId: t.id });
+    vi.spyOn(agentStore, 'update').mockRejectedValueOnce(new Error('store down'));
+
+    await expect(manager.markAwaitingHuman(
+      'qa-1', 'checkout-preparation-failed', 'first hold', { expectedTaskId: t.id },
+    )).rejects.toThrow('store down');
+    await expect(manager.markAwaitingHuman(
+      'qa-1', 'dispatch-failed:ack_unknown', 'second hold', { expectedTaskId: t.id },
+    )).resolves.toBe(true);
+
+    expect(await agentStore.get('qa-1')).toMatchObject({
+      status: 'awaiting_human', awaitingPhase: 'dispatch-failed:ack_unknown',
+    });
   });
 });

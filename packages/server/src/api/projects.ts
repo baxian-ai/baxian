@@ -11,7 +11,6 @@ import type {
   AgentConfig,
 } from '../shared/index.js';
 import {
-  ROOT_AGENT_ID,
   TASK_ACTIVE_STATUS_SET,
   TASK_OWNER_ROLES,
   TASK_TERMINAL_STATUS_SET,
@@ -511,7 +510,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         }
       }
       const agents = await Promise.all(checks);
-      // server 执行面手动诊断组：poller 未装配/零 agent 的部署也要能自证 merge/close 通道。
       let server: { results: PreflightResult[] } | undefined;
       if (projectNeedsPlatformEntry(app.ctx.config, project)) {
         server = { results: await runServerHostChecks(app.ctx.agentManager, project.id) };
@@ -1372,7 +1370,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       try {
         const result = await app.ctx.agentManager.ensureSession(agentId, 'runtime', { expectedGeneration: genAtEntry });
         const now = new Date().toISOString();
-        // Generation-gated: a DELETE→recreate during ensureSession leaves a NEW state, so an existing-only check would bind the stale paneId to the wrong incarnation.
         const paneCommit = await app.ctx.agentStore.update(agentId, (existing) => {
           if (!existing
               || app.ctx.agentManager.isDeletionInFlight(agentId)
@@ -1381,7 +1378,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
           }
           return { ...existing, paneId: result.paneId, updatedAt: now };
         });
-        // No-op ⇒ a DELETE→recreate raced ensureSession; fail closed rather than run stale retry cleanup against the new incarnation.
         if (paneCommit !== 'committed') {
           if (maintenanceToken && acquiredMaintenanceLock) {
             await app.ctx.lockManager.releaseIfOwner(agentId, maintenanceLockOwner, maintenanceToken);
@@ -1442,14 +1438,6 @@ function findConfiguredWorkdirConflict(
     host: ReturnType<typeof resolveAgentHost>;
     workdir: string;
   }> = [];
-  if (config.root) {
-    configured.push({
-      id: ROOT_AGENT_ID,
-      mode: config.root.mode,
-      host: resolveAgentHost(config.host, config.root.host),
-      workdir: config.root.workdir,
-    });
-  }
   for (const project of config.project) {
     for (const existing of project.agent.flat()) {
       if (!existing.workdir) continue;
@@ -1572,7 +1560,6 @@ async function pendingCleanupAfterReplReady(
       if (await app.ctx.agentManager.redispatchTaskPromptAfterReplRestart(agentId, taskId)) return;
     } catch (err) {
       app.log.error({ err, agentId, taskId }, 'restart/retry task prompt redispatch failed');
-      // Bound to the pre-restart task tuple: a successor pass rotated mid-replay must not be held.
       const held = await app.ctx.agentManager.holdReplayFailureIfCurrent(
         agentId,
         task,
@@ -1590,7 +1577,6 @@ async function pendingCleanupAfterReplReady(
       return;
     }
   }
-  // Both fences ride inside the release itself: a hold or pass rotation landing after any pre-read survives.
   await app.ctx.agentManager.markAgentWaiting(agentId, taskId, {
     allowAwaitingHuman: true,
     clearAwaitingHuman: true,

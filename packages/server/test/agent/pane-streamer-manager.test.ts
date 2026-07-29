@@ -12,7 +12,6 @@ type ExecMock = ReturnType<typeof vi.fn<(cmd: string) => Promise<ExecResult>>>;
 
 function mockRunner(): CommandRunner & { exec: ExecMock } {
   return {
-    // list-sessions answers a self-claimed snapshot so the PaneStreamer attach ownership gate passes.
     exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockImplementation(async (cmd: string) => {
       if (cmd.includes('list-sessions')) {
         const name = /#\{==:#\{session_name\},([^}]+)\}/.exec(cmd)?.[1] ?? 'dev-1';
@@ -60,8 +59,6 @@ const TEST_AGENT: AgentConfig = {
   mode: 'local',
 };
 
-// Attach-capability probes (`tmux -V`) must answer and exit or every spawn waits
-// out the settle deadline; a pre-3.2 answer keeps flag/follow paths off.
 function probeAware(factory: PtyFactory, version = 'tmux 3.0a\n'): PtyFactory {
   return (cmd, cols, rows) => {
     if (cmd.args.some((a) => typeof a === 'string' && a.includes('tmux -V'))) {
@@ -176,7 +173,6 @@ describe('PaneStreamerManager', () => {
 
     it('ensure replaces a streamer that auto-destroyed after tmux session disappeared', async () => {
       const { manager, fakePty, runner } = makeManager();
-      // Owned at the initial attach + post-attach handshake (probes 1-2), gone on the reconnect probe (3).
       let probes = 0;
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('list-sessions')) {
@@ -430,7 +426,6 @@ describe('owner reconciliation (manager-level, fenced writes)', () => {
     await settle();
     const manualWrite = h.fencedWrites().find((c) => c.includes('window-size manual'));
     expect(manualWrite).toBeDefined();
-    // basis = streamer headless 200x50, status on → content area 200x49
     expect(manualWrite).toContain('-x 200 -y 49');
     expect(h.state.mode).toBe('manual');
 
@@ -536,7 +531,6 @@ describe('owner reconciliation (manager-level, fenced writes)', () => {
     await settle();
     expect(h.state.mode).toBe('manual');
 
-    // Session rebuilt: same name, new identity, fresh defaults.
     h.state.sid = '$9';
     h.state.gen = '';
     h.state.mode = 'latest';
@@ -657,8 +651,6 @@ describe('owner reconciliation (manager-level, fenced writes)', () => {
       expect(h.manager._ownerForTest(TEST_AGENT.id)?.fullHolds).toBe(1);
       const epochBefore = h.manager._ownerForTest(TEST_AGENT.id)?.epoch ?? 0;
 
-      // Removing the agent while its owner state is still full-held/dirty is the
-      // exact case the removal warning exists for — assert it, exactly once.
       await h.manager.destroy(TEST_AGENT.id);
       const dirtyWarns = warnSpy.mock.calls.filter((c) =>
         String(c[0]).includes('removed while owner state dirty'));
@@ -783,7 +775,6 @@ describe('probe admission ordering (lazy start, no untracked live bodies)', () =
         maxPendingGeometryPerAgent: 1,
       });
 
-      // Occupy the single global slot with a never-settling geometry exec.
       const blockerAgent: AgentConfig = { ...TEST_AGENT, id: 'blocker' };
       const blocker = manager.ensure(blockerAgent);
       await blocker.subscribeAtomic(OWNER_CBS);
@@ -793,8 +784,6 @@ describe('probe admission ordering (lazy start, no untracked live bodies)', () =
       expect(manager._geometryPendingForTest().global).toBe(1);
       counting = true;
 
-      // Two attach lifecycles for another agent: probes must not be admitted, and
-      // since admission is checked BEFORE creation, no probe PTY may ever exist.
       const streamer = manager.ensure(TEST_AGENT);
       await streamer.subscribeAtomic(OWNER_CBS);
       attachPtys.at(-1)?.emitExit();
@@ -823,7 +812,6 @@ describe('probe admission ordering (lazy start, no untracked live bodies)', () =
       });
       const owner = manager.ensure(TEST_AGENT);
       void owner;
-      // Reach into the streamer hooks via a raw probe: never settles, kill throws.
       const hooks = (manager as unknown as {
         geometryHooksFor: (o: unknown) => { raceProbe: <T>(s: () => { result: Promise<T>; settled: Promise<unknown>; onDeadline: () => void }) => Promise<T> };
         owners: Map<string, unknown>;
@@ -843,7 +831,6 @@ describe('probe admission ordering (lazy start, no untracked live bodies)', () =
       const killWarns = warnSpy.mock.calls.filter((c) =>
         String(c[0]).includes('capability probe kill failed') && String(c[0]).includes(TEST_AGENT.id));
       expect(killWarns.length).toBe(1);
-      // The un-killable probe never exits: its slot stays occupied (honest backpressure).
       expect(manager._geometryPendingForTest().byAgent.get(TEST_AGENT.id)).toBe(1);
       await manager.destroyAll();
     } finally {

@@ -71,7 +71,6 @@ export async function ensureBaxianRuntimeDirsSafe(
   const dirs = BAXIAN_RUNTIME_DIRS.map(dir => `${absRepoPath}/${dir}`);
   const operands = dirs.map(shellQuote).join(' ');
   const q = shellQuote(absRepoPath);
-  // Canonical root guard rides the same command: a rebound Workdir root never receives a mkdir.
   const command =
     `[ "$(cd -- ${q} 2>/dev/null && pwd -P)" = ${q} ] || exit 9; ` +
     `for p in ${operands}; do ` +
@@ -106,13 +105,10 @@ export async function ensureBaxianRuntimeDirsSafe(
 }
 
 function normalizeRoot(root: string): string {
-  // Strip trailing slashes, but keep the filesystem root as "/" — collapsing it to "" would make the
-  // guard `cd -- ''` and break cloning on root-home (HOME=/) container hosts.
   const cleaned = root.replace(/\/+$/, '');
   return cleaned === '' ? '/' : cleaned;
 }
 
-// Canonical Workdir (pwd -P) is symlink-free by construction; this equality re-proves it in the SAME command as a mutation so a mid-ensure root rebind can't be written through.
 export function canonicalSelfGuard(path: string): string {
   const q = shellQuote(path);
   return `[ "$(cd -- ${q} 2>/dev/null && pwd -P)" = ${q} ]`;
@@ -120,17 +116,14 @@ export function canonicalSelfGuard(path: string): string {
 
 export function isUnder(root: string, path: string): boolean {
   const r = normalizeRoot(root);
-  // Root "/" contributes a single leading slash, not "//".
   return r === '/' ? path.startsWith('/') && path !== '/' : path.startsWith(`${r}/`);
 }
 
-// Canonical (pwd -P) root proves the whole chain symlink-free; a bare [ ! -L root ] misses a rebound mid-path ancestor. Root MUST be canonical (state.workdir / physical home).
 export function ancestorSymlinkGuard(root: string, target: string): string {
   const rootClean = normalizeRoot(root);
   if (!isUnder(root, target)) {
     throw new Error(`ancestorSymlinkGuard: ${target} is not under ${rootClean}`);
   }
-  // For root "/" the separator IS the leading slash (offset 1); otherwise it is an extra "/" (offset +1).
   const sliceFrom = rootClean === '/' ? rootClean.length : rootClean.length + 1;
   const parts = target.slice(sliceFrom).split('/').filter(Boolean);
   const q = shellQuote(rootClean);
@@ -143,7 +136,6 @@ export function ancestorSymlinkGuard(root: string, target: string): string {
   return checks.join(' && ');
 }
 
-// The guard/op/quoting composition for destructive removes lives here once.
 export function guardedRemoveClause(root: string, target: string, opts: { recursive?: boolean } = {}): string {
   const rm = opts.recursive ? 'rm -rf' : 'rm -f';
   return `${ancestorSymlinkGuard(root, target)} && ${rm} -- ${shellQuote(target)}`;
@@ -152,7 +144,6 @@ export function guardedRemoveClause(root: string, target: string, opts: { recurs
 const SWEEP_REMOVED = 'BX_SWEEP_REMOVED';
 const SWEEP_REFUSED = 'BX_SWEEP_REFUSED';
 
-// Four audited outcomes: removed-or-absent, guard-refused (deliberate keep), rm-failed, and probe-unknown (exec reject / exit 255 — rm may have run, reply lost) which is kept and flagged, never folded into the others.
 async function sweepGuardedPath(runner: CommandRunner, path: string, guardClause?: string): Promise<void> {
   const rm = `rm -f -- ${shellQuote(path)} && printf '%s' ${shellQuote(SWEEP_REMOVED)}`;
   const cmd = guardClause
@@ -186,7 +177,6 @@ function nestedSweepGuard(final: string, guardRoot?: string): string {
   return guardRoot ? `${ancestorSymlinkGuard(guardRoot, final)} && ${finalIsRealDir}` : finalIsRealDir;
 }
 
-// Guard and write share one command so a rebound ancestor never receives staging bytes; mkdir -p recreates components the guard just cleared as not-yet-existing.
 export async function stageFileGuarded(
   runner: CommandRunner,
   root: string,
@@ -225,7 +215,6 @@ export async function stageFileGuarded(
   }
 }
 
-// mv onto a directory target nests instead of replacing: fail closed ahead, verify after, sweep both tmp homes on failure.
 export async function moveFileIntoPlace(
   runner: CommandRunner,
   tmp: string,
@@ -246,7 +235,6 @@ export async function moveFileIntoPlace(
   const tmpGuard = guardCovers(tmp) ? ancestorSymlinkGuard(opts.guardRoot!, tmp) : undefined;
   const nestedGuard = nestedSweepGuard(final, guardCovers(final) ? opts.guardRoot : undefined);
   const nested = `${final}/${tmpBase}`;
-  // Each home swept independently so a first-step failure can't be masked by a second-step no-op.
   const sweepBoth = async (): Promise<void> => {
     await sweepGuardedPath(runner, tmp, tmpGuard);
     await sweepGuardedPath(runner, nested, nestedGuard);
@@ -291,8 +279,6 @@ export class RepoStore {
   ) {
     this.repo = repo.trim();
     this.isGitHub = isGitHubRepo(this.repo);
-    // clone 是 agent 执行面：github 仓库仅 resolved tool 为 gh 时走 gh repo clone，
-    // 自定义 tool 走朴素 git（repo clone 是 gh 专属子命令）。
     this.cloneWithGh = cloneViaGh ?? this.isGitHub;
   }
 
@@ -394,7 +380,6 @@ export class RepoStore {
           `baxian never creates a user-specified Workdir implicitly.`,
         );
       }
-      // Auto mode only (configured Workdir threw above), so physical home is the provable root; mkdir and clone carry the same chain guard, leaving only the in-command race during the long clone.
       const guardRoot = await this.resolveHome();
       const parent = absRepoPath.replace(/\/[^/]+$/, '');
       const staging = `${absRepoPath}.claim-${randomUUID()}`;
@@ -459,7 +444,6 @@ export class RepoStore {
     return this.syncMatchingOriginUrl(absRepoPath);
   }
 
-  // gh resolves a two-segment slug against the ambient GH_HOST, so the clone must pin the host from the authoritative repo URL.
   private ghCloneHostEnv(): string {
     let host: string | undefined = 'github.com';
     if (!this.isGitHub) {
@@ -471,7 +455,6 @@ export class RepoStore {
     return host === undefined ? '' : `GH_HOST=${shellQuote(host)} `;
   }
 
-  // Runs a remote probe; an uncertain transport outcome throws instead of masquerading as "no".
   private async probe(cmd: string, what: string): Promise<ExecResult> {
     const result = await this.runner.exec(cmd);
     if (result.exitCode !== 0 && execOutcomeUnknown(result)) {
@@ -511,8 +494,6 @@ export class RepoStore {
         `Workdir ${absRepoPath} must be an independent ordinary clone, not a linked worktree or alternates-based clone.`,
       );
     }
-    // A promisor/partial clone lazy-fetches missing objects on read, so an unguarded object query
-    // could write packs into an externally-rebound .git; reject it as non-independent up front.
     const partial = await probe(
       `git -C ${path} config --get-regexp ${shellQuote('^(remote\\..*\\.(promisor|partialclonefilter)|extensions\\.partialclone)$')}`,
       'partial-clone markers',
@@ -570,17 +551,14 @@ export class RepoStore {
     return this.syncOriginUrl(absRepoPath, originUrl);
   }
 
-  // pushurl is cleared BEFORE the URL flips, so a failure keeps the diff visible and the next ensure() retries.
   private async syncOriginUrl(absRepoPath: string, originUrl: string): Promise<boolean> {
     if (parseGitRemote(this.repo) === null) return false;
     if (!accessMethodDiffers(this.repo, originUrl)) return false;
-    // These config writes precede validateClone, so a rebound-to-external Workdir would be mutated first; each carries the canonical self-guard in its own command.
     const guard = canonicalSelfGuard(absRepoPath);
     const unset = await this.probe(
       `${guard} && git -C ${shellQuote(absRepoPath)} config --unset-all remote.origin.pushurl`,
       `remote.origin.pushurl removal at ${absRepoPath}`,
     );
-    // git config exit 5 = key absent, the normal case here.
     if (unset.exitCode !== 0 && unset.exitCode !== 5) {
       throw new Error(redactGitCredentials(
         `Failed to clear remote.origin.pushurl at ${absRepoPath} (exit ${unset.exitCode}): ${unset.stderr.trim()}`,
@@ -606,7 +584,6 @@ export class RepoStore {
     return want !== null && got !== null && want.host === got.host && want.path === got.path;
   }
 
-  // exit 1 is test(1) saying "no" — unless transport noise rode along, proving nothing.
   private async probeDirExists(absRepoPath: string): Promise<boolean> {
     const probe = await this.probe(`test -d ${shellQuote(absRepoPath)}`, `workdir ${absRepoPath}`);
     if (probe.exitCode === 0) return true;
@@ -616,10 +593,8 @@ export class RepoStore {
     );
   }
 
-  // The staging name embeds a UUID, so deleting by name cannot hit anyone else's work.
   private async discardStaging(staging: string, reason: string, guardClause?: string): Promise<void> {
     console.warn(`[repo-store] removing staged clone ${staging}: ${redactGitCredentials(reason)}`);
-    // Emit a marker so a guard-refused sweep is not masked by the `if`'s exit 0 (destructive cleanup must not fail silently).
     const rmCmd = guardClause
       ? `if ${guardClause}; then rm -rf ${shellQuote(staging)} && echo BX_STAGING_REMOVED; else echo BX_STAGING_REFUSED; fi`
       : `rm -rf ${shellQuote(staging)} && echo BX_STAGING_REMOVED`;
@@ -637,11 +612,9 @@ export class RepoStore {
     }
   }
 
-  // mv has three homes (unmoved staging / moved final / nested-on-race); a nonce in staging/.git survives the move so an unknown outcome is reconciled by which home holds our bytes, never guessed.
   private async promoteStaging(staging: string, absRepoPath: string, guardRoot: string): Promise<void> {
     const base = staging.slice(staging.lastIndexOf('/') + 1);
     const nestedPath = `${absRepoPath}/${base}`;
-    // Sweeps carry the FULL ancestor chain from the managed root: a leaf-only [ ! -L ] would still fire inside an external dir if `.baxian/agents/<id>` rebinds.
     const stagingGuard = ancestorSymlinkGuard(guardRoot, staging);
     const nestedGuard = ancestorSymlinkGuard(guardRoot, nestedPath);
     const discardBoth = async (reason: string): Promise<void> => {
@@ -660,7 +633,6 @@ export class RepoStore {
       await this.discardStaging(staging, `promote-claim write failed: ${mark.stderr.trim() || `exit ${mark.exitCode}`}`, markGuard);
       throw new Error(`Cannot stamp staged clone ${staging}: ${mark.stderr.trim() || `exit ${mark.exitCode}`}`);
     }
-    // Guard + free-and-not-symlink + mv share one command: a rebound ancestor never receives the move.
     const promoteCmd =
       `${ancestorSymlinkGuard(guardRoot, absRepoPath)} && ` +
       `[ ! -e ${shellQuote(absRepoPath)} ] && [ ! -L ${shellQuote(absRepoPath)} ] && ` +
@@ -674,7 +646,6 @@ export class RepoStore {
       return;
     }
     if (promote.exitCode === 0) {
-      // Confirm the landing site BEFORE touching any marker: an exit-0 mv can nest staging into a raced-in target, making `final` foreign — clearing its baxian-promote-claim would delete someone else's file.
       const nested = await this.runner.exec(`test -e ${shellQuote(nestedPath)}`);
       if (execOutcomeUnknown(nested) || (nested.exitCode !== 0 && nested.exitCode !== 1)) {
         const reason = `promote verification failed (exit ${nested.exitCode}): ${nested.stderr.trim() || 'exec layer failure'}`;
@@ -682,8 +653,6 @@ export class RepoStore {
         throw new Error(`Cannot verify promoted clone at ${absRepoPath}; ${reason}`);
       }
       if (nested.exitCode === 1) {
-        // No nested copy: our mv landed at `final`. Its marker must still hold our nonce to adopt it — a
-        // refused clear means `final` was replaced after the mv (foreign clone), so promote is inconclusive.
         const cleared = await this.clearPromoteClaim(finalClaim, ancestorSymlinkGuard(guardRoot, finalClaim), nonce);
         if (cleared !== 'removed') {
           throw new Error(
@@ -706,7 +675,6 @@ export class RepoStore {
     );
   }
 
-  // Three-home reconciliation of an unknown mv: staging present → not executed (discard); final holds our nonce → done; nested → target race (discard); else inconclusive (keep).
   private async reconcilePromote(
     staging: string,
     absRepoPath: string,
@@ -724,8 +692,6 @@ export class RepoStore {
     if (stagingExists.exitCode === 1) {
       const marker = await this.runner.exec(`cat ${shellQuote(finalClaim)} 2>/dev/null`);
       if (marker.exitCode === 0 && marker.stdout.trim() === nonce) {
-        // The separate cat above can race a replacement of `final`; the atomic clear is authoritative —
-        // only treat the promote as completed-and-ours if the marker was actually removed under nonce.
         const cleared = await this.clearPromoteClaim(finalClaim, ancestorSymlinkGuard(guardRoot, finalClaim), nonce);
         if (cleared !== 'removed') {
           throw new Error(
@@ -747,7 +713,6 @@ export class RepoStore {
 
   private async clearPromoteClaim(finalClaim: string, guard: string, nonce: string): Promise<'removed' | 'refused' | 'failed'> {
     try {
-      // Nonce re-check and rm in ONE command (a separate cat→rm could delete a replaced foreign marker); the echoed marker surfaces a guard/nonce-refused clear that the `if`'s exit 0 would otherwise mask.
       const rm = await this.runner.exec(
         `if ${guard} && [ "$(cat ${shellQuote(finalClaim)} 2>/dev/null)" = ${shellQuote(nonce)} ]; ` +
           `then rm -f ${shellQuote(finalClaim)} && echo BX_MARKER_REMOVED; else echo BX_MARKER_REFUSED; fi`,
@@ -767,7 +732,6 @@ export class RepoStore {
     }
   }
 
-  // rmdir can't touch anything non-empty and the chain guard binds it to the physical managed root, so a rebound parent can't be hit.
   private async recoverEmptyLeftoverDir(absRepoPath: string): Promise<boolean> {
     if (this.configuredWorkdir) return false;
     const guardRoot = await this.resolveHome();
@@ -785,8 +749,6 @@ export class RepoStore {
   private async fetchIfStale(cacheKey: string, absRepoPath: string): Promise<void> {
     const last = this.cache.lastFetchAt.get(cacheKey) ?? 0;
     if (Date.now() - last < FETCH_THROTTLE_MS) return;
-    // fetch/set-head write refs and FETCH_HEAD; the canonical self-guard rides the same command so a
-    // rebind after validateClone can't redirect the writes into an external repo.
     const result = await execNetwork(
       this.runner,
       `${canonicalSelfGuard(absRepoPath)} && cd ${shellQuote(absRepoPath)} && ${GIT_NET_ENV} git fetch --all --prune && git remote set-head origin --auto`,

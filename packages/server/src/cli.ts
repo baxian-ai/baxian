@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
-import { ROOT_AGENT_ID, type HostConfig } from './shared/index.js';
+import { type HostConfig } from './shared/index.js';
 import { startServer } from './index.js';
 import { shellQuote, wrapRemoteCommand, sshTarget, resolveAgentHost } from './agent/runner.js';
 
@@ -29,23 +29,10 @@ export function readTtyDimensions(stdout: { columns?: number; rows?: number }): 
   return { cols, rows };
 }
 
-// The window-size write targets the session by name, which a fresh tmux server can reissue to a
-// foreign session; gate it on our claim so a same-name stranger's window is never touched. The CLI
-// has no server-generation credential, but the claim equality alone excludes any foreign session.
 function claimGatedWindowSize(agentId: string): string {
   const cond = `#{==:#{@baxian-agent-id},${agentId}}`;
   const set = `set-option -t '=${agentId}:' window-size latest`;
   return `tmux if-shell -t '=${agentId}:' -F '${cond}' '${set}' ''`;
-}
-
-function claimGatedAttachArgs(agentId: string): string[] {
-  const target = `=${agentId}`;
-  const cond = `#{==:#{@baxian-agent-id},${agentId}}`;
-  const attach = `attach-session -t ${shellQuote(target)}`;
-  const refuse =
-    `display-message -p ${shellQuote(`Refusing to attach: tmux session ${agentId} is not owned by Baxian`)}` +
-    `; run-shell ${shellQuote('exit 1')}`;
-  return ['-u', 'if-shell', '-t', `${target}:`, '-F', cond, attach, refuse];
 }
 
 export function buildLocalAttachCommands(
@@ -67,9 +54,7 @@ export function buildLocalAttachCommands(
     {
       kind: 'attach',
       file: 'tmux',
-      args: agentId === ROOT_AGENT_ID
-        ? claimGatedAttachArgs(agentId)
-        : ['-u', 'attach-session', '-t', `=${agentId}`],
+      args: ['-u', 'attach-session', '-t', `=${agentId}`],
     },
   ];
 }
@@ -82,9 +67,7 @@ export function buildRemoteAttachSshArgs(
   const quotedId = shellQuote(`=${agentId}`);
   const autoSizePrefix = `${claimGatedWindowSize(agentId)} 2>/dev/null || true; `;
   const focusEventsPrefix = 'tmux set-option -g focus-events on 2>/dev/null || true; ';
-  const attach = agentId === ROOT_AGENT_ID
-    ? `tmux ${claimGatedAttachArgs(agentId).map(shellQuote).join(' ')}`
-    : `tmux -u attach-session -t ${quotedId}`;
+  const attach = `tmux -u attach-session -t ${quotedId}`;
   return [
     '-o', 'ConnectTimeout=10',
     ...(host.port !== undefined ? ['-p', String(host.port)] : []),
@@ -154,7 +137,6 @@ async function apiPost<T = unknown>(
 ): Promise<T> {
   const res = await fetch(`${resolveApiBase(opts)}${path}`, {
     method: 'POST',
-    // Fastify 400s on an empty body with a JSON content-type, so only send the header with a body.
     headers: body
       ? { 'Content-Type': 'application/json', ...authHeaders(opts) }
       : authHeaders(opts),
@@ -272,17 +254,11 @@ export function buildCli(): Command {
       let resolvedHost: HostConfig | undefined;
       try {
         type CfgAgent = { id: string; mode: 'local' | 'remote'; host?: string | HostConfig };
-        type CfgRoot = Omit<CfgAgent, 'id'>;
         type CfgRes = {
           host?: HostConfig[];
           project?: Array<{ agent?: CfgAgent[][] }>;
-          root?: CfgRoot;
         };
         const cfgRes = await apiGet<CfgRes>('/config', ctx);
-        if (agentId === ROOT_AGENT_ID && cfgRes?.root) {
-          agent = cfgRes.root;
-          resolvedHost = resolveAgentHost(cfgRes.host, cfgRes.root.host);
-        }
         for (const proj of cfgRes?.project ?? []) {
           for (const pair of proj.agent ?? []) {
             for (const a of pair) {
@@ -316,15 +292,11 @@ export function buildCli(): Command {
     .description('Stop an agent')
     .action((agentId, opts) =>
       withErrors(async () => {
-        const response = await apiDelete<{ message?: unknown }>(
+        await apiDelete<{ message?: unknown }>(
           `/agents/${encodeURIComponent(agentId)}/session`,
           ctxOf(opts),
         );
-        const message = agentId === ROOT_AGENT_ID
-          && typeof response?.message === 'string'
-          ? ` ${response.message}`
-          : '';
-        console.log(`Agent ${agentId} stopped.${message}`);
+        console.log(`Agent ${agentId} stopped.`);
       }));
 
   const taskCommand = program.command('task').description('Task management');

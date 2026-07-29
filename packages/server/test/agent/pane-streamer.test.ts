@@ -21,8 +21,6 @@ type ExecMock = ReturnType<typeof vi.fn<(cmd: string, options?: ExecOptions) => 
 
 function mockRunner(): CommandRunner & { exec: ExecMock } {
   return {
-    // Default: the session is present and self-claimed (claim == the queried session name), so the
-    // attach/reattach ownership gate passes for whatever agent id the streamer is probing.
     exec: vi.fn<(cmd: string, options?: ExecOptions) => Promise<ExecResult>>().mockImplementation(async (cmd: string) => {
       if (cmd.includes('list-sessions')) {
         const name = /#\{==:#\{session_name\},([^}]+)\}/.exec(cmd)?.[1] ?? 'dev-1';
@@ -141,8 +139,6 @@ async function expectDims(streamer: PaneStreamer, cols: number, rows: number): P
   expect(snapshot.rows).toBe(rows);
 }
 
-// Present + owned at the initial attach probe, then gone on the reconnect probe (models a session
-// that vanishes while attached — the reconnect ownership gate must fire onSessionGone).
 function mockSessionGone(runner: ReturnType<typeof mockRunner>): void {
   let probes = 0;
   runner.exec.mockImplementation(async (cmd: string) => {
@@ -233,9 +229,6 @@ function stubGeometryHooks(overrides: Partial<StreamerGeometryHooks> = {}): Stre
     fullHolds: () => 0,
     acquireFullHold: () => () => undefined,
     readGeometry: async () => { throw new Error('no geometry in stub'); },
-    // Answer the attach-capability probe with a pre-3.2 tmux so hook-based tests
-    // stay off the flag/follow paths unless they opt in explicitly. The probe
-    // body is intentionally NOT started: admission-refused probes create nothing.
     raceProbe: (<T>(_start: () => ProbeHandle<T>) => Promise.resolve('tmux 3.0a\n' as T)) as StreamerGeometryHooks['raceProbe'],
     noteManualSeen: () => undefined,
     recordFullTarget: () => undefined,
@@ -396,6 +389,92 @@ describe('PaneStreamer', () => {
       }, { ptyFactory: factory, reattachDelayMs: 1000, random: () => 0 });
     });
 
+    it('reattaches when the new PTY exits during its post-attach handshake', async () => {
+      const ptys = makePtys(3);
+      const { factory, calls, expectAfter } = countingFactory(ptys);
+      let probes = 0;
+      let resolvePostAttach!: (result: ExecResult) => void;
+      let postAttachStarted!: () => void;
+      const postAttachStartedP = new Promise<void>((resolve) => { postAttachStarted = resolve; });
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('list-sessions')) return { stdout: '', stderr: '', exitCode: 0 };
+        probes++;
+        if (probes === 5) {
+          postAttachStarted();
+          return new Promise<ExecResult>((resolve) => { resolvePostAttach = resolve; });
+        }
+        return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+      });
+      await withTimerHarness(async () => {
+        ptys[0].emitExit(0);
+        await tick();
+        await vi.advanceTimersByTimeAsync(1000);
+        await postAttachStartedP;
+
+        ptys[1].emitExit(0);
+        await tick();
+        resolvePostAttach({ stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 });
+        await tick();
+
+        expect(calls()).toBe(2);
+        await expectAfter(1999, 2);
+        await expectAfter(1, 3);
+      }, { ptyFactory: factory, runner, reattachDelayMs: 1000, random: () => 0 });
+    });
+
+    it('reattaches when the new PTY exits during quarantine drain', async () => {
+      const ptys = makePtys(3);
+      const { factory, calls, expectAfter } = countingFactory(ptys);
+      let probes = 0;
+      let resolvePostAttach!: (result: ExecResult) => void;
+      let postAttachStarted!: () => void;
+      const postAttachStartedP = new Promise<void>((resolve) => { postAttachStarted = resolve; });
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('list-sessions')) return { stdout: '', stderr: '', exitCode: 0 };
+        probes++;
+        if (probes === 5) {
+          postAttachStarted();
+          return new Promise<ExecResult>((resolve) => { resolvePostAttach = resolve; });
+        }
+        return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+      });
+      await withTimerHarness(async ({ streamer }) => {
+        ptys[0].emitExit(0);
+        await tick();
+        await vi.advanceTimersByTimeAsync(1000);
+        await postAttachStartedP;
+
+        const terminal = (streamer as unknown as {
+          headless: { write(data: string, callback?: () => void): void };
+        }).headless;
+        const write = terminal.write.bind(terminal);
+        let releaseWrite!: () => void;
+        let writeStarted!: () => void;
+        const writeStartedP = new Promise<void>((resolve) => { writeStarted = resolve; });
+        terminal.write = (data, callback) => {
+          write(data, () => {
+            releaseWrite = () => callback?.();
+            writeStarted();
+          });
+        };
+
+        ptys[1].emitData('buffered');
+        resolvePostAttach({ stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 });
+        await vi.advanceTimersByTimeAsync(1);
+        await writeStartedP;
+        ptys[1].emitExit(0);
+        await tick();
+        releaseWrite();
+        await tick();
+
+        expect(calls()).toBe(2);
+        await expectAfter(1999, 2);
+        await expectAfter(1, 3);
+      }, { ptyFactory: factory, runner, reattachDelayMs: 1000, random: () => 0 });
+    });
+
     it('bounds the ownership probe with a timeout and does NOT spawn a PTY while the probe stays uncertain (fail-closed backoff)', async () => {
       const ptys = makePtys(3);
       const { factory, calls, expectAfter } = countingFactory(ptys);
@@ -405,8 +484,8 @@ describe('PaneStreamer', () => {
         if (cmd.includes('list-sessions')) {
           expect(options?.timeout).toBe(1234);
           probes += 1;
-          if (probes <= 2) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }; // initial attach + post-attach handshake: owned
-          throw new Error('probe timeout'); // reconnect probes: transport-uncertain
+          if (probes <= 2) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+          throw new Error('probe timeout');
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -418,7 +497,6 @@ describe('PaneStreamer', () => {
         expect(warnSpy).toHaveBeenCalledWith(
           '[pane-streamer] dev-1 attach failing; backing off retries: probe timeout',
         );
-        // Uncertain probe must NOT spawn a replacement PTY — it only backs off and re-probes.
         await expectAfter(1000, 1);
         await expectAfter(2000, 1);
       }, { ptyFactory: factory, runner, reattachDelayMs: 1000, sessionProbeTimeoutMs: 1234 });
@@ -445,8 +523,6 @@ describe('PaneStreamer', () => {
     });
 
     it('treats a REISSUED generation (server restart, same name AND same claim) as gone — not the original session', async () => {
-      // The canonical ABA: a new tmux server reuses the session name AND baxian re-adopts it (same
-      // claim), but the generation (pid/start_time) differs. It is NOT the session we pinned.
       const ptys = makePtys(2);
       const { factory, calls } = countingFactory(ptys);
       let probes = 0;
@@ -454,7 +530,6 @@ describe('PaneStreamer', () => {
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('list-sessions')) {
           probes += 1;
-          // probe 1 (initial attach) pins pid 4242; probe 2 (reconnect) is a fresh server pid 9999.
           const pid = probes <= 2 ? '4242' : '9999';
           return { stdout: `${pid}|1700000000|$1|dev-1\n`, stderr: '', exitCode: 0 };
         }
@@ -468,13 +543,11 @@ describe('PaneStreamer', () => {
       ptys[0].emitExit(0);
       await tick();
       expect(gone).toBe(1);
-      expect(calls()).toBe(1); // never reattached into the reissued generation
+      expect(calls()).toBe(1);
       expect(streamer.isDestroyed()).toBe(true);
     });
 
     it('treats a fresh servers same-name FOREIGN session as gone on reconnect (does not reattach into it)', async () => {
-      // Initial attach: our claim. Reconnect probe: same name but a DIFFERENT claim (a new tmux server
-      // reissued the name to another agent's session) — must be treated as gone, never reattached into.
       const ptys = makePtys(2);
       const { factory, calls } = countingFactory(ptys);
       let probes = 0;
@@ -495,7 +568,7 @@ describe('PaneStreamer', () => {
       ptys[0].emitExit(0);
       await tick();
       expect(gone).toBe(1);
-      expect(calls()).toBe(1); // never reattached into the foreign session
+      expect(calls()).toBe(1);
       expect(streamer.isDestroyed()).toBe(true);
     });
 
@@ -534,10 +607,9 @@ describe('PaneStreamer', () => {
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('list-sessions')) {
           probes += 1;
-          // probes 1-2 = initial attach + post-attach handshake (owned); probe 3 = the delayed reconnect probe.
           if (probes <= 2) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
           probeStarted();
-          return new Promise<ExecResult>((resolve) => { resolveProbe = resolve; }); // reconnect probe: delayed
+          return new Promise<ExecResult>((resolve) => { resolveProbe = resolve; });
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -547,21 +619,17 @@ describe('PaneStreamer', () => {
 
       ptys[0].emitExit(0);
       await probeStartedPromise;
-      // The reconnect probe is still pending: no replacement PTY is spawned into an unverified session.
       expect(calls()).toBe(1);
 
-      resolveProbe({ stdout: '', stderr: '', exitCode: 0 }); // no matching session → gone/foreign
+      resolveProbe({ stdout: '', stderr: '', exitCode: 0 });
       await tick();
 
       expect(streamer.isDestroyed()).toBe(true);
-      expect(calls()).toBe(1); // never reattached
+      expect(calls()).toBe(1);
       expect(_sessionGoneCalls).toBe(1);
     });
 
     it('post-attach handshake tears down before Web I/O when the connected session is a reissued generation', async () => {
-      // probe→restart→same-name→attach: a server restart lands between the guard probe and attach-session,
-      // so the PTY connects to a fresh-server successor. The post-attach handshake (probe 2) must catch the
-      // new generation and tear down BEFORE any data is broadcast, rather than stream a foreign session.
       const ptys = makePtys(2);
       const { factory, calls } = countingFactory(ptys);
       let probes = 0;
@@ -569,7 +637,7 @@ describe('PaneStreamer', () => {
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('list-sessions')) {
           probes += 1;
-          const pid = probes === 1 ? '4242' : '9999'; // probe 1 pins 4242; post-attach handshake sees fresh 9999
+          const pid = probes === 1 ? '4242' : '9999';
           return { stdout: `${pid}|1700000000|$1|dev-1\n`, stderr: '', exitCode: 0 };
         }
         return { stdout: '', stderr: '', exitCode: 0 };
@@ -578,7 +646,7 @@ describe('PaneStreamer', () => {
 
       await expect(streamer.subscribeAtomic(cbs)).rejects.toThrow(/destroyed/i);
       expect(streamer.isDestroyed()).toBe(true);
-      expect(calls()).toBe(1); // the attach PTY was spawned then killed; the foreign session was never streamed
+      expect(calls()).toBe(1);
     });
 
     it('post-attach handshake fails closed on an uncertain probe: tears down the PTY, never streams unverified', async () => {
@@ -589,8 +657,8 @@ describe('PaneStreamer', () => {
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('list-sessions')) {
           probes += 1;
-          if (probes === 1) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }; // pre-attach: owned
-          throw new Error('probe timeout'); // post-attach handshake: transport-uncertain
+          if (probes === 1) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+          throw new Error('probe timeout');
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -598,7 +666,6 @@ describe('PaneStreamer', () => {
       const { streamer } = makeStreamer({ ptyFactory: factory, runner, reattachDelayMs: 100_000 });
       await streamer.subscribeAtomic({ onLive: (d) => live.push(d), onSessionGone: () => undefined });
 
-      // The uncertain post-attach probe tore the just-attached PTY down (fail closed); nothing was streamed.
       expect(ptys[0].killCalled).toBeGreaterThanOrEqual(1);
       expect(live).toEqual([]);
       streamer.destroy();
@@ -615,9 +682,9 @@ describe('PaneStreamer', () => {
       runner.exec.mockImplementation(async (cmd: string) => {
         if (cmd.includes('list-sessions')) {
           probes += 1;
-          if (probes === 1) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }; // pre-attach: owned
+          if (probes === 1) return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
           postAttachStarted();
-          return new Promise<ExecResult>((resolve) => { resolvePostAttach = resolve; }); // post-attach: delayed
+          return new Promise<ExecResult>((resolve) => { resolvePostAttach = resolve; });
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       });
@@ -625,15 +692,15 @@ describe('PaneStreamer', () => {
       const { streamer } = makeStreamer({ ptyFactory: factory, runner });
       const subP = streamer.subscribeAtomic({ onLive: (d) => live.push(d), onSessionGone: () => undefined }).catch(() => undefined);
 
-      await postAttachStartedP; // PTY attached + onData wired; handshake pending
+      await postAttachStartedP;
       ptys[0].emitData('unverified-foreign-bytes');
       await tick();
-      expect(live).toEqual([]); // quarantined, not broadcast while unverified
+      expect(live).toEqual([]);
 
-      resolvePostAttach({ stdout: '9999|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 }); // fresh server → foreign
+      resolvePostAttach({ stdout: '9999|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 });
       await subP;
       await tick();
-      expect(live).toEqual([]); // the unverified bytes were discarded, never streamed
+      expect(live).toEqual([]);
       expect(streamer.isDestroyed()).toBe(true);
     });
   });
@@ -1199,7 +1266,6 @@ describe('spawn geometry baseline', () => {
     });
     const made = makeStreamer({ ptyFactory: factory, geometry: hooks });
     const result = await made.streamer.subscribeAtomic(cbs);
-    // subscribeAtomic snapshot is taken after spawn: already at the aligned size.
     expect(result.snapshot.cols).toBe(100);
     expect(result.snapshot.rows).toBe(31);
     expect(attachSizes[0]).toEqual({ cols: 100, rows: 31 });
@@ -1241,6 +1307,128 @@ describe('spawn geometry baseline', () => {
       made.streamer._waitForChainDrain();
       await vi.advanceTimersByTimeAsync(1);
       expect(refreshes.at(-1)).toEqual({ cols: 120, rows: 31 });
+      made.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drains old data before a reattach baseline resize', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      let width = 80;
+      const attachPtys = [createFakePty(), createFakePty()];
+      let attaches = 0;
+      const factory: PtyFactory = () => attachPtys[attaches++];
+      const hooks = stubGeometryHooks({
+        raceProbe: probeAnswer('tmux 3.6a\n'),
+        readGeometry: async () => GEOM(width, 23),
+      });
+      const made = makeStreamer({
+        ptyFactory: factory,
+        geometry: hooks,
+        initialCols: 80,
+        initialRows: 24,
+        reattachDelayMs: 1000,
+      });
+      const seen: Array<{ visible: string; cols: number }> = [];
+      await made.streamer.subscribeAtomic({
+        onVisible: (visible) => seen.push({ visible, cols: made.streamer.size.cols }),
+        onSessionGone: () => undefined,
+      });
+
+      const terminal = (made.streamer as unknown as {
+        headless: { write(data: string, callback?: () => void): void };
+      }).headless;
+      const write = terminal.write.bind(terminal);
+      let releaseWrite: (() => void) | undefined;
+      terminal.write = (data, callback) => {
+        write(data, () => { releaseWrite = callback; });
+      };
+
+      attachPtys[0].emitData('\x1b[74G[bx:pr-\x1b[2;1Hfixed:tok123abc]');
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(releaseWrite).toBeTypeOf('function');
+
+      width = 20;
+      attachPtys[0].emitExit();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(attaches).toBe(1);
+      expect(made.streamer.size.cols).toBe(80);
+
+      releaseWrite?.();
+      await vi.advanceTimersByTimeAsync(1);
+      await made.streamer._waitForChainDrain();
+
+      expect(attaches).toBe(2);
+      expect(made.streamer.size.cols).toBe(20);
+      expect(seen).toEqual([{ visible: '[bx:pr-fixed:tok123abc]', cols: 80 }]);
+      made.streamer.destroy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drains quarantined reattach output before follow can change geometry', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    try {
+      let width = 20;
+      const attachPtys = [createFakePty(), createFakePty()];
+      let attaches = 0;
+      const factory: PtyFactory = () => attachPtys[attaches++];
+      let probes = 0;
+      let resolvePostAttach: ((result: ExecResult) => void) | undefined;
+      let postAttachStarted!: () => void;
+      const postAttachStartedP = new Promise<void>((resolve) => { postAttachStarted = resolve; });
+      const runner = mockRunner();
+      runner.exec.mockImplementation(async (cmd: string) => {
+        if (!cmd.includes('list-sessions')) return { stdout: '', stderr: '', exitCode: 0 };
+        probes++;
+        if (probes === 5) {
+          postAttachStarted();
+          return new Promise<ExecResult>((resolve) => { resolvePostAttach = resolve; });
+        }
+        return { stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 };
+      });
+      const hooks = stubGeometryHooks({
+        raceProbe: probeAnswer('tmux 3.6a\n'),
+        readGeometry: async () => GEOM(width, 23),
+      });
+      const made = makeStreamer({
+        ptyFactory: factory,
+        runner,
+        geometry: hooks,
+        initialCols: 20,
+        initialRows: 24,
+        reattachDelayMs: 1000,
+        windowFollowIntervalMs: 200,
+      });
+      const seen: string[] = [];
+      await made.streamer.subscribeAtomic({
+        onVisible: (visible) => seen.push(visible),
+        onSessionGone: () => undefined,
+      });
+
+      attachPtys[0].emitExit();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
+      await postAttachStartedP;
+
+      attachPtys[1].emitData('\x1b[74G[bx:pr-\x1b[2;1Hfixed:tok123abc]');
+      width = 80;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(made.streamer.size.cols).toBe(20);
+
+      resolvePostAttach?.({ stdout: '4242|1700000000|$1|dev-1\n', stderr: '', exitCode: 0 });
+      await vi.advanceTimersByTimeAsync(1);
+      await made.streamer._waitForChainDrain();
+      expect(seen.join('')).toContain('[bx:pr-\x00fixed:tok123abc]');
+
+      await vi.advanceTimersByTimeAsync(250);
+      expect(made.streamer.size.cols).toBe(80);
       made.streamer.destroy();
     } finally {
       vi.useRealTimers();
@@ -1456,7 +1644,6 @@ describe('viewport follow tick', () => {
       let release: (() => void) | null = null;
       const h = await followHarness({
         geom: () => {
-          // The spawn baseline read must complete or subscribe never returns.
           if (!baselineDone) {
             baselineDone = true;
             return Promise.resolve(GEOM(100, 30));
@@ -1539,19 +1726,17 @@ describe('PaneStreamer visible-text stream', () => {
     streamer.destroy();
   });
 
-  // The reason the decoder lives here and not on each subscription: subscribeAtomic can
-  // only join at a PTY chunk boundary, which is not necessarily a Ground boundary.
   it('keeps a control string opened BEFORE the subscription open for the new subscriber', async () => {
     const { streamer, fakePty } = makeStreamer();
     await streamer.subscribeAtomic(NOOP_CBS);
 
-    fakePty.emitData(`${ESC}]0;title-start`); // unterminated OSC, no marker yet
+    fakePty.emitData(`${ESC}]0;title-start`);
     await flush(streamer);
 
     const { cbs: lateCbs, seen } = visibleSub();
     await streamer.subscribeAtomic(lateCbs);
 
-    fakePty.emitData(`${MARKER}${BEL}`); // payload still inside the OSC the terminal hides
+    fakePty.emitData(`${MARKER}${BEL}`);
     await flush(streamer);
     expect(seen.map(s => s.visible).join('')).toBe('');
 
@@ -1586,6 +1771,50 @@ describe('PaneStreamer visible-text stream', () => {
       await flush(streamer);
     }
     expect(seen.map(s => s.visible).join('')).toBe('tail');
+    streamer.destroy();
+  });
+
+  it('keeps the decoder on pane geometry and fences adjacency across resize', async () => {
+    const { streamer, fakePty } = makeStreamer({ initialCols: 20, initialRows: 10 });
+    const { cbs: visCbs, seen } = visibleSub();
+    await streamer.subscribeAtomic(visCbs);
+
+    fakePty.emitData(`${ESC}[19G[bx:pr-${ESC}[2;6Hfixed:tok123abc]`);
+    await flush(streamer);
+    expect(seen.map(s => s.visible).join('')).toBe(MARKER);
+
+    seen.length = 0;
+    fakePty.emitData(`${ESC}[10;1H[bx:pr-${ESC}[Bfixed:tok123abc]`);
+    await flush(streamer);
+    expect(seen.map(s => s.visible).join('')).toContain(MARKER);
+
+    seen.length = 0;
+    fakePty.emitData('[bx:pr-');
+    await flush(streamer);
+    await streamer.resize(30, 10);
+    fakePty.emitData('fixed:tok123abc]');
+    await flush(streamer);
+    expect(seen.map(s => s.visible).join('')).toContain('[bx:pr-\x00fixed:tok123abc]');
+    streamer.destroy();
+  });
+
+  it('serializes resize behind data already handed to the terminal parser', async () => {
+    const { streamer, fakePty } = makeStreamer({ initialCols: 80, initialRows: 24 });
+    const seen: Array<{ visible: string; cols: number }> = [];
+    await streamer.subscribeAtomic({
+      onVisible: (visible) => { seen.push({ visible, cols: streamer.size.cols }); },
+      onSessionGone: () => undefined,
+    });
+
+    fakePty.emitData(`${ESC}[74G[bx:pr-${ESC}[2;1Hfixed:tok123abc]`);
+    await Promise.resolve();
+    const resize = streamer.resize(20, 24);
+    expect(streamer.size.cols).toBe(80);
+    await resize;
+    await flush(streamer);
+
+    expect(seen).toEqual([{ visible: MARKER, cols: 80 }]);
+    expect(streamer.size).toEqual({ cols: 20, rows: 24 });
     streamer.destroy();
   });
 

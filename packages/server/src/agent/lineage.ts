@@ -29,11 +29,6 @@ export async function findForeignTaskTip(
   if (exclusive.size === 0) return null;
 
   for (const candidate of candidates) {
-    // Compare against the candidate's whole base..tip chain, not just its tip:
-    // after contaminating us the foreign branch may advance further, moving its
-    // tip out of our history while the shared commits remain embedded.
-    // Both refs are probed independently: the local branch may hold unpushed
-    // work, while the remote-tracking ref may contain commits fetched later.
     const refs = [
       `refs/heads/${candidate.branch}`,
       `refs/remotes/origin/${candidate.branch}`,
@@ -48,10 +43,6 @@ export async function findForeignTaskTip(
         .map(line => line.trim())
         .find(line => line !== '' && exclusive.has(line));
       if (!sha) continue;
-      // Shared commits with a candidate that forked FROM this branch are this
-      // branch's own work carried downstream, not foreign work embedded here —
-      // the contamination victim must stay publishable. Diverged shapes
-      // (neither contains the other) stay flagged: ownership is undecidable.
       const downstream = await exec(
         `git -C ${shellQuote(workdir)} merge-base --is-ancestor HEAD ${shellQuote(ref)}`,
       );

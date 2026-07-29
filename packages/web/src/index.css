@@ -45,14 +45,11 @@
     line-height: 1.55;
     -webkit-font-smoothing: antialiased;
     text-rendering: geometricprecision;
-    /* Stop iOS from auto-inflating body text when rotated to landscape. */
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
   }
 }
 
-/* iOS Safari zooms the viewport when focusing a control whose font-size < 16px.
-   Pin form controls to 16px on touch devices so tapping a field never zooms. */
 @media (pointer: coarse) {
   input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="file"]),
   select,
@@ -109,7 +106,6 @@
   .pill-idle::before {
     @apply bg-og-200;
   }
-  /* Stale = hollow outline, not opacity: dimming the whole pill drops text contrast below WCAG AA. */
   .pill--stale {
     @apply border border-dashed border-current bg-transparent;
   }
@@ -130,7 +126,6 @@
 }
 
 @layer utilities {
-  /* Single-line rows that must not wrap degrade to horizontal scroll; hide the bar so it stays clean. */
   .scrollbar-none {
     -ms-overflow-style: none;
     scrollbar-width: none;

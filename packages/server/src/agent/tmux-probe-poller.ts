@@ -306,7 +306,6 @@ export class TmuxProbePoller {
     const presentProbe = result.tmuxSessionStatus === 'present' && tmux
       ? await this.observePresentSession(agent, tmux, now)
       : {};
-    // present hasSession() but no owned pane (undefined) = foreign/gone name reuse; publish absent so reconcile runs, not a stale present.
     const effectiveStatus: TmuxSessionStatus =
       result.tmuxSessionStatus === 'present' && presentProbe === undefined
         ? 'absent'
@@ -340,15 +339,11 @@ export class TmuxProbePoller {
     occurredAt: string,
   ): Promise<Partial<TmuxSessionObservation> | undefined> {
     try {
-      // Resolve the pane by generation+claim, not by name: a fresh server can reissue the
-      // session name to a foreign session, and polling it would read someone else's pane.
-      // A missing timeout lets a stuck remote list-sessions pin the poller worker indefinitely.
       const snapshot = await tmux.getSessionSnapshot(agent.id, { timeout: this.probeTimeoutMs });
       if (!snapshot || snapshot.claim !== agent.id) return undefined;
       const pane = await tmux.getSinglePaneByRef(snapshot.ref, agent.id, { timeout: this.probeTimeoutMs });
       const paneState = await tmux.classifyPaneForAdopt(pane, agent.runtime, { timeout: this.probeTimeoutMs });
       const liveRuntime = paneState.kind === 'live-runtime';
-      // the four reads only depend on the pane — run the round-trips concurrently
       const [runtimeScreen, currentTaskId, oscTitle, paneWidth] = liveRuntime
         ? await Promise.all([
             tmux.capturePaneById(pane, {
@@ -376,11 +371,9 @@ export class TmuxProbePoller {
         if (!prev || prev.taskId !== currentTaskId) {
           this.lastScreen.set(agent.id, { hash, changedAt: this.now(), taskId: currentTaskId, idle: idleNow, width: paneWidth });
         } else if (prev.hash !== hash) {
-          // A viewer resize reflows an idle pane (pane_width changes) — that is not runtime activity; real output keeps the same width. Only a width-changing idle→idle reflow keeps the idle-grace clock.
           const cosmeticIdleReflow = idleNow && prev.idle && prev.width > 0 && paneWidth > 0 && prev.width !== paneWidth;
           this.lastScreen.set(agent.id, { hash, changedAt: cosmeticIdleReflow ? prev.changedAt : this.now(), taskId: currentTaskId, idle: idleNow, width: paneWidth });
         } else if (prev.width !== paneWidth) {
-          // Hash unchanged but pane_width changed (a resize that did not alter a short capture) — sync the cached width so the next real output compares against the current width, not a stale pre-resize one.
           this.lastScreen.set(agent.id, { ...prev, width: paneWidth });
         }
       } else {

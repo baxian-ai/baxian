@@ -2,32 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { BaxianConfig } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import { AgentManager } from '../../src/agent/manager.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
+import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxManager, ReplNotReadyError } from '../../src/agent/tmux.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'user/repo',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/repo-qa' },
-    ]],
-  }],
-};
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
 
 const CODEX_IDLE = '› \n\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
 const CODEX_BUSY = '• Working (12s)\n  esc to interrupt\n  gpt-5.5 xhigh · ~/repo\n  permissions: YOLO mode\n';
@@ -56,20 +34,14 @@ function mockFrames(frames: string[], opts: { cycle?: boolean } = {}): ReturnTyp
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-debounce-'));
-  await initStateDir(tempDir);
-  const noopRunner: CommandRunner = {
-    exec: vi.fn(async (): Promise<ExecResult> => ({ stdout: '', stderr: '', exitCode: 0 })),
-    writeFile: vi.fn(async (): Promise<void> => undefined),
-  };
-  manager = new AgentManager({
-    config: CONFIG,
-    agentStore: new AgentStore(join(tempDir, 'state', 'agents')),
-    taskStore: new TaskStore(join(tempDir, 'state', 'tasks')),
-    lockManager: new LockManager(join(tempDir, 'locks')),
-    eventBus: new EventBus(new EventLog(join(tempDir, 'events'))),
-    skillRegistry: new SkillRegistry(join(tempDir, 'skills')),
-    runnerFactory: () => noopRunner,
+  const runner = fakeRunner({ defaultResult: {} });
+  const harness = await createManagerHarness(tempDir, {
+    deps: {
+      runnerFactory: () => runner,
+      platformRunner: runner,
+    },
   });
+  manager = harness.manager;
   Object.assign(manager, {
     compactIdlePollMs: 1,
     readyStableSpacingMs: 1,
@@ -77,7 +49,7 @@ beforeEach(async () => {
     dispatchAckTimeoutMs: 30,
     dispatchSettleTimeoutMs: 30,
   });
-  tmux = new TmuxManager(noopRunner);
+  tmux = new TmuxManager(runner);
   vi.spyOn(TmuxManager.prototype, 'displayMessage').mockResolvedValue('node');
   vi.spyOn(TmuxManager.prototype, 'readPaneTitle').mockResolvedValue('');
 });
@@ -105,7 +77,7 @@ describe('waitForReplPromptReady stableIdle 去抖', () => {
     expect(spy.mock.calls.length).toBe(3);
   });
 
-  it('非 stableIdle 分支的忙碌超时同样抛类型化 ReplNotReadyError（#563 R45）', async () => {
+  it('非 stableIdle 分支的忙碌超时同样抛类型化 ReplNotReadyError', async () => {
     mockFrames([CODEX_BUSY], { cycle: true });
     await expect(waitReady(30)).rejects.toBeInstanceOf(ReplNotReadyError);
   });
@@ -128,7 +100,7 @@ describe('waitForReplPromptReady stableIdle 去抖', () => {
   });
 });
 
-describe('任务边界注入前的稳定就绪门（task-209 回归）', () => {
+describe('任务边界注入前的稳定就绪门', () => {
   it('假 idle 帧不放行 /clear：就绪未确证前不发送任何按键', async () => {
     mockFrames([CODEX_BUSY, CODEX_IDLE, CODEX_BUSY, CODEX_IDLE], { cycle: true });
     const clearDraft = vi.spyOn(TmuxManager.prototype, 'clearComposerDraft').mockResolvedValue(undefined);

@@ -28,8 +28,6 @@ const PANE: PaneRef = {
   claim: 'dev-1',
 };
 
-// guardedPaneRead marker-first protocol: first stdout line carries BX_PANE_OK + header format,
-// subsequent lines are the body (capture-pane output).
 const okHeader = (value: string): string => `BX_PANE_OK${value}\n`;
 const okBody = (content: string): string => `BX_PANE_OK\n${content}`;
 const composeSnapStdout = (visible: string, history: string | number): string =>
@@ -487,7 +485,6 @@ describe('TmuxManager', () => {
       ['exit 255 (ssh layer) — does not silently report absence', 'ssh: timeout', 255, /outcome unknown/],
       ['unexpected exit (not absence-classified)', 'permission denied', 7, /unexpected exit 7/],
       ['exit=1 with empty stderr (do NOT silently treat as absent)', '', 1, /unexpected exit 1/],
-      // exit 1 + an absence marker AND an INDEPENDENT transient (not the socket-absence) → unknown, not absent.
       ['exit 1 with mixed absence + independent transient', "can't find session: dev\nconnection reset by peer", 1, /outcome unknown/],
     ])('throws on %s', async (_label, stderr, exitCode, pattern) => {
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr, exitCode });
@@ -677,7 +674,6 @@ describe('TmuxManager', () => {
 
     it('loads via probe-gated stdin (no openssl), then a separate guarded paste', async () => {
       await tmux.injectPrompt(PANE, 'hello world', 'dev-1');
-      // step 1: load via execWithStdin (raw bytes on stdin, no openssl/base64)
       const stdin = stdinMock(runner);
       expect(stdin).toHaveBeenCalledTimes(1);
       const loadCmd = stdin.mock.calls[0][0] as string;
@@ -686,7 +682,6 @@ describe('TmuxManager', () => {
       expect(loadCmd).toContain('tmux load-buffer');
       expect(loadCmd).toContain('[ "$(tmux display-message -p -t ');
       expect(payload.toString('utf8')).toBe('hello world');
-      // step 2: paste via exec — the claim-checked if-shell with self-clean else branch
       expect(runner.exec).toHaveBeenCalledTimes(1);
       const pasteCmd = lastCmd(runner);
       expect(pasteCmd).toContain("tmux if-shell -t '%7'");
@@ -708,7 +703,6 @@ describe('TmuxManager', () => {
     it('throws PaneGoneError when the identity probe fails before load (no buffer, no reconcile)', async () => {
       stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 1 });
       await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/before any buffer was created/);
-      // no paste and no reconcile: nothing was loaded
       expect(runner.exec).not.toHaveBeenCalled();
     });
 
@@ -720,11 +714,9 @@ describe('TmuxManager', () => {
 
     it('reconciles the loaded buffer by unique name when the pane vanishes AFTER load (exit 1 can\'t find pane)', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      // load succeeds (execWithStdin default), paste fails with a pane-gone error → buffer lingers
       runner.exec.mockResolvedValueOnce({ stdout: '', stderr: "can't find pane: %7", exitCode: 1 });
       primeExec('');
       await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(PaneGoneError);
-      // 2 exec calls: the failed paste + the by-name delete-buffer reconciliation
       expect(runner.exec).toHaveBeenCalledTimes(2);
       const deleteCmd = lastCmd(runner);
       expect(deleteCmd).toContain('tmux delete-buffer -b');
@@ -737,7 +729,6 @@ describe('TmuxManager', () => {
       stdinMock(runner).mockResolvedValueOnce({ stdout: '', stderr: 'client_loop: send disconnect: Broken pipe', exitCode: 255 });
       primeExec('');
       await expect(tmux.injectPrompt(PANE, 'x', 'dev-1')).rejects.toThrow(/load outcome unknown/);
-      // reconcile delete-buffer issued via exec even though the load exec was unknown
       expect(runner.exec).toHaveBeenCalledTimes(1);
       expect(lastCmd(runner)).toContain('tmux delete-buffer -b');
       warn.mockRestore();
@@ -765,7 +756,6 @@ describe('TmuxManager', () => {
       expect(buf).toMatch(/^baxian-dev-1-[0-9a-f-]{36}$/);
       await tmux.pasteStagedBuffer('%0', buf);
 
-      // load via execWithStdin (raw stdin, no openssl); paste via exec
       const stdin = stdinMock(runner);
       expect(stdin).toHaveBeenCalledTimes(1);
       const loadCmd = stdin.mock.calls[0][0] as string;
@@ -922,7 +912,6 @@ describe('TmuxManager', () => {
         stderr: '',
         exitCode: 0,
       }));
-      // Decouple the OSC title from runner.exec so tests overriding runner.exec for snapshot content can't leak into pane_title reads.
       vi.spyOn(tmux, 'readPaneTitle').mockImplementation(async () => titleFrames.shift() ?? paneTitle);
     });
     const primeSnapshot = (visible: string, history: number): void => {
@@ -942,23 +931,23 @@ describe('TmuxManager', () => {
 
     it('acks via the OSC-title working spinner when in-pane content stays unrecognized-as-busy (narrow/wrapped pane)', async () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
-      primeTitle('~/repo');        // baseline: idle title
-      primeTitle('⠹ Reviewing');   // OSC spinner appears once the runtime starts working
+      primeTitle('~/repo');
+      primeTitle('⠹ Reviewing');
       await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50 }))
         .resolves.toBeUndefined();
     });
 
     it('rejects (busy baseline) when the pane is ALREADY working at entry — a spinner refresh is not a fresh ack', async () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
-      primeTitle('⠹ Reviewing');   // already working at entry (a prior turn; narrow pane hid the in-pane busy line)
-      primeTitle('⠸ Reviewing');   // spinner rotates — must NOT be read as this prompt's idle→working ack
+      primeTitle('⠹ Reviewing');
+      primeTitle('⠸ Reviewing');
       await expect(tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 200, intervalMs: 50 }))
         .rejects.toThrow(/pane already busy at baseline/);
     });
 
     it('honors a caller-provided PRE-Enter baseline title: a title already working on the first post-submit read still acks', async () => {
       const baseline = buildBaseline('› Run /review\n  gpt-5.5 xhigh · ~/repo\n', 0);
-      primeTitle('⠹ Reviewing'); // runtime flipped the OSC title to working immediately after Enter — the first read the loop sees
+      primeTitle('⠹ Reviewing');
       await expect(
         tmux.waitSubmitAck(PANE, baseline, 'codex', { timeoutMs: 1500, intervalMs: 50, baselineTitle: '~/repo' }),
       ).resolves.toBeUndefined();
@@ -2070,8 +2059,6 @@ describe('hasRuntimeReadyView', () => {
     expect(hasRuntimeReadyView('△ Permission required\n  Allow once   Reject\n  ctrl+p commands\n', 'opencode')).toBe(false);
   });
 
-  // every qodercli.json confirmation_blocker phrase must also block the ready gate, even
-  // when the idle composer placeholder is still on screen.
   it.each([
     'Permission Required',
     'Allow this command to run?',
@@ -2114,11 +2101,6 @@ describe('runtimeBusyCheck (opencode/qodercli screen-only busy)', () => {
   });
 });
 
-
-// ————— 真实截屏 fixture（issue #475 探针，tmux 200×50 底部窗口，spec 附录 A）—————
-// 非 YOLO（无 bypass 旗标）与 YOLO fresh 屏的就绪/忙碌几何回归：
-// opencode 垂直居中、qodercli 顶部锚定，标记与窗口底部之间隔着空行海；
-// claude-code 空 composer 行是 ❯ + no-break space。
 const blank = (n: number): string[] => Array(n).fill('');
 
 const CC_NONYOLO_IDLE = [
@@ -2313,7 +2295,7 @@ const QODER_NONYOLO_SHELL_PERMISSION = [
   "    4. No",
   ...blank(20),
 ].join('\n');
-describe('non-yolo & fresh-screen geometry (real captures, issue #475)', () => {
+describe('non-yolo & fresh-screen geometry (real captures)', () => {
   it.each([
     ['claude-code non-yolo idle (❯ + NBSP composer)', CC_NONYOLO_IDLE, 'claude-code'],
     ['codex non-yolo idle (generic footer anchor)', CODEX_NONYOLO_IDLE, 'codex'],
@@ -2335,7 +2317,6 @@ describe('non-yolo & fresh-screen geometry (real captures, issue #475)', () => {
     expect(hasRuntimeReadyView(screen, runtime)).toBe(false);
   });
 
-  // 按实测 fresh 屏几何构造：busy 标记与底部之间同样隔着空行海
   it('opencode: busy bar above the blank sea is still busy', () => {
     const screen = ['  ┃  ■■■■⬝⬝⬝⬝  esc interrupt', ...blank(12), '  /w  1.17.17'].join('\n');
     expect(runtimeBusyCheck(screen, 'opencode')).toBe(true);

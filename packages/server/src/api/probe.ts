@@ -205,7 +205,6 @@ export async function probeRoutes(app: FastifyInstance, options: ProbeRoutesOpti
       }
     }
 
-    // 同一目标机器的并发安装合并为一次执行：重复点击 / 前端超时重试都只跑一个安装进程
     const key = installKey(host);
     let pending = inflightInstalls.get(key);
     if (!pending) {

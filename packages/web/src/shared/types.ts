@@ -243,9 +243,7 @@ export interface PrReviewConversation {
   prUrl?: string;
   items: PrReviewItem[];
   error?: string;
-  // 平台限流：展示端必须遵循平台退避，不得按秒级重试
   rateLimited?: boolean;
-  // 聚合超出预算，时间线只含前若干条
   truncated?: boolean;
 }
 

@@ -76,7 +76,6 @@ function resolveBranch(branch: Branch, cmd: string): ExecResult | Promise<ExecRe
   return typeof branch === 'function' ? branch(cmd) : branch;
 }
 
-// Fixtures stay raw pane content; the mock speaks the guarded-read marker protocol (tmux.ts guardedPaneRead).
 async function markerHeader(branch: Branch, cmd: string): Promise<ExecResult> {
   const result = await resolveBranch(branch, cmd);
   return { ...result, stdout: `${PANE_OK}${result.stdout}` };
@@ -360,12 +359,12 @@ describe('TmuxProbePoller', () => {
     });
 
     it('a viewer resize (idle→idle reflow at a NEW pane width) does NOT reset the PENDING_IDLE grace', async () => {
-      const idleReflowed: ExecResult = text('done\n❯ '); // reflowed idle composer (still visibleIdle)
+      const idleReflowed: ExecResult = text('done\n❯ ');
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({
           capturePane: scripted([idleCapture, idleCapture, idleReflowed]),
-          paneWidth: scripted([text('80'), text('80'), text('120')]), // resize on the 3rd poll
+          paneWidth: scripted([text('80'), text('80'), text('120')]),
         }),
         steps: [{}, { advance: FIVE_MIN + 1 }, {}],
         expectMatch: { runtimeStatusHint: 'pending', reason: 'PENDING_IDLE' },
@@ -373,12 +372,12 @@ describe('TmuxProbePoller', () => {
     });
 
     it('real output that returns to an idle prompt at the SAME width DOES reset the grace', async () => {
-      const idleAfterOutput: ExecResult = text('ran tests\nAll green\n❯ '); // new output, back to idle, no resize
+      const idleAfterOutput: ExecResult = text('ran tests\nAll green\n❯ ');
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({
           capturePane: scripted([idleCapture, idleCapture, idleAfterOutput]),
-          paneWidth: text('80'), // width unchanged throughout
+          paneWidth: text('80'),
         }),
         steps: [{}, { advance: FIVE_MIN + 1 }, {}],
         expectClear: true,
@@ -390,7 +389,6 @@ describe('TmuxProbePoller', () => {
       await runProbeScenario({
         binding: { taskId: 'task-001' },
         exec: makeExec({
-          // poll3: resize 80→120 but the bare `❯ ` capture is byte-identical; poll4: real output at 120
           capturePane: scripted([idleCapture, idleCapture, idleCapture, idleAfterOutput]),
           paneWidth: scripted([text('80'), text('80'), text('120'), text('120')]),
         }),
@@ -768,8 +766,6 @@ describe('TmuxProbePoller', () => {
     expect(boundedCalls.length).toBeGreaterThanOrEqual(6);
     expect(boundedCalls.every(t => t === 123)).toBe(true);
     expect(maxActive).toBe(2);
-    // Every step of the snapshot→pane chain must be bounded, else a stuck remote list-sessions /
-    // list-panes pins the poller worker. Assert both probes carry the deadline.
     const listSessions = calls.find(c => c.cmd.includes('list-sessions'));
     expect(listSessions?.timeout).toBe(123);
     const listPanes = calls.find(c => c.cmd.includes('list-panes'));
@@ -1137,11 +1133,6 @@ describe('TmuxSessionStatusStore onChange', () => {
 
 describe('TmuxProbePoller triggers reconcileFailedAgent on absent', () => {
   it('calls reconcileFailedAgent on absent and on present-but-foreign, not on healthy/unreachable', async () => {
-    // dev-1 healthy present (owned snapshot + live pane) → no reconcile
-    // dev-2 absent (has-session can't find the session) → reconcile
-    // dev-3 unreachable (ssh dead, exit 255) → no reconcile
-    // dev-4 has-session present but empty snapshot (session vanished between probes) → reconcile
-    // dev-5 has-session present but foreign claim (fresh server reissued the name) → reconcile
     const agents = ['dev-1', 'dev-2', 'dev-3', 'dev-4', 'dev-5'].map(makeAgent);
     const cfg = makeConfig(agents);
     const calls: string[] = [];

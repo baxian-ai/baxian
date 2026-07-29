@@ -36,9 +36,6 @@ export interface ProbeHandle<T> {
   onDeadline: () => void;
 }
 
-// Injected by PaneStreamerManager: owner state, admission-capped geometry reads,
-// and the per-agent geometry chain all live at manager level so they survive
-// streamer idle-destroy and instance replacement.
 export interface StreamerGeometryHooks {
   fullHolds(): number;
   acquireFullHold(): () => void;
@@ -69,7 +66,6 @@ export interface GetSnapshotResult {
 export interface SubscriberCallbacks {
   onLive?: (data: string, seq: number) => void;
   onSessionGone: () => void;
-  // Decoded off the same stream headless sees — a subscription can start mid control string.
   onVisible?: (visible: string, seq: number) => void;
   onSnapshotRefresh?: (snapshot: { cols: number; rows: number; data: string }, seq: number) => void;
 }
@@ -98,8 +94,6 @@ const DEFAULT_ROWS = 50;
 const DEFAULT_FOLLOW_INTERVAL_MS = 1500;
 const MIN_FOLLOW_INTERVAL_MS = 200;
 
-// The follow interval has no disable value: the owner reconciler shares this
-// cadence and must never be configured off (invariant 6).
 export function normalizeFollowIntervalMs(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value) || value <= 0) return DEFAULT_FOLLOW_INTERVAL_MS;
   return Math.min(Math.max(Math.trunc(value), MIN_FOLLOW_INTERVAL_MS), MAX_TIMER_DELAY_MS);
@@ -217,8 +211,7 @@ export class PaneStreamer {
   private lastBroadcastSeq = -1;
   private live = new Set<NonNullable<SubscriberCallbacks['onLive']>>();
   private visibleCbs = new Set<NonNullable<SubscriberCallbacks['onVisible']>>();
-  // Bound to the WHOLE PTY stream, never to one subscription's arbitrary starting chunk.
-  private readonly visible = new VisibleTextExtractor();
+  private readonly visible: VisibleTextExtractor;
   private sessionGoneCbs = new Set<SubscriberCallbacks['onSessionGone']>();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private reattachTimer: ReturnType<typeof setTimeout> | null = null;
@@ -227,10 +220,10 @@ export class PaneStreamer {
   private outageActive = false;
   private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
   private ptyGeneration = 0;
-  // Just-attached PTY output is held here until the post-attach handshake proves the generation (flushed on 'owned', dropped otherwise) — the browser must never see bytes from an unverified session.
   private attachQuarantined = false;
   private quarantineBuffer: string[] = [];
-  // The tmux generation this streamer is bound to (pinned on first attach); a reissued generation is treated as gone so the manager rebuilds the streamer.
+  private finishQuarantine: ((verified: boolean) => void) | null = null;
+  private quarantineDrain: Promise<void> | null = null;
   private expectedRef: TmuxSessionRef | null = null;
   private destroyed = false;
   private starting: Promise<void> | null = null;
@@ -240,7 +233,6 @@ export class PaneStreamer {
   private followReadFailing = false;
   private refreshPending = false;
   private refreshCbs = new Set<NonNullable<SubscriberCallbacks['onSnapshotRefresh']>>();
-  // null = capability unknown (probe failed/hung/unparseable): never cached, re-probed next spawn.
   private attachFlagged: boolean | null = null;
   private currentPtyFlagged = false;
 
@@ -279,6 +271,7 @@ export class PaneStreamer {
     );
     this.initialCols = opts.initialCols ?? DEFAULT_COLS;
     this.initialRows = opts.initialRows ?? DEFAULT_ROWS;
+    this.visible = new VisibleTextExtractor(this.initialCols, this.initialRows);
     this.windowFollowIntervalMs = normalizeFollowIntervalMs(opts.windowFollowIntervalMs);
     this.geometry = opts.geometry;
     this.ptyFactoryProvided = opts.ptyFactory;
@@ -325,19 +318,17 @@ export class PaneStreamer {
       .then((outcome) => { wantRetry = outcome === 'retry'; })
       .finally(() => {
         if (this.reattaching === p) this.reattaching = null;
-        // A transport-uncertain probe never spawns a PTY; it only schedules a backoff retry.
         if (wantRetry && !this.destroyed && !this.pty) this.scheduleReattach();
       });
     this.reattaching = p;
     return p;
   }
 
-  // Owned = current same-name generation (pid+start_time+session_id) matches the pinned one and is still self-claimed; a fresh server reissues the name with a NEW generation. Throws on a transport-uncertain probe so the caller backs off, not misreads it as gone.
   private async checkOwnership(): Promise<'owned' | 'gone'> {
     const snap = await this.tmux.getSessionSnapshot(this.agent.id, { timeout: this.sessionProbeTimeoutMs });
     if (!snap || snap.claim !== this.agent.id) return 'gone';
     if (this.expectedRef === null) {
-      this.expectedRef = snap.ref; // first attach pins the generation we are bound to
+      this.expectedRef = snap.ref;
       return 'owned';
     }
     const sameGeneration =
@@ -347,7 +338,6 @@ export class PaneStreamer {
     return sameGeneration ? 'owned' : 'gone';
   }
 
-  // 'ok' = attached; 'gone' = session absent/foreign/reissued (torn down); 'retry' = probe uncertain.
   private async attemptAttach(): Promise<'ok' | 'gone' | 'retry'> {
     let ownership: 'owned' | 'gone';
     try {
@@ -362,15 +352,18 @@ export class PaneStreamer {
       return 'gone';
     }
     await this.spawnAttachPty();
-    // Post-attach handshake: a restart between the guard probe and attach-session exec could connect a same-name successor; re-prove the pinned generation before Web I/O settles, tear down otherwise.
-    if (this.destroyed || !this.pty) return 'ok';
+    if (this.destroyed) {
+      this.cancelQuarantine();
+      return 'ok';
+    }
+    if (!this.pty) {
+      this.cancelQuarantine();
+      return 'retry';
+    }
     let postOwnership: 'owned' | 'gone';
     try {
       postOwnership = await this.checkOwnership();
     } catch (err) {
-      // Fail closed like the pre-attach probe: an uncertain post-attach probe cannot prove we are still on
-      // the pinned generation, so tear down the just-attached PTY and back off rather than expose a
-      // possibly-foreign session to the browser.
       this.killAttachPty();
       this.noteOutage(err);
       return 'retry';
@@ -380,16 +373,56 @@ export class PaneStreamer {
       return 'gone';
     }
     if (this.destroyed) return 'ok';
-    this.releaseQuarantine(); // verified — flush the buffered output and stream live from here
+    if (!this.pty) return 'retry';
+    await this.releaseQuarantine();
+    if (this.destroyed) return 'ok';
+    if (!this.pty) return 'retry';
+    this.armFollowTimer();
     return 'ok';
   }
 
-  private releaseQuarantine(): void {
-    if (!this.attachQuarantined) return;
-    this.attachQuarantined = false;
-    const buffered = this.quarantineBuffer;
+  private async releaseQuarantine(): Promise<void> {
+    const finish = this.finishQuarantine;
+    const drain = this.quarantineDrain;
+    if (!finish || !drain) return;
+    this.finishQuarantine = null;
+    finish(true);
+    try {
+      await drain;
+    } finally {
+      if (this.quarantineDrain === drain) this.quarantineDrain = null;
+    }
+  }
+
+  private beginQuarantine(generation: number): void {
+    this.attachQuarantined = true;
     this.quarantineBuffer = [];
-    for (const data of buffered) this.onPtyData(data);
+    let finish!: (verified: boolean) => void;
+    const verified = new Promise<boolean>((resolve) => { finish = resolve; });
+    const drain = this.onPtyDataChain.then(async () => {
+      if (!await verified || generation !== this.ptyGeneration || this.destroyed) return;
+      while (this.quarantineBuffer.length > 0) {
+        const buffered = this.quarantineBuffer;
+        this.quarantineBuffer = [];
+        for (const data of buffered) {
+          if (generation !== this.ptyGeneration || this.destroyed || !this.attachQuarantined) return;
+          await this.processPtyData(data);
+        }
+      }
+      if (generation === this.ptyGeneration && !this.destroyed) this.attachQuarantined = false;
+    });
+    this.finishQuarantine = finish;
+    this.quarantineDrain = drain;
+    this.onPtyDataChain = drain;
+  }
+
+  private cancelQuarantine(): void {
+    this.attachQuarantined = false;
+    this.quarantineBuffer = [];
+    const finish = this.finishQuarantine;
+    this.finishQuarantine = null;
+    this.quarantineDrain = null;
+    finish?.(false);
   }
 
   private async spawnAttachPty(): Promise<void> {
@@ -399,9 +432,10 @@ export class PaneStreamer {
     const env = await sshEnv(host);
     const flagged = await this.resolveAttachCapability(factory, host, env);
     if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
+    await this.enqueueStreamMutation(() => undefined);
+    if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
     await this.alignSpawnBaseline(flagged);
     if (this.destroyed) throw new Error('PaneStreamer destroyed during attach');
-    // The attach command re-proves and attaches the pinned expectedRef before PTY streaming.
     const expected = this.expectedRef
       ? {
           serverPid: this.expectedRef.serverPid,
@@ -418,9 +452,7 @@ export class PaneStreamer {
     const generation = ++this.ptyGeneration;
     this.pty = pty;
     this.currentPtyFlagged = flagged;
-    // Quarantine output until attemptAttach's post-attach handshake confirms the generation.
-    this.attachQuarantined = true;
-    this.quarantineBuffer = [];
+    this.beginQuarantine(generation);
 
     pty.onData((data: string) => {
       if (generation !== this.ptyGeneration || this.destroyed) return;
@@ -435,15 +467,13 @@ export class PaneStreamer {
       this.clearStabilityTimer();
       this.clearFollowTimer();
       this.pty = null;
+      if (this.finishQuarantine) this.cancelQuarantine();
       void this.handleAttachExit();
     });
-    // A resize() that landed between baseline and spawn moved headless; the pty
-    // always follows headless (single source of truth), never the reverse.
     if (this.headless.cols !== spawnCols || this.headless.rows !== spawnRows) {
       pty.resize(this.headless.cols, this.headless.rows);
     }
     this.armStabilityTimer(generation);
-    this.armFollowTimer();
   }
 
   private async resolveAttachCapability(
@@ -487,10 +517,6 @@ export class PaneStreamer {
     return {
       result: settled.then(() => output),
       settled,
-      // SIGKILL cannot be ignored: a hung probe reliably reaches onExit, releasing
-      // its admission slot; anything still wedged stays registered as honest
-      // backpressure. A kill throw propagates to the manager, which logs it with
-      // the agent as target — never swallowed silently.
       onDeadline: () => pty.kill('SIGKILL'),
     };
   }
@@ -505,12 +531,16 @@ export class PaneStreamer {
       return;
     }
     if (this.destroyed) return;
-    // holds flipping mid-read means a full subscriber owns geometry now; keep headless.
     if (g.fullHolds() > 0) return;
     const want = desiredTty(geom);
-    if (want.cols === this.headless.cols && want.rows === this.headless.rows) return;
-    this.headless.resize(want.cols, want.rows);
-    this.scheduleSnapshotRefresh();
+    const resized = await this.enqueueStreamMutation(() => {
+      if (this.destroyed || g.fullHolds() > 0) return false;
+      if (want.cols === this.headless.cols && want.rows === this.headless.rows) return false;
+      this.headless.resize(want.cols, want.rows);
+      this.visible.resize(want.cols, want.rows);
+      return true;
+    });
+    if (resized) this.scheduleSnapshotRefresh();
   }
 
   private armStabilityTimer(generation: number): void {
@@ -577,19 +607,21 @@ export class PaneStreamer {
       }
       const want = desiredTty(geom);
       if (want.cols === this.headless.cols && want.rows === this.headless.rows) return;
-      // Commit-point recheck: the read was async and the world may have moved.
-      if (this.destroyed || g.fullHolds() > 0 || generation !== this.ptyGeneration || !this.pty) return;
+      let resized = false;
       try {
-        // The hidden attach can die between the recheck and this call (onExit not
-        // yet delivered); this runs on a bare interval, so a throw here would be
-        // an unhandled rejection, not a client-visible resize_failed.
-        this.pty.resize(want.cols, want.rows);
-        this.headless.resize(want.cols, want.rows);
+        resized = await this.enqueueStreamMutation(() => {
+          const pty = this.pty;
+          if (this.destroyed || g.fullHolds() > 0 || generation !== this.ptyGeneration || !pty) return false;
+          pty.resize(want.cols, want.rows);
+          this.headless.resize(want.cols, want.rows);
+          this.visible.resize(want.cols, want.rows);
+          return true;
+        });
       } catch (err) {
         console.warn(`[pane-streamer] ${this.agent.id} follow resize raced pty exit:`, err);
         return;
       }
-      this.scheduleSnapshotRefresh();
+      if (resized) this.scheduleSnapshotRefresh();
     } catch (err) {
       console.warn(`[pane-streamer] ${this.agent.id} follow tick failed:`, err);
     } finally {
@@ -597,8 +629,12 @@ export class PaneStreamer {
     }
   }
 
-  // Non-blocking, merged: geometry commits never wait on the data chain; one
-  // pending node re-reads headless at run time, so the last geometry wins.
+  private enqueueStreamMutation<T>(mutation: () => T): Promise<T> {
+    const pending = this.onPtyDataChain.then(mutation);
+    this.onPtyDataChain = pending.then(() => undefined, () => undefined);
+    return pending;
+  }
+
   scheduleSnapshotRefresh(): void {
     if (this.refreshPending || this.destroyed) return;
     this.refreshPending = true;
@@ -615,8 +651,6 @@ export class PaneStreamer {
         try { cb(snapshot, seq); } catch {}
       }
     }).catch((err) => {
-      // A rejected tail would silently swallow every later write/subscribe on
-      // this chain; recover it so one bad serialize can't kill the stream.
       this.refreshPending = false;
       console.warn(`[pane-streamer] ${this.agent.id} snapshot refresh failed:`, err);
     });
@@ -627,21 +661,22 @@ export class PaneStreamer {
     return this.geometry.acquireFullHold();
   }
 
+  private async processPtyData(data: string): Promise<void> {
+    if (this.destroyed) return;
+    const seq = this.nextSeq++;
+    const visible = this.visible.write(data);
+    await new Promise<void>((resolve) => this.headless.write(data, () => resolve()));
+    this.lastBroadcastSeq = seq;
+    for (const cb of [...this.live]) {
+      try { cb(data, seq); } catch {}
+    }
+    for (const cb of [...this.visibleCbs]) {
+      try { cb(visible, seq); } catch {}
+    }
+  }
+
   private onPtyData(data: string): void {
-    this.onPtyDataChain = this.onPtyDataChain.then(async () => {
-      if (this.destroyed) return;
-      const seq = this.nextSeq++;
-      // Same bytes, same order as headless: that adjacency is what keeps scan and render in step.
-      const visible = this.visible.write(data);
-      await new Promise<void>((resolve) => this.headless.write(data, () => resolve()));
-      this.lastBroadcastSeq = seq;
-      for (const cb of [...this.live]) {
-        try { cb(data, seq); } catch {}
-      }
-      for (const cb of [...this.visibleCbs]) {
-        try { cb(visible, seq); } catch {}
-      }
-    });
+    this.onPtyDataChain = this.onPtyDataChain.then(() => this.processPtyData(data));
   }
 
   async subscribeAtomic(cbs: SubscriberCallbacks): Promise<SubscribeResult> {
@@ -699,18 +734,17 @@ export class PaneStreamer {
     }
   }
 
-  // Full target lands in owner state before any exec, and the local stream follows
-  // immediately (the client xterm already fitted); the tmux write may fail, but the
-  // target survives for the reconciler to converge on.
   async resize(cols: number, rows: number): Promise<void> {
     if (this.destroyed) throw new Error('PaneStreamer is destroyed');
     const g = this.geometry;
     g?.recordFullTarget({ cols, rows });
-    this.pty?.resize(cols, rows);
-    this.headless.resize(cols, rows);
+    await this.enqueueStreamMutation(() => {
+      if (this.destroyed) throw new Error('PaneStreamer destroyed before resize');
+      this.pty?.resize(cols, rows);
+      this.headless.resize(cols, rows);
+      this.visible.resize(cols, rows);
+    });
     this.scheduleSnapshotRefresh();
-    // The manager's owner write carries the triple∧claim∧generation guard server-side,
-    // so a foreign or reissued same-name session can never be resized from here.
     if (g) await g.commitOwnerResize();
   }
 
@@ -757,9 +791,7 @@ export class PaneStreamer {
   private killAttachPty(): void {
     this.clearStabilityTimer();
     this.clearFollowTimer();
-    // Discard any quarantined (unverified) output with the PTY — it must never reach the browser.
-    this.attachQuarantined = false;
-    this.quarantineBuffer = [];
+    this.cancelQuarantine();
     if (this.pty) {
       const pty = this.pty;
       this.pty = null;
@@ -774,12 +806,11 @@ export class PaneStreamer {
       return;
     }
 
-    // Reconnect only into our pinned generation; a bare hasSession(name) would reattach Web I/O into a fresh server's same-name session.
     let ownership: 'owned' | 'gone' | null = null;
     try {
       ownership = await this.checkOwnership();
     } catch (err) {
-      this.noteOutage(err); // transport-uncertain → backoff retry (attemptAttach re-verifies), never spawn now
+      this.noteOutage(err);
     }
     if (this.destroyed) return;
     if (ownership === 'gone') {

@@ -1,37 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { AgentManager } from '../../src/agent/manager.js';
+import type { AgentManager } from '../../src/agent/manager.js';
 import { TmuxManager, type PaneRef, type TmuxSessionRef } from '../../src/agent/tmux.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
-import type { AgentBindingFacts, BaxianConfig } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [{
-    id: 'proj',
-    repo: 'user/repo',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '' },
-    ]],
-  }],
-};
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import type { CommandRunner } from '../../src/agent/runner.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 const REF: TmuxSessionRef = { sessionId: '$1', serverPid: '4242', serverStart: '1700000000' };
 const paneRef = (agentId: string, paneId: string): PaneRef => ({ session: REF, paneId, claim: agentId });
-// shellQuote(`send-keys -l -t %N ' '`) 中空格字面量的转义形态，用于在 exec 命令流里辨认"空格弄脏 composer"那一次写入
 const SPACE_LITERAL = "'\\'' '\\''";
 
 let tempDir: string;
@@ -40,6 +21,7 @@ let lockManager: LockManager;
 let manager: AgentManager;
 let mockRunner: CommandRunner;
 let waitReadySpy: ReturnType<typeof vi.spyOn>;
+let seedAgent: Awaited<ReturnType<typeof createManagerHarness>>['seedAgent'];
 
 function execCalls(): string[] {
   return (mockRunner.exec as ReturnType<typeof vi.fn>).mock.calls.map(c => String(c[0]));
@@ -47,16 +29,6 @@ function execCalls(): string[] {
 
 function guardSet(): Set<string> {
   return (manager as never as { compactInFlight: Set<string> }).compactInFlight;
-}
-
-function seedAgent(overrides: Partial<AgentBindingFacts> = {}): Promise<void> {
-  return agentStore.set({
-    id: 'dev-1',
-    projectId: 'proj',
-    paneId: '%7',
-    updatedAt: new Date().toISOString(),
-    ...overrides,
-  });
 }
 
 function installGates(): Array<() => void> {
@@ -189,44 +161,32 @@ async function startBlockedUpload(id: string): Promise<{ upload: Promise<unknown
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-compact-test-'));
-  await initStateDir(tempDir);
-
-  const skillsDir = join(tempDir, 'skills');
-  for (const s of ['baxian-rules', 'task-check', 'spells']) {
-    await mkdir(join(skillsDir, s), { recursive: true });
-    await writeFile(join(skillsDir, s, 'SKILL.md'), `# ${s}`);
-  }
-  const skillRegistry = new SkillRegistry(skillsDir);
-  await skillRegistry.scan();
-
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  const taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  const eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
-
-  mockRunner = {
-    exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
-    writeFile: vi.fn<(p: string, c: Buffer | string) => Promise<void>>().mockResolvedValue(undefined),
-    execWithStdin: vi.fn<(cmd: string, stdin: Buffer) => Promise<ExecResult>>().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
-  };
-
-  const config: BaxianConfig = {
-    ...CONFIG,
-    project: CONFIG.project.map(p => ({
-      ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
-    })),
-  };
-
-  manager = new AgentManager({
-    config,
-    agentStore,
-    taskStore,
-    lockManager,
-    eventBus,
-    skillRegistry,
-    runnerFactory: () => mockRunner,
+  mockRunner = fakeRunner({ defaultResult: {} });
+  const config = makeConfig({
+    project: [{
+      id: 'proj',
+      repo: 'user/repo',
+      merge: null,
+      agent: [[
+        makeAgent({ workdir: join(tempDir, 'dev-1') }),
+        makeAgent({
+          id: 'qa-1',
+          runtime: 'codex',
+          role: 'qa',
+          workdir: join(tempDir, 'qa-1'),
+        }),
+      ]],
+    }],
   });
+  const harness = await createManagerHarness(tempDir, {
+    config,
+    agentDefaults: { paneId: '%7' },
+    deps: {
+      runnerFactory: () => mockRunner,
+      platformRunner: mockRunner,
+    },
+  });
+  ({ manager, agentStore, lockManager, seedAgent } = harness);
 
   waitReadySpy = vi.spyOn(
     manager as never as { waitForReplPromptReady: (...args: unknown[]) => Promise<void> },
@@ -424,17 +384,15 @@ describe('compactAgent', () => {
     await seedAgent();
     setPollMs(1);
     const fakeTmux = fakeDispatchTmux();
-    fakeTmux.readPaneTitle.mockResolvedValue('~/repo'); // pre-Enter idle title
+    fakeTmux.readPaneTitle.mockResolvedValue('~/repo');
     const { gates, holder: manual } = await startGuarded();
 
     const dispatch = injectAndAwaitAck(fakeTmux, paneRef('dev-1', '%7'), 'p', 'dev-1', 'claude-code');
     await drainHolderGates(gates, manual);
     await expect(dispatch).resolves.toMatchObject({ acked: true });
 
-    // pre-Enter sampling: readPaneTitle runs before sendEnter…
     expect(fakeTmux.readPaneTitle.mock.invocationCallOrder[0])
       .toBeLessThan(fakeTmux.sendEnter.mock.invocationCallOrder[0]);
-    // …and is threaded to waitSubmitAck as the busy-baseline anchor
     expect(fakeTmux.waitSubmitAck).toHaveBeenCalledWith(
       expect.objectContaining({ paneId: '%7' }),
       'snapshot', 'claude-code', expect.objectContaining({ baselineTitle: '~/repo' }),
@@ -451,7 +409,6 @@ describe('compactAgent', () => {
     let calls = 0;
     const guard = vi.fn(async () => {
       calls += 1;
-      // The entry guard passes; the pre-scrub guard sees the takeover.
       return calls === 1;
     });
 
@@ -910,7 +867,6 @@ describe('waitForReplPromptReady (narrow-pane width-independent idle detection)'
     '\n' +
     '✻ Churned for 56s\n';
 
-  // 走真实 guardedPaneRead：首行 marker 判定 ok/gone，故 mock 输出必须以 BX_PANE_OK 开头
   function mockPaneState(procTitle: string, screen: string, title: string): void {
     (mockRunner.exec as ReturnType<typeof vi.fn>).mockImplementation(async (cmd: string) => {
       if (cmd.includes('pane_current_command')) return { stdout: `BX_PANE_OK${procTitle}\n`, stderr: '', exitCode: 0 };

@@ -21,7 +21,6 @@ const SIZE_CLASS: Record<NonNullable<Props['size']>, string> = {
 const FOCUSABLE_SELECTOR =
   'input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
-// 嵌套弹窗（如弹窗内再弹确认框）时，Escape/Tab/背板点击只由栈顶实例响应。
 const modalStack: symbol[] = [];
 
 export function Modal({ open, onClose, title, titleContent, children, footer, size = 'md', dismissOnBackdrop = true }: Props) {

@@ -164,43 +164,6 @@ describe('CLI command actions', () => {
       expect(logs.join('\n')).toContain('Agent dev-1 stopped.');
     });
 
-    it('warns that stopping root-agent disables recovery until restart', async () => {
-      const { fn } = mockFetch([{
-        status: 200,
-        body: {
-          stopped: true,
-          recoveryStatus: 'stopped-until-restart',
-          message: 'Server supplied root recovery stop guidance.',
-        },
-      }]);
-      globalThis.fetch = fn as unknown as typeof globalThis.fetch;
-
-      await buildCli().parseAsync(['node', 'cli', 'stop', 'root-agent']);
-
-      expect(logs.join('\n')).toContain(
-        'Agent root-agent stopped. Server supplied root recovery stop guidance.',
-      );
-    });
-
-    it('prints a concise API error and exits cleanly when root stop is retryable', async () => {
-      const { fn } = mockFetch([{
-        status: 503,
-        body: {
-          error: 'Root recovery shutdown is incomplete; retry stopping root-agent',
-          recoveryStatus: 'stop-incomplete',
-          retryable: true,
-        },
-      }]);
-      globalThis.fetch = fn as unknown as typeof globalThis.fetch;
-
-      await expect(buildCli().parseAsync(['node', 'cli', 'stop', 'root-agent']))
-        .rejects.toThrow('__exit__:1');
-
-      expect(errors.join('\n')).toContain('Root recovery shutdown is incomplete');
-      expect(errors.join('\n')).not.toContain('"recoveryStatus"');
-      expect(errors.join('\n')).not.toContain('{"error"');
-      expect(errors.join('\n')).not.toContain(' at ');
-    });
   });
 
   describe('check', () => {
@@ -318,48 +281,6 @@ describe('CLI command actions', () => {
       expect(file).toBe('ssh');
       expect(args).toContain('baxian@hz1');
       expect(args.join(' ')).toContain('attach-session');
-      expect(opts.stdio).toBe('inherit');
-    });
-
-    it('attaches to a remote root agent using the top-level root host', async () => {
-      const { fn } = mockFetch([{
-        body: {
-          ...remoteConfig,
-          root: { runtime: 'codex', mode: 'remote', host: 'box', workdir: '/srv/root' },
-        },
-      }]);
-      globalThis.fetch = fn as unknown as typeof globalThis.fetch;
-
-      await expect(buildCli().parseAsync(['node', 'cli', 'attach', 'root-agent'])).rejects.toThrow('__exit__:0');
-
-      expect(spawnSyncMock).toHaveBeenCalledTimes(1);
-      const [file, args] = spawnSyncMock.mock.calls[0] as [string, string[]];
-      expect(file).toBe('ssh');
-      expect(args).toContain('baxian@hz1');
-      expect(args.join(' ')).toContain('=root-agent');
-      expect(args.join(' ')).toContain('if-shell');
-      expect(args.join(' ')).toContain('@baxian-agent-id');
-      expect(args.join(' ')).toContain('root-agent is not owned by Baxian');
-    });
-
-    it('atomically claim-gates a local root attach while leaving ordinary attaches unchanged', async () => {
-      const { fn } = mockFetch([{
-        body: {
-          ...remoteConfig,
-          root: { runtime: 'codex', mode: 'local', workdir: '/srv/root' },
-        },
-      }]);
-      globalThis.fetch = fn as unknown as typeof globalThis.fetch;
-
-      await expect(buildCli().parseAsync(['node', 'cli', 'attach', 'root-agent'])).rejects.toThrow('__exit__:0');
-
-      expect(spawnSyncMock).toHaveBeenCalledTimes(3);
-      const [file, args, opts] = spawnSyncMock.mock.calls[2] as [string, string[], { stdio: string }];
-      expect(file).toBe('tmux');
-      expect(args.slice(0, 2)).toEqual(['-u', 'if-shell']);
-      expect(args).toContain('#{==:#{@baxian-agent-id},root-agent}');
-      expect(args.join(' ')).toContain('attach-session');
-      expect(args.join(' ')).toContain('root-agent is not owned by Baxian');
       expect(opts.stdio).toBe('inherit');
     });
 

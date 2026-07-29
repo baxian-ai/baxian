@@ -68,9 +68,6 @@ export function PrReviewPage() {
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(flashTimerRef.current), []);
 
-  // 依赖 data（对象身份）而非布尔：同 task 重拉补进目标记录时要能重试定位；
-  // 落点以 landedRef 只执行一次，后续轮询刷新不会反复抢滚动。flash 计时器放
-  // ref 而不是 effect cleanup——数据刷新触发的 cleanup 会误杀 2s 归零。
   useEffect(() => {
     let anchor: string | null = null;
     if (hash) {

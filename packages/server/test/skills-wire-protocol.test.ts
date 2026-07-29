@@ -17,9 +17,6 @@ const GH_SKILL = join(
   'SKILL.md',
 );
 
-// The need-input wire grammar lives in baxian-signals ONLY. A bare literal hardcoded in
-// another skill would keep provisioning the pre-ordinal protocol and silently reopen the
-// replay window the ordinal pairing closed.
 describe('need-input wire protocol single source', () => {
   it('no skill outside baxian-signals hardcodes a need-input/input-received wire literal', async () => {
     const offenders: string[] = [];

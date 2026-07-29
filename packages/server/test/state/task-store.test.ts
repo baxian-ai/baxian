@@ -5,29 +5,12 @@ import { tmpdir } from 'node:os';
 import { TaskSchemaError, TaskStore } from '../../src/state/task-store.js';
 import { initStateDir } from '../../src/state/init.js';
 import type { TaskState } from '../../src/shared/index.js';
+import { makeTask } from '../helpers/fixtures.js';
 
 let tempDir: string;
 let tasksDir: string;
 let store: TaskStore;
 const NOW = '2026-04-28T10:00:00Z';
-
-function makeTask(id: string, overrides: Partial<TaskState> = {}): TaskState {
-  return {
-    id,
-    projectId: 'proj',
-    title: `Task ${id}`,
-    description: 'sample',
-    preferredAgentId: 'dev-1',
-    agentId: 'dev-1',
-    devAgentId: 'dev-1',
-    qaAgentId: 'qa-1',
-    reviewRound: 0,
-    status: 'pending',
-    createdAt: NOW,
-    updatedAt: NOW,
-    ...overrides,
-  };
-}
 
 async function writeRawTask(id: string, raw: Record<string, unknown>): Promise<void> {
   await writeFile(join(tasksDir, `${id}.json`), JSON.stringify(raw, null, 2) + '\n');
@@ -73,14 +56,14 @@ afterEach(async () => {
 
 describe('TaskStore', () => {
   it('writes and reads task state', async () => {
-    const task = makeTask('task-001');
+    const task = makeTask({ id: 'task-001', status: 'pending' });
     await store.set(task);
     const loaded = await store.get('task-001');
     expect(loaded).toEqual(task);
   });
 
   it('preserves images[] across persistence round-trip', async () => {
-    const task = makeTask('task-img', { images: ['a.png', 'b.webp'] });
+    const task = makeTask({ id: 'task-img', status: 'pending', images: ['a.png', 'b.webp'] });
     await store.set(task);
     const loaded = await store.get('task-img');
     expect(loaded?.images).toEqual(['a.png', 'b.webp']);
@@ -88,7 +71,7 @@ describe('TaskStore', () => {
 
   it('strips retired task fields instead of migrating them', async () => {
     const task = {
-      ...makeTask('task-retired-fields'),
+      ...makeTask({ id: 'task-retired-fields', status: 'pending' }),
       reviewMode: 'server',
       afterDone: 'pr',
       reviewCheckoutMode: 'base',
@@ -119,23 +102,23 @@ describe('TaskStore', () => {
   });
 
   it('lists all tasks', async () => {
-    await store.set(makeTask('task-001'));
-    await store.set(makeTask('task-002', { projectId: 'other' }));
+    await store.set(makeTask({ id: 'task-001', status: 'pending' }));
+    await store.set(makeTask({ id: 'task-002', status: 'pending', projectId: 'other' }));
     const all = await store.list();
     expect(all).toHaveLength(2);
   });
 
   it('filters by projectId', async () => {
-    await store.set(makeTask('task-001', { projectId: 'p1' }));
-    await store.set(makeTask('task-002', { projectId: 'p2' }));
+    await store.set(makeTask({ id: 'task-001', status: 'pending', projectId: 'p1' }));
+    await store.set(makeTask({ id: 'task-002', status: 'pending', projectId: 'p2' }));
     const filtered = await store.list({ projectId: 'p1' });
     expect(filtered).toHaveLength(1);
     expect(filtered[0].id).toBe('task-001');
   });
 
   it('filters by status', async () => {
-    await store.set(makeTask('task-001', { status: 'in_progress' }));
-    await store.set(makeTask('task-002', { status: 'pending' }));
+    await store.set(makeTask({ id: 'task-001', status: 'in_progress' }));
+    await store.set(makeTask({ id: 'task-002', status: 'pending' }));
     const filtered = await store.list({ status: 'in_progress' });
     expect(filtered).toHaveLength(1);
     expect(filtered[0].id).toBe('task-001');
@@ -144,13 +127,13 @@ describe('TaskStore', () => {
   it('generates sequential IDs', async () => {
     const id1 = await store.nextId();
     expect(id1).toBe('task-001');
-    await store.set(makeTask('task-001'));
+    await store.set(makeTask({ id: 'task-001', status: 'pending' }));
     const id2 = await store.nextId();
     expect(id2).toBe('task-002');
   });
 
   it('generates IDs that skip existing numbers', async () => {
-    await store.set(makeTask('task-005'));
+    await store.set(makeTask({ id: 'task-005', status: 'pending' }));
     const id = await store.nextId();
     expect(id).toBe('task-006');
   });
@@ -161,7 +144,7 @@ describe('TaskStore', () => {
   });
 
   it('deletes task', async () => {
-    await store.set(makeTask('task-001'));
+    await store.set(makeTask({ id: 'task-001', status: 'pending' }));
     await store.delete('task-001');
     expect(await store.get('task-001')).toBeNull();
   });
@@ -169,7 +152,7 @@ describe('TaskStore', () => {
   it('delete fires onChange on success and on ENOENT (idempotent), not on EPERM', async () => {
     const fired: Array<['set' | 'delete', string]> = [];
     store.onChange((kind, id) => fired.push([kind, id]));
-    await store.set(makeTask('task-005'));
+    await store.set(makeTask({ id: 'task-005', status: 'pending' }));
     fired.length = 0;
     await store.delete('task-005');
     expect(fired).toEqual([['delete', 'task-005']]);
@@ -186,7 +169,7 @@ describe('TaskStore', () => {
   });
 
   it('get/delete reject path-like ids so a store key cannot escape its dir', async () => {
-    await store.set(makeTask('task-001'));
+    await store.set(makeTask({ id: 'task-001', status: 'pending' }));
     for (const bad of ['../../../secret', '../task-001', 'a/b', '..', 'task 001', '中文']) {
       expect(await store.get(bad)).toBeNull();
     }
@@ -199,8 +182,8 @@ describe('TaskStore', () => {
 });
 
 describe('TaskStore sanitize', () => {
-  it('reviewRoundPending 持久化并校验类型：boolean 通过、字符串 "true" 抛错（#563 R24）', async () => {
-    await store.set({ ...makeTask('task-rrp'), reviewRoundPending: true });
+  it('reviewRoundPending 持久化并校验类型：boolean 通过、字符串 "true" 抛错', async () => {
+    await store.set({ ...makeTask({ id: 'task-rrp', status: 'pending' }), reviewRoundPending: true });
     const loaded = await store.get('task-rrp');
     expect(loaded?.reviewRoundPending).toBe(true);
 
@@ -228,7 +211,7 @@ describe('TaskStore sanitize', () => {
 
   it('strips schema-foreign fields on set', async () => {
     const taskWithExtras = {
-      ...makeTask('task-101'),
+      ...makeTask({ id: 'task-101', status: 'pending' }),
       strayField: 7,
       anotherStray: 'https://example.com/y',
     } as TaskState & { strayField: number; anotherStray: string };
@@ -261,7 +244,7 @@ describe('TaskStore sanitize', () => {
     await writeUnsanitizedTask('task-103', {
       strayField: 21,
     });
-    await store.set(makeTask('task-104'));
+    await store.set(makeTask({ id: 'task-104', status: 'pending' }));
 
     const all = await store.list();
     expect(all).toHaveLength(2);
@@ -319,7 +302,7 @@ describe('TaskStore sanitize', () => {
 
   it('list carries the filename id for entries whose body omits it, and nextId survives non-numeric ids', async () => {
     await writeUnsanitizedTask('task-noid2', { id: undefined, title: 'x' });
-    await store.set(makeTask('task-007'));
+    await store.set(makeTask({ id: 'task-007', status: 'pending' }));
     const all = await store.list();
     expect(all.map((t) => t.id)).toContain('task-noid2');
     expect(await store.nextId()).toBe('task-008');
@@ -459,13 +442,15 @@ describe('TaskStore git review fields', () => {
   };
 
   it('round-trips the git field family through set and get', async () => {
-    await store.set(makeTask('task-400', gitFields));
+    await store.set(makeTask({ id: 'task-400', status: 'pending', ...gitFields }));
     const loaded = await store.get('task-400');
     expect(loaded).toMatchObject(gitFields);
   });
 
   it('round-trips a task with its immutable platform binding', async () => {
-    const task = makeTask('task-platform-bound', {
+    const task = makeTask({
+      id: 'task-platform-bound',
+      status: 'pending',
       platformBinding: { mode: 'git', repoKey: 'github.com/owner/repo', tool: 'gh' },
     });
     await store.set(task);
@@ -536,7 +521,7 @@ describe('TaskStore git review fields', () => {
       pendingRedispatch: true,
       redispatchCount: 2,
     };
-    await store.set(makeTask('task-episode', episode));
+    await store.set(makeTask({ id: 'task-episode', status: 'pending', ...episode }));
     expect(await store.get('task-episode')).toMatchObject(episode);
   });
 
@@ -582,7 +567,8 @@ describe('TaskStore git review fields', () => {
       remoteProjectId: 'R_repo',
       updatedAt: NOW,
     };
-    await store.set(makeTask('task-remote', {
+    await store.set(makeTask({
+      id: 'task-remote',
       status: 'cancelled', remoteCleanup,
     }));
     expect((await store.get('task-remote'))?.remoteCleanup).toEqual(remoteCleanup);
@@ -621,7 +607,8 @@ describe('TaskStore git review fields', () => {
       effectiveRound: 2,
       updatedAt: NOW,
     };
-    await store.set(makeTask('task-lease', {
+    await store.set(makeTask({
+      id: 'task-lease',
       status: 'review', reviewRound: 1, reviewRoundPending: true,
       signalToken: lease.signalToken, reviewHeadAnchorSha: lease.headSha,
       passToken: lease.passToken, failToken: lease.failToken, reviewDispatch: lease,

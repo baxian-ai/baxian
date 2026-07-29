@@ -944,7 +944,10 @@ describe('parseDriverSpec: values translation table', () => {
       pushPermitted: 'permissions.push',
     };
     const r = parseDriverSpec(j(spec), '/p/x');
-    if ('errors' in r) throw new Error(r.errors.map(e => e.message).join('\n'));
+    expect(
+      'errors' in r,
+      'errors' in r ? r.errors.map(e => e.message).join('\n') : undefined,
+    ).toBe(false);
   });
 });
 
@@ -956,7 +959,10 @@ describe('parseDriverSpec: {branch} placeholder', () => {
       env: { REF: '{branch}' },
     };
     const r = parseDriverSpec(j(spec), '/p/x');
-    if ('errors' in r) throw new Error(r.errors.map(e => e.message).join('\n'));
+    expect(
+      'errors' in r,
+      'errors' in r ? r.errors.map(e => e.message).join('\n') : undefined,
+    ).toBe(false);
   });
 
   it('is not allowed in preflight (task context)', () => {

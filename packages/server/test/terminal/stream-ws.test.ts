@@ -22,13 +22,9 @@ afterEach(async () => {
     await runningApp.close();
     runningApp = null;
   }
-  // stream-ws fires void emitIntervention(...) whose event-log append can land in
-  // events/ after app.close(); retries absorb that race (see #494).
   await rm(tempDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 });
 
-// The streamer probes attach capability with `tmux -V` before attaching; answer
-// with a pre-3.2 version so these WS-mechanics tests skip flag/follow behavior.
 function createProbeAwarePty(cmd: { args: string[] }): MinimalPty {
   const isProbe = cmd.args.some((a) => typeof a === 'string' && a.includes('tmux -V'));
   let dataCb: ((data: string) => void) | null = null;
@@ -60,14 +56,12 @@ async function startApp(opts?: {
     const ptyFactory: PtyFactory = (cmd) => createProbeAwarePty(cmd);
     ctx.paneStreamerManager = new PaneStreamerManager({
       runnerFactory: () => ({
-        // list-sessions answers a self-claimed snapshot so the attach ownership gate passes.
         exec: vi.fn().mockImplementation(async (cmd: string) => {
           if (cmd.includes('list-sessions')) {
             const name = /#\{==:#\{session_name\},([^}]+)\}/.exec(cmd)?.[1] ?? 'dev-1';
             return { stdout: `4242|1700000000|$1|${name}\n`, stderr: '', exitCode: 0 };
           }
           if (cmd.includes('display-message')) {
-            // Well-formed geometry so no test run emits standing geometry warnings.
             return { stdout: '200 50 on latest |4242|1700000000|$1|dev-1|3.0a|#{e|<=:1,2}\n', stderr: '', exitCode: 0 };
           }
           return { stdout: '', stderr: '', exitCode: 0 };
@@ -1139,7 +1133,6 @@ describe('streamWsPlugin /api/stream — full-hold lifecycle + preview snapshot 
       data: 'REFRESHED',
       snapshotSeq: 99,
     });
-    // Nothing else queued for the full subscriber: the next frame is our ping pong.
     const pong = await pingBarrier(ws, reader);
     expect(pong.type).toBe('pong');
     ws.close();

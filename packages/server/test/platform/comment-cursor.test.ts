@@ -231,7 +231,7 @@ describe('state file structural validation', () => {
   };
 
   it('accepts a well-formed file', async () => {
-    await writeState(VALID);
+    await expect(writeState(VALID)).resolves.toBeUndefined();
   });
 
   it('rejects wrong versions and structurally corrupt fields', async () => {

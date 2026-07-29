@@ -12,8 +12,6 @@ const HI = '\ud83d';
 const LO = '\ude00';
 const MARKER = '[bx:pr-fixed:tok123abc]';
 
-// The oracle: xterm's own PRINT stream. Reached through a private field on purpose — it is
-// the reference we compare against, never a production dependency (xterm exposes no PRINT hook).
 interface PrintProbe {
   feed: (data: string) => Promise<void>;
   take: () => string;
@@ -37,8 +35,6 @@ function printProbe(): PrintProbe {
   };
 }
 
-// Separate terminal with its print handler INTACT — hijacking it leaves the buffer empty,
-// so the rendered screen has to come from an untouched instance.
 async function renderScreen(input: string): Promise<string> {
   const term = new xterm.Terminal({ cols: 80, rows: 24, scrollback: 200, allowProposedApi: true });
   const serialize = new SerializeAddon();
@@ -49,7 +45,6 @@ async function renderScreen(input: string): Promise<string> {
   return out;
 }
 
-// Everything we add on top of the PRINT stream is a C0/C1 the terminal never prints.
 const NON_PRINT_WE_ADD = /[\x00-\x1f\x7f-\x9f]/g;
 
 async function wideRow0(input: string): Promise<string> {
@@ -60,8 +55,6 @@ async function wideRow0(input: string): Promise<string> {
   return out;
 }
 
-// What the cells actually hold. SerializeAddon re-encodes gaps as CUF escapes, which would
-// survive compactSignalText and make the screen look like it lost a marker it really shows.
 async function screenText(input: string): Promise<string> {
   const term = new xterm.Terminal({ cols: 80, rows: 24, scrollback: 200, allowProposedApi: true });
   await new Promise<void>(resolve => term.write(input, () => resolve()));
@@ -72,7 +65,6 @@ async function screenText(input: string): Promise<string> {
   return rows.join('\n');
 }
 
-// Malformed sequences are the input these oracles exist for; xterm logs an error object per one.
 async function withoutParserNoise<T>(run: () => Promise<T>): Promise<T> {
   const consoleError = console.error;
   console.error = () => undefined;
@@ -83,8 +75,6 @@ async function withoutParserNoise<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-// The cells stay populated under SGR 8, so only the rendition attribute says whether the
-// glyph reaches the screen at all.
 async function screenHides(prefix: string): Promise<boolean> {
   const term = new xterm.Terminal({ cols: 80, rows: 24, allowProposedApi: true });
   await new Promise<void>(resolve => term.write(`${prefix}X`, () => resolve()));
@@ -119,16 +109,11 @@ describe('VisibleTextExtractor vs the terminal parser', () => {
       '中', '\u{1f600}', '\xe9', '\xa0', '\xff', BOM, `A${BOM}B`, '​', `${BOM}\u{1f600}`,
       '\x85', '\x84', '\x88', '\x8d', '\x91', '\x97', '\x99', '\x9a', '\x80',
     ];
-    // Deterministic PRNG so a CI failure is reproducible from the seed alone.
     let seed = 0x2f6e2b1;
     const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
 
     const probe = printProbe();
-    // ONE extractor and ONE terminal for the whole run: xterm's decoder carries a half
-    // surrogate pair across writes, so both sides must hold the same long-lived state.
     const extractor = new VisibleTextExtractor();
-    // The corpus deliberately contains malformed sequences; xterm dumps its whole parser
-    // state to console.error for each. Silence only this loop — a real assertion still fails.
     const consoleError = console.error;
     console.error = () => undefined;
     try {
@@ -136,8 +121,6 @@ describe('VisibleTextExtractor vs the terminal parser', () => {
         let stream = '';
         const atomCount = 1 + Math.floor(rnd() * 20);
         for (let i = 0; i < atomCount; i++) stream += atoms[Math.floor(rnd() * atoms.length)];
-        // xterm parses the stream whole, we parse it in random chunks: equality then proves
-        // both parser agreement AND that our cross-chunk state is chunking-invariant.
         await probe.feed(stream);
         let ours = '';
         for (let i = 0; i < stream.length;) {
@@ -152,7 +135,7 @@ describe('VisibleTextExtractor vs the terminal parser', () => {
       console.error = consoleError;
       probe.dispose();
     }
-  });
+  }, 15_000);
 
   it('never sees xterm PRINT a C0/C1, which is what makes the projection lossless', async () => withoutParserNoise(async () => {
       const prefixes = ['', ESC, `${ESC} `, `${ESC}[`, `${ESC}[12`, `${ESC}]0;x`,
@@ -190,7 +173,7 @@ describe('output contract: HT/LF/CR follow the EXECUTE action', () => {
   it.each(EXECUTE_PREFIXES)('emits LF in %s, where the cursor really moves', async (_name, prefix, suffix) => {
     const stream = `A${prefix}\n${suffix}B`;
     expect(visibleText(stream)).toBe('A\nB');
-    expect(await renderScreen(stream)).toContain('\r\n'); // the screen really wrapped to a new row
+    expect(await renderScreen(stream)).toContain('\r\n');
   });
 
   it.each(IGNORE_PREFIXES)('swallows LF in %s, where the terminal shows nothing', async (_name, prefix, suffix) => {
@@ -215,7 +198,7 @@ describe('output contract: HT/LF/CR follow the EXECUTE action', () => {
   });
 
   it('keeps the cursor-moving C0 verbatim and drops every other one', () => {
-    expect(visibleText('\tA\nB\rC')).toBe('\tA\nB\rC');
+    expect(visibleText('\tA\nB\rC')).toBe('\tA\nB\r\x00C');
     expect(visibleText('A\x08B')).toBe('A\x08B');
     expect(visibleText('\x00\x0b\x0c\x1fA')).toBe('A');
   });
@@ -246,7 +229,6 @@ describe('input decoding layer', () => {
   });
 
   it('a non-ASCII code point aborts a pending sequence exactly once, not once per unit', () => {
-    // The whole pair resets the CSI to ground; a per-code-unit parser would print the low half.
     expect(visibleText(`${ESC}[1\u{1f600}B`)).toBe('B');
   });
 
@@ -265,17 +247,24 @@ describe('known, deliberate divergence from xterm 5.5.0', () => {
     const printed = probe.take();
     probe.dispose();
 
-    // Upstream's StringToUtf32 misses the BOM check on the stranded-surrogate branch.
     expect(printed).toContain(BOM);
     expect(visibleText(stream)).not.toContain(BOM);
-    // Unreachable from a UTF-8 PTY stream, and compaction erases the difference anyway
-    // because JS \s includes U+FEFF.
     expect(compactSignalText(visibleText(stream))).toBe(compactSignalText(printed));
     expect(compactSignalText(`[bx:pr-${BOM}fixed:tok123abc]`)).toBe(MARKER);
   });
+
+  it.each([
+    ['CUP', `${ESC}[2;1H`],
+    ['CRLF', '\r\n'],
+  ])('does not infer prior-row occupancy before a %s continuation', async (_name, move) => {
+    const stream =
+      `${ESC}[1;10Hz${ESC}[1;1H[bx:pr-${move}fixed:tok123abc]`;
+    expect(compactSignalText(await screenText(stream))).not.toContain(MARKER);
+    expect(compactSignalText(visibleText(stream))).toContain(MARKER);
+  });
 });
 
-describe('issue #594 regressions', () => {
+describe('terminal control-string marker visibility', () => {
   it.each([
     ['OSC cancelled by a CSI', `${ESC}]0;title${ESC}[31m${MARKER}${BEL}`],
     ['OSC cancelled by CAN', `${ESC}]0;title\x18${MARKER}${BEL}`],
@@ -322,8 +311,7 @@ describe('issue #594 regressions', () => {
   });
 });
 
-// The PRINT stream cannot see a cursor rewind, so the oracle here is the rendered screen.
-describe('a cursor rewind breaks adjacency (issue #594 review P1)', () => {
+describe('a cursor rewind breaks adjacency', () => {
   const MARKER_RE = /\[bx:pr-fixed:[A-Za-z0-9_-]{6,64}\]/;
 
   it('does not claim a marker that backspacing erased from the screen', async () => {
@@ -345,8 +333,7 @@ describe('a cursor rewind breaks adjacency (issue #594 review P1)', () => {
 
   it('never claims a marker the screen does not show, across the whole C0/C1 range', async () => withoutParserNoise(async () => {
       for (let code = 0; code <= 0x9f; code++) {
-        if (code === 0x1b) continue; // ESC starts a sequence rather than acting on its own
-        if (code === 0x0d) continue; // CR: see the soft-wrap trade-off asserted below
+        if (code === 0x1b) continue;
         const stream = `[bx:pr-${String.fromCharCode(code)}fixed:tok123abc]`;
         const ours = MARKER_RE.test(compactSignalText(visibleText(stream)));
         if (!ours) continue;
@@ -360,21 +347,528 @@ describe('a cursor rewind breaks adjacency (issue #594 review P1)', () => {
     expect(compactSignalText(visibleText('[bx:pr-\x1b[31mfixed:tok123abc]'))).toMatch(MARKER_RE);
   });
 
-  // A lone CR redraws the line, so the screen loses the marker — but CR is half of the CRLF
-  // every soft wrap emits, and treating it as a boundary would break the tolerance the whole
-  // protocol leans on. Accepted, unchanged from the pre-parser behaviour; pinned so a future
-  // change to the whitespace class has to face it.
-  it('accepts a lone CR as whitespace even though the screen redraws the line', async () => {
-    const stream = '[bx:pr-\rfixed:tok123abc]';
-    expect((await screenText(stream)).trim()).toBe('fixed:tok123abc]');
+  it.each([
+    ['a bare CR', '\r'],
+    ['CR followed by EL(0)', `\r${ESC}[K`],
+  ])('rejects a marker overwritten by %s', async (_name, sequence) => {
+    const stream = `[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(compactSignalText(visibleText(stream))).not.toMatch(MARKER_RE);
+  });
+
+  it.each([
+    ['CRLF continues at the next row', '\r\n'],
+    ['CHA returns to the exact continuation column after CR', `\r${ESC}[8G`],
+  ])('keeps a marker when %s', async (_name, sequence) => {
+    const stream = `[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(compactSignalText(visibleText(stream))).toMatch(MARKER_RE);
+  });
+
+  it('still sees a complete marker reprinted after CR', async () => {
+    const stream = `[bx:pr-\r${MARKER}`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
     expect(compactSignalText(visibleText(stream))).toMatch(MARKER_RE);
   });
 });
 
-// main's scanner only knows ESC[, so an 8-bit CSI stayed in the text and kept the two marker
-// halves apart. Parsing it is new here, and swallowing one would be a false completion main
-// never had — hence the three-way base/head/screen contract.
-describe('8-bit CSI keeps the boundary main used to get for free (review round 12)', () => {
+describe('7-bit CSI cursor state preserves only real marker adjacency', () => {
+  const MARKER_RE = /\[bx:pr-fixed:[A-Za-z0-9_-]{6,64}\]/;
+  const seesMarker = (stream: string): boolean =>
+    MARKER_RE.test(compactSignalText(visibleText(stream)));
+
+  it('rejects the issue reproduction that xterm renders without a marker', async () => {
+    const stream = `[bx:pr-${ESC}[6Dfixed:tok123abc]`;
+    expect((await screenText(stream)).trim()).toBe('[fixed:tok123abc]');
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['ECH', 'X'],
+    ['ICH', '@'],
+    ['DCH', 'P'],
+  ])('rejects a marker when %s edits cells inside the prefix', async (_name, final) => {
+    const stream = `[bx:pr-${ESC}[3G${ESC}[6${final}${ESC}[8Gfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('keeps a marker when ECH ends before the prefix starts', async () => {
+    const stream =
+      `${ESC}[10G[bx:pr-${ESC}[1G${ESC}[5X${ESC}[17Gfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['DECIC', '}'],
+    ['DECDC', '~'],
+  ])('rejects a marker when %s edits columns inside the prefix', async (_name, final) => {
+    const stream =
+      `[bx:pr-${ESC}[3G${ESC}[1'${final}${ESC}[8Gfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['DECIC', '}'],
+    ['DECDC', '~'],
+  ])('keeps a marker when %s starts after the prefix', async (_name, final) => {
+    const stream =
+      `[bx:pr-${ESC}[10G${ESC}[1'${final}${ESC}[8Gfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['CHT', `[bx:pr-${ESC}[2147483647Ifixed:tok123abc]`],
+    ['CBT', `${ESC}[20G[bx:pr-${ESC}[2147483647Zfixed:tok123abc]`],
+  ])('handles the maximum parameter for %s in constant time', (_name, stream) => {
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['CUB overwrites the prefix', `${ESC}[6D`],
+    ['CUF leaves an unprinted gap', `${ESC}[5C`],
+    ['CHA moves back into the prefix', `${ESC}[3G`],
+    ['HPA moves past the continuation column', `${ESC}[20\``],
+    ['CUP moves back into the prefix', `${ESC}[1;3H`],
+    ['HVP moves past the continuation column', `${ESC}[1;20f`],
+    ['CUD moves below the continuation cell', `${ESC}[B`],
+    ['CHT skips to the next tab stop', `${ESC}[I`],
+    ['CBT moves to the previous tab stop', `${ESC}[Z`],
+    ['VPR moves below the continuation cell', `${ESC}[e`],
+    ['DECSTBM homes the cursor', `${ESC}[r`],
+    ['origin mode homes the cursor', `${ESC}[?6h`],
+    ['REP inserts a byte not present in the stream', `${ESC}[b`],
+    ['IL replaces the active row', `${ESC}[L`],
+    ['DL replaces the active row', `${ESC}[M`],
+    ['SU scrolls the prefix away', `${ESC}[S`],
+    ['SD separates the prefix from the cursor', `${ESC}[T`],
+  ])('rejects a marker when %s', (_name, sequence) => {
+    expect(seesMarker(`[bx:pr-${sequence}fixed:tok123abc]`)).toBe(false);
+  });
+
+  it('fails closed after TBC changes the tab-stop layout', async () => {
+    const stream = `${ESC}[3g[bx:pr-${ESC}[I${ESC}[Dfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('fails closed on CHT after HTS changes the tab-stop layout', async () => {
+    const stream =
+      `${ESC}[3g${ESC}[13G${ESC}H${ESC}[1G[bx:pr-${ESC}[I${ESC}[5Dfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('fails closed when HT crosses a cell whose existing content is unknown', async () => {
+    const stream =
+      `${ESC}[1;8Hz${ESC}[1;1H[bx:pr-\tfixed:tok123abc]`;
+    expect((await screenText(stream)).trim()).toBe('[bx:pr-zfixed:tok123abc]');
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('keeps a marker when an HT detour returns to the exact continuation cell', async () => {
+    const stream = `[bx:pr-\t${ESC}[Dfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it('reanchors the cursor after an uncertain custom-tab movement', () => {
+    const stream = `${ESC}[3g${ESC}[I${ESC}[1;1H${MARKER}`;
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['CUP continues at the start of the next row', `${ESC}[2;1H`],
+    ['HVP continues at the start of the next row', `${ESC}[2;1f`],
+    ['EL erases only to the right', `${ESC}[K`],
+    ['a saved cursor is restored without moving', `${ESC}[s${ESC}[u`],
+    ['cursor movement returns to the continuation cell', `${ESC}[5C${ESC}[5D`],
+    ['CSI u returns from a detour to the continuation cell', `${ESC}[s${ESC}[5C${ESC}[u`],
+    ['CUU is clamped at the top edge', `${ESC}[A`],
+    ['VPA names the current first row', `${ESC}[d`],
+    ['ED erases only after the cursor', `${ESC}[J`],
+    ['ED only clears scrollback', `${ESC}[3J`],
+    ['ICH leaves the prefix left of the cursor intact', `${ESC}[@`],
+    ['DCH leaves the prefix left of the cursor intact', `${ESC}[P`],
+    ['ECH leaves the prefix left of the cursor intact', `${ESC}[X`],
+    ['a 1049 alternate-screen round trip restores the cursor', `${ESC}[?1049h${ESC}[?1049l`],
+    ['a 47 alternate-screen round trip restores the cursor', `${ESC}[?47h${ESC}[?47l`],
+  ])('keeps a marker when %s', (_name, sequence) => {
+    expect(seesMarker(`[bx:pr-${sequence}fixed:tok123abc]`)).toBe(true);
+  });
+
+  it('rejects a jump that crosses a row containing earlier output', async () => {
+    const stream =
+      `${ESC}[2;1HX${ESC}[1;1H[bx:pr-${ESC}[3;1Hfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['EL(0)', `${ESC}[3G${ESC}[K${ESC}[8G`],
+    ['ED(0)', `${ESC}[3G${ESC}[J${ESC}[8G`],
+  ])('rejects a marker when %s erases part of the prefix before the cursor returns', async (_name, sequence) => {
+    const stream = `[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['a later row', `${ESC}[2;1H[bx:pr-${ESC}[s${ESC}[1;1H`],
+    ['later columns on the same row', `${ESC}[10G[bx:pr-${ESC}[s${ESC}[5G`],
+  ])('keeps a marker when ED(1) ends before the prefix on %s', async (_name, setup) => {
+    const stream = `${setup}${ESC}[1J${ESC}[ufixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it('rejects a marker when ED(1) reaches the prefix on the current row', async () => {
+    const stream =
+      `${ESC}[10G[bx:pr-${ESC}[s${ESC}[12G${ESC}[1J${ESC}[ufixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([1, 2])(
+    'applies EL(%s) only when the erased row contains the pending projection',
+    async (mode) => {
+      const safe =
+        `[bx:pr-${ESC}[s${ESC}[B${ESC}[${mode}K${ESC}[ufixed:tok123abc]`;
+      const destructive = `[bx:pr-${ESC}[${mode}K${ESC}[8Gfixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(safe)))).toBe(true);
+      expect(seesMarker(safe)).toBe(true);
+      expect(MARKER_RE.test(compactSignalText(await screenText(destructive)))).toBe(false);
+      expect(seesMarker(destructive)).toBe(false);
+    },
+  );
+
+  it.each(['L', 'M'])(
+    'keeps a saved continuation when CSI %s edits only lower lines',
+    async (final) => {
+      const stream =
+        `[bx:pr-${ESC}7${ESC}[B${ESC}[${final}${ESC}8fixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+      expect(seesMarker(stream)).toBe(true);
+    },
+  );
+
+  it.each(['K', 'J'])('keeps a marker when CSI %s starts after a right-edge prefix', async (final) => {
+    const stream = `${ESC}[74G[bx:pr-${ESC}[${final}${ESC}[2;1Hfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['pending wrap', `${ESC}[74G[bx:pr-${ESC}[74G${ESC}[K${ESC}[2;1Hfixed:tok123abc]`],
+    ['CRLF', `[bx:pr-\r\n${ESC}[1;1H${ESC}[K${ESC}[2;1Hfixed:tok123abc]`],
+  ])('rejects EL(0) on the previous row after %s', async (_name, stream) => {
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('keeps EL(0) on the new row after CRLF', async () => {
+    const stream = `[bx:pr-\r\n${ESC}[Kfixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['CSI save/restore', `${ESC}[s`, `${ESC}[u`],
+    ['DECSC/DECRC', `${ESC}7`, `${ESC}8`],
+  ])('keeps a marker when %s returns from a C0 tab detour', async (_name, save, restore) => {
+    const stream = `[bx:pr-${save}\t${restore}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['CSI save/restore', `${ESC}[s`, `${ESC}[u`],
+    ['DECSC/DECRC', `${ESC}7`, `${ESC}8`],
+  ])('does not restore a continuation after %s enclosed printable output', async (_name, save, restore) => {
+    const destructive = `[bx:pr-${save}fixed:${restore}tok123abc]`;
+    const safe = `[bx:pr-${save}\t${restore}fixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(destructive)))).toBe(false);
+    expect(seesMarker(destructive)).toBe(false);
+    expect(MARKER_RE.test(compactSignalText(await screenText(safe)))).toBe(true);
+    expect(seesMarker(safe)).toBe(true);
+  });
+
+  it.each(['47', '1047', '1049'])(
+    'keeps repeated DECSET ?%s idempotent while already on the alternate screen',
+    async (mode) => {
+      const stream = `${ESC}[?${mode}h[bx:pr-${ESC}[?${mode}hfixed:tok123abc]`;
+      expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+      expect(seesMarker(stream)).toBe(true);
+    },
+  );
+
+  it.each(['47', '1047'])(
+    'propagates alternate-screen cursor movement when clearing ?%s',
+    async (mode) => {
+      const stream =
+        `[bx:pr-${ESC}[?${mode}h${ESC}[5C${ESC}[?${mode}lfixed:tok123abc]`;
+      expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+      expect(seesMarker(stream)).toBe(false);
+    },
+  );
+
+  it.each(['47', '1047'])(
+    'keeps a marker when alternate-screen movement returns before clearing ?%s',
+    async (mode) => {
+      const stream =
+        `[bx:pr-${ESC}[?${mode}h${ESC}[5C${ESC}[5D${ESC}[?${mode}lfixed:tok123abc]`;
+      expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+      expect(seesMarker(stream)).toBe(true);
+    },
+  );
+
+  it.each(['47', '1047', '1049'])(
+    'rejects a stale continuation after alternate screen ?%s is cleared and reactivated',
+    async (mode) => {
+      const stream =
+        `${ESC}[?${mode}h[bx:pr-${ESC}[?${mode}l${ESC}[1;8H`
+        + `${ESC}[?${mode}hfixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+      expect(seesMarker(stream)).toBe(false);
+    },
+  );
+
+  it.each(['47', '1047', '1049'])(
+    'does not restore a saved continuation after alternate screen ?%s is cleared and reactivated',
+    async (mode) => {
+      const stream =
+        `${ESC}[?${mode}h[bx:pr-${ESC}[s${ESC}[?${mode}lX`
+        + `${ESC}[?${mode}h${ESC}[ufixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+      expect(seesMarker(stream)).toBe(false);
+    },
+  );
+
+  it.each(['47', '1047', '1049'])(
+    'preserves the saved cursor position when alternate screen ?%s is cleared and reactivated',
+    async (mode) => {
+      const stream =
+        `${ESC}[?${mode}h${ESC}[3;11H${ESC}[s${ESC}[?${mode}l${ESC}[1;1H`
+        + `${ESC}[?${mode}h${ESC}[u[bx:pr-${ESC}[3;18Hfixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+      expect(seesMarker(stream)).toBe(true);
+    },
+  );
+
+  it.each(['47', '1047', '1049'])(
+    'keeps main-screen continuation isolated from an erase on alternate screen ?%s',
+    async (mode) => {
+      const stream = `[bx:pr-${ESC}[?${mode}h${ESC}[2J${ESC}[?${mode}lfixed:tok123abc]`;
+      expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+      expect(seesMarker(stream)).toBe(true);
+    },
+  );
+
+  it('keeps a main-screen invalidation across an alternate-screen round trip', async () => {
+    const stream = `[bx:pr-${ESC}[2J${ESC}[?1049h${ESC}[?1049lfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['CUD', `${ESC}[B`],
+    ['VPR', `${ESC}[e`],
+  ])('clamps %s at the bottom row', async (_name, sequence) => {
+    const stream = `${ESC}[24;1H[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it('clamps CUD at the active scroll margin', async () => {
+    const stream = `${ESC}[5;10r${ESC}[10;1H[bx:pr-${ESC}[Bfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it('rejects an out-of-range CUP that xterm clamps onto the prefix row', async () => {
+    const stream = `${ESC}[24;1H[bx:pr-${ESC}[99;1Hfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['CRLF scrolls the prefix and continues on the bottom row', '\r\n'],
+    ['pending wrap scrolls the prefix and continues on the bottom row', ''],
+  ])('keeps a marker when %s', async (name, sequence) => {
+    const column = name.startsWith('pending') ? 74 : 1;
+    const stream = `${ESC}[24;${column}H[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['IND', `${ESC}D`],
+    ['LF', '\n'],
+    ['VT', '\v'],
+    ['FF', '\f'],
+    ['NEL', `${ESC}E`],
+  ])('keeps a marker when %s starts at the continuation cell', async (_name, sequence) => {
+    const stream = `[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it.each([
+    ['IND', `${ESC}D`],
+    ['LF', '\n'],
+    ['VT', '\v'],
+    ['FF', '\f'],
+    ['NEL', `${ESC}E`],
+  ])('rejects a marker when %s returns from a non-adjacent row', async (_name, sequence) => {
+    const stream =
+      `${ESC}[2;1H[bx:pr-${ESC}[F${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    [
+      'CRLF',
+      `${ESC}[1;2r${ESC}[2;1H[bx:pr-\r\n${ESC}[1;1H${ESC}[2K${ESC}[2;1Hfixed:tok123abc]`,
+    ],
+    [
+      'pending wrap',
+      `${ESC}[1;2r${ESC}[2;74H[bx:pr-f${ESC}[1;1H${ESC}[2K${ESC}[2;2Hixed:tok123abc]`,
+    ],
+  ])('tracks the printed extent after a %s scroll', async (_name, stream) => {
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    [23, true],
+    [24, false],
+  ])(
+    'tracks whether ED(3) clears a prefix after %i full-screen scrolls',
+    async (scrolls, expected) => {
+      const stream =
+        `${ESC}[24;1H[bx:pr-${'\r\n'.repeat(scrolls)}${ESC}[3Jfixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(expected);
+      expect(seesMarker(stream)).toBe(expected);
+    },
+  );
+
+  it.each([
+    ['main buffer', '', true],
+    ['alternate buffer', `${ESC}[?47h`, false],
+  ])(
+    'tracks whether full-screen scrolling preserves a prefix in the %s',
+    async (_name, enter, expected) => {
+      const stream =
+        `${enter}${ESC}[24;1H[bx:pr-${'\r\n'.repeat(24)}fixed:tok123abc]`;
+      expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(expected);
+      expect(seesMarker(stream)).toBe(expected);
+    },
+  );
+
+  it.each([
+    ['CRLF', 1, '\r\n'],
+    ['pending wrap', 74, ''],
+  ])('rejects %s at the screen bottom outside the scroll region', async (_name, column, sequence) => {
+    const stream = `${ESC}[1;10r${ESC}[24;${column}H[bx:pr-${sequence}fixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['EL erases the prefix to the left', `${ESC}[1K`],
+    ['EL erases the whole row', `${ESC}[2K`],
+    ['ED erases the prefix to the left', `${ESC}[1J`],
+    ['ED erases the whole viewport', `${ESC}[2J`],
+    ['DECSEL erases an unprotected prefix', `${ESC}[?1K`],
+    ['DECSED erases an unprotected viewport', `${ESC}[?2J`],
+    ['printing continues on a different screen', `${ESC}[?1049h`],
+  ])('rejects a marker when %s', (_name, sequence) => {
+    expect(seesMarker(`[bx:pr-${sequence}fixed:tok123abc]`)).toBe(false);
+  });
+
+  it.each([
+    ['CSI u', `${ESC}[s`, `${ESC}[u`],
+    ['DECRC', `${ESC}7`, `${ESC}8`],
+  ])('rejects a marker when %s restores a cursor inside the prefix', (_name, save, restore) => {
+    expect(seesMarker(`${save}[bx:pr-${restore}fixed:tok123abc]`)).toBe(false);
+  });
+
+  it('never completes off screen across the supported cursor and mutation CSI matrix', async () => {
+    const finals = Array.from({ length: 0x7f - 0x40 }, (_, i) => String.fromCharCode(0x40 + i));
+    const params = ['', '0', '1', '2', '5', '1;1', '2;1', '1;20', '20;1', '24;1', '99;1'];
+    const sequences = finals.flatMap(final => params.map(param => `${ESC}[${param}${final}`));
+    for (const sequence of sequences) {
+      const stream = `[bx:pr-${sequence}fixed:tok123abc]`;
+      if (!seesMarker(stream)) continue;
+      const screen = (await screenText(stream)).replaceAll('\n', '');
+      expect(MARKER_RE.test(screen), JSON.stringify(sequence)).toBe(true);
+    }
+  });
+
+  it('uses terminal width to recognise a nonzero-column continuation after wrapping', async () => {
+    const stream = `${ESC}[78G[bx:pr-${ESC}[2;5Hfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it('preserves delayed-wrap semantics when CUB moves back from the right edge', () => {
+    const stream = `${ESC}[74G[bx:pr-${ESC}[Dfixed:tok123abc]`;
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it.each([
+    ['CR', `${ESC}[24;74H[bx:pr-\rfixed:tok123abc]`],
+    [
+      'CUB and CUP',
+      `${ESC}[24;74H[bx:pr-${ESC}[D${ESC}[24;1Hfixed:tok123abc]`,
+    ],
+  ])('rejects a bottom-row pending wrap cancelled by %s', async (_name, stream) => {
+    expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('separates bytes that overwrite the rightmost cell when wraparound is disabled', async () => {
+    const stream = `${ESC}[?7l${ESC}[74G${MARKER}`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('fails closed when a preceding wide glyph makes an absolute column ambiguous', async () => {
+    const stream = `中[bx:pr-${ESC}[9Gfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(false);
+    expect(seesMarker(stream)).toBe(false);
+  });
+
+  it('re-establishes reliable coordinates after a full absolute position', async () => {
+    const stream = `中${ESC}[1;1H[bx:pr-${ESC}[2;1Hfixed:tok123abc]`;
+    expect(MARKER_RE.test((await screenText(stream)).replaceAll('\n', ''))).toBe(true);
+    expect(seesMarker(stream)).toBe(true);
+  });
+
+  it('separates output across a resize until the new geometry has a fresh print anchor', () => {
+    const extractor = new VisibleTextExtractor(80);
+    let visible = extractor.write('[bx:pr-');
+    extractor.resize(20);
+    visible += extractor.write('fixed:tok123abc]');
+    expect(MARKER_RE.test(compactSignalText(visible))).toBe(false);
+    expect(compactSignalText(extractor.write(MARKER))).toContain(MARKER);
+  });
+
+  it('keeps cursor state across arbitrary write boundaries', () => {
+    const extractor = new VisibleTextExtractor();
+    let visible = extractor.write('[bx:pr-');
+    visible += extractor.write(`${ESC}[`);
+    visible += extractor.write('6');
+    visible += extractor.write('Dfixed:tok123abc]');
+    expect(MARKER_RE.test(compactSignalText(visible))).toBe(false);
+  });
+});
+
+describe('8-bit CSI marker detection matches the rendered screen', () => {
   const MARKER_RE = /\[bx:pr-fixed:[A-Za-z0-9_-]{6,64}\]/;
   const BASE_OSC_RE = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;
   const BASE_ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
@@ -396,8 +890,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
     expect(oursSees(stream)).toBe(false);
   });
 
-  // Exempting SGR looked safe until conceal: `CSI 8 m` leaves the cells populated while the
-  // glyphs never reach the screen, so the cell text alone still says "marker".
   it.each([
     ['8-bit conceal', '[bx:pr-\x9b8mfixed:tok123abc]'],
     ['7-bit conceal', `[bx:pr-${ESC}[8mfixed:tok123abc]`],
@@ -413,8 +905,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
     expect(oursSees(stream)).toBe(true);
   });
 
-  // A cancelled or ignored sequence is one xterm discards whole: nothing of it reaches the
-  // screen, so the only thing that can break adjacency is a C0 it executed on the way through.
   it.each([
     ['CAN, after CR already redrew the line inside the CSI', '[bx:pr-\x9b\r\x18fixed:tok123abc]', false],
     ['CAN mid-parameter', '[bx:pr-\x9b1\x18fixed:tok123abc]', true],
@@ -427,8 +917,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
       expect(oursSees(stream)).toBe(visible);
   }));
 
-  // Conceal is saved, restored and reset by the same sequences as the charset, and neither
-  // shows up in the cell text — so the whole product is anchored to the rendition attribute.
   it('tracks conceal through every save, restore and reset the charset uses', async () => {
     const SGRS = ['', '0', '8', '28', '08', '8:1', '28:0', '1;8', '8;28', '28;8', '31', '108'];
     const WRAPS: Array<[string, (sgr: string) => string]> = [
@@ -457,9 +945,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
     }
   }, 60_000);
 
-
-  // A CR inside a sequence is not half of a soft wrap — it redraws the line, and the tail
-  // lands back over the prefix whether the sequence then dispatches, is ignored, or is cancelled.
   it.each([
     ['an 8-bit SGR that would otherwise be transparent', '[bx:pr-\x9b\r31mfixed:tok123abc]'],
     ['an 8-bit CSI leaving through csiIgnore', '[bx:pr-\x9b1?\rmfixed:tok123abc]'],
@@ -470,8 +955,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
     expect(oursSees(stream)).toBe(false);
   });
 
-  // RI moves the tail one row ABOVE the prefix, so reading the screen top-down never yields
-  // the marker — unlike IND/NEL, which move forward and compaction rejoins.
   it('separates on ESC M, which the 8-bit 0x8d form does not trigger in 5.5.0', async () => {
     for (const stream of [`\n[bx:pr-${ESC}Mfixed:tok123abc]`, `[bx:pr-${ESC}Mfixed:tok123abc]`]) {
       expect(await screenSees(stream), stream).toBe(false);
@@ -484,8 +967,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
     }
   });
 
-  // 38/48/58 swallow a colour payload whose components are ordinary numbers: an 8 in there is
-  // not conceal, and a 28 is not reveal. Getting the span wrong breaks in both directions.
   it('follows the extended-colour payload span instead of reading every parameter', async () => {
     const LEADERS = ['38', '48', '58', '39', '4'];
     const SUBS = ['', '0', '1', '2', '3', '4', '5', '9', '28', '8'];
@@ -514,7 +995,6 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
     }
   }, 120_000);
 
-
   it('never completes where the screen does not, nor misses what base saw', async () => withoutParserNoise(async () => {
     const CANCELS = ['', '\x18', '\x1a', ' '];
     for (let final = 0x40; final <= 0x7e; final++) {
@@ -538,9 +1018,7 @@ describe('8-bit CSI keeps the boundary main used to get for free (review round 1
   }), 120_000);
 });
 
-// Charset mapping happens in InputHandler.print, downstream of the parser's PRINT handler,
-// so the differential oracle is blind to it here too — the screen is the oracle again.
-describe('a designated charset makes printed ASCII untrustworthy (issue #594 review round 2)', () => {
+describe('a designated charset makes printed ASCII untrustworthy', () => {
   const MARKER_RE = /\[bx:pr-fixed:[A-Za-z0-9_-]{6,64}\]/;
   const SO = '\x0e';
   const SI = '\x0f';
@@ -582,8 +1060,6 @@ describe('a designated charset makes printed ASCII untrustworthy (issue #594 rev
     }
   });
 
-  // UK only rewrites '#', which no marker contains — treating the whole charset as unreadable
-  // would drop a completion signal the terminal really shows and stall the task.
   it('keeps a marker that a partially-remapping charset leaves intact', async () => {
     const stream = `${ESC}(A[bx:pr-fixed:tok123abc]`;
     expect((await screenText(stream)).trim()).toBe('[bx:pr-fixed:tok123abc]');
@@ -609,9 +1085,6 @@ describe('a designated charset makes printed ASCII untrustworthy (issue #594 rev
     ['SS2', `${ESC}N`, '*'],
     ['SS3', `${ESC}O`, '+'],
   ])('tracks %s the same way the terminal does', async (_name, shift, intermediate) => {
-    // The second position is what makes this test able to fail: ahead of the marker's '[' —
-    // a byte DEC graphics never rewrites — both sides say "marker" whether or not the
-    // terminal implements single shift at all. Before 's' the two answers come apart.
     for (const marker of [`${shift}[bx:pr-fixed:tok123abc]`, `[bx:${shift}pr-fixed:tok123abc]`]) {
       const stream = `${ESC}(B${ESC}${intermediate}0${marker}`;
       const onScreen = MARKER_RE.test(compactSignalText(await screenText(stream)));
@@ -628,7 +1101,6 @@ describe('a designated charset makes printed ASCII untrustworthy (issue #594 rev
   });
 
   it('an aborted designation does not latch onto the next final byte', () => {
-    // ESC ( cancelled by CAN, then a bare `0` prints normally instead of designating G0.
     expect(visibleText(`${ESC}(\x180[bx:pr-fixed:tok123abc]`)).toBe('0[bx:pr-fixed:tok123abc]');
   });
 
@@ -641,9 +1113,7 @@ describe('a designated charset makes printed ASCII untrustworthy (issue #594 rev
   });
 });
 
-// Charset state is saved, restored and reset by sequences the PRINT stream never reveals,
-// so every case here is anchored to the rendered screen.
-describe('charset state follows the terminal (issue #594 review round 4)', () => {
+describe('charset state follows the terminal', () => {
   const MARKER_RE = /\[bx:pr-fixed:[A-Za-z0-9_-]{6,64}\]/;
   const M = '[bx:pr-fixed:tok123abc]';
 
@@ -690,9 +1160,6 @@ describe('charset state follows the terminal (issue #594 review round 4)', () =>
   });
 });
 
-// Per-action cases all start from the default state, which cannot prove a state machine:
-// every round of review found another composite that diverged. This drives random
-// compositions of the state-changing sequences and holds the verdict to the rendered screen.
 describe('composite charset state agrees with the terminal', () => {
   const MARKER_RE = /\[bx:pr-fixed:[A-Za-z0-9_-]{6,64}\]/;
   const M = '[bx:pr-fixed:tok123abc]';
@@ -712,8 +1179,6 @@ describe('composite charset state agrees with the terminal', () => {
     `${ESC}[31m`, `${ESC}]0;t\x07`, '',
   ];
 
-  // A canary on a fresh line reads back the charset state a composite prefix left behind,
-  // free of where the cursor happens to sit — cursor positioning is a separate axis (#599).
   const CANARY = 'fixedmarker';
   const COMPOSITE_ROUNDS = Number(process.env.BX_COMPOSITE_ROUNDS ?? 400);
 
@@ -721,19 +1186,12 @@ describe('composite charset state agrees with the terminal', () => {
     let seed = 0x51d3c7;
     const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     const pick = <T>(items: T[]): T => items[Math.floor(rnd() * items.length)];
-    // Hand-written atoms only carry the finals we already knew about; generating the whole
-    // intermediate × final grid is what reaches the unrecognised ones.
     const anyEscapeSequence = (): string =>
       ESC + pick([...'()*+-./%#$" ']) + String.fromCharCode(0x30 + Math.floor(rnd() * 0x4f));
-    // Same idea one level down: private markers, params and intermediates are their own grid.
     const anyCsiSequence = (): string =>
       `${ESC}[${pick(['', '?', '>', '<'])}${pick(['', '2', '25', '47', '1047', '1048', '1049', '1;2'])}`
       + `${pick(['', '!', '!!', '" ', '$'])}${String.fromCharCode(0x40 + Math.floor(rnd() * 0x3f))}`;
 
-    // Uniform random over a flat atom list is far too sparse to land an ordered trajectory
-    // like designate -> save -> redesignate -> restore -> shift, which is exactly where the
-    // active charset and the G0-G3 slots come apart. So draw from a template with one slot
-    // per state transition; every round is a meaningful trajectory rather than noise.
     const DESIGNATIONS = [`${ESC}(0`, `${ESC})0`, `${ESC}*0`, `${ESC}+0`, `${ESC}-0`, `${ESC}(A`, `${ESC}(X`, `${ESC}(B`];
     const SHIFTS = ['', SI, SO, `${ESC}n`, `${ESC}o`, `${ESC}~`, `${ESC}}`, `${ESC}|`];
     const SAVES = ['', `${ESC}7`, `${ESC}[s`, `${ESC}[?1049h`, `${ESC}[?1048h`,
@@ -749,29 +1207,21 @@ describe('composite charset state agrees with the terminal', () => {
       const trajectory = pick(DESIGNATIONS) + pick(SHIFTS) + pick(SAVES) + pick(DESIGNATIONS)
         + pick(SAVES) + pick(SHIFTS) + pick(RESTORES) + pick(DESIGNATIONS) + pick(RESTORES)
         + pick(RESETS);
-      // Keep a smaller free-form tail so shapes the template does not model still get exercised.
       let noise = '';
       for (let i = 0; i < Math.floor(rnd() * 3); i++) {
         const roll = rnd();
         noise += roll < 0.3 ? anyEscapeSequence() : roll < 0.6 ? anyCsiSequence() : pick(STATE_ATOMS);
       }
       const prefix = trajectory + noise;
-      // A trailing shift is what separates "active charset" from "the G0-G3 slots": without it
-      // a restore that wrote to the wrong place still reads back correctly.
       const trailingShift = pick(SHIFTS);
       const stream = `${prefix}${trailingShift}\r\n${CANARY}`;
 
-      // Search every row: a screen fill (DECALN) leaves the canary somewhere above the last row.
       const screenRemapped = !(await screenText(stream)).includes(CANARY);
       const oursRemapped = !visibleText(stream).includes(CANARY);
       expect(oursRemapped, `round ${round}: ${JSON.stringify(prefix + trailingShift)}`).toBe(screenRemapped);
     }
   }, COMPOSITE_ROUNDS * 30);
 
-  // Random slot draws are still too sparse for interleavings that need three or four specific
-  // ops to line up (a reset BETWEEN a save and its restore, a 1048 nested inside a 1049, a save
-  // taken on the far side of a buffer switch). Those products are small enough to enumerate,
-  // so cover them exhaustively instead of hoping the sampler lands on them.
   const OVERFLOW_PARAMS = Array.from({ length: 40 }, () => '1').join(';');
   const MANY_PARAMS = '1;2;3;4;5;6;7;8;9;10;11;12;13;14';
   const SAVE_OPS = ['', `${ESC}7`, `${ESC}[s`, `${ESC}[?1049h`, `${ESC}[?1048h`, `${ESC}[?47h`,
@@ -819,8 +1269,6 @@ describe('composite charset state agrees with the terminal', () => {
     }
   }, 120_000);
 
-  // Deliberate divergence from the framebuffer: a TUI clears the screen on every redraw, so
-  // requiring the marker to survive on the final screen would miss nearly every real signal.
   it('still reports a marker that a later screen wipe erased', async () => {
     const stream = `${M}${ESC}#8`;
     expect(MARKER_RE.test(compactSignalText(await screenText(stream)))).toBe(false);

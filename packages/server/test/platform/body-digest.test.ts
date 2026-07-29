@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { bodyDigest } from '../../src/platform/body-digest.js';
 
-// core 与 skill 两执行面共享的 golden vectors（spec §6 digest 线协议）：
-// 对 API 解码原文按 UTF-8 取 SHA-256 完整小写 hex，不做规范化/剥标记/trim。
 const VECTORS: Array<[name: string, body: string, hex: string]> = [
   ['empty string', '', 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'],
   ['trailing LF', 'hello\n', '5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03'],

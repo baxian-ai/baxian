@@ -1,13 +1,8 @@
 import type { PrReviewItem, TaskState } from '../shared/index.js';
 
 export const PR_CONVERSATION_CACHE_TTL_MS = 60_000;
-// 限流结果必须服务端共享退避：只靠客户端计时挡不住刷新、第二个浏览器与重复 mount，
-// 而限流期间继续打平台可能导致集成被封禁（GitHub 明示）。
 export const PR_CONVERSATION_RATE_LIMIT_TTL_MS = 60_000;
-// 窗口过期后仍记住连击一段时间：立即遗忘会让每次重试都从 60s 起，指数增长永不生效。
 const RATE_LIMIT_STRIKE_MEMORY_MS = 10 * 60_000;
-// 与 poller 的限流退避同上限：无封顶的 2^n 会在连续五六次后把端点锁死数小时，
-// 平台早已恢复也无法自愈（进入长窗口后连重建都不再发生，计数也就永不清零）。
 const RATE_LIMIT_MAX_WAIT_MS = 900_000;
 export const PR_CONVERSATION_CACHE_MAX_ENTRIES = 64;
 export const PR_CONVERSATION_CACHE_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
@@ -25,8 +20,6 @@ type RevisionTask = Pick<
   'reviewRound' | 'latestHeadSha' | 'status' | 'reviewDispatchedAt' | 'prFeedbackReceivedAt' | 'prNumber' | 'reviewConversationUpdatedAt'
 >;
 
-// web/src/shared/pr-review.ts 的 prReviewRevision 字段必须是本函数的前缀子集：
-// 前端触发重拉的任何变化在服务端必然 miss，服务端仅追加 miss 条件（repoKey 仅服务端可见）。
 export function prReviewCacheRevision(task: RevisionTask, repoKey: string): string {
   return [
     task.reviewRound,
@@ -97,8 +90,6 @@ export class PrConversationCache {
     if (entry && entry.revision === revision && !this.expired(entry)) {
       return entry.payload;
     }
-    // 退避按 task 生效（同 task 任何请求在窗口内都不得再打平台），但 payload 绑定 revision：
-    // 换绑 PR/仓库后 revision 变化，只回退避状态，绝不把旧 PR 的评论挂到新 PR 名下。
     const throttled = this.rateLimited.get(key);
     if (throttled !== undefined) {
       if (this.now() < throttled.until) {
@@ -106,7 +97,6 @@ export class PrConversationCache {
           ? throttled.payload
           : { items: [], error: throttled.payload.error ?? 'rate limited', rateLimited: true };
       }
-      // 窗口已过：放行本次重建，但保留连击计数（并丢掉 payload 只留状态）供指数增长使用。
       this.rateLimited.set(key, {
         ...throttled,
         payload: { items: [], rateLimited: true },
@@ -117,7 +107,6 @@ export class PrConversationCache {
     if (running && running.revision === revision) {
       return running.promise;
     }
-    // revision 不同：直接取代注册，旧构建继续跑但落定时不再拥有写入权。
     const reg: InflightBuild = { revision, promise: Promise.resolve({ items: [] }) };
     reg.promise = (async () => {
       try {
@@ -155,7 +144,6 @@ export class PrConversationCache {
     for (const [key, entry] of this.entries) {
       if (this.expired(entry)) this.remove(key);
     }
-    // 退避条目同样参与全局回收与容量上限，否则历史限流任务会让这张表无界增长。
     const now = this.now();
     for (const [key, backoff] of this.rateLimited) {
       if (now >= backoff.until + RATE_LIMIT_STRIKE_MEMORY_MS) this.rateLimited.delete(key);
@@ -167,12 +155,9 @@ export class PrConversationCache {
     }
   }
 
-  // 连续限流按指数增长（60 / 120 / 240…），成功即清零——客户端计时保护不了其他客户端。
   private noteRateLimited(key: string, revision: string, payload: PrConversationPayload): void {
     const strikes = (this.rateLimited.get(key)?.strikes ?? 0) + 1;
     const wait = Math.min(PR_CONVERSATION_RATE_LIMIT_TTL_MS * 2 ** (strikes - 1), RATE_LIMIT_MAX_WAIT_MS);
-    // 超过单项上限的 payload 只留退避状态：限流条目与普通条目共用一份字节预算，
-    // 否则这张表能在 stats() 之外常驻上百 MiB。
     const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
     const kept: PrConversationPayload = bytes > this.maxPayloadBytes
       ? { items: [], error: payload.error, rateLimited: true }
@@ -194,7 +179,6 @@ export class PrConversationCache {
     return total;
   }
 
-  // 退避表与普通条目共享总字节上限；淘汰只丢 payload、保留退避状态（连击计数不能因内存压力清零）。
   private enforceRateLimitBudget(): void {
     while (
       this.rateLimited.size > this.maxEntries
@@ -230,7 +214,6 @@ export class PrConversationCache {
   }
 
   private evict(): void {
-    // store() 先 delete 再 set，Map 插入序即 fetchedAt 非降序，队首即最旧。
     while (this.entries.size > this.maxEntries || this.totalBytes > this.maxTotalBytes) {
       const oldestKey = this.entries.keys().next().value;
       if (oldestKey === undefined) return;

@@ -2,37 +2,20 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { initStateDir } from '../../src/state/init.js';
+import { DispatchTerminalError, type AgentManager } from '../../src/agent/manager.js';
+import type { TaskStore } from '../../src/state/task-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import type { EventBus } from '../../src/event/bus.js';
 import { recoverGitPostApprovePending, registerEventHandlers } from '../../src/event/handlers.js';
-import type { BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
+import type { BaxianEvent, TaskState } from '../../src/shared/index.js';
 import { DirtyWorkdirError } from '../../src/agent/branch.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { makeAgent, makeConfig, makeTask } from '../helpers/fixtures.js';
 
 const SHA1 = 'a'.repeat(40);
 const SHA2 = 'b'.repeat(40);
 const POST_APPROVE_GENERATION = 'feedfeedfeed';
 const RECOVERY_READY_AT = '2000-01-01T00:00:00.000Z';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 3 },
-  server: DEFAULT_SERVER_CONFIG,
-  host: [],
-  project: [{
-    id: 'proj',
-    repo: 'git@github.com:owner/repo.git',
-    merge: null,
-    agent: [[
-      { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '/tmp/repo' },
-      { id: 'qa-1', runtime: 'codex', role: 'qa', mode: 'local', workdir: '/tmp/qa' },
-    ]],
-  }],
-};
 
 let tempDir: string;
 let taskStore: TaskStore;
@@ -43,19 +26,20 @@ let emitted: BaxianEvent[];
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'bx-handlers-git-'));
-  await initStateDir(tempDir);
-  taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  eventBus = new EventBus(new EventLog(join(tempDir, 'events')));
-  emitted = [];
-  eventBus.on('*', (evt) => { emitted.push(evt); });
-  manager = new AgentManager({
-    config: CONFIG,
-    agentStore: new AgentStore(join(tempDir, 'state', 'agents')),
-    taskStore,
-    lockManager,
-    eventBus,
+  const config = makeConfig({
+    review: { rounds: 3 },
+    project: [{
+      id: 'proj',
+      repo: 'git@github.com:owner/repo.git',
+      merge: null,
+      agent: [[
+        makeAgent(),
+        makeAgent({ id: 'qa-1', runtime: 'codex', role: 'qa', workdir: '/tmp/qa' }),
+      ]],
+    }],
   });
+  const harness = await createManagerHarness(tempDir, { config });
+  ({ taskStore, lockManager, eventBus, manager, events: emitted } = harness);
   vi.spyOn(manager, 'markAgentWaiting').mockResolvedValue(true);
   vi.spyOn(manager, 'platformVerifyPrBinding').mockResolvedValue({
     ok: true, headSha: SHA1, branch: 'bx/task-1', targetBranch: 'main',
@@ -70,16 +54,16 @@ afterEach(async () => {
 
 function gitTask(over: Partial<TaskState> = {}): TaskState {
   const now = new Date().toISOString();
-  const task = {
-    id: 'task-1', projectId: 'proj', title: 'T', description: 'd',
-    preferredAgentId: 'dev-1', agentId: 'dev-1', devAgentId: 'dev-1',
-    qaAgentId: 'qa-1',
-    reviewRound: 0, status: 'in_progress', phase: 'code', createdAt: now, updatedAt: now,
-    branch: 'bx/task-1', branchCreatedByBaxian: true,
+  const task = makeTask({
+    description: 'd',
+    phase: 'code',
+    platformBinding: undefined,
     deliveryConfirmation: { phase: 'code', source: 'signal', at: now },
     signalToken: 'aaaa11112222',
+    createdAt: now,
+    updatedAt: now,
     ...over,
-  } as TaskState;
+  });
   if (task.phase === undefined) delete task.deliveryConfirmation;
   else if (!Object.hasOwn(over, 'deliveryConfirmation')) {
     task.deliveryConfirmation = { phase: task.phase, source: 'signal', at: now };
@@ -1088,7 +1072,7 @@ describe('review.submitted (git)', () => {
 
   it('parks an approved spec for human approval without consuming a code review round', async () => {
     vi.spyOn(manager, 'getProjectConfig').mockReturnValue({
-      ...CONFIG.project[0]!,
+      ...manager.getConfig().project[0]!,
       specApproval: 'human',
     });
     vi.spyOn(manager, 'releaseAgentForTask').mockResolvedValue(true);
@@ -1727,7 +1711,6 @@ describe('post-approve feedback consumption (git)', () => {
     await recoverGitPostApprovePending(eventBus, manager);
     const task = await taskStore.get('task-1');
     expect(task?.postApproveToken).toBeDefined();
-    // continueSession 确认后 pending 才清（false 表已确认送达）
     expect(task?.pendingRedispatch).toBe(false);
     expect(continueSpy).toHaveBeenCalledWith('task-1', 'dev-1', 'post-approve', expect.not.objectContaining({
       postApproveRedispatchCount: expect.anything(),
@@ -2060,7 +2043,6 @@ describe('merge-ready receipt recheck (git)', () => {
     await eventBus.emit(mergeReadySignal('tok123456789'));
     const task = await taskStore.get('task-1');
     expect(task?.status).toBe('approved');
-    // 信号已消费且 dev 不会重发：durable pending + signaled 相位交给 sweep 补派，而不是重放滚动区
     expect(task?.pendingRedispatch).toBe(true);
     expect(task?.postApprovePhase).toBe('signaled');
     expect(emitted.find(e => e.type === 'human.intervention')?.data).toMatchObject({
@@ -2439,7 +2421,7 @@ describe('closed-unmerged / reopen anchor with outbox (git)', () => {
   });
 
 });
-describe('review round fixes from PR review', () => {
+describe('git review state transition guards', () => {
   it('rejects malformed git verdicts before any task or agent side effect', async () => {
     const base = {
       prNumber: 42, qaAgentId: 'qa-1',
@@ -2600,7 +2582,7 @@ describe('review round fixes from PR review', () => {
   });
 });
 
-describe('second review round fixes', () => {
+describe('git feedback return and reconciliation re-arm', () => {
   it('returns merge-ready feedback on platforms whose head shas are not 40 hex chars', async () => {
     const shortSha = 'abc123def456';
     await taskStore.set(gitTask({
@@ -3100,7 +3082,7 @@ describe('generation-fenced review dispatch', () => {
   });
 });
 
-describe('fifth review round fixes', () => {
+describe('durable review dispatch and post-approve retry fencing', () => {
   it('sweep dispatches a durable pending lease by generation', async () => {
     await taskStore.set(gitTask({ status: 'fixing', prNumber: 42, qaAgentId: 'qa-1', reviewRound: 1 }));
     const begun = await manager.beginGitReviewPass('task-1', {

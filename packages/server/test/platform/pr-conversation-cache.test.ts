@@ -143,8 +143,6 @@ describe('PrConversationCache', () => {
     dA.resolve(convo('a'));
     await pA;
 
-    // A settled while superseded: B's registration must survive, so a third
-    // same-revision get joins B's in-flight build instead of starting a new one.
     let extraCalls = 0;
     const pB2 = cache.get('t1', 'rB', () => {
       extraCalls++;
@@ -155,7 +153,6 @@ describe('PrConversationCache', () => {
     expect(await pB2).toEqual(convo('b'));
     expect(extraCalls).toBe(0);
 
-    // And the store must hold B's payload, not A's.
     const after = counting(convo('never'));
     expect(await cache.get('t1', 'rB', after.build)).toEqual(convo('b'));
     expect(after.calls()).toBe(0);

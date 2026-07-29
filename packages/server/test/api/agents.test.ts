@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { AgentBindingFacts, AgentSnapshot } from '../../src/shared/index.js';
 import * as imageInput from '../../src/agent/image-input.js';
-import { RootRuntimeStopIncompleteError } from '../../src/agent/root-recovery-coordinator.js';
 import { TmuxManager } from '../../src/agent/tmux.js';
 import { requesters, setupApiHarness, teardownApiHarness, type ApiHarness } from './helpers.js';
 
@@ -70,54 +69,6 @@ describe('GET /api/agents', () => {
 });
 
 describe('GET /api/agents/:id', () => {
-  it.each([
-    { recoveryStatus: 'active' as const, recoveryEnabled: true },
-    { recoveryStatus: 'disabled' as const, recoveryEnabled: false },
-    { recoveryStatus: 'stopped-until-restart' as const, recoveryEnabled: false },
-  ])('exposes root recovery status $recoveryStatus through its session resource', async ({
-    recoveryStatus,
-    recoveryEnabled,
-  }) => {
-    app.ctx.rootRecoveryCoordinator = {
-      getRuntimeControlStatus: vi.fn(() => recoveryStatus),
-      getRuntimeStopWarning: vi.fn(() => undefined),
-      stop: vi.fn(async () => undefined),
-    } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-    const response = await get('/api/agents/root-agent/session');
-
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toEqual({
-      id: 'root-agent',
-      recoveryStatus,
-      recoveryEnabled,
-    });
-  });
-
-  it('exposes a persisted root stop warning through the session resource', async () => {
-    app.ctx.rootRecoveryCoordinator = {
-      getRuntimeControlStatus: vi.fn(() => 'stopped-until-restart'),
-      getRuntimeStopWarning: vi.fn(() => 'Recovery ledger reconciliation failed: corrupt ledger'),
-      stop: vi.fn(async () => undefined),
-    } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-    const response = await get('/api/agents/root-agent/session');
-
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toEqual({
-      id: 'root-agent',
-      recoveryStatus: 'stopped-until-restart',
-      recoveryEnabled: false,
-      warning: 'Recovery ledger reconciliation failed: corrupt ledger',
-    });
-  });
-
-  it('returns 404 for the root session status when root-agent is not configured', async () => {
-    const response = await get('/api/agents/root-agent/session');
-    expect(response.statusCode).toBe(404);
-    expect(JSON.parse(response.body).error).toMatch(/not configured/);
-  });
-
   it('returns configured agent details before state exists', async () => {
     const response = await get('/api/agents/dev-1');
     expect(response.statusCode).toBe(200);
@@ -259,70 +210,6 @@ describe('POST /api/agents/:id/clear', () => {
 });
 
 describe('DELETE /api/agents/:id/session', () => {
-  it('stops the configured root-agent runtime', async () => {
-    const stopRuntime = vi.fn(async () => undefined);
-    app.ctx.rootRecoveryCoordinator = {
-      stopRuntime,
-      getRuntimeControlStatus: vi.fn(() => 'stopped-until-restart'),
-      getRuntimeStopWarning: vi.fn(() => undefined),
-      stop: vi.fn(async () => undefined),
-    } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-    const response = await del('/api/agents/root-agent/session');
-
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toEqual({
-      stopped: true,
-      recoveryStatus: 'stopped-until-restart',
-      message: 'Root recovery is disabled until the Baxian server restarts.',
-    });
-    expect(stopRuntime).toHaveBeenCalledOnce();
-  });
-
-  it('returns a visible warning when termination succeeded but ledger reconciliation failed', async () => {
-    app.ctx.rootRecoveryCoordinator = {
-      stopRuntime: vi.fn(async () => undefined),
-      getRuntimeControlStatus: vi.fn(() => 'stopped-until-restart'),
-      getRuntimeStopWarning: vi.fn(() =>
-        'Root session termination was confirmed, but recovery ledger reconciliation failed: corrupt ledger'),
-      stop: vi.fn(async () => undefined),
-    } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-    const response = await del('/api/agents/root-agent/session');
-
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toMatchObject({
-      stopped: true,
-      recoveryStatus: 'stopped-until-restart',
-      message: expect.stringContaining('corrupt ledger'),
-    });
-  });
-
-  it('returns an actionable retry response when root stop reconciliation is incomplete', async () => {
-    app.ctx.rootRecoveryCoordinator = {
-      stopRuntime: vi.fn(async () => {
-        throw new RootRuntimeStopIncompleteError('recovery ledger is read-only');
-      }),
-      getRuntimeControlStatus: vi.fn(() => 'stop-incomplete'),
-      stop: vi.fn(async () => undefined),
-    } as unknown as NonNullable<typeof app.ctx.rootRecoveryCoordinator>;
-
-    const response = await del('/api/agents/root-agent/session');
-
-    expect(response.statusCode).toBe(503);
-    expect(JSON.parse(response.body)).toMatchObject({
-      recoveryStatus: 'stop-incomplete',
-      retryable: true,
-      error: expect.stringContaining('retry stopping root-agent'),
-    });
-  });
-
-  it('returns 404 when root-agent is not configured', async () => {
-    const response = await del('/api/agents/root-agent/session');
-    expect(response.statusCode).toBe(404);
-    expect(JSON.parse(response.body).error).toMatch(/not configured/);
-  });
-
   it('with active task → cancels the task (status=cancelled) + returns 204', async () => {
     const now = new Date().toISOString();
     await app.ctx.taskStore.set({

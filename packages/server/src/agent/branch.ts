@@ -43,7 +43,6 @@ export class BranchManager {
   constructor(private runner: CommandRunner) {}
 
   async assertClean(workdir: string): Promise<void> {
-    // --no-optional-locks: a plain `git status` may refresh and write the index; keep it read-only.
     const result = await this.runner.exec(
       `git -C ${shellQuote(workdir)} --no-optional-locks status --porcelain=v1 -z ` +
         `--untracked-files=all --ignore-submodules=none`,
@@ -77,8 +76,6 @@ export class BranchManager {
       await this.switch(workdir, `--no-guess ${shellQuote(branch)}`);
     } else if (local.exitCode === 1) {
       if (opts.restorableRemoteTip) {
-        // 凭据存在说明本地 ref 是 release 时主动清理的、工作在远端；远端也消失时绝不能
-        // 从 origin/HEAD 重建同名空分支顶替，否则已推送的上一轮成果被静默丢弃
         if (!await this.remoteBranchExists(workdir, branch)) {
           throw new Error(
             `Remote ${branch} vanished after its local ref was cleaned up `
@@ -87,8 +84,6 @@ export class BranchManager {
         }
         await this.restoreTaskBranchFromRemote(workdir, taskId, branch, opts.restorableRemoteTip);
       } else if (opts.requireExistingWork) {
-        // continuation 场景本地分支必须在（或持有清理凭据）：都没有说明上一轮工作已不可
-        // 证明，新建空分支会把丢失伪装成可继续
         throw new Error(
           `Local branch ${branch} is missing with no cleanup credential; refusing to recreate it mid-task`,
         );
@@ -111,7 +106,6 @@ export class BranchManager {
     await this.verifyRef(workdir, localRef);
   }
 
-  // 只信删除时刻持久化的 remoteTipSha 凭据：远端 tip 必须仍包含它，防同名陌生分支或 force-push 重写被采纳
   private async restoreTaskBranchFromRemote(
     workdir: string,
     taskId: string,
@@ -406,7 +400,6 @@ export class BranchManager {
     }
   }
 
-  // canonicalSelfGuard rides every Workdir tree/ref mutation so a rebound ancestor can't redirect it to an external repo.
   private async fetch(workdir: string): Promise<void> {
     const result = await execNetwork(
       this.runner,

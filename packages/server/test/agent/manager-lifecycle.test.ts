@@ -1,73 +1,31 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { AgentManager, DispatchTerminalError } from '../../src/agent/manager.js';
-import { AgentStore } from '../../src/state/agent-store.js';
-import { TaskStore } from '../../src/state/task-store.js';
-import { LockManager } from '../../src/state/lock.js';
-import { EventBus } from '../../src/event/bus.js';
-import { EventLog } from '../../src/event/log.js';
-import { SkillRegistry } from '../../src/skill/registry.js';
-import { initStateDir } from '../../src/state/init.js';
-import type { BaxianConfig, BaxianEvent, TaskState } from '../../src/shared/index.js';
-import { DEFAULT_SERVER_CONFIG } from '../../src/shared/index.js';
-import type { CommandRunner, ExecResult } from '../../src/agent/runner.js';
-
-const CONFIG: BaxianConfig = {
-  review: { rounds: 10 },
-  server: DEFAULT_SERVER_CONFIG,
-  project: [
-    {
-      id: 'proj',
-      repo: 'user/repo',
-      merge: null,
-      agent: [
-        [
-          { id: 'dev-1', runtime: 'claude-code', role: 'dev', mode: 'local', workdir: '' },
-          { id: 'qa-1', runtime: 'claude-code', role: 'qa', mode: 'local', workdir: '' },
-        ],
-      ],
-    },
-  ],
-};
+import { DispatchTerminalError, type AgentManager } from '../../src/agent/manager.js';
+import type { AgentStore } from '../../src/state/agent-store.js';
+import type { TaskStore } from '../../src/state/task-store.js';
+import type { LockManager } from '../../src/state/lock.js';
+import type { TaskState } from '../../src/shared/index.js';
+import type { CommandRunner } from '../../src/agent/runner.js';
+import { createManagerHarness } from '../helpers/manager-harness.js';
+import { fakeRunner } from '../helpers/fake-runner.js';
+import { makeAgent, makeConfig } from '../helpers/fixtures.js';
 
 let tempDir: string;
 let agentStore: AgentStore;
 let taskStore: TaskStore;
 let lockManager: LockManager;
-let eventBus: EventBus;
 let manager: AgentManager;
 let mockRunner: CommandRunner;
-let emittedEvents: BaxianEvent[];
-
-async function seedTask(overrides: Partial<TaskState> & { id: string }): Promise<TaskState> {
-  const now = new Date().toISOString();
-  const task: TaskState = {
-    id: overrides.id,
-    projectId: 'proj',
-    title: `Task ${overrides.id}`,
-    description: 'seeded task',
-    preferredAgentId: 'dev-1',
-    agentId: 'dev-1',
-    devAgentId: 'dev-1',
-    qaAgentId: 'qa-1',
-    phase: 'code',
-    reviewRound: 0,
-    platformBinding: { mode: 'git', repoKey: 'github.com/user/repo', tool: 'gh' },
-    status: 'in_progress',
-    branch: `bx/${overrides.id}`,
-    createdAt: now,
-    updatedAt: now,
-    ...overrides,
-  };
-  await taskStore.set(task);
-  return task;
-}
+let seedTask: Awaited<ReturnType<typeof createManagerHarness>>['seedTask'];
 
 function seedPending(id: string, preferredAgentId: string): Promise<TaskState> {
   return seedTask({
     id,
+    title: `Task ${id}`,
+    description: 'seeded task',
+    phase: 'code',
     status: 'pending',
     agentId: '',
     preferredAgentId,
@@ -81,50 +39,37 @@ function stubStartSession(result: boolean): void {
 
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), 'baxian-lifecycle-test-'));
-  await initStateDir(tempDir);
-
-  const skillsDir = join(tempDir, 'skills');
-  for (const s of ['baxian-rules', 'task-check', 'pr-review', 'pr-feedback', 'pr-recheck']) {
-    await mkdir(join(skillsDir, s), { recursive: true });
-    await writeFile(join(skillsDir, s, 'SKILL.md'), `# ${s}`);
-  }
-  const skillRegistry = new SkillRegistry(skillsDir);
-  await skillRegistry.scan();
-
-  agentStore = new AgentStore(join(tempDir, 'state', 'agents'));
-  taskStore = new TaskStore(join(tempDir, 'state', 'tasks'));
-  lockManager = new LockManager(join(tempDir, 'locks'));
-  const eventLog = new EventLog(join(tempDir, 'events'));
-  eventBus = new EventBus(eventLog);
-
-  emittedEvents = [];
-  eventBus.on('*', (evt) => { emittedEvents.push(evt); });
-
-  mockRunner = {
-    exec: vi.fn<(cmd: string) => Promise<ExecResult>>().mockResolvedValue({
-      stdout: '',
-      stderr: '',
-      exitCode: 0,
-    }),
-    writeFile: vi.fn<(p: string, c: Buffer | string) => Promise<void>>().mockResolvedValue(undefined),
-  };
-
-  const config: BaxianConfig = {
-    ...CONFIG,
-    project: CONFIG.project.map(p => ({
-      ...p,
-      agent: p.agent.map(pair => pair.map(a => ({ ...a, workdir: join(tempDir, a.id) }))),
-    })),
-  };
-
-  manager = new AgentManager({
+  mockRunner = fakeRunner({ defaultResult: {} });
+  const config = makeConfig({
+    project: [{
+      id: 'proj',
+      repo: 'user/repo',
+      merge: null,
+      agent: [[
+        makeAgent({ workdir: join(tempDir, 'dev-1') }),
+        makeAgent({
+          id: 'qa-1',
+          runtime: 'claude-code',
+          role: 'qa',
+          workdir: join(tempDir, 'qa-1'),
+        }),
+      ]],
+    }],
+  });
+  const harness = await createManagerHarness(tempDir, {
     config,
+    deps: {
+      runnerFactory: () => mockRunner,
+      platformRunner: mockRunner,
+    },
+  });
+  ({
+    manager,
     agentStore,
     taskStore,
     lockManager,
-    eventBus,
-    runnerFactory: () => mockRunner,
-  });
+    seedTask,
+  } = harness);
 });
 
 afterEach(async () => {
@@ -215,6 +160,9 @@ describe('dispatchPendingTask', () => {
   it('returns 409 when task status is not pending', async () => {
     const task = await seedTask({
       id: 'task-005',
+      title: 'Task task-005',
+      description: 'seeded task',
+      phase: 'code',
       status: 'in_progress',
       agentId: 'dev-1',
       preferredAgentId: 'dev-1',

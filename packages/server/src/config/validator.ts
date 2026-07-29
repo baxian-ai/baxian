@@ -2,7 +2,6 @@ import { isAbsolute, normalize } from 'node:path';
 import { isBareRepoSlug,
   CONTROL_CHAR_RE, TOOL_PATTERN,
   hasEmbeddedCredentials, isGitHubRepo, isRecord, isSafeGitHost, parseGitRemote, repoIdentityKey, repoSlug,
-  ROOT_AGENT_ID,
   type BaxianConfig, type AgentRole, type AgentRuntime, type AgentMode, type MergeStrategy, type ProjectConfig, type SpecApprovalStrategy,
 } from '../shared/index.js';
 import { mayShareHostAccount, resolveAgentHost } from '../agent/runner.js';
@@ -25,10 +24,7 @@ const VALID_SPEC_APPROVAL: Array<SpecApprovalStrategy | undefined> = ['human', n
 const ID_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 const REPO_SLUG_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 const REPO_SEGMENT_PATTERN = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
-const ROOT_FIELDS = new Set([
-  'runtime', 'mode', 'host', 'workdir', 'yolo', 'model', 'projects', 'responseTimeoutMinutes',
-]);
-const TOP_LEVEL_FIELDS = new Set(['language', 'review', 'server', 'host', 'project', 'root']);
+const TOP_LEVEL_FIELDS = new Set(['language', 'review', 'server', 'host', 'project']);
 const REVIEW_FIELDS = new Set(['rounds']);
 const SERVER_FIELDS = new Set([
   'port', 'host', 'token', 'https', 'allowedHosts', 'githubPollIntervalMs',
@@ -106,7 +102,6 @@ export function validateConfig(config: BaxianConfig): ValidationError[] {
   validateAgentWorkdirUniqueness(config, errors);
   validateAgentPairs(config, errors);
   validateRemoteHosts(config, errors);
-  validateRootAgent(config, errors);
 
   return errors;
 }
@@ -115,9 +110,6 @@ function nonEmptyString(v: unknown): boolean {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
-
-// tool 解析的唯一定义（spec v2 §4）：显式 gitCli.tool 优先；github 仓库零配置自动 'gh'（内置插件）；
-// 非 github 且未声明 → undefined（validator 已报配置错误，消费端跳过）。
 export function resolveProjectTool(project: ProjectConfig): string | undefined {
   if (isRecord(project.gitCli) && typeof project.gitCli.tool === 'string') return project.gitCli.tool;
   return nonEmptyString(project.repo) && isGitHubRepo(project.repo) ? 'gh' : undefined;
@@ -229,8 +221,6 @@ function validateGlobals(config: BaxianConfig, errors: ValidationError[]): void 
 }
 
 function validatePlatformRepoUniqueness(config: BaxianConfig, errors: ValidationError[]): void {
-  // 查重范围 = platform entry 集合（spec §4/§5.5 同谓词）：共用一个 repo 就共用一份 cursor
-  // 与观察缓存，两个 entry 指向同一仓库会互相吞事件。都不进 entry 的项目共用 repo 无妨。
   const seen = new Map<string, string>();
   config.project.forEach((project, i) => {
     if (!nonEmptyString(project.repo) || !projectNeedsPlatformEntry(config, project)) return;
@@ -252,21 +242,15 @@ function validatePlatformProjects(config: BaxianConfig, errors: ValidationError[
     const path = `project[${i}]`;
     const gitCli = project.gitCli;
 
-    // project.repo 的存在性/类型错误已由 validateProjectFields 报告；此处短路，避免对畸形 repo 重复报告或在 isGitHubRepo/dedupe 上崩溃
     if (!nonEmptyString(project.repo)) return;
 
-    // github 仓库豁免 http(s) 形态与 gitCli 声明：内置 gh 驱动只用 {hostname}/{repoPath} 占位符
-    // 且 tool 自动解析为 'gh'（spec v2 §4），SSH/scp/裸 slug 形态照常合法。
     if (!isGitHubRepo(project.repo)) {
-      // scheme 大小写不敏感（WHATWG）：大写 HTTPS:// 由 isValidRepo 统一拒，此处小写敏感会对它误报「ssh/scp 打到 SSH 端口」。
       if (!/^https?:\/\//i.test(project.repo)) {
         errors.push({
           path: `${path}.repo`,
           message: 'non-GitHub repos require an http(s):// repo URL because the platform driver derives its API endpoint from it',
         });
       } else {
-        // 补 isValidRepo 段模式不查的 URL 结构错误（如非数字端口）；退化路径形态
-        // （纯 host/query/fragment）由 validateProjectFields 的 isValidRepo 单点把守。
         try {
           new URL(project.repo);
         } catch {
@@ -281,7 +265,6 @@ function validatePlatformProjects(config: BaxianConfig, errors: ValidationError[
         });
       }
     } else if (isBareRepoSlug(project.repo) && resolveProjectTool(project) !== 'gh') {
-      // 裸 slug 只有 gh 能 clone；不代用户合成 URL——https 与 ssh 的凭据通道不同（spec §4）。
       errors.push({
         path: `${path}.repo`,
         message: "a bare owner/repo slug requires the resolved tool 'gh' (plain git cannot clone a bare slug) — declare the full https:// or ssh URL, or drop gitCli.tool",
@@ -327,7 +310,6 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
     if (!nonEmptyString(project.repo)) {
       errors.push({ path: `${path}.repo`, message: 'project.repo must be a non-empty string' });
     } else if (CONTROL_CHAR_RE.test(project.repo)) {
-      // repo 会进入 descriptor 行协议与 argv 渲染；段模式对 Cc 的拒绝是巧合而非声明，这里钉死不变量（spec §4）。
       errors.push({ path: `${path}.repo`, message: 'project.repo must not contain control characters' });
     } else if (hasEmbeddedCredentials(project.repo)) {
       errors.push({
@@ -359,8 +341,6 @@ function validateProjectFields(config: BaxianConfig, errors: ValidationError[]):
   }
 }
 
-// gitCli 对任意项目合法（spec v2 §4），归字段形状层——
-// 放 validateGitMode 会被其 repo 短路压掉，repo 与 gitCli 同坏时用户要修两轮才见全错。
 function validateGitCliShape(project: ProjectConfig, path: string, errors: ValidationError[]): void {
   const gitCli = project.gitCli;
   if (gitCli === undefined) return;
@@ -371,13 +351,10 @@ function validateGitCliShape(project: ProjectConfig, path: string, errors: Valid
   if (typeof gitCli.tool !== 'string' || !TOOL_PATTERN.test(gitCli.tool)) {
     errors.push({ path: `${path}.gitCli.tool`, message: `gitCli.tool must match ${TOOL_PATTERN}` });
   }
-  // isAbsolute 单独挡不住换行伪造（isAbsolute('/x\nbase: forged') 为真），行协议值一律拒 Cc（spec §4）。
   if (gitCli.binary !== undefined
     && (typeof gitCli.binary !== 'string' || !isAbsolute(gitCli.binary) || CONTROL_CHAR_RE.test(gitCli.binary))) {
     errors.push({ path: `${path}.gitCli.binary`, message: 'gitCli.binary must be an absolute path without control characters' });
   }
-  // 长度约束按 spec §8 属 cli-notes 渲染层的截断语义（512B + 警告）；控制字符在此拒——
-  // cli-notes 是行式派发描述符，\n 可伪造额外 cli-*: 行，截断不移除换行。
   if (gitCli.notes !== undefined
     && (typeof gitCli.notes !== 'string' || CONTROL_CHAR_RE.test(gitCli.notes))) {
     errors.push({ path: `${path}.gitCli.notes`, message: 'gitCli.notes must be a string without control characters' });
@@ -499,23 +476,6 @@ function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: Validation
     host: ReturnType<typeof resolveAgentHost>;
     workdir: string;
   }> = [];
-  const root = config.root;
-  if (
-    root
-    && VALID_MODES.includes(root.mode)
-    && nonEmptyString(root.workdir)
-    && isAbsolute(root.workdir)
-  ) {
-    const host = resolveAgentHost(hosts, root.host);
-    if (root.mode === 'local' || host) {
-      seen.push({
-        id: ROOT_AGENT_ID,
-        mode: root.mode,
-        host,
-        workdir: normalize(root.workdir),
-      });
-    }
-  }
   for (const project of config.project) {
     if (!Array.isArray(project.agent)) continue;
     for (let i = 0; i < project.agent.length; i++) {
@@ -546,167 +506,6 @@ function validateAgentWorkdirUniqueness(config: BaxianConfig, errors: Validation
         }
       }
     }
-  }
-}
-
-function validateRootAgent(config: BaxianConfig, errors: ValidationError[]): void {
-  for (const project of config.project) {
-    if (!Array.isArray(project.agent)) continue;
-    for (const group of project.agent) {
-      if (!Array.isArray(group)) continue;
-      if (group.some(agent => isRecord(agent) && agent.id === ROOT_AGENT_ID)) {
-        errors.push({
-          path: `project.${project.id}.agent.${ROOT_AGENT_ID}`,
-          message: `Agent id "${ROOT_AGENT_ID}" is reserved for the root agent`,
-        });
-      }
-    }
-  }
-
-  const root = config.root as unknown;
-  if (root === undefined) return;
-  if (!isRecord(root)) {
-    errors.push({ path: 'root', message: 'root must be an object' });
-    return;
-  }
-  for (const field of Object.keys(root)) {
-    if (!ROOT_FIELDS.has(field)) {
-      errors.push({ path: `root.${field}`, message: `unsupported root field: ${field}` });
-    }
-  }
-  if (!VALID_RUNTIMES.includes(root.runtime as AgentRuntime)) {
-    errors.push({
-      path: 'root.runtime',
-      message: `root.runtime must be one of: ${VALID_RUNTIMES.join(', ')}`,
-    });
-  }
-  if (!VALID_MODES.includes(root.mode as AgentMode)) {
-    errors.push({
-      path: 'root.mode',
-      message: `root.mode must be one of: ${VALID_MODES.join(', ')}`,
-    });
-  }
-  if (!nonEmptyString(root.workdir)) {
-    errors.push({ path: 'root.workdir', message: 'root.workdir must be a non-empty string' });
-  } else if (!isAbsolute(root.workdir as string)) {
-    errors.push({ path: 'root.workdir', message: 'root.workdir must be an absolute path' });
-  } else if (normalize(root.workdir as string) === '/') {
-    errors.push({ path: 'root.workdir', message: 'root.workdir must not be the filesystem root' });
-  }
-  if (root.model !== undefined && !nonEmptyString(root.model)) {
-    errors.push({ path: 'root.model', message: 'root.model, when set, must be a non-empty string' });
-  }
-  if (root.yolo !== undefined && typeof root.yolo !== 'boolean') {
-    errors.push({ path: 'root.yolo', message: 'root.yolo must be a boolean if present' });
-  }
-  if (!Number.isInteger(root.responseTimeoutMinutes)
-    || (root.responseTimeoutMinutes as number) < 1
-    || (root.responseTimeoutMinutes as number) > 1440) {
-    errors.push({
-      path: 'root.responseTimeoutMinutes',
-      message: 'root.responseTimeoutMinutes must be an integer in [1, 1440]',
-    });
-  }
-
-  const projectIds = new Set(config.project.map(project => project.id));
-  if (root.projects !== undefined) {
-    if (!Array.isArray(root.projects)) {
-      errors.push({ path: 'root.projects', message: 'root.projects must be an array of project ids' });
-    } else {
-      if (root.projects.length === 0) {
-        errors.push({ path: 'root.projects', message: 'root.projects must contain at least one project id' });
-      }
-      const seen = new Set<string>();
-      root.projects.forEach((projectId, index) => {
-        if (!nonEmptyString(projectId)) {
-          errors.push({ path: `root.projects[${index}]`, message: 'root.projects[*] must be a non-empty string' });
-          return;
-        }
-        if (!projectIds.has(projectId as string)) {
-          errors.push({
-            path: `root.projects[${index}]`,
-            message: `root.projects references unknown project id "${projectId as string}"`,
-          });
-        }
-        if (seen.has(projectId as string)) {
-          errors.push({ path: `root.projects[${index}]`, message: `Duplicate root project id: ${projectId as string}` });
-        }
-        seen.add(projectId as string);
-      });
-    }
-  }
-
-  validateRootHost(config, root, errors);
-  validateRootAccountIsolation(config, errors);
-}
-
-function validateRootAccountIsolation(config: BaxianConfig, errors: ValidationError[]): void {
-  const root = config.root;
-  if (!root || !VALID_MODES.includes(root.mode)) return;
-  const rootHost = resolveAgentHost(config.host, root.host);
-  if (root.mode === 'remote' && !rootHost) return;
-  for (const project of config.project) {
-    for (const group of project.agent) {
-      for (const agent of group) {
-        if (agent.yolo === false || !VALID_MODES.includes(agent.mode)) continue;
-        const agentHost = resolveAgentHost(config.host, agent.host);
-        if (agent.mode === 'remote' && !agentHost) continue;
-        if (!mayShareHostAccount(root.mode, rootHost, agent.mode, agentHost)) continue;
-        errors.push({
-          path: `project.${project.id}.agent.${agent.id}.yolo`,
-          message:
-            `yolo agent "${agent.id}" may share the root mailbox OS account; ` +
-            'set yolo: false or use a different explicit SSH user or hostname',
-        });
-      }
-    }
-  }
-}
-
-function validateRootHost(
-  config: BaxianConfig,
-  root: Record<string, unknown>,
-  errors: ValidationError[],
-): void {
-  if (root.mode === 'local') {
-    if (root.host !== undefined) {
-      errors.push({ path: 'root.host', message: 'local root agent must not configure root.host' });
-    }
-    return;
-  }
-  if (root.mode !== 'remote') return;
-  if (root.host === undefined || root.host === null) {
-    errors.push({ path: 'root.host', message: 'remote root agent must reference a host' });
-    return;
-  }
-  if (typeof root.host === 'string') {
-    if (!config.host.some(host => host.id === root.host)) {
-      errors.push({
-        path: 'root.host',
-        message: `remote root agent references unknown host id "${root.host}" — add it via Host 管理`,
-      });
-    }
-    return;
-  }
-  if (!isRecord(root.host)) {
-    errors.push({ path: 'root.host', message: 'root.host must be a host id (string) or an inline host object' });
-    return;
-  }
-  if (!nonEmptyString(root.host.hostname)) {
-    errors.push({ path: 'root.host.hostname', message: 'host.hostname must be a non-empty string' });
-  }
-  if (root.host.port !== undefined
-    && (!Number.isInteger(root.host.port) || (root.host.port as number) <= 0 || (root.host.port as number) > 65535)) {
-    errors.push({ path: 'root.host.port', message: 'host.port must be a positive integer ≤ 65535' });
-  }
-  if (root.host.user !== undefined && !nonEmptyString(root.host.user)) {
-    errors.push({ path: 'root.host.user', message: 'host.user, if set, must be a non-empty string' });
-  }
-  if (root.host.password !== undefined) {
-    errors.push({
-      path: 'root.host.password',
-      message: 'inline root.host must not carry a password; define it in the top-level host registry and reference it by id',
-    });
   }
 }
 
